@@ -16,17 +16,32 @@
 #![feature(assert_matches)]
 
 pub mod arrow_array;
+pub mod arrow1_array;
 pub mod data_type;
 pub mod error;
 pub mod macros;
 pub mod prelude;
 mod scalars;
+mod scalars2;
 pub mod schema;
 pub mod serialize;
 pub mod type_id;
 pub mod types;
 pub mod value;
 pub mod vectors;
+pub mod vectors2;
 
 pub use arrow;
 pub use error::{Error, Result};
+
+pub mod prelude2 {
+    pub use crate::data_type::{ConcreteDataType, DataType, DataTypeRef};
+    pub use crate::macros::*;
+    pub use crate::scalars2::{Scalar, ScalarRef, ScalarVector, ScalarVectorBuilder};
+    pub use crate::type_id::LogicalTypeId;
+    pub use crate::types::Primitive;
+    pub use crate::value::{Value, ValueRef};
+    pub use crate::vectors2::{
+        MutableVector, Validity, Vector, VectorRef,
+    };
+}

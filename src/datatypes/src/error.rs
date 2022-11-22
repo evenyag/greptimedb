@@ -85,6 +85,12 @@ pub enum Error {
         backtrace: Backtrace,
     },
 
+    #[snafu(display("Arrow failed to compute, source: {}", source))]
+    Arrow1Compute {
+        source: arrow1::error::ArrowError,
+        backtrace: Backtrace,
+    },
+
     #[snafu(display("Unsupported column default constraint expression: {}", expr))]
     UnsupportedDefaultExpr { expr: String, backtrace: Backtrace },
 

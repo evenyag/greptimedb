@@ -35,3 +35,7 @@ features = [
     "compute",
     "serde_types",
 ]
+
+[dependencies.arrow1]
+package = "arrow"
+version = "26.0"
