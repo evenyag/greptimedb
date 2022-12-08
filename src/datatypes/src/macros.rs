@@ -81,6 +81,7 @@ mod tests {
     use chrono_tz::Tz;
 
     pub struct EvalContext {
+        tz: [i64; 12],
         // _tz: Tz,
         // pub error: Option<Error>,
     }
@@ -89,6 +90,7 @@ mod tests {
         fn default() -> Self {
             // let tz = "UTC".parse::<Tz>().unwrap();
             Self {
+                tz: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
                 // error: None,
                 // _tz: tz,
             }
