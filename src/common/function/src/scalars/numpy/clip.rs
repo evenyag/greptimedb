@@ -30,49 +30,151 @@ use crate::scalars::function::{Function, FunctionContext};
 #[derive(Clone, Debug, Default)]
 pub struct ClipFunction;
 
-macro_rules! define_eval {
-    ($O: ident) => {
-        paste! {
-            fn [<eval_ $O>](columns: &[VectorRef]) -> Result<VectorRef> {
-                with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
-                    with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
-                        with_match_primitive_type_id!(columns[2].data_type().logical_type_id(), |$R| {
-                            // clip(a, min, max) is equals to min(max(a, min), max)
-                            let col: VectorRef = Arc::new(scalar_binary_op::<
-                                <$S as LogicalPrimitiveType>::Wrapper,
-                                <$T as LogicalPrimitiveType>::Wrapper,
-                                $O,
-                                _,
-                            >(
-                                &columns[0],
-                                &columns[1],
-                                scalar_max,
-                                &mut EvalContext::default(),
-                            )?);
-                            let col = scalar_binary_op::<$O, <$R as LogicalPrimitiveType>::Wrapper, $O, _>(
-                                &col,
-                                &columns[2],
-                                scalar_min,
-                                &mut EvalContext::default(),
-                            )?;
-                            Ok(Arc::new(col))
-                        }, {
-                            unreachable!()
-                        })
-                    }, {
-                        unreachable!()
-                    })
-                }, {
-                    unreachable!()
-                })
-            }
-        }
-    }
+// macro_rules! define_eval {
+//     ($O: ident) => {
+//         paste! {
+//             fn [<eval_ $O>](columns: &[VectorRef]) -> Result<VectorRef> {
+//                 with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
+//                     with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
+//                         with_match_primitive_type_id!(columns[2].data_type().logical_type_id(), |$R| {
+//                             // clip(a, min, max) is equals to min(max(a, min), max)
+//                             let col: VectorRef = Arc::new(scalar_binary_op::<
+//                                 <$S as LogicalPrimitiveType>::Wrapper,
+//                                 <$T as LogicalPrimitiveType>::Wrapper,
+//                                 $O,
+//                                 _,
+//                             >(
+//                                 &columns[0],
+//                                 &columns[1],
+//                                 scalar_max,
+//                                 &mut EvalContext::default(),
+//                             )?);
+//                             let col = scalar_binary_op::<$O, <$R as LogicalPrimitiveType>::Wrapper, $O, _>(
+//                                 &col,
+//                                 &columns[2],
+//                                 scalar_min,
+//                                 &mut EvalContext::default(),
+//                             )?;
+//                             Ok(Arc::new(col))
+//                         }, {
+//                             unreachable!()
+//                         })
+//                     }, {
+//                         unreachable!()
+//                     })
+//                 }, {
+//                     unreachable!()
+//                 })
+//             }
+//         }
+//     }
+// }
+
+fn eval_i64(columns: &[VectorRef]) -> Result<VectorRef> {
+    with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
+        with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
+            with_match_primitive_type_id!(columns[2].data_type().logical_type_id(), |$R| {
+                // clip(a, min, max) is equals to min(max(a, min), max)
+                let col: VectorRef = Arc::new(scalar_binary_op::<
+                    <$S as LogicalPrimitiveType>::Wrapper,
+                    <$T as LogicalPrimitiveType>::Wrapper,
+                    i64,
+                    _,
+                >(
+                    &columns[0],
+                    &columns[1],
+                    scalar_max,
+                    &mut EvalContext::default(),
+                )?);
+                let col = scalar_binary_op::<i64, <$R as LogicalPrimitiveType>::Wrapper, i64, _>(
+                    &col,
+                    &columns[2],
+                    scalar_min,
+                    &mut EvalContext::default(),
+                )?;
+                Ok(Arc::new(col))
+            }, {
+                unreachable!()
+            })
+        }, {
+            unreachable!()
+        })
+    }, {
+        unreachable!()
+    })
 }
 
-define_eval!(i64);
-define_eval!(u64);
-define_eval!(f64);
+fn eval_u64(columns: &[VectorRef]) -> Result<VectorRef> {
+    with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
+        with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
+            with_match_primitive_type_id!(columns[2].data_type().logical_type_id(), |$R| {
+                // clip(a, min, max) is equals to min(max(a, min), max)
+                let col: VectorRef = Arc::new(scalar_binary_op::<
+                    <$S as LogicalPrimitiveType>::Wrapper,
+                    <$T as LogicalPrimitiveType>::Wrapper,
+                    u64,
+                    _,
+                >(
+                    &columns[0],
+                    &columns[1],
+                    scalar_max,
+                    &mut EvalContext::default(),
+                )?);
+                let col = scalar_binary_op::<u64, <$R as LogicalPrimitiveType>::Wrapper, u64, _>(
+                    &col,
+                    &columns[2],
+                    scalar_min,
+                    &mut EvalContext::default(),
+                )?;
+                Ok(Arc::new(col))
+            }, {
+                unreachable!()
+            })
+        }, {
+            unreachable!()
+        })
+    }, {
+        unreachable!()
+    })
+}
+
+fn eval_f64(columns: &[VectorRef]) -> Result<VectorRef> {
+    with_match_primitive_type_id!(columns[0].data_type().logical_type_id(), |$S| {
+        with_match_primitive_type_id!(columns[1].data_type().logical_type_id(), |$T| {
+            with_match_primitive_type_id!(columns[2].data_type().logical_type_id(), |$R| {
+                // clip(a, min, max) is equals to min(max(a, min), max)
+                let col: VectorRef = Arc::new(scalar_binary_op::<
+                    <$S as LogicalPrimitiveType>::Wrapper,
+                    <$T as LogicalPrimitiveType>::Wrapper,
+                    f64,
+                    _,
+                >(
+                    &columns[0],
+                    &columns[1],
+                    scalar_max,
+                    &mut EvalContext::default(),
+                )?);
+                let col = scalar_binary_op::<f64, <$R as LogicalPrimitiveType>::Wrapper, f64, _>(
+                    &col,
+                    &columns[2],
+                    scalar_min,
+                    &mut EvalContext::default(),
+                )?;
+                Ok(Arc::new(col))
+            }, {
+                unreachable!()
+            })
+        }, {
+            unreachable!()
+        })
+    }, {
+        unreachable!()
+    })
+}
+
+// define_eval!(i64);
+// define_eval!(u64);
+// define_eval!(f64);
 
 impl Function for ClipFunction {
     fn name(&self) -> &str {
@@ -228,7 +330,9 @@ mod tests {
             )),
         ];
 
-        let vector = clip.eval(FunctionContext::default(), &args).unwrap();
+        let ctx = FunctionContext::default();
+        let vs = args.as_slice();
+        let vector = clip.eval(ctx, vs).unwrap();
         assert_eq!(10, vector.len());
 
         // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
@@ -260,7 +364,9 @@ mod tests {
             )),
         ];
 
-        let vector = clip.eval(FunctionContext::default(), &args).unwrap();
+        let ctx = FunctionContext::default();
+        let vs = args.as_slice();
+        let vector = clip.eval(ctx, vs).unwrap();
         assert_eq!(10, vector.len());
 
         // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
@@ -292,7 +398,9 @@ mod tests {
             )),
         ];
 
-        let vector = clip.eval(FunctionContext::default(), &args).unwrap();
+        let ctx = FunctionContext::default();
+        let vs = args.as_slice();
+        let vector = clip.eval(ctx, vs).unwrap();
         assert_eq!(10, vector.len());
 
         // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
