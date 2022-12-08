@@ -196,7 +196,8 @@ impl Function for ClipFunction {
     }
 
     fn eval(&self, _func_ctx: FunctionContext, columns: &[VectorRef]) -> Result<VectorRef> {
-        if columns.iter().all(|v| v.data_type().is_signed()) {
+        let is_s = columns.iter().all(|v| v.data_type().is_signed());
+        if is_s {
             eval_i64(columns)
         } else if columns.iter().all(|v| v.data_type().is_unsigned()) {
             eval_u64(columns)
