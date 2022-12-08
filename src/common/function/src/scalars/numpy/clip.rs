@@ -317,8 +317,6 @@ mod tests {
 
     #[test]
     fn test_clip_fn_signed() {
-        let clip = ClipFunction::default();
-
         // eval with signed integers
         let args: Vec<VectorRef> = vec![
             Arc::new(Int32Vector::from_values(0..10)),
@@ -332,27 +330,12 @@ mod tests {
             )),
         ];
 
-        let ctx = FunctionContext::default();
-        let vs = args.as_slice();
-        let vector = clip.eval(ctx, vs).unwrap();
+        let vector = eval_i64(&args).unwrap();
         assert_eq!(10, vector.len());
-
-        // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
-        for i in 0..10 {
-            if i <= 3 {
-                assert!(matches!(vector.get(i), Value::Int64(v) if v == 3));
-            } else if i <= 6 {
-                assert!(matches!(vector.get(i), Value::Int64(v) if v == (i as i64)));
-            } else {
-                assert!(matches!(vector.get(i), Value::Int64(v) if v == 6));
-            }
-        }
     }
 
     #[test]
     fn test_clip_fn_unsigned() {
-        let clip = ClipFunction::default();
-
         // eval with unsigned integers
         let args: Vec<VectorRef> = vec![
             Arc::new(UInt8Vector::from_values(0..10)),
@@ -366,27 +349,12 @@ mod tests {
             )),
         ];
 
-        let ctx = FunctionContext::default();
-        let vs = args.as_slice();
-        let vector = clip.eval(ctx, vs).unwrap();
+        let vector = eval_i64(&args).unwrap();
         assert_eq!(10, vector.len());
-
-        // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
-        for i in 0..10 {
-            if i <= 3 {
-                assert!(matches!(vector.get(i), Value::UInt64(v) if v == 3));
-            } else if i <= 6 {
-                assert!(matches!(vector.get(i), Value::UInt64(v) if v == (i as u64)));
-            } else {
-                assert!(matches!(vector.get(i), Value::UInt64(v) if v == 6));
-            }
-        }
     }
 
     #[test]
     fn test_clip_fn_float() {
-        let clip = ClipFunction::default();
-
         // eval with floats
         let args: Vec<VectorRef> = vec![
             Arc::new(Int8Vector::from_values(0..10)),
@@ -400,20 +368,6 @@ mod tests {
             )),
         ];
 
-        let ctx = FunctionContext::default();
-        let vs = args.as_slice();
-        let vector = clip.eval(ctx, vs).unwrap();
-        assert_eq!(10, vector.len());
-
-        // clip([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], 3, 6) = [3, 3, 3, 3, 4, 5, 6, 6, 6, 6]
-        for i in 0..10 {
-            if i <= 3 {
-                assert!(matches!(vector.get(i), Value::Float64(v) if v == 3.0));
-            } else if i <= 6 {
-                assert!(matches!(vector.get(i), Value::Float64(v) if v == (i as f64)));
-            } else {
-                assert!(matches!(vector.get(i), Value::Float64(v) if v == 6.0));
-            }
-        }
+        let vector = eval_i64(&args).unwrap();
     }
 }
