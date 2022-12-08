@@ -81,28 +81,27 @@ mod tests {
     use chrono_tz::Tz;
 
     pub struct EvalContext {
-        _tz: Tz,
-        pub error: Option<Error>,
+        // _tz: Tz,
+        // pub error: Option<Error>,
     }
 
     impl Default for EvalContext {
         fn default() -> Self {
-            let tz = "UTC".parse::<Tz>().unwrap();
+            // let tz = "UTC".parse::<Tz>().unwrap();
             Self {
-                error: None,
-                _tz: tz,
+                // error: None,
+                // _tz: tz,
             }
         }
     }
 
-    impl EvalContext {
-        pub fn set_error(&mut self, e: Error) {
-            if self.error.is_none() {
-                self.error = Some(e);
-            }
-        }
-    }
-
+    // impl EvalContext {
+    //     pub fn set_error(&mut self, e: Error) {
+    //         if self.error.is_none() {
+    //             self.error = Some(e);
+    //         }
+    //     }
+    // }
 
     #[inline]
     fn min<T: PartialOrd>(input: T, min: T) -> T {
@@ -163,53 +162,14 @@ mod tests {
             "Size of vectors must match to apply binary expression"
         );
 
-        let result = match (l.is_const(), r.is_const()) {
-            (false, true) => {
-                let left: &<L as Scalar>::VectorType = unsafe { Helper::static_cast(l) };
-                let right: &ConstantVector = unsafe { Helper::static_cast(r) };
-                let right: &<R as Scalar>::VectorType = unsafe { Helper::static_cast(right.inner()) };
-                let b = right.get_data(0);
+        let result = {
+            let left: &<L as Scalar>::VectorType = unsafe { Helper::static_cast(l) };
+            let right: &ConstantVector = unsafe { Helper::static_cast(r) };
+            let right: &<R as Scalar>::VectorType = unsafe { Helper::static_cast(right.inner()) };
+            let b = right.get_data(0);
 
-                let it = left.iter_data().map(|a| f(a, b, ctx));
-                <O as Scalar>::VectorType::from_owned_iterator(it)
-            }
-
-            (false, false) => {
-                let left: &<L as Scalar>::VectorType = unsafe { Helper::static_cast(l) };
-                let right: &<R as Scalar>::VectorType = unsafe { Helper::static_cast(r) };
-
-                let it = left
-                    .iter_data()
-                    .zip(right.iter_data())
-                    .map(|(a, b)| f(a, b, ctx));
-                <O as Scalar>::VectorType::from_owned_iterator(it)
-            }
-
-            (true, false) => {
-                let left: &ConstantVector = unsafe { Helper::static_cast(l) };
-                let left: &<L as Scalar>::VectorType = unsafe { Helper::static_cast(left.inner()) };
-                let a = left.get_data(0);
-
-                let right: &<R as Scalar>::VectorType = unsafe { Helper::static_cast(r) };
-                let it = right.iter_data().map(|b| f(a, b, ctx));
-                <O as Scalar>::VectorType::from_owned_iterator(it)
-            }
-
-            (true, true) => {
-                let left: &ConstantVector = unsafe { Helper::static_cast(l) };
-                let left: &<L as Scalar>::VectorType = unsafe { Helper::static_cast(left.inner()) };
-                let a = left.get_data(0);
-
-                let right: &ConstantVector = unsafe { Helper::static_cast(r) };
-                let right: &<R as Scalar>::VectorType = unsafe { Helper::static_cast(right.inner()) };
-                let b = right.get_data(0);
-
-                let it = iter::repeat(a)
-                    .zip(iter::repeat(b))
-                    .map(|(a, b)| f(a, b, ctx))
-                    .take(left.len());
-                <O as Scalar>::VectorType::from_owned_iterator(it)
-            }
+            let it = left.iter_data().map(|a| f(a, b, ctx));
+            <O as Scalar>::VectorType::from_owned_iterator(it)
         };
         Ok(result)
     }
