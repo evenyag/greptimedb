@@ -13,3 +13,67 @@
 // limitations under the License.
 
 //! Common traits and structures for the procedure framework.
+
+use std::any::Any;
+
+use common_error::prelude::*;
+use uuid::Uuid;
+
+#[derive(Debug, Snafu)]
+pub enum Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl ErrorExt for Error {
+    fn status_code(&self) -> StatusCode {
+        StatusCode::Internal
+    }
+
+    fn backtrace_opt(&self) -> Option<&Backtrace> {
+        ErrorCompat::backtrace(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Procedure execution status.
+#[derive(Debug)]
+pub enum Status {
+    Executing,
+    Done,
+}
+
+/// Procedure execution context.
+#[derive(Debug)]
+pub struct Context {}
+
+/// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
+pub trait Procedure {
+    fn execute(&mut self, ctx: &Context) -> Result<Status>;
+}
+
+/// Boxed [Procedure].
+pub type BoxedProcedure = Box<dyn Procedure>;
+
+/// `ProcedureManager` executes [Procedure] submitted to it.
+pub trait ProcedureManager {
+    /// Submit a [Procedure] to execute.
+    fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
+}
+
+/// Unique id for [Procedure].
+#[derive(Debug)]
+pub struct ProcedureId(Uuid);
+
+/// Standalone [ProcedureManager].
+#[derive(Debug)]
+struct StandaloneManager {
+}
+
+impl ProcedureManager for StandaloneManager {
+    fn submit(&self, procedure: BoxedProcedure) -> Result<()> {
+        unimplemented!()
+    }
+}

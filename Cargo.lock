@@ -1520,6 +1520,11 @@ dependencies = [
 [[package]]
 name = "common-procedure"
 version = "0.1.0"
+dependencies = [
+ "common-error",
+ "snafu",
+ "uuid",
+]
 
 [[package]]
 name = "common-query"
