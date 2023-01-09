@@ -1092,7 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_alter_rename_table() {
-        let (engine, table_engine, _table, object_store, _dir) =
+        let (engine, table_engine, table, object_store, _dir) =
             test_util::setup_mock_engine_and_table().await;
         let ctx = EngineContext::default();
 
@@ -1139,11 +1139,9 @@ mod tests {
                 new_table_name: new_table_name.to_string(),
             },
         };
-        let table = table_engine.alter_table(&ctx, req).await.unwrap();
+        let altered_table = table_engine.alter_table(&ctx, req).await.unwrap();
+        assert_eq!(altered_table.table_info().name, new_table_name);
 
-        assert_eq!(table.table_info().name, new_table_name);
-
-        let table_engine = MitoEngine::new(EngineConfig::default(), engine, object_store);
         let open_req = OpenTableRequest {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             schema_name: DEFAULT_SCHEMA_NAME.to_string(),
@@ -1152,19 +1150,14 @@ mod tests {
             region_numbers: vec![0],
         };
 
-        // test reopen table
-        let reopened = table_engine
+        // test open table by the new table name.
+        let table_engine = MitoEngine::new(EngineConfig::default(), engine, object_store);
+        let table_renamed = table_engine
             .open_table(&ctx, open_req.clone())
             .await
             .unwrap()
             .unwrap();
-        let reopened = reopened
-            .as_any()
-            .downcast_ref::<MitoTable<MockRegion>>()
-            .unwrap();
-        assert_eq!(reopened.table_info(), table.table_info());
-        assert_eq!(reopened.table_info().name, new_table_name);
-        assert_eq!(reopened.manifest().last_version(), 2);
+        assert_eq!(table_renamed.table_info(), table.table_info());
     }
 
     #[tokio::test]

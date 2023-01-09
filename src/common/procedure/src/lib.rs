@@ -69,8 +69,7 @@ pub struct ProcedureId(Uuid);
 
 /// Standalone [ProcedureManager].
 #[derive(Debug)]
-struct StandaloneManager {
-}
+struct StandaloneManager {}
 
 impl ProcedureManager for StandaloneManager {
     fn submit(&self, procedure: BoxedProcedure) -> Result<()> {
