@@ -100,18 +100,20 @@ impl ScriptManager {
 #[cfg(test)]
 mod tests {
     use catalog::CatalogManager;
-    use mito::config::EngineConfig as TableEngineConfig;
-    use mito::table::test_util::new_test_object_store;
-    use query::QueryEngineFactory;
-
-    use super::*;
-    type DefaultEngine = MitoEngine<EngineImpl<RaftEngineLogStore>>;
+    use common_procedure::StandaloneManager;
     use log_store::raft_engine::log_store::RaftEngineLogStore;
     use log_store::LogConfig;
+    use mito::config::EngineConfig as TableEngineConfig;
     use mito::engine::MitoEngine;
+    use mito::table::test_util::new_test_object_store;
+    use query::QueryEngineFactory;
     use storage::config::EngineConfig as StorageEngineConfig;
     use storage::EngineImpl;
     use tempdir::TempDir;
+
+    use super::*;
+
+    type DefaultEngine = MitoEngine<EngineImpl<RaftEngineLogStore>>;
 
     #[tokio::test]
     async fn test_insert_find_compile_script() {
@@ -134,6 +136,7 @@ mod tests {
                 object_store.clone(),
             ),
             object_store,
+            Arc::new(StandaloneManager::new()),
         ));
 
         let catalog_manager = Arc::new(

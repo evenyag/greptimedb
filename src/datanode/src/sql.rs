@@ -119,6 +119,7 @@ mod tests {
 
     use catalog::{CatalogList, SchemaProvider};
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_procedure::StandaloneManager;
     use common_query::logical_plan::Expr;
     use common_query::physical_plan::PhysicalPlanRef;
     use common_time::timestamp::Timestamp;
@@ -242,6 +243,7 @@ mod tests {
                 object_store.clone(),
             ),
             object_store,
+            Arc::new(StandaloneManager::new()),
         ));
 
         let catalog_list = Arc::new(

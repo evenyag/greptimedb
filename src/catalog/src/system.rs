@@ -380,6 +380,7 @@ pub struct TableEntryValue {
 
 #[cfg(test)]
 mod tests {
+    use common_procedure::StandaloneManager;
     use log_store::NoopLogStore;
     use mito::config::EngineConfig;
     use mito::engine::MitoEngine;
@@ -478,6 +479,7 @@ mod tests {
                 object_store.clone(),
             ),
             object_store,
+            Arc::new(StandaloneManager::new()),
         ));
         (dir, table_engine)
     }

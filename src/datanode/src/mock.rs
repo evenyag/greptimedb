@@ -18,6 +18,7 @@ use std::sync::Arc;
 use catalog::remote::MetaKvBackend;
 use catalog::CatalogManagerRef;
 use common_catalog::consts::MIN_USER_TABLE_ID;
+use common_procedure::StandaloneManager;
 use meta_client::client::{MetaClient, MetaClientBuilder};
 use meta_srv::mocks::MockInfo;
 use mito::config::EngineConfig as TableEngineConfig;
@@ -54,6 +55,7 @@ impl Instance {
                 object_store.clone(),
             ),
             object_store,
+            Arc::new(StandaloneManager::new()),
         ));
 
         // By default, catalog manager and factory are created in standalone mode

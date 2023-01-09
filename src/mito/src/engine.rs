@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
+use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging;
 use datatypes::schema::SchemaRef;
 use object_store::ObjectStore;
@@ -74,9 +75,19 @@ pub struct MitoEngine<S: StorageEngine> {
 }
 
 impl<S: StorageEngine> MitoEngine<S> {
-    pub fn new(config: EngineConfig, storage_engine: S, object_store: ObjectStore) -> Self {
+    pub fn new(
+        config: EngineConfig,
+        storage_engine: S,
+        object_store: ObjectStore,
+        procedure_manager: ProcedureManagerRef,
+    ) -> Self {
         Self {
-            inner: Arc::new(MitoEngineInner::new(config, storage_engine, object_store)),
+            inner: Arc::new(MitoEngineInner::new(
+                config,
+                storage_engine,
+                object_store,
+                procedure_manager,
+            )),
         }
     }
 }
@@ -148,6 +159,13 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
     }
 }
 
+#[cfg(test)]
+impl<S: StorageEngine> MitoEngine<S> {
+    fn procedure_manager(&self) -> ProcedureManagerRef {
+        self.inner.procedure_manager.clone()
+    }
+}
+
 struct MitoEngineInner<S: StorageEngine> {
     /// All tables opened by the engine. Map key is formatted [TableReference].
     ///
@@ -158,6 +176,7 @@ struct MitoEngineInner<S: StorageEngine> {
     /// Table mutex is used to protect the operations such as creating/opening/closing
     /// a table, to avoid things like opening the same table simultaneously.
     table_mutex: Mutex<()>,
+    procedure_manager: ProcedureManagerRef,
 }
 
 fn build_row_key_desc(
@@ -289,6 +308,21 @@ fn validate_create_table_request(request: &CreateTableRequest) -> Result<()> {
 }
 
 impl<S: StorageEngine> MitoEngineInner<S> {
+    fn new(
+        _config: EngineConfig,
+        storage_engine: S,
+        object_store: ObjectStore,
+        procedure_manager: ProcedureManagerRef,
+    ) -> Self {
+        Self {
+            tables: RwLock::new(HashMap::default()),
+            storage_engine,
+            object_store,
+            table_mutex: Mutex::new(()),
+            procedure_manager,
+        }
+    }
+
     async fn create_table(
         &self,
         _ctx: &EngineContext,
@@ -549,17 +583,6 @@ impl<S: StorageEngine> MitoEngineInner<S> {
     }
 }
 
-impl<S: StorageEngine> MitoEngineInner<S> {
-    fn new(_config: EngineConfig, storage_engine: S, object_store: ObjectStore) -> Self {
-        Self {
-            tables: RwLock::new(HashMap::default()),
-            storage_engine,
-            object_store,
-            table_mutex: Mutex::new(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use common_query::physical_plan::SessionContext;
@@ -570,19 +593,18 @@ mod tests {
     use datatypes::vectors::{
         Float64Vector, Int32Vector, StringVector, TimestampMillisecondVector, VectorRef,
     };
-    use log_store::NoopLogStore;
-    use storage::config::EngineConfig as StorageEngineConfig;
-    use storage::EngineImpl;
     use store_api::manifest::Manifest;
     use store_api::storage::ReadContext;
     use table::requests::{AddColumnRequest, AlterKind, DeleteRequest};
-    use tempdir::TempDir;
+    use common_procedure::StandaloneManager;
 
     use super::*;
     use crate::table::test_util;
     use crate::table::test_util::{new_insert_request, schema_for_test, MockRegion, TABLE_NAME};
 
-    async fn setup_table_with_column_default_constraint() -> (TempDir, String, TableRef) {
+    async fn setup_table_with_column_default_constraint(
+        table_engine: &impl TableEngine,
+    ) -> (String, TableRef) {
         let table_name = "test_default_constraint";
         let column_schemas = vec![
             ColumnSchema::new("name", ConcreteDataType::string_datatype(), false),
@@ -604,19 +626,6 @@ mod tests {
                 .expect("ts must be timestamp column"),
         );
 
-        let (dir, object_store) =
-            test_util::new_test_object_store("test_insert_with_column_default_constraint").await;
-
-        let table_engine = MitoEngine::new(
-            EngineConfig::default(),
-            EngineImpl::new(
-                StorageEngineConfig::default(),
-                Arc::new(NoopLogStore::default()),
-                object_store.clone(),
-            ),
-            object_store,
-        );
-
         let table = table_engine
             .create_table(
                 &EngineContext::default(),
@@ -636,12 +645,13 @@ mod tests {
             .await
             .unwrap();
 
-        (dir, table_name.to_string(), table)
+        (table_name.to_string(), table)
     }
 
     #[tokio::test]
     async fn test_column_default_constraint() {
-        let (_dir, table_name, table) = setup_table_with_column_default_constraint().await;
+        let (table_engine, _dir) = test_util::setup_test_engine("column_default_constraint").await;
+        let (table_name, table) = setup_table_with_column_default_constraint(&table_engine).await;
 
         let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
         let names: VectorRef = Arc::new(StringVector::from(vec!["first", "second"]));
@@ -671,7 +681,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_with_column_default_constraint() {
-        let (_dir, table_name, table) = setup_table_with_column_default_constraint().await;
+        let (table_engine, _dir) = test_util::setup_test_engine("insert_default_constraint").await;
+        let (table_name, table) = setup_table_with_column_default_constraint(&table_engine).await;
 
         let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
         let names: VectorRef = Arc::new(StringVector::from(vec!["first", "second"]));
@@ -757,10 +768,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_table_insert_scan() {
-        let (_engine, table, schema, _dir) = test_util::setup_test_engine_and_table().await;
+        let (_engine, table, _dir) = test_util::setup_test_engine_and_table().await;
 
         assert_eq!(TableType::Base, table.table_type());
-        assert_eq!(schema, table.schema());
 
         let insert_req = new_insert_request("demo".to_string(), HashMap::default());
         assert_eq!(0, table.insert(insert_req).await.unwrap());
@@ -839,7 +849,7 @@ mod tests {
     async fn test_create_table_scan_batches() {
         common_telemetry::init_default_ut_logging();
 
-        let (_engine, table, _schema, _dir) = test_util::setup_test_engine_and_table().await;
+        let (_engine, table, _dir) = test_util::setup_test_engine_and_table().await;
 
         // TODO(yingwen): Custom batch size once the table support setting batch_size.
         let default_batch_size = ReadContext::default().batch_size;
@@ -936,11 +946,12 @@ mod tests {
             region_numbers: vec![0],
         };
 
-        let (engine, table, object_store, _dir) = {
+        let (engine, table, object_store, procedure_manager, _dir) = {
             let (engine, table_engine, table, object_store, dir) =
                 test_util::setup_mock_engine_and_table().await;
             assert_eq!(MITO_ENGINE, table_engine.name());
-            // Now try to open the table again.
+            // Now try to open the table again. Since the table has been opened, this
+            // only returns the table in the `tables` map.
             let reopened = table_engine
                 .open_table(&ctx, open_req.clone())
                 .await
@@ -948,11 +959,23 @@ mod tests {
                 .unwrap();
             assert_eq!(table.schema(), reopened.schema());
 
-            (engine, table, object_store, dir)
+            (
+                engine,
+                table,
+                object_store,
+                table_engine.procedure_manager(),
+                dir,
+            )
         };
 
-        // Construct a new table engine, and try to open the table.
-        let table_engine = MitoEngine::new(EngineConfig::default(), engine, object_store);
+        // Construct a new table engine, and try to open the table. This goes through the
+        // table recover process.
+        let table_engine = MitoEngine::new(
+            EngineConfig::default(),
+            engine,
+            object_store,
+            procedure_manager,
+        );
         let reopened = table_engine
             .open_table(&ctx, open_req.clone())
             .await
@@ -1151,7 +1174,7 @@ mod tests {
         };
 
         // test open table by the new table name.
-        let table_engine = MitoEngine::new(EngineConfig::default(), engine, object_store);
+        let table_engine = MitoEngine::new(EngineConfig::default(), engine, object_store, Arc::new(StandaloneManager::new()));
         let table_renamed = table_engine
             .open_table(&ctx, open_req.clone())
             .await
@@ -1227,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_delete_rows() {
-        let (_engine, table, _schema, _dir) = test_util::setup_test_engine_and_table().await;
+        let (_engine, table, _dir) = test_util::setup_test_engine_and_table().await;
 
         let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
         let hosts: VectorRef =

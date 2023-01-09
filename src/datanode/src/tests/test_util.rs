@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID};
+use common_procedure::StandaloneManager;
 use common_query::Output;
 use common_recordbatch::util;
 use datatypes::data_type::ConcreteDataType;
@@ -136,6 +137,7 @@ pub async fn create_mock_sql_handler() -> SqlHandler {
         EngineConfig::default(),
         MockEngine::default(),
         object_store,
+        Arc::new(StandaloneManager::new()),
     ));
     let catalog_manager = Arc::new(
         catalog::local::LocalCatalogManager::try_new(mock_engine.clone())

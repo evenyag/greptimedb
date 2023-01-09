@@ -19,6 +19,7 @@ mod tests {
     use catalog::local::LocalCatalogManager;
     use catalog::{CatalogManager, RegisterTableRequest, RenameTableRequest};
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_procedure::StandaloneManager;
     use common_telemetry::{error, info};
     use mito::config::EngineConfig;
     use table::table::numbers::NumbersTable;
@@ -28,10 +29,12 @@ mod tests {
     async fn create_local_catalog_manager() -> Result<LocalCatalogManager, catalog::error::Error> {
         let (_dir, object_store) =
             mito::table::test_util::new_test_object_store("setup_mock_engine_and_table").await;
+        let procedure_manager = Arc::new(StandaloneManager::new());
         let mock_engine = Arc::new(mito::table::test_util::MockMitoEngine::new(
             EngineConfig::default(),
             mito::table::test_util::MockEngine::default(),
             object_store,
+            procedure_manager,
         ));
         let catalog_manager = LocalCatalogManager::try_new(mock_engine).await.unwrap();
         catalog_manager.start().await?;

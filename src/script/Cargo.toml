@@ -65,6 +65,7 @@ table = { path = "../table" }
 tokio.workspace = true
 
 [dev-dependencies]
+common-procedure = { path = "../common/procedure" }
 log-store = { path = "../log-store" }
 mito = { path = "../mito", features = ["test"] }
 ron = "0.7"

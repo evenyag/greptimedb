@@ -15,6 +15,7 @@
 //! Common traits and structures for the procedure framework.
 
 use std::any::Any;
+use std::sync::Arc;
 
 use common_error::prelude::*;
 use uuid::Uuid;
@@ -58,10 +59,13 @@ pub trait Procedure {
 pub type BoxedProcedure = Box<dyn Procedure>;
 
 /// `ProcedureManager` executes [Procedure] submitted to it.
-pub trait ProcedureManager {
+pub trait ProcedureManager: Send + Sync + 'static {
     /// Submit a [Procedure] to execute.
     fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
 }
+
+/// Ref-counted pointer to the [ProcedureManager].
+pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
 
 /// Unique id for [Procedure].
 #[derive(Debug)]
@@ -69,7 +73,14 @@ pub struct ProcedureId(Uuid);
 
 /// Standalone [ProcedureManager].
 #[derive(Debug)]
-struct StandaloneManager {}
+pub struct StandaloneManager {}
+
+impl StandaloneManager {
+    /// Create a new StandaloneManager with default configurations.
+    pub fn new() -> StandaloneManager {
+        StandaloneManager {}
+    }
+}
 
 impl ProcedureManager for StandaloneManager {
     fn submit(&self, procedure: BoxedProcedure) -> Result<()> {

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_procedure::StandaloneManager;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema, SchemaBuilder, SchemaRef};
 use datatypes::vectors::VectorRef;
@@ -115,13 +116,9 @@ fn new_create_request(schema: SchemaRef) -> CreateTableRequest {
     }
 }
 
-pub async fn setup_test_engine_and_table() -> (
-    MitoEngine<EngineImpl<NoopLogStore>>,
-    TableRef,
-    SchemaRef,
-    TempDir,
-) {
-    let (dir, object_store) = new_test_object_store("setup_test_engine_and_table").await;
+pub async fn setup_test_engine(dir_name: &str) -> (MitoEngine<EngineImpl<NoopLogStore>>, TempDir) {
+    let (dir, object_store) = new_test_object_store(dir_name).await;
+    let procedure_manager = Arc::new(StandaloneManager::new());
 
     let table_engine = MitoEngine::new(
         EngineConfig::default(),
@@ -131,7 +128,15 @@ pub async fn setup_test_engine_and_table() -> (
             object_store.clone(),
         ),
         object_store,
+        procedure_manager,
     );
+
+    (table_engine, dir)
+}
+
+pub async fn setup_test_engine_and_table(
+) -> (MitoEngine<EngineImpl<NoopLogStore>>, TableRef, TempDir) {
+    let (table_engine, dir) = setup_test_engine("setup_test_engine_and_table").await;
 
     let schema = Arc::new(schema_for_test());
     let table = table_engine
@@ -142,17 +147,22 @@ pub async fn setup_test_engine_and_table() -> (
         .await
         .unwrap();
 
-    (table_engine, table, schema, dir)
+    assert_eq!(schema, table.schema());
+
+    (table_engine, table, dir)
 }
 
 pub async fn setup_mock_engine_and_table(
 ) -> (MockEngine, MockMitoEngine, TableRef, ObjectStore, TempDir) {
     let mock_engine = MockEngine::default();
     let (dir, object_store) = new_test_object_store("setup_mock_engine_and_table").await;
+    let procedure_manager = Arc::new(StandaloneManager::new());
+
     let table_engine = MitoEngine::new(
         EngineConfig::default(),
         mock_engine.clone(),
         object_store.clone(),
+        procedure_manager,
     );
 
     let schema = Arc::new(schema_for_test());
