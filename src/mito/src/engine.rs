@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod procedure;
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -29,25 +31,27 @@ use store_api::storage::{
     RegionId, RowKeyDescriptor, RowKeyDescriptorBuilder, StorageEngine,
 };
 use table::engine::{EngineContext, TableEngine, TableReference};
+use table::error::TableOperationSnafu;
 use table::metadata::{TableId, TableInfoBuilder, TableMetaBuilder, TableType, TableVersion};
 use table::requests::{
     AlterKind, AlterTableRequest, CreateTableRequest, DropTableRequest, OpenTableRequest,
 };
 use table::table::{AlterContext, TableRef};
-use table::{error as table_error, Result as TableResult, Table};
+use table::{Result as TableResult, Table};
 use tokio::sync::Mutex;
 
 use crate::config::EngineConfig;
+use crate::engine::procedure::CreateTableProcedure;
 use crate::error::{
     self, BuildColumnDescriptorSnafu, BuildColumnFamilyDescriptorSnafu, BuildRegionDescriptorSnafu,
     BuildRowKeyDescriptorSnafu, InvalidPrimaryKeySnafu, MissingTimestampIndexSnafu, Result,
-    TableExistsSnafu,
+    SubmitProcedureSnafu, TableExistsSnafu,
 };
 use crate::table::MitoTable;
 
 pub const MITO_ENGINE: &str = "mito";
 pub const INIT_COLUMN_ID: ColumnId = 0;
-const INIT_TABLE_VERSION: TableVersion = 0;
+pub(crate) const INIT_TABLE_VERSION: TableVersion = 0;
 
 /// Generate region name in the form of "{TABLE_ID}_{REGION_NUMBER}"
 #[inline]
@@ -70,7 +74,7 @@ fn table_dir(schema_name: &str, table_id: TableId) -> String {
 /// About mito <https://en.wikipedia.org/wiki/Alfa_Romeo_MiTo>.
 /// "You can't be a true petrolhead until you've owned an Alfa Romeo." -- by Jeremy Clarkson
 #[derive(Clone)]
-pub struct MitoEngine<S: StorageEngine> {
+pub struct MitoEngine<S> {
     inner: Arc<MitoEngineInner<S>>,
 }
 
@@ -107,7 +111,7 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
             .create_table(ctx, request)
             .await
             .map_err(BoxedError::new)
-            .context(table_error::TableOperationSnafu)
+            .context(TableOperationSnafu)
     }
 
     async fn open_table(
@@ -119,7 +123,7 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
             .open_table(ctx, request)
             .await
             .map_err(BoxedError::new)
-            .context(table_error::TableOperationSnafu)
+            .context(TableOperationSnafu)
     }
 
     async fn alter_table(
@@ -131,7 +135,7 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
             .alter_table(ctx, req)
             .await
             .map_err(BoxedError::new)
-            .context(table_error::TableOperationSnafu)
+            .context(TableOperationSnafu)
     }
 
     fn get_table(
@@ -155,7 +159,7 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
             .drop_table(request)
             .await
             .map_err(BoxedError::new)
-            .context(table_error::TableOperationSnafu)
+            .context(TableOperationSnafu)
     }
 }
 
@@ -166,7 +170,7 @@ impl<S: StorageEngine> MitoEngine<S> {
     }
 }
 
-struct MitoEngineInner<S: StorageEngine> {
+pub(crate) struct MitoEngineInner<S> {
     /// All tables opened by the engine. Map key is formatted [TableReference].
     ///
     /// Writing to `tables` should also hold the `table_mutex`.
@@ -179,112 +183,112 @@ struct MitoEngineInner<S: StorageEngine> {
     procedure_manager: ProcedureManagerRef,
 }
 
-fn build_row_key_desc(
-    mut column_id: ColumnId,
-    table_name: &str,
-    table_schema: &SchemaRef,
-    primary_key_indices: &Vec<usize>,
-) -> Result<(ColumnId, RowKeyDescriptor)> {
-    let ts_column_schema = table_schema
-        .timestamp_column()
-        .context(MissingTimestampIndexSnafu { table_name })?;
-    // `unwrap` is safe because we've checked the `timestamp_column` above
-    let timestamp_index = table_schema.timestamp_index().unwrap();
+// fn build_row_key_desc(
+//     mut column_id: ColumnId,
+//     table_name: &str,
+//     table_schema: &SchemaRef,
+//     primary_key_indices: &Vec<usize>,
+// ) -> Result<(ColumnId, RowKeyDescriptor)> {
+//     let ts_column_schema = table_schema
+//         .timestamp_column()
+//         .context(MissingTimestampIndexSnafu { table_name })?;
+//     // `unwrap` is safe because we've checked the `timestamp_column` above
+//     let timestamp_index = table_schema.timestamp_index().unwrap();
 
-    let ts_column = ColumnDescriptorBuilder::new(
-        column_id,
-        ts_column_schema.name.clone(),
-        ts_column_schema.data_type.clone(),
-    )
-    .default_constraint(ts_column_schema.default_constraint().cloned())
-    .is_nullable(ts_column_schema.is_nullable())
-    .is_time_index(true)
-    .build()
-    .context(BuildColumnDescriptorSnafu {
-        column_name: &ts_column_schema.name,
-        table_name,
-    })?;
-    column_id += 1;
+//     let ts_column = ColumnDescriptorBuilder::new(
+//         column_id,
+//         ts_column_schema.name.clone(),
+//         ts_column_schema.data_type.clone(),
+//     )
+//     .default_constraint(ts_column_schema.default_constraint().cloned())
+//     .is_nullable(ts_column_schema.is_nullable())
+//     .is_time_index(true)
+//     .build()
+//     .context(BuildColumnDescriptorSnafu {
+//         column_name: &ts_column_schema.name,
+//         table_name,
+//     })?;
+//     column_id += 1;
 
-    let column_schemas = &table_schema.column_schemas();
+//     let column_schemas = &table_schema.column_schemas();
 
-    //TODO(boyan): enable version column by table option?
-    let mut builder = RowKeyDescriptorBuilder::new(ts_column);
+//     //TODO(boyan): enable version column by table option?
+//     let mut builder = RowKeyDescriptorBuilder::new(ts_column);
 
-    for index in primary_key_indices {
-        if *index == timestamp_index {
-            continue;
-        }
+//     for index in primary_key_indices {
+//         if *index == timestamp_index {
+//             continue;
+//         }
 
-        let column_schema = &column_schemas[*index];
+//         let column_schema = &column_schemas[*index];
 
-        let column = ColumnDescriptorBuilder::new(
-            column_id,
-            column_schema.name.clone(),
-            column_schema.data_type.clone(),
-        )
-        .default_constraint(column_schema.default_constraint().cloned())
-        .is_nullable(column_schema.is_nullable())
-        .build()
-        .context(BuildColumnDescriptorSnafu {
-            column_name: &column_schema.name,
-            table_name,
-        })?;
+//         let column = ColumnDescriptorBuilder::new(
+//             column_id,
+//             column_schema.name.clone(),
+//             column_schema.data_type.clone(),
+//         )
+//         .default_constraint(column_schema.default_constraint().cloned())
+//         .is_nullable(column_schema.is_nullable())
+//         .build()
+//         .context(BuildColumnDescriptorSnafu {
+//             column_name: &column_schema.name,
+//             table_name,
+//         })?;
 
-        builder = builder.push_column(column);
-        column_id += 1;
-    }
+//         builder = builder.push_column(column);
+//         column_id += 1;
+//     }
 
-    Ok((
-        column_id,
-        builder
-            .build()
-            .context(BuildRowKeyDescriptorSnafu { table_name })?,
-    ))
-}
+//     Ok((
+//         column_id,
+//         builder
+//             .build()
+//             .context(BuildRowKeyDescriptorSnafu { table_name })?,
+//     ))
+// }
 
-fn build_column_family(
-    mut column_id: ColumnId,
-    table_name: &str,
-    table_schema: &SchemaRef,
-    primary_key_indices: &[usize],
-) -> Result<(ColumnId, ColumnFamilyDescriptor)> {
-    let mut builder = ColumnFamilyDescriptorBuilder::default();
+// fn build_column_family(
+//     mut column_id: ColumnId,
+//     table_name: &str,
+//     table_schema: &SchemaRef,
+//     primary_key_indices: &[usize],
+// ) -> Result<(ColumnId, ColumnFamilyDescriptor)> {
+//     let mut builder = ColumnFamilyDescriptorBuilder::default();
 
-    let ts_index = table_schema
-        .timestamp_index()
-        .context(MissingTimestampIndexSnafu { table_name })?;
-    let column_schemas = table_schema
-        .column_schemas()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != ts_index && !primary_key_indices.contains(index));
+//     let ts_index = table_schema
+//         .timestamp_index()
+//         .context(MissingTimestampIndexSnafu { table_name })?;
+//     let column_schemas = table_schema
+//         .column_schemas()
+//         .iter()
+//         .enumerate()
+//         .filter(|(index, _)| *index != ts_index && !primary_key_indices.contains(index));
 
-    for (_, column_schema) in column_schemas {
-        let column = ColumnDescriptorBuilder::new(
-            column_id,
-            column_schema.name.clone(),
-            column_schema.data_type.clone(),
-        )
-        .default_constraint(column_schema.default_constraint().cloned())
-        .is_nullable(column_schema.is_nullable())
-        .build()
-        .context(BuildColumnDescriptorSnafu {
-            column_name: &column_schema.name,
-            table_name,
-        })?;
+//     for (_, column_schema) in column_schemas {
+//         let column = ColumnDescriptorBuilder::new(
+//             column_id,
+//             column_schema.name.clone(),
+//             column_schema.data_type.clone(),
+//         )
+//         .default_constraint(column_schema.default_constraint().cloned())
+//         .is_nullable(column_schema.is_nullable())
+//         .build()
+//         .context(BuildColumnDescriptorSnafu {
+//             column_name: &column_schema.name,
+//             table_name,
+//         })?;
 
-        builder = builder.push_column(column);
-        column_id += 1;
-    }
+//         builder = builder.push_column(column);
+//         column_id += 1;
+//     }
 
-    Ok((
-        column_id,
-        builder
-            .build()
-            .context(BuildColumnFamilyDescriptorSnafu { table_name })?,
-    ))
-}
+//     Ok((
+//         column_id,
+//         builder
+//             .build()
+//             .context(BuildColumnFamilyDescriptorSnafu { table_name })?,
+//     ))
+// }
 
 fn validate_create_table_request(request: &CreateTableRequest) -> Result<()> {
     let ts_index = request
@@ -324,7 +328,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
     }
 
     async fn create_table(
-        &self,
+        self: &Arc<Self>,
         _ctx: &EngineContext,
         request: CreateTableRequest,
     ) -> Result<TableRef> {
@@ -350,99 +354,107 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             }
         }
 
-        let table_schema = &request.schema;
-        let primary_key_indices = &request.primary_key_indices;
-        let (next_column_id, default_cf) = build_column_family(
-            INIT_COLUMN_ID,
-            table_name,
-            table_schema,
-            primary_key_indices,
-        )?;
-        let (next_column_id, row_key) = build_row_key_desc(
-            next_column_id,
-            table_name,
-            table_schema,
-            primary_key_indices,
-        )?;
+        let procedure = CreateTableProcedure::new(request, self.clone());
 
-        let table_id = request.id;
-        // TODO(dennis): supports multi regions;
-        assert_eq!(1, request.region_numbers.len());
-        let region_number = request.region_numbers[0];
-        let region_id = region_id(table_id, region_number);
+        self.procedure_manager
+            .submit(Box::new(procedure))
+            .context(SubmitProcedureSnafu)?;
 
-        let region_name = region_name(table_id, region_number);
-        let region_descriptor = RegionDescriptorBuilder::default()
-            .id(region_id)
-            .name(&region_name)
-            .row_key(row_key)
-            .default_cf(default_cf)
-            .build()
-            .context(BuildRegionDescriptorSnafu {
-                table_name,
-                region_name,
-            })?;
+        todo!("join the procedure handle and get table from the tables map")
 
-        let _lock = self.table_mutex.lock().await;
-        // Checks again, read lock should be enough since we are guarded by the mutex.
-        if let Some(table) = self.get_table(&table_ref) {
-            if request.create_if_not_exists {
-                return Ok(table);
-            } else {
-                return TableExistsSnafu { table_name }.fail();
-            }
-        }
+        // let table_schema = &request.schema;
+        // let primary_key_indices = &request.primary_key_indices;
+        // let (next_column_id, default_cf) = build_column_family(
+        //     INIT_COLUMN_ID,
+        //     table_name,
+        //     table_schema,
+        //     primary_key_indices,
+        // )?;
+        // let (next_column_id, row_key) = build_row_key_desc(
+        //     next_column_id,
+        //     table_name,
+        //     table_schema,
+        //     primary_key_indices,
+        // )?;
 
-        let table_dir = table_dir(schema_name, table_id);
-        let opts = CreateOptions {
-            parent_dir: table_dir.clone(),
-        };
+        // let table_id = request.id;
+        // // TODO(dennis): supports multi regions;
+        // assert_eq!(1, request.region_numbers.len());
+        // let region_number = request.region_numbers[0];
+        // let region_id = region_id(table_id, region_number);
 
-        let region = self
-            .storage_engine
-            .create_region(&StorageEngineContext::default(), region_descriptor, &opts)
-            .await
-            .map_err(BoxedError::new)
-            .context(error::CreateRegionSnafu)?;
+        // let region_name = region_name(table_id, region_number);
+        // let region_descriptor = RegionDescriptorBuilder::default()
+        //     .id(region_id)
+        //     .name(&region_name)
+        //     .row_key(row_key)
+        //     .default_cf(default_cf)
+        //     .build()
+        //     .context(BuildRegionDescriptorSnafu {
+        //         table_name,
+        //         region_name,
+        //     })?;
 
-        let table_meta = TableMetaBuilder::default()
-            .schema(request.schema)
-            .engine(MITO_ENGINE)
-            .next_column_id(next_column_id)
-            .primary_key_indices(request.primary_key_indices.clone())
-            .region_numbers(vec![region_number])
-            .build()
-            .context(error::BuildTableMetaSnafu { table_name })?;
+        // let _lock = self.table_mutex.lock().await;
+        // // Checks again, read lock should be enough since we are guarded by the mutex.
+        // if let Some(table) = self.get_table(&table_ref) {
+        //     if request.create_if_not_exists {
+        //         return Ok(table);
+        //     } else {
+        //         return TableExistsSnafu { table_name }.fail();
+        //     }
+        // }
 
-        let table_info = TableInfoBuilder::new(table_name.clone(), table_meta)
-            .ident(table_id)
-            .table_version(INIT_TABLE_VERSION)
-            .table_type(TableType::Base)
-            .catalog_name(catalog_name.to_string())
-            .schema_name(schema_name.to_string())
-            .desc(request.desc)
-            .build()
-            .context(error::BuildTableInfoSnafu { table_name })?;
+        // let table_dir = table_dir(schema_name, table_id);
+        // let opts = CreateOptions {
+        //     parent_dir: table_dir.clone(),
+        // };
 
-        let table = Arc::new(
-            MitoTable::create(
-                table_name,
-                &table_dir,
-                table_info,
-                region,
-                self.object_store.clone(),
-            )
-            .await?,
-        );
+        // let region = self
+        //     .storage_engine
+        //     .create_region(&StorageEngineContext::default(), region_descriptor, &opts)
+        //     .await
+        //     .map_err(BoxedError::new)
+        //     .context(error::CreateRegionSnafu)?;
 
-        logging::info!("Mito engine created table: {:?}.", table.table_info());
+        // let table_meta = TableMetaBuilder::default()
+        //     .schema(request.schema)
+        //     .engine(MITO_ENGINE)
+        //     .next_column_id(next_column_id)
+        //     .primary_key_indices(request.primary_key_indices.clone())
+        //     .region_numbers(vec![region_number])
+        //     .build()
+        //     .context(error::BuildTableMetaSnafu { table_name })?;
 
-        self.tables
-            .write()
-            .unwrap()
-            .insert(table_ref.to_string(), table.clone());
+        // let table_info = TableInfoBuilder::new(table_name.clone(), table_meta)
+        //     .ident(table_id)
+        //     .table_version(INIT_TABLE_VERSION)
+        //     .table_type(TableType::Base)
+        //     .catalog_name(catalog_name.to_string())
+        //     .schema_name(schema_name.to_string())
+        //     .desc(request.desc)
+        //     .build()
+        //     .context(error::BuildTableInfoSnafu { table_name })?;
 
-        Ok(table)
+        // let table = Arc::new(
+        //     MitoTable::create(
+        //         table_name,
+        //         &table_dir,
+        //         table_info,
+        //         region,
+        //         self.object_store.clone(),
+        //     )
+        //     .await?,
+        // );
+
+        // logging::info!("Mito engine created table: {:?}.", table.table_info());
+
+        // self.tables
+        //     .write()
+        //     .unwrap()
+        //     .insert(table_ref.to_string(), table.clone());
+
+        // Ok(table)
     }
 
     async fn open_table(
@@ -476,7 +488,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             let engine_ctx = StorageEngineContext::default();
             let table_dir = table_dir(schema_name, table_id);
             let opts = OpenOptions {
-                parent_dir: table_dir.to_string(),
+                parent_dir: table_dir.clone(),
             };
 
             // TODO(dennis): supports multi regions;
@@ -489,18 +501,19 @@ impl<S: StorageEngine> MitoEngineInner<S> {
                 .open_region(&engine_ctx, &region_name, &opts)
                 .await
                 .map_err(BoxedError::new)
-                .context(table_error::TableOperationSnafu)?
+                .context(TableOperationSnafu)?
             {
                 None => return Ok(None),
                 Some(region) => region,
             };
 
-            let table = Arc::new(
-                MitoTable::open(table_name, &table_dir, region, self.object_store.clone())
-                    .await
-                    .map_err(BoxedError::new)
-                    .context(table_error::TableOperationSnafu)?,
-            );
+            let Some(table) = MitoTable::open(table_name, &table_dir, region, self.object_store.clone())
+                .await
+                .map_err(BoxedError::new)
+                .context(TableOperationSnafu)? else {
+                    return Ok(None);
+                };
+            let table = Arc::new(table);
 
             self.tables
                 .write()

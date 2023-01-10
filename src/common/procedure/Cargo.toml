@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 common-error = { path = "../error" }
 snafu.workspace = true
 uuid.workspace = true

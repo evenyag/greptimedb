@@ -128,12 +128,6 @@ pub enum Error {
         table_name: String,
     },
 
-    #[snafu(display("Table info not found in manifest, table: {}", table_name))]
-    TableInfoNotFound {
-        backtrace: Backtrace,
-        table_name: String,
-    },
-
     #[snafu(display("Table already exists: {}", table_name))]
     TableExists {
         backtrace: Backtrace,
@@ -170,6 +164,12 @@ pub enum Error {
         #[snafu(backtrace)]
         source: table::metadata::ConvertError,
     },
+
+    #[snafu(display("Failed to submit procedure, source: {}", source))]
+    SubmitProcedure {
+        #[snafu(backtrace)]
+        source: common_procedure::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -195,9 +195,11 @@ impl ErrorExt for Error {
             | MissingTimestampIndex { .. }
             | TableNotFound { .. } => StatusCode::InvalidArguments,
 
-            TableInfoNotFound { .. } | ConvertRaw { .. } => StatusCode::Unexpected,
+            ConvertRaw { .. } => StatusCode::Unexpected,
 
-            ScanTableManifest { .. } | UpdateTableManifest { .. } => StatusCode::StorageUnavailable,
+            ScanTableManifest { .. } | UpdateTableManifest { .. } | SubmitProcedure { .. } => {
+                StatusCode::StorageUnavailable
+            }
         }
     }
 

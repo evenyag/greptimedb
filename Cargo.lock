@@ -1522,6 +1522,7 @@ dependencies = [
 name = "common-procedure"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "common-error",
  "snafu",
  "uuid",

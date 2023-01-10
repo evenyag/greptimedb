@@ -43,9 +43,11 @@ pub struct CreateTableRequest {
     pub catalog_name: String,
     pub schema_name: String,
     pub table_name: String,
+    /// Comment of the table.
     pub desc: Option<String>,
     pub schema: SchemaRef,
     pub region_numbers: Vec<u32>,
+    /// Column indices of the primary key.
     pub primary_key_indices: Vec<usize>,
     pub create_if_not_exists: bool,
     pub table_options: HashMap<String, String>,

@@ -49,8 +49,7 @@ use table::table::{AlterContext, Table};
 use tokio::sync::Mutex;
 
 use crate::error::{
-    self, ProjectedColumnNotFoundSnafu, Result, ScanTableManifestSnafu, TableInfoNotFoundSnafu,
-    UpdateTableManifestSnafu,
+    self, ProjectedColumnNotFoundSnafu, Result, ScanTableManifestSnafu, UpdateTableManifestSnafu,
 };
 use crate::manifest::action::*;
 use crate::manifest::TableManifest;
@@ -364,6 +363,9 @@ impl<R: Region> MitoTable<R> {
             .transpose()
     }
 
+    /// Creates a new [MitoTable].
+    ///
+    /// This function always put a new [TableMetaAction] to the [TableManifest].
     pub async fn create(
         table_name: &str,
         table_dir: &str,
@@ -386,19 +388,24 @@ impl<R: Region> MitoTable<R> {
         Ok(MitoTable::new(table_info, region, manifest))
     }
 
+    /// Try to open a [MitoTable].
+    ///
+    /// If no such table, returns `Ok(None)`.
     pub async fn open(
         table_name: &str,
         table_dir: &str,
         region: R,
         object_store: ObjectStore,
-    ) -> Result<MitoTable<R>> {
+    ) -> Result<Option<MitoTable<R>>> {
         let manifest = TableManifest::new(&table_manifest_dir(table_dir), object_store);
 
-        let mut table_info = Self::recover_table_info(table_name, &manifest)
-            .await?
-            .context(TableInfoNotFoundSnafu { table_name })?;
-        table_info.meta.region_numbers = vec![(region.id() & 0xFFFFFFFF) as u32];
-        Ok(MitoTable::new(table_info, region, manifest))
+        if let Some(mut table_info) = Self::recover_table_info(table_name, &manifest).await? {
+            // FIXME(yingwen): Define a function to get region number from region id.
+            table_info.meta.region_numbers = vec![(region.id() & 0xFFFFFFFF) as u32];
+            Ok(Some(MitoTable::new(table_info, region, manifest)))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn recover_table_info(

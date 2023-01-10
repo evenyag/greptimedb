@@ -17,17 +17,26 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use common_error::prelude::*;
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
-pub enum Error {}
+pub enum Error {
+    #[snafu(display("Failed to execute procedure, source: {}", source))]
+    Execute {
+        #[snafu(backtrace)]
+        source: BoxedError,
+    },
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
-        StatusCode::Internal
+        match self {
+            Error::Execute { source } => source.status_code(),
+        }
     }
 
     fn backtrace_opt(&self) -> Option<&Backtrace> {
@@ -39,11 +48,32 @@ impl ErrorExt for Error {
     }
 }
 
+impl Error {
+    /// Creates a new [Error::Execute] error from source `err`.
+    pub fn execute<E: ErrorExt + Send + Sync + 'static>(err: E) -> Error {
+        Error::Execute {
+            source: BoxedError::new(err),
+        }
+    }
+}
+
 /// Procedure execution status.
 #[derive(Debug)]
 pub enum Status {
-    Executing,
+    /// The procedure is still executing.
+    Executing {
+        /// Whether the framework need to persist the procedure.
+        persist: bool,
+    },
+    /// the procedure is done.
     Done,
+}
+
+impl Status {
+    /// Returns a [Status::Executing] with given `persist` flag.
+    pub fn executing(persist: bool) -> Status {
+        Status::Executing { persist }
+    }
 }
 
 /// Procedure execution context.
@@ -51,8 +81,12 @@ pub enum Status {
 pub struct Context {}
 
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
+#[async_trait]
 pub trait Procedure {
-    fn execute(&mut self, ctx: &Context) -> Result<Status>;
+    /// Execute the procedure.
+    ///
+    /// The implementation must be idempotent.
+    async fn execute(&mut self, ctx: &Context) -> Result<Status>;
 }
 
 /// Boxed [Procedure].
@@ -61,6 +95,7 @@ pub type BoxedProcedure = Box<dyn Procedure>;
 /// `ProcedureManager` executes [Procedure] submitted to it.
 pub trait ProcedureManager: Send + Sync + 'static {
     /// Submit a [Procedure] to execute.
+    // TODO(yingwen): Returns a joinable handle.
     fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
 }
 

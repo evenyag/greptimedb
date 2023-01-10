@@ -258,7 +258,7 @@ impl StorageEngine for MockEngine {
         name: &str,
         _opts: &OpenOptions,
     ) -> Result<Option<MockRegion>> {
-        logging::info!("Mock engine create region, name: {}", name);
+        logging::info!("Mock engine open region, name: {}", name);
 
         let mut regions = self.regions.lock().unwrap();
         if let Some(region) = regions.opened_regions.get(name) {
