@@ -16,6 +16,7 @@ use store_api::storage::{
 use table::engine::TableReference;
 use table::metadata::{TableId, TableInfoBuilder, TableMetaBuilder, TableType};
 use table::requests::CreateTableRequest;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::engine::{self, MitoEngineInner};
 use crate::error::{
@@ -56,6 +57,9 @@ struct CreateTableData {
     next_column_id: Option<ColumnId>,
 }
 
+/// [MitoTable] receiver.
+pub type TableReceiver<R> = Receiver<Arc<MitoTable<R>>>;
+
 /// Procedure to create a [MitoTable].
 pub struct CreateTableProcedure<S: StorageEngine> {
     data: CreateTableData,
@@ -66,13 +70,14 @@ pub struct CreateTableProcedure<S: StorageEngine> {
     /// The region is `Some` while [CreateTableData::state] is
     /// [CreateTableState::WriteTableManifest].
     region: Option<S::Region>,
+    sender: Sender<Arc<MitoTable<S::Region>>>,
 }
 
 #[async_trait]
 impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
     async fn execute(&mut self, ctx: &Context) -> ProcedureResult<Status> {
         match self.data.state {
-            CreateTableState::Prepare => self.on_prepare().map_err(ProcedureError::external),
+            CreateTableState::Prepare => self.on_prepare(),
             CreateTableState::CreateRegion => self.on_create_region().await,
             CreateTableState::WriteTableManifest => self.on_write_table_manifest().await,
         }
@@ -80,17 +85,20 @@ impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
 }
 
 impl<S: StorageEngine> CreateTableProcedure<S> {
-    /// Creates a new [CreateTableProcedure].
+    /// Returns a new [CreateTableProcedure] and a receiver to receive the created table.
     ///
     /// The [CreateTableRequest] must be valid.
     pub(crate) fn new(
         request: CreateTableRequest,
         engine_inner: Arc<MitoEngineInner<S>>,
-    ) -> CreateTableProcedure<S> {
+    ) -> (CreateTableProcedure<S>, TableReceiver<S::Region>) {
         // Now we only support creating one region in the table.
         assert_eq!(request.region_numbers.len(), 1);
 
-        CreateTableProcedure {
+        // We can't use oneshot as the procedure might call `send()` multiple times.
+        let (sender, receiver) = mpsc::channel(1);
+
+        let procedure = CreateTableProcedure {
             data: CreateTableData {
                 state: CreateTableState::Prepare,
                 table_id: request.id,
@@ -108,17 +116,20 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             schema: request.schema,
             engine_inner,
             region: None,
-        }
+            sender,
+        };
+
+        (procedure, receiver)
     }
 
     /// Checks whether the table exists.
-    fn on_prepare(&mut self) -> Result<Status> {
+    fn on_prepare(&mut self) -> ProcedureResult<Status> {
         let table_ref = TableReference {
             catalog: &self.data.catalog_name,
             schema: &self.data.schema_name,
             table: &self.data.table_name,
         };
-        if self.engine_inner.get_table(&table_ref).is_some() {
+        if let Some(table) = self.engine_inner.get_table(&table_ref) {
             // If the table already exists.
             ensure!(
                 self.data.create_if_not_exists,
@@ -127,7 +138,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
                 }
             );
 
-            return Ok(Status::Done);
+            return self.done(table);
         }
 
         self.data.state = CreateTableState::CreateRegion;
@@ -162,9 +173,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
 
         // Create a new region.
         let region_id = engine::region_id(self.data.table_id, region_number);
-        let region_desc = self
-            .build_region_desc(region_id, &region_name)
-            .map_err(ProcedureError::external)?;
+        let region_desc = self.build_region_desc(region_id, &region_name)?;
         let opts = CreateOptions {
             parent_dir: table_dir,
         };
@@ -187,9 +196,9 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             schema: &self.data.schema_name,
             table: &self.data.table_name,
         };
-        if self.engine_inner.get_table(&table_ref).is_some() {
+        if let Some(table) = self.engine_inner.get_table(&table_ref) {
             // If the table is opened, we are done.
-            return Ok(Status::Done);
+            return self.done(table);
         }
 
         // Try to open the table, as the table manifest might already exist.
@@ -202,35 +211,43 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             region.clone(),
             self.engine_inner.object_store.clone(),
         )
-        .await
-        .map_err(ProcedureError::external)?;
+        .await?;
         if let Some(table) = table_opt {
+            let table = Arc::new(table);
             // We already have the table manifest, just need to insert the table into the table map.
             self.engine_inner
                 .tables
                 .write()
                 .unwrap()
-                .insert(table_ref.to_string(), Arc::new(table));
-            return Ok(Status::Done);
+                .insert(table_ref.to_string(), table.clone());
+            return self.done(table);
         }
 
         // We need to persist the table manifest and create the table instance.
         let table = self
             .write_manifest_and_create_table(&table_dir, region)
-            .await
-            .map_err(ProcedureError::external)?;
+            .await?;
+        let table = Arc::new(table);
         self.engine_inner
             .tables
             .write()
             .unwrap()
-            .insert(table_ref.to_string(), Arc::new(table));
-        Ok(Status::Done)
+            .insert(table_ref.to_string(), table.clone());
+
+        self.done(table)
     }
 
     /// Switchs to [CreateTableState::WriteTableManifest] state and set [CreateTableProcedure::region].
     fn switch_to_write_table_manifest(&mut self, region: S::Region) {
         self.data.state = CreateTableState::WriteTableManifest;
         self.region = Some(region);
+    }
+
+    /// Try to send the table to the sender and return [Status::Done].
+    fn done(&self, table: Arc<MitoTable<S::Region>>) -> ProcedureResult<Status> {
+        // If sender is full, we don't need to re-send the table.
+        let _ = self.sender.try_send(table);
+        Ok(Status::Done)
     }
 
     /// Builds [RegionDescriptor] and cache next column id in [CreateTableProcedure::data].

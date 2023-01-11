@@ -170,6 +170,12 @@ pub enum Error {
         #[snafu(backtrace)]
         source: common_procedure::Error,
     },
+
+    #[snafu(display("Failed to join procedure, source: {}", source))]
+    JoinProcedure {
+        #[snafu(backtrace)]
+        source: common_procedure::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -192,14 +198,17 @@ impl ErrorExt for Error {
             | TableExists { .. }
             | ProjectedColumnNotFound { .. }
             | InvalidPrimaryKey { .. }
-            | MissingTimestampIndex { .. }
-            | TableNotFound { .. } => StatusCode::InvalidArguments,
+            | MissingTimestampIndex { .. } => StatusCode::InvalidArguments,
+
+            TableNotFound { .. } => StatusCode::TableNotFound,
 
             ConvertRaw { .. } => StatusCode::Unexpected,
 
             ScanTableManifest { .. } | UpdateTableManifest { .. } | SubmitProcedure { .. } => {
                 StatusCode::StorageUnavailable
             }
+
+            JoinProcedure { .. } => StatusCode::Internal,
         }
     }
 
@@ -209,6 +218,12 @@ impl ErrorExt for Error {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl From<Error> for common_procedure::Error {
+    fn from(e: Error) -> common_procedure::Error {
+        common_procedure::Error::external(e)
     }
 }
 

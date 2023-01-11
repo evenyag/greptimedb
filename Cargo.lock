@@ -1525,6 +1525,7 @@ dependencies = [
  "async-trait",
  "common-error",
  "snafu",
+ "tokio",
  "uuid",
 ]
 

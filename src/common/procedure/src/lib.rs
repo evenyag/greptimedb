@@ -15,10 +15,13 @@
 //! Common traits and structures for the procedure framework.
 
 use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_error::prelude::*;
+use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::oneshot::{self, Receiver, Sender};
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
@@ -31,6 +34,16 @@ pub enum Error {
         #[snafu(backtrace)]
         source: BoxedError,
     },
+
+    #[snafu(display(
+        "Failed to join the procedure {}, the sender is dropped: {}",
+        procedure_id,
+        source
+    ))]
+    Join {
+        procedure_id: ProcedureId,
+        source: RecvError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,6 +52,7 @@ impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Error::External { source } => source.status_code(),
+            Error::Join { .. } => StatusCode::Internal,
         }
     }
 
@@ -95,19 +109,58 @@ pub trait Procedure {
 /// Boxed [Procedure].
 pub type BoxedProcedure = Box<dyn Procedure>;
 
+/// Handle to join on a procedure.
+pub struct Handle {
+    procedure_id: ProcedureId,
+    receiver: Receiver<Result<()>>,
+}
+
+impl Handle {
+    /// Returns a sender and a handle to join the procedure with specific
+    /// `procedure_id`.
+    ///
+    /// The [ProcedureManager] could use the sender to notify the handle.
+    pub fn new(procedure_id: ProcedureId) -> (Sender<Result<()>>, Handle) {
+        let (sender, receiver) = oneshot::channel();
+        let handle = Handle {
+            procedure_id,
+            receiver,
+        };
+        (sender, handle)
+    }
+
+    /// Returns the id of the procedure to join.
+    #[inline]
+    pub fn procedure_id(&self) -> ProcedureId {
+        self.procedure_id
+    }
+
+    /// Joins the result from the sender.
+    pub async fn join(self) -> Result<()> {
+        self.receiver.await.context(JoinSnafu {
+            procedure_id: self.procedure_id,
+        })?
+    }
+}
+
 /// `ProcedureManager` executes [Procedure] submitted to it.
 pub trait ProcedureManager: Send + Sync + 'static {
     /// Submit a [Procedure] to execute.
-    // TODO(yingwen): Returns a joinable handle.
-    fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
+    fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
 }
 
 /// Ref-counted pointer to the [ProcedureManager].
 pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
 
 /// Unique id for [Procedure].
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ProcedureId(Uuid);
+
+impl fmt::Display for ProcedureId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Standalone [ProcedureManager].
 #[derive(Debug)]
@@ -121,7 +174,7 @@ impl StandaloneManager {
 }
 
 impl ProcedureManager for StandaloneManager {
-    fn submit(&self, procedure: BoxedProcedure) -> Result<()> {
+    fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
         unimplemented!()
     }
 }

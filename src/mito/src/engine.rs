@@ -44,8 +44,8 @@ use crate::config::EngineConfig;
 use crate::engine::procedure::CreateTableProcedure;
 use crate::error::{
     self, BuildColumnDescriptorSnafu, BuildColumnFamilyDescriptorSnafu, BuildRegionDescriptorSnafu,
-    BuildRowKeyDescriptorSnafu, InvalidPrimaryKeySnafu, MissingTimestampIndexSnafu, Result,
-    SubmitProcedureSnafu, TableExistsSnafu,
+    BuildRowKeyDescriptorSnafu, InvalidPrimaryKeySnafu, JoinProcedureSnafu,
+    MissingTimestampIndexSnafu, Result, SubmitProcedureSnafu, TableExistsSnafu,
 };
 use crate::table::MitoTable;
 
@@ -74,7 +74,7 @@ fn table_dir(schema_name: &str, table_id: TableId) -> String {
 /// About mito <https://en.wikipedia.org/wiki/Alfa_Romeo_MiTo>.
 /// "You can't be a true petrolhead until you've owned an Alfa Romeo." -- by Jeremy Clarkson
 #[derive(Clone)]
-pub struct MitoEngine<S> {
+pub struct MitoEngine<S: StorageEngine> {
     inner: Arc<MitoEngineInner<S>>,
 }
 
@@ -143,7 +143,8 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
         _ctx: &EngineContext,
         table_ref: &TableReference,
     ) -> TableResult<Option<TableRef>> {
-        Ok(self.inner.get_table(table_ref))
+        let table = self.inner.get_table(table_ref).map(|table| table as _);
+        Ok(table)
     }
 
     fn table_exists(&self, _ctx: &EngineContext, table_ref: &TableReference) -> bool {
@@ -170,11 +171,11 @@ impl<S: StorageEngine> MitoEngine<S> {
     }
 }
 
-pub(crate) struct MitoEngineInner<S> {
+pub(crate) struct MitoEngineInner<S: StorageEngine> {
     /// All tables opened by the engine. Map key is formatted [TableReference].
     ///
     /// Writing to `tables` should also hold the `table_mutex`.
-    tables: RwLock<HashMap<String, TableRef>>,
+    tables: RwLock<HashMap<String, Arc<MitoTable<S::Region>>>>,
     object_store: ObjectStore,
     storage_engine: S,
     /// Table mutex is used to protect the operations such as creating/opening/closing
@@ -354,13 +355,22 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             }
         }
 
-        let procedure = CreateTableProcedure::new(request, self.clone());
+        let (procedure, mut table_receiver) = CreateTableProcedure::new(request, self.clone());
 
-        self.procedure_manager
+        let handle = self
+            .procedure_manager
             .submit(Box::new(procedure))
             .context(SubmitProcedureSnafu)?;
+        handle.join().await.context(JoinProcedureSnafu)?;
 
-        todo!("join the procedure handle and get table from the tables map")
+        // Safety: Since the procedure is finished, we expect the table is always available in the
+        // channel.
+        let table = table_receiver
+            .recv()
+            .await
+            .expect("Table unavailable after creation");
+
+        Ok(table)
 
         // let table_schema = &request.schema;
         // let primary_key_indices = &request.primary_key_indices;
@@ -527,7 +537,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         Ok(table)
     }
 
-    fn get_table(&self, table_ref: &TableReference) -> Option<TableRef> {
+    fn get_table(&self, table_ref: &TableReference) -> Option<Arc<MitoTable<S::Region>>> {
         self.tables
             .read()
             .unwrap()
