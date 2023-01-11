@@ -12,13 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Common traits and structures for the procedure framework.
+use async_trait::async_trait;
 
-mod error;
-mod procedure;
+use crate::error::Result;
+use crate::procedure::{BoxedProcedure, Handle, ProcedureManager};
 
-pub use crate::error::{Error, Result};
-pub use crate::procedure::{
-    BoxedProcedure, Context, Handle, Procedure, ProcedureManager, ProcedureManagerRef,
-    StandaloneManager, Status,
-};
+/// Standalone [ProcedureManager].
+#[derive(Debug)]
+pub struct StandaloneManager {}
+
+impl StandaloneManager {
+    /// Create a new StandaloneManager with default configurations.
+    pub fn new() -> StandaloneManager {
+        StandaloneManager {}
+    }
+}
+
+#[async_trait]
+impl ProcedureManager for StandaloneManager {
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
+        unimplemented!()
+    }
+}

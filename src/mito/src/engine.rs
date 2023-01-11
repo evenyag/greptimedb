@@ -360,6 +360,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         let handle = self
             .procedure_manager
             .submit(Box::new(procedure))
+            .await
             .context(SubmitProcedureSnafu)?;
         handle.join().await.context(JoinProcedureSnafu)?;
 
