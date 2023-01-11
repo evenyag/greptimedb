@@ -15,9 +15,9 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::procedure::{BoxedProcedure, Handle, ProcedureManager};
+use crate::procedure::{BoxedProcedure, BoxedProcedureLoader, Handle, ProcedureManager};
 
-/// Standalone [ProcedureManager].
+/// Standalone [ProcedureManager] that maintains state on current machine.
 #[derive(Debug)]
 pub struct StandaloneManager {}
 
@@ -30,6 +30,10 @@ impl StandaloneManager {
 
 #[async_trait]
 impl ProcedureManager for StandaloneManager {
+    fn register_loader(&self, _name: &str, _loader: BoxedProcedureLoader) -> Result<()> {
+        unimplemented!()
+    }
+
     async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
         unimplemented!()
     }

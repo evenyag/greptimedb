@@ -55,6 +55,9 @@ pub trait Procedure: Send + Sync {
     ///
     /// The implementation must be idempotent.
     async fn execute(&mut self, ctx: &Context) -> Result<Status>;
+
+    /// Dump the state of the procedure to a string.
+    fn dump(&self) -> Result<String>;
 }
 
 /// Boxed [Procedure].
@@ -104,9 +107,14 @@ impl Handle {
     }
 }
 
+/// Loader to recover the [Procedure] instance from serialized data.
+pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure>>;
+
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]
 pub trait ProcedureManager: Send + Sync + 'static {
+    fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
+
     /// Submit a [Procedure] to execute.
     async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
 }

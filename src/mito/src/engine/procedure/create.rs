@@ -93,6 +93,10 @@ impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
             CreateTableState::WriteTableManifest => self.on_write_table_manifest().await,
         }
     }
+
+    fn dump(&self) -> ProcedureResult<String> {
+        todo!()
+    }
 }
 
 impl<S: StorageEngine> CreateTableProcedure<S> {
