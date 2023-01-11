@@ -23,8 +23,11 @@ use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to execute procedure, source: {}", source))]
-    Execute {
+    #[snafu(display(
+        "Failed to execute procedure due to external error, source: {}",
+        source
+    ))]
+    External {
         #[snafu(backtrace)]
         source: BoxedError,
     },
@@ -35,7 +38,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
-            Error::Execute { source } => source.status_code(),
+            Error::External { source } => source.status_code(),
         }
     }
 
@@ -49,9 +52,9 @@ impl ErrorExt for Error {
 }
 
 impl Error {
-    /// Creates a new [Error::Execute] error from source `err`.
-    pub fn execute<E: ErrorExt + Send + Sync + 'static>(err: E) -> Error {
-        Error::Execute {
+    /// Creates a new [Error::External] error from source `err`.
+    pub fn external<E: ErrorExt + Send + Sync + 'static>(err: E) -> Error {
+        Error::External {
             source: BoxedError::new(err),
         }
     }

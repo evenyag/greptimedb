@@ -72,7 +72,7 @@ pub struct CreateTableProcedure<S: StorageEngine> {
 impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
     async fn execute(&mut self, ctx: &Context) -> ProcedureResult<Status> {
         match self.data.state {
-            CreateTableState::Prepare => self.on_prepare().map_err(ProcedureError::execute),
+            CreateTableState::Prepare => self.on_prepare().map_err(ProcedureError::external),
             CreateTableState::CreateRegion => self.on_create_region().await,
             CreateTableState::WriteTableManifest => self.on_write_table_manifest().await,
         }
@@ -152,7 +152,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             .storage_engine
             .open_region(&engine_ctx, &region_name, &opts)
             .await
-            .map_err(ProcedureError::execute)?
+            .map_err(ProcedureError::external)?
         {
             // The region has been created, we could move to the next step.
             self.switch_to_write_table_manifest(region);
@@ -164,7 +164,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
         let region_id = engine::region_id(self.data.table_id, region_number);
         let region_desc = self
             .build_region_desc(region_id, &region_name)
-            .map_err(ProcedureError::execute)?;
+            .map_err(ProcedureError::external)?;
         let opts = CreateOptions {
             parent_dir: table_dir,
         };
@@ -173,7 +173,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             .storage_engine
             .create_region(&engine_ctx, region_desc, &opts)
             .await
-            .map_err(ProcedureError::execute)?;
+            .map_err(ProcedureError::external)?;
 
         self.switch_to_write_table_manifest(region);
 
@@ -203,7 +203,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             self.engine_inner.object_store.clone(),
         )
         .await
-        .map_err(ProcedureError::execute)?;
+        .map_err(ProcedureError::external)?;
         if let Some(table) = table_opt {
             // We already have the table manifest, just need to insert the table into the table map.
             self.engine_inner
@@ -218,7 +218,7 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
         let table = self
             .write_manifest_and_create_table(&table_dir, region)
             .await
-            .map_err(ProcedureError::execute)?;
+            .map_err(ProcedureError::external)?;
         self.engine_inner
             .tables
             .write()
