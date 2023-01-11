@@ -81,14 +81,16 @@ impl<S: StorageEngine> MitoEngine<S> {
         object_store: ObjectStore,
         procedure_manager: ProcedureManagerRef,
     ) -> Self {
-        Self {
-            inner: Arc::new(MitoEngineInner::new(
-                config,
-                storage_engine,
-                object_store,
-                procedure_manager,
-            )),
-        }
+        let inner = Arc::new(MitoEngineInner::new(
+            config,
+            storage_engine,
+            object_store,
+            procedure_manager.clone(),
+        ));
+
+        procedure::register_procedure_loaders(inner.clone(), &*procedure_manager);
+
+        Self { inner }
     }
 }
 

@@ -1524,6 +1524,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "common-error",
+ "serde_json",
  "snafu",
  "tokio",
  "uuid",

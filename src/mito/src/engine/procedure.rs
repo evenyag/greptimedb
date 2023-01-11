@@ -16,4 +16,22 @@
 
 mod create;
 
+use std::sync::Arc;
+
+use common_procedure::ProcedureManager;
 pub use create::CreateTableProcedure;
+use store_api::storage::StorageEngine;
+
+use crate::engine::MitoEngineInner;
+
+/// Register all procedure loaders to the procedure manager.
+///
+/// # Panics
+/// Panics on error.
+pub(crate) fn register_procedure_loaders<S: StorageEngine>(
+    engine_inner: Arc<MitoEngineInner<S>>,
+    procedure_manager: &dyn ProcedureManager,
+) {
+    // The procedure names are expected to be unique, so we just panic on error.
+    CreateTableProcedure::register_loader(engine_inner, procedure_manager);
+}

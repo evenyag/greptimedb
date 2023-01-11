@@ -16,9 +16,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_procedure::{
-    Context, Error as ProcedureError, Procedure, Result as ProcedureResult, Status,
+    Context, Error as ProcedureError, Procedure, ProcedureManager, Result as ProcedureResult,
+    Status,
 };
-use datatypes::schema::{RawSchema, SchemaRef};
+use datatypes::schema::{RawSchema, Schema, SchemaRef};
+use serde::{Deserialize, Serialize};
+use serde_json;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{
     ColumnDescriptorBuilder, ColumnFamilyDescriptor, ColumnFamilyDescriptorBuilder, ColumnId,
@@ -34,23 +37,24 @@ use crate::engine::{self, MitoEngineInner};
 use crate::error::{
     BuildColumnDescriptorSnafu, BuildColumnFamilyDescriptorSnafu, BuildRegionDescriptorSnafu,
     BuildRowKeyDescriptorSnafu, BuildTableInfoSnafu, BuildTableMetaSnafu,
-    MissingTimestampIndexSnafu, Result, TableExistsSnafu,
+    DeserializeProcedureSnafu, InvalidRawSchemaSnafu, MissingTimestampIndexSnafu, Result,
+    SerializeProcedureSnafu, TableExistsSnafu,
 };
 use crate::table::MitoTable;
 
 /// `CreateTableState` represents each step while creating table.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum CreateTableState {
     /// Prepare to create region.
     Prepare,
-    /// Creating region.
+    /// Create region.
     CreateRegion,
-    /// Writing metadata to table manifest.
+    /// Write metadata to table manifest.
     WriteTableManifest,
 }
 
 /// Serializable data of [CreateTableProcedure].
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CreateTableData {
     state: CreateTableState,
     table_id: TableId,
@@ -70,6 +74,8 @@ struct CreateTableData {
 
 /// [MitoTable] receiver.
 pub type TableReceiver<R> = Receiver<Arc<MitoTable<R>>>;
+/// [MitoTable] receiver.
+type TableSender<R> = Sender<Arc<MitoTable<R>>>;
 
 /// Procedure to create a [MitoTable].
 pub struct CreateTableProcedure<S: StorageEngine> {
@@ -81,11 +87,15 @@ pub struct CreateTableProcedure<S: StorageEngine> {
     /// The region is `Some` while [CreateTableData::state] is
     /// [CreateTableState::WriteTableManifest].
     region: Option<S::Region>,
-    sender: Sender<Arc<MitoTable<S::Region>>>,
+    sender: Option<TableSender<S::Region>>,
 }
 
 #[async_trait]
 impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
+    fn type_name(&self) -> &str {
+        Self::TYPE_NAME
+    }
+
     async fn execute(&mut self, _ctx: &Context) -> ProcedureResult<Status> {
         match self.data.state {
             CreateTableState::Prepare => self.on_prepare(),
@@ -95,18 +105,21 @@ impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
     }
 
     fn dump(&self) -> ProcedureResult<String> {
-        todo!()
+        let json = serde_json::to_string(&self.data).context(SerializeProcedureSnafu)?;
+        Ok(json)
     }
 }
 
 impl<S: StorageEngine> CreateTableProcedure<S> {
+    const TYPE_NAME: &str = "MitoCreateTable";
+
     /// Returns a new [CreateTableProcedure] and a receiver to receive the created table.
     ///
     /// The [CreateTableRequest] must be valid.
     pub(crate) fn new(
         request: CreateTableRequest,
         engine_inner: Arc<MitoEngineInner<S>>,
-    ) -> (CreateTableProcedure<S>, TableReceiver<S::Region>) {
+    ) -> (Self, TableReceiver<S::Region>) {
         // Now we only support creating one region in the table.
         assert_eq!(request.region_numbers.len(), 1);
 
@@ -130,10 +143,43 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
             schema: request.schema,
             engine_inner,
             region: None,
-            sender,
+            sender: Some(sender),
         };
 
         (procedure, receiver)
+    }
+
+    /// Recover the procedure from json.
+    fn from_json(json: &str, engine_inner: Arc<MitoEngineInner<S>>) -> ProcedureResult<Self> {
+        let data: CreateTableData =
+            serde_json::from_str(json).context(DeserializeProcedureSnafu)?;
+        let schema = Schema::try_from(data.schema.clone()).context(InvalidRawSchemaSnafu)?;
+
+        Ok(CreateTableProcedure {
+            data,
+            schema: Arc::new(schema),
+            engine_inner,
+            region: None,
+            sender: None,
+        })
+    }
+
+    /// Register the loader of this procedure to the `procedure_manager`.
+    ///
+    /// # Panics
+    /// Panics on error.
+    pub(crate) fn register_loader(
+        engine_inner: Arc<MitoEngineInner<S>>,
+        procedure_manager: &dyn ProcedureManager,
+    ) {
+        procedure_manager
+            .register_loader(
+                Self::TYPE_NAME,
+                Box::new(move |data| {
+                    Self::from_json(data, engine_inner.clone()).map(|p| Box::new(p) as _)
+                }),
+            )
+            .unwrap()
     }
 
     /// Checks whether the table exists.
@@ -260,7 +306,9 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
     /// Try to send the table to the sender and return [Status::Done].
     fn done(&self, table: Arc<MitoTable<S::Region>>) -> ProcedureResult<Status> {
         // If sender is full, we don't need to re-send the table.
-        let _ = self.sender.try_send(table);
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(table);
+        }
         Ok(Status::Done)
     }
 

@@ -14,7 +14,7 @@
 
 //! Common traits and structures for the procedure framework.
 
-mod error;
+pub mod error;
 mod procedure;
 
 pub use crate::error::{Error, Result};

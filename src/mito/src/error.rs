@@ -176,6 +176,24 @@ pub enum Error {
         #[snafu(backtrace)]
         source: common_procedure::Error,
     },
+
+    #[snafu(display("Failed to serialize procedure to json, source: {}", source))]
+    SerializeProcedure {
+        source: serde_json::Error,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Failed to deserialize procedure from json, source: {}", source))]
+    DeserializeProcedure {
+        source: serde_json::Error,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Invalid raw schema, source: {}", source))]
+    InvalidRawSchema {
+        #[snafu(backtrace)]
+        source: datatypes::error::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -202,13 +220,15 @@ impl ErrorExt for Error {
 
             TableNotFound { .. } => StatusCode::TableNotFound,
 
-            ConvertRaw { .. } => StatusCode::Unexpected,
+            ConvertRaw { .. } | InvalidRawSchema { .. } => StatusCode::Unexpected,
 
             ScanTableManifest { .. } | UpdateTableManifest { .. } | SubmitProcedure { .. } => {
                 StatusCode::StorageUnavailable
             }
 
-            JoinProcedure { .. } => StatusCode::Internal,
+            JoinProcedure { .. } | SerializeProcedure { .. } | DeserializeProcedure { .. } => {
+                StatusCode::Internal
+            }
         }
     }
 

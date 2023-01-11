@@ -51,6 +51,9 @@ pub struct Context {}
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
 #[async_trait]
 pub trait Procedure: Send + Sync {
+    /// Type name of the procedure.
+    fn type_name(&self) -> &str;
+
     /// Execute the procedure.
     ///
     /// The implementation must be idempotent.
