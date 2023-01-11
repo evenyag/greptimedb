@@ -1,8 +1,20 @@
-use std::collections::HashMap;
+// Copyright 2023 Greptime Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common_error::ext::BoxedError;
 use common_procedure::{
     Context, Error as ProcedureError, Procedure, Result as ProcedureResult, Status,
 };
@@ -50,7 +62,6 @@ struct CreateTableData {
     region_numbers: Vec<u32>,
     primary_key_indices: Vec<usize>,
     create_if_not_exists: bool,
-    table_options: HashMap<String, String>,
     /// Next id for column.
     ///
     /// Available in [CreateTableState::WriteTableManifest] state.
@@ -75,7 +86,7 @@ pub struct CreateTableProcedure<S: StorageEngine> {
 
 #[async_trait]
 impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
-    async fn execute(&mut self, ctx: &Context) -> ProcedureResult<Status> {
+    async fn execute(&mut self, _ctx: &Context) -> ProcedureResult<Status> {
         match self.data.state {
             CreateTableState::Prepare => self.on_prepare(),
             CreateTableState::CreateRegion => self.on_create_region().await,
@@ -110,7 +121,6 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
                 region_numbers: request.region_numbers,
                 primary_key_indices: request.primary_key_indices,
                 create_if_not_exists: request.create_if_not_exists,
-                table_options: request.table_options,
                 next_column_id: None,
             },
             schema: request.schema,
