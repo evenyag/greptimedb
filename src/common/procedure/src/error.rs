@@ -39,6 +39,13 @@ pub enum Error {
     Join {
         procedure_id: ProcedureId,
         source: RecvError,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Loader {} is already registered", name))]
+    LoaderConflict {
+        name: String,
+        backtrace: Backtrace,
     },
 }
 
@@ -49,6 +56,7 @@ impl ErrorExt for Error {
         match self {
             Error::External { source } => source.status_code(),
             Error::Join { .. } => StatusCode::Internal,
+            Error::LoaderConflict { .. } => StatusCode::InvalidArguments,
         }
     }
 

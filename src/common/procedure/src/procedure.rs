@@ -111,7 +111,7 @@ impl Handle {
 }
 
 /// Loader to recover the [Procedure] instance from serialized data.
-pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure>>;
+pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]

@@ -14,24 +14,40 @@
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use std::collections::HashMap;
+use crate::error::{Result, LoaderConflictSnafu};
 use crate::procedure::{BoxedProcedure, BoxedProcedureLoader, Handle, ProcedureManager};
+use std::sync::Mutex;
+use snafu::ensure;
+
+// TODO(yingwen): 1. lock manager; 2. procedure store.
 
 /// Standalone [ProcedureManager] that maintains state on current machine.
-#[derive(Debug)]
-pub struct StandaloneManager {}
+pub struct StandaloneManager {
+    /// Procedure loaders. The key is the type name of the procedure which the loader returns.
+    loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
+}
 
 impl StandaloneManager {
     /// Create a new StandaloneManager with default configurations.
     pub fn new() -> StandaloneManager {
-        StandaloneManager {}
+        StandaloneManager {
+            loaders: Mutex::new(HashMap::new()),
+        }
     }
 }
 
 #[async_trait]
 impl ProcedureManager for StandaloneManager {
-    fn register_loader(&self, _name: &str, _loader: BoxedProcedureLoader) -> Result<()> {
-        unimplemented!()
+    fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()> {
+        let mut loaders = self.loaders.lock().unwrap();
+        ensure!(!loaders.contains_key(name), LoaderConflictSnafu {
+            name,
+        });
+
+        loaders.insert(name.to_string(), loader);
+
+        Ok(())
     }
 
     async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
