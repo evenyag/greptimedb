@@ -43,10 +43,7 @@ pub enum Error {
     },
 
     #[snafu(display("Loader {} is already registered", name))]
-    LoaderConflict {
-        name: String,
-        backtrace: Backtrace,
-    },
+    LoaderConflict { name: String, backtrace: Backtrace },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

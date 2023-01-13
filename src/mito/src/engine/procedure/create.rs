@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_procedure::{
-    Context, Error as ProcedureError, Procedure, ProcedureManager, Result as ProcedureResult,
-    Status,
+    Context, Error as ProcedureError, LockKey, Procedure, ProcedureManager,
+    Result as ProcedureResult, Status,
 };
 use datatypes::schema::{RawSchema, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
@@ -107,6 +107,16 @@ impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
     fn dump(&self) -> ProcedureResult<String> {
         let json = serde_json::to_string(&self.data).context(SerializeProcedureSnafu)?;
         Ok(json)
+    }
+
+    fn lock_key(&self) -> Option<LockKey> {
+        let table_ref = TableReference {
+            catalog: &self.data.catalog_name,
+            schema: &self.data.schema_name,
+            table: &self.data.table_name,
+        };
+        let key = table_ref.to_string();
+        Some(LockKey::new(key))
     }
 }
 

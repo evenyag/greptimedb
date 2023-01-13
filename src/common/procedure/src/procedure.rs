@@ -46,7 +46,10 @@ impl Status {
 
 /// Procedure execution context.
 #[derive(Debug)]
-pub struct Context {}
+pub struct Context {
+    /// Id of the procedure.
+    pub procedure_id: ProcedureId,
+}
 
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
 #[async_trait]
@@ -61,14 +64,41 @@ pub trait Procedure: Send + Sync {
 
     /// Dump the state of the procedure to a string.
     fn dump(&self) -> Result<String>;
+
+    /// Returns the [LockKey] if this procedure needs to acquire lock.
+    fn lock_key(&self) -> Option<LockKey>;
+}
+
+/// A key to identify the lock.
+// We might hold multiple keys in this struct. When there are multiple keys, we need to sort the
+// keys and use the first key as primary key.
+pub struct LockKey(String);
+
+impl LockKey {
+    /// Returns a new [LockKey].
+    pub fn new(key: impl Into<String>) -> LockKey {
+        LockKey(key.into())
+    }
+
+    /// Returns the primary lock key.
+    pub fn primary_lock_key(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Boxed [Procedure].
 pub type BoxedProcedure = Box<dyn Procedure>;
 
 /// Unique id for [Procedure].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureId(Uuid);
+
+impl ProcedureId {
+    /// Returns a new ProcedureId randomly.
+    fn random() -> ProcedureId {
+        ProcedureId(Uuid::new_v4())
+    }
+}
 
 impl fmt::Display for ProcedureId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -87,13 +117,13 @@ impl Handle {
     /// `procedure_id`.
     ///
     /// The [ProcedureManager] could use the sender to notify the handle.
-    pub fn new(procedure_id: ProcedureId) -> (Sender<Result<()>>, Handle) {
+    pub fn new(procedure_id: ProcedureId) -> (Handle, Sender<Result<()>>) {
         let (sender, receiver) = oneshot::channel();
         let handle = Handle {
             procedure_id,
             receiver,
         };
-        (sender, handle)
+        (handle, sender)
     }
 
     /// Returns the id of the procedure to join.
