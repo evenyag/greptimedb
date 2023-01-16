@@ -162,13 +162,6 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
     }
 }
 
-#[cfg(test)]
-impl<S: StorageEngine> MitoEngine<S> {
-    fn procedure_manager(&self) -> ProcedureManagerRef {
-        self.inner.procedure_manager.clone()
-    }
-}
-
 pub(crate) struct MitoEngineInner<S: StorageEngine> {
     /// All tables opened by the engine. Map key is formatted [TableReference].
     ///
@@ -768,7 +761,7 @@ mod tests {
             region_numbers: vec![0],
         };
 
-        let (engine, table, object_store, procedure_manager, _dir) = {
+        let (engine, table, object_store, _dir) = {
             let (engine, table_engine, table, object_store, dir) =
                 test_util::setup_mock_engine_and_table().await;
             assert_eq!(MITO_ENGINE, table_engine.name());
@@ -781,13 +774,7 @@ mod tests {
                 .unwrap();
             assert_eq!(table.schema(), reopened.schema());
 
-            (
-                engine,
-                table,
-                object_store,
-                table_engine.procedure_manager(),
-                dir,
-            )
+            (engine, table, object_store, dir)
         };
 
         // Construct a new table engine, and try to open the table. This goes through the
@@ -796,7 +783,8 @@ mod tests {
             EngineConfig::default(),
             engine,
             object_store,
-            procedure_manager,
+            // Use a new procedure manager to avoid loader key conflict.
+            Arc::new(StandaloneManager::new()),
         );
         let reopened = table_engine
             .open_table(&ctx, open_req.clone())
