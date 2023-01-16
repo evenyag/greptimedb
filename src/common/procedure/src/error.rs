@@ -44,6 +44,12 @@ pub enum Error {
 
     #[snafu(display("Loader {} is already registered", name))]
     LoaderConflict { name: String, backtrace: Backtrace },
+
+    #[snafu(display("Failed to serialize to json, source: {}", source))]
+    ToJson {
+        source: serde_json::Error,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -52,7 +58,7 @@ impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Error::External { source } => source.status_code(),
-            Error::Join { .. } => StatusCode::Internal,
+            Error::Join { .. } | Error::ToJson { .. } => StatusCode::Internal,
             Error::LoaderConflict { .. } => StatusCode::InvalidArguments,
         }
     }

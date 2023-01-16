@@ -18,6 +18,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 pub use standalone::StandaloneManager;
 use tokio::sync::oneshot::{self, Receiver, Sender};
@@ -98,6 +99,11 @@ impl ProcedureId {
     fn random() -> ProcedureId {
         ProcedureId(Uuid::new_v4())
     }
+
+    /// Parses id from string.
+    fn parse_str(input: &str) -> Option<ProcedureId> {
+        Uuid::parse_str(input).map(ProcedureId).ok()
+    }
 }
 
 impl fmt::Display for ProcedureId {
@@ -146,11 +152,27 @@ pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Sen
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]
 pub trait ProcedureManager: Send + Sync + 'static {
+    /// Registers loader for specific procedure type `name`.
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
-    /// Submit a [Procedure] to execute.
+    /// Submits a [Procedure] to execute.
     async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
+
+    /// Recovers unfinished procedures and reruns them.
+    ///
+    /// Callers should ensure all loaders are registered.
+    async fn recover(&self) -> Result<()>;
 }
 
 /// Ref-counted pointer to the [ProcedureManager].
 pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
+
+/// Serialized data of a procedure.
+#[derive(Debug, Serialize, Deserialize)]
+struct ProcedureMessage {
+    /// Type name of the procedure. The procedure framework also use the type name to
+    /// find a loader to load the procedure.
+    type_name: String,
+    /// The data of the procedure.
+    data: String,
+}

@@ -1526,6 +1526,7 @@ dependencies = [
  "common-error",
  "common-runtime",
  "common-telemetry",
+ "serde",
  "serde_json",
  "snafu",
  "tokio",

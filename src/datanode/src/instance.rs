@@ -21,7 +21,7 @@ use catalog::remote::MetaKvBackend;
 use catalog::{CatalogManager, CatalogManagerRef, RegisterTableRequest};
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID};
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
-use common_procedure::StandaloneManager;
+use common_procedure::{ProcedureManager, StandaloneManager};
 use common_telemetry::logging::info;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::LogConfig;
@@ -46,7 +46,7 @@ use table::Table;
 use crate::datanode::{DatanodeOptions, ObjectStoreConfig, WalConfig};
 use crate::error::{
     self, CatalogSnafu, MetaClientInitSnafu, MissingMetasrvOptsSnafu, MissingNodeIdSnafu,
-    NewCatalogSnafu, OpenLogStoreSnafu, Result,
+    NewCatalogSnafu, OpenLogStoreSnafu, RecoverProceduresSnafu, Result,
 };
 use crate::heartbeat::HeartbeatTask;
 use crate::script::ScriptExecutor;
@@ -98,7 +98,7 @@ impl Instance {
                 object_store.clone(),
             ),
             object_store,
-            procedure_manager,
+            procedure_manager.clone(),
         ));
 
         // create remote catalog manager
@@ -154,6 +154,12 @@ impl Instance {
                 (catalog as CatalogManagerRef, factory, None)
             }
         };
+
+        // Recover procedures.
+        procedure_manager
+            .recover()
+            .await
+            .context(RecoverProceduresSnafu)?;
 
         let query_engine = factory.query_engine();
         let script_executor =

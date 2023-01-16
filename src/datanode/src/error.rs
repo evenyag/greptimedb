@@ -315,6 +315,12 @@ pub enum Error {
         column: String,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("Failed to recover procedures, source: {}", source))]
+    RecoverProcedures {
+        #[snafu(source)]
+        source: common_procedure::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -385,6 +391,7 @@ impl ErrorExt for Error {
             Error::MissingMetasrvOpts { .. } => StatusCode::InvalidArguments,
             Error::ColumnDefaultValue { source, .. } => source.status_code(),
             Error::ColumnNoneDefaultValue { .. } => StatusCode::InvalidArguments,
+            Error::RecoverProcedures { source } => source.status_code(),
         }
     }
 
