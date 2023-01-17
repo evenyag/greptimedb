@@ -36,6 +36,7 @@ pub struct CreateDatabaseRequest {
     pub create_if_not_exists: bool,
 }
 
+// TODO(yingwen): Change schema to RawSchema and derive Serialize and Deserialize for it.
 /// Create table request
 #[derive(Debug, Clone)]
 pub struct CreateTableRequest {

@@ -12,17 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(assert_matches)]
+//! Procedures for datanode.
 
-pub mod datanode;
-pub mod error;
-mod heartbeat;
-pub mod instance;
-mod metric;
-mod mock;
-mod script;
-pub mod server;
-pub mod sql;
-#[cfg(test)]
-mod tests;
-mod procedure;
+mod create;

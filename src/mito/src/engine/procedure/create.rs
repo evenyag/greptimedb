@@ -53,6 +53,7 @@ enum CreateTableState {
     WriteTableManifest,
 }
 
+// TODO(yingwen): Replace fields by CreateTableRequest once it use RawSchema.
 /// Serializable data of [CreateTableProcedure].
 #[derive(Debug, Serialize, Deserialize)]
 struct CreateTableData {
