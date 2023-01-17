@@ -20,9 +20,9 @@ mod heartbeat;
 pub mod instance;
 mod metric;
 mod mock;
+mod procedure;
 mod script;
 pub mod server;
 pub mod sql;
 #[cfg(test)]
 mod tests;
-mod procedure;

@@ -91,7 +91,7 @@ impl LockKey {
 pub type BoxedProcedure = Box<dyn Procedure>;
 
 /// Unique id for [Procedure].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcedureId(Uuid);
 
 impl ProcedureId {
@@ -149,6 +149,18 @@ impl Handle {
 /// Loader to recover the [Procedure] instance from serialized data.
 pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
+/// Options to submit a procedure.
+#[derive(Debug, Default)]
+pub struct SubmitOptions {
+    /// Parent procedure id.
+    pub parent_id: Option<ProcedureId>,
+    /// Current procedure id.
+    ///
+    /// If this id is specific, the procedure manager can use this id to load the
+    /// cached procedure data from the procedure store.
+    pub procedure_id: Option<ProcedureId>,
+}
+
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]
 pub trait ProcedureManager: Send + Sync + 'static {
@@ -156,7 +168,7 @@ pub trait ProcedureManager: Send + Sync + 'static {
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
     /// Submits a [Procedure] to execute.
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
+    async fn submit(&self, opts: SubmitOptions, procedure: BoxedProcedure) -> Result<Handle>;
 
     /// Recovers unfinished procedures and reruns them.
     ///
@@ -175,4 +187,6 @@ struct ProcedureMessage {
     type_name: String,
     /// The data of the procedure.
     data: String,
+    /// Parent procedure id.
+    parent_id: Option<ProcedureId>,
 }

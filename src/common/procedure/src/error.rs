@@ -50,6 +50,18 @@ pub enum Error {
         source: serde_json::Error,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("Failed to submit procedure, input is invalid, reason: {}", reason))]
+    SubmitInvalidProcedure {
+        reason: String,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Procedure {} already exists", procedure_id))]
+    DuplicateProcedure {
+        procedure_id: ProcedureId,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -59,7 +71,9 @@ impl ErrorExt for Error {
         match self {
             Error::External { source } => source.status_code(),
             Error::Join { .. } | Error::ToJson { .. } => StatusCode::Internal,
-            Error::LoaderConflict { .. } => StatusCode::InvalidArguments,
+            Error::LoaderConflict { .. }
+            | Error::SubmitInvalidProcedure { .. }
+            | Error::DuplicateProcedure { .. } => StatusCode::InvalidArguments,
         }
     }
 

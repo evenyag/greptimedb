@@ -14,16 +14,13 @@
 
 //! Procedure for creating table.
 
+use async_trait::async_trait;
 use catalog::CatalogManagerRef;
+use common_procedure::{Context, LockKey, Procedure, Result as ProcedureResult, Status};
+use datatypes::schema::RawSchema;
+use serde::{Deserialize, Serialize};
 use table::engine::TableEngineRef;
 use table::metadata::TableId;
-use datatypes::schema::RawSchema;
-use serde::{Serialize, Deserialize};
-use common_procedure::{
-    Context, LockKey, Procedure,
-    Result as ProcedureResult, Status,
-};
-use async_trait::async_trait;
 
 // TODO(yingwen): Replace fields by CreateTableRequest once it use RawSchema.
 /// Serializable data of [CreateTableProcedure].

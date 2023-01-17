@@ -24,10 +24,12 @@ use tokio::sync::oneshot::Sender;
 use tokio::sync::{Barrier, Notify};
 use tokio::time;
 
-use crate::error::{LoaderConflictSnafu, Result, ToJsonSnafu};
+use crate::error::{
+    DuplicateProcedureSnafu, LoaderConflictSnafu, Result, SubmitInvalidProcedureSnafu, ToJsonSnafu,
+};
 use crate::procedure::{
     BoxedProcedure, BoxedProcedureLoader, Context, Handle, ProcedureId, ProcedureManager,
-    ProcedureMessage, Status,
+    ProcedureMessage, Status, SubmitOptions,
 };
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
@@ -48,6 +50,8 @@ trait StateStore: Send + Sync {
 }
 
 type StateStoreRef = Arc<dyn StateStore>;
+/// Procedure and its parent procedure id.
+struct ProcedureAndParent(BoxedProcedure, Option<ProcedureId>);
 
 /// Standalone [ProcedureManager] that maintains state on current machine.
 pub struct StandaloneManager {
@@ -55,6 +59,8 @@ pub struct StandaloneManager {
     loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
     manager_ctx: Arc<ManagerContext>,
     state_store: StateStoreRef,
+    /// Messages loaded from the procedure store.
+    messages: Mutex<HashMap<ProcedureId, ProcedureMessage>>,
 }
 
 impl StandaloneManager {
@@ -64,7 +70,37 @@ impl StandaloneManager {
             loaders: Mutex::new(HashMap::new()),
             manager_ctx: Arc::new(ManagerContext::new()),
             state_store: Arc::new(MemStateStore::default()),
+            messages: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Load procedure with specific `procedure_id`.
+    fn load_one_procedure(&self, procedure_id: ProcedureId) -> Option<ProcedureAndParent> {
+        let messages = self.messages.lock().unwrap();
+        let message = messages.get(&procedure_id)?;
+
+        let loaders = self.loaders.lock().unwrap();
+        let loader = loaders.get(&message.type_name).or_else(|| {
+            logging::error!(
+                "Loader not found, procedure_id: {}, type_name: {}",
+                procedure_id,
+                message.type_name
+            );
+            None
+        })?;
+
+        let procedure = loader(&message.data)
+            .map_err(|e| {
+                logging::error!(
+                    "Failed to load procedure data, key: {}, source: {}",
+                    procedure_id,
+                    e
+                );
+                e
+            })
+            .ok()?;
+
+        Some(ProcedureAndParent(procedure, message.parent_id))
     }
 }
 
@@ -79,11 +115,36 @@ impl ProcedureManager for StandaloneManager {
         Ok(())
     }
 
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
-        let procedure_id = ProcedureId::random();
+    async fn submit(&self, opts: SubmitOptions, mut procedure: BoxedProcedure) -> Result<Handle> {
+        if let (Some(parent_id), Some(procedure_id)) = (opts.parent_id, opts.procedure_id) {
+            // Since we submit the root procedure while recovering, we only need to check whether
+            // we can load a child procedure.
+            if let Some(procedure_and_parent) = self.load_one_procedure(procedure_id) {
+                if opts.parent_id != procedure_and_parent.1 {
+                    // Check parent id.
+                    return SubmitInvalidProcedureSnafu {
+                        reason: format!(
+                            "parent id {} of options is not equal to {:?} from procedure store",
+                            parent_id, procedure_and_parent.1
+                        ),
+                    }
+                    .fail()?;
+                }
+                // Now we can use the dumped procedure from the procedure store.
+                procedure = procedure_and_parent.0;
+            }
+        }
+
+        let procedure_id = opts.procedure_id.unwrap_or_else(ProcedureId::random);
+        ensure!(
+            !self.manager_ctx.contains_procedure(procedure_id),
+            DuplicateProcedureSnafu { procedure_id }
+        );
+
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             notify: Notify::new(),
+            parent_id: opts.parent_id,
         });
         let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
@@ -113,10 +174,24 @@ impl ProcedureManager for StandaloneManager {
 
     async fn recover(&self) -> Result<()> {
         let procedure_store = ProcedureStore(self.state_store.clone());
-        let procedures = procedure_store.load_procedures(&self.loaders).await?;
+        let messages = procedure_store.load_messages().await?;
 
-        for procedure in procedures {
-            self.submit(procedure).await?;
+        for (procedure_id, message) in &messages {
+            if message.parent_id.is_none() {
+                // This is the root procedure. We only submit the root procedure as it can
+                // submit sub-procedures to the manager.
+                let opts = SubmitOptions {
+                    parent_id: None,
+                    procedure_id: Some(*procedure_id),
+                };
+                let Some(procedure_and_parent) = self.load_one_procedure(*procedure_id) else {
+                    // Try to load other procedures.
+                    continue;
+                };
+
+                // If unable to submit to new procedure, we abort the recover process.
+                self.submit(opts, procedure_and_parent.0).await?;
+            }
         }
 
         Ok(())
@@ -160,6 +235,8 @@ struct ProcedureMeta {
     id: ProcedureId,
     /// Notify to wake up the runner.
     notify: Notify,
+    /// Parent procedure id.
+    parent_id: Option<ProcedureId>,
 }
 
 type ProcedureMetaRef = Arc<ProcedureMeta>;
@@ -192,6 +269,11 @@ impl ManagerContext {
     fn remove_procedure(&self, procedure_id: ProcedureId) {
         let mut procedures = self.procedures.write().unwrap();
         procedures.remove(&procedure_id);
+    }
+
+    fn contains_procedure(&self, procedure_id: ProcedureId) -> bool {
+        let procedures = self.procedures.read().unwrap();
+        procedures.contains_key(&procedure_id)
     }
 }
 
@@ -258,6 +340,7 @@ impl ProcedureStore {
         procedure_id: ProcedureId,
         step: u32,
         procedure: &BoxedProcedure,
+        parent_id: Option<ProcedureId>,
     ) -> Result<()> {
         let type_name = procedure.type_name();
         let data = procedure.dump()?;
@@ -265,6 +348,7 @@ impl ProcedureStore {
         let message = ProcedureMessage {
             type_name: type_name.to_string(),
             data,
+            parent_id,
         };
         let key = ParsedKey {
             procedure_id,
@@ -291,12 +375,9 @@ impl ProcedureStore {
         Ok(())
     }
 
-    async fn load_procedures(
-        &self,
-        loaders: &Mutex<HashMap<String, BoxedProcedureLoader>>,
-    ) -> Result<Vec<BoxedProcedure>> {
+    async fn load_messages(&self) -> Result<HashMap<ProcedureId, ProcedureMessage>> {
         let key_values = self.0.scan_prefix(KEY_VERSION).await?;
-        let mut procedures = Vec::new();
+        let mut messages = HashMap::new();
         let mut procedure_key_value = None;
         for (key, value) in key_values {
             let Some(curr_key) = ParsedKey::parse_str(&key) else {
@@ -315,55 +396,31 @@ impl ProcedureStore {
                 procedure_key_value = None;
             } else {
                 // A new procedure, now we can load previous procedure.
-                let Some(procedure) = self.load_one_procedure(prev_key, prev_value, loaders) else {
+                let Some(message) = self.load_one_message(prev_key, prev_value) else {
                     // We don't abort the loading process and just ignore errors to ensure all remaining
                     // procedures are loaded.
                     continue;
                 };
-                procedures.push(procedure);
+                messages.insert(prev_key.procedure_id, message);
 
                 procedure_key_value = Some((curr_key, value));
             }
         }
 
         if let Some((last_key, last_value)) = &procedure_key_value {
-            if let Some(procedure) = self.load_one_procedure(last_key, last_value, loaders) {
-                procedures.push(procedure);
+            if let Some(message) = self.load_one_message(last_key, last_value) {
+                messages.insert(last_key.procedure_id, message);
             }
         }
 
-        Ok(procedures)
+        Ok(messages)
     }
 
-    fn load_one_procedure(
-        &self,
-        key: &ParsedKey,
-        value: &str,
-        loader_map: &Mutex<HashMap<String, BoxedProcedureLoader>>,
-    ) -> Option<BoxedProcedure> {
-        let message: ProcedureMessage = serde_json::from_str(&value)
+    fn load_one_message(&self, key: &ParsedKey, value: &str) -> Option<ProcedureMessage> {
+        serde_json::from_str(&value)
             .map_err(|e| {
                 // `e` doesn't impl ErrorExt so we print it as normal error.
                 logging::error!("Failed to parse value, key: {:?}, source: {}", key, e);
-                e
-            })
-            .ok()?;
-        let loaders = loader_map.lock().unwrap();
-        let loader = loaders.get(&message.type_name).or_else(|| {
-            logging::error!(
-                "Loader not found, key: {:?}, type_name: {}",
-                key,
-                message.type_name
-            );
-            None
-        })?;
-        loader(&message.data)
-            .map_err(|e| {
-                logging::error!(
-                    "Failed to load procedure data, key: {:?}, source: {}",
-                    key,
-                    e
-                );
                 e
             })
             .ok()
@@ -455,7 +512,12 @@ impl Runner {
 
     async fn persist_procedure(&mut self) -> Result<()> {
         self.store
-            .store_procedure(self.meta.id, self.step, &self.procedure)
+            .store_procedure(
+                self.meta.id,
+                self.step,
+                &self.procedure,
+                self.meta.parent_id,
+            )
             .await?;
         self.step += 1;
         Ok(())
