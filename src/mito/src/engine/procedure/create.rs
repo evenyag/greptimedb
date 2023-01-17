@@ -121,7 +121,7 @@ impl<S: StorageEngine> Procedure for CreateTableProcedure<S> {
 }
 
 impl<S: StorageEngine> CreateTableProcedure<S> {
-    const TYPE_NAME: &str = "MitoCreateTable";
+    const TYPE_NAME: &str = "mito::CreateTable";
 
     /// Returns a new [CreateTableProcedure] and a receiver to receive the created table.
     ///
