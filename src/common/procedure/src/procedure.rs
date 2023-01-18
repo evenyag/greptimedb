@@ -34,6 +34,11 @@ pub enum Status {
         /// Whether the framework need to persist the procedure.
         persist: bool,
     },
+    /// The procedure has suspended itself and is waiting for subprocedures.
+    Suspended {
+        /// Whether the framework need to persist the procedure.
+        persist: bool,
+    },
     /// the procedure is done.
     Done,
 }
@@ -42,6 +47,14 @@ impl Status {
     /// Returns a [Status::Executing] with given `persist` flag.
     pub fn executing(persist: bool) -> Status {
         Status::Executing { persist }
+    }
+
+    /// Returns `true` if the procedure needs the framework to persist its state.
+    pub fn need_persist(&self) -> bool {
+        match self {
+            Status::Executing { persist } | Status::Suspended { persist } => *persist,
+            Status::Done => false,
+        }
     }
 }
 
@@ -112,6 +125,7 @@ impl fmt::Display for ProcedureId {
     }
 }
 
+// TODO(yingwen): The handle is a bit useless, we could remove it.
 /// Handle to join on a procedure.
 pub struct Handle {
     procedure_id: ProcedureId,

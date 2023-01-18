@@ -59,6 +59,8 @@ pub struct StandaloneManager {
     loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
     manager_ctx: Arc<ManagerContext>,
     state_store: StateStoreRef,
+    // TODO(yingwen): Now we never clean the messages. But when the root procedure is done, we
+    // should be able to remove the its message and all its child messages.
     /// Messages loaded from the procedure store.
     messages: Mutex<HashMap<ProcedureId, ProcedureMessage>>,
 }
@@ -143,8 +145,9 @@ impl ProcedureManager for StandaloneManager {
 
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
-            notify: Notify::new(),
+            lock_notify: Notify::new(),
             parent_id: opts.parent_id,
+            child_notify: Notify::new(),
         });
         let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
@@ -233,10 +236,12 @@ impl StateStore for MemStateStore {
 struct ProcedureMeta {
     /// Id of this procedure.
     id: ProcedureId,
-    /// Notify to wake up the runner.
-    notify: Notify,
+    /// Notify to waiting for a lock.
+    lock_notify: Notify,
     /// Parent procedure id.
     parent_id: Option<ProcedureId>,
+    /// Notify to waiting for subprocedures.
+    child_notify: Notify,
 }
 
 type ProcedureMetaRef = Arc<ProcedureMeta>;
@@ -248,6 +253,13 @@ struct ManagerContext {
 }
 
 impl ManagerContext {
+    fn new() -> ManagerContext {
+        ManagerContext {
+            lock_map: LockMap::new(),
+            procedures: RwLock::new(HashMap::new()),
+        }
+    }
+
     fn insert_procedure(&self, procedure_id: ProcedureId, meta: ProcedureMetaRef) {
         let mut procedures = self.procedures.write().unwrap();
         procedures.insert(procedure_id, meta);
@@ -271,17 +283,17 @@ impl ManagerContext {
         procedures.remove(&procedure_id);
     }
 
+    /// Returns true if the procedure exists.
     fn contains_procedure(&self, procedure_id: ProcedureId) -> bool {
         let procedures = self.procedures.read().unwrap();
         procedures.contains_key(&procedure_id)
     }
-}
 
-impl ManagerContext {
-    fn new() -> ManagerContext {
-        ManagerContext {
-            lock_map: LockMap::new(),
-            procedures: RwLock::new(HashMap::new()),
+    /// Notify a parent procedure with given `procedure_id` by its subprocedure.
+    fn notify_by_subprocedure(&self, procedure_id: ProcedureId) {
+        let procedures = self.procedures.read().unwrap();
+        if let Some(meta) = procedures.get(&procedure_id) {
+            meta.child_notify.notify_one();
         }
     }
 }
@@ -465,25 +477,11 @@ impl Runner {
 
         loop {
             match self.procedure.execute(&ctx).await {
-                Ok(status) => match status {
-                    Status::Executing { persist } => {
-                        if persist {
-                            if let Err(e) = self.persist_procedure().await {
-                                logging::error!(
-                                    e; "Failed to persist procedure {}-{}",
-                                    self.procedure.type_name(),
-                                    self.meta.id
-                                );
-
-                                time::sleep(ERR_WAIT_DURATION).await;
-                                continue;
-                            }
-                        }
-                    }
-                    Status::Done => {
-                        if let Err(e) = self.commit_procedure().await {
+                Ok(status) => {
+                    if status.need_persist() {
+                        if let Err(e) = self.persist_procedure().await {
                             logging::error!(
-                                e; "Failed to commit procedure {}-{}",
+                                e; "Failed to persist procedure {}-{}",
                                 self.procedure.type_name(),
                                 self.meta.id
                             );
@@ -491,14 +489,39 @@ impl Runner {
                             time::sleep(ERR_WAIT_DURATION).await;
                             continue;
                         }
+                    }
 
-                        // TODO(yingwen): Add files to remove list.
-                        logging::info!(
-                            "Procedure {}-{} done",
-                            self.procedure.type_name(),
-                            self.meta.id
-                        );
-                        return Ok(());
+                    match status {
+                        Status::Executing { .. } => (),
+                        Status::Suspended { .. } => {
+                            logging::info!(
+                                "Procedure {}-{} is waiting for subprocedures",
+                                self.procedure.type_name(),
+                                self.meta.id,
+                            );
+                            // Wait for subprocedures.
+                            self.meta.child_notify.notified().await;
+                            logging::info!(
+                                "Procedure {}-{} is waked up",
+                                self.procedure.type_name(),
+                                self.meta.id,
+                            );
+                        }
+                        Status::Done => {
+                            if let Err(e) = self.commit_procedure().await {
+                                logging::error!(
+                                    e; "Failed to commit procedure {}-{}",
+                                    self.procedure.type_name(),
+                                    self.meta.id
+                                );
+
+                                time::sleep(ERR_WAIT_DURATION).await;
+                                continue;
+                            }
+
+                            self.done();
+                            return Ok(());
+                        }
                     }
                 },
                 Err(e) => {
@@ -528,6 +551,16 @@ impl Runner {
         self.step += 1;
         Ok(())
     }
+
+    fn done(&self) {
+        // TODO(yingwen): Add files to remove list.
+        logging::info!("Procedure {}-{} done", self.procedure.type_name(), self.meta.id);
+
+        // Notify parent procedure.
+        if let Some(parent_id) = self.meta.parent_id {
+            self.manager_ctx.notify_by_subprocedure(parent_id);
+        }
+    }
 }
 
 /// Data of the lock entry.
@@ -554,7 +587,8 @@ impl Lock {
     /// Returns false if there is no waiter in the waiter list.
     fn switch_owner(&mut self) -> bool {
         if let Some(waiter) = self.waiters.pop_front() {
-            waiter.notify.notify_one();
+            // We need to use notify_one() since the waiter may not been registered yet.
+            waiter.lock_notify.notify_one();
             true
         } else {
             false
@@ -601,7 +635,7 @@ impl LockMap {
         }
 
         // Wait for notify.
-        meta.notify.notified().await;
+        meta.lock_notify.notified().await;
 
         // It is possible that the procedure is notified by other signal so
         // we check the lock again.
