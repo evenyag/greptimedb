@@ -65,6 +65,7 @@ pub struct Context {
     pub procedure_id: ProcedureId,
 }
 
+// FIXME(yingwen): Let the caller provides procedure id.
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
 #[async_trait]
 pub trait Procedure: Send + Sync {

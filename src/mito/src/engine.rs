@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
-use common_procedure::{ProcedureManagerRef};
+use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging;
 use object_store::ObjectStore;
 use snafu::{ensure, OptionExt, ResultExt};

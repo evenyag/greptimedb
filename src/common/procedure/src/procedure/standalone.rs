@@ -56,54 +56,17 @@ struct ProcedureAndParent(BoxedProcedure, Option<ProcedureId>);
 
 /// Standalone [ProcedureManager] that maintains state on current machine.
 pub struct StandaloneManager {
-    /// Procedure loaders. The key is the type name of the procedure which the loader returns.
-    loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
     manager_ctx: Arc<ManagerContext>,
     state_store: StateStoreRef,
-    // TODO(yingwen): Now we never clean the messages. But when the root procedure is done, we
-    // should be able to remove the its message and all its child messages.
-    /// Messages loaded from the procedure store.
-    messages: Mutex<HashMap<ProcedureId, ProcedureMessage>>,
 }
 
 impl StandaloneManager {
     /// Create a new StandaloneManager with default configurations.
     pub fn new() -> StandaloneManager {
         StandaloneManager {
-            loaders: Mutex::new(HashMap::new()),
             manager_ctx: Arc::new(ManagerContext::new()),
             state_store: Arc::new(MemStateStore::default()),
-            messages: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Load procedure with specific `procedure_id`.
-    fn load_one_procedure(&self, procedure_id: ProcedureId) -> Option<ProcedureAndParent> {
-        let messages = self.messages.lock().unwrap();
-        let message = messages.get(&procedure_id)?;
-
-        let loaders = self.loaders.lock().unwrap();
-        let loader = loaders.get(&message.type_name).or_else(|| {
-            logging::error!(
-                "Loader not found, procedure_id: {}, type_name: {}",
-                procedure_id,
-                message.type_name
-            );
-            None
-        })?;
-
-        let procedure = loader(&message.data)
-            .map_err(|e| {
-                logging::error!(
-                    "Failed to load procedure data, key: {}, source: {}",
-                    procedure_id,
-                    e
-                );
-                e
-            })
-            .ok()?;
-
-        Some(ProcedureAndParent(procedure, message.parent_id))
     }
 
     /// Submit a root procedure with given `procedure_id`.
@@ -133,6 +96,7 @@ impl StandaloneManager {
             // We need to wait until we inserts the meta into the manager context.
             task_barrier.wait().await;
 
+            // Run the root procedure.
             runner.run().await
         });
 
@@ -147,7 +111,7 @@ impl StandaloneManager {
 #[async_trait]
 impl ProcedureManager for StandaloneManager {
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()> {
-        let mut loaders = self.loaders.lock().unwrap();
+        let mut loaders = self.manager_ctx.loaders.lock().unwrap();
         ensure!(!loaders.contains_key(name), LoaderConflictSnafu { name });
 
         loaders.insert(name.to_string(), loader);
@@ -157,7 +121,7 @@ impl ProcedureManager for StandaloneManager {
 
     async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
         let procedure_id = ProcedureId::random();
-        
+
         let handle = self.submit_with_id(procedure_id, procedure).await;
         Ok(handle)
     }
@@ -246,12 +210,13 @@ impl ProcedureManager for StandaloneManager {
             if message.parent_id.is_none() {
                 // This is the root procedure. We only submit the root procedure as it can
                 // submit sub-procedures to the manager.
-                let Some(procedure_and_parent) = self.load_one_procedure(*procedure_id) else {
+                let Some(procedure_and_parent) = self.manager_ctx.load_one_procedure(*procedure_id) else {
                     // Try to load other procedures.
                     continue;
                 };
 
-                self.submit_with_id(*procedure_id, procedure_and_parent.0).await;
+                self.submit_with_id(*procedure_id, procedure_and_parent.0)
+                    .await;
             }
         }
 
@@ -336,19 +301,41 @@ struct ProcedureMeta {
     lock_key: Option<LockKey>,
 }
 
+impl ProcedureMeta {
+    /// Return all locks the procedure needs.
+    fn locks_needed(&self) -> Vec<LockKey> {
+        let num_locks = self.parent_locks.len() + if self.lock_key.is_some() { 1 } else { 0 };
+        let mut locks = Vec::with_capacity(num_locks);
+        locks.extend_from_slice(&self.parent_locks);
+        if let Some(key) = &self.lock_key {
+            locks.push(key.clone());
+        }
+
+        locks
+    }
+}
+
 type ProcedureMetaRef = Arc<ProcedureMeta>;
 
 /// Shared context of the manager.
 struct ManagerContext {
+    /// Procedure loaders. The key is the type name of the procedure which the loader returns.
+    loaders: Mutex<HashMap<String, BoxedProcedureLoader>>,
     lock_map: LockMap,
     procedures: RwLock<HashMap<ProcedureId, ProcedureMetaRef>>,
+    // TODO(yingwen): Now we never clean the messages. But when the root procedure is done, we
+    // should be able to remove the its message and all its child messages.
+    /// Messages loaded from the procedure store.
+    messages: Mutex<HashMap<ProcedureId, ProcedureMessage>>,
 }
 
 impl ManagerContext {
     fn new() -> ManagerContext {
         ManagerContext {
+            loaders: Mutex::new(HashMap::new()),
             lock_map: LockMap::new(),
             procedures: RwLock::new(HashMap::new()),
+            messages: Mutex::new(HashMap::new()),
         }
     }
 
@@ -398,21 +385,50 @@ impl ManagerContext {
         }
     }
 
-    /// Return all locks the procedure owns.
-    fn owned_locks(&self, procedure_id: ProcedureId) -> Vec<LockKey> {
-        let procedures = self.procedures.read().unwrap();
-        if let Some(meta) = procedures.get(&procedure_id) {
-            let num_locks = meta.parent_locks.len() + if meta.lock_key.is_some() { 1 } else { 0 };
-            let mut locks = Vec::with_capacity(num_locks);
-            locks.extend_from_slice(&meta.parent_locks);
-            if let Some(key) = &meta.lock_key {
-                locks.push(key.clone());
-            }
+    // /// Return all locks the procedure owns.
+    // fn owned_locks(&self, procedure_id: ProcedureId) -> Vec<LockKey> {
+    //     let procedures = self.procedures.read().unwrap();
+    //     if let Some(meta) = procedures.get(&procedure_id) {
+    //         let num_locks = meta.parent_locks.len() + if meta.lock_key.is_some() { 1 } else { 0 };
+    //         let mut locks = Vec::with_capacity(num_locks);
+    //         locks.extend_from_slice(&meta.parent_locks);
+    //         if let Some(key) = &meta.lock_key {
+    //             locks.push(key.clone());
+    //         }
 
-            locks
-        } else {
-            Vec::new()
-        }
+    //         locks
+    //     } else {
+    //         Vec::new()
+    //     }
+    // }
+
+    /// Load procedure with specific `procedure_id`.
+    fn load_one_procedure(&self, procedure_id: ProcedureId) -> Option<ProcedureAndParent> {
+        let messages = self.messages.lock().unwrap();
+        let message = messages.get(&procedure_id)?;
+
+        let loaders = self.loaders.lock().unwrap();
+        let loader = loaders.get(&message.type_name).or_else(|| {
+            logging::error!(
+                "Loader not found, procedure_id: {}, type_name: {}",
+                procedure_id,
+                message.type_name
+            );
+            None
+        })?;
+
+        let procedure = loader(&message.data)
+            .map_err(|e| {
+                logging::error!(
+                    "Failed to load procedure data, key: {}, source: {}",
+                    procedure_id,
+                    e
+                );
+                e
+            })
+            .ok()?;
+
+        Some(ProcedureAndParent(procedure, message.parent_id))
     }
 }
 
@@ -462,6 +478,7 @@ impl ParsedKey {
     }
 }
 
+#[derive(Clone)]
 struct ProcedureStore(StateStoreRef);
 
 impl ProcedureStore {
@@ -567,6 +584,7 @@ struct Runner {
 }
 
 impl Runner {
+    /// Run the procedure.
     async fn run(mut self) {
         // We use the lock key in ProcedureMeta as it considers locks inherited from
         // its parent.
@@ -588,6 +606,55 @@ impl Runner {
         // need the return value.
         let _ = self.sender.send(execute_result);
         self.manager_ctx.remove_procedure(self.meta.id);
+    }
+
+    /// Submit a subprocedure.
+    fn submit_sub(&self, procedure_id: ProcedureId, mut procedure: BoxedProcedure) {
+        if let Some(procedure_and_parent) = self.manager_ctx.load_one_procedure(procedure_id) {
+            // Try to load procedure state from the message to avoid re-run the subprocedure
+            // from initial state.
+            assert_eq!(self.meta.id, procedure_and_parent.1.unwrap());
+
+            // Use the dumped procedure from the procedure store.
+            procedure = procedure_and_parent.0;
+        }
+
+        // Inherit locks from the parent procedure. This procedure can submit a subprocedure,
+        // which indicates the procedure already owns the locks and is executing now.
+        let parent_locks = self.meta.locks_needed();
+        let mut child_lock = procedure.lock_key();
+        if let Some(lock) = &child_lock {
+            if parent_locks.contains(lock) {
+                // If the parent procedure already holds this lock, we set this lock to None
+                // so the subprocedure don't need to acquire lock again.
+                child_lock = None;
+            }
+        }
+
+        let meta = Arc::new(ProcedureMeta {
+            id: procedure_id,
+            lock_notify: Notify::new(),
+            parent_id: Some(self.meta.id),
+            child_notify: Notify::new(),
+            state: AtomicState::new(),
+            parent_locks: parent_locks,
+            lock_key: child_lock,
+        });
+        let (handle, sender) = Handle::new(procedure_id);
+        let runner = Runner {
+            meta: meta.clone(),
+            procedure,
+            manager_ctx: self.manager_ctx.clone(),
+            sender,
+            step: 0,
+            store: self.store.clone(),
+        };
+
+        self.manager_ctx.insert_procedure(procedure_id, meta);
+        common_runtime::spawn_bg(async move {
+            // Run the root procedure.
+            runner.run().await
+        });
     }
 
     async fn execute_procedure(&mut self) -> Result<()> {
@@ -613,21 +680,8 @@ impl Runner {
 
                     match status {
                         Status::Executing { .. } => (),
-                        Status::Suspended { .. } => {
-                            todo!("Execute subprocedures");
-
-                            logging::info!(
-                                "Procedure {}-{} is waiting for subprocedures",
-                                self.procedure.type_name(),
-                                self.meta.id,
-                            );
-                            // Wait for subprocedures.
-                            self.meta.child_notify.notified().await;
-                            logging::info!(
-                                "Procedure {}-{} is waked up",
-                                self.procedure.type_name(),
-                                self.meta.id,
-                            );
+                        Status::Suspended { subprocedures, .. } => {
+                            self.on_suspended(subprocedures).await;
                         }
                         Status::Done => {
                             if let Err(e) = self.commit_procedure().await {
@@ -655,6 +709,27 @@ impl Runner {
                 }
             }
         }
+    }
+
+    async fn on_suspended(&self, subprocedures: Vec<BoxedProcedure>) {
+        for subprocedure in subprocedures {
+            self.submit_sub(ProcedureId::random(), subprocedure);
+        }
+
+        logging::info!(
+            "Procedure {}-{} is waiting for subprocedures",
+            self.procedure.type_name(),
+            self.meta.id,
+        );
+
+        // Wait for subprocedures.
+        self.meta.child_notify.notified().await;
+
+        logging::info!(
+            "Procedure {}-{} is waked up",
+            self.procedure.type_name(),
+            self.meta.id,
+        );
     }
 
     async fn persist_procedure(&mut self) -> Result<()> {
