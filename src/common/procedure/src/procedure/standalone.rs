@@ -29,7 +29,7 @@ use crate::error::{
     DuplicateProcedureSnafu, LoaderConflictSnafu, Result, SubmitInvalidProcedureSnafu, ToJsonSnafu,
 };
 use crate::procedure::{
-    BoxedProcedure, BoxedProcedureLoader, Context, Handle, ProcedureId, ProcedureManager,
+    BoxedProcedure, BoxedProcedureLoader, Context, Handle, LockKey, ProcedureId, ProcedureManager,
     ProcedureMessage, ProcedureState, Status, SubmitOptions,
 };
 
@@ -119,6 +119,8 @@ impl ProcedureManager for StandaloneManager {
     }
 
     async fn submit(&self, opts: SubmitOptions, mut procedure: BoxedProcedure) -> Result<Handle> {
+        // TODO(yingwen): Checks whether parent procedure exists.
+
         if let (Some(parent_id), Some(procedure_id)) = (opts.parent_id, opts.procedure_id) {
             // Since we submit the root procedure while recovering, we only need to check whether
             // we can load a child procedure.
@@ -144,12 +146,27 @@ impl ProcedureManager for StandaloneManager {
             DuplicateProcedureSnafu { procedure_id }
         );
 
+        // Inherit locks from the parent procedure.
+        let parent_locks = opts
+            .parent_id
+            .map(|parent_id| self.manager_ctx.owned_locks(parent_id))
+            .unwrap_or_default();
+        let mut current_lock = procedure.lock_key();
+        if let Some(lock) = &current_lock {
+            if parent_locks.contains(lock) {
+                // If the parent procedure already holds this lock.
+                current_lock = None;
+            }
+        }
+
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             lock_notify: Notify::new(),
             parent_id: opts.parent_id,
             child_notify: Notify::new(),
             state: AtomicState::new(),
+            parent_locks: parent_locks,
+            lock_key: current_lock,
         });
         let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
@@ -258,7 +275,6 @@ impl AtomicState {
     }
 }
 
-// We can add a cancelation flag here.
 /// Shared metadata of a procedure.
 #[derive(Debug)]
 struct ProcedureMeta {
@@ -272,6 +288,13 @@ struct ProcedureMeta {
     child_notify: Notify,
     /// State of the procedure.
     state: AtomicState,
+    /// Locks inherted from the parent procedure.
+    parent_locks: Vec<LockKey>,
+    /// Lock this procedure needs additionally.
+    ///
+    /// If the parent procedure already owns the lock this procedure
+    /// needs, then we also set this field to `None`.
+    lock_key: Option<LockKey>,
 }
 
 type ProcedureMetaRef = Arc<ProcedureMeta>;
@@ -301,13 +324,17 @@ impl ManagerContext {
     }
 
     /// Acquire the lock for the procedure or wait for the lock.
-    async fn acquire_lock(&self, lock_key: &str, meta: &ProcedureMetaRef) {
-        while !self.lock_map.acquire_lock(lock_key, meta.clone()).await {}
+    async fn acquire_lock(&self, lock_key: &LockKey, meta: &ProcedureMetaRef) {
+        while !self
+            .lock_map
+            .acquire_lock(lock_key.key(), meta.clone())
+            .await
+        {}
     }
 
     /// Release the lock for the procedure and notify the new owner of the lock.
-    fn release_lock(&self, lock_key: &str) {
-        self.lock_map.release_lock(lock_key);
+    fn release_lock(&self, lock_key: &LockKey) {
+        self.lock_map.release_lock(lock_key.key());
     }
 
     /// Remove metadata of the procedure.
@@ -329,6 +356,23 @@ impl ManagerContext {
         let procedures = self.procedures.read().unwrap();
         if let Some(meta) = procedures.get(&procedure_id) {
             meta.child_notify.notify_one();
+        }
+    }
+
+    /// Return all locks the procedure owns.
+    fn owned_locks(&self, procedure_id: ProcedureId) -> Vec<LockKey> {
+        let procedures = self.procedures.read().unwrap();
+        if let Some(meta) = procedures.get(&procedure_id) {
+            let num_locks = meta.parent_locks.len() + if meta.lock_key.is_some() { 1 } else { 0 };
+            let mut locks = Vec::with_capacity(num_locks);
+            locks.extend_from_slice(&meta.parent_locks);
+            if let Some(key) = &meta.lock_key {
+                locks.push(key.clone());
+            }
+
+            locks
+        } else {
+            Vec::new()
         }
     }
 }
@@ -485,18 +529,20 @@ struct Runner {
 
 impl Runner {
     async fn run(mut self) {
-        let lock_key = self.procedure.lock_key();
-        let primary_lock_key = lock_key.as_ref().map(|k| k.primary_lock_key());
+        // We use the lock key in ProcedureMeta as it considers locks inherited from
+        // its parent.
+        let lock_key = self.meta.lock_key.clone();
 
+        // TODO(yingwen): Support multiple lock keys.
         // Acquire lock if necessary.
-        if let Some(lock_key) = primary_lock_key {
-            self.manager_ctx.acquire_lock(lock_key, &self.meta).await;
+        if let Some(key) = &lock_key {
+            self.manager_ctx.acquire_lock(key, &self.meta).await;
         }
         // Execute the procedure.
         let execute_result = self.execute_procedure().await;
 
-        if let Some(lock_key) = primary_lock_key {
-            self.manager_ctx.release_lock(lock_key);
+        if let Some(key) = &lock_key {
+            self.manager_ctx.release_lock(key);
         }
 
         // Ignore the result since the callers can drop the handle if they don't

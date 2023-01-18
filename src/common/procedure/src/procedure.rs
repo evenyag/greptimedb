@@ -85,7 +85,8 @@ pub trait Procedure: Send + Sync {
 
 /// A key to identify the lock.
 // We might hold multiple keys in this struct. When there are multiple keys, we need to sort the
-// keys and use the first key as primary key.
+// keys lock all the keys in order to avoid dead lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockKey(String);
 
 impl LockKey {
@@ -94,8 +95,8 @@ impl LockKey {
         LockKey(key.into())
     }
 
-    /// Returns the primary lock key.
-    pub fn primary_lock_key(&self) -> &str {
+    /// Returns the lock key.
+    pub fn key(&self) -> &str {
         &self.0
     }
 }
