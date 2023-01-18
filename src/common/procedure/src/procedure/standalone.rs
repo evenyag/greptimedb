@@ -30,7 +30,7 @@ use crate::error::{
 };
 use crate::procedure::{
     BoxedProcedure, BoxedProcedureLoader, Context, Handle, LockKey, ProcedureId, ProcedureManager,
-    ProcedureMessage, ProcedureState, Status, SubmitOptions,
+    ProcedureMessage, ProcedureState, Status,
 };
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
@@ -105,68 +105,17 @@ impl StandaloneManager {
 
         Some(ProcedureAndParent(procedure, message.parent_id))
     }
-}
 
-#[async_trait]
-impl ProcedureManager for StandaloneManager {
-    fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()> {
-        let mut loaders = self.loaders.lock().unwrap();
-        ensure!(!loaders.contains_key(name), LoaderConflictSnafu { name });
-
-        loaders.insert(name.to_string(), loader);
-
-        Ok(())
-    }
-
-    async fn submit(&self, opts: SubmitOptions, mut procedure: BoxedProcedure) -> Result<Handle> {
-        // TODO(yingwen): Checks whether parent procedure exists.
-
-        if let (Some(parent_id), Some(procedure_id)) = (opts.parent_id, opts.procedure_id) {
-            // Since we submit the root procedure while recovering, we only need to check whether
-            // we can load a child procedure.
-            if let Some(procedure_and_parent) = self.load_one_procedure(procedure_id) {
-                if opts.parent_id != procedure_and_parent.1 {
-                    // Check parent id.
-                    return SubmitInvalidProcedureSnafu {
-                        reason: format!(
-                            "parent id {} of options is not equal to {:?} from procedure store",
-                            parent_id, procedure_and_parent.1
-                        ),
-                    }
-                    .fail()?;
-                }
-                // Now we can use the dumped procedure from the procedure store.
-                procedure = procedure_and_parent.0;
-            }
-        }
-
-        let procedure_id = opts.procedure_id.unwrap_or_else(ProcedureId::random);
-        ensure!(
-            !self.manager_ctx.contains_procedure(procedure_id),
-            DuplicateProcedureSnafu { procedure_id }
-        );
-
-        // Inherit locks from the parent procedure.
-        let parent_locks = opts
-            .parent_id
-            .map(|parent_id| self.manager_ctx.owned_locks(parent_id))
-            .unwrap_or_default();
-        let mut current_lock = procedure.lock_key();
-        if let Some(lock) = &current_lock {
-            if parent_locks.contains(lock) {
-                // If the parent procedure already holds this lock.
-                current_lock = None;
-            }
-        }
-
+    /// Submit a root procedure with given `procedure_id`.
+    async fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) -> Handle {
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             lock_notify: Notify::new(),
-            parent_id: opts.parent_id,
+            parent_id: None,
             child_notify: Notify::new(),
             state: AtomicState::new(),
-            parent_locks: parent_locks,
-            lock_key: current_lock,
+            parent_locks: Vec::new(),
+            lock_key: procedure.lock_key(),
         });
         let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
@@ -191,8 +140,103 @@ impl ProcedureManager for StandaloneManager {
         // Notify the task to run the runner.
         barrier.wait().await;
 
+        handle
+    }
+}
+
+#[async_trait]
+impl ProcedureManager for StandaloneManager {
+    fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()> {
+        let mut loaders = self.loaders.lock().unwrap();
+        ensure!(!loaders.contains_key(name), LoaderConflictSnafu { name });
+
+        loaders.insert(name.to_string(), loader);
+
+        Ok(())
+    }
+
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
+        let procedure_id = ProcedureId::random();
+        
+        let handle = self.submit_with_id(procedure_id, procedure).await;
         Ok(handle)
     }
+
+    // async fn submit(&self, opts: SubmitOptions, mut procedure: BoxedProcedure) -> Result<Handle> {
+    //     // TODO(yingwen): Checks whether parent procedure exists.
+
+    //     if let (Some(parent_id), Some(procedure_id)) = (opts.parent_id, opts.procedure_id) {
+    //         // Since we submit the root procedure while recovering, we only need to check whether
+    //         // we can load a child procedure.
+    //         if let Some(procedure_and_parent) = self.load_one_procedure(procedure_id) {
+    //             if opts.parent_id != procedure_and_parent.1 {
+    //                 // Check parent id.
+    //                 return SubmitInvalidProcedureSnafu {
+    //                     reason: format!(
+    //                         "parent id {} of options is not equal to {:?} from procedure store",
+    //                         parent_id, procedure_and_parent.1
+    //                     ),
+    //                 }
+    //                 .fail()?;
+    //             }
+    //             // Now we can use the dumped procedure from the procedure store.
+    //             procedure = procedure_and_parent.0;
+    //         }
+    //     }
+
+    //     let procedure_id = opts.procedure_id.unwrap_or_else(ProcedureId::random);
+    //     ensure!(
+    //         !self.manager_ctx.contains_procedure(procedure_id),
+    //         DuplicateProcedureSnafu { procedure_id }
+    //     );
+
+    //     // Inherit locks from the parent procedure.
+    //     let parent_locks = opts
+    //         .parent_id
+    //         .map(|parent_id| self.manager_ctx.owned_locks(parent_id))
+    //         .unwrap_or_default();
+    //     let mut current_lock = procedure.lock_key();
+    //     if let Some(lock) = &current_lock {
+    //         if parent_locks.contains(lock) {
+    //             // If the parent procedure already holds this lock.
+    //             current_lock = None;
+    //         }
+    //     }
+
+    //     let meta = Arc::new(ProcedureMeta {
+    //         id: procedure_id,
+    //         lock_notify: Notify::new(),
+    //         parent_id: opts.parent_id,
+    //         child_notify: Notify::new(),
+    //         state: AtomicState::new(),
+    //         parent_locks: parent_locks,
+    //         lock_key: current_lock,
+    //     });
+    //     let (handle, sender) = Handle::new(procedure_id);
+    //     let runner = Runner {
+    //         meta: meta.clone(),
+    //         procedure,
+    //         manager_ctx: self.manager_ctx.clone(),
+    //         sender,
+    //         step: 0,
+    //         store: ProcedureStore(self.state_store.clone()),
+    //     };
+
+    //     let barrier = Arc::new(Barrier::new(2));
+    //     let task_barrier = barrier.clone();
+    //     common_runtime::spawn_bg(async move {
+    //         // We need to wait until we inserts the meta into the manager context.
+    //         task_barrier.wait().await;
+
+    //         runner.run().await
+    //     });
+
+    //     self.manager_ctx.insert_procedure(procedure_id, meta);
+    //     // Notify the task to run the runner.
+    //     barrier.wait().await;
+
+    //     Ok(handle)
+    // }
 
     async fn recover(&self) -> Result<()> {
         let procedure_store = ProcedureStore(self.state_store.clone());
@@ -202,17 +246,12 @@ impl ProcedureManager for StandaloneManager {
             if message.parent_id.is_none() {
                 // This is the root procedure. We only submit the root procedure as it can
                 // submit sub-procedures to the manager.
-                let opts = SubmitOptions {
-                    parent_id: None,
-                    procedure_id: Some(*procedure_id),
-                };
                 let Some(procedure_and_parent) = self.load_one_procedure(*procedure_id) else {
                     // Try to load other procedures.
                     continue;
                 };
 
-                // If unable to submit to new procedure, we abort the recover process.
-                self.submit(opts, procedure_and_parent.0).await?;
+                self.submit_with_id(*procedure_id, procedure_and_parent.0).await;
             }
         }
 
@@ -575,6 +614,8 @@ impl Runner {
                     match status {
                         Status::Executing { .. } => (),
                         Status::Suspended { .. } => {
+                            todo!("Execute subprocedures");
+
                             logging::info!(
                                 "Procedure {}-{} is waiting for subprocedures",
                                 self.procedure.type_name(),

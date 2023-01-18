@@ -20,5 +20,5 @@ mod procedure;
 pub use crate::error::{Error, Result};
 pub use crate::procedure::{
     BoxedProcedure, Context, Handle, LockKey, Procedure, ProcedureId, ProcedureManager,
-    ProcedureManagerRef, StandaloneManager, Status, SubmitOptions,
+    ProcedureManagerRef, StandaloneManager, Status,
 };

@@ -27,7 +27,6 @@ use uuid::Uuid;
 use crate::error::{JoinSnafu, Result};
 
 /// Procedure execution status.
-#[derive(Debug)]
 pub enum Status {
     /// The procedure is still executing.
     Executing {
@@ -36,6 +35,7 @@ pub enum Status {
     },
     /// The procedure has suspended itself and is waiting for subprocedures.
     Suspended {
+        subprocedures: Vec<BoxedProcedure>,
         /// Whether the framework need to persist the procedure.
         persist: bool,
     },
@@ -52,7 +52,7 @@ impl Status {
     /// Returns `true` if the procedure needs the framework to persist its state.
     pub fn need_persist(&self) -> bool {
         match self {
-            Status::Executing { persist } | Status::Suspended { persist } => *persist,
+            Status::Executing { persist } | Status::Suspended { persist, .. } => *persist,
             Status::Done => false,
         }
     }
@@ -175,18 +175,6 @@ pub enum ProcedureState {
     Failed,
 }
 
-/// Options to submit a procedure.
-#[derive(Debug, Default)]
-pub struct SubmitOptions {
-    /// Parent procedure id.
-    pub parent_id: Option<ProcedureId>,
-    /// Current procedure id.
-    ///
-    /// If this id is specific, the procedure manager can use this id to load the
-    /// cached procedure data from the procedure store.
-    pub procedure_id: Option<ProcedureId>,
-}
-
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]
 pub trait ProcedureManager: Send + Sync + 'static {
@@ -194,7 +182,7 @@ pub trait ProcedureManager: Send + Sync + 'static {
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
     /// Submits a [Procedure] to execute.
-    async fn submit(&self, opts: SubmitOptions, procedure: BoxedProcedure) -> Result<Handle>;
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
 
     /// Recovers unfinished procedures and reruns them.
     ///
