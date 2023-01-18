@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ use crate::error::{
 };
 use crate::procedure::{
     BoxedProcedure, BoxedProcedureLoader, Context, Handle, ProcedureId, ProcedureManager,
-    ProcedureMessage, Status, SubmitOptions,
+    ProcedureMessage, ProcedureState, Status, SubmitOptions,
 };
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
@@ -148,6 +149,7 @@ impl ProcedureManager for StandaloneManager {
             lock_notify: Notify::new(),
             parent_id: opts.parent_id,
             child_notify: Notify::new(),
+            state: AtomicState::new(),
         });
         let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
@@ -199,6 +201,10 @@ impl ProcedureManager for StandaloneManager {
 
         Ok(())
     }
+
+    async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>> {
+        Ok(self.manager_ctx.state(procedure_id))
+    }
 }
 
 #[derive(Default)]
@@ -230,6 +236,28 @@ impl StateStore for MemStateStore {
     }
 }
 
+#[derive(Debug)]
+struct AtomicState(AtomicU8);
+
+impl AtomicState {
+    fn new() -> AtomicState {
+        AtomicState(AtomicU8::new(ProcedureState::Running as u8))
+    }
+
+    fn set(&self, state: ProcedureState) {
+        self.0.store(state as u8, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> ProcedureState {
+        match self.0.load(Ordering::Relaxed) {
+            v if v == ProcedureState::Running as u8 => ProcedureState::Running,
+            v if v == ProcedureState::Done as u8 => ProcedureState::Done,
+            v if v == ProcedureState::Failed as u8 => ProcedureState::Failed,
+            _ => unreachable!(),
+        }
+    }
+}
+
 // We can add a cancelation flag here.
 /// Shared metadata of a procedure.
 #[derive(Debug)]
@@ -242,6 +270,8 @@ struct ProcedureMeta {
     parent_id: Option<ProcedureId>,
     /// Notify to waiting for subprocedures.
     child_notify: Notify,
+    /// State of the procedure.
+    state: AtomicState,
 }
 
 type ProcedureMetaRef = Arc<ProcedureMeta>;
@@ -263,6 +293,11 @@ impl ManagerContext {
     fn insert_procedure(&self, procedure_id: ProcedureId, meta: ProcedureMetaRef) {
         let mut procedures = self.procedures.write().unwrap();
         procedures.insert(procedure_id, meta);
+    }
+
+    fn state(&self, procedure_id: ProcedureId) -> Option<ProcedureState> {
+        let procedures = self.procedures.read().unwrap();
+        procedures.get(&procedure_id).map(|meta| meta.state.get())
     }
 
     /// Acquire the lock for the procedure or wait for the lock.
@@ -523,9 +558,11 @@ impl Runner {
                             return Ok(());
                         }
                     }
-                },
+                }
                 Err(e) => {
                     logging::error!(e; "Failed to execute procedure {}-{}", self.procedure.type_name(), self.meta.id);
+
+                    self.meta.state.set(ProcedureState::Failed);
                     // TODO(yingwen): Retry and rollback if it can't proceed.
                     return Err(e);
                 }
@@ -554,7 +591,14 @@ impl Runner {
 
     fn done(&self) {
         // TODO(yingwen): Add files to remove list.
-        logging::info!("Procedure {}-{} done", self.procedure.type_name(), self.meta.id);
+        logging::info!(
+            "Procedure {}-{} done",
+            self.procedure.type_name(),
+            self.meta.id
+        );
+
+        // Mark the state of this procedure to done.
+        self.meta.state.set(ProcedureState::Done);
 
         // Notify parent procedure.
         if let Some(parent_id) = self.meta.parent_id {

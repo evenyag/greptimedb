@@ -163,6 +163,17 @@ impl Handle {
 /// Loader to recover the [Procedure] instance from serialized data.
 pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
+/// State of a submitted procedure.
+#[derive(Debug)]
+pub enum ProcedureState {
+    /// The procedure is running.
+    Running = 0,
+    /// The procedure is finished.
+    Done,
+    /// The procedure is failed.
+    Failed,
+}
+
 /// Options to submit a procedure.
 #[derive(Debug, Default)]
 pub struct SubmitOptions {
@@ -188,6 +199,11 @@ pub trait ProcedureManager: Send + Sync + 'static {
     ///
     /// Callers should ensure all loaders are registered.
     async fn recover(&self) -> Result<()>;
+
+    /// Query the procedure state.
+    ///
+    /// Returns `Ok(None)` if the procedure doesn't exist.
+    async fn procedure_state(&self, procedure_id: ProcedureId) -> Result<Option<ProcedureState>>;
 }
 
 /// Ref-counted pointer to the [ProcedureManager].
