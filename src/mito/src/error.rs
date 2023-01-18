@@ -171,11 +171,8 @@ pub enum Error {
         source: common_procedure::Error,
     },
 
-    #[snafu(display("Failed to join procedure, source: {}", source))]
-    JoinProcedure {
-        #[snafu(backtrace)]
-        source: common_procedure::Error,
-    },
+    #[snafu(display("Failed to exec procedure"))]
+    ExecProcedure { backtrace: Backtrace },
 
     #[snafu(display("Failed to serialize procedure to json, source: {}", source))]
     SerializeProcedure {
@@ -226,7 +223,7 @@ impl ErrorExt for Error {
                 StatusCode::StorageUnavailable
             }
 
-            JoinProcedure { .. } | SerializeProcedure { .. } | DeserializeProcedure { .. } => {
+            ExecProcedure { .. } | SerializeProcedure { .. } | DeserializeProcedure { .. } => {
                 StatusCode::Internal
             }
         }

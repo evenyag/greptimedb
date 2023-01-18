@@ -19,12 +19,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
 pub use standalone::StandaloneManager;
-use tokio::sync::oneshot::{self, Receiver, Sender};
 use uuid::Uuid;
 
-use crate::error::{JoinSnafu, Result};
+use crate::error::Result;
 
 /// Procedure execution status.
 pub enum Status {
@@ -127,41 +125,6 @@ impl fmt::Display for ProcedureId {
     }
 }
 
-// TODO(yingwen): The handle is a bit useless, we could remove it.
-/// Handle to join on a procedure.
-pub struct Handle {
-    procedure_id: ProcedureId,
-    receiver: Receiver<Result<()>>,
-}
-
-impl Handle {
-    /// Returns a sender and a handle to join the procedure with specific
-    /// `procedure_id`.
-    ///
-    /// The [ProcedureManager] could use the sender to notify the handle.
-    pub fn new(procedure_id: ProcedureId) -> (Handle, Sender<Result<()>>) {
-        let (sender, receiver) = oneshot::channel();
-        let handle = Handle {
-            procedure_id,
-            receiver,
-        };
-        (handle, sender)
-    }
-
-    /// Returns the id of the procedure to join.
-    #[inline]
-    pub fn procedure_id(&self) -> ProcedureId {
-        self.procedure_id
-    }
-
-    /// Joins the result from the sender.
-    pub async fn join(self) -> Result<()> {
-        self.receiver.await.context(JoinSnafu {
-            procedure_id: self.procedure_id,
-        })?
-    }
-}
-
 /// Loader to recover the [Procedure] instance from serialized data.
 pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
@@ -183,7 +146,7 @@ pub trait ProcedureManager: Send + Sync + 'static {
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
     /// Submits a [Procedure] to execute.
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle>;
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
 
     /// Recovers unfinished procedures and reruns them.
     ///

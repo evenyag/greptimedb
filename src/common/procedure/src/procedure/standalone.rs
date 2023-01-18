@@ -21,15 +21,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common_telemetry::logging;
 use snafu::{ensure, ResultExt};
-use tokio::sync::oneshot::Sender;
-use tokio::sync::{Barrier, Notify};
+use tokio::sync::Notify;
 use tokio::time;
 
-use crate::error::{
-    DuplicateProcedureSnafu, LoaderConflictSnafu, Result, SubmitInvalidProcedureSnafu, ToJsonSnafu,
-};
+use crate::error::{LoaderConflictSnafu, Result, ToJsonSnafu};
 use crate::procedure::{
-    BoxedProcedure, BoxedProcedureLoader, Context, Handle, LockKey, ProcedureId, ProcedureManager,
+    BoxedProcedure, BoxedProcedureLoader, Context, LockKey, ProcedureId, ProcedureManager,
     ProcedureMessage, ProcedureState, Status,
 };
 
@@ -70,7 +67,7 @@ impl StandaloneManager {
     }
 
     /// Submit a root procedure with given `procedure_id`.
-    async fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) -> Handle {
+    async fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) {
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             lock_notify: Notify::new(),
@@ -80,31 +77,20 @@ impl StandaloneManager {
             parent_locks: Vec::new(),
             lock_key: procedure.lock_key(),
         });
-        let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
             meta: meta.clone(),
             procedure,
             manager_ctx: self.manager_ctx.clone(),
-            sender,
             step: 0,
             store: ProcedureStore(self.state_store.clone()),
         };
 
-        let barrier = Arc::new(Barrier::new(2));
-        let task_barrier = barrier.clone();
-        common_runtime::spawn_bg(async move {
-            // We need to wait until we inserts the meta into the manager context.
-            task_barrier.wait().await;
+        self.manager_ctx.insert_procedure(procedure_id, meta);
 
+        common_runtime::spawn_bg(async move {
             // Run the root procedure.
             runner.run().await
         });
-
-        self.manager_ctx.insert_procedure(procedure_id, meta);
-        // Notify the task to run the runner.
-        barrier.wait().await;
-
-        handle
     }
 }
 
@@ -119,88 +105,12 @@ impl ProcedureManager for StandaloneManager {
         Ok(())
     }
 
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<Handle> {
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<()> {
         let procedure_id = ProcedureId::random();
+        self.submit_with_id(procedure_id, procedure).await;
 
-        let handle = self.submit_with_id(procedure_id, procedure).await;
-        Ok(handle)
+        Ok(())
     }
-
-    // async fn submit(&self, opts: SubmitOptions, mut procedure: BoxedProcedure) -> Result<Handle> {
-    //     // TODO(yingwen): Checks whether parent procedure exists.
-
-    //     if let (Some(parent_id), Some(procedure_id)) = (opts.parent_id, opts.procedure_id) {
-    //         // Since we submit the root procedure while recovering, we only need to check whether
-    //         // we can load a child procedure.
-    //         if let Some(procedure_and_parent) = self.load_one_procedure(procedure_id) {
-    //             if opts.parent_id != procedure_and_parent.1 {
-    //                 // Check parent id.
-    //                 return SubmitInvalidProcedureSnafu {
-    //                     reason: format!(
-    //                         "parent id {} of options is not equal to {:?} from procedure store",
-    //                         parent_id, procedure_and_parent.1
-    //                     ),
-    //                 }
-    //                 .fail()?;
-    //             }
-    //             // Now we can use the dumped procedure from the procedure store.
-    //             procedure = procedure_and_parent.0;
-    //         }
-    //     }
-
-    //     let procedure_id = opts.procedure_id.unwrap_or_else(ProcedureId::random);
-    //     ensure!(
-    //         !self.manager_ctx.contains_procedure(procedure_id),
-    //         DuplicateProcedureSnafu { procedure_id }
-    //     );
-
-    //     // Inherit locks from the parent procedure.
-    //     let parent_locks = opts
-    //         .parent_id
-    //         .map(|parent_id| self.manager_ctx.owned_locks(parent_id))
-    //         .unwrap_or_default();
-    //     let mut current_lock = procedure.lock_key();
-    //     if let Some(lock) = &current_lock {
-    //         if parent_locks.contains(lock) {
-    //             // If the parent procedure already holds this lock.
-    //             current_lock = None;
-    //         }
-    //     }
-
-    //     let meta = Arc::new(ProcedureMeta {
-    //         id: procedure_id,
-    //         lock_notify: Notify::new(),
-    //         parent_id: opts.parent_id,
-    //         child_notify: Notify::new(),
-    //         state: AtomicState::new(),
-    //         parent_locks: parent_locks,
-    //         lock_key: current_lock,
-    //     });
-    //     let (handle, sender) = Handle::new(procedure_id);
-    //     let runner = Runner {
-    //         meta: meta.clone(),
-    //         procedure,
-    //         manager_ctx: self.manager_ctx.clone(),
-    //         sender,
-    //         step: 0,
-    //         store: ProcedureStore(self.state_store.clone()),
-    //     };
-
-    //     let barrier = Arc::new(Barrier::new(2));
-    //     let task_barrier = barrier.clone();
-    //     common_runtime::spawn_bg(async move {
-    //         // We need to wait until we inserts the meta into the manager context.
-    //         task_barrier.wait().await;
-
-    //         runner.run().await
-    //     });
-
-    //     self.manager_ctx.insert_procedure(procedure_id, meta);
-    //     // Notify the task to run the runner.
-    //     barrier.wait().await;
-
-    //     Ok(handle)
-    // }
 
     async fn recover(&self) -> Result<()> {
         let procedure_store = ProcedureStore(self.state_store.clone());
@@ -371,12 +281,6 @@ impl ManagerContext {
         procedures.remove(&procedure_id);
     }
 
-    /// Returns true if the procedure exists.
-    fn contains_procedure(&self, procedure_id: ProcedureId) -> bool {
-        let procedures = self.procedures.read().unwrap();
-        procedures.contains_key(&procedure_id)
-    }
-
     /// Notify a parent procedure with given `procedure_id` by its subprocedure.
     fn notify_by_subprocedure(&self, procedure_id: ProcedureId) {
         let procedures = self.procedures.read().unwrap();
@@ -384,23 +288,6 @@ impl ManagerContext {
             meta.child_notify.notify_one();
         }
     }
-
-    // /// Return all locks the procedure owns.
-    // fn owned_locks(&self, procedure_id: ProcedureId) -> Vec<LockKey> {
-    //     let procedures = self.procedures.read().unwrap();
-    //     if let Some(meta) = procedures.get(&procedure_id) {
-    //         let num_locks = meta.parent_locks.len() + if meta.lock_key.is_some() { 1 } else { 0 };
-    //         let mut locks = Vec::with_capacity(num_locks);
-    //         locks.extend_from_slice(&meta.parent_locks);
-    //         if let Some(key) = &meta.lock_key {
-    //             locks.push(key.clone());
-    //         }
-
-    //         locks
-    //     } else {
-    //         Vec::new()
-    //     }
-    // }
 
     /// Load procedure with specific `procedure_id`.
     fn load_one_procedure(&self, procedure_id: ProcedureId) -> Option<ProcedureAndParent> {
@@ -578,7 +465,6 @@ struct Runner {
     meta: ProcedureMetaRef,
     procedure: BoxedProcedure,
     manager_ctx: Arc<ManagerContext>,
-    sender: Sender<Result<()>>,
     step: u32,
     store: ProcedureStore,
 }
@@ -596,15 +482,18 @@ impl Runner {
             self.manager_ctx.acquire_lock(key, &self.meta).await;
         }
         // Execute the procedure.
-        let execute_result = self.execute_procedure().await;
+        if let Err(e) = self.execute_procedure().await {
+            logging::error!(
+                e; "Failed to execute procedure {}-{}",
+                self.procedure.type_name(),
+                self.meta.id
+            );
+        }
 
         if let Some(key) = &lock_key {
             self.manager_ctx.release_lock(key);
         }
 
-        // Ignore the result since the callers can drop the handle if they don't
-        // need the return value.
-        let _ = self.sender.send(execute_result);
         self.manager_ctx.remove_procedure(self.meta.id);
     }
 
@@ -640,17 +529,16 @@ impl Runner {
             parent_locks: parent_locks,
             lock_key: child_lock,
         });
-        let (handle, sender) = Handle::new(procedure_id);
         let runner = Runner {
             meta: meta.clone(),
             procedure,
             manager_ctx: self.manager_ctx.clone(),
-            sender,
             step: 0,
             store: self.store.clone(),
         };
 
         self.manager_ctx.insert_procedure(procedure_id, meta);
+
         common_runtime::spawn_bg(async move {
             // Run the root procedure.
             runner.run().await

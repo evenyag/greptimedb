@@ -40,7 +40,7 @@ use tokio::sync::Mutex;
 use crate::config::EngineConfig;
 use crate::engine::procedure::CreateTableProcedure;
 use crate::error::{
-    self, InvalidPrimaryKeySnafu, JoinProcedureSnafu, MissingTimestampIndexSnafu, Result,
+    self, ExecProcedureSnafu, InvalidPrimaryKeySnafu, MissingTimestampIndexSnafu, Result,
     SubmitProcedureSnafu, TableExistsSnafu,
 };
 use crate::table::MitoTable;
@@ -241,20 +241,11 @@ impl<S: StorageEngine> MitoEngineInner<S> {
 
         let (procedure, mut table_receiver) = CreateTableProcedure::new(request, self.clone());
 
-        let handle = self
-            .procedure_manager
+        self.procedure_manager
             .submit(Box::new(procedure))
             .await
             .context(SubmitProcedureSnafu)?;
-        handle.join().await.context(JoinProcedureSnafu)?;
-
-        // Safety: Since the procedure is finished, we expect the table is always available in the
-        // channel.
-        let table = table_receiver
-            .recv()
-            .await
-            .expect("Table unavailable after creation");
-
+        let table = table_receiver.recv().await.context(ExecProcedureSnafu)?;
         Ok(table)
     }
 

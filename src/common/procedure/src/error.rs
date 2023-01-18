@@ -15,7 +15,6 @@
 use std::any::Any;
 
 use common_error::prelude::*;
-use tokio::sync::oneshot::error::RecvError;
 
 use crate::procedure::ProcedureId;
 
@@ -31,29 +30,12 @@ pub enum Error {
         source: BoxedError,
     },
 
-    #[snafu(display(
-        "Failed to join the procedure {}, the sender is dropped: {}",
-        procedure_id,
-        source
-    ))]
-    Join {
-        procedure_id: ProcedureId,
-        source: RecvError,
-        backtrace: Backtrace,
-    },
-
     #[snafu(display("Loader {} is already registered", name))]
     LoaderConflict { name: String, backtrace: Backtrace },
 
     #[snafu(display("Failed to serialize to json, source: {}", source))]
     ToJson {
         source: serde_json::Error,
-        backtrace: Backtrace,
-    },
-
-    #[snafu(display("Failed to submit procedure, input is invalid, reason: {}", reason))]
-    SubmitInvalidProcedure {
-        reason: String,
         backtrace: Backtrace,
     },
 
@@ -70,10 +52,10 @@ impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Error::External { source } => source.status_code(),
-            Error::Join { .. } | Error::ToJson { .. } => StatusCode::Internal,
-            Error::LoaderConflict { .. }
-            | Error::SubmitInvalidProcedure { .. }
-            | Error::DuplicateProcedure { .. } => StatusCode::InvalidArguments,
+            Error::ToJson { .. } => StatusCode::Internal,
+            Error::LoaderConflict { .. } | Error::DuplicateProcedure { .. } => {
+                StatusCode::InvalidArguments
+            }
         }
     }
 
