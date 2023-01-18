@@ -27,7 +27,7 @@ use tokio::time;
 use crate::error::{LoaderConflictSnafu, Result, ToJsonSnafu};
 use crate::procedure::{
     BoxedProcedure, BoxedProcedureLoader, Context, LockKey, ProcedureId, ProcedureManager,
-    ProcedureMessage, ProcedureState, Status,
+    ProcedureMessage, ProcedureState, ProcedureWithId, Status,
 };
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
@@ -67,7 +67,7 @@ impl StandaloneManager {
     }
 
     /// Submit a root procedure with given `procedure_id`.
-    async fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) {
+    fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) {
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             lock_notify: Notify::new(),
@@ -105,11 +105,11 @@ impl ProcedureManager for StandaloneManager {
         Ok(())
     }
 
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<()> {
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<ProcedureId> {
         let procedure_id = ProcedureId::random();
-        self.submit_with_id(procedure_id, procedure).await;
+        self.submit_with_id(procedure_id, procedure);
 
-        Ok(())
+        Ok(procedure_id)
     }
 
     async fn recover(&self) -> Result<()> {
@@ -125,8 +125,7 @@ impl ProcedureManager for StandaloneManager {
                     continue;
                 };
 
-                self.submit_with_id(*procedure_id, procedure_and_parent.0)
-                    .await;
+                self.submit_with_id(*procedure_id, procedure_and_parent.0);
             }
         }
 
@@ -599,9 +598,9 @@ impl Runner {
         }
     }
 
-    async fn on_suspended(&self, subprocedures: Vec<BoxedProcedure>) {
+    async fn on_suspended(&self, subprocedures: Vec<ProcedureWithId>) {
         for subprocedure in subprocedures {
-            self.submit_sub(ProcedureId::random(), subprocedure);
+            self.submit_sub(subprocedure.id, subprocedure.procedure);
         }
 
         logging::info!(

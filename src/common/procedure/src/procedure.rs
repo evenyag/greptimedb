@@ -33,7 +33,7 @@ pub enum Status {
     },
     /// The procedure has suspended itself and is waiting for subprocedures.
     Suspended {
-        subprocedures: Vec<BoxedProcedure>,
+        subprocedures: Vec<ProcedureWithId>,
         /// Whether the framework need to persist the procedure.
         persist: bool,
     },
@@ -103,6 +103,13 @@ impl LockKey {
 /// Boxed [Procedure].
 pub type BoxedProcedure = Box<dyn Procedure>;
 
+/// A procedure with specific id.
+pub struct ProcedureWithId {
+    /// Id of the procedure.
+    pub id: ProcedureId,
+    pub procedure: BoxedProcedure,
+}
+
 /// Unique id for [Procedure].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcedureId(Uuid);
@@ -146,7 +153,7 @@ pub trait ProcedureManager: Send + Sync + 'static {
     fn register_loader(&self, name: &str, loader: BoxedProcedureLoader) -> Result<()>;
 
     /// Submits a [Procedure] to execute.
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<()>;
+    async fn submit(&self, procedure: BoxedProcedure) -> Result<ProcedureId>;
 
     /// Recovers unfinished procedures and reruns them.
     ///
