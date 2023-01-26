@@ -135,6 +135,8 @@ impl<S: StorageEngine> CreateTableProcedure<S> {
         // Now we only support creating one region in the table.
         assert_eq!(request.region_numbers.len(), 1);
 
+        // TODO(yingwen): In fact we could use oneshot, since we have only one receiver
+        // and we can skip if we the sender is none.
         // We can't use oneshot as the procedure might call `send()` multiple times.
         let (sender, receiver) = mpsc::channel(1);
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use catalog::CatalogManagerRef;
+use common_procedure::ProcedureManagerRef;
 use common_query::Output;
 use common_telemetry::error;
 use query::query_engine::QueryEngineRef;
@@ -51,6 +52,7 @@ pub struct SqlHandler {
     table_engine: TableEngineRef,
     catalog_manager: CatalogManagerRef,
     query_engine: QueryEngineRef,
+    procedure_manager: ProcedureManagerRef,
 }
 
 impl SqlHandler {
@@ -58,11 +60,13 @@ impl SqlHandler {
         table_engine: TableEngineRef,
         catalog_manager: CatalogManagerRef,
         query_engine: QueryEngineRef,
+        procedure_manager: ProcedureManagerRef,
     ) -> Self {
         Self {
             table_engine,
             catalog_manager,
             query_engine,
+            procedure_manager,
         }
     }
 
@@ -235,6 +239,7 @@ mod tests {
                            ('host2', 88.8,  333.3, 1655276558000)
                            "#;
 
+        let procedure_manager = Arc::new(StandaloneManager::new());
         let table_engine = Arc::new(MitoEngine::<EngineImpl<NoopLogStore>>::new(
             TableEngineConfig::default(),
             EngineImpl::new(
@@ -243,7 +248,7 @@ mod tests {
                 object_store.clone(),
             ),
             object_store,
-            Arc::new(StandaloneManager::new()),
+            procedure_manager.clone(),
         ));
 
         let catalog_list = Arc::new(
@@ -261,7 +266,12 @@ mod tests {
 
         let factory = QueryEngineFactory::new(catalog_list.clone());
         let query_engine = factory.query_engine();
-        let sql_handler = SqlHandler::new(table_engine, catalog_list.clone(), query_engine.clone());
+        let sql_handler = SqlHandler::new(
+            table_engine,
+            catalog_list.clone(),
+            query_engine.clone(),
+            procedure_manager,
+        );
 
         let stmt = match QueryLanguageParser::parse_sql(sql).unwrap() {
             QueryStatement::Sql(Statement::Insert(i)) => i,

@@ -116,7 +116,7 @@ pub struct ProcedureId(Uuid);
 
 impl ProcedureId {
     /// Returns a new ProcedureId randomly.
-    fn random() -> ProcedureId {
+    pub fn random() -> ProcedureId {
         ProcedureId(Uuid::new_v4())
     }
 
@@ -139,13 +139,14 @@ pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Sen
 #[derive(Debug)]
 pub enum ProcedureState {
     /// The procedure is running.
-    Running = 0,
+    Running,
     /// The procedure is finished.
     Done,
     /// The procedure is failed.
     Failed,
 }
 
+// TODO(yingwen): Shutdown
 /// `ProcedureManager` executes [Procedure] submitted to it.
 #[async_trait]
 pub trait ProcedureManager: Send + Sync + 'static {

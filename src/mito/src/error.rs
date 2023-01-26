@@ -129,10 +129,7 @@ pub enum Error {
     },
 
     #[snafu(display("Table already exists: {}", table_name))]
-    TableExists {
-        backtrace: Backtrace,
-        table_name: String,
-    },
+    TableExists { table_name: String },
 
     #[snafu(display("Table not found: {}", table_name))]
     TableNotFound {
@@ -219,13 +216,13 @@ impl ErrorExt for Error {
 
             ConvertRaw { .. } | InvalidRawSchema { .. } => StatusCode::Unexpected,
 
-            ScanTableManifest { .. } | UpdateTableManifest { .. } | SubmitProcedure { .. } => {
-                StatusCode::StorageUnavailable
-            }
+            ScanTableManifest { .. } | UpdateTableManifest { .. } => StatusCode::StorageUnavailable,
 
             ExecProcedure { .. } | SerializeProcedure { .. } | DeserializeProcedure { .. } => {
                 StatusCode::Internal
             }
+
+            SubmitProcedure { source } => source.status_code(),
         }
     }
 

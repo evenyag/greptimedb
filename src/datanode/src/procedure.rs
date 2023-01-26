@@ -15,3 +15,25 @@
 //! Procedures for datanode.
 
 mod create;
+
+use catalog::CatalogManagerRef;
+use common_procedure::ProcedureManagerRef;
+pub use create::CreateTableProcedure;
+use table::engine::TableEngineRef;
+
+/// Register all procedure loaders to the procedure manager.
+///
+/// # Panics
+/// Panics on error.
+pub(crate) fn register_procedure_loaders(
+    catalog_manager: CatalogManagerRef,
+    table_engine: TableEngineRef,
+    procedure_manager: ProcedureManagerRef,
+) {
+    // The procedure names are expected to be unique, so we just panic on error.
+    CreateTableProcedure::register_loader(
+        catalog_manager.clone(),
+        table_engine.clone(),
+        procedure_manager.clone(),
+    );
+}

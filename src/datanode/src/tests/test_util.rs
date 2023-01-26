@@ -133,11 +133,12 @@ pub(crate) async fn create_test_table(
 
 pub async fn create_mock_sql_handler() -> SqlHandler {
     let (_dir, object_store) = new_test_object_store("setup_mock_engine_and_table").await;
+    let procedure_manager = Arc::new(StandaloneManager::new());
     let mock_engine = Arc::new(MockMitoEngine::new(
         EngineConfig::default(),
         MockEngine::default(),
         object_store,
-        Arc::new(StandaloneManager::new()),
+        procedure_manager.clone(),
     ));
     let catalog_manager = Arc::new(
         catalog::local::LocalCatalogManager::try_new(mock_engine.clone())
@@ -148,7 +149,12 @@ pub async fn create_mock_sql_handler() -> SqlHandler {
     let catalog_list = catalog::local::new_memory_catalog_list().unwrap();
     let factory = QueryEngineFactory::new(catalog_list);
 
-    SqlHandler::new(mock_engine, catalog_manager, factory.query_engine())
+    SqlHandler::new(
+        mock_engine,
+        catalog_manager,
+        factory.query_engine(),
+        procedure_manager,
+    )
 }
 
 pub(crate) async fn setup_test_instance(test_name: &str) -> MockInstance {

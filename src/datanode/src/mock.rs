@@ -47,6 +47,7 @@ impl Instance {
         let object_store = new_object_store(&opts.storage).await?;
         let logstore = Arc::new(create_log_store(&opts.wal).await?);
         let meta_client = Arc::new(mock_meta_client(meta_srv, opts.node_id.unwrap_or(42)).await);
+        let procedure_manager = Arc::new(StandaloneManager::new());
         let table_engine = Arc::new(DefaultEngine::new(
             TableEngineConfig::default(),
             EngineImpl::new(
@@ -55,7 +56,7 @@ impl Instance {
                 object_store.clone(),
             ),
             object_store,
-            Arc::new(StandaloneManager::new()),
+            procedure_manager.clone(),
         ));
 
         // By default, catalog manager and factory are created in standalone mode
@@ -98,6 +99,7 @@ impl Instance {
                 table_engine,
                 catalog_manager.clone(),
                 query_engine.clone(),
+                procedure_manager,
             ),
             catalog_manager,
             script_executor,

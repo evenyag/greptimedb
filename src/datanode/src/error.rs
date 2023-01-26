@@ -327,6 +327,30 @@ pub enum Error {
         source: serde_json::Error,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("Failed to deserialize procedure from json, source: {}", source))]
+    DeserializeProcedure {
+        source: serde_json::Error,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Invalid raw schema, source: {}", source))]
+    InvalidRawSchema {
+        #[snafu(backtrace)]
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Failed to submit procedure, source: {}", source))]
+    SubmitProcedure {
+        #[snafu(backtrace)]
+        source: common_procedure::Error,
+    },
+
+    #[snafu(display("Failed to recv procedure result, source: {}", source))]
+    RecvProcedureResult {
+        source: tokio::sync::oneshot::error::RecvError,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -384,7 +408,10 @@ impl ErrorExt for Error {
             | Error::Catalog { .. }
             | Error::MissingRequiredField { .. }
             | Error::IncorrectInternalState { .. }
-            | Error::SerializeProcedure { .. } => StatusCode::Internal,
+            | Error::SerializeProcedure { .. }
+            | Error::DeserializeProcedure { .. }
+            | Error::InvalidRawSchema { .. }
+            | Error::RecvProcedureResult { .. } => StatusCode::Internal,
 
             Error::InitBackend { .. } => StatusCode::StorageUnavailable,
             Error::OpenLogStore { source } => source.status_code(),
@@ -399,6 +426,7 @@ impl ErrorExt for Error {
             Error::ColumnDefaultValue { source, .. } => source.status_code(),
             Error::ColumnNoneDefaultValue { .. } => StatusCode::InvalidArguments,
             Error::RecoverProcedures { source } => source.status_code(),
+            Error::SubmitProcedure { source } => source.status_code(),
         }
     }
 

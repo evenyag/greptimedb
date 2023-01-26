@@ -49,6 +49,7 @@ use crate::error::{
     NewCatalogSnafu, OpenLogStoreSnafu, RecoverProceduresSnafu, Result,
 };
 use crate::heartbeat::HeartbeatTask;
+use crate::procedure;
 use crate::script::ScriptExecutor;
 use crate::sql::SqlHandler;
 
@@ -155,6 +156,13 @@ impl Instance {
             }
         };
 
+        // Register datanode's procedures.
+        procedure::register_procedure_loaders(
+            catalog_manager.clone(),
+            table_engine.clone(),
+            procedure_manager.clone(),
+        );
+
         // Recover procedures.
         procedure_manager
             .recover()
@@ -181,6 +189,7 @@ impl Instance {
                 table_engine,
                 catalog_manager.clone(),
                 query_engine.clone(),
+                procedure_manager,
             ),
             catalog_manager,
             script_executor,

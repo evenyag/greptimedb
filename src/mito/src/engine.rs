@@ -271,6 +271,11 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             schema: &request.schema_name,
             table: &request.table_name,
         };
+        logging::info!(
+            "create table procedure, create_if_not_exists {}, has: {}",
+            request.create_if_not_exists,
+            self.get_table(&table_ref).is_none()
+        );
         ensure!(
             request.create_if_not_exists || self.get_table(&table_ref).is_none(),
             TableExistsSnafu {

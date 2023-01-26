@@ -325,6 +325,7 @@ async fn test_execute_show_databases_tables() {
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn test_execute_create() {
+    common_telemetry::init_default_ut_logging();
     let instance = MockInstance::new("execute_create").await;
 
     let output = execute_sql(

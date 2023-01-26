@@ -248,9 +248,15 @@ impl ManagerContext {
         }
     }
 
+    fn contains_procedure(&self, procedure_id: ProcedureId) -> bool {
+        let procedures = self.procedures.read().unwrap();
+        procedures.contains_key(&procedure_id)
+    }
+
     fn insert_procedure(&self, procedure_id: ProcedureId, meta: ProcedureMetaRef) {
         let mut procedures = self.procedures.write().unwrap();
-        procedures.insert(procedure_id, meta);
+        let old = procedures.insert(procedure_id, meta);
+        assert!(old.is_none());
     }
 
     fn state(&self, procedure_id: ProcedureId) -> Option<ProcedureState> {
@@ -270,14 +276,6 @@ impl ManagerContext {
     /// Release the lock for the procedure and notify the new owner of the lock.
     fn release_lock(&self, lock_key: &LockKey) {
         self.lock_map.release_lock(lock_key.key());
-    }
-
-    /// Remove metadata of the procedure.
-    ///
-    /// The procedure MUST release the lock it holds before invoking this method.
-    fn remove_procedure(&self, procedure_id: ProcedureId) {
-        let mut procedures = self.procedures.write().unwrap();
-        procedures.remove(&procedure_id);
     }
 
     /// Notify a parent procedure with given `procedure_id` by its subprocedure.
@@ -492,8 +490,10 @@ impl Runner {
         if let Some(key) = &lock_key {
             self.manager_ctx.release_lock(key);
         }
-
-        self.manager_ctx.remove_procedure(self.meta.id);
+        // We can't remove the metadata of the procedure now as users and its parent might
+        // need to query its state.
+        // TODO(yingwen): 1. Add TTL to the metadata; 2. Only keep state in the procedure store
+        // so we don't need to always store the metadata in memory after the procedure is done.
     }
 
     /// Submit a subprocedure.
@@ -505,6 +505,11 @@ impl Runner {
 
             // Use the dumped procedure from the procedure store.
             procedure = procedure_and_parent.0;
+        }
+
+        if self.manager_ctx.contains_procedure(procedure_id) {
+            // If the parent has already submitted this procedure, don't submit it again.
+            return;
         }
 
         // Inherit locks from the parent procedure. This procedure can submit a subprocedure,
