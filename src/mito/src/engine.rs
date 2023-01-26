@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
-use common_procedure::ProcedureManagerRef;
+use common_procedure::{BoxedProcedure, ProcedureManagerRef};
 use common_telemetry::logging;
 use object_store::ObjectStore;
 use snafu::{ensure, OptionExt, ResultExt};
@@ -108,6 +108,17 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
         self.inner
             .create_table(ctx, request)
             .await
+            .map_err(BoxedError::new)
+            .context(TableOperationSnafu)
+    }
+
+    fn create_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        request: CreateTableRequest,
+    ) -> TableResult<BoxedProcedure> {
+        self.inner
+            .create_table_procedure(request)
             .map_err(BoxedError::new)
             .context(TableOperationSnafu)
     }
@@ -217,6 +228,9 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         _ctx: &EngineContext,
         request: CreateTableRequest,
     ) -> Result<TableRef> {
+        validate_create_table_request(&request)?;
+
+        // TODO(yingwen): Remove local variables xxx_name
         let catalog_name = &request.catalog_name;
         let schema_name = &request.schema_name;
         let table_name = &request.table_name;
@@ -225,9 +239,6 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             schema: schema_name,
             table: table_name,
         };
-
-        validate_create_table_request(&request)?;
-
         if let Some(table) = self.get_table(&table_ref) {
             if request.create_if_not_exists {
                 return Ok(table);
@@ -247,6 +258,28 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             .context(SubmitProcedureSnafu)?;
         let table = table_receiver.recv().await.context(ExecProcedureSnafu)?;
         Ok(table)
+    }
+
+    fn create_table_procedure(
+        self: &Arc<Self>,
+        request: CreateTableRequest,
+    ) -> Result<BoxedProcedure> {
+        validate_create_table_request(&request)?;
+
+        let table_ref = TableReference {
+            catalog: &request.catalog_name,
+            schema: &request.schema_name,
+            table: &request.table_name,
+        };
+        ensure!(
+            request.create_if_not_exists || self.get_table(&table_ref).is_none(),
+            TableExistsSnafu {
+                table_name: table_ref.to_string(),
+            }
+        );
+
+        let (procedure, _recevier) = CreateTableProcedure::new(request, self.clone());
+        Ok(Box::new(procedure))
     }
 
     async fn open_table(

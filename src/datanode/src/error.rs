@@ -321,6 +321,12 @@ pub enum Error {
         #[snafu(source)]
         source: common_procedure::Error,
     },
+
+    #[snafu(display("Failed to serialize procedure to json, source: {}", source))]
+    SerializeProcedure {
+        source: serde_json::Error,
+        backtrace: Backtrace,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -377,7 +383,8 @@ impl ErrorExt for Error {
             | Error::RegisterSchema { .. }
             | Error::Catalog { .. }
             | Error::MissingRequiredField { .. }
-            | Error::IncorrectInternalState { .. } => StatusCode::Internal,
+            | Error::IncorrectInternalState { .. }
+            | Error::SerializeProcedure { .. } => StatusCode::Internal,
 
             Error::InitBackend { .. } => StatusCode::StorageUnavailable,
             Error::OpenLogStore { source } => source.status_code(),
@@ -407,6 +414,12 @@ impl ErrorExt for Error {
 impl From<Error> for tonic::Status {
     fn from(err: Error) -> Self {
         tonic::Status::from_error(Box::new(err))
+    }
+}
+
+impl From<Error> for common_procedure::Error {
+    fn from(e: Error) -> common_procedure::Error {
+        common_procedure::Error::external(e)
     }
 }
 

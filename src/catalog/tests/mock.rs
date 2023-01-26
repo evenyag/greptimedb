@@ -27,7 +27,7 @@ use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema};
 use datatypes::vectors::StringVector;
 use serde::Serializer;
-use table::engine::{EngineContext, TableEngine, TableReference};
+use table::engine::{BoxedProcedure, EngineContext, TableEngine, TableReference};
 use table::metadata::TableId;
 use table::requests::{AlterTableRequest, CreateTableRequest, DropTableRequest, OpenTableRequest};
 use table::test_util::MemTable;
@@ -171,6 +171,14 @@ impl TableEngine for MockTableEngine {
         let mut tables = self.tables.write().await;
         tables.insert(table_name, table.clone() as TableRef);
         Ok(table)
+    }
+
+    fn create_table_procedure(
+        &self,
+        _ctx: &EngineContext,
+        _request: CreateTableRequest,
+    ) -> table::Result<BoxedProcedure> {
+        unimplemented!()
     }
 
     async fn open_table(

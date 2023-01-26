@@ -19,7 +19,7 @@ mod create;
 use std::sync::Arc;
 
 use common_procedure::ProcedureManager;
-pub use create::CreateTableProcedure;
+pub use create::{CreateTableProcedure, TableReceiver};
 use store_api::storage::StorageEngine;
 
 use crate::engine::MitoEngineInner;

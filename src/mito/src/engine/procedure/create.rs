@@ -42,7 +42,8 @@ use crate::error::{
 };
 use crate::table::MitoTable;
 
-/// `CreateTableState` represents each step while creating table.
+/// `CreateTableState` represents each step while creating table in the
+/// mito engine.
 #[derive(Debug, Serialize, Deserialize)]
 enum CreateTableState {
     /// Prepare to create region.
