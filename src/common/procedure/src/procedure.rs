@@ -135,6 +135,7 @@ impl fmt::Display for ProcedureId {
 /// Loader to recover the [Procedure] instance from serialized data.
 pub type BoxedProcedureLoader = Box<dyn Fn(&str) -> Result<BoxedProcedure> + Send>;
 
+// TODO(yingwen): Find a way to return the error message if the procedure is failed.
 /// State of a submitted procedure.
 #[derive(Debug)]
 pub enum ProcedureState {

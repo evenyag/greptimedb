@@ -57,6 +57,12 @@ pub struct StandaloneManager {
     state_store: StateStoreRef,
 }
 
+impl Default for StandaloneManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StandaloneManager {
     /// Create a new StandaloneManager with default configurations.
     pub fn new() -> StandaloneManager {
@@ -448,7 +454,7 @@ impl ProcedureStore {
     }
 
     fn load_one_message(&self, key: &ParsedKey, value: &str) -> Option<ProcedureMessage> {
-        serde_json::from_str(&value)
+        serde_json::from_str(value)
             .map_err(|e| {
                 // `e` doesn't impl ErrorExt so we print it as normal error.
                 logging::error!("Failed to parse value, key: {:?}, source: {}", key, e);
@@ -530,7 +536,7 @@ impl Runner {
             parent_id: Some(self.meta.id),
             child_notify: Notify::new(),
             state: AtomicState::new(),
-            parent_locks: parent_locks,
+            parent_locks,
             lock_key: child_lock,
         });
         let runner = Runner {
