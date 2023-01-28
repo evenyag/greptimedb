@@ -28,13 +28,13 @@ use crate::error::Result;
 pub enum Status {
     /// The procedure is still executing.
     Executing {
-        /// Whether the framework need to persist the procedure.
+        /// Whether the framework needs to persist the procedure.
         persist: bool,
     },
     /// The procedure has suspended itself and is waiting for subprocedures.
     Suspended {
         subprocedures: Vec<ProcedureWithId>,
-        /// Whether the framework need to persist the procedure.
+        /// Whether the framework needs to persist the procedure.
         persist: bool,
     },
     /// the procedure is done.
@@ -63,7 +63,6 @@ pub struct Context {
     pub procedure_id: ProcedureId,
 }
 
-// FIXME(yingwen): Let the caller provides procedure id.
 /// A `Procedure` represents an operation or a set of operations to be performed step-by-step.
 #[async_trait]
 pub trait Procedure: Send + Sync {
