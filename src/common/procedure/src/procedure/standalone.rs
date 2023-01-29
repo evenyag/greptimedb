@@ -32,17 +32,20 @@ use crate::procedure::{
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
 
+/// Key value from state store.
+type KeyValue = (String, Vec<u8>);
+
 /// Key-value store for persisting procedure's state.
 #[async_trait]
 trait StateStore: Send + Sync {
     /// Puts `key` and `value` into the store.
     // TODO(yingwen): Maybe move the key/value?
-    async fn put(&self, key: &str, value: &str) -> Result<()>;
+    async fn put(&self, key: &str, value: &[u8]) -> Result<()>;
 
     /// Returns the key-value pairs that have the same key `prefix`.
     ///
     /// The `prefix` must ends with `/`.
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>>;
+    async fn list(&self, prefix: &str) -> Result<Vec<KeyValue>>;
 
     /// Deletes key-value pairs by `keys`.
     async fn delete(&self, keys: &[String]) -> Result<()>;
@@ -145,24 +148,24 @@ impl ProcedureManager for StandaloneManager {
 
 /// In-memory state store for test purpose.
 #[derive(Default)]
-struct MemStateStore(Mutex<BTreeMap<String, String>>);
+struct MemStateStore(Mutex<BTreeMap<String, Vec<u8>>>);
 
 #[async_trait]
 impl StateStore for MemStateStore {
-    async fn put(&self, key: &str, value: &str) -> Result<()> {
+    async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
         let mut tree = self.0.lock().unwrap();
-        tree.insert(key.to_string(), value.to_string());
+        tree.insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
-    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+    async fn list(&self, prefix: &str) -> Result<Vec<KeyValue>> {
         let tree = self.0.lock().unwrap();
         let key_values = tree
             .range(prefix.to_string()..)
             // Only collect key with the same prefix. In fact we could break the iterator earlier
             // if the key is not starts with the prefix, but using filter is enough for test.
             .filter(|(k, _v)| k.starts_with(prefix))
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         Ok(key_values)
     }
@@ -398,7 +401,7 @@ impl ProcedureStore {
         .to_string();
         let value = serde_json::to_string(&message).context(ToJsonSnafu)?;
 
-        self.0.put(&key, &value).await?;
+        self.0.put(&key, value.as_bytes()).await?;
 
         Ok(())
     }
@@ -410,7 +413,7 @@ impl ProcedureStore {
             is_committed: true,
         }
         .to_string();
-        self.0.put(&key, "").await?;
+        self.0.put(&key, b"").await?;
 
         Ok(())
     }
@@ -456,8 +459,8 @@ impl ProcedureStore {
         Ok(messages)
     }
 
-    fn load_one_message(&self, key: &ParsedKey, value: &str) -> Option<ProcedureMessage> {
-        serde_json::from_str(value)
+    fn load_one_message(&self, key: &ParsedKey, value: &[u8]) -> Option<ProcedureMessage> {
+        serde_json::from_slice(value)
             .map_err(|e| {
                 // `e` doesn't impl ErrorExt so we print it as normal error.
                 logging::error!("Failed to parse value, key: {:?}, source: {}", key, e);
