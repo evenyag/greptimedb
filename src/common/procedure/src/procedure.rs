@@ -47,8 +47,10 @@ impl Status {
         Status::Executing { persist }
     }
 
-    /// Returns `true` if the procedure needs the framework to persist its state.
+    /// Returns `true` if the procedure needs the framework to persist its intermediate state.
     pub fn need_persist(&self) -> bool {
+        // If the procedure is done, the framework doesn't need to persist the procedure
+        // anymore. It only needs to mark the procedure as committed.
         match self {
             Status::Executing { persist } | Status::Suspended { persist, .. } => *persist,
             Status::Done => false,
