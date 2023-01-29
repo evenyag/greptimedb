@@ -31,7 +31,6 @@ use crate::procedure::{
 };
 
 const ERR_WAIT_DURATION: Duration = Duration::from_secs(30);
-const KEY_VERSION: &str = "v1";
 
 /// Key-value store for persisting procedure's state.
 #[async_trait]
@@ -41,7 +40,9 @@ trait StateStore: Send + Sync {
     async fn put(&self, key: &str, value: &str) -> Result<()>;
 
     /// Returns the key-value pairs that have the same key `prefix`.
-    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>>;
+    ///
+    /// The `prefix` must ends with `/`.
+    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>>;
 
     /// Deletes key-value pairs by `keys`.
     async fn delete(&self, keys: &[String]) -> Result<()>;
@@ -142,6 +143,7 @@ impl ProcedureManager for StandaloneManager {
     }
 }
 
+/// In-memory state store for test purpose.
 #[derive(Default)]
 struct MemStateStore(Mutex<BTreeMap<String, String>>);
 
@@ -153,10 +155,13 @@ impl StateStore for MemStateStore {
         Ok(())
     }
 
-    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let tree = self.0.lock().unwrap();
         let key_values = tree
             .range(prefix.to_string()..)
+            // Only collect key with the same prefix. In fact we could break the iterator earlier
+            // if the key is not starts with the prefix, but using filter is enough for test.
+            .filter(|(k, _v)| k.starts_with(prefix))
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Ok(key_values)
@@ -332,8 +337,7 @@ impl fmt::Display for ParsedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}_{}_{}.{}",
-            KEY_VERSION,
+            "{}/{}.{}",
             self.procedure_id,
             self.step,
             if self.is_committed { "commit" } else { "step" }
@@ -343,21 +347,21 @@ impl fmt::Display for ParsedKey {
 
 impl ParsedKey {
     fn parse_str(input: &str) -> Option<ParsedKey> {
-        let mut parts = input.split('.');
-        let prefix = parts.next()?;
+        let mut iter = input.rsplit('/');
+        let name = iter.next()?;
+        let id_str = iter.next()?;
+
+        let procedure_id = ProcedureId::parse_str(id_str)?;
+
+        let mut parts = name.split('.');
+        let step_str = parts.next()?;
         let suffix = parts.next()?;
         let is_committed = match suffix {
             "commit" => true,
             "step" => false,
             _ => return None,
         };
-
-        let mut substrings = prefix.split('_');
-        let procedure_id = ProcedureId::parse_str(substrings.next()?)?;
-        let step = substrings.next()?.parse().ok()?;
-        if substrings.next().is_some() {
-            return None;
-        }
+        let step = step_str.parse().ok()?;
 
         Some(ParsedKey {
             procedure_id,
@@ -412,7 +416,7 @@ impl ProcedureStore {
     }
 
     async fn load_messages(&self) -> Result<HashMap<ProcedureId, ProcedureMessage>> {
-        let key_values = self.0.scan_prefix(KEY_VERSION).await?;
+        let key_values = self.0.list("/").await?;
         let mut messages = HashMap::new();
         let mut procedure_key_value = None;
         for (key, value) in key_values {
