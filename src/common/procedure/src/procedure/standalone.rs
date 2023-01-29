@@ -73,7 +73,7 @@ impl StandaloneManager {
     }
 
     /// Submit a root procedure with given `procedure_id`.
-    fn submit_with_id(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) {
+    fn submit_root(&self, procedure_id: ProcedureId, procedure: BoxedProcedure) {
         let meta = Arc::new(ProcedureMeta {
             id: procedure_id,
             lock_notify: Notify::new(),
@@ -111,11 +111,10 @@ impl ProcedureManager for StandaloneManager {
         Ok(())
     }
 
-    async fn submit(&self, procedure: BoxedProcedure) -> Result<ProcedureId> {
-        let procedure_id = ProcedureId::random();
-        self.submit_with_id(procedure_id, procedure);
+    async fn submit(&self, procedure: ProcedureWithId) -> Result<()> {
+        self.submit_root(procedure.id, procedure.procedure);
 
-        Ok(procedure_id)
+        Ok(())
     }
 
     async fn recover(&self) -> Result<()> {
@@ -131,7 +130,7 @@ impl ProcedureManager for StandaloneManager {
                     continue;
                 };
 
-                self.submit_with_id(*procedure_id, procedure_and_parent.0);
+                self.submit_root(*procedure_id, procedure_and_parent.0);
             }
         }
 

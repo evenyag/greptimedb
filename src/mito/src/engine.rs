@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_error::ext::BoxedError;
-use common_procedure::{BoxedProcedure, ProcedureManagerRef};
+use common_procedure::{BoxedProcedure, ProcedureManagerRef, ProcedureWithId};
 use common_telemetry::logging;
 use object_store::ObjectStore;
 use snafu::{ensure, OptionExt, ResultExt};
@@ -253,7 +253,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         let (procedure, mut table_receiver) = CreateTableProcedure::new(request, self.clone());
 
         self.procedure_manager
-            .submit(Box::new(procedure))
+            .submit(ProcedureWithId::with_random_id(Box::new(procedure)))
             .await
             .context(SubmitProcedureSnafu)?;
         let table = table_receiver.recv().await.context(ExecProcedureSnafu)?;

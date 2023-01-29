@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use catalog::RegisterSchemaRequest;
 use common_catalog::consts::DEFAULT_CATALOG_NAME;
+use common_procedure::ProcedureWithId;
 use common_query::Output;
 use common_telemetry::tracing::info;
 use datatypes::schema::SchemaBuilder;
@@ -71,7 +72,7 @@ impl SqlHandler {
         );
 
         self.procedure_manager
-            .submit(Box::new(procedure))
+            .submit(ProcedureWithId::with_random_id(Box::new(procedure)))
             .await
             .context(SubmitProcedureSnafu)?;
 
