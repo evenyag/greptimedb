@@ -1526,6 +1526,8 @@ dependencies = [
  "common-error",
  "common-runtime",
  "common-telemetry",
+ "futures-util",
+ "object-store",
  "serde",
  "serde_json",
  "snafu",

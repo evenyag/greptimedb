@@ -20,11 +20,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common_telemetry::logging;
+use futures_util::TryStreamExt;
+use object_store::{ObjectMode, ObjectStore};
 use snafu::{ensure, ResultExt};
 use tokio::sync::Notify;
 use tokio::time;
 
-use crate::error::{LoaderConflictSnafu, Result, ToJsonSnafu};
+use crate::error::{
+    DeleteStateSnafu, ListStateSnafu, LoaderConflictSnafu, PutStateSnafu, ReadStateSnafu, Result,
+    ToJsonSnafu,
+};
 use crate::procedure::{
     BoxedProcedure, BoxedProcedureLoader, Context, LockKey, ProcedureId, ProcedureManager,
     ProcedureMessage, ProcedureState, ProcedureWithId, Status,
@@ -176,6 +181,76 @@ impl StateStore for MemStateStore {
             tree.remove(key);
         }
         Ok(())
+    }
+}
+
+/// [StateStore] based on [ObjectStore].
+#[derive(Debug)]
+struct ObjectStateStore {
+    /// The dir name to store procedures.
+    ///
+    /// The dir should end with `/`.
+    dir: String,
+    store: ObjectStore,
+}
+
+impl ObjectStateStore {
+    /// Returns a new [ObjectStateStore] with specific root `dir` and `store`.
+    fn new(dir: String, store: ObjectStore) -> ObjectStateStore {
+        ObjectStateStore {
+            dir,
+            store,
+        }
+    }
+}
+
+#[async_trait]
+impl StateStore for ObjectStateStore {
+    async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+        let object = self.store.object(&self.object_path(key));
+        object.write(value).await.context(PutStateSnafu { key })
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<KeyValue>> {
+        let object = self.store.object(&self.list_path(prefix));
+        let mut lister = object.list().await.context(ListStateSnafu { prefix })?;
+
+        let mut key_values = Vec::new();
+        while let Some(entry) = lister.try_next().await.context(ListStateSnafu { prefix })? {
+            match entry.mode().await.context(ListStateSnafu { prefix })? {
+                ObjectMode::FILE => {
+                    let key = entry.path();
+                    let value = entry.read().await.context(ReadStateSnafu { key })?;
+                    key_values.push((key.to_string(), value));
+                }
+                ObjectMode::DIR | ObjectMode::Unknown => continue,
+            }
+        }
+
+        Ok(key_values)
+    }
+
+    async fn delete(&self, keys: &[String]) -> Result<()> {
+        for key in keys {
+            let object = self.store.object(&self.object_path(key));
+            object.delete().await.context(DeleteStateSnafu { key })?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ObjectStateStore {
+    fn object_path(&self, key: &str) -> String {
+        format!("{}{}", self.dir, key)
+    }
+
+    fn list_path(&self, prefix: &str) -> String {
+        if prefix == "/" {
+            self.dir.to_string()
+        } else {
+            self.object_path(prefix)
+        }
     }
 }
 

@@ -44,6 +44,30 @@ pub enum Error {
         procedure_id: ProcedureId,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("Failed to put {}, source: {}", key, source))]
+    PutState {
+        key: String,
+        source: object_store::Error,
+    },
+
+    #[snafu(display("Failed to delete {}, source: {}", key, source))]
+    DeleteState {
+        key: String,
+        source: object_store::Error,
+    },
+
+    #[snafu(display("Failed to list {}, source: {}", prefix, source))]
+    ListState {
+        prefix: String,
+        source: object_store::Error,
+    },
+
+    #[snafu(display("Failed to read {}, source: {}", key, source))]
+    ReadState {
+        key: String,
+        source: object_store::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -52,7 +76,11 @@ impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Error::External { source } => source.status_code(),
-            Error::ToJson { .. } => StatusCode::Internal,
+            Error::ToJson { .. }
+            | Error::PutState { .. }
+            | Error::DeleteState { .. }
+            | Error::ListState { .. }
+            | Error::ReadState { .. } => StatusCode::Internal,
             Error::LoaderConflict { .. } | Error::DuplicateProcedure { .. } => {
                 StatusCode::InvalidArguments
             }
