@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-pub use standalone::StandaloneManager;
+pub use standalone::{StandaloneManager, ManagerConfig};
 use uuid::Uuid;
 
 use crate::error::Result;

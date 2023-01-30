@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_procedure::StandaloneManager;
+use common_procedure::{StandaloneManager, ManagerConfig};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, Schema, SchemaBuilder, SchemaRef};
 use datatypes::vectors::VectorRef;
@@ -118,7 +118,7 @@ fn new_create_request(schema: SchemaRef) -> CreateTableRequest {
 
 pub async fn setup_test_engine(dir_name: &str) -> (MitoEngine<EngineImpl<NoopLogStore>>, TempDir) {
     let (dir, object_store) = new_test_object_store(dir_name).await;
-    let procedure_manager = Arc::new(StandaloneManager::new());
+    let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
 
     let table_engine = MitoEngine::new(
         EngineConfig::default(),
@@ -156,7 +156,7 @@ pub async fn setup_mock_engine_and_table(
 ) -> (MockEngine, MockMitoEngine, TableRef, ObjectStore, TempDir) {
     let mock_engine = MockEngine::default();
     let (dir, object_store) = new_test_object_store("setup_mock_engine_and_table").await;
-    let procedure_manager = Arc::new(StandaloneManager::new());
+    let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
 
     let table_engine = MitoEngine::new(
         EngineConfig::default(),

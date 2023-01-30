@@ -21,7 +21,7 @@ use catalog::remote::MetaKvBackend;
 use catalog::{CatalogManager, CatalogManagerRef, RegisterTableRequest};
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID};
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
-use common_procedure::{ProcedureManager, StandaloneManager};
+use common_procedure::{ProcedureManager, StandaloneManager, ManagerConfig};
 use common_telemetry::logging::info;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::LogConfig;
@@ -90,7 +90,7 @@ impl Instance {
             }
         };
 
-        let procedure_manager = Arc::new(StandaloneManager::new());
+        let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
         let table_engine = Arc::new(DefaultEngine::new(
             TableEngineConfig::default(),
             EngineImpl::new(

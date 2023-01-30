@@ -60,24 +60,45 @@ type StateStoreRef = Arc<dyn StateStore>;
 /// Procedure and its parent procedure id.
 struct ProcedureAndParent(BoxedProcedure, Option<ProcedureId>);
 
-/// Standalone [ProcedureManager] that maintains state on current machine.
+/// Config for [StandaloneManager].
+#[derive(Debug)]
+pub struct ManagerConfig {
+    /// Directory to store procedure's data.
+    store_dir: String,
+    /// Object store 
+    object_store: ObjectStore,
+}
+
+impl ManagerConfig {
+    /// Returns a config with default store dir.
+    pub fn with_default_dir(object_store: ObjectStore) -> ManagerConfig {
+        ManagerConfig {
+            store_dir: "procedures/".to_string(),
+            object_store,
+        }
+    }
+}
+
+/// Standalone [ProcedureManager] that maintains state locally.
 pub struct StandaloneManager {
     manager_ctx: Arc<ManagerContext>,
     state_store: StateStoreRef,
 }
 
-impl Default for StandaloneManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl StandaloneManager {
-    /// Create a new StandaloneManager with default configurations.
-    pub fn new() -> StandaloneManager {
+    /// Create a new [StandaloneManager] with memory store.
+    pub fn new_mem() -> StandaloneManager {
         StandaloneManager {
             manager_ctx: Arc::new(ManagerContext::new()),
             state_store: Arc::new(MemStateStore::default()),
+        }
+    }
+
+    /// Create a new [StandaloneManager] with specific `config`.
+    pub fn new(config: ManagerConfig) -> StandaloneManager {
+        StandaloneManager {
+            manager_ctx: Arc::new(ManagerContext::new()),
+            state_store: Arc::new(ObjectStateStore::new(config.store_dir, config.object_store)),
         }
     }
 
@@ -556,6 +577,7 @@ struct Runner {
 impl Runner {
     /// Run the procedure.
     async fn run(mut self) {
+        logging::info!("Runner {}-{} starts", self.procedure.type_name(), self.meta.id);
         // We use the lock key in ProcedureMeta as it considers locks inherited from
         // its parent.
         let lock_key = self.meta.lock_key.clone();
@@ -581,6 +603,8 @@ impl Runner {
         // need to query its state.
         // TODO(yingwen): 1. Add TTL to the metadata; 2. Only keep state in the procedure store
         // so we don't need to always store the metadata in memory after the procedure is done.
+
+        logging::info!("Runner {}-{} exits", self.procedure.type_name(), self.meta.id);
     }
 
     /// Submit a subprocedure.
@@ -772,6 +796,8 @@ impl Lock {
     /// Returns false if there is no waiter in the waiter list.
     fn switch_owner(&mut self) -> bool {
         if let Some(waiter) = self.waiters.pop_front() {
+            // Update owner.
+            self.owner = waiter.clone();
             // We need to use notify_one() since the waiter may not been registered yet.
             waiter.lock_notify.notify_one();
             true

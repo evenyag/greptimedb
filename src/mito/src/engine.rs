@@ -428,7 +428,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
 
 #[cfg(test)]
 mod tests {
-    use common_procedure::StandaloneManager;
+    use common_procedure::{StandaloneManager, ManagerConfig};
     use common_query::physical_plan::SessionContext;
     use common_recordbatch::util;
     use datatypes::prelude::ConcreteDataType;
@@ -811,9 +811,9 @@ mod tests {
         let table_engine = MitoEngine::new(
             EngineConfig::default(),
             engine,
-            object_store,
+            object_store.clone(),
             // Use a new procedure manager to avoid loader key conflict.
-            Arc::new(StandaloneManager::new()),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
         );
         let reopened = table_engine
             .open_table(&ctx, open_req.clone())
@@ -1016,8 +1016,8 @@ mod tests {
         let table_engine = MitoEngine::new(
             EngineConfig::default(),
             engine,
-            object_store,
-            Arc::new(StandaloneManager::new()),
+            object_store.clone(),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
         );
         let table_renamed = table_engine
             .open_table(&ctx, open_req.clone())
@@ -1063,6 +1063,8 @@ mod tests {
         assert_eq!(table_info, created_table.table_info());
         assert!(table_engine.table_exists(&engine_ctx, &table_reference));
 
+        logging::info!("Table created");
+
         let drop_table_request = DropTableRequest {
             catalog_name: table_reference.catalog.to_string(),
             schema_name: table_reference.schema.to_string(),
@@ -1074,6 +1076,8 @@ mod tests {
             .unwrap();
         assert!(table_dropped);
         assert!(!table_engine.table_exists(&engine_ctx, &table_reference));
+
+        logging::info!("Table dropped");
 
         // should be able to re-create
         let request = CreateTableRequest {
@@ -1090,6 +1094,7 @@ mod tests {
         };
         table_engine.create_table(&ctx, request).await.unwrap();
         assert!(table_engine.table_exists(&engine_ctx, &table_reference));
+        logging::info!("Table re-created");
     }
 
     #[tokio::test]

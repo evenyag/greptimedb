@@ -380,7 +380,7 @@ pub struct TableEntryValue {
 
 #[cfg(test)]
 mod tests {
-    use common_procedure::StandaloneManager;
+    use common_procedure::{StandaloneManager, ManagerConfig};
     use log_store::NoopLogStore;
     use mito::config::EngineConfig;
     use mito::engine::MitoEngine;
@@ -478,8 +478,8 @@ mod tests {
                 Arc::new(NoopLogStore::default()),
                 object_store.clone(),
             ),
-            object_store,
-            Arc::new(StandaloneManager::new()),
+            object_store.clone(),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
         ));
         (dir, table_engine)
     }

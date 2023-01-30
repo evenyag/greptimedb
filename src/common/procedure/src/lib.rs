@@ -21,4 +21,5 @@ pub use crate::error::{Error, Result};
 pub use crate::procedure::{
     BoxedProcedure, Context, LockKey, Procedure, ProcedureId, ProcedureManager,
     ProcedureManagerRef, ProcedureState, ProcedureWithId, StandaloneManager, Status,
+    ManagerConfig,
 };
