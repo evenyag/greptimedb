@@ -100,7 +100,7 @@ impl ScriptManager {
 #[cfg(test)]
 mod tests {
     use catalog::CatalogManager;
-    use common_procedure::{StandaloneManager, ManagerConfig};
+    use common_procedure::{ManagerConfig, StandaloneManager};
     use log_store::raft_engine::log_store::RaftEngineLogStore;
     use log_store::LogConfig;
     use mito::config::EngineConfig as TableEngineConfig;
@@ -136,7 +136,9 @@ mod tests {
                 object_store.clone(),
             ),
             object_store.clone(),
-            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+                object_store,
+            ))),
         ));
 
         let catalog_manager = Arc::new(

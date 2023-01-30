@@ -123,7 +123,7 @@ mod tests {
 
     use catalog::{CatalogList, SchemaProvider};
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-    use common_procedure::{StandaloneManager, ManagerConfig};
+    use common_procedure::{ManagerConfig, StandaloneManager};
     use common_query::logical_plan::Expr;
     use common_query::physical_plan::PhysicalPlanRef;
     use common_time::timestamp::Timestamp;
@@ -239,7 +239,9 @@ mod tests {
                            ('host2', 88.8,  333.3, 1655276558000)
                            "#;
 
-        let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
+        let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+            object_store.clone(),
+        )));
         let table_engine = Arc::new(MitoEngine::<EngineImpl<NoopLogStore>>::new(
             TableEngineConfig::default(),
             EngineImpl::new(

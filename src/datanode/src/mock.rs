@@ -18,7 +18,7 @@ use std::sync::Arc;
 use catalog::remote::MetaKvBackend;
 use catalog::CatalogManagerRef;
 use common_catalog::consts::MIN_USER_TABLE_ID;
-use common_procedure::{StandaloneManager, ManagerConfig};
+use common_procedure::{ManagerConfig, StandaloneManager};
 use meta_client::client::{MetaClient, MetaClientBuilder};
 use meta_srv::mocks::MockInfo;
 use mito::config::EngineConfig as TableEngineConfig;
@@ -47,7 +47,9 @@ impl Instance {
         let object_store = new_object_store(&opts.storage).await?;
         let logstore = Arc::new(create_log_store(&opts.wal).await?);
         let meta_client = Arc::new(mock_meta_client(meta_srv, opts.node_id.unwrap_or(42)).await);
-        let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
+        let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+            object_store.clone(),
+        )));
         let table_engine = Arc::new(DefaultEngine::new(
             TableEngineConfig::default(),
             EngineImpl::new(

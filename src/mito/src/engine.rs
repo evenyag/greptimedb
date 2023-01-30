@@ -428,7 +428,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
 
 #[cfg(test)]
 mod tests {
-    use common_procedure::{StandaloneManager, ManagerConfig};
+    use common_procedure::{ManagerConfig, StandaloneManager};
     use common_query::physical_plan::SessionContext;
     use common_recordbatch::util;
     use datatypes::prelude::ConcreteDataType;
@@ -813,7 +813,9 @@ mod tests {
             engine,
             object_store.clone(),
             // Use a new procedure manager to avoid loader key conflict.
-            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+                object_store,
+            ))),
         );
         let reopened = table_engine
             .open_table(&ctx, open_req.clone())
@@ -1017,7 +1019,9 @@ mod tests {
             EngineConfig::default(),
             engine,
             object_store.clone(),
-            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store))),
+            Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+                object_store,
+            ))),
         );
         let table_renamed = table_engine
             .open_table(&ctx, open_req.clone())

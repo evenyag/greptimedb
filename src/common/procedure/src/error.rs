@@ -68,6 +68,9 @@ pub enum Error {
         key: String,
         source: object_store::Error,
     },
+
+    #[snafu(display("Invalid procedure id, source: {}", source))]
+    InvalidId { source: uuid::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -81,9 +84,9 @@ impl ErrorExt for Error {
             | Error::DeleteState { .. }
             | Error::ListState { .. }
             | Error::ReadState { .. } => StatusCode::Internal,
-            Error::LoaderConflict { .. } | Error::DuplicateProcedure { .. } => {
-                StatusCode::InvalidArguments
-            }
+            Error::LoaderConflict { .. }
+            | Error::DuplicateProcedure { .. }
+            | Error::InvalidId { .. } => StatusCode::InvalidArguments,
         }
     }
 

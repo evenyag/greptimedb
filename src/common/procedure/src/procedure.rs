@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-pub use standalone::{StandaloneManager, ManagerConfig};
+use snafu::ResultExt;
+pub use standalone::{ManagerConfig, StandaloneManager};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{InvalidIdSnafu, Result};
 
 /// Procedure execution status.
 pub enum Status {
@@ -133,8 +134,10 @@ impl ProcedureId {
     }
 
     /// Parses id from string.
-    fn parse_str(input: &str) -> Option<ProcedureId> {
-        Uuid::parse_str(input).map(ProcedureId).ok()
+    pub fn parse_str(input: &str) -> Result<ProcedureId> {
+        Uuid::parse_str(input)
+            .map(ProcedureId)
+            .context(InvalidIdSnafu)
     }
 }
 

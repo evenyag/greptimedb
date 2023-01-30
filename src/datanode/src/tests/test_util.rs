@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID};
-use common_procedure::{StandaloneManager, ManagerConfig};
+use common_procedure::{ManagerConfig, StandaloneManager};
 use common_query::Output;
 use common_recordbatch::util;
 use datatypes::data_type::ConcreteDataType;
@@ -133,7 +133,9 @@ pub(crate) async fn create_test_table(
 
 pub async fn create_mock_sql_handler() -> SqlHandler {
     let (_dir, object_store) = new_test_object_store("setup_mock_engine_and_table").await;
-    let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(object_store.clone())));
+    let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
+        object_store.clone(),
+    )));
     let mock_engine = Arc::new(MockMitoEngine::new(
         EngineConfig::default(),
         MockEngine::default(),

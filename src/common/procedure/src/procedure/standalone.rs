@@ -65,7 +65,7 @@ struct ProcedureAndParent(BoxedProcedure, Option<ProcedureId>);
 pub struct ManagerConfig {
     /// Directory to store procedure's data.
     store_dir: String,
-    /// Object store 
+    /// Object store
     object_store: ObjectStore,
 }
 
@@ -218,10 +218,7 @@ struct ObjectStateStore {
 impl ObjectStateStore {
     /// Returns a new [ObjectStateStore] with specific root `dir` and `store`.
     fn new(dir: String, store: ObjectStore) -> ObjectStateStore {
-        ObjectStateStore {
-            dir,
-            store,
-        }
+        ObjectStateStore { dir, store }
     }
 }
 
@@ -450,7 +447,7 @@ impl ParsedKey {
         let name = iter.next()?;
         let id_str = iter.next()?;
 
-        let procedure_id = ProcedureId::parse_str(id_str)?;
+        let procedure_id = ProcedureId::parse_str(id_str).ok()?;
 
         let mut parts = name.split('.');
         let step_str = parts.next()?;
@@ -577,7 +574,11 @@ struct Runner {
 impl Runner {
     /// Run the procedure.
     async fn run(mut self) {
-        logging::info!("Runner {}-{} starts", self.procedure.type_name(), self.meta.id);
+        logging::info!(
+            "Runner {}-{} starts",
+            self.procedure.type_name(),
+            self.meta.id
+        );
         // We use the lock key in ProcedureMeta as it considers locks inherited from
         // its parent.
         let lock_key = self.meta.lock_key.clone();
@@ -604,7 +605,11 @@ impl Runner {
         // TODO(yingwen): 1. Add TTL to the metadata; 2. Only keep state in the procedure store
         // so we don't need to always store the metadata in memory after the procedure is done.
 
-        logging::info!("Runner {}-{} exits", self.procedure.type_name(), self.meta.id);
+        logging::info!(
+            "Runner {}-{} exits",
+            self.procedure.type_name(),
+            self.meta.id
+        );
     }
 
     /// Submit a subprocedure.
