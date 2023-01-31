@@ -158,7 +158,7 @@ pub enum ProcedureState {
     Running,
     /// The procedure is finished.
     Done,
-    /// The procedure is failed.
+    /// The procedure is failed and cannot proceed anymore.
     Failed,
 }
 

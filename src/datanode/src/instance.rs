@@ -90,6 +90,7 @@ impl Instance {
             }
         };
 
+        // TODO(yingwen): Add a dedicate path to the DatanodeOptions.
         let procedure_manager = Arc::new(StandaloneManager::new(ManagerConfig::with_default_dir(
             object_store.clone(),
         )));
