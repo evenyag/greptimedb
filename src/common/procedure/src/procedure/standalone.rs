@@ -372,11 +372,9 @@ impl ManagerContext {
 
     /// Acquire the lock for the procedure or wait for the lock.
     async fn acquire_lock(&self, lock_key: &LockKey, meta: &ProcedureMetaRef) {
-        while !self
-            .lock_map
+        self.lock_map
             .acquire_lock(lock_key.key(), meta.clone())
-            .await
-        {}
+            .await;
     }
 
     /// Release the lock for the procedure and notify the new owner of the lock.
