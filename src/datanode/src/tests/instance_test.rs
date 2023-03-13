@@ -939,3 +939,46 @@ async fn try_execute_sql_in_db(
 async fn execute_sql_in_db(instance: &MockInstance, sql: &str, db: &str) -> Output {
     try_execute_sql_in_db(instance, sql, db).await.unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_tables_in_file() {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use common_telemetry::logging;
+    use crate::datanode::DatanodeOptions;
+    use crate::instance::Instance;
+    use api::v1::FlushTableExpr;
+    use tokio::time;
+    use std::time::Duration;
+
+    common_telemetry::init_default_ut_logging();
+
+    let opts = DatanodeOptions::default();
+    let instance = Instance::new(&opts).await.unwrap();
+    instance.start().await.unwrap();
+
+    // let file = File::open("/Users/evenyag/Documents/test/lixiang/list.txt").unwrap();
+    // let reader = BufReader::new(file);
+    // let lines = reader.lines();
+    // for line in lines {
+    //     let line = line.unwrap();
+    //     let table_name = line.trim().to_string();
+    //     if !table_name.is_empty() {
+    //         logging::info!("Try to flush table {table_name}");
+
+    //         if let Err(e) = instance.handle_flush_table(FlushTableExpr {
+    //             catalog_name: "greptime".to_string(),
+    //             schema_name: "benchmark".to_string(),
+    //             table_name,
+    //             region_id: None,
+    //         }).await {
+    //             logging::error!("Fail to flush table err: {e}");
+    //         }
+    //     }
+    // }
+
+    logging::info!("sleep start...");
+    time::sleep(Duration::from_secs(60 * 3)).await;
+
+    logging::info!("finish...");
+}

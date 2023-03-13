@@ -97,9 +97,9 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             dir: "/tmp/greptimedb/wal".to_string(),
-            file_size: ReadableSize::gb(1),        // log file size 1G
-            purge_threshold: ReadableSize::gb(50), // purge threshold 50G
-            purge_interval: Duration::from_secs(600),
+            file_size: ReadableSize::mb(32),        // log file size 1G
+            purge_threshold: ReadableSize::mb(64), // purge threshold 50G
+            purge_interval: Duration::from_secs(60),
             read_batch_size: 128,
             sync_write: false,
         }
