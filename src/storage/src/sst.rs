@@ -357,7 +357,7 @@ impl FromStr for FileId {
 }
 
 /// Immutable metadata of a sst file.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FileMeta {
     /// Region of file.
@@ -372,6 +372,22 @@ pub struct FileMeta {
     pub level: Level,
     /// Size of the file.
     pub file_size: u64,
+}
+
+impl fmt::Debug for FileMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let range = self
+            .time_range
+            .as_ref()
+            .map(|(l, r)| (l.to_iso8601_string(), r.to_iso8601_string()));
+        f.debug_struct("FileMeta")
+            .field("region_id", &self.region_id)
+            .field("file_id", &self.file_id)
+            .field("time_range", &range)
+            .field("level", &self.level)
+            .field("file_size", &self.file_size)
+            .finish()
+    }
 }
 
 fn deserialize_from_string<'de, D>(deserializer: D) -> std::result::Result<FileId, D::Error>

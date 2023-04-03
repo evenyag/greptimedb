@@ -377,6 +377,43 @@ impl Ord for Node {
     }
 }
 
+use std::time::{Duration, Instant};
+
+use common_telemetry::logging;
+
+#[derive(Debug)]
+struct Metrics {
+    start: Instant,
+    next_time_total: Duration,
+    next_count: usize,
+    fetch_from_hottest_count: usize,
+    fetch_next_time_total: Duration,
+    reheap_time_total: Duration,
+    fetch_batch_from_hottest_total: Duration,
+    fetch_one_row_from_hottest_total: Duration,
+    push_next_row_to_total: Duration,
+    push_rows_to_total: Duration,
+    try_init_total: Duration,
+}
+
+impl Metrics {
+    fn new() -> Metrics {
+        Metrics {
+            start: Instant::now(),
+            next_time_total: Duration::ZERO,
+            next_count: 0,
+            fetch_from_hottest_count: 0,
+            fetch_next_time_total: Duration::ZERO,
+            reheap_time_total: Duration::ZERO,
+            fetch_batch_from_hottest_total: Duration::ZERO,
+            fetch_one_row_from_hottest_total: Duration::ZERO,
+            push_next_row_to_total: Duration::ZERO,
+            push_rows_to_total: Duration::ZERO,
+            try_init_total: Duration::ZERO,
+        }
+    }
+}
+
 /// A reader that would sort and merge `Batch` from multiple sources by key.
 ///
 /// `Batch` from each `Source` **must** be sorted.
@@ -405,12 +442,27 @@ pub struct MergeReader {
     batch_size: usize,
     /// Buffered batch.
     batch_builder: BatchBuilder,
+    metrics: Metrics,
 }
 
 #[async_trait]
 impl BatchReader for MergeReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
-        self.fetch_next_batch().await
+        let now = Instant::now();
+        let ret = self.fetch_next_batch().await;
+        self.metrics.next_count += 1;
+        self.metrics.next_time_total += now.elapsed();
+        ret
+    }
+}
+
+impl Drop for MergeReader {
+    fn drop(&mut self) {
+        logging::info!(
+            "merge reader, total: {:?}, metrics: {:#?}",
+            self.metrics.start.elapsed(),
+            self.metrics,
+        );
     }
 }
 
@@ -464,6 +516,7 @@ impl MergeReaderBuilder {
             cold: BinaryHeap::with_capacity(num_sources),
             batch_size: self.batch_size,
             batch_builder,
+            metrics: Metrics::new(),
         }
     }
 }
@@ -480,6 +533,7 @@ impl MergeReader {
             return Ok(());
         }
 
+        let now = Instant::now();
         for source in self.sources.drain(..) {
             let node = Node::new(self.schema.clone(), source).await?;
 
@@ -491,6 +545,7 @@ impl MergeReader {
         self.refill_hot();
 
         self.initialized = true;
+        self.metrics.try_init_total = now.elapsed();
 
         Ok(())
     }
@@ -503,6 +558,7 @@ impl MergeReader {
                 // No need to do merge sort if only one batch in the hot heap.
                 let fetch_row_num = self.batch_size - self.batch_builder.num_rows();
                 if let Some(batch) = self.fetch_batch_from_hottest(fetch_row_num).await? {
+                    self.metrics.fetch_from_hottest_count += 1;
                     // The builder is empty and we have fetched a new batch from this node.
                     return Ok(Some(batch));
                 }
@@ -544,6 +600,7 @@ impl MergeReader {
     /// instead of pushing into the builder if the `self.batch_builder` is empty.
     async fn fetch_batch_from_hottest(&mut self, fetch_row_num: usize) -> Result<Option<Batch>> {
         assert_eq!(1, self.hot.len());
+        let now = Instant::now();
 
         let mut hottest = self.hot.pop().unwrap();
         let batch = if self.batch_builder.is_empty() {
@@ -553,24 +610,32 @@ impl MergeReader {
 
             None
         };
+        self.metrics.push_rows_to_total += now.elapsed();
 
         self.reheap(hottest).await?;
+        self.metrics.fetch_batch_from_hottest_total += now.elapsed();
 
         Ok(batch)
     }
 
     /// Fetch one row from the hottest node.
     async fn fetch_one_row_from_hottest(&mut self) -> Result<()> {
+        let now = Instant::now();
         let mut hottest = self.hot.pop().unwrap();
         hottest.push_next_row_to(&mut self.batch_builder)?;
+        self.metrics.push_next_row_to_total += now.elapsed();
 
-        self.reheap(hottest).await
+        let ret = self.reheap(hottest).await;
+        self.metrics.fetch_one_row_from_hottest_total += now.elapsed();
+        ret
     }
 
     /// Fetch next batch from this node and reset its cursor, then push the node back to a
     /// proper heap.
     async fn reheap(&mut self, mut node: Node) -> Result<()> {
+        let now = Instant::now();
         let fetched_new_batch = node.maybe_fetch_next_batch().await?;
+        self.metrics.fetch_next_time_total += now.elapsed();
 
         if node.is_eof() {
             // The merge window would be updated, need to refill the hot heap.
@@ -597,6 +662,7 @@ impl MergeReader {
             // changed, we could just put the node back to the hot heap.
             self.hot.push(node);
         }
+        self.metrics.reheap_time_total += now.elapsed();
 
         Ok(())
     }

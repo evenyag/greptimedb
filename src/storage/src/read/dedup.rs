@@ -12,14 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
 use common_base::BitVec;
+use common_telemetry::logging;
 use datatypes::prelude::ScalarVector;
 use datatypes::vectors::BooleanVector;
 
 use crate::error::Result;
 use crate::read::{Batch, BatchOp, BatchReader};
 use crate::schema::ProjectedSchemaRef;
+
+#[derive(Debug)]
+struct Metrics {
+    start: Instant,
+    next_time_total: Duration,
+    dedup_time_total: Duration,
+    next_count: usize,
+}
+
+impl Metrics {
+    fn new() -> Metrics {
+        Metrics {
+            start: Instant::now(),
+            next_time_total: Duration::ZERO,
+            dedup_time_total: Duration::ZERO,
+            next_count: 0,
+        }
+    }
+}
 
 /// A reader that dedup rows from inner reader.
 pub struct DedupReader<R> {
@@ -31,6 +53,7 @@ pub struct DedupReader<R> {
     prev_batch: Option<Batch>,
     /// Reused bitmap buffer.
     selected: BitVec,
+    metrics: Metrics,
 }
 
 impl<R> DedupReader<R> {
@@ -40,6 +63,7 @@ impl<R> DedupReader<R> {
             reader,
             prev_batch: None,
             selected: BitVec::default(),
+            metrics: Metrics::new(),
         }
     }
 
@@ -78,15 +102,32 @@ impl<R> DedupReader<R> {
 #[async_trait]
 impl<R: BatchReader> BatchReader for DedupReader<R> {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
+        let now = Instant::now();
         while let Some(batch) = self.reader.next_batch().await? {
+            let dedup_start = Instant::now();
             let filtered = self.dedup_batch(batch)?;
+            self.metrics.dedup_time_total += dedup_start.elapsed();
             // Skip empty batch.
             if !filtered.is_empty() {
+                self.metrics.next_count += 1;
+                self.metrics.next_time_total += now.elapsed();
                 return Ok(Some(filtered));
             }
         }
 
+        self.metrics.next_count += 1;
+        self.metrics.next_time_total += now.elapsed();
         Ok(None)
+    }
+}
+
+impl<R> Drop for DedupReader<R> {
+    fn drop(&mut self) {
+        logging::info!(
+            "dedup reader, total: {:?}, metrics: {:#?}",
+            self.metrics.start.elapsed(),
+            self.metrics,
+        );
     }
 }
 

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::DataType;
 use arrow_array::types::Int64Type;
@@ -27,7 +28,7 @@ use arrow_array::{
 use async_compat::CompatExt;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use common_telemetry::error;
+use common_telemetry::{error, logging};
 use common_time::range::TimestampRange;
 use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
@@ -231,6 +232,19 @@ fn decode_timestamp_range_inner(
     )))
 }
 
+#[derive(Debug, Default)]
+struct Metrics {
+    new_buf_reader: Duration,
+    new_stream_builder: Duration,
+    prune_row_groups: Duration,
+    build_stream: Duration,
+    stream_next_total: Duration,
+    stream_next_count: usize,
+    rows_total: usize,
+    times_total: Duration,
+    fields_to_read: Vec<usize>,
+}
+
 pub struct ParquetReader {
     // Holds the file handle to avoid the file purge purge it.
     file_handle: FileHandle,
@@ -261,15 +275,20 @@ impl ParquetReader {
         let file_path = self.file_handle.file_path();
         let operator = self.object_store.clone();
 
+        let now = Instant::now();
+        let start = now.clone();
         let reader = operator
             .reader(&file_path)
             .await
             .context(ReadObjectSnafu { path: &file_path })?
             .compat();
         let buf_reader = BufReader::new(reader);
+        let new_buf_reader = now.elapsed();
+
         let builder = ParquetRecordBatchStreamBuilder::new(buf_reader)
             .await
             .context(ReadParquetSnafu { file: &file_path })?;
+        let new_stream_builder = now.elapsed() - new_buf_reader;
         let arrow_schema = builder.schema().clone();
 
         let store_schema = Arc::new(
@@ -289,9 +308,11 @@ impl ParquetReader {
             .enumerate()
             .filter_map(|(idx, valid)| if valid { Some(idx) } else { None })
             .collect::<Vec<_>>();
+        let prune_row_groups = now.elapsed() - new_stream_builder;
 
         let parquet_schema_desc = builder.metadata().file_metadata().schema_descr_ptr();
 
+        let fields_to_read = adapter.fields_to_read().to_vec();
         let projection = ProjectionMask::roots(&parquet_schema_desc, adapter.fields_to_read());
         let mut builder = builder
             .with_projection(projection)
@@ -305,11 +326,42 @@ impl ParquetReader {
         let mut stream = builder
             .build()
             .context(ReadParquetSnafu { file: &file_path })?;
+        let build_stream = now.elapsed() - prune_row_groups;
 
         let chunk_stream = try_stream!({
+            let mut stream_next_count = 0;
+            let mut rows_total = 0;
+            let mut stream_next_total = Duration::ZERO;
+
+            let mut now = Instant::now();
             while let Some(res) = stream.next().await {
-                yield res.context(ReadParquetSnafu { file: &file_path })?
+                stream_next_count += 1;
+                stream_next_total += now.elapsed();
+                let res = res.context(ReadParquetSnafu { file: &file_path })?;
+                rows_total += res.num_rows();
+                yield res;
+                now = Instant::now();
             }
+
+            stream_next_total += now.elapsed();
+            let times_total = start.elapsed();
+            let metrics = Metrics {
+                new_buf_reader,
+                new_stream_builder,
+                prune_row_groups,
+                build_stream,
+                stream_next_total,
+                stream_next_count,
+                rows_total,
+                times_total,
+                fields_to_read,
+            };
+
+            logging::info!(
+                "Read parquet finished, file_path: {}, metrics: {:#?}",
+                file_path,
+                metrics
+            );
         });
 
         ChunkStream::new(self.file_handle.clone(), adapter, Box::pin(chunk_stream))

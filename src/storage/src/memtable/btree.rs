@@ -18,7 +18,9 @@ use std::fmt;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
+use common_telemetry::logging;
 use datatypes::data_type::DataType;
 use datatypes::prelude::*;
 use datatypes::value::Value;
@@ -109,6 +111,13 @@ impl Memtable for BTreeMemtable {
     }
 }
 
+#[derive(Debug, Default)]
+struct Metrics {
+    rows_total: usize,
+    next_count_total: usize,
+    next_time_total: Duration,
+}
+
 struct BTreeIterator {
     ctx: IterContext,
     /// Schema of this memtable.
@@ -118,6 +127,7 @@ struct BTreeIterator {
     adapter: ReadAdapter,
     map: Arc<RwLockMap>,
     last_key: Option<InnerKey>,
+    metrics: Metrics,
 }
 
 impl BatchIterator for BTreeIterator {
@@ -157,10 +167,13 @@ impl BTreeIterator {
             adapter,
             map,
             last_key: None,
+            metrics: Metrics::default(),
         })
     }
 
     fn next_batch(&mut self) -> Result<Option<Batch>> {
+        self.metrics.next_count_total += 1;
+        let now = Instant::now();
         let map = self.map.read().unwrap();
         let iter = if let Some(last_key) = &self.last_key {
             map.range((Bound::Excluded(last_key), Bound::Unbounded))
@@ -176,6 +189,7 @@ impl BTreeIterator {
         };
 
         if keys.is_empty() {
+            self.metrics.next_time_total += now.elapsed();
             return Ok(None);
         }
         self.last_key = keys.last().map(|k| {
@@ -210,8 +224,16 @@ impl BTreeIterator {
             Arc::new(sequences),
             Arc::new(op_types),
         )?;
+        self.metrics.next_time_total += now.elapsed();
+        self.metrics.rows_total += batch.num_rows();
 
         Ok(Some(batch))
+    }
+}
+
+impl Drop for BTreeIterator {
+    fn drop(&mut self) {
+        logging::info!("BTree iterator finished, metrics: {:?}", self.metrics);
     }
 }
 

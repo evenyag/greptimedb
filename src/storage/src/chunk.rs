@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common_query::logical_plan::Expr;
-use common_telemetry::debug;
+use common_telemetry::{debug, logging};
 use common_time::range::TimestampRange;
 use snafu::ResultExt;
 use store_api::storage::{Chunk, ChunkReader, SchemaRef, SequenceNumber};
@@ -156,6 +156,13 @@ impl ChunkReaderBuilder {
         debug!(
             "Time range predicate for chunk reader: {:?}",
             time_range_predicate
+        );
+        logging::info!(
+            "Build chunk reader, memtables: {}, num_files_to_read: {}, projection: {:?}, files_to_read: {:#?}",
+            self.memtables.len(),
+            self.files_to_read.len(),
+            self.projection,
+            self.files_to_read,
         );
 
         let schema = Arc::new(
