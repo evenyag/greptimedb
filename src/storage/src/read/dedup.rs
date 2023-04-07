@@ -93,6 +93,10 @@ impl<R> DedupReader<R> {
         // Find all rows whose op_types are `OpType::Delete`, mark their `selected` to false.
         self.schema.unselect_deleted(&batch, &mut self.selected);
 
+        if self.selected.all() {
+            return Ok(batch);
+        }
+
         let filter = BooleanVector::from_iterator(self.selected.iter().by_vals());
         // Filter duplicate rows.
         self.schema.filter(&batch, &filter)
