@@ -11,3 +11,10 @@ humantime-serde = "1"
 serde = "1"
 storage = { path = "../storage" }
 toml = "0.5"
+
+[dev-dependencies]
+criterion = "0.4"
+
+[[bench]]
+name = "bench"
+harness = false

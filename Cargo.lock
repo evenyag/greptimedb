@@ -9477,6 +9477,7 @@ dependencies = [
 name = "storage-bencher"
 version = "0.4.0"
 dependencies = [
+ "criterion 0.4.0",
  "humantime-serde",
  "serde",
  "storage",
