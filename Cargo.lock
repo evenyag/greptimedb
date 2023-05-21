@@ -9474,6 +9474,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-bencher"
+version = "0.4.0"
+dependencies = [
+ "humantime-serde",
+ "serde",
+ "storage",
+ "toml",
+]
+
+[[package]]
 name = "store-api"
 version = "0.3.2"
 dependencies = [
