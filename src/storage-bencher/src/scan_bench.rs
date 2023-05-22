@@ -51,4 +51,8 @@ impl ScanBench {
     pub async fn run(&self) -> ScanMetrics {
         self.target.full_scan(self.scan_batch_size).await
     }
+
+    pub async fn shutdown(self) {
+        self.target.shutdown().await
+    }
 }

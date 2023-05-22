@@ -12,6 +12,7 @@ common-runtime = { path = "../common/runtime" }
 common-telemetry = { path = "../common/telemetry" }
 datatypes = { path = "../datatypes" }
 humantime-serde = "1"
+log = "0.4"
 log-store = { path = "../log-store" }
 object-store = { path = "../object-store" }
 once_cell = "1"

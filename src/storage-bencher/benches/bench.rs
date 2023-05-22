@@ -25,6 +25,7 @@ use storage_bencher::scan_bench::ScanBench;
 use storage_bencher::target::Target;
 
 const BENCH_CONFIG_KEY: &str = "BENCH_CONFIG";
+const BENCH_ENABLE_LOG_KEY: &str = "BENCH_ENABLE_LOG";
 const DEFAULT_CONFIG_PATH: &str = "./bench-config.toml";
 static GLOBAL_CONFIG: Lazy<Mutex<BenchConfig>> = Lazy::new(|| Mutex::new(BenchConfig::default()));
 
@@ -56,7 +57,13 @@ impl BenchContext {
 }
 
 fn init_bench() -> BenchConfig {
-    common_telemetry::init_default_ut_logging();
+    let enable_log: bool = env::var(BENCH_ENABLE_LOG_KEY)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false);
+    if enable_log {
+        common_telemetry::init_default_ut_logging();
+    }
     let cwd = env::current_dir().unwrap();
     logging::info!("Init bench, current dir: {}", cwd.display());
     let config_path =
@@ -75,22 +82,15 @@ fn init_bench() -> BenchConfig {
     (*config).clone()
 }
 
-fn bench_storage_iter(b: &mut Bencher<'_>, ctx: &BenchContext) {
-    let scan_bench = ctx.runtime.block_on(async {
-        let mut scan_bench = ctx.new_scan_bench().await;
-        scan_bench.maybe_prepare_data().await;
-
-        scan_bench
-    });
+fn bench_storage_iter(b: &mut Bencher<'_>, input: &(BenchContext, ScanBench)) {
     let mut times = 0;
-
     b.iter(|| {
-        let metrics = ctx.runtime.block_on(async { scan_bench.run().await });
+        let metrics = input.0.runtime.block_on(async { input.1.run().await });
 
-        if ctx.config.print_metrics_every > 0 {
+        if input.0.config.print_metrics_every > 0 {
             times += 1;
-            if times % ctx.config.print_metrics_every == 0 {
-                logging::info!("Metrics: {:?}", metrics);
+            if times % input.0.config.print_metrics_every == 0 {
+                logging::info!("Metrics at times {} is: {:?}", times, metrics);
             }
         }
     })
@@ -108,11 +108,22 @@ fn bench_full_scan(c: &mut Criterion) {
 
     let parquet_path = config.parquet_path.clone();
     let ctx = BenchContext::new(config);
+    let scan_bench = ctx.runtime.block_on(async {
+        let mut scan_bench = ctx.new_scan_bench().await;
+        scan_bench.maybe_prepare_data().await;
+
+        scan_bench
+    });
+    let input = (ctx, scan_bench);
     group.bench_with_input(
         BenchmarkId::new("test", parquet_path),
-        &ctx,
+        &input,
         bench_storage_iter,
     );
+
+    input.0.runtime.block_on(async {
+        input.1.shutdown().await;
+    });
 
     group.finish();
 }

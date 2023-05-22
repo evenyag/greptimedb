@@ -25,6 +25,7 @@ use datatypes::arrow::datatypes::{DataType, TimeUnit};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::vectors::Helper;
+use log::Level;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::LogConfig;
 use object_store::layers::{LoggingLayer, MetricsLayer, TracingLayer};
@@ -44,6 +45,9 @@ use store_api::storage::{
     WriteRequest,
 };
 
+/// Timestamp column name.
+const TS_COLUMN_NAME: &str = "ts";
+
 /// Returns a new object store based on local file system.
 async fn new_fs_object_store(path: &str) -> ObjectStore {
     let data_dir = util::normalize_dir(path);
@@ -59,7 +63,7 @@ async fn new_fs_object_store(path: &str) -> ObjectStore {
         .unwrap()
         .finish()
         .layer(MetricsLayer)
-        .layer(LoggingLayer::default())
+        .layer(LoggingLayer::default().with_error_level(Some(Level::Debug)))
         .layer(TracingLayer)
 }
 
@@ -100,7 +104,7 @@ fn new_cpu_region_descriptor(region_name: &str, region_id: RegionId) -> RegionDe
     // Note that the timestamp in the input parquet file has Timestamp(Microsecond, None) type.
     let timestamp = ColumnDescriptorBuilder::new(
         column_id,
-        "ts",
+        TS_COLUMN_NAME,
         ConcreteDataType::timestamp_millisecond_datatype(),
     )
     .is_time_index(true)
@@ -230,7 +234,7 @@ fn put_record_batch_to_write_batch(batch: RecordBatch, request: &mut WriteBatch)
             )
             .unwrap();
             let vector = Helper::try_into_vector(timestamps).unwrap();
-            data.insert(field.name().clone(), vector);
+            data.insert(TS_COLUMN_NAME.to_string(), vector);
         } else {
             let vector = Helper::try_into_vector(array).unwrap();
             data.insert(field.name().clone(), vector);
@@ -274,7 +278,7 @@ impl Target {
     }
 
     /// Stop the target.
-    pub async fn stop(mut self) {
+    pub async fn shutdown(mut self) {
         let region = self.region.take().unwrap();
         let ctx = EngineContext::default();
         self.engine.close_region(&ctx, region).await.unwrap();
