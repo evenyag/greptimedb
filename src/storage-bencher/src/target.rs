@@ -157,6 +157,7 @@ fn new_cpu_region_descriptor(region_name: &str, region_id: RegionId) -> RegionDe
         .name(region_name)
         .row_key(row_key)
         .default_cf(cf)
+        .compaction_time_window(None)
         .build()
         .unwrap()
 }
