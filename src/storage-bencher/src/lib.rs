@@ -14,4 +14,5 @@
 
 pub mod config;
 pub mod loader;
+pub mod scan_bench;
 pub mod target;

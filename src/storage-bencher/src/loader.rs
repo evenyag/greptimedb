@@ -14,7 +14,8 @@
 
 //! Data loader.
 
-use std::{time::{Instant, Duration}, fs::File};
+use std::fs::File;
+use std::time::{Duration, Instant};
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -29,7 +30,7 @@ pub struct LoadMetrics {
 }
 
 /// Parquet data loader.
-struct ParquetLoader {
+pub struct ParquetLoader {
     file_path: String,
     batch_size: usize,
 }

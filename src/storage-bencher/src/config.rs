@@ -19,29 +19,61 @@ use std::io::Read;
 use std::time::Duration;
 
 use serde::Deserialize;
+use storage::config::EngineConfig;
+use store_api::storage::RegionId;
 
-#[derive(Debug, Deserialize)]
+/// Storage engine config.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Storage data path.
+    pub path: String,
+    /// Region to bench.
+    pub region_id: RegionId,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        StorageConfig {
+            path: "/tmp/storage-bencher/".to_string(),
+            region_id: 0,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Returns the engine config for bench.
+    pub fn engine_config(&self) -> EngineConfig {
+        EngineConfig::default()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BenchConfig {
+    pub runtime_size: usize,
     pub parquet_path: String,
     #[serde(with = "humantime_serde")]
     pub measurement_time: Duration,
     pub sample_size: usize,
+    pub load_batch_size: usize,
     pub scan_batch_size: usize,
-    pub print_metrics: bool,
-    /// Index of columns to read, empty for all columns.
-    pub columns: Vec<usize>,
+    /// Print metrics every N benches. Never print metrics if N is 0.
+    pub print_metrics_every: usize,
+    pub storage: StorageConfig,
 }
 
 impl Default for BenchConfig {
     fn default() -> BenchConfig {
         BenchConfig {
+            runtime_size: 4,
             parquet_path: "".to_string(),
             measurement_time: Duration::from_secs(30),
             sample_size: 30,
+            load_batch_size: 1024,
             scan_batch_size: 1024,
-            print_metrics: false,
-            columns: Vec::new(),
+            print_metrics_every: 0,
+            storage: StorageConfig::default(),
         }
     }
 }

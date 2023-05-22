@@ -228,7 +228,7 @@ fn put_record_batch_to_write_batch(batch: RecordBatch, request: &mut WriteBatch)
                 &DataType::Timestamp(TimeUnit::Millisecond, zone.clone()),
             )
             .unwrap();
-            let vector = Helper::try_into_vector(array).unwrap();
+            let vector = Helper::try_into_vector(timestamps).unwrap();
             data.insert(field.name().clone(), vector);
         } else {
             let vector = Helper::try_into_vector(array).unwrap();
@@ -240,9 +240,10 @@ fn put_record_batch_to_write_batch(batch: RecordBatch, request: &mut WriteBatch)
 }
 
 /// Metrics of scanning a region.
+#[derive(Debug)]
 pub struct ScanMetrics {
-    total_cost: Duration,
-    num_rows: usize,
+    pub total_cost: Duration,
+    pub num_rows: usize,
 }
 
 /// Target region to test.

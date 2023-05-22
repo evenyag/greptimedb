@@ -8,11 +8,13 @@ license.workspace = true
 
 [dependencies]
 common-base = { path = "../common/base" }
+common-runtime = { path = "../common/runtime" }
 common-telemetry = { path = "../common/telemetry" }
 datatypes = { path = "../datatypes" }
 humantime-serde = "1"
 log-store = { path = "../log-store" }
 object-store = { path = "../object-store" }
+once_cell = "1"
 parquet = { workspace = true, features = ["async"] }
 serde = "1"
 storage = { path = "../storage" }
