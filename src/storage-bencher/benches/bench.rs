@@ -114,6 +114,9 @@ fn bench_full_scan(c: &mut Criterion) {
 
         scan_bench
     });
+
+    logging::info!("start bench full scan");
+
     let input = (ctx, scan_bench);
     group.bench_with_input(
         BenchmarkId::new("test", parquet_path),

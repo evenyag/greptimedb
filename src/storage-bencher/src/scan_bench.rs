@@ -46,6 +46,8 @@ impl ScanBench {
 
             self.loaded = true;
         }
+
+        logging::info!("region already exists, don't load again");
     }
 
     pub async fn run(&self) -> ScanMetrics {
