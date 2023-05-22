@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::env;
 use std::sync::{Mutex, Once};
 
 use common_runtime::{create_runtime, Runtime};
@@ -23,7 +24,8 @@ use storage_bencher::loader::ParquetLoader;
 use storage_bencher::scan_bench::ScanBench;
 use storage_bencher::target::Target;
 
-const CONFIG_PATH: &str = "./bench-config.toml";
+const BENCH_CONFIG_KEY: &str = "BENCH_CONFIG";
+const DEFAULT_CONFIG_PATH: &str = "./bench-config.toml";
 static GLOBAL_CONFIG: Lazy<Mutex<BenchConfig>> = Lazy::new(|| Mutex::new(BenchConfig::default()));
 
 struct BenchContext {
@@ -55,12 +57,18 @@ impl BenchContext {
 
 fn init_bench() -> BenchConfig {
     common_telemetry::init_default_ut_logging();
+    let cwd = env::current_dir().unwrap();
+    logging::info!("Init bench, current dir: {}", cwd.display());
+    let config_path =
+        env::var(BENCH_CONFIG_KEY).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
 
     static START: Once = Once::new();
 
     START.call_once(|| {
+        logging::info!("Loading config from path: {}", config_path);
+
         let mut config = GLOBAL_CONFIG.lock().unwrap();
-        *config = BenchConfig::parse_toml(CONFIG_PATH);
+        *config = BenchConfig::parse_toml(&config_path);
     });
 
     let config = GLOBAL_CONFIG.lock().unwrap();
