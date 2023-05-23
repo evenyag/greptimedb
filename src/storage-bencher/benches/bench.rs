@@ -82,13 +82,11 @@ fn init_bench() -> BenchConfig {
     (*config).clone()
 }
 
-fn bench_storage_iter(b: &mut Bencher<'_>, input: &(BenchContext, ScanBench)) {
-    let mut times = 0;
+fn bench_storage_iter(times: usize, b: &mut Bencher<'_>, input: &(BenchContext, ScanBench)) {
     b.iter(|| {
         let metrics = input.0.runtime.block_on(async { input.1.run().await });
 
         if input.0.config.print_metrics_every > 0 {
-            times += 1;
             if times % input.0.config.print_metrics_every == 0 {
                 logging::info!("Metrics at times {} is: {:?}", times, metrics);
             }
@@ -117,11 +115,15 @@ fn bench_full_scan(c: &mut Criterion) {
 
     logging::info!("start bench full scan");
 
+    let mut times = 0;
     let input = (ctx, scan_bench);
     group.bench_with_input(
         BenchmarkId::new("test", parquet_path),
         &input,
-        bench_storage_iter,
+        |b, input| {
+            times += 1;
+            bench_storage_iter(times, b, input)
+        },
     );
 
     input.0.runtime.block_on(async {

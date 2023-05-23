@@ -225,9 +225,7 @@ fn put_record_batch_to_write_batch(batch: RecordBatch, request: &mut WriteBatch)
     let schema = batch.schema();
     let mut data = HashMap::with_capacity(batch.num_columns());
     for (field, array) in schema.fields().iter().zip(batch.columns()) {
-        if let DataType::Timestamp(unit, zone) = field.data_type() {
-            assert!(matches!(unit, TimeUnit::Microsecond), "{unit:?}");
-
+        if let DataType::Timestamp(_unit, zone) = field.data_type() {
             let timestamps = cast(
                 array,
                 &DataType::Timestamp(TimeUnit::Millisecond, zone.clone()),
