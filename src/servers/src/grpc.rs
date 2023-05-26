@@ -44,6 +44,7 @@ use crate::error::{
 use crate::grpc::database::DatabaseService;
 use crate::grpc::flight::FlightHandler;
 use crate::grpc::handler::GreptimeRequestHandler;
+use crate::metrics::MetricsMiddlewareLayer;
 use crate::prom::PromHandlerRef;
 use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::server::Server;
@@ -151,8 +152,14 @@ impl Server for GrpcServer {
             .build()
             .context(GrpcReflectionServiceSnafu)?;
 
+        let layer = tower::ServiceBuilder::new()
+            // Apply metrics middleware
+            .layer(MetricsMiddlewareLayer::default())
+            .into_inner();
+
         // Would block to serve requests.
         let mut builder = tonic::transport::Server::builder()
+            .layer(layer)
             .add_service(self.create_flight_service())
             .add_service(self.create_database_service())
             .add_service(self.create_healthcheck_service());

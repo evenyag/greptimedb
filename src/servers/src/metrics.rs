@@ -69,8 +69,9 @@ pub(crate) static PROCESS_COLLECTOR: Lazy<Collector> = Lazy::new(|| {
 
 // Based on https://github.com/hyperium/tonic/blob/master/examples/src/tower/server.rs
 // See https://github.com/hyperium/tonic/issues/242
+/// A metrics middleware.
 #[derive(Debug, Clone, Default)]
-struct MetricsMiddlewareLayer;
+pub(crate) struct MetricsMiddlewareLayer;
 
 impl<S> Layer<S> for MetricsMiddlewareLayer {
     type Service = MetricsMiddleware<S>;
@@ -81,7 +82,7 @@ impl<S> Layer<S> for MetricsMiddlewareLayer {
 }
 
 #[derive(Debug, Clone)]
-struct MetricsMiddleware<S> {
+pub(crate) struct MetricsMiddleware<S> {
     inner: S,
 }
 
