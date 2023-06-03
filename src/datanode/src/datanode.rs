@@ -61,6 +61,8 @@ pub struct StorageConfig {
     /// The precedence order is: ttl in table options > global ttl.
     #[serde(with = "humantime_serde")]
     pub global_ttl: Option<Duration>,
+    /// Skip wal
+    pub skip_wal: bool,
     #[serde(flatten)]
     pub store: ObjectStoreConfig,
     pub compaction: CompactionConfig,
@@ -308,6 +310,7 @@ impl From<&DatanodeOptions> for StorageEngineConfig {
             auto_flush_interval: value.storage.flush.auto_flush_interval,
             global_write_buffer_size: value.storage.flush.global_write_buffer_size,
             global_ttl: value.storage.global_ttl,
+            skip_wal: value.storage.skip_wal,
         }
     }
 }

@@ -50,6 +50,8 @@ pub struct EngineConfig {
     ///
     /// The precedence order is: region ttl > global ttl.
     pub global_ttl: Option<Duration>,
+    /// Skip wal
+    pub skip_wal: bool,
 }
 
 impl Default for EngineConfig {
@@ -70,6 +72,7 @@ impl Default for EngineConfig {
             auto_flush_interval: Duration::from_millis(DEFAULT_AUTO_FLUSH_INTERVAL.into()),
             global_write_buffer_size: None,
             global_ttl: None,
+            skip_wal: false,
         }
     }
 }

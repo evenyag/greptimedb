@@ -65,6 +65,7 @@ pub struct RegionWriter {
     ///
     /// Increasing committed sequence should be guarded by this lock.
     version_mutex: Mutex<()>,
+    skip_wal: bool,
 }
 
 impl RegionWriter {
@@ -75,6 +76,7 @@ impl RegionWriter {
         compaction_time_window: Option<i64>,
         write_buffer_size: usize,
     ) -> RegionWriter {
+        let skip_wal = config.skip_wal;
         RegionWriter {
             inner: Mutex::new(WriterInner::new(
                 memtable_builder,
@@ -84,6 +86,7 @@ impl RegionWriter {
                 write_buffer_size,
             )),
             version_mutex: Mutex::new(()),
+            skip_wal,
         }
     }
 
@@ -251,6 +254,12 @@ impl RegionWriter {
         let next_sequence = version_control.committed_sequence() + 1;
         version_control.set_committed_sequence(next_sequence);
 
+        if self.skip_wal && (wal.region_id() >> 32) >= 1024 {
+            return Ok(());
+        }
+
+        // We still write wal in this case to so alter action can still have
+        // a unique sequence
         let header = WalHeader::with_last_manifest_version(manifest_version);
         wal.write_to_wal(next_sequence, header, None).await?;
 
@@ -500,11 +509,13 @@ impl WriterInner {
         let next_sequence = committed_sequence + 1;
 
         let version = version_control.current();
-        let wal_header = WalHeader::with_last_manifest_version(version.manifest_version());
-        writer_ctx
-            .wal
-            .write_to_wal(next_sequence, wal_header, Some(request.payload()))
-            .await?;
+        if !self.engine_config.skip_wal || (metadata.id() >> 32) < 1024 {
+            let wal_header = WalHeader::with_last_manifest_version(version.manifest_version());
+            writer_ctx
+                .wal
+                .write_to_wal(next_sequence, wal_header, Some(request.payload()))
+                .await?;
+        }
 
         // Insert batch into memtable.
         let mut inserter = Inserter::new(next_sequence);
