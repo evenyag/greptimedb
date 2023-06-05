@@ -69,9 +69,9 @@ pub fn query_to_sql(q: &Query) -> Result<(String, String)> {
     for m in label_matches {
         let name = &m.name;
 
-        if name == METRIC_NAME_LABEL {
-            continue;
-        }
+        //if name == METRIC_NAME_LABEL {
+        //    continue;
+        //}
 
         let value = &m.value;
         let m_type =
@@ -285,19 +285,21 @@ fn recordbatch_to_timeseries(table: &str, recordbatch: RecordBatch) -> Result<Ve
 
 pub fn to_grpc_insert_requests(request: WriteRequest) -> Result<(InsertRequests, usize)> {
     let mut writers: HashMap<String, LinesWriter> = HashMap::new();
+
     for timeseries in &request.timeseries {
-        let table_name = timeseries
-            .labels
-            .iter()
-            .find(|label| {
-                // The metric name is a special label
-                label.name == METRIC_NAME_LABEL
-            })
-            .context(error::InvalidPromRemoteRequestSnafu {
-                msg: "missing '__name__' label in timeseries",
-            })?
-            .value
-            .clone();
+        let table_name = "prometheus_metrics".to_string();
+//        let table_name = timeseries
+//            .labels
+//            .iter()
+//            .find(|label| {
+//                // The metric name is a special label
+//                label.name == METRIC_NAME_LABEL
+//            })
+//            .context(error::InvalidPromRemoteRequestSnafu {
+//                msg: "missing '__name__' label in timeseries",
+//            })?
+//            .value
+        //            .clone();
 
         let writer = writers
             .entry(table_name)
@@ -307,9 +309,9 @@ pub fn to_grpc_insert_requests(request: WriteRequest) -> Result<(InsertRequests,
             // Insert labels first.
             for label in &timeseries.labels {
                 // The metric name is a special label
-                if label.name == METRIC_NAME_LABEL {
-                    continue;
-                }
+                //if label.name == METRIC_NAME_LABEL {
+                //    continue;
+                //}
 
                 writer
                     .write_tag(&label.name, &label.value)
