@@ -159,6 +159,7 @@ pub trait MemtableBuilder: Send + Sync + fmt::Debug {
 pub type MemtableBuilderRef = Arc<dyn MemtableBuilder>;
 
 /// Key-value pairs in columnar format.
+#[derive(Debug)]
 pub struct KeyValues {
     pub sequence: SequenceNumber,
     pub op_type: OpType,

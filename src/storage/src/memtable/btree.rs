@@ -19,14 +19,16 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
+use common_telemetry::logging;
 use common_time::range::TimestampRange;
 use datatypes::data_type::DataType;
 use datatypes::prelude::*;
 use datatypes::value::Value;
 use datatypes::vectors::{UInt64Vector, UInt64VectorBuilder, UInt8Vector, UInt8VectorBuilder};
+use snafu::OptionExt;
 use store_api::storage::{OpType, SequenceNumber};
 
-use crate::error::Result;
+use crate::error::{InvalidPayloadSnafu, Result};
 use crate::flush::FlushStrategyRef;
 use crate::memtable::{
     AllocTracker, BatchIterator, BoxedBatchIterator, IterContext, KeyValues, Memtable, MemtableId,
@@ -68,14 +70,16 @@ impl BTreeMemtable {
 
     /// Updates memtable stats.
     /// This function is guarded by `BTreeMemtable::map` so that store-after-load is safe.
-    fn update_stats(&self, request_size: usize, min: Option<Value>, max: Option<Value>) {
+    fn update_stats(
+        &self,
+        request_size: usize,
+        min: Option<Value>,
+        max: Option<Value>,
+    ) -> Result<()> {
         self.alloc_tracker.on_allocate(request_size);
 
         if let Some(min) = min {
-            let min_val = min
-                .as_timestamp()
-                .expect("Min timestamp must be a valid timestamp value")
-                .value();
+            let min_val = min.as_timestamp().context(InvalidPayloadSnafu)?.value();
             let cur_min = self.min_timestamp.load(AtomicOrdering::Relaxed);
             if min_val < cur_min {
                 self.min_timestamp.store(min_val, AtomicOrdering::Relaxed);
@@ -84,14 +88,13 @@ impl BTreeMemtable {
 
         if let Some(max) = max {
             let cur_max = self.max_timestamp.load(AtomicOrdering::Relaxed);
-            let max_val = max
-                .as_timestamp()
-                .expect("Max timestamp must be a valid timestamp value")
-                .value();
+            let max_val = max.as_timestamp().context(InvalidPayloadSnafu)?.value();
             if max_val > cur_max {
                 self.max_timestamp.store(max_val, AtomicOrdering::Relaxed);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -140,7 +143,11 @@ impl Memtable for BTreeMemtable {
             map.insert(inner_key, row_value);
         }
 
-        self.update_stats(kvs.estimated_memory_size(), min_ts, max_ts);
+        self.update_stats(kvs.estimated_memory_size(), min_ts, max_ts)
+            .map_err(|e| {
+                logging::error!(e; "Failed to update stats, kvs: {:?}", kvs);
+                e
+            })?;
 
         Ok(())
     }

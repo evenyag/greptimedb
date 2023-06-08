@@ -508,7 +508,11 @@ impl WriterInner {
 
         // Insert batch into memtable.
         let mut inserter = Inserter::new(next_sequence);
-        inserter.insert_memtable(request.payload(), version.mutable_memtable())?;
+        inserter.insert_memtable(request.payload(), version.mutable_memtable())
+            .map_err(|e| {
+                logging::error!(e; "Failed to insert memtable, region_id: {}, region_name: {}", metadata.id(), metadata.name());
+                e
+            })?;
 
         // Update committed_sequence to make current batch visible. The `&mut self` of WriterInner
         // guarantees the writer is exclusive.
@@ -523,6 +527,12 @@ impl WriterInner {
         mut recovered_metadata: RecoveredMetadataMap,
         writer_ctx: WriterContext<'_, S>,
     ) -> Result<()> {
+        logging::info!(
+            "Start to replay, region_id: {}, name: {}",
+            writer_ctx.shared.id(),
+            writer_ctx.shared.name()
+        );
+
         let version_control = writer_ctx.version_control();
 
         let (flushed_sequence, mut last_sequence);

@@ -134,10 +134,19 @@ impl<S: StorageEngine> TableEngine for MitoEngine<S> {
         request: OpenTableRequest,
     ) -> TableResult<Option<TableRef>> {
         let _timer = common_telemetry::timer!(metrics::MITO_OPEN_TABLE_ELAPSED);
+        let table_id = request.table_id;
+        let table_name = request.table_name.clone();
         self.inner
             .open_table(ctx, request)
             .await
-            .map_err(BoxedError::new)
+            .map_err(|e| {
+                logging::error!(
+                    e; "Failed to open table, table: {}, table_id: {}",
+                    table_name,
+                    table_id
+                );
+                BoxedError::new(e)
+            })
             .context(table_error::TableOperationSnafu)
     }
 
@@ -567,6 +576,12 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             table: table_name,
         };
 
+        logging::info!(
+            "Mito engine try to open table: {}, table_id: {}",
+            table_ref,
+            request.table_id
+        );
+
         if let Some(table) = self.get_table(&table_ref) {
             if let Some(table) = self.check_regions(table, &request.region_numbers)? {
                 return Ok(Some(table));
@@ -605,9 +620,9 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         };
 
         logging::info!(
-            "Mito engine opened table: {} in schema: {}",
-            table_name,
-            schema_name
+            "Mito engine opened table: {}, table_id: {}",
+            table_ref,
+            request.table_id,
         );
 
         Ok(table)

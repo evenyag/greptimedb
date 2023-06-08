@@ -522,6 +522,9 @@ pub enum Error {
         source: ArrowError,
         location: Location,
     },
+
+    #[snafu(display("Invalid payload, location: {}", location))]
+    InvalidPayload { location: Location },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -579,7 +582,8 @@ impl ErrorExt for Error {
             | ManifestCheckpoint { .. }
             | CompressObject { .. }
             | DecompressObject { .. }
-            | ParseSchema { .. } => StatusCode::Unexpected,
+            | ParseSchema { .. }
+            | InvalidPayload { .. } => StatusCode::Unexpected,
 
             WriteParquet { .. }
             | ReadObject { .. }

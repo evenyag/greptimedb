@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use common_telemetry::logging;
 use store_api::storage::{OpType, SequenceNumber};
 
 use super::MemtableRef;
-use crate::error::Result;
+use crate::error::{InvalidPayloadSnafu, Result};
 use crate::memtable::KeyValues;
 use crate::metrics::MEMTABLE_WRITE_ELAPSED;
 use crate::write_batch::{Mutation, Payload};
@@ -47,8 +48,8 @@ impl Inserter {
             return Ok(());
         }
 
-        // This function only makes effect in debug mode.
-        validate_input_and_memtable_schemas(payload, memtable);
+        // This function only asserts in debug mode.
+        validate_input_and_memtable_schemas(payload, memtable)?;
 
         // Enough to hold all key or value columns.
         let total_column_num = payload.schema.num_columns();
@@ -98,18 +99,30 @@ impl Inserter {
     }
 }
 
-fn validate_input_and_memtable_schemas(payload: &Payload, memtable: &MemtableRef) {
+/// Validate input schema and memtable schema.
+fn validate_input_and_memtable_schemas(payload: &Payload, memtable: &MemtableRef) -> Result<()> {
+    let payload_schema = &payload.schema;
+    let memtable_schema = memtable.schema();
+    let user_schema = memtable_schema.user_schema();
+
     if cfg!(debug_assertions) {
-        let payload_schema = &payload.schema;
-        let memtable_schema = memtable.schema();
-        let user_schema = memtable_schema.user_schema();
         debug_assert_eq!(payload_schema.version(), user_schema.version());
         // Only validate column schemas.
         debug_assert_eq!(
             payload_schema.column_schemas(),
             user_schema.column_schemas()
         );
+    } else if payload_schema.column_schemas() != user_schema.column_schemas() {
+        logging::error!(
+            "Invalid payload schema, memtable_schema: {:?}, payload: {:?}",
+            memtable_schema,
+            payload
+        );
+
+        return InvalidPayloadSnafu.fail();
     }
+
+    Ok(())
 }
 
 /// Holds `start` and `end` indexes to get a slice `[start, end)` from the vector whose
