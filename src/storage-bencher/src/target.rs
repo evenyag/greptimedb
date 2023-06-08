@@ -25,7 +25,6 @@ use datatypes::arrow::datatypes::{DataType, TimeUnit};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::vectors::Helper;
-use log::Level;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::LogConfig;
 use object_store::layers::{LoggingLayer, MetricsLayer, TracingLayer};
@@ -39,10 +38,10 @@ use storage::write_batch::WriteBatch;
 use storage::EngineImpl;
 use store_api::logstore::LogStore;
 use store_api::storage::{
-    ChunkReader, ColumnDescriptorBuilder, ColumnFamilyDescriptorBuilder, CreateOptions,
-    EngineContext, OpenOptions, ReadContext, Region, RegionDescriptor, RegionDescriptorBuilder,
-    RegionId, RowKeyDescriptorBuilder, ScanRequest, Snapshot, StorageEngine, WriteContext,
-    WriteRequest,
+    ChunkReader, CloseOptions, ColumnDescriptorBuilder, ColumnFamilyDescriptorBuilder,
+    CreateOptions, EngineContext, OpenOptions, ReadContext, Region, RegionDescriptor,
+    RegionDescriptorBuilder, RegionId, RowKeyDescriptorBuilder, ScanRequest, Snapshot,
+    StorageEngine, WriteContext, WriteRequest,
 };
 
 /// Timestamp column name.
@@ -63,7 +62,11 @@ async fn new_fs_object_store(path: &str) -> ObjectStore {
         .unwrap()
         .finish()
         .layer(MetricsLayer)
-        .layer(LoggingLayer::default().with_error_level(Some(Level::Debug)))
+        .layer(
+            LoggingLayer::default()
+                .with_error_level(Some("debug"))
+                .unwrap(),
+        )
         .layer(TracingLayer)
 }
 
@@ -251,6 +254,7 @@ pub struct ScanMetrics {
 
 /// Target region to test.
 pub struct Target {
+    region_id: RegionId,
     engine: EngineImpl<RaftEngineLogStore>,
     region: Option<RegionImpl<RaftEngineLogStore>>,
     is_new_region: bool,
@@ -264,6 +268,7 @@ impl Target {
         let (region, is_new_region) = init_region(&engine, &region_name, region_id).await;
 
         Target {
+            region_id,
             engine,
             region: Some(region),
             is_new_region,
@@ -277,9 +282,13 @@ impl Target {
 
     /// Stop the target.
     pub async fn shutdown(mut self) {
-        let region = self.region.take().unwrap();
+        self.region.take().unwrap();
         let ctx = EngineContext::default();
-        self.engine.close_region(&ctx, region).await.unwrap();
+        let region_name = region_name_by_id(self.region_id);
+        self.engine
+            .close_region(&ctx, &region_name, &CloseOptions { flush: false })
+            .await
+            .unwrap();
         self.engine.close(&ctx).await.unwrap();
     }
 

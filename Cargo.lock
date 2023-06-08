@@ -9483,7 +9483,6 @@ dependencies = [
  "criterion 0.4.0",
  "datatypes",
  "humantime-serde",
- "log",
  "log-store",
  "object-store",
  "once_cell",
