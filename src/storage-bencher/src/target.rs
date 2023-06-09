@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common_base::readable_size::ReadableSize;
@@ -256,7 +256,7 @@ pub struct ScanMetrics {
 pub struct Target {
     region_id: RegionId,
     engine: EngineImpl<RaftEngineLogStore>,
-    region: Option<RegionImpl<RaftEngineLogStore>>,
+    region: Mutex<Option<RegionImpl<RaftEngineLogStore>>>,
     is_new_region: bool,
 }
 
@@ -270,7 +270,7 @@ impl Target {
         Target {
             region_id,
             engine,
-            region: Some(region),
+            region: Mutex::new(Some(region)),
             is_new_region,
         }
     }
@@ -281,8 +281,9 @@ impl Target {
     }
 
     /// Stop the target.
-    pub async fn shutdown(mut self) {
-        self.region.take().unwrap();
+    pub async fn shutdown(&self) {
+        // Drop the region.
+        self.region.lock().unwrap().take();
         let ctx = EngineContext::default();
         let region_name = region_name_by_id(self.region_id);
         self.engine
@@ -324,7 +325,7 @@ impl Target {
     }
 
     /// Returns the region.
-    fn region(&self) -> &RegionImpl<RaftEngineLogStore> {
-        self.region.as_ref().unwrap()
+    fn region(&self) -> RegionImpl<RaftEngineLogStore> {
+        self.region.lock().unwrap().clone().unwrap()
     }
 }

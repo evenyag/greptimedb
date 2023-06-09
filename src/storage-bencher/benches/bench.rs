@@ -82,7 +82,7 @@ fn init_bench() -> BenchConfig {
     (*config).clone()
 }
 
-fn bench_storage_iter(times: usize, b: &mut Bencher<'_>, input: &(BenchContext, ScanBench)) {
+fn scan_storage_iter(times: usize, b: &mut Bencher<'_>, input: &(BenchContext, ScanBench)) {
     b.iter(|| {
         let metrics = input.0.runtime.block_on(async { input.1.run().await });
 
@@ -122,7 +122,7 @@ fn bench_full_scan(c: &mut Criterion) {
         &input,
         |b, input| {
             times += 1;
-            bench_storage_iter(times, b, input)
+            scan_storage_iter(times, b, input)
         },
     );
 

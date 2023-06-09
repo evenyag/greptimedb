@@ -36,6 +36,7 @@ impl ScanBench {
         }
     }
 
+    /// Prepare test data if the target contains a new region.
     pub async fn maybe_prepare_data(&mut self) {
         if self.target.is_new_region() && !self.loaded {
             logging::info!("Load data to target");
@@ -50,10 +51,12 @@ impl ScanBench {
         logging::info!("region already exists, don't load again");
     }
 
+    /// Iter one bench.
     pub async fn run(&self) -> ScanMetrics {
         self.target.full_scan(self.scan_batch_size).await
     }
 
+    /// Shutdown the bencher.
     pub async fn shutdown(self) {
         self.target.shutdown().await
     }

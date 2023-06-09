@@ -17,7 +17,8 @@
 use std::fs::File;
 use std::time::{Duration, Instant};
 
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datatypes::arrow::record_batch::RecordBatchReader;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 
 use crate::target::Target;
 
@@ -48,14 +49,8 @@ impl ParquetLoader {
     pub async fn load_to_target(&self, target: &Target) -> LoadMetrics {
         let start = Instant::now();
 
-        let file = File::open(&self.file_path).unwrap();
-
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .with_batch_size(self.batch_size);
-        let parquet_schema_desc = builder.metadata().file_metadata().schema_descr_ptr();
-        let num_columns = parquet_schema_desc.num_columns();
-        let reader = builder.build().unwrap();
+        let reader = self.reader();
+        let num_columns = reader.schema().fields().len();
 
         let mut num_rows = 0;
         for batch in reader {
@@ -69,5 +64,15 @@ impl ParquetLoader {
             num_rows,
             num_columns,
         }
+    }
+
+    /// Returns a new [ParquetRecordBatchReader].
+    pub fn reader(&self) -> ParquetRecordBatchReader {
+        let file = File::open(&self.file_path).unwrap();
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .with_batch_size(self.batch_size);
+        builder.build().unwrap()
     }
 }

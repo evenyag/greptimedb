@@ -11,6 +11,8 @@ common-base = { path = "../common/base" }
 common-runtime = { path = "../common/runtime" }
 common-telemetry = { path = "../common/telemetry" }
 datatypes = { path = "../datatypes" }
+flume = "0.10"
+futures-util.workspace = true
 humantime-serde = "1"
 log-store = { path = "../log-store" }
 object-store = { path = "../object-store" }
@@ -19,6 +21,7 @@ parquet = { workspace = true, features = ["async"] }
 serde = "1"
 storage = { path = "../storage" }
 store-api = { path = "../store-api" }
+tokio.workspace = true
 toml = "0.5"
 
 [dev-dependencies]
