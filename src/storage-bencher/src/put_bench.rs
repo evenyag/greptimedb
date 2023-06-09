@@ -65,8 +65,6 @@ impl PutBench {
     pub async fn run(&self) -> PutMetrics {
         let run_start = Instant::now();
 
-        logging::info!("Create region");
-
         let target = self.new_target().await;
         let target = Arc::new(target);
         let reader = self.loader.reader();

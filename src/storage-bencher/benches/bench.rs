@@ -53,28 +53,28 @@ impl BenchContext {
     async fn new_scan_bench(&self) -> ScanBench {
         let loader = ParquetLoader::new(
             self.config.parquet_path.clone(),
-            self.config.load_batch_size,
+            self.config.scan.load_batch_size,
         );
         let target = Target::new(
-            &self.config.storage.path,
-            self.config.storage.engine_config(),
-            self.config.storage.region_id,
+            &self.config.scan.path,
+            self.config.scan.engine_config(),
+            self.config.scan.region_id,
         )
         .await;
 
-        ScanBench::new(loader, target, self.config.scan_batch_size)
+        ScanBench::new(loader, target, self.config.scan.scan_batch_size)
     }
 
     fn new_put_bench(&self) -> PutBench {
         let loader = ParquetLoader::new(
             self.config.parquet_path.clone(),
-            self.config.load_batch_size,
+            self.config.put.batch_size,
         );
 
         PutBench::new(
             loader,
-            self.config.storage.path.clone(),
-            self.config.storage.engine_config(),
+            self.config.put.path.clone(),
+            self.config.put.engine_config(),
         )
     }
 }

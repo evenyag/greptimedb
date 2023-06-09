@@ -22,26 +22,61 @@ use serde::Deserialize;
 use storage::config::EngineConfig;
 use store_api::storage::RegionId;
 
-/// Storage engine config.
+/// Scan bench config.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct StorageConfig {
+pub struct ScanConfig {
     /// Storage data path.
     pub path: String,
     /// Region to bench.
     pub region_id: RegionId,
+    /// Batch size to load data.
+    pub load_batch_size: usize,
+    /// Batch size to scan.
+    pub scan_batch_size: usize,
 }
 
-impl Default for StorageConfig {
+impl Default for ScanConfig {
     fn default() -> Self {
-        StorageConfig {
+        ScanConfig {
             path: "/tmp/storage-bencher/".to_string(),
             region_id: 0,
+            load_batch_size: 1024,
+            scan_batch_size: 1024,
         }
     }
 }
 
-impl StorageConfig {
+impl ScanConfig {
+    /// Returns the engine config for bench.
+    pub fn engine_config(&self) -> EngineConfig {
+        EngineConfig::default()
+    }
+}
+
+/// Put bench config.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PutConfig {
+    /// Storage data path.
+    pub path: String,
+    /// Batch size to put.
+    pub batch_size: usize,
+    /// Put worker num.
+    pub put_workers: usize,
+}
+
+impl Default for PutConfig {
+    fn default() -> Self {
+        PutConfig {
+            path: "/tmp/storage-bencher/".to_string(),
+            batch_size: 1024,
+            put_workers: 1,
+        }
+    }
+}
+
+impl PutConfig {
     /// Returns the engine config for bench.
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig::default()
@@ -56,12 +91,12 @@ pub struct BenchConfig {
     #[serde(with = "humantime_serde")]
     pub measurement_time: Duration,
     pub sample_size: usize,
-    pub load_batch_size: usize,
-    pub scan_batch_size: usize,
-    pub put_workers: usize,
     /// Print metrics every N benches. Never print metrics if N is 0.
     pub print_metrics_every: usize,
-    pub storage: StorageConfig,
+    /// Config for scan bench.
+    pub scan: ScanConfig,
+    /// Config for put bench.
+    pub put: PutConfig,
 }
 
 impl Default for BenchConfig {
@@ -71,11 +106,9 @@ impl Default for BenchConfig {
             parquet_path: "".to_string(),
             measurement_time: Duration::from_secs(30),
             sample_size: 30,
-            load_batch_size: 1024,
-            scan_batch_size: 1024,
-            put_workers: 1,
             print_metrics_every: 0,
-            storage: StorageConfig::default(),
+            scan: ScanConfig::default(),
+            put: PutConfig::default(),
         }
     }
 }
