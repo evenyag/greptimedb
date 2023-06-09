@@ -69,56 +69,52 @@ impl PutBench {
         let target = Arc::new(target);
         let reader = self.loader.reader();
         let num_columns = reader.schema().fields().len();
-        let mut num_rows = 0;
-        let mut put_cost = Duration::ZERO;
 
-        if self.put_workers <= 1 {
-            // Put in current thread.
-            for batch in reader {
-                let batch = batch.unwrap();
-                num_rows += batch.num_rows();
-
-                let put_start = Instant::now();
-                target.write(batch).await;
-                put_cost += put_start.elapsed();
-            }
+        let put_workers = if self.put_workers <= 1 {
+            1
         } else {
-            // Spawn multiple tasks to put.
-            let (tx, rx) = flume::bounded(64);
-            let mut handles = Vec::with_capacity(self.put_workers);
-            for _ in 0..self.put_workers {
-                let rx = rx.clone();
-                let target = target.clone();
-                let handle = tokio::spawn(async move {
-                    let mut stream = rx.into_stream();
-                    let mut put_cost = Duration::ZERO;
-                    // Each worker receive batch from the channel.
-                    while let Some(batch) = stream.next().await {
-                        let put_start = Instant::now();
-                        target.write(batch).await;
-                        put_cost += put_start.elapsed();
-                    }
+            self.put_workers
+        };
 
-                    put_cost
-                });
+        // Spawn multiple tasks to put.
+        let (tx, rx) = flume::bounded(64);
+        let mut handles = Vec::with_capacity(self.put_workers);
+        for _ in 0..put_workers {
+            let rx = rx.clone();
+            let target = target.clone();
+            let handle = tokio::spawn(async move {
+                let mut stream = rx.into_stream();
+                let mut put_cost = Duration::ZERO;
+                // Each worker receive batch from the channel.
+                while let Some(batch) = stream.next().await {
+                    let put_start = Instant::now();
+                    target.write(batch).await;
+                    put_cost += put_start.elapsed();
+                }
 
-                handles.push(handle);
-            }
+                put_cost
+            });
 
-            // Send batch to the channel.
+            handles.push(handle);
+        }
+
+        // Send batch to the channel.
+        let num_rows = tokio::task::block_in_place(|| {
+            let mut num_rows = 0;
             for batch in reader {
                 let batch = batch.unwrap();
                 num_rows += batch.num_rows();
 
                 tx.send(batch).unwrap();
             }
+            num_rows
+        });
 
-            put_cost = join_all(handles)
-                .await
-                .into_iter()
-                .map(|result| result.unwrap())
-                .sum();
-        }
+        let put_cost = join_all(handles)
+            .await
+            .into_iter()
+            .map(|result| result.unwrap())
+            .sum();
 
         let load_cost = run_start.elapsed();
 
