@@ -1,5 +1,5 @@
 [package]
-name = "storage-bencher"
+name = "engine-bencher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

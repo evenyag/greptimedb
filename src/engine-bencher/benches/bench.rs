@@ -19,12 +19,12 @@ use std::sync::{Mutex, Once};
 use common_runtime::{create_runtime, Runtime};
 use common_telemetry::logging;
 use criterion::*;
+use engine_bencher::config::BenchConfig;
+use engine_bencher::loader::ParquetLoader;
+use engine_bencher::put_bench::PutBench;
+use engine_bencher::scan_bench::ScanBench;
+use engine_bencher::target::Target;
 use once_cell::sync::Lazy;
-use storage_bencher::config::BenchConfig;
-use storage_bencher::loader::ParquetLoader;
-use storage_bencher::put_bench::PutBench;
-use storage_bencher::scan_bench::ScanBench;
-use storage_bencher::target::Target;
 
 const BENCH_CONFIG_KEY: &str = "BENCH_CONFIG";
 const BENCH_ENABLE_LOG_KEY: &str = "BENCH_ENABLE_LOG";
@@ -66,10 +66,8 @@ impl BenchContext {
     }
 
     fn new_put_bench(&self) -> PutBench {
-        let loader = ParquetLoader::new(
-            self.config.parquet_path.clone(),
-            self.config.put.batch_size,
-        );
+        let loader =
+            ParquetLoader::new(self.config.parquet_path.clone(), self.config.put.batch_size);
 
         PutBench::new(
             loader,
