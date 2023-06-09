@@ -58,6 +58,7 @@ pub struct BenchConfig {
     pub sample_size: usize,
     pub load_batch_size: usize,
     pub scan_batch_size: usize,
+    pub put_workers: usize,
     /// Print metrics every N benches. Never print metrics if N is 0.
     pub print_metrics_every: usize,
     pub storage: StorageConfig,
@@ -72,6 +73,7 @@ impl Default for BenchConfig {
             sample_size: 30,
             load_batch_size: 1024,
             scan_batch_size: 1024,
+            put_workers: 1,
             print_metrics_every: 0,
             storage: StorageConfig::default(),
         }
