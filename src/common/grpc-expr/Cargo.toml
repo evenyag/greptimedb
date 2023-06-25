@@ -19,4 +19,4 @@ snafu = { version = "0.7", features = ["backtraces"] }
 table = { path = "../../table" }
 
 [dev-dependencies]
-paste = "1.0"
+paste.workspace = true

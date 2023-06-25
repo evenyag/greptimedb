@@ -10,7 +10,7 @@ datafusion.workspace = true
 datafusion-common.workspace = true
 datatypes = { path = "../../datatypes" }
 futures.workspace = true
-paste = "1.0"
+paste.workspace = true
 serde = "1.0"
 snafu = { version = "0.7", features = ["backtraces"] }
 
