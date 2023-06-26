@@ -19,7 +19,6 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
 
-use common_telemetry::logging;
 use common_time::range::TimestampRange;
 use datatypes::data_type::DataType;
 use datatypes::prelude::*;
@@ -245,8 +244,6 @@ impl BTreeIterator {
             let iter = MapIterWrapper::new(iter, self.ctx.visible_sequence, self.ctx.time_range);
             collect_iter(iter, self.ctx.batch_size)
         };
-
-        logging::info!("collect iter, keys: {:?}, values: {:?}, sequences: {:?}, op_types: {:?}", keys, values, sequences, op_types);
 
         if keys.is_empty() {
             return Ok(None);
