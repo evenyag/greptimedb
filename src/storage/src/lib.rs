@@ -22,7 +22,7 @@ pub mod compaction;
 pub mod config;
 mod engine;
 pub mod error;
-pub mod flush;
+mod flush;
 pub mod manifest;
 pub mod memtable;
 pub mod metadata;
