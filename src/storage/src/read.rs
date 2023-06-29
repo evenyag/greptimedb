@@ -82,7 +82,7 @@ impl Batch {
     ///
     /// # Panics
     /// Panics if `offset + length > self.num_rows()`.
-    fn slice(&self, offset: usize, length: usize) -> Batch {
+    pub fn slice(&self, offset: usize, length: usize) -> Batch {
         let columns = self
             .columns
             .iter()
