@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use api::v1::meta::{HeartbeatRequest, PutRequest, Role};
+use std::cmp::Ordering;
+
+use api::v1::meta::{HeartbeatRequest, Role};
+use common_meta::rpc::store::PutRequest;
+use common_telemetry::warn;
 use dashmap::DashMap;
 
 use crate::error::Result;
@@ -90,13 +94,18 @@ impl HeartbeatHandler for PersistStatsHandler {
         let epoch_stats = entry.value_mut();
 
         let refresh = if let Some(epoch) = epoch_stats.epoch() {
-            // This node may have been redeployed.
-            if current_stat.node_epoch > epoch {
-                epoch_stats.set_epoch(current_stat.node_epoch);
-                epoch_stats.clear();
-                true
-            } else {
-                false
+            match current_stat.node_epoch.cmp(&epoch) {
+                Ordering::Greater => {
+                    // This node may have been redeployed.
+                    epoch_stats.set_epoch(current_stat.node_epoch);
+                    epoch_stats.clear();
+                    true
+                }
+                Ordering::Less => {
+                    warn!("Ignore stale heartbeat: {:?}", current_stat);
+                    false
+                }
+                Ordering::Equal => false,
             }
         } else {
             epoch_stats.set_epoch(current_stat.node_epoch);
@@ -122,7 +131,7 @@ impl HeartbeatHandler for PersistStatsHandler {
             ..Default::default()
         };
 
-        ctx.in_memory.put(put).await?;
+        let _ = ctx.in_memory.put(put).await?;
 
         Ok(())
     }
@@ -133,27 +142,45 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    use common_meta::key::TableMetadataManager;
+
     use super::*;
+    use crate::cluster::MetaPeerClientBuilder;
     use crate::handler::{HeartbeatMailbox, Pushers};
     use crate::keys::StatKey;
     use crate::sequence::Sequence;
-    use crate::service::store::ext::KvStoreExt;
+    use crate::service::store::cached_kv::LeaderCachedKvStore;
+    use crate::service::store::kv::KvBackendAdapter;
     use crate::service::store::memory::MemStore;
 
     #[tokio::test]
     async fn test_handle_datanode_stats() {
         let in_memory = Arc::new(MemStore::new());
         let kv_store = Arc::new(MemStore::new());
+        let leader_cached_kv_store =
+            Arc::new(LeaderCachedKvStore::with_always_leader(kv_store.clone()));
         let seq = Sequence::new("test_seq", 0, 10, kv_store.clone());
         let mailbox = HeartbeatMailbox::create(Pushers::default(), seq);
+        let meta_peer_client = MetaPeerClientBuilder::default()
+            .election(None)
+            .in_memory(in_memory.clone())
+            .build()
+            .map(Arc::new)
+            // Safety: all required fields set at initialization
+            .unwrap();
         let ctx = Context {
             server_addr: "127.0.0.1:0000".to_string(),
             in_memory,
-            kv_store,
+            kv_store: kv_store.clone(),
+            leader_cached_kv_store,
+            meta_peer_client,
             mailbox,
             election: None,
             skip_all: Arc::new(AtomicBool::new(false)),
             is_infancy: false,
+            table_metadata_manager: Arc::new(TableMetadataManager::new(KvBackendAdapter::wrap(
+                kv_store.clone(),
+            ))),
         };
 
         let handler = PersistStatsHandler::default();
@@ -163,8 +190,8 @@ mod tests {
             cluster_id: 3,
             node_id: 101,
         };
-        let res = ctx.in_memory.get(key.try_into().unwrap()).await.unwrap();
-        assert!(res.is_some());
+        let key: Vec<u8> = key.try_into().unwrap();
+        let res = ctx.in_memory.get(&key).await.unwrap();
         let kv = res.unwrap();
         let key: StatKey = kv.key.clone().try_into().unwrap();
         assert_eq!(3, key.cluster_id);
@@ -175,8 +202,9 @@ mod tests {
         assert_eq!(Some(1), val.stats[0].region_num);
 
         handle_request_many_times(ctx.clone(), &handler, 10).await;
-        let res = ctx.in_memory.get(key.try_into().unwrap()).await.unwrap();
-        assert!(res.is_some());
+
+        let key: Vec<u8> = key.try_into().unwrap();
+        let res = ctx.in_memory.get(&key).await.unwrap();
         let kv = res.unwrap();
         let val: StatValue = kv.value.try_into().unwrap();
         // refresh every 10 stats

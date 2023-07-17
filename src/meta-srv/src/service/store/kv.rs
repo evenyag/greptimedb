@@ -12,39 +12,133 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::sync::Arc;
 
-use api::v1::meta::{
+use async_trait::async_trait;
+use common_error::ext::BoxedError;
+use common_meta::error::MetaSrvSnafu;
+use common_meta::kv_backend::txn::{Txn, TxnResponse};
+use common_meta::kv_backend::{KvBackend, KvBackendRef, TxnService};
+use common_meta::rpc::store::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchPutRequest,
     BatchPutResponse, CompareAndPutRequest, CompareAndPutResponse, DeleteRangeRequest,
     DeleteRangeResponse, MoveValueRequest, MoveValueResponse, PutRequest, PutResponse,
     RangeRequest, RangeResponse,
 };
+use snafu::ResultExt;
 
-use crate::error::Result;
+use crate::error::Error;
 
-pub type KvStoreRef = Arc<dyn KvStore>;
+pub type KvStoreRef = Arc<dyn KvBackend<Error = Error>>;
 pub type ResettableKvStoreRef = Arc<dyn ResettableKvStore>;
 
-#[async_trait::async_trait]
-pub trait KvStore: Send + Sync {
-    async fn range(&self, req: RangeRequest) -> Result<RangeResponse>;
-
-    async fn put(&self, req: PutRequest) -> Result<PutResponse>;
-
-    async fn batch_get(&self, req: BatchGetRequest) -> Result<BatchGetResponse>;
-
-    async fn batch_put(&self, req: BatchPutRequest) -> Result<BatchPutResponse>;
-
-    async fn batch_delete(&self, req: BatchDeleteRequest) -> Result<BatchDeleteResponse>;
-
-    async fn compare_and_put(&self, req: CompareAndPutRequest) -> Result<CompareAndPutResponse>;
-
-    async fn delete_range(&self, req: DeleteRangeRequest) -> Result<DeleteRangeResponse>;
-
-    async fn move_value(&self, req: MoveValueRequest) -> Result<MoveValueResponse>;
+pub trait ResettableKvStore: KvBackend<Error = Error> {
+    fn reset(&self);
 }
 
-pub trait ResettableKvStore: KvStore {
-    fn reset(&self);
+/// An adaptor to bridge [KvStoreRef] and [KvBackendRef].
+pub struct KvBackendAdapter(KvStoreRef);
+
+impl KvBackendAdapter {
+    pub fn wrap(kv_store: KvStoreRef) -> KvBackendRef {
+        Arc::new(Self(kv_store))
+    }
+}
+
+#[async_trait]
+impl TxnService for KvBackendAdapter {
+    type Error = common_meta::error::Error;
+
+    async fn txn(&self, txn: Txn) -> Result<TxnResponse, Self::Error> {
+        self.0
+            .txn(txn)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+}
+
+#[async_trait]
+impl KvBackend for KvBackendAdapter {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    async fn range(&self, req: RangeRequest) -> Result<RangeResponse, Self::Error> {
+        self.0
+            .range(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn put(&self, req: PutRequest) -> Result<PutResponse, Self::Error> {
+        self.0
+            .put(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn batch_put(&self, req: BatchPutRequest) -> Result<BatchPutResponse, Self::Error> {
+        self.0
+            .batch_put(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn compare_and_put(
+        &self,
+        req: CompareAndPutRequest,
+    ) -> Result<CompareAndPutResponse, Self::Error> {
+        self.0
+            .compare_and_put(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn delete_range(
+        &self,
+        req: DeleteRangeRequest,
+    ) -> Result<DeleteRangeResponse, Self::Error> {
+        self.0
+            .delete_range(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn batch_delete(
+        &self,
+        req: BatchDeleteRequest,
+    ) -> Result<BatchDeleteResponse, Self::Error> {
+        self.0
+            .batch_delete(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn batch_get(&self, req: BatchGetRequest) -> Result<BatchGetResponse, Self::Error> {
+        self.0
+            .batch_get(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    async fn move_value(&self, req: MoveValueRequest) -> Result<MoveValueResponse, Self::Error> {
+        self.0
+            .move_value(req)
+            .await
+            .map_err(BoxedError::new)
+            .context(MetaSrvSnafu)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self.0.as_any()
+    }
 }

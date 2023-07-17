@@ -19,7 +19,7 @@ use common_base::Plugins;
 use common_telemetry::logging;
 use frontend::frontend::FrontendOptions;
 use frontend::instance::{FrontendInstance, Instance as FeInstance};
-use frontend::service_config::{InfluxdbOptions, PromOptions};
+use frontend::service_config::{InfluxdbOptions, PrometheusOptions};
 use meta_client::MetaClientOptions;
 use servers::auth::UserProviderRef;
 use servers::tls::{TlsMode, TlsOption};
@@ -172,7 +172,7 @@ impl StartCommand {
         }
 
         if let Some(addr) = &self.prom_addr {
-            opts.prom_options = Some(PromOptions { addr: addr.clone() });
+            opts.prometheus_options = Some(PrometheusOptions { addr: addr.clone() });
         }
 
         if let Some(addr) = &self.postgres_addr {
@@ -236,6 +236,7 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
+    use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_named_temp_file;
     use frontend::service_config::GrpcOptions;
     use servers::auth::{Identity, Password, UserProviderRef};
@@ -260,6 +261,10 @@ mod tests {
             command.load_options(TopLevelOptions::default()).unwrap() else { unreachable!() };
 
         assert_eq!(opts.http_options.as_ref().unwrap().addr, "127.0.0.1:1234");
+        assert_eq!(
+            ReadableSize::mb(64),
+            opts.http_options.as_ref().unwrap().body_limit
+        );
         assert_eq!(opts.mysql_options.as_ref().unwrap().addr, "127.0.0.1:5678");
         assert_eq!(
             opts.postgres_options.as_ref().unwrap().addr,
@@ -269,7 +274,10 @@ mod tests {
             opts.opentsdb_options.as_ref().unwrap().addr,
             "127.0.0.1:4321"
         );
-        assert_eq!(opts.prom_options.as_ref().unwrap().addr, "127.0.0.1:4444");
+        assert_eq!(
+            opts.prometheus_options.as_ref().unwrap().addr,
+            "127.0.0.1:4444"
+        );
 
         let default_opts = FrontendOptions::default();
         assert_eq!(
@@ -301,6 +309,7 @@ mod tests {
             [http_options]
             addr = "127.0.0.1:4000"
             timeout = "30s"
+            body_limit = "2GB"
 
             [logging]
             level = "debug"
@@ -326,6 +335,11 @@ mod tests {
             fe_opts.http_options.as_ref().unwrap().timeout
         );
 
+        assert_eq!(
+            ReadableSize::gb(2),
+            fe_opts.http_options.as_ref().unwrap().body_limit
+        );
+
         assert_eq!("debug", fe_opts.logging.level.as_ref().unwrap());
         assert_eq!("/tmp/greptimedb/test/logs".to_string(), fe_opts.logging.dir);
     }
@@ -339,19 +353,15 @@ mod tests {
         };
 
         let plugins = load_frontend_plugins(&command.user_provider);
-        assert!(plugins.is_ok());
         let plugins = plugins.unwrap();
-        let provider = plugins.get::<UserProviderRef>();
-        assert!(provider.is_some());
-
-        let provider = provider.unwrap();
+        let provider = plugins.get::<UserProviderRef>().unwrap();
         let result = provider
             .authenticate(
                 Identity::UserId("test", None),
                 Password::PlainText("test".to_string().into()),
             )
             .await;
-        assert!(result.is_ok());
+        let _ = result.unwrap();
     }
 
     #[test]

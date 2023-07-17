@@ -19,7 +19,7 @@ pub mod influxdb;
 pub mod mem_prof;
 pub mod opentsdb;
 mod pprof;
-pub mod prometheus;
+pub mod prom_store;
 pub mod script;
 
 #[cfg(feature = "dashboard")]
@@ -34,12 +34,13 @@ use aide::openapi::{Info, OpenApi, Server as OpenAPIServer};
 use async_trait::async_trait;
 use axum::body::BoxBody;
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::MatchedPath;
+use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json};
 use axum::{routing, BoxError, Extension, Router};
-use common_error::prelude::ErrorExt;
+use common_base::readable_size::ReadableSize;
+use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_recordbatch::{util, RecordBatch};
@@ -59,11 +60,11 @@ use tower_http::auth::AsyncRequireAuthorizationLayer;
 use tower_http::trace::TraceLayer;
 
 use self::authorize::HttpAuth;
-use self::influxdb::{influxdb_health, influxdb_ping, influxdb_write};
+use self::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
 use crate::auth::UserProviderRef;
 use crate::configurator::ConfiguratorRef;
 use crate::error::{AlreadyStartedSnafu, Result, StartHttpSnafu};
-use crate::http::admin::flush;
+use crate::http::admin::{compact, flush};
 use crate::metrics::{
     METRIC_HTTP_REQUESTS_ELAPSED, METRIC_HTTP_REQUESTS_TOTAL, METRIC_METHOD_LABEL,
     METRIC_PATH_LABEL, METRIC_STATUS_LABEL,
@@ -72,7 +73,7 @@ use crate::metrics_handler::MetricsHandler;
 use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
-    InfluxdbLineProtocolHandlerRef, OpentsdbProtocolHandlerRef, PrometheusProtocolHandlerRef,
+    InfluxdbLineProtocolHandlerRef, OpentsdbProtocolHandlerRef, PromStoreProtocolHandlerRef,
     ScriptHandlerRef,
 };
 use crate::server::Server;
@@ -104,6 +105,8 @@ pub(crate) async fn query_context_from_db(
 
 pub const HTTP_API_VERSION: &str = "v1";
 pub const HTTP_API_PREFIX: &str = "/v1/";
+/// Default http body limit (64M).
+const DEFAULT_BODY_LIMIT: ReadableSize = ReadableSize::mb(64);
 
 // TODO(fys): This is a temporary workaround, it will be improved later
 pub static PUBLIC_APIS: [&str; 2] = ["/v1/influxdb/ping", "/v1/influxdb/health"];
@@ -115,12 +118,13 @@ pub struct HttpServer {
     options: HttpOptions,
     influxdb_handler: Option<InfluxdbLineProtocolHandlerRef>,
     opentsdb_handler: Option<OpentsdbProtocolHandlerRef>,
-    prom_handler: Option<PrometheusProtocolHandlerRef>,
+    prom_handler: Option<PromStoreProtocolHandlerRef>,
     script_handler: Option<ScriptHandlerRef>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     user_provider: Option<UserProviderRef>,
     metrics_handler: Option<MetricsHandler>,
     configurator: Option<ConfiguratorRef>,
+    greptime_config_options: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +137,8 @@ pub struct HttpOptions {
 
     #[serde(skip)]
     pub disable_dashboard: bool,
+
+    pub body_limit: ReadableSize,
 }
 
 impl Default for HttpOptions {
@@ -141,6 +147,7 @@ impl Default for HttpOptions {
             addr: "127.0.0.1:4000".to_string(),
             timeout: Duration::from_secs(30),
             disable_dashboard: false,
+            body_limit: DEFAULT_BODY_LIMIT,
         }
     }
 }
@@ -372,6 +379,11 @@ pub struct ApiState {
     pub script_handler: Option<ScriptHandlerRef>,
 }
 
+#[derive(Clone)]
+pub struct GreptimeOptionsConfigState {
+    pub greptime_config_options: String,
+}
+
 #[derive(Default)]
 pub struct HttpServerBuilder {
     inner: HttpServer,
@@ -392,52 +404,58 @@ impl HttpServerBuilder {
                 metrics_handler: None,
                 shutdown_tx: Mutex::new(None),
                 configurator: None,
+                greptime_config_options: None,
             },
         }
     }
 
     pub fn with_sql_handler(&mut self, handler: ServerSqlQueryHandlerRef) -> &mut Self {
-        self.inner.sql_handler.get_or_insert(handler);
+        let _ = self.inner.sql_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_grpc_handler(&mut self, handler: ServerGrpcQueryHandlerRef) -> &mut Self {
-        self.inner.grpc_handler.get_or_insert(handler);
+        let _ = self.inner.grpc_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_opentsdb_handler(&mut self, handler: OpentsdbProtocolHandlerRef) -> &mut Self {
-        self.inner.opentsdb_handler.get_or_insert(handler);
+        let _ = self.inner.opentsdb_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_script_handler(&mut self, handler: ScriptHandlerRef) -> &mut Self {
-        self.inner.script_handler.get_or_insert(handler);
+        let _ = self.inner.script_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_influxdb_handler(&mut self, handler: InfluxdbLineProtocolHandlerRef) -> &mut Self {
-        self.inner.influxdb_handler.get_or_insert(handler);
+        let _ = self.inner.influxdb_handler.get_or_insert(handler);
         self
     }
 
-    pub fn with_prom_handler(&mut self, handler: PrometheusProtocolHandlerRef) -> &mut Self {
-        self.inner.prom_handler.get_or_insert(handler);
+    pub fn with_prom_handler(&mut self, handler: PromStoreProtocolHandlerRef) -> &mut Self {
+        let _ = self.inner.prom_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_user_provider(&mut self, user_provider: UserProviderRef) -> &mut Self {
-        self.inner.user_provider.get_or_insert(user_provider);
+        let _ = self.inner.user_provider.get_or_insert(user_provider);
         self
     }
 
     pub fn with_metrics_handler(&mut self, handler: MetricsHandler) -> &mut Self {
-        self.inner.metrics_handler.get_or_insert(handler);
+        let _ = self.inner.metrics_handler.get_or_insert(handler);
         self
     }
 
     pub fn with_configurator(&mut self, configurator: Option<ConfiguratorRef>) -> &mut Self {
         self.inner.configurator = configurator;
+        self
+    }
+
+    pub fn with_greptime_config_options(&mut self, opts: String) -> &mut Self {
+        self.inner.greptime_config_options = Some(opts);
         self
     }
 
@@ -471,7 +489,7 @@ impl HttpServer {
                     script_handler: self.script_handler.clone(),
                 })
                 .finish_api(&mut api)
-                .layer(Extension(api));
+                .layer(Extension(api.clone()));
             router = router.nest(&format!("/{HTTP_API_VERSION}"), sql_router);
         }
 
@@ -512,6 +530,17 @@ impl HttpServer {
             routing::get(handler::health).post(handler::health),
         );
 
+        let config_router = self
+            .route_config(GreptimeOptionsConfigState {
+                greptime_config_options: self
+                    .greptime_config_options
+                    .clone()
+                    .unwrap_or("".to_string()),
+            })
+            .finish_api(&mut api);
+
+        router = router.nest("", config_router);
+
         router = router.route("/status", routing::get(handler::status));
 
         #[cfg(feature = "dashboard")]
@@ -544,6 +573,13 @@ impl HttpServer {
                     .layer(HandleErrorLayer::new(handle_error))
                     .layer(TraceLayer::new_for_http())
                     .layer(TimeoutLayer::new(self.options.timeout))
+                    .layer(DefaultBodyLimit::max(
+                        self.options
+                            .body_limit
+                            .0
+                            .try_into()
+                            .unwrap_or_else(|_| DEFAULT_BODY_LIMIT.as_bytes() as usize),
+                    ))
                     // custom layer
                     .layer(AsyncRequireAuthorizationLayer::new(
                         HttpAuth::<BoxBody>::new(self.user_provider.clone()),
@@ -589,16 +625,17 @@ impl HttpServer {
             .with_state(api_state)
     }
 
-    fn route_prom<S>(&self, prom_handler: PrometheusProtocolHandlerRef) -> Router<S> {
+    fn route_prom<S>(&self, prom_handler: PromStoreProtocolHandlerRef) -> Router<S> {
         Router::new()
-            .route("/write", routing::post(prometheus::remote_write))
-            .route("/read", routing::post(prometheus::remote_read))
+            .route("/write", routing::post(prom_store::remote_write))
+            .route("/read", routing::post(prom_store::remote_read))
             .with_state(prom_handler)
     }
 
     fn route_influxdb<S>(&self, influxdb_handler: InfluxdbLineProtocolHandlerRef) -> Router<S> {
         Router::new()
-            .route("/write", routing::post(influxdb_write))
+            .route("/write", routing::post(influxdb_write_v1))
+            .route("/api/v2/write", routing::post(influxdb_write_v2))
             .route("/ping", routing::get(influxdb_ping))
             .route("/health", routing::get(influxdb_health))
             .with_state(influxdb_handler)
@@ -613,7 +650,14 @@ impl HttpServer {
     fn route_admin<S>(&self, grpc_handler: ServerGrpcQueryHandlerRef) -> Router<S> {
         Router::new()
             .route("/flush", routing::post(flush))
+            .route("/compact", routing::post(compact))
             .with_state(grpc_handler)
+    }
+
+    fn route_config<S>(&self, state: GreptimeOptionsConfigState) -> ApiRouter<S> {
+        ApiRouter::new()
+            .route("/config", apirouting::get(handler::config))
+            .with_state(state)
     }
 }
 

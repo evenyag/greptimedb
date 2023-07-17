@@ -17,13 +17,14 @@ use std::io::Error as IoError;
 use std::str::Utf8Error;
 
 use common_datasource::compression::CompressionType;
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
 use common_runtime::error::Error as RuntimeError;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
 use serde_json::error::Error as JsonError;
-use snafu::Location;
+use snafu::{Location, Snafu};
 use store_api::manifest::action::ProtocolVersion;
 use store_api::manifest::ManifestVersion;
 use store_api::storage::{RegionId, SequenceNumber};
@@ -522,6 +523,22 @@ pub enum Error {
         source: ArrowError,
         location: Location,
     },
+
+    #[snafu(display("Failed to build scan predicate, source: {}", source))]
+    BuildPredicate {
+        source: table::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to join spawned tasks, source: {}, location: {}",
+        source,
+        location
+    ))]
+    JoinError {
+        source: JoinError,
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -621,6 +638,8 @@ impl ErrorExt for Error {
 
             TtlCalculation { source, .. } => source.status_code(),
             ConvertColumnsToRows { .. } | SortArrays { .. } => StatusCode::Unexpected,
+            BuildPredicate { source, .. } => source.status_code(),
+            JoinError { .. } => StatusCode::Unexpected,
         }
     }
 

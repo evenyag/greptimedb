@@ -21,18 +21,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use catalog::error::Error;
     use catalog::helper::{CatalogKey, CatalogValue, SchemaKey, SchemaValue};
-    use catalog::remote::mock::{MockKvBackend, MockTableEngine};
+    use catalog::remote::mock::MockTableEngine;
     use catalog::remote::region_alive_keeper::RegionAliveKeepers;
-    use catalog::remote::{
-        CachedMetaKvBackend, KvBackend, KvBackendRef, RemoteCatalogManager, RemoteCatalogProvider,
-        RemoteSchemaProvider,
-    };
-    use catalog::{CatalogManager, RegisterTableRequest};
+    use catalog::remote::{CachedMetaKvBackend, RemoteCatalogManager};
+    use catalog::{CatalogManager, RegisterSchemaRequest, RegisterTableRequest};
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
     use common_meta::ident::TableIdent;
+    use common_meta::key::TableMetadataManager;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::kv_backend::KvBackend;
+    use common_meta::rpc::store::{CompareAndPutRequest, PutRequest, RangeRequest};
     use datatypes::schema::RawSchema;
-    use futures_util::StreamExt;
     use table::engine::manager::{MemoryTableEngineManager, TableEngineManagerRef};
     use table::engine::{EngineContext, TableEngineRef};
     use table::requests::CreateTableRequest;
@@ -40,7 +41,6 @@ mod tests {
     use tokio::time::Instant;
 
     struct TestingComponents {
-        kv_backend: KvBackendRef,
         catalog_manager: Arc<RemoteCatalogManager>,
         table_engine_manager: TableEngineManagerRef,
         region_alive_keepers: Arc<RegionAliveKeepers>,
@@ -54,38 +54,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_backend() {
-        common_telemetry::init_default_ut_logging();
-        let backend = MockKvBackend::default();
+        let backend = MemoryKvBackend::<Error>::default();
 
         let default_catalog_key = CatalogKey {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
         }
         .to_string();
-
-        backend
-            .set(
-                default_catalog_key.as_bytes(),
-                &CatalogValue {}.as_bytes().unwrap(),
-            )
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(default_catalog_key.as_bytes())
+            .with_value(CatalogValue.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
 
         let schema_key = SchemaKey {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             schema_name: DEFAULT_SCHEMA_NAME.to_string(),
         }
         .to_string();
-        backend
-            .set(schema_key.as_bytes(), &SchemaValue {}.as_bytes().unwrap())
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(schema_key.as_bytes())
+            .with_value(SchemaValue.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
 
-        let mut iter = backend.range("__c-".as_bytes());
-        let mut res = HashSet::new();
-        while let Some(r) = iter.next().await {
-            let kv = r.unwrap();
-            res.insert(String::from_utf8_lossy(&kv.0).to_string());
-        }
+        let req = RangeRequest::new().with_prefix(b"__c-".to_vec());
+        let res = backend
+            .range(req)
+            .await
+            .unwrap()
+            .kvs
+            .into_iter()
+            .map(|kv| String::from_utf8_lossy(kv.key()).to_string());
         assert_eq!(
             vec!["__c-greptime".to_string()],
             res.into_iter().collect::<Vec<_>>()
@@ -94,54 +91,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_cached_backend() {
-        common_telemetry::init_default_ut_logging();
-        let backend = CachedMetaKvBackend::wrap(Arc::new(MockKvBackend::default()));
+        let backend = CachedMetaKvBackend::wrap(Arc::new(MemoryKvBackend::default()));
 
         let default_catalog_key = CatalogKey {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
         }
         .to_string();
-
-        backend
-            .set(
-                default_catalog_key.as_bytes(),
-                &CatalogValue {}.as_bytes().unwrap(),
-            )
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(default_catalog_key.as_bytes())
+            .with_value(CatalogValue.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
 
         let ret = backend.get(b"__c-greptime").await.unwrap();
-        assert!(ret.is_some());
+        let _ = ret.unwrap();
 
-        let _ = backend
-            .compare_and_set(
-                b"__c-greptime",
-                &CatalogValue {}.as_bytes().unwrap(),
-                b"123",
-            )
-            .await
-            .unwrap();
+        let req = CompareAndPutRequest::new()
+            .with_key(b"__c-greptime".to_vec())
+            .with_expect(CatalogValue.as_bytes().unwrap())
+            .with_value(b"123".to_vec());
+        let _ = backend.compare_and_put(req).await.unwrap();
 
         let ret = backend.get(b"__c-greptime").await.unwrap();
-        assert!(ret.is_some());
-        assert_eq!(&b"123"[..], &(ret.as_ref().unwrap().1));
+        assert_eq!(b"123", ret.as_ref().unwrap().value.as_slice());
 
-        let _ = backend.set(b"__c-greptime", b"1234").await;
+        let req = PutRequest::new()
+            .with_key(b"__c-greptime".to_vec())
+            .with_value(b"1234".to_vec());
+        let _ = backend.put(req).await;
 
         let ret = backend.get(b"__c-greptime").await.unwrap();
-        assert!(ret.is_some());
-        assert_eq!(&b"1234"[..], &(ret.as_ref().unwrap().1));
+        assert_eq!(b"1234", ret.unwrap().value.as_slice());
 
-        backend.delete(b"__c-greptime").await.unwrap();
+        backend.delete(b"__c-greptime", false).await.unwrap();
 
         let ret = backend.get(b"__c-greptime").await.unwrap();
         assert!(ret.is_none());
     }
 
     async fn prepare_components(node_id: u64) -> TestingComponents {
-        let cached_backend = Arc::new(CachedMetaKvBackend::wrap(
-            Arc::new(MockKvBackend::default()),
-        ));
+        let backend = Arc::new(MemoryKvBackend::default());
+
+        let req = PutRequest::new()
+            .with_key(b"__c-greptime".to_vec())
+            .with_value(b"".to_vec());
+        backend.put(req).await.unwrap();
+
+        let req = PutRequest::new()
+            .with_key(b"__s-greptime-public".to_vec())
+            .with_value(b"".to_vec());
+        backend.put(req).await.unwrap();
+
+        let cached_backend = Arc::new(CachedMetaKvBackend::wrap(backend));
 
         let table_engine = Arc::new(MockTableEngine::default());
         let engine_manager = Arc::new(MemoryTableEngineManager::alias(
@@ -156,11 +156,11 @@ mod tests {
             node_id,
             cached_backend.clone(),
             region_alive_keepers.clone(),
+            Arc::new(TableMetadataManager::new(cached_backend)),
         );
         catalog_manager.start().await.unwrap();
 
         TestingComponents {
-            kv_backend: cached_backend,
             catalog_manager: Arc::new(catalog_manager),
             table_engine_manager: engine_manager,
             region_alive_keepers,
@@ -179,14 +179,12 @@ mod tests {
             catalog_manager.catalog_names().await.unwrap()
         );
 
-        let default_catalog = catalog_manager
-            .catalog(DEFAULT_CATALOG_NAME)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
             vec![DEFAULT_SCHEMA_NAME.to_string()],
-            default_catalog.schema_names().await.unwrap()
+            catalog_manager
+                .schema_names(DEFAULT_CATALOG_NAME)
+                .await
+                .unwrap()
         );
     }
 
@@ -242,22 +240,14 @@ mod tests {
     async fn test_register_table() {
         let node_id = 42;
         let components = prepare_components(node_id).await;
-        let catalog_manager = &components.catalog_manager;
-        let default_catalog = catalog_manager
-            .catalog(DEFAULT_CATALOG_NAME)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
             vec![DEFAULT_SCHEMA_NAME.to_string()],
-            default_catalog.schema_names().await.unwrap()
+            components
+                .catalog_manager
+                .schema_names(DEFAULT_CATALOG_NAME)
+                .await
+                .unwrap()
         );
-
-        let default_schema = default_catalog
-            .schema(DEFAULT_SCHEMA_NAME)
-            .await
-            .unwrap()
-            .unwrap();
 
         // register a new table with an nonexistent catalog
         let catalog_name = DEFAULT_CATALOG_NAME.to_string();
@@ -293,10 +283,18 @@ mod tests {
             table_id,
             table,
         };
-        assert!(catalog_manager.register_table(reg_req).await.unwrap());
+        assert!(components
+            .catalog_manager
+            .register_table(reg_req)
+            .await
+            .unwrap());
         assert_eq!(
             vec![table_name],
-            default_schema.table_names().await.unwrap()
+            components
+                .catalog_manager
+                .table_names(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME)
+                .await
+                .unwrap()
         );
     }
 
@@ -304,29 +302,28 @@ mod tests {
     async fn test_register_catalog_schema_table() {
         let node_id = 42;
         let components = prepare_components(node_id).await;
-        let backend = &components.kv_backend;
-        let catalog_manager = components.catalog_manager.clone();
-        let engine_manager = components.table_engine_manager.clone();
 
         let catalog_name = "test_catalog".to_string();
         let schema_name = "nonexistent_schema".to_string();
-        let catalog = Arc::new(RemoteCatalogProvider::new(
-            catalog_name.clone(),
-            backend.clone(),
-            engine_manager.clone(),
-            node_id,
-            components.region_alive_keepers.clone(),
-        ));
 
         // register catalog to catalog manager
-        CatalogManager::register_catalog(&*catalog_manager, catalog_name.clone(), catalog)
+        assert!(components
+            .catalog_manager
+            .register_catalog(catalog_name.clone())
             .await
-            .unwrap();
+            .is_ok());
         assert_eq!(
             HashSet::<String>::from_iter(
                 vec![DEFAULT_CATALOG_NAME.to_string(), catalog_name.clone()].into_iter()
             ),
-            HashSet::from_iter(catalog_manager.catalog_names().await.unwrap().into_iter())
+            HashSet::from_iter(
+                components
+                    .catalog_manager
+                    .catalog_names()
+                    .await
+                    .unwrap()
+                    .into_iter()
+            )
         );
 
         let table_to_register = components
@@ -359,38 +356,34 @@ mod tests {
         };
         // this register will fail since schema does not exist yet
         assert_matches!(
-            catalog_manager
+            components
+                .catalog_manager
                 .register_table(reg_req.clone())
                 .await
                 .unwrap_err(),
             catalog::error::Error::SchemaNotFound { .. }
         );
 
-        let new_catalog = catalog_manager
-            .catalog(&catalog_name)
+        let register_schema_request = RegisterSchemaRequest {
+            catalog: catalog_name.to_string(),
+            schema: schema_name.to_string(),
+        };
+        assert!(components
+            .catalog_manager
+            .register_schema(register_schema_request)
             .await
-            .unwrap()
-            .expect("catalog should exist since it's already registered");
-        let schema = Arc::new(RemoteSchemaProvider::new(
-            catalog_name.clone(),
-            schema_name.clone(),
-            node_id,
-            engine_manager,
-            backend.clone(),
-            components.region_alive_keepers.clone(),
-        ));
-
-        let prev = new_catalog
-            .register_schema(schema_name.clone(), schema.clone())
+            .expect("Register schema should not fail"));
+        assert!(components
+            .catalog_manager
+            .register_table(reg_req)
             .await
-            .expect("Register schema should not fail");
-        assert!(prev.is_none());
-        assert!(catalog_manager.register_table(reg_req).await.unwrap());
+            .unwrap());
 
         assert_eq!(
             HashSet::from([schema_name.clone()]),
-            new_catalog
-                .schema_names()
+            components
+                .catalog_manager
+                .schema_names(&catalog_name)
                 .await
                 .unwrap()
                 .into_iter()

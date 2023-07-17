@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use api::v1::meta::cluster_server::ClusterServer;
+use api::v1::meta::ddl_task_server::DdlTaskServer;
 use api::v1::meta::heartbeat_server::HeartbeatServer;
 use api::v1::meta::lock_server::LockServer;
 use api::v1::meta::router_server::RouterServer;
@@ -30,7 +31,6 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::Router;
 
-use crate::cluster::MetaPeerClientBuilder;
 use crate::election::etcd::EtcdElection;
 use crate::lock::etcd::EtcdLock;
 use crate::lock::memory::MemLock;
@@ -62,6 +62,7 @@ impl MetaSrvInstance {
         let http_srv = Arc::new(
             HttpServerBuilder::new(opts.http_opts.clone())
                 .with_metrics_handler(MetricsHandler)
+                .with_greptime_config_options(opts.to_toml_string())
                 .build(),
         );
         Ok(MetaSrvInstance {
@@ -132,7 +133,7 @@ pub async fn bootstrap_meta_srv_with_router(
 
     router
         .serve_with_incoming_shutdown(listener, async {
-            signal.recv().await;
+            let _ = signal.recv().await;
         })
         .await
         .context(error::StartGrpcSnafu)?;
@@ -148,6 +149,7 @@ pub fn router(meta_srv: MetaSrv) -> Router {
         .add_service(StoreServer::new(meta_srv.clone()))
         .add_service(ClusterServer::new(meta_srv.clone()))
         .add_service(LockServer::new(meta_srv.clone()))
+        .add_service(DdlTaskServer::new(meta_srv.clone()))
         .add_service(admin::make_admin_service(meta_srv))
 }
 
@@ -172,17 +174,8 @@ pub async fn build_meta_srv(opts: &MetaSrvOptions) -> Result<MetaSrv> {
 
     let in_memory = Arc::new(MemStore::default()) as ResettableKvStoreRef;
 
-    let meta_peer_client = MetaPeerClientBuilder::default()
-        .election(election.clone())
-        .in_memory(in_memory.clone())
-        .build()
-        // Safety: all required fields set at initialization
-        .unwrap();
-
     let selector = match opts.selector {
-        SelectorType::LoadBased => Arc::new(LoadBasedSelector {
-            meta_peer_client: meta_peer_client.clone(),
-        }) as SelectorRef,
+        SelectorType::LoadBased => Arc::new(LoadBasedSelector) as SelectorRef,
         SelectorType::LeaseBased => Arc::new(LeaseBasedSelector) as SelectorRef,
     };
 
@@ -192,7 +185,6 @@ pub async fn build_meta_srv(opts: &MetaSrvOptions) -> Result<MetaSrv> {
         .in_memory(in_memory)
         .selector(selector)
         .election(election)
-        .meta_peer_client(meta_peer_client)
         .lock(lock)
         .build()
         .await

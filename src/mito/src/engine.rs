@@ -33,8 +33,8 @@ use snafu::{ensure, OptionExt, ResultExt};
 use storage::manifest::manifest_compress_type;
 use store_api::storage::{
     CloseOptions, ColumnDescriptorBuilder, ColumnFamilyDescriptor, ColumnFamilyDescriptorBuilder,
-    ColumnId, EngineContext as StorageEngineContext, OpenOptions, RegionNumber, RowKeyDescriptor,
-    RowKeyDescriptorBuilder, StorageEngine,
+    ColumnId, CompactionStrategy, EngineContext as StorageEngineContext, OpenOptions, RegionNumber,
+    RowKeyDescriptor, RowKeyDescriptorBuilder, StorageEngine,
 };
 use table::engine::{
     region_name, table_dir, CloseTableResult, EngineContext, TableEngine, TableEngineProcedure,
@@ -417,6 +417,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
                             .await.map_err(BoxedError::new)
                             .context(table_error::TableOperationSnafu)? else { return Ok(None) };
 
+        let compaction_strategy = CompactionStrategy::from(&table_info.meta.options.extra_options);
         let opts = OpenOptions {
             parent_dir: table_dir.to_string(),
             write_buffer_size: table_info
@@ -425,6 +426,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
                 .write_buffer_size
                 .map(|s| s.0 as usize),
             ttl: table_info.meta.options.ttl,
+            compaction_strategy,
         };
 
         debug!(
@@ -445,7 +447,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             let region = self
                 .open_region(&engine_ctx, table_id, *region_number, &table_ref, &opts)
                 .await?;
-            regions.insert(*region_number, region);
+            let _ = regions.insert(*region_number, region);
         }
 
         let table = Arc::new(MitoTable::new(table_info, regions, manifest));
@@ -501,6 +503,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
             table: name,
         };
 
+        let compaction_strategy = CompactionStrategy::from(&table_info.meta.options.extra_options);
         let opts = OpenOptions {
             parent_dir: table_dir.to_string(),
             write_buffer_size: table_info
@@ -509,6 +512,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
                 .write_buffer_size
                 .map(|s| s.0 as usize),
             ttl: table_info.meta.options.ttl,
+            compaction_strategy,
         };
 
         // TODO(weny): Returns an error earlier if the target region does not exist in the meta.
@@ -561,7 +565,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
                 let table = self.recover_table(ctx, request.clone()).await?;
                 if let Some(table) = table {
                     // already locked
-                    self.tables.insert(request.table_id, table.clone());
+                    let _ = self.tables.insert(request.table_id, table.clone());
 
                     Some(table as _)
                 } else {
@@ -583,28 +587,21 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         // Remove the table from the engine to avoid further access from users.
         let _lock = self.table_mutex.lock(request.table_id).await;
         let removed_table = self.tables.remove(&request.table_id);
+
         // Close the table to close all regions. Closing a region is idempotent.
         if let Some((_, table)) = &removed_table {
-            let regions = table.region_ids();
-            let table_id = table.table_info().ident.table_id;
-
-            table
-                .drop_regions(&regions)
-                .await
-                .map_err(BoxedError::new)
-                .context(table_error::TableOperationSnafu)?;
+            let mut regions = table.remove_regions(&table.region_ids()).await?;
 
             let ctx = StorageEngineContext::default();
 
-            let opts = CloseOptions::default();
-            // Releases regions in storage engine
-            for region_number in regions {
-                self.storage_engine
-                    .close_region(&ctx, &region_name(table_id, region_number), &opts)
-                    .await
-                    .map_err(BoxedError::new)
-                    .context(table_error::TableOperationSnafu)?;
-            }
+            let _ = futures::future::try_join_all(
+                regions
+                    .drain()
+                    .map(|(_, region)| self.storage_engine.drop_region(&ctx, region)),
+            )
+            .await
+            .map_err(BoxedError::new)
+            .context(table_error::TableOperationSnafu)?;
 
             Ok(true)
         } else {
@@ -639,7 +636,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
     }
 
     async fn close(&self) -> TableResult<()> {
-        futures::future::try_join_all(
+        let _ = futures::future::try_join_all(
             self.tables
                 .iter()
                 .map(|item| self.close_table_inner(item.value().clone(), None, false)),
@@ -694,7 +691,7 @@ impl<S: StorageEngine> MitoEngineInner<S> {
         }
 
         if table.is_releasable() {
-            self.tables.remove(&table_id);
+            let _ = self.tables.remove(&table_id);
 
             logging::info!(
                 "Mito engine closed table: {} in schema: {}",

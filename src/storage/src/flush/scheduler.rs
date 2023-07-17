@@ -25,7 +25,7 @@ use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::{oneshot, Notify};
 
-use crate::compaction::{CompactionRequestImpl, CompactionSchedulerRef};
+use crate::compaction::{CompactionPickerRef, CompactionRequestImpl, CompactionSchedulerRef};
 use crate::config::EngineConfig;
 use crate::engine::RegionMap;
 use crate::error::{
@@ -96,7 +96,7 @@ pub struct FlushRegionRequest<S: LogStore> {
     /// Sst access layer of the region.
     pub sst_layer: AccessLayerRef,
     /// Region writer, used to persist log entry that points to the latest manifest file.
-    pub writer: RegionWriterRef,
+    pub writer: RegionWriterRef<S>,
     /// Region write-ahead logging, used to write data/meta to the log file.
     pub wal: Wal<S>,
     /// Region manifest service, used to persist metadata.
@@ -109,6 +109,7 @@ pub struct FlushRegionRequest<S: LogStore> {
     pub ttl: Option<Duration>,
     /// Time window for compaction.
     pub compaction_time_window: Option<i64>,
+    pub compaction_picker: CompactionPickerRef<S>,
 }
 
 impl<S: LogStore> FlushRegionRequest<S> {
@@ -146,7 +147,10 @@ impl<S: LogStore> From<&FlushRegionRequest<S>> for CompactionRequestImpl<S> {
             ttl: req.ttl,
             compaction_time_window: req.compaction_time_window,
             sender: None,
+            picker: req.compaction_picker.clone(),
             sst_write_buffer_size: req.engine_config.sst_write_buffer_size,
+            // compaction triggered by flush always reschedules
+            reschedule_on_finish: true,
         }
     }
 }
@@ -243,7 +247,7 @@ impl<S: LogStore> FlushScheduler<S> {
 
     /// Schedules a engine flush request.
     pub fn schedule_engine_flush(&self) -> Result<()> {
-        self.scheduler.schedule(FlushRequest::Engine)?;
+        let _ = self.scheduler.schedule(FlushRequest::Engine)?;
         Ok(())
     }
 
@@ -256,7 +260,7 @@ impl<S: LogStore> FlushScheduler<S> {
         self.scheduler.stop(true).await?;
 
         #[cfg(test)]
-        futures::future::join_all(self.pending_tasks.write().await.drain(..)).await;
+        let _ = futures::future::join_all(self.pending_tasks.write().await.drain(..)).await;
 
         Ok(())
     }
@@ -329,13 +333,22 @@ async fn execute_flush_region<S: LogStore>(
         let max_files_in_l0 = req.engine_config.max_files_in_l0;
         let shared_data = req.shared.clone();
 
-        // If flush is success, schedule a compaction request for this region.
-        region::schedule_compaction(
-            shared_data,
-            compaction_scheduler,
-            compaction_request,
-            max_files_in_l0,
-        );
+        let level0_file_num = shared_data
+            .version_control
+            .current()
+            .ssts()
+            .level(0)
+            .file_num();
+        if level0_file_num <= max_files_in_l0 {
+            logging::debug!(
+                "No enough SST files in level 0 (threshold: {}), skip compaction",
+                max_files_in_l0
+            );
+        } else {
+            // If flush is success, schedule a compaction request for this region.
+            let _ =
+                region::schedule_compaction(shared_data, compaction_scheduler, compaction_request);
+        }
 
         // Complete the request.
         FlushRequest::Region { req, sender }.complete(Ok(()));
@@ -354,7 +367,7 @@ impl<S: LogStore> TaskFunction<Error> for AutoFlushFunction<S> {
     async fn call(&mut self) -> Result<()> {
         // Get all regions.
         let regions = self.regions.list_regions();
-        self.picker.pick_by_interval(&regions).await;
+        let _ = self.picker.pick_by_interval(&regions).await;
 
         Ok(())
     }

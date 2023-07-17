@@ -15,12 +15,13 @@
 use std::collections::HashMap;
 
 use api::v1::meta::{
-    router_server, BatchPutRequest, CreateRequest, DeleteRequest, Error, KeyValue,
-    MoveValueRequest, Peer, PeerDict, Region, RegionRoute, ResponseHeader, RouteRequest,
-    RouteResponse, Table, TableRoute, TableRouteValue,
+    router_server, CreateRequest, DeleteRequest, Error, Peer, PeerDict, Region, RegionRoute,
+    ResponseHeader, RouteRequest, RouteResponse, Table, TableRoute, TableRouteValue,
 };
 use catalog::helper::{TableGlobalKey, TableGlobalValue};
 use common_meta::key::TableRouteKey;
+use common_meta::rpc::store::BatchPutRequest;
+use common_meta::rpc::KeyValue;
 use common_meta::table_name::TableName;
 use common_telemetry::{timer, warn};
 use snafu::{ensure, OptionExt, ResultExt};
@@ -33,10 +34,11 @@ use crate::lock::{keys, DistLockGuard};
 use crate::metasrv::{Context, MetaSrv, SelectorContext, SelectorRef};
 use crate::metrics::METRIC_META_ROUTE_REQUEST;
 use crate::sequence::SequenceRef;
-use crate::service::store::ext::KvStoreExt;
-use crate::service::store::kv::KvStoreRef;
 use crate::service::GrpcResult;
-use crate::table_routes::{get_table_global_value, get_table_route_value};
+use crate::table_routes::{
+    fetch_tables, get_table_global_value, remove_table_global_value, remove_table_route_value,
+    table_route_key,
+};
 
 #[async_trait::async_trait]
 impl router_server::Router for MetaSrv {
@@ -64,7 +66,7 @@ impl router_server::Router for MetaSrv {
         .to_string()
         .into_bytes();
         ensure!(
-            self.kv_store().get(table_global_key).await?.is_none(),
+            self.kv_store().get(&table_global_key).await?.is_none(),
             error::TableAlreadyExistsSnafu {
                 table_name: table_name.to_string(),
             }
@@ -83,7 +85,8 @@ impl router_server::Router for MetaSrv {
         let ctx = SelectorContext {
             datanode_lease_secs: self.options().datanode_lease_secs,
             server_addr: self.options().server_addr.clone(),
-            kv_store: self.kv_store(),
+            kv_store: self.kv_store().clone(),
+            meta_peer_client: self.meta_peer_client().clone(),
             catalog: Some(table_name.catalog_name.clone()),
             schema: Some(table_name.schema_name.clone()),
             table: Some(table_name.table_name.clone()),
@@ -137,8 +140,8 @@ impl router_server::Router for MetaSrv {
 async fn handle_create(
     req: CreateRequest,
     ctx: SelectorContext,
-    selector: SelectorRef,
-    table_id_sequence: SequenceRef,
+    selector: &SelectorRef,
+    table_id_sequence: &SequenceRef,
 ) -> Result<RouteResponse> {
     let CreateRequest {
         header,
@@ -177,8 +180,8 @@ async fn handle_create(
     let id = table_id_sequence.next().await?;
     table_info.ident.table_id = id as u32;
 
-    let table_route_key = TableRouteKey::with_table_name(id, &table_name)
-        .key()
+    let table_route_key = TableRouteKey::with_table_name(id as _, &table_name)
+        .to_string()
         .into_bytes();
 
     let table = Table {
@@ -235,7 +238,6 @@ async fn handle_create(
             },
         ],
         prev_kv: true,
-        ..Default::default()
     };
 
     let resp = ctx.kv_store.batch_put(req).await?;
@@ -254,7 +256,7 @@ async fn handle_create(
     })
 }
 
-fn create_table_global_value(
+pub(crate) fn create_table_global_value(
     table_route_value: &TableRouteValue,
     table_info: RawTableInfo,
 ) -> Result<TableGlobalValue> {
@@ -333,7 +335,7 @@ async fn handle_delete(req: DeleteRequest, ctx: Context) -> Result<RouteResponse
 
     let _ = remove_table_global_value(&ctx.kv_store, &tgk).await?;
 
-    let trk = table_route_key(tgv.table_id() as u64, &tgk);
+    let trk = table_route_key(tgv.table_id(), &tgk);
     let (_, trv) = remove_table_route_value(&ctx.kv_store, &trk).await?;
     let (peers, table_routes) = fill_table_routes(vec![(tgv, trv)])?;
 
@@ -345,7 +347,7 @@ async fn handle_delete(req: DeleteRequest, ctx: Context) -> Result<RouteResponse
     })
 }
 
-fn fill_table_routes(
+pub(crate) fn fill_table_routes(
     tables: Vec<(TableGlobalValue, TableRouteValue)>,
 ) -> Result<(Vec<Peer>, Vec<TableRoute>)> {
     let mut peer_dict = PeerDict::default();
@@ -377,85 +379,4 @@ fn fill_table_routes(
     }
 
     Ok((peer_dict.into_peers(), table_routes))
-}
-
-async fn fetch_tables(
-    kv_store: &KvStoreRef,
-    keys: impl Iterator<Item = TableGlobalKey>,
-) -> Result<Vec<(TableGlobalValue, TableRouteValue)>> {
-    let mut tables = vec![];
-    // Maybe we can optimize the for loop in the future, but in general,
-    // there won't be many keys, in fact, there is usually just one.
-    for tgk in keys {
-        let tgv = get_table_global_value(kv_store, &tgk).await?;
-        if tgv.is_none() {
-            warn!("Table global value is absent: {}", tgk);
-            continue;
-        }
-        let tgv = tgv.unwrap();
-
-        let trk = table_route_key(tgv.table_id() as u64, &tgk);
-        let trv = get_table_route_value(kv_store, &trk).await?;
-
-        tables.push((tgv, trv));
-    }
-
-    Ok(tables)
-}
-
-fn table_route_key(table_id: u64, t: &TableGlobalKey) -> TableRouteKey<'_> {
-    TableRouteKey {
-        table_id,
-        catalog_name: &t.catalog_name,
-        schema_name: &t.schema_name,
-        table_name: &t.table_name,
-    }
-}
-
-async fn remove_table_route_value(
-    kv_store: &KvStoreRef,
-    key: &TableRouteKey<'_>,
-) -> Result<(Vec<u8>, TableRouteValue)> {
-    let from_key = key.key().into_bytes();
-    let to_key = key.removed_key().into_bytes();
-    let v = move_value(kv_store, from_key, to_key)
-        .await?
-        .context(error::TableRouteNotFoundSnafu { key: key.key() })?;
-    let trv: TableRouteValue =
-        v.1.as_slice()
-            .try_into()
-            .context(error::DecodeTableRouteSnafu)?;
-
-    Ok((v.0, trv))
-}
-
-async fn remove_table_global_value(
-    kv_store: &KvStoreRef,
-    key: &TableGlobalKey,
-) -> Result<(Vec<u8>, TableGlobalValue)> {
-    let key = key.to_string();
-    let removed_key = crate::keys::to_removed_key(&key);
-    let kv = move_value(kv_store, key.as_bytes(), removed_key)
-        .await?
-        .context(error::TableNotFoundSnafu { name: key })?;
-    let value: TableGlobalValue =
-        TableGlobalValue::from_bytes(&kv.1).context(error::InvalidCatalogValueSnafu)?;
-    Ok((kv.0, value))
-}
-
-async fn move_value(
-    kv_store: &KvStoreRef,
-    from_key: impl Into<Vec<u8>>,
-    to_key: impl Into<Vec<u8>>,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-    let from_key = from_key.into();
-    let to_key = to_key.into();
-    let move_req = MoveValueRequest {
-        from_key,
-        to_key,
-        ..Default::default()
-    };
-    let res = kv_store.move_value(move_req).await?;
-
-    Ok(res.kv.map(|kv| (kv.key, kv.value)))
 }

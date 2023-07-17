@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::prelude::*;
-use snafu::Location;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_meta::peer::Peer;
+use common_runtime::JoinError;
+use snafu::{Location, Snafu};
 use tokio::sync::mpsc::error::SendError;
 use tonic::codegen::http;
 use tonic::Code;
@@ -21,6 +24,73 @@ use tonic::Code;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("Failed to join a future: {}", source))]
+    Join {
+        location: Location,
+        source: JoinError,
+    },
+
+    #[snafu(display("Failed to convert grpc expr, source: {}", source))]
+    ConvertGrpcExpr {
+        location: Location,
+        source: common_grpc_expr::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to build table meta for table: {}, source: {}",
+        table_name,
+        source
+    ))]
+    BuildTableMeta {
+        table_name: String,
+        source: table::metadata::TableMetaBuilderError,
+        location: Location,
+    },
+
+    #[snafu(display("Table occurs error, source: {}", source))]
+    Table {
+        location: Location,
+        source: table::error::Error,
+    },
+
+    #[snafu(display("Failed to convert RawTableInfo into TableInfo: {}", source))]
+    ConvertRawTableInfo {
+        location: Location,
+        source: datatypes::Error,
+    },
+
+    #[snafu(display("Failed to execute transaction: {}", msg))]
+    Txn { location: Location, msg: String },
+
+    #[snafu(display(
+        "Unexpected table_id changed, expected: {}, found: {}",
+        expected,
+        found,
+    ))]
+    TableIdChanged {
+        location: Location,
+        expected: u64,
+        found: u64,
+    },
+
+    #[snafu(display(
+        "Failed to request Datanode, expected: {}, but only {} available",
+        expected,
+        available
+    ))]
+    NoEnoughAvailableDatanode {
+        location: Location,
+        expected: usize,
+        available: usize,
+    },
+
+    #[snafu(display("Failed to request Datanode {}, source: {}", peer, source))]
+    RequestDatanode {
+        location: Location,
+        peer: Peer,
+        source: client::Error,
+    },
+
     #[snafu(display("Failed to send shutdown signal"))]
     SendShutdownSignal { source: SendError<()> },
 
@@ -221,9 +291,6 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("MetaSrv has no meta peer client"))]
-    NoMetaPeerClient { location: Location },
-
     #[snafu(display("Invalid http body, source: {}", source))]
     InvalidHttpBody {
         source: http::Error,
@@ -273,6 +340,18 @@ pub enum Error {
 
     #[snafu(display("Failed to recover procedure, source: {source}"))]
     RecoverProcedure {
+        location: Location,
+        source: common_procedure::Error,
+    },
+
+    #[snafu(display("Failed to wait procedure done, source: {source}"))]
+    WaitProcedure {
+        location: Location,
+        source: common_procedure::Error,
+    },
+
+    #[snafu(display("Failed to submit procedure, source: {source}"))]
+    SubmitProcedure {
         location: Location,
         source: common_procedure::Error,
     },
@@ -360,11 +439,23 @@ pub enum Error {
         source: common_meta::error::Error,
     },
 
+    #[snafu(display("Failed to convert Etcd txn object: {source}"))]
+    ConvertEtcdTxnObject {
+        source: common_meta::error::Error,
+        location: Location,
+    },
+
     // this error is used for custom error mapping
     // please do not delete it
     #[snafu(display("Other error, source: {}", source))]
     Other {
         source: BoxedError,
+        location: Location,
+    },
+
+    #[snafu(display("Table metadata manager error: {}", source))]
+    TableMetadataManager {
+        source: common_meta::error::Error,
         location: Location,
     },
 }
@@ -396,7 +487,6 @@ impl ErrorExt for Error {
             | Error::Range { .. }
             | Error::ResponseHeaderNotFound { .. }
             | Error::IsNotLeader { .. }
-            | Error::NoMetaPeerClient { .. }
             | Error::InvalidHttpBody { .. }
             | Error::Lock { .. }
             | Error::Unlock { .. }
@@ -414,7 +504,10 @@ impl ErrorExt for Error {
             | Error::MailboxReceiver { .. }
             | Error::RetryLater { .. }
             | Error::StartGrpc { .. }
-            | Error::Combine { .. } => StatusCode::Internal,
+            | Error::Combine { .. }
+            | Error::NoEnoughAvailableDatanode { .. }
+            | Error::ConvertGrpcExpr { .. }
+            | Error::Join { .. } => StatusCode::Internal,
             Error::EmptyKey { .. }
             | Error::MissingRequiredParameter { .. }
             | Error::MissingRequestHeader { .. }
@@ -437,10 +530,18 @@ impl ErrorExt for Error {
             | Error::InvalidTxnResult { .. }
             | Error::InvalidUtf8Value { .. }
             | Error::UnexpectedInstructionReply { .. }
-            | Error::Unexpected { .. } => StatusCode::Unexpected,
+            | Error::Unexpected { .. }
+            | Error::Txn { .. }
+            | Error::TableIdChanged { .. }
+            | Error::ConvertRawTableInfo { .. }
+            | Error::BuildTableMeta { .. } => StatusCode::Unexpected,
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
+            Error::Table { source, .. } => source.status_code(),
+            Error::RequestDatanode { source, .. } => source.status_code(),
             Error::InvalidCatalogValue { source, .. } => source.status_code(),
-            Error::RecoverProcedure { source, .. } => source.status_code(),
+            Error::RecoverProcedure { source, .. }
+            | Error::SubmitProcedure { source, .. }
+            | Error::WaitProcedure { source, .. } => source.status_code(),
             Error::ShutdownServer { source, .. } | Error::StartHttp { source, .. } => {
                 source.status_code()
             }
@@ -448,9 +549,12 @@ impl ErrorExt for Error {
             Error::RegionFailoverCandidatesNotFound { .. } => StatusCode::RuntimeResourcesExhausted,
 
             Error::RegisterProcedureLoader { source, .. } => source.status_code(),
-            Error::TableRouteConversion { source, .. } | Error::ConvertProtoData { source, .. } => {
-                source.status_code()
-            }
+
+            Error::TableRouteConversion { source, .. }
+            | Error::ConvertProtoData { source, .. }
+            | Error::TableMetadataManager { source, .. }
+            | Error::ConvertEtcdTxnObject { source, .. } => source.status_code(),
+
             Error::Other { source, .. } => source.status_code(),
         }
     }

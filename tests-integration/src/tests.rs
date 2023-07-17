@@ -19,7 +19,8 @@ mod test_util;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use catalog::local::{MemoryCatalogProvider, MemorySchemaProvider};
+use catalog::RegisterSchemaRequest;
+use common_meta::key::TableMetadataManagerRef;
 use common_test_util::temp_dir::TempDir;
 use datanode::instance::Instance as DatanodeInstance;
 use frontend::instance::Instance;
@@ -49,6 +50,11 @@ impl MockDistributedInstance {
     pub fn datanodes(&self) -> &HashMap<u64, Arc<DatanodeInstance>> {
         &self.0.datanode_instances
     }
+
+    #[allow(unused)]
+    pub fn table_metadata_manager(&self) -> &TableMetadataManagerRef {
+        self.0.meta_srv.table_metadata_manager()
+    }
 }
 
 pub struct MockStandaloneInstance {
@@ -65,27 +71,34 @@ impl MockStandaloneInstance {
 
 pub(crate) async fn create_standalone_instance(test_name: &str) -> MockStandaloneInstance {
     let (opts, guard) = create_tmp_dir_and_datanode_opts(StorageType::File, test_name);
-    let dn_instance = Arc::new(DatanodeInstance::with_opts(&opts).await.unwrap());
+    let (dn_instance, heartbeat) = DatanodeInstance::with_opts(&opts, Default::default())
+        .await
+        .unwrap();
 
     let frontend_instance = Instance::try_new_standalone(dn_instance.clone())
         .await
         .unwrap();
 
-    // create another catalog and schema for testing
-    let another_catalog = Arc::new(MemoryCatalogProvider::new());
-    let _ = another_catalog
-        .register_schema_sync(
-            "another_schema".to_string(),
-            Arc::new(MemorySchemaProvider::new()),
-        )
-        .unwrap();
-    let _ = dn_instance
-        .catalog_manager()
-        .register_catalog("another_catalog".to_string(), another_catalog)
-        .await
-        .unwrap();
-
     dn_instance.start().await.unwrap();
+
+    assert!(dn_instance
+        .catalog_manager()
+        .register_catalog("another_catalog".to_string())
+        .await
+        .is_ok());
+    let req = RegisterSchemaRequest {
+        catalog: "another_catalog".to_string(),
+        schema: "another_schema".to_string(),
+    };
+    assert!(dn_instance
+        .catalog_manager()
+        .register_schema(req)
+        .await
+        .is_ok());
+
+    if let Some(heartbeat) = heartbeat {
+        heartbeat.start().await.unwrap();
+    };
     MockStandaloneInstance {
         instance: Arc::new(frontend_instance),
         _guard: guard,

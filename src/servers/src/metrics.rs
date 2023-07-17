@@ -18,7 +18,6 @@ use std::time::Instant;
 use common_telemetry::error;
 use hyper::Body;
 use metrics::gauge;
-use metrics_process::Collector;
 use once_cell::sync::Lazy;
 use snafu::ResultExt;
 use tikv_jemalloc_ctl::stats::{allocated_mib, resident_mib};
@@ -32,14 +31,18 @@ use crate::error::UpdateJemallocMetricsSnafu;
 pub(crate) const METRIC_DB_LABEL: &str = "db";
 pub(crate) const METRIC_CODE_LABEL: &str = "code";
 pub(crate) const METRIC_TYPE_LABEL: &str = "type";
+pub(crate) const METRIC_PROTOCOL_LABEL: &str = "protocol";
+
+pub(crate) const METRIC_ERROR_COUNTER: &str = "servers.error";
+pub(crate) const METRIC_ERROR_COUNTER_LABEL_MYSQL: &str = "mysql";
 
 pub(crate) const METRIC_HTTP_SQL_ELAPSED: &str = "servers.http_sql_elapsed";
 pub(crate) const METRIC_HTTP_PROMQL_ELAPSED: &str = "servers.http_promql_elapsed";
 pub(crate) const METRIC_AUTH_FAILURE: &str = "servers.auth_failure_count";
 pub(crate) const METRIC_HTTP_INFLUXDB_WRITE_ELAPSED: &str = "servers.http_influxdb_write_elapsed";
-pub(crate) const METRIC_HTTP_PROMETHEUS_WRITE_ELAPSED: &str =
+pub(crate) const METRIC_HTTP_PROM_STORE_WRITE_ELAPSED: &str =
     "servers.http_prometheus_write_elapsed";
-pub(crate) const METRIC_HTTP_PROMETHEUS_READ_ELAPSED: &str = "servers.http_prometheus_read_elapsed";
+pub(crate) const METRIC_HTTP_PROM_STORE_READ_ELAPSED: &str = "servers.http_prometheus_read_elapsed";
 pub(crate) const METRIC_TCP_OPENTSDB_LINE_WRITE_ELAPSED: &str =
     "servers.opentsdb_line_write_elapsed";
 
@@ -71,8 +74,9 @@ pub(crate) const METRIC_JEMALLOC_RESIDENT: &str = "sys.jemalloc.resident";
 pub(crate) const METRIC_JEMALLOC_ALLOCATED: &str = "sys.jemalloc.allocated";
 
 /// Prometheus style process metrics collector.
-pub(crate) static PROCESS_COLLECTOR: Lazy<Collector> = Lazy::new(|| {
-    let collector = Collector::default();
+#[cfg(feature = "metrics-process")]
+pub(crate) static PROCESS_COLLECTOR: Lazy<metrics_process::Collector> = Lazy::new(|| {
+    let collector = metrics_process::Collector::default();
     // Describe collector.
     collector.describe();
     collector
@@ -112,7 +116,7 @@ impl JemallocCollector {
     }
 
     pub(crate) fn update(&self) -> error::Result<()> {
-        self.epoch.advance().context(UpdateJemallocMetricsSnafu)?;
+        let _ = self.epoch.advance().context(UpdateJemallocMetricsSnafu)?;
         let allocated = self.allocated.read().context(UpdateJemallocMetricsSnafu)?;
         let resident = self.resident.read().context(UpdateJemallocMetricsSnafu)?;
         gauge!(METRIC_JEMALLOC_ALLOCATED, allocated as f64);

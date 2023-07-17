@@ -12,28 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PromOptions {
-    pub addr: String,
-}
-
-impl Default for PromOptions {
-    fn default() -> Self {
-        Self {
-            addr: "127.0.0.1:4004".to_string(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PromOptions;
-
-    #[test]
-    fn test_prometheus_options() {
-        let default = PromOptions::default();
-        assert_eq!(default.addr, "127.0.0.1:4004".to_string());
-    }
-}
+pub const METRIC_META_TXN_REQUEST: &str = "meta.txn_request";

@@ -14,24 +14,25 @@
 
 use std::collections::HashMap;
 
-use api::v1::meta::{PutRequest, TableRouteValue};
+use api::v1::meta::TableRouteValue;
 use catalog::helper::{TableGlobalKey, TableGlobalValue};
 use common_meta::key::TableRouteKey;
-use common_meta::rpc::store::{BatchGetRequest, BatchGetResponse};
+use common_meta::rpc::store::{BatchGetRequest, MoveValueRequest, PutRequest};
+use common_telemetry::warn;
 use snafu::{OptionExt, ResultExt};
+use table::engine::TableReference;
 
 use crate::error::{
-    ConvertProtoDataSnafu, DecodeTableRouteSnafu, InvalidCatalogValueSnafu, Result,
+    DecodeTableRouteSnafu, InvalidCatalogValueSnafu, Result, TableNotFoundSnafu,
     TableRouteNotFoundSnafu,
 };
-use crate::service::store::ext::KvStoreExt;
 use crate::service::store::kv::KvStoreRef;
 
 pub async fn get_table_global_value(
     kv_store: &KvStoreRef,
     key: &TableGlobalKey,
 ) -> Result<Option<TableGlobalValue>> {
-    let kv = kv_store.get(key.to_raw_key()).await?;
+    let kv = kv_store.get(&key.to_raw_key()).await?;
     kv.map(|kv| TableGlobalValue::from_bytes(kv.value).context(InvalidCatalogValueSnafu))
         .transpose()
 }
@@ -43,23 +44,18 @@ pub(crate) async fn batch_get_table_global_value(
     let req = BatchGetRequest {
         keys: keys.iter().map(|x| x.to_raw_key()).collect::<Vec<_>>(),
     };
-    let mut resp: BatchGetResponse = kv_store
-        .batch_get(req.into())
-        .await?
-        .try_into()
-        .context(ConvertProtoDataSnafu)?;
+    let kvs = kv_store.batch_get(req).await?.kvs;
 
-    let kvs = resp.take_kvs();
     let mut result = HashMap::with_capacity(kvs.len());
     for kv in kvs {
         let key = TableGlobalKey::try_from_raw_key(kv.key()).context(InvalidCatalogValueSnafu)?;
         let value = TableGlobalValue::from_bytes(kv.value()).context(InvalidCatalogValueSnafu)?;
-        result.insert(key, Some(value));
+        let _ = result.insert(key, Some(value));
     }
 
     for key in keys {
         if !result.contains_key(key) {
-            result.insert(key.clone(), None);
+            let _ = result.insert(key.clone(), None);
         }
     }
     Ok(result)
@@ -71,7 +67,6 @@ pub(crate) async fn put_table_global_value(
     value: &TableGlobalValue,
 ) -> Result<()> {
     let req = PutRequest {
-        header: None,
         key: key.to_raw_key(),
         value: value.as_bytes().context(InvalidCatalogValueSnafu)?,
         prev_kv: false,
@@ -80,18 +75,31 @@ pub(crate) async fn put_table_global_value(
     Ok(())
 }
 
+pub(crate) async fn remove_table_global_value(
+    kv_store: &KvStoreRef,
+    key: &TableGlobalKey,
+) -> Result<(Vec<u8>, TableGlobalValue)> {
+    let key = key.to_string();
+    let removed_key = crate::keys::to_removed_key(&key);
+    let kv = move_value(kv_store, key.as_bytes(), removed_key)
+        .await?
+        .context(TableNotFoundSnafu { name: key })?;
+    let value: TableGlobalValue =
+        TableGlobalValue::from_bytes(&kv.1).context(InvalidCatalogValueSnafu)?;
+    Ok((kv.0, value))
+}
+
 pub(crate) async fn get_table_route_value(
     kv_store: &KvStoreRef,
     key: &TableRouteKey<'_>,
 ) -> Result<TableRouteValue> {
     let kv = kv_store
-        .get(key.key().into_bytes())
+        .get(key.to_string().as_bytes())
         .await?
-        .with_context(|| TableRouteNotFoundSnafu { key: key.key() })?;
-    kv.value
-        .as_slice()
-        .try_into()
-        .context(DecodeTableRouteSnafu)
+        .with_context(|| TableRouteNotFoundSnafu {
+            key: key.to_string(),
+        })?;
+    kv.value().try_into().context(DecodeTableRouteSnafu)
 }
 
 pub(crate) async fn put_table_route_value(
@@ -100,13 +108,96 @@ pub(crate) async fn put_table_route_value(
     value: TableRouteValue,
 ) -> Result<()> {
     let req = PutRequest {
-        header: None,
-        key: key.key().into_bytes(),
+        key: key.to_string().into_bytes(),
         value: value.into(),
         prev_kv: false,
     };
     let _ = kv_store.put(req).await?;
     Ok(())
+}
+
+pub(crate) async fn remove_table_route_value(
+    kv_store: &KvStoreRef,
+    key: &TableRouteKey<'_>,
+) -> Result<(Vec<u8>, TableRouteValue)> {
+    let from_key = key.to_string().into_bytes();
+    let to_key = key.removed_key().into_bytes();
+    let v = move_value(kv_store, from_key, to_key)
+        .await?
+        .context(TableRouteNotFoundSnafu {
+            key: key.to_string(),
+        })?;
+    let trv: TableRouteValue = v.1.as_slice().try_into().context(DecodeTableRouteSnafu)?;
+
+    Ok((v.0, trv))
+}
+
+async fn move_value(
+    kv_store: &KvStoreRef,
+    from_key: impl Into<Vec<u8>>,
+    to_key: impl Into<Vec<u8>>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let from_key = from_key.into();
+    let to_key = to_key.into();
+    let move_req = MoveValueRequest { from_key, to_key };
+    let res = kv_store.move_value(move_req).await?;
+
+    Ok(res.0.map(Into::into))
+}
+
+pub(crate) fn table_route_key(table_id: u32, t: &TableGlobalKey) -> TableRouteKey<'_> {
+    TableRouteKey {
+        table_id,
+        catalog_name: &t.catalog_name,
+        schema_name: &t.schema_name,
+        table_name: &t.table_name,
+    }
+}
+
+pub(crate) async fn fetch_table(
+    kv_store: &KvStoreRef,
+    table_ref: TableReference<'_>,
+) -> Result<Option<(TableGlobalValue, TableRouteValue)>> {
+    let tgk = TableGlobalKey {
+        catalog_name: table_ref.catalog.to_string(),
+        schema_name: table_ref.schema.to_string(),
+        table_name: table_ref.table.to_string(),
+    };
+
+    let tgv = get_table_global_value(kv_store, &tgk).await?;
+
+    if let Some(tgv) = tgv {
+        let trk = table_route_key(tgv.table_id(), &tgk);
+        let trv = get_table_route_value(kv_store, &trk).await?;
+
+        return Ok(Some((tgv, trv)));
+    }
+
+    Ok(None)
+}
+
+pub(crate) async fn fetch_tables(
+    kv_store: &KvStoreRef,
+    keys: impl Iterator<Item = TableGlobalKey>,
+) -> Result<Vec<(TableGlobalValue, TableRouteValue)>> {
+    let mut tables = vec![];
+    // Maybe we can optimize the for loop in the future, but in general,
+    // there won't be many keys, in fact, there is usually just one.
+    for tgk in keys {
+        let tgv = get_table_global_value(kv_store, &tgk).await?;
+        let Some(tgv) = tgv else {
+            warn!("Table global value is absent: {}", tgk);
+            continue;
+        };
+
+        let trk = table_route_key(tgv.table_id(), &tgk);
+
+        let trv = get_table_route_value(kv_store, &trk).await?;
+
+        tables.push((tgv, trv));
+    }
+
+    Ok(tables)
 }
 
 #[cfg(test)]

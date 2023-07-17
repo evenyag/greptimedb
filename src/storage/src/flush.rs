@@ -194,20 +194,20 @@ impl FlushStrategy for SizeBasedStrategy {
 
     fn reserve_mem(&self, mem: usize) {
         if self.is_global_limit_enabled() {
-            self.memory_used.fetch_add(mem, Ordering::Relaxed);
-            self.memory_active.fetch_add(mem, Ordering::Relaxed);
+            let _ = self.memory_used.fetch_add(mem, Ordering::Relaxed);
+            let _ = self.memory_active.fetch_add(mem, Ordering::Relaxed);
         }
     }
 
     fn schedule_free_mem(&self, mem: usize) {
         if self.is_global_limit_enabled() {
-            self.memory_active.fetch_sub(mem, Ordering::Relaxed);
+            let _ = self.memory_active.fetch_sub(mem, Ordering::Relaxed);
         }
     }
 
     fn free_mem(&self, mem: usize) {
         if self.is_global_limit_enabled() {
-            self.memory_used.fetch_sub(mem, Ordering::Relaxed);
+            let _ = self.memory_used.fetch_sub(mem, Ordering::Relaxed);
         }
     }
 }
@@ -225,7 +225,7 @@ pub struct FlushJob<S: LogStore> {
     /// Sst access layer of the region.
     pub sst_layer: AccessLayerRef,
     /// Region writer, used to persist log entry that points to the latest manifest file.
-    pub writer: RegionWriterRef,
+    pub writer: RegionWriterRef<S>,
     /// Region write-ahead logging, used to write data/meta to the log file.
     pub wal: Wal<S>,
     /// Region manifest service, used to persist metadata.
@@ -253,9 +253,9 @@ impl<S: LogStore> FlushJob<S> {
         let region_id = self.shared.id();
         let mut futures = Vec::with_capacity(self.memtables.len());
         let iter_ctx = IterContext {
-            for_flush: true,
             // TODO(ruihang): dynamic row group size based on content (#412)
             batch_size: WRITE_ROW_GROUP_SIZE,
+            // All sequences are visible by default.
             ..Default::default()
         };
 
@@ -355,13 +355,13 @@ mod tests {
         assert_eq!(0, strategy.memory_active.load(Ordering::Relaxed));
 
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 400,
             write_buffer_size: 300,
         };
         assert_eq!(Some(FlushType::Region), strategy.should_flush(status));
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 100,
             write_buffer_size: 300,
         };
@@ -373,7 +373,7 @@ mod tests {
         let strategy = SizeBasedStrategy::new(Some(1000));
         strategy.reserve_mem(500);
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 300,
             write_buffer_size: 500,
         };
@@ -382,7 +382,7 @@ mod tests {
 
         // Flush region.
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 400,
             write_buffer_size: 300,
         };
@@ -390,7 +390,7 @@ mod tests {
 
         // More than mutable limitation, Flush global.
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 100,
             write_buffer_size: 300,
         };
@@ -415,7 +415,7 @@ mod tests {
         strategy.schedule_free_mem(200);
         // More than global limit.
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 100,
             write_buffer_size: 300,
         };
@@ -424,7 +424,7 @@ mod tests {
         // More than global limit, but mutable not enough (< 500).
         strategy.schedule_free_mem(450);
         let status = RegionStatus {
-            region_id: 1,
+            region_id: 1.into(),
             bytes_mutable: 100,
             write_buffer_size: 300,
         };

@@ -23,7 +23,7 @@ use datanode::instance::InstanceRef;
 use frontend::frontend::FrontendOptions;
 use frontend::instance::{FrontendInstance, Instance as FeInstance};
 use frontend::service_config::{
-    GrpcOptions, InfluxdbOptions, MysqlOptions, OpentsdbOptions, PostgresOptions, PromOptions,
+    GrpcOptions, InfluxdbOptions, MysqlOptions, OpentsdbOptions, PostgresOptions, PromStoreOptions,
     PrometheusOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -89,8 +89,8 @@ pub struct StandaloneOptions {
     pub postgres_options: Option<PostgresOptions>,
     pub opentsdb_options: Option<OpentsdbOptions>,
     pub influxdb_options: Option<InfluxdbOptions>,
+    pub prom_store_options: Option<PromStoreOptions>,
     pub prometheus_options: Option<PrometheusOptions>,
-    pub prom_options: Option<PromOptions>,
     pub wal: WalConfig,
     pub storage: StorageConfig,
     pub procedure: ProcedureConfig,
@@ -108,8 +108,8 @@ impl Default for StandaloneOptions {
             postgres_options: Some(PostgresOptions::default()),
             opentsdb_options: Some(OpentsdbOptions::default()),
             influxdb_options: Some(InfluxdbOptions::default()),
+            prom_store_options: Some(PromStoreOptions::default()),
             prometheus_options: Some(PrometheusOptions::default()),
-            prom_options: Some(PromOptions::default()),
             wal: WalConfig::default(),
             storage: StorageConfig::default(),
             procedure: ProcedureConfig::default(),
@@ -128,10 +128,11 @@ impl StandaloneOptions {
             postgres_options: self.postgres_options,
             opentsdb_options: self.opentsdb_options,
             influxdb_options: self.influxdb_options,
+            prom_store_options: self.prom_store_options,
             prometheus_options: self.prometheus_options,
-            prom_options: self.prom_options,
             meta_client_options: None,
             logging: self.logging,
+            ..Default::default()
         }
     }
 
@@ -268,7 +269,7 @@ impl StartCommand {
         }
 
         if let Some(addr) = &self.prom_addr {
-            opts.prom_options = Some(PromOptions { addr: addr.clone() })
+            opts.prometheus_options = Some(PrometheusOptions { addr: addr.clone() })
         }
 
         if let Some(addr) = &self.postgres_addr {
@@ -308,7 +309,7 @@ impl StartCommand {
             fe_opts, dn_opts
         );
 
-        let datanode = Datanode::new(dn_opts.clone())
+        let datanode = Datanode::new(dn_opts.clone(), Default::default())
             .await
             .context(StartDatanodeSnafu)?;
 
@@ -341,6 +342,7 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
+    use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_named_temp_file;
     use servers::auth::{Identity, Password, UserProviderRef};
     use servers::Mode;
@@ -356,18 +358,15 @@ mod tests {
         };
 
         let plugins = load_frontend_plugins(&command.user_provider);
-        assert!(plugins.is_ok());
         let plugins = plugins.unwrap();
-        let provider = plugins.get::<UserProviderRef>();
-        assert!(provider.is_some());
-        let provider = provider.unwrap();
+        let provider = plugins.get::<UserProviderRef>().unwrap();
         let result = provider
             .authenticate(
                 Identity::UserId("test", None),
                 Password::PlainText("test".to_string().into()),
             )
             .await;
-        assert!(result.is_ok());
+        let _ = result.unwrap();
     }
 
     #[test]
@@ -411,6 +410,7 @@ mod tests {
             [http_options]
             addr = "127.0.0.1:4000"
             timeout = "30s"
+            body_limit = "128MB"
 
             [logging]
             level = "debug"
@@ -435,6 +435,10 @@ mod tests {
         assert_eq!(
             Duration::from_secs(30),
             fe_opts.http_options.as_ref().unwrap().timeout
+        );
+        assert_eq!(
+            ReadableSize::mb(128),
+            fe_opts.http_options.as_ref().unwrap().body_limit
         );
         assert_eq!(
             "127.0.0.1:4001".to_string(),
@@ -561,6 +565,10 @@ mod tests {
                 assert_eq!(
                     opts.fe_opts.http_options.as_ref().unwrap().addr,
                     "127.0.0.1:14000"
+                );
+                assert_eq!(
+                    ReadableSize::mb(64),
+                    opts.fe_opts.http_options.as_ref().unwrap().body_limit
                 );
 
                 // Should be default value.

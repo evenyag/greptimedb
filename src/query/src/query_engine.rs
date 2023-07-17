@@ -108,9 +108,9 @@ impl QueryEngineFactory {
             with_dist_planner,
             partition_manager,
             clients,
-            plugins,
+            plugins.clone(),
         ));
-        let query_engine = Arc::new(DatafusionQueryEngine::new(state));
+        let query_engine = Arc::new(DatafusionQueryEngine::new(state, plugins));
         register_functions(&query_engine);
         Self { query_engine }
     }
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_query_engine_factory() {
-        let catalog_list = catalog::local::new_memory_catalog_list().unwrap();
+        let catalog_list = catalog::local::new_memory_catalog_manager().unwrap();
         let factory = QueryEngineFactory::new(catalog_list, false);
 
         let engine = factory.query_engine();

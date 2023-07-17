@@ -13,12 +13,10 @@
 // limitations under the License.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
 use common_meta::peer::Peer;
-use common_telemetry::info;
 use moka::future::{Cache, CacheBuilder};
 
 use crate::Client;
@@ -26,21 +24,11 @@ use crate::Client;
 pub struct DatanodeClients {
     channel_manager: ChannelManager,
     clients: Cache<Peer, Client>,
-    started: Arc<Mutex<bool>>,
 }
 
 impl Default for DatanodeClients {
     fn default() -> Self {
-        let config = ChannelConfig::new().timeout(Duration::from_secs(8));
-
-        Self {
-            channel_manager: ChannelManager::with_config(config),
-            clients: CacheBuilder::new(1024)
-                .time_to_live(Duration::from_secs(30 * 60))
-                .time_to_idle(Duration::from_secs(5 * 60))
-                .build(),
-            started: Arc::new(Mutex::new(false)),
-        }
+        Self::new(ChannelConfig::new())
     }
 }
 
@@ -53,16 +41,14 @@ impl Debug for DatanodeClients {
 }
 
 impl DatanodeClients {
-    pub fn start(&self) {
-        let mut started = self.started.lock().unwrap();
-        if *started {
-            return;
+    pub fn new(config: ChannelConfig) -> Self {
+        Self {
+            channel_manager: ChannelManager::with_config(config),
+            clients: CacheBuilder::new(1024)
+                .time_to_live(Duration::from_secs(30 * 60))
+                .time_to_idle(Duration::from_secs(5 * 60))
+                .build(),
         }
-
-        self.channel_manager.start_channel_recycle();
-
-        info!("Datanode clients manager is started!");
-        *started = true;
     }
 
     pub async fn get_client(&self, datanode: &Peer) -> Client {

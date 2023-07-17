@@ -14,8 +14,9 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
-use snafu::Location;
+use common_error::ext::ErrorExt;
+use common_error::status_code::StatusCode;
+use snafu::{Location, Snafu};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -44,12 +45,6 @@ pub enum Error {
         source: catalog::error::Error,
     },
 
-    #[snafu(display("Catalog {} not found", name))]
-    CatalogNotFound { name: String },
-
-    #[snafu(display("Schema {} not found", name))]
-    SchemaNotFound { name: String },
-
     #[snafu(display("Table {} not found", name))]
     TableNotFound { name: String },
 
@@ -72,10 +67,8 @@ impl ErrorExt for Error {
             }
             InvalidRawSchema { source, .. } => source.status_code(),
             AccessCatalog { source, .. } => source.status_code(),
-            CatalogNotFound { .. } | SchemaNotFound { .. } | TableExists { .. } => {
-                StatusCode::InvalidArguments
-            }
             TableNotFound { .. } => StatusCode::TableNotFound,
+            TableExists { .. } => StatusCode::TableAlreadyExists,
         }
     }
 

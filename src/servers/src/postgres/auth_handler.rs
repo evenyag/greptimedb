@@ -15,7 +15,7 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use futures::{Sink, SinkExt};
 use metrics::increment_counter;
 use pgwire::api::auth::StartupHandler;
@@ -155,12 +155,9 @@ impl StartupHandler for PostgresServerHandler {
                 // check if db is valid
                 match resolve_db_info(client, self.query_handler.clone()).await? {
                     DbResolution::Resolved(catalog, schema) => {
-                        client
-                            .metadata_mut()
-                            .insert(super::METADATA_CATALOG.to_owned(), catalog);
-                        client
-                            .metadata_mut()
-                            .insert(super::METADATA_SCHEMA.to_owned(), schema);
+                        let metadata = client.metadata_mut();
+                        let _ = metadata.insert(super::METADATA_CATALOG.to_owned(), catalog);
+                        let _ = metadata.insert(super::METADATA_SCHEMA.to_owned(), schema);
                     }
                     DbResolution::NotFound(msg) => {
                         send_error(client, "FATAL", "3D000", msg).await?;

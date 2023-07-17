@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use common_query::Output;
 use common_telemetry::{error, logging, timer, trace, warn};
 use datatypes::prelude::ConcreteDataType;
@@ -48,13 +48,7 @@ use crate::mysql::helper::{
 use crate::mysql::writer;
 use crate::mysql::writer::create_mysql_column;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
-
-/// Cached SQL and logical plan
-#[derive(Clone)]
-struct SqlPlan {
-    query: String,
-    plan: Option<LogicalPlan>,
-}
+use crate::SqlPlan;
 
 // An intermediate shim for executing MySQL queries.
 pub struct MysqlInstanceShim {
@@ -138,7 +132,7 @@ impl MysqlInstanceShim {
     fn save_plan(&self, plan: SqlPlan) -> u32 {
         let stmt_id = self.prepared_stmts_counter.fetch_add(1, Ordering::Relaxed);
         let mut prepared_stmts = self.prepared_stmts.write();
-        prepared_stmts.insert(stmt_id, plan);
+        let _ = prepared_stmts.insert(stmt_id, plan);
         stmt_id
     }
 
@@ -203,11 +197,10 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
 
     async fn on_prepare<'a>(
         &'a mut self,
-        query: &'a str,
+        raw_query: &'a str,
         w: StatementMetaWriter<'a, W>,
     ) -> Result<()> {
-        let raw_query = query.clone();
-        let (query, param_num) = replace_placeholders(query);
+        let (query, param_num) = replace_placeholders(raw_query);
 
         let statement = validate_query(raw_query).await?;
 
@@ -215,10 +208,16 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
         // in the form of "$i", it can't process "?" right now.
         let statement = transform_placeholders(statement);
 
-        let plan = self
-            .do_describe(statement.clone())
-            .await?
-            .map(|DescribeResult { logical_plan, .. }| logical_plan);
+        let describe_result = self.do_describe(statement.clone()).await?;
+        let (plan, schema) = if let Some(DescribeResult {
+            logical_plan,
+            schema,
+        }) = describe_result
+        {
+            (Some(logical_plan), Some(schema))
+        } else {
+            (None, None)
+        };
 
         let params = if let Some(plan) = &plan {
             prepared_params(
@@ -235,6 +234,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
         let stmt_id = self.save_plan(SqlPlan {
             query: query.to_string(),
             plan,
+            schema,
         });
 
         w.reply(stmt_id, &params, &[]).await?;
@@ -317,7 +317,7 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
         W: 'async_trait,
     {
         let mut guard = self.prepared_stmts.write();
-        guard.remove(&stmt_id);
+        let _ = guard.remove(&stmt_id);
     }
 
     async fn on_query<'a>(
@@ -345,10 +345,16 @@ impl<W: AsyncWrite + Send + Sync + Unpin> AsyncMysqlShim<W> for MysqlInstanceShi
 
     async fn on_init<'a>(&'a mut self, database: &'a str, w: InitWriter<'a, W>) -> Result<()> {
         let (catalog, schema) = crate::parse_catalog_and_schema_from_client_database_name(database);
-        ensure!(
-            self.query_handler.is_valid_schema(catalog, schema).await?,
-            error::DatabaseNotFoundSnafu { catalog, schema }
-        );
+
+        if !self.query_handler.is_valid_schema(catalog, schema).await? {
+            return w
+                .error(
+                    ErrorKind::ER_WRONG_DB_NAME,
+                    format!("Unknown database '{}'", database).as_bytes(),
+                )
+                .await
+                .map_err(|e| e.into());
+        }
 
         let user_info = &self.session.user_info();
 

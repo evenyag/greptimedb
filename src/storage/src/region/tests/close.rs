@@ -38,7 +38,7 @@ struct CloseTester {
     base: Option<FileTesterBase>,
 }
 
-/// Create a new region for flush test
+/// Create a new region for close test
 async fn create_region_for_close(
     store_dir: &str,
     flush_strategy: FlushStrategyRef,
@@ -66,12 +66,12 @@ impl CloseTester {
         self.base.as_ref().unwrap()
     }
 
-    async fn put(&self, data: &[(i64, Option<i64>)]) -> WriteResponse {
+    async fn put(&self, data: &[(i64, Option<i64>)]) {
         let data = data
             .iter()
             .map(|(ts, v0)| (*ts, v0.map(|v| v.to_string())))
             .collect::<Vec<_>>();
-        self.base().put(&data).await
+        let _ = self.base().put(&data).await;
     }
 
     async fn try_put(&self, data: &[(i64, Option<i64>)]) -> Result<WriteResponse, Error> {

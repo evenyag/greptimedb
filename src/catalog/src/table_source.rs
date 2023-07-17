@@ -24,10 +24,7 @@ use session::context::QueryContext;
 use snafu::{ensure, OptionExt};
 use table::table::adapter::DfTableProviderAdapter;
 
-use crate::error::{
-    CatalogNotFoundSnafu, QueryAccessDeniedSnafu, Result, SchemaNotFoundSnafu, TableNotExistSnafu,
-};
-use crate::information_schema::InformationSchemaProvider;
+use crate::error::{QueryAccessDeniedSnafu, Result, TableNotExistSnafu};
 use crate::CatalogManagerRef;
 
 pub struct DfTableSourceProvider {
@@ -104,41 +101,18 @@ impl DfTableSourceProvider {
         let schema_name = table_ref.schema.as_ref();
         let table_name = table_ref.table.as_ref();
 
-        let schema = if schema_name != INFORMATION_SCHEMA_NAME {
-            let catalog = self
-                .catalog_manager
-                .catalog(catalog_name)
-                .await?
-                .context(CatalogNotFoundSnafu { catalog_name })?;
-            catalog
-                .schema(schema_name)
-                .await?
-                .context(SchemaNotFoundSnafu {
-                    catalog: catalog_name,
-                    schema: schema_name,
-                })?
-        } else {
-            let catalog_provider = self
-                .catalog_manager
-                .catalog(catalog_name)
-                .await?
-                .context(CatalogNotFoundSnafu { catalog_name })?;
-            Arc::new(InformationSchemaProvider::new(
-                catalog_name.to_string(),
-                catalog_provider,
-            ))
-        };
-        let table = schema
-            .table(table_name)
+        let table = self
+            .catalog_manager
+            .table(catalog_name, schema_name, table_name)
             .await?
             .with_context(|| TableNotExistSnafu {
                 table: format_full_table_name(catalog_name, schema_name, table_name),
             })?;
 
-        let table = DfTableProviderAdapter::new(table);
-        let table = provider_as_source(Arc::new(table));
-        self.resolved_tables.insert(resolved_name, table.clone());
-        Ok(table)
+        let provider = DfTableProviderAdapter::new(table);
+        let source = provider_as_source(Arc::new(provider));
+        let _ = self.resolved_tables.insert(resolved_name, source.clone());
+        Ok(source)
     }
 }
 
@@ -162,14 +136,14 @@ mod tests {
             table: Cow::Borrowed("table_name"),
         };
         let result = table_provider.resolve_table_ref(table_ref);
-        assert!(result.is_ok());
+        let _ = result.unwrap();
 
         let table_ref = TableReference::Partial {
             schema: Cow::Borrowed("public"),
             table: Cow::Borrowed("table_name"),
         };
         let result = table_provider.resolve_table_ref(table_ref);
-        assert!(result.is_ok());
+        let _ = result.unwrap();
 
         let table_ref = TableReference::Partial {
             schema: Cow::Borrowed("wrong_schema"),
@@ -184,7 +158,7 @@ mod tests {
             table: Cow::Borrowed("table_name"),
         };
         let result = table_provider.resolve_table_ref(table_ref);
-        assert!(result.is_ok());
+        let _ = result.unwrap();
 
         let table_ref = TableReference::Full {
             catalog: Cow::Borrowed("wrong_catalog"),
@@ -198,14 +172,14 @@ mod tests {
             schema: Cow::Borrowed("information_schema"),
             table: Cow::Borrowed("columns"),
         };
-        assert!(table_provider.resolve_table_ref(table_ref).is_ok());
+        let _ = table_provider.resolve_table_ref(table_ref).unwrap();
 
         let table_ref = TableReference::Full {
             catalog: Cow::Borrowed("greptime"),
             schema: Cow::Borrowed("information_schema"),
             table: Cow::Borrowed("columns"),
         };
-        assert!(table_provider.resolve_table_ref(table_ref).is_ok());
+        let _ = table_provider.resolve_table_ref(table_ref).unwrap();
 
         let table_ref = TableReference::Full {
             catalog: Cow::Borrowed("dummy"),

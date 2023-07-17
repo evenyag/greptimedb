@@ -35,12 +35,10 @@ rows |  protobuf    |    arrow       |
 fn codec_arrow(batch: &WriteBatch, mutation_types: &[i32]) {
     let encoder = codec::PayloadEncoder::new();
     let mut dst = vec![];
-    let result = encoder.encode(batch.payload(), &mut dst);
-    assert!(result.is_ok());
+    encoder.encode(batch.payload(), &mut dst).unwrap();
 
     let decoder = codec::PayloadDecoder::new(mutation_types);
-    let result = decoder.decode(&dst);
-    assert!(result.is_ok());
+    let _ = decoder.decode(&dst).unwrap();
 }
 
 fn bench_wal_encode_decode(c: &mut Criterion) {
@@ -49,15 +47,16 @@ fn bench_wal_encode_decode(c: &mut Criterion) {
     let (batch_10000, types_10000) = gen_new_batch_and_types(100);
 
     let mut group = c.benchmark_group("wal_encode_decode");
-    group.bench_function("arrow_encode_decode_with_10_num_rows", |b| {
-        b.iter(|| codec_arrow(&batch_10, &types_10))
-    });
-    group.bench_function("arrow_encode_decode_with_100_num_rows", |b| {
-        b.iter(|| codec_arrow(&batch_100, &types_100))
-    });
-    group.bench_function("arrow_encode_decode_with_10000_num_rows", |b| {
-        b.iter(|| codec_arrow(&batch_10000, &types_10000))
-    });
+    let _ = group
+        .bench_function("arrow_encode_decode_with_10_num_rows", |b| {
+            b.iter(|| codec_arrow(&batch_10, &types_10))
+        })
+        .bench_function("arrow_encode_decode_with_100_num_rows", |b| {
+            b.iter(|| codec_arrow(&batch_100, &types_100))
+        })
+        .bench_function("arrow_encode_decode_with_10000_num_rows", |b| {
+            b.iter(|| codec_arrow(&batch_10000, &types_10000))
+        });
     group.finish();
 }
 

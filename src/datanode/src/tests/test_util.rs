@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use catalog::RegisterTableRequest;
 use common_catalog::consts::{
     DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID, MITO_ENGINE,
 };
@@ -28,10 +29,12 @@ use crate::datanode::{
     DatanodeOptions, FileConfig, ObjectStoreConfig, ProcedureConfig, StorageConfig, WalConfig,
 };
 use crate::error::{CreateTableSnafu, Result};
-use crate::instance::Instance;
+use crate::heartbeat::HeartbeatTask;
+use crate::instance::{Instance, InstanceRef};
 
 pub(crate) struct MockInstance {
-    instance: Instance,
+    instance: InstanceRef,
+    _heartbeat: Option<HeartbeatTask>,
     _guard: TestGuard,
 }
 
@@ -39,10 +42,17 @@ impl MockInstance {
     pub(crate) async fn new(name: &str) -> Self {
         let (opts, _guard) = create_tmp_dir_and_datanode_opts(name);
 
-        let instance = Instance::with_mock_meta_client(&opts).await.unwrap();
+        let (instance, heartbeat) = Instance::with_mock_meta_client(&opts).await.unwrap();
         instance.start().await.unwrap();
+        if let Some(task) = heartbeat.as_ref() {
+            task.start().await.unwrap();
+        }
 
-        MockInstance { instance, _guard }
+        MockInstance {
+            instance,
+            _guard,
+            _heartbeat: heartbeat,
+        }
     }
 
     pub(crate) fn inner(&self) -> &Instance {
@@ -119,15 +129,13 @@ pub(crate) async fn create_test_table(
         .await
         .context(CreateTableSnafu { table_name })?;
 
-    let schema_provider = instance
-        .catalog_manager
-        .schema(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME)
-        .await
-        .unwrap()
-        .unwrap();
-    schema_provider
-        .register_table(table_name.to_string(), table.clone())
-        .await
-        .unwrap();
+    let req = RegisterTableRequest {
+        catalog: DEFAULT_CATALOG_NAME.to_string(),
+        schema: DEFAULT_SCHEMA_NAME.to_string(),
+        table_name: table_name.to_string(),
+        table_id: table.table_info().ident.table_id,
+        table: table.clone(),
+    };
+    let _ = instance.catalog_manager.register_table(req).await.unwrap();
     Ok(table)
 }

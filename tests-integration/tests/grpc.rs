@@ -23,7 +23,7 @@ use api::v1::{
 use client::{Client, Database, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::consts::{MIN_USER_TABLE_ID, MITO_ENGINE};
 use common_query::Output;
-use servers::prom::{PromData, PromJsonResponse, PromResponse, PromSeries};
+use servers::prometheus::{PromData, PromSeries, PrometheusJsonResponse, PrometheusResponse};
 use servers::server::Server;
 use tests_integration::test_util::{setup_grpc_server, StorageType};
 
@@ -209,6 +209,7 @@ pub async fn test_insert_and_select(store_type: StorageType) {
         schema_name: DEFAULT_SCHEMA_NAME.to_string(),
         table_name: "demo".to_string(),
         kind: Some(kind),
+        ..Default::default()
     };
     let result = db.alter(expr).await.unwrap();
     assert!(matches!(result, Output::AffectedRows(0)));
@@ -328,8 +329,7 @@ pub async fn test_health_check(store_type: StorageType) {
         setup_grpc_server(store_type, "auto_create_table").await;
 
     let grpc_client = Client::with_urls(vec![addr]);
-    let r = grpc_client.health_check().await;
-    assert!(r.is_ok());
+    grpc_client.health_check().await.unwrap();
 
     let _ = fe_grpc_server.shutdown().await;
     guard.remove_all().await;
@@ -347,12 +347,18 @@ pub async fn test_prom_gateway_query(store_type: StorageType) {
     let mut gateway_client = grpc_client.make_prometheus_gateway_client().unwrap();
 
     // create table and insert data
-    db.sql("CREATE TABLE test(i DOUBLE, j TIMESTAMP TIME INDEX, k STRING PRIMARY KEY);")
-        .await
-        .unwrap();
-    db.sql(r#"INSERT INTO test VALUES (1, 1, "a"), (1, 1, "b"), (2, 2, "a");"#)
-        .await
-        .unwrap();
+    assert!(matches!(
+        db.sql("CREATE TABLE test(i DOUBLE, j TIMESTAMP TIME INDEX, k STRING PRIMARY KEY);")
+            .await
+            .unwrap(),
+        Output::AffectedRows(0)
+    ));
+    assert!(matches!(
+        db.sql(r#"INSERT INTO test VALUES (1, 1, "a"), (1, 1, "b"), (2, 2, "a");"#)
+            .await
+            .unwrap(),
+        Output::AffectedRows(3)
+    ));
 
     // Instant query using prometheus gateway service
     let header = RequestHeader {
@@ -373,10 +379,11 @@ pub async fn test_prom_gateway_query(store_type: StorageType) {
         .unwrap()
         .into_inner()
         .body;
-    let instant_query_result = serde_json::from_slice::<PromJsonResponse>(&json_bytes).unwrap();
-    let expected = PromJsonResponse {
+    let instant_query_result =
+        serde_json::from_slice::<PrometheusJsonResponse>(&json_bytes).unwrap();
+    let expected = PrometheusJsonResponse {
         status: "success".to_string(),
-        data: PromResponse::PromData(PromData {
+        data: PrometheusResponse::PromData(PromData {
             result_type: "vector".to_string(),
             result: vec![
                 PromSeries {
@@ -424,10 +431,10 @@ pub async fn test_prom_gateway_query(store_type: StorageType) {
         .unwrap()
         .into_inner()
         .body;
-    let range_query_result = serde_json::from_slice::<PromJsonResponse>(&json_bytes).unwrap();
-    let expected = PromJsonResponse {
+    let range_query_result = serde_json::from_slice::<PrometheusJsonResponse>(&json_bytes).unwrap();
+    let expected = PrometheusJsonResponse {
         status: "success".to_string(),
-        data: PromResponse::PromData(PromData {
+        data: PrometheusResponse::PromData(PromData {
             result_type: "matrix".to_string(),
             result: vec![
                 PromSeries {
@@ -475,10 +482,10 @@ pub async fn test_prom_gateway_query(store_type: StorageType) {
         .unwrap()
         .into_inner()
         .body;
-    let range_query_result = serde_json::from_slice::<PromJsonResponse>(&json_bytes).unwrap();
-    let expected = PromJsonResponse {
+    let range_query_result = serde_json::from_slice::<PrometheusJsonResponse>(&json_bytes).unwrap();
+    let expected = PrometheusJsonResponse {
         status: "success".to_string(),
-        data: PromResponse::PromData(PromData {
+        data: PrometheusResponse::PromData(PromData {
             result_type: "matrix".to_string(),
             result: vec![],
         }),

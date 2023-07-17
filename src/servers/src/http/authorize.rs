@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 
 use axum::http::{self, Request, StatusCode};
 use axum::response::Response;
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use common_telemetry::warn;
 use futures::future::BoxFuture;
 use http_body::Body;
@@ -75,7 +75,7 @@ where
             let user_provider = if let Some(user_provider) = user_provider.filter(|_| need_auth) {
                 user_provider
             } else {
-                request.extensions_mut().insert(UserInfo::default());
+                let _ = request.extensions_mut().insert(UserInfo::default());
                 return Ok(request);
             };
 
@@ -119,7 +119,7 @@ where
                 .await
             {
                 Ok(userinfo) => {
-                    request.extensions_mut().insert(userinfo);
+                    let _ = request.extensions_mut().insert(userinfo);
                     Ok(request)
                 }
                 Err(e) => {

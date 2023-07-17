@@ -13,53 +13,49 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 use std::sync::Arc;
 
-use async_stream::stream;
 use async_trait::async_trait;
-use common_catalog::consts::{MAX_SYS_TABLE_ID, MITO_ENGINE};
+use common_catalog::consts::MITO_ENGINE;
 use common_meta::ident::TableIdent;
+use common_meta::key::TableMetadataManagerRef;
+use common_meta::kv_backend::KvBackendRef;
+use common_meta::rpc::store::{PutRequest, RangeRequest};
+use common_meta::rpc::KeyValue;
 use common_telemetry::{debug, error, info, warn};
-use dashmap::DashMap;
-use futures::Stream;
-use futures_util::{StreamExt, TryStreamExt};
-use metrics::{decrement_gauge, increment_gauge};
-use parking_lot::RwLock;
+use metrics::increment_gauge;
 use snafu::{ensure, OptionExt, ResultExt};
 use table::engine::manager::TableEngineManagerRef;
 use table::engine::{EngineContext, TableReference};
-use table::requests::{CreateTableRequest, OpenTableRequest};
+use table::requests::OpenTableRequest;
 use table::TableRef;
 use tokio::sync::Mutex;
 
 use crate::error::{
-    CatalogNotFoundSnafu, CreateTableSnafu, InvalidCatalogValueSnafu, OpenTableSnafu,
-    ParallelOpenTableSnafu, Result, SchemaNotFoundSnafu, TableEngineNotFoundSnafu,
-    TableExistsSnafu, UnimplementedSnafu,
+    InvalidCatalogValueSnafu, OpenTableSnafu, ParallelOpenTableSnafu, Result,
+    TableEngineNotFoundSnafu, TableExistsSnafu, TableMetadataManagerSnafu, TableNotFoundSnafu,
+    UnimplementedSnafu,
 };
 use crate::helper::{
-    build_catalog_prefix, build_schema_prefix, build_table_global_prefix,
-    build_table_regional_prefix, CatalogKey, CatalogValue, SchemaKey, SchemaValue, TableGlobalKey,
-    TableGlobalValue, TableRegionalKey, TableRegionalValue, CATALOG_KEY_PREFIX,
+    build_catalog_prefix, build_schema_prefix, build_table_global_prefix, CatalogKey, SchemaKey,
+    TableGlobalKey, TableGlobalValue, TableRegionalKey, TableRegionalValue,
 };
+use crate::local::MemoryCatalogManager;
 use crate::remote::region_alive_keeper::RegionAliveKeepers;
-use crate::remote::{Kv, KvBackendRef};
 use crate::{
-    handle_system_table_request, CatalogManager, CatalogProvider, CatalogProviderRef,
-    DeregisterTableRequest, RegisterSchemaRequest, RegisterSystemTableRequest,
-    RegisterTableRequest, RenameTableRequest, SchemaProvider, SchemaProviderRef,
+    handle_system_table_request, CatalogManager, DeregisterSchemaRequest, DeregisterTableRequest,
+    RegisterSchemaRequest, RegisterSystemTableRequest, RegisterTableRequest, RenameTableRequest,
 };
 
 /// Catalog manager based on metasrv.
 pub struct RemoteCatalogManager {
     node_id: u64,
     backend: KvBackendRef,
-    catalogs: Arc<RwLock<DashMap<String, CatalogProviderRef>>>,
     engine_manager: TableEngineManagerRef,
     system_table_requests: Mutex<Vec<RegisterSystemTableRequest>>,
     region_alive_keepers: Arc<RegionAliveKeepers>,
+    memory_catalog_manager: Arc<MemoryCatalogManager>,
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl RemoteCatalogManager {
@@ -68,264 +64,297 @@ impl RemoteCatalogManager {
         node_id: u64,
         backend: KvBackendRef,
         region_alive_keepers: Arc<RegionAliveKeepers>,
+        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             engine_manager,
             node_id,
             backend,
-            catalogs: Default::default(),
             system_table_requests: Default::default(),
             region_alive_keepers,
+            memory_catalog_manager: Arc::new(MemoryCatalogManager::default()),
+            table_metadata_manager,
         }
     }
 
-    fn new_catalog_provider(&self, catalog_name: &str) -> CatalogProviderRef {
-        Arc::new(RemoteCatalogProvider {
-            node_id: self.node_id,
-            catalog_name: catalog_name.to_string(),
-            backend: self.backend.clone(),
-            engine_manager: self.engine_manager.clone(),
-            region_alive_keepers: self.region_alive_keepers.clone(),
-        }) as _
-    }
-
-    async fn iter_remote_catalogs(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = Result<CatalogKey>> + Send + '_>> {
+    async fn iter_remote_catalogs(&self) -> Result<Vec<CatalogKey>> {
         let catalog_range_prefix = build_catalog_prefix();
-        info!("catalog_range_prefix: {}", catalog_range_prefix);
-        let mut catalogs = self.backend.range(catalog_range_prefix.as_bytes());
-        Box::pin(stream!({
-            while let Some(r) = catalogs.next().await {
-                let Kv(k, _) = r?;
-                if !k.starts_with(catalog_range_prefix.as_bytes()) {
-                    debug!("Ignoring non-catalog key: {}", String::from_utf8_lossy(&k));
-                    continue;
-                }
+        let req = RangeRequest::new().with_prefix(catalog_range_prefix.as_bytes());
 
-                let catalog_key = String::from_utf8_lossy(&k);
-                if let Ok(key) = CatalogKey::parse(&catalog_key) {
-                    yield Ok(key)
-                } else {
-                    error!("Invalid catalog key: {:?}", catalog_key);
+        let kvs = self
+            .backend
+            .range(req)
+            .await
+            .context(TableMetadataManagerSnafu)?
+            .kvs;
+
+        let catalogs = kvs
+            .into_iter()
+            .filter_map(|kv| {
+                let catalog_key = String::from_utf8_lossy(kv.key());
+
+                match CatalogKey::parse(&catalog_key) {
+                    Ok(x) => Some(x),
+                    Err(e) => {
+                        error!(e; "Ignore invalid catalog key {:?}", catalog_key);
+                        None
+                    }
                 }
-            }
-        }))
+            })
+            .collect();
+        Ok(catalogs)
     }
 
     /// Fetch catalogs/schemas/tables from remote catalog manager along with max table id allocated.
-    async fn initiate_catalogs(&self) -> Result<HashMap<String, CatalogProviderRef>> {
-        let mut res = HashMap::new();
-
-        let mut catalogs = self.iter_remote_catalogs().await;
+    async fn initiate_catalogs(&self) -> Result<()> {
+        let catalogs = self.iter_remote_catalogs().await?;
         let mut joins = Vec::new();
-        while let Some(r) = catalogs.next().await {
-            let CatalogKey { catalog_name, .. } = r?;
+        for CatalogKey { catalog_name } in catalogs {
             info!("Fetch catalog from metasrv: {}", catalog_name);
-            let catalog = res
-                .entry(catalog_name.clone())
-                .or_insert_with(|| self.new_catalog_provider(&catalog_name))
-                .clone();
 
             let node_id = self.node_id;
             let backend = self.backend.clone();
             let engine_manager = self.engine_manager.clone();
 
             increment_gauge!(crate::metrics::METRIC_CATALOG_MANAGER_CATALOG_COUNT, 1.0);
-
-            let region_alive_keepers = self.region_alive_keepers.clone();
-            joins.push(common_runtime::spawn_bg(async move {
-                let max_table_id = initiate_schemas(
-                    node_id,
-                    backend,
-                    engine_manager,
-                    &catalog_name,
-                    catalog,
-                    region_alive_keepers,
-                )
-                .await?;
-                info!(
-                    "Catalog name: {}, max table id allocated: {}",
-                    &catalog_name, max_table_id
-                );
-                Ok(())
-            }));
+            joins.push(self.initiate_schemas(node_id, backend, engine_manager, catalog_name));
         }
+
+        futures::future::try_join_all(joins).await?;
+
+        Ok(())
+    }
+
+    fn build_schema_key(&self, catalog_name: String, schema_name: String) -> SchemaKey {
+        SchemaKey {
+            catalog_name,
+            schema_name,
+        }
+    }
+
+    /// Initiates all tables inside the catalog by fetching data from metasrv.
+    /// Return maximum table id in the schema.
+    async fn initiate_tables(
+        &self,
+        node_id: u64,
+        backend: KvBackendRef,
+        engine_manager: TableEngineManagerRef,
+        catalog_name: String,
+        schema_name: String,
+    ) -> Result<()> {
+        info!("initializing tables in {}.{}", catalog_name, schema_name);
+        let kvs = iter_remote_tables(node_id, &backend, &catalog_name, &schema_name).await?;
+        let joins = kvs
+            .into_iter()
+            .map(|(_, table_value)| {
+                let engine_manager = engine_manager.clone();
+                let memory_catalog_manager = self.memory_catalog_manager.clone();
+                let table_metadata_manager = self.table_metadata_manager.clone();
+                let table_id = table_value.table_id();
+                common_runtime::spawn_bg(async move {
+                    if let Err(e) = open_and_register_table(
+                        node_id,
+                        engine_manager,
+                        &table_value,
+                        memory_catalog_manager,
+                        table_metadata_manager,
+                    )
+                    .await
+                    {
+                        // Note that we don't return error here if table opened failed. This is because
+                        // we don't want those broken tables to impede the startup of Datanode.
+                        // However, this could be changed in the future.
+                        error!(e; "Failed to open or register table, id = {table_id}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
 
         futures::future::try_join_all(joins)
             .await
-            .context(ParallelOpenTableSnafu)?
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(res)
+            .context(ParallelOpenTableSnafu)?;
+        Ok(())
     }
 
-    pub async fn create_catalog_and_schema(
+    /// Initiates all schemas inside the catalog by fetching data from metasrv.
+    /// Return maximum table id in the catalog.
+    async fn initiate_schemas(
         &self,
-        catalog_name: &str,
-        schema_name: &str,
-    ) -> Result<CatalogProviderRef> {
-        let schema_provider = new_schema_provider(
-            self.node_id,
-            self.backend.clone(),
-            self.engine_manager.clone(),
+        node_id: u64,
+        backend: KvBackendRef,
+        engine_manager: TableEngineManagerRef,
+        catalog_name: String,
+    ) -> Result<()> {
+        let schemas = iter_remote_schemas(&backend, &catalog_name).await?;
+
+        let mut joins = Vec::new();
+        for SchemaKey {
             catalog_name,
             schema_name,
-            self.region_alive_keepers.clone(),
+        } in schemas
+        {
+            info!(
+                "Fetch schema from metasrv: {}.{}",
+                &catalog_name, &schema_name
+            );
+            increment_gauge!(crate::metrics::METRIC_CATALOG_MANAGER_SCHEMA_COUNT, 1.0);
+
+            let backend = backend.clone();
+            let engine_manager = engine_manager.clone();
+
+            joins.push(self.initiate_tables(
+                node_id,
+                backend,
+                engine_manager,
+                catalog_name,
+                schema_name,
+            ));
+        }
+
+        futures::future::try_join_all(joins).await?;
+        Ok(())
+    }
+
+    async fn register_table(
+        &self,
+        catalog_name: String,
+        schema_name: String,
+        table_name: String,
+        table: TableRef,
+    ) -> Result<Option<TableRef>> {
+        let table_info = table.table_info();
+        let table_version = table_info.ident.version;
+        let table_value = TableRegionalValue {
+            table_id: Some(table.table_info().ident.table_id),
+            version: table_version,
+            regions_ids: table.table_info().meta.region_numbers.clone(),
+            engine_name: Some(table_info.meta.engine.clone()),
+        };
+        let table_key = self
+            .build_regional_table_key(catalog_name, schema_name, table_name)
+            .to_string();
+        let req = PutRequest::new()
+            .with_key(table_key.as_bytes())
+            .with_value(table_value.as_bytes().context(InvalidCatalogValueSnafu)?);
+        self.backend
+            .put(req)
+            .await
+            .context(TableMetadataManagerSnafu)?;
+        debug!(
+            "Successfully set catalog table entry, key: {}, table value: {:?}",
+            table_key, table_value
         );
 
-        let catalog_provider = self.new_catalog_provider(catalog_name);
-        catalog_provider
-            .register_schema(schema_name.to_string(), schema_provider.clone())
-            .await?;
-
-        let schema_key = SchemaKey {
-            catalog_name: catalog_name.to_string(),
-            schema_name: schema_name.to_string(),
-        }
-        .to_string();
-        self.backend
-            .set(
-                schema_key.as_bytes(),
-                &SchemaValue {}
-                    .as_bytes()
-                    .context(InvalidCatalogValueSnafu)?,
-            )
-            .await?;
-        info!("Created schema '{schema_key}'");
-
-        let catalog_key = CatalogKey {
-            catalog_name: catalog_name.to_string(),
-        }
-        .to_string();
-        self.backend
-            .set(
-                catalog_key.as_bytes(),
-                &CatalogValue {}
-                    .as_bytes()
-                    .context(InvalidCatalogValueSnafu)?,
-            )
-            .await?;
-        info!("Created catalog '{catalog_key}");
-        Ok(catalog_provider)
+        // TODO(hl): retrieve prev table info using cas
+        Ok(None)
     }
-}
 
-fn new_schema_provider(
-    node_id: u64,
-    backend: KvBackendRef,
-    engine_manager: TableEngineManagerRef,
-    catalog_name: &str,
-    schema_name: &str,
-    region_alive_keepers: Arc<RegionAliveKeepers>,
-) -> SchemaProviderRef {
-    Arc::new(RemoteSchemaProvider {
-        catalog_name: catalog_name.to_string(),
-        schema_name: schema_name.to_string(),
-        node_id,
-        backend,
-        engine_manager,
-        region_alive_keepers,
-    }) as _
+    async fn deregister_table(
+        &self,
+        catalog_name: String,
+        schema_name: String,
+        table_name: String,
+    ) -> Result<Option<TableRef>> {
+        let table_key = self
+            .build_regional_table_key(
+                catalog_name.clone(),
+                schema_name.clone(),
+                table_name.clone(),
+            )
+            .to_string();
+
+        let engine_opt = self
+            .backend
+            .get(table_key.as_bytes())
+            .await
+            .context(TableMetadataManagerSnafu)?
+            .map(|KeyValue { key: _, value: v }| {
+                let TableRegionalValue {
+                    table_id,
+                    engine_name,
+                    ..
+                } = TableRegionalValue::parse(String::from_utf8_lossy(&v))
+                    .context(InvalidCatalogValueSnafu)?;
+                Ok(engine_name.and_then(|name| table_id.map(|id| (name, id))))
+            })
+            .transpose()?
+            .flatten();
+
+        let Some((engine_name, table_id)) = engine_opt else {
+                warn!("Cannot find table id and engine name for {table_key}");
+                return Ok(None);
+            };
+
+        self.backend
+            .delete(table_key.as_bytes(), false)
+            .await
+            .context(TableMetadataManagerSnafu)?;
+        debug!(
+            "Successfully deleted catalog table entry, key: {}",
+            table_key
+        );
+
+        // deregistering table does not necessarily mean dropping the table
+        let table = self
+            .engine_manager
+            .engine(&engine_name)
+            .context(TableEngineNotFoundSnafu { engine_name })?
+            .get_table(&EngineContext {}, table_id)
+            .with_context(|_| {
+                let reference = TableReference {
+                    catalog: &catalog_name,
+                    schema: &schema_name,
+                    table: &table_name,
+                };
+                OpenTableSnafu {
+                    table_info: reference.to_string(),
+                }
+            })?;
+        Ok(table)
+    }
+
+    fn build_regional_table_key(
+        &self,
+        catalog_name: String,
+        schema_name: String,
+        table_name: String,
+    ) -> TableRegionalKey {
+        TableRegionalKey {
+            catalog_name,
+            schema_name,
+            table_name,
+            node_id: self.node_id,
+        }
+    }
 }
 
 async fn iter_remote_schemas<'a>(
     backend: &'a KvBackendRef,
     catalog_name: &'a str,
-) -> Pin<Box<dyn Stream<Item = Result<SchemaKey>> + Send + 'a>> {
+) -> Result<Vec<SchemaKey>> {
     let schema_prefix = build_schema_prefix(catalog_name);
-    let mut schemas = backend.range(schema_prefix.as_bytes());
+    let req = RangeRequest::new().with_prefix(schema_prefix.as_bytes());
 
-    Box::pin(stream!({
-        while let Some(r) = schemas.next().await {
-            let Kv(k, _) = r?;
-            if !k.starts_with(schema_prefix.as_bytes()) {
-                debug!("Ignoring non-schema key: {}", String::from_utf8_lossy(&k));
-                continue;
-            }
-
-            let schema_key =
-                SchemaKey::parse(&String::from_utf8_lossy(&k)).context(InvalidCatalogValueSnafu)?;
-            yield Ok(schema_key)
-        }
-    }))
-}
-
-/// Initiates all schemas inside the catalog by fetching data from metasrv.
-/// Return maximum table id in the catalog.
-async fn initiate_schemas(
-    node_id: u64,
-    backend: KvBackendRef,
-    engine_manager: TableEngineManagerRef,
-    catalog_name: &str,
-    catalog: CatalogProviderRef,
-    region_alive_keepers: Arc<RegionAliveKeepers>,
-) -> Result<u32> {
-    let mut schemas = iter_remote_schemas(&backend, catalog_name).await;
-    let mut joins = Vec::new();
-    while let Some(r) = schemas.next().await {
-        let SchemaKey {
-            catalog_name,
-            schema_name,
-            ..
-        } = r?;
-
-        info!("Found schema: {}.{}", catalog_name, schema_name);
-        let schema = match catalog.schema(&schema_name).await? {
-            None => {
-                let schema = new_schema_provider(
-                    node_id,
-                    backend.clone(),
-                    engine_manager.clone(),
-                    &catalog_name,
-                    &schema_name,
-                    region_alive_keepers.clone(),
-                );
-                catalog
-                    .register_schema(schema_name.clone(), schema.clone())
-                    .await?;
-                info!("Registered schema: {}", &schema_name);
-                schema
-            }
-            Some(schema) => schema,
-        };
-
-        info!(
-            "Fetch schema from metasrv: {}.{}",
-            &catalog_name, &schema_name
-        );
-        increment_gauge!(crate::metrics::METRIC_CATALOG_MANAGER_SCHEMA_COUNT, 1.0);
-
-        let backend = backend.clone();
-        let engine_manager = engine_manager.clone();
-
-        joins.push(common_runtime::spawn_bg(async move {
-            initiate_tables(
-                node_id,
-                backend,
-                engine_manager,
-                &catalog_name,
-                &schema_name,
-                schema,
-            )
-            .await
-        }));
-    }
-
-    let mut max_table_id = MAX_SYS_TABLE_ID;
-    if let Some(found_max_table_id) = futures::future::try_join_all(joins)
+    let kvs = backend
+        .range(req)
         .await
-        .context(ParallelOpenTableSnafu)?
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-    {
-        max_table_id = max_table_id.max(found_max_table_id);
-    }
+        .context(TableMetadataManagerSnafu)?
+        .kvs;
 
-    Ok(max_table_id)
+    let schemas = kvs
+        .into_iter()
+        .filter_map(|kv| {
+            let schema_key = String::from_utf8_lossy(kv.key());
+            match SchemaKey::parse(&schema_key) {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    warn!("Ignore invalid schema key {:?}: {e}", schema_key);
+                    None
+                }
+            }
+        })
+        .collect();
+    Ok(schemas)
 }
 
 /// Iterate over all table entries on metasrv
@@ -334,169 +363,52 @@ async fn iter_remote_tables<'a>(
     backend: &'a KvBackendRef,
     catalog_name: &'a str,
     schema_name: &'a str,
-) -> Pin<Box<dyn Stream<Item = Result<(TableGlobalKey, TableGlobalValue)>> + Send + 'a>> {
+) -> Result<Vec<(TableGlobalKey, TableGlobalValue)>> {
     let table_prefix = build_table_global_prefix(catalog_name, schema_name);
-    let mut tables = backend.range(table_prefix.as_bytes());
-    Box::pin(stream!({
-        while let Some(r) = tables.next().await {
-            let Kv(k, v) = r?;
-            if !k.starts_with(table_prefix.as_bytes()) {
-                debug!("Ignoring non-table prefix: {}", String::from_utf8_lossy(&k));
-                continue;
-            }
-            let table_key = TableGlobalKey::parse(&String::from_utf8_lossy(&k))
-                .context(InvalidCatalogValueSnafu)?;
-            let table_value = TableGlobalValue::from_bytes(&v).context(InvalidCatalogValueSnafu)?;
+    let req = RangeRequest::new().with_prefix(table_prefix.as_bytes());
 
-            info!(
-                "Found catalog table entry, key: {}, value: {:?}",
-                table_key, table_value
-            );
-            // metasrv has allocated region ids to current datanode
-            if table_value
-                .regions_id_map
-                .get(&node_id)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-            {
-                yield Ok((table_key, table_value))
-            }
-        }
-    }))
-}
-
-async fn print_regional_key_debug_info(
-    node_id: u64,
-    backend: KvBackendRef,
-    table_key: &TableGlobalKey,
-) {
-    let regional_key = TableRegionalKey {
-        catalog_name: table_key.catalog_name.clone(),
-        schema_name: table_key.schema_name.clone(),
-        table_name: table_key.table_name.clone(),
-        node_id,
-    }
-    .to_string();
-
-    match backend.get(regional_key.as_bytes()).await {
-        Ok(Some(Kv(_, values_bytes))) => {
-            debug!(
-                "Node id: {}, TableRegionalKey: {}, value: {},",
-                node_id,
-                table_key,
-                String::from_utf8_lossy(&values_bytes),
-            );
-        }
-        Ok(None) => {
-            debug!(
-                "Node id: {}, TableRegionalKey: {}, value: None",
-                node_id, table_key,
-            );
-        }
-        Err(err) => {
-            debug!(
-                "Node id: {}, failed to fetch TableRegionalKey: {}, source: {}",
-                node_id, regional_key, err
-            );
-        }
-    }
-}
-
-/// Initiates all tables inside the catalog by fetching data from metasrv.
-/// Return maximum table id in the schema.
-async fn initiate_tables(
-    node_id: u64,
-    backend: KvBackendRef,
-    engine_manager: TableEngineManagerRef,
-    catalog_name: &str,
-    schema_name: &str,
-    schema: SchemaProviderRef,
-) -> Result<u32> {
-    info!("initializing tables in {}.{}", catalog_name, schema_name);
-    let tables = iter_remote_tables(node_id, &backend, catalog_name, schema_name).await;
-
-    let kvs = tables.try_collect::<Vec<_>>().await?;
-    let table_num = kvs.len();
-    let joins = kvs
-        .into_iter()
-        .map(|(table_key, table_value)| {
-            let engine_manager = engine_manager.clone();
-            let schema = schema.clone();
-            let backend = backend.clone();
-            common_runtime::spawn_bg(async move {
-                match open_or_create_table(node_id, engine_manager, &table_key, &table_value).await
-                {
-                    Ok(table_ref) => {
-                        let table_info = table_ref.table_info();
-                        let table_name = &table_info.name;
-                        schema.register_table(table_name.clone(), table_ref).await?;
-                        info!("Registered table {}", table_name);
-                        Ok(Some(table_info.ident.table_id))
-                    }
-                    Err(err) => {
-                        warn!(
-                            "Node id: {}, failed to open table: {}, source: {}",
-                            node_id, table_key, err
-                        );
-                        debug!(
-                            "Node id: {}, TableGlobalKey: {}, value: {:?},",
-                            node_id, table_key, table_value
-                        );
-                        print_regional_key_debug_info(node_id, backend, &table_key).await;
-
-                        Ok(None)
-                    }
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let opened_table_ids = futures::future::try_join_all(joins)
+    let kvs = backend
+        .range(req)
         .await
-        .context(ParallelOpenTableSnafu)?
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        .context(TableMetadataManagerSnafu)?
+        .kvs;
 
-    let opened = opened_table_ids.len();
+    let mut tables = Vec::with_capacity(kvs.len());
+    for kv in kvs {
+        let tgk = &String::from_utf8_lossy(kv.key());
+        let Ok(table_key) = TableGlobalKey::parse(tgk) else {
+            warn!("Ignore invalid table global key {:?}", tgk);
+            continue;
+        };
 
-    let max_table_id = opened_table_ids
-        .into_iter()
-        .max()
-        .unwrap_or(MAX_SYS_TABLE_ID);
+        let Ok(table_value) = TableGlobalValue::from_bytes(kv.value()) else {
+            warn!("Ignore invalid table global value {:?}", String::from_utf8_lossy(kv.value()));
+            continue;
+        };
 
-    increment_gauge!(
-        crate::metrics::METRIC_CATALOG_MANAGER_TABLE_COUNT,
-        table_num as f64,
-        &[crate::metrics::db_label(catalog_name, schema_name)],
-    );
-    info!(
-        "initialized tables in {}.{}, total: {}, opened: {}, failed: {}",
-        catalog_name,
-        schema_name,
-        table_num,
-        opened,
-        table_num - opened
-    );
+        info!("Found catalog table entry, key: {table_key}, value: {table_value:?}");
 
-    Ok(max_table_id)
+        // metasrv has allocated region ids to current datanode
+        if table_value
+            .regions_id_map
+            .get(&node_id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            tables.push((table_key, table_value))
+        }
+    }
+    Ok(tables)
 }
 
-async fn open_or_create_table(
+async fn open_and_register_table(
     node_id: u64,
     engine_manager: TableEngineManagerRef,
-    table_key: &TableGlobalKey,
     table_value: &TableGlobalValue,
-) -> Result<TableRef> {
+    memory_catalog_manager: Arc<MemoryCatalogManager>,
+    _table_metadata_manager: TableMetadataManagerRef,
+) -> Result<()> {
     let context = EngineContext {};
-    let TableGlobalKey {
-        catalog_name,
-        schema_name,
-        table_name,
-        ..
-    } = table_key;
 
     let table_id = table_value.table_id();
 
@@ -505,6 +417,10 @@ async fn open_or_create_table(
         regions_id_map,
         ..
     } = table_value;
+
+    let catalog_name = table_info.catalog_name.clone();
+    let schema_name = table_info.schema_name.clone();
+    let table_name = table_info.name.clone();
 
     // unwrap safety: checked in yielding this table when `iter_remote_tables`
     let region_numbers = regions_id_map.get(&node_id).unwrap();
@@ -522,68 +438,48 @@ async fn open_or_create_table(
             .context(TableEngineNotFoundSnafu {
                 engine_name: &table_info.meta.engine,
             })?;
-    match engine
+
+    let table_ident = TableIdent {
+        catalog: catalog_name,
+        schema: schema_name,
+        table: table_name,
+        table_id,
+        engine: table_info.meta.engine.clone(),
+    };
+
+    let table = engine
         .open_table(&context, request)
         .await
         .with_context(|_| OpenTableSnafu {
-            table_info: format!("{catalog_name}.{schema_name}.{table_name}, id:{table_id}"),
-        })? {
-        Some(table) => {
-            info!(
-                "Table opened: {}.{}.{}",
-                catalog_name, schema_name, table_name
-            );
-            Ok(table)
-        }
-        None => {
-            info!(
-                "Try create table: {}.{}.{}",
-                catalog_name, schema_name, table_name
-            );
+            table_info: table_ident.to_string(),
+        })?
+        .with_context(|| TableNotFoundSnafu {
+            table_info: table_ident.to_string(),
+        })?;
+    info!("Successfully opened table, {table_ident}");
 
-            let meta = &table_info.meta;
-            let req = CreateTableRequest {
-                id: table_id,
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
-                desc: None,
-                schema: meta.schema.clone(),
-                region_numbers: region_numbers.clone(),
-                primary_key_indices: meta.primary_key_indices.clone(),
-                create_if_not_exists: true,
-                table_options: meta.options.clone(),
-                engine: engine.name().to_string(),
-            };
-
-            engine
-                .create_table(&context, req)
-                .await
-                .context(CreateTableSnafu {
-                    table_info: format!(
-                        "{}.{}.{}, id:{}",
-                        &catalog_name, &schema_name, &table_name, table_id
-                    ),
-                })
+    let request = RegisterTableRequest {
+        catalog: table_ident.catalog.clone(),
+        schema: table_ident.schema.clone(),
+        table_name: table_ident.table.clone(),
+        table_id,
+        table,
+    };
+    let registered = memory_catalog_manager.register_table_sync(request)?;
+    ensure!(
+        registered,
+        TableExistsSnafu {
+            table: table_ident.to_string(),
         }
-    }
+    );
+    info!("Successfully registered table, {table_ident}");
+    Ok(())
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl CatalogManager for RemoteCatalogManager {
     async fn start(&self) -> Result<()> {
-        let catalogs = self.initiate_catalogs().await?;
-        info!(
-            "Initialized catalogs: {:?}",
-            catalogs.keys().cloned().collect::<Vec<_>>()
-        );
-
-        {
-            let self_catalogs = self.catalogs.read();
-            catalogs.into_iter().for_each(|(k, v)| {
-                self_catalogs.insert(k, v);
-            });
-        }
+        self.initiate_catalogs().await?;
 
         let mut system_table_requests = self.system_table_requests.lock().await;
         let engine = self
@@ -598,121 +494,81 @@ impl CatalogManager for RemoteCatalogManager {
     }
 
     async fn register_table(&self, request: RegisterTableRequest) -> Result<bool> {
-        let catalog = &request.catalog;
-        let schema = &request.schema;
-        let table_name = &request.table_name;
+        let catalog = request.catalog.clone();
+        let schema = request.schema.clone();
+        let table_name = request.table_name.clone();
+        let table = request.table.clone();
 
-        let schema_provider = self
-            .catalog(catalog)
-            .await?
-            .context(CatalogNotFoundSnafu {
-                catalog_name: catalog,
-            })?
-            .schema(schema)
-            .await?
-            .context(SchemaNotFoundSnafu { catalog, schema })?;
-        ensure!(
-            !schema_provider.table_exist(table_name).await?,
-            TableExistsSnafu {
-                table: common_catalog::format_full_table_name(catalog, schema, table_name),
-            }
-        );
+        let registered = self.memory_catalog_manager.register_table_sync(request)?;
 
-        increment_gauge!(
-            crate::metrics::METRIC_CATALOG_MANAGER_TABLE_COUNT,
-            1.0,
-            &[crate::metrics::db_label(catalog, schema)],
-        );
-        schema_provider
-            .register_table(table_name.to_string(), request.table)
-            .await?;
+        if registered {
+            self.register_table(catalog, schema, table_name, table.clone())
+                .await?;
 
-        Ok(true)
-    }
-
-    async fn deregister_table(&self, request: DeregisterTableRequest) -> Result<bool> {
-        let catalog_name = &request.catalog;
-        let schema_name = &request.schema;
-        let result = self
-            .schema(catalog_name, schema_name)
-            .await?
-            .context(SchemaNotFoundSnafu {
-                catalog: catalog_name,
-                schema: schema_name,
-            })?
-            .deregister_table(&request.table_name)
-            .await?;
-        decrement_gauge!(
-            crate::metrics::METRIC_CATALOG_MANAGER_TABLE_COUNT,
-            1.0,
-            &[crate::metrics::db_label(catalog_name, schema_name)],
-        );
-
-        if let Some(table) = result.as_ref() {
             let table_info = table.table_info();
             let table_ident = TableIdent {
-                catalog: request.catalog,
-                schema: request.schema,
-                table: request.table_name,
-                table_id: table_info.ident.table_id,
+                catalog: table_info.catalog_name.clone(),
+                schema: table_info.schema_name.clone(),
+                table: table_info.name.clone(),
+                table_id: table_info.table_id(),
                 engine: table_info.meta.engine.clone(),
             };
             self.region_alive_keepers
-                .deregister_table(&table_ident)
-                .await;
+                .register_table(table_ident, table)
+                .await?;
         }
 
-        Ok(true)
+        Ok(registered)
+    }
+
+    async fn deregister_table(&self, request: DeregisterTableRequest) -> Result<()> {
+        let Some(table) = self
+            .memory_catalog_manager
+            .table(&request.catalog, &request.schema, &request.table_name)
+            .await? else { return Ok(()) };
+
+        self.deregister_table(
+            request.catalog.clone(),
+            request.schema.clone(),
+            request.table_name.clone(),
+        )
+        .await?;
+
+        let table_info = table.table_info();
+        let table_ident = TableIdent {
+            catalog: request.catalog.clone(),
+            schema: request.schema.clone(),
+            table: request.table_name.clone(),
+            table_id: table_info.ident.table_id,
+            engine: table_info.meta.engine.clone(),
+        };
+        if let Some(keeper) = self
+            .region_alive_keepers
+            .deregister_table(&table_ident)
+            .await
+        {
+            warn!(
+                "Table {} is deregistered from region alive keepers",
+                keeper.table_ident(),
+            );
+        }
+
+        self.memory_catalog_manager.deregister_table(request).await
     }
 
     async fn register_schema(&self, request: RegisterSchemaRequest) -> Result<bool> {
-        let catalog_name = request.catalog;
-        let schema_name = request.schema;
-        let catalog_provider =
-            self.catalog(&catalog_name)
-                .await?
-                .context(CatalogNotFoundSnafu {
-                    catalog_name: &catalog_name,
-                })?;
-        let schema_provider = new_schema_provider(
-            self.node_id,
-            self.backend.clone(),
-            self.engine_manager.clone(),
-            &catalog_name,
-            &schema_name,
-            self.region_alive_keepers.clone(),
-        );
-        catalog_provider
-            .register_schema(schema_name, schema_provider)
-            .await?;
-        increment_gauge!(crate::metrics::METRIC_CATALOG_MANAGER_SCHEMA_COUNT, 1.0);
-        Ok(true)
+        self.memory_catalog_manager.register_schema_sync(request)
+    }
+
+    async fn deregister_schema(&self, _request: DeregisterSchemaRequest) -> Result<bool> {
+        UnimplementedSnafu {
+            operation: "deregister schema",
+        }
+        .fail()
     }
 
     async fn rename_table(&self, request: RenameTableRequest) -> Result<bool> {
-        let old_table_key = TableRegionalKey {
-            catalog_name: request.catalog.clone(),
-            schema_name: request.schema.clone(),
-            table_name: request.table_name.clone(),
-            node_id: self.node_id,
-        }
-        .to_string();
-        let Some(Kv(_, value_bytes)) = self.backend.get(old_table_key.as_bytes()).await? else {
-            return Ok(false)
-        };
-        let new_table_key = TableRegionalKey {
-            catalog_name: request.catalog.clone(),
-            schema_name: request.schema.clone(),
-            table_name: request.new_table_name,
-            node_id: self.node_id,
-        };
-        self.backend
-            .set(new_table_key.to_string().as_bytes(), &value_bytes)
-            .await?;
-        self.backend
-            .delete(old_table_key.to_string().as_bytes())
-            .await?;
-        Ok(true)
+        self.memory_catalog_manager.rename_table(request).await
     }
 
     async fn register_system_table(&self, request: RegisterSystemTableRequest) -> Result<()> {
@@ -729,14 +585,46 @@ impl CatalogManager for RemoteCatalogManager {
         Ok(())
     }
 
-    async fn schema(&self, catalog: &str, schema: &str) -> Result<Option<SchemaProviderRef>> {
-        self.catalog(catalog)
+    async fn schema_exist(&self, catalog: &str, schema: &str) -> Result<bool> {
+        if !self.catalog_exist(catalog).await? {
+            return Ok(false);
+        }
+
+        if self
+            .memory_catalog_manager
+            .schema_exist(catalog, schema)
             .await?
-            .context(CatalogNotFoundSnafu {
-                catalog_name: catalog,
-            })?
-            .schema(schema)
+        {
+            return Ok(true);
+        }
+
+        let key = self
+            .build_schema_key(catalog.to_string(), schema.to_string())
+            .to_string();
+        let remote_schema_exists = self
+            .backend
+            .get(key.as_bytes())
             .await
+            .context(TableMetadataManagerSnafu)?
+            .is_some();
+
+        // Create schema locally if remote schema exists. Since local schema is managed by memory
+        // catalog manager, creating a local schema is relatively cheap (just a HashMap).
+        // Besides, if this method ("schema_exist) is called, it's very likely that someone wants to
+        // create a table in this schema. We should create the schema now.
+        if remote_schema_exists
+            && self
+                .memory_catalog_manager
+                .register_schema(RegisterSchemaRequest {
+                    catalog: catalog.to_string(),
+                    schema: schema.to_string(),
+                })
+                .await?
+        {
+            info!("register schema '{catalog}/{schema}' on demand");
+        }
+
+        Ok(remote_schema_exists)
     }
 
     async fn table(
@@ -745,374 +633,76 @@ impl CatalogManager for RemoteCatalogManager {
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<TableRef>> {
-        let catalog = self
-            .catalog(catalog_name)
-            .await?
-            .with_context(|| CatalogNotFoundSnafu { catalog_name })?;
-        let schema = catalog
-            .schema(schema_name)
-            .await?
-            .with_context(|| SchemaNotFoundSnafu {
-                catalog: catalog_name,
-                schema: schema_name,
-            })?;
-        schema.table(table_name).await
+        self.memory_catalog_manager
+            .table(catalog_name, schema_name, table_name)
+            .await
     }
 
-    async fn catalog(&self, catalog: &str) -> Result<Option<CatalogProviderRef>> {
+    async fn catalog_exist(&self, catalog: &str) -> Result<bool> {
+        if self.memory_catalog_manager.catalog_exist(catalog).await? {
+            return Ok(true);
+        }
+
         let key = CatalogKey {
             catalog_name: catalog.to_string(),
         };
-        Ok(self
+
+        let remote_catalog_exists = self
             .backend
             .get(key.to_string().as_bytes())
-            .await?
-            .map(|_| self.new_catalog_provider(catalog)))
+            .await
+            .context(TableMetadataManagerSnafu)?
+            .is_some();
+
+        // Create catalog locally if remote catalog exists. Since local catalog is managed by memory
+        // catalog manager, creating a local catalog is relatively cheap (just a HashMap).
+        // Besides, if this method ("catalog_exist) is called, it's very likely that someone wants to
+        // create a table in this catalog. We should create the catalog now.
+        if remote_catalog_exists
+            && self
+                .memory_catalog_manager
+                .register_catalog(catalog.to_string())
+                .await?
+        {
+            info!("register catalog '{catalog}' on demand");
+        }
+
+        Ok(remote_catalog_exists)
+    }
+
+    async fn table_exist(&self, catalog: &str, schema: &str, table: &str) -> Result<bool> {
+        if !self.catalog_exist(catalog).await? {
+            return Ok(false);
+        }
+
+        if !self.schema_exist(catalog, schema).await? {
+            return Ok(false);
+        }
+
+        self.memory_catalog_manager
+            .table_exist(catalog, schema, table)
+            .await
     }
 
     async fn catalog_names(&self) -> Result<Vec<String>> {
-        let mut stream = self.backend.range(CATALOG_KEY_PREFIX.as_bytes());
-        let mut catalogs = HashSet::new();
-
-        while let Some(catalog) = stream.next().await {
-            if let Ok(catalog) = catalog {
-                let catalog_key = String::from_utf8_lossy(&catalog.0);
-
-                if let Ok(key) = CatalogKey::parse(&catalog_key) {
-                    catalogs.insert(key.catalog_name);
-                }
-            }
-        }
-
-        Ok(catalogs.into_iter().collect())
+        self.memory_catalog_manager.catalog_names().await
     }
 
-    async fn register_catalog(
-        &self,
-        name: String,
-        _catalog: CatalogProviderRef,
-    ) -> Result<Option<CatalogProviderRef>> {
-        let key = CatalogKey { catalog_name: name }.to_string();
-        // TODO(hl): use compare_and_swap to prevent concurrent update
-        self.backend
-            .set(
-                key.as_bytes(),
-                &CatalogValue {}
-                    .as_bytes()
-                    .context(InvalidCatalogValueSnafu)?,
-            )
-            .await?;
-        increment_gauge!(crate::metrics::METRIC_CATALOG_MANAGER_CATALOG_COUNT, 1.0);
-        Ok(None)
+    async fn schema_names(&self, catalog_name: &str) -> Result<Vec<String>> {
+        self.memory_catalog_manager.schema_names(catalog_name).await
+    }
+
+    async fn table_names(&self, catalog_name: &str, schema_name: &str) -> Result<Vec<String>> {
+        self.memory_catalog_manager
+            .table_names(catalog_name, schema_name)
+            .await
+    }
+
+    async fn register_catalog(&self, name: String) -> Result<bool> {
+        self.memory_catalog_manager.register_catalog_sync(name)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-pub struct RemoteCatalogProvider {
-    node_id: u64,
-    catalog_name: String,
-    backend: KvBackendRef,
-    engine_manager: TableEngineManagerRef,
-    region_alive_keepers: Arc<RegionAliveKeepers>,
-}
-
-impl RemoteCatalogProvider {
-    pub fn new(
-        catalog_name: String,
-        backend: KvBackendRef,
-        engine_manager: TableEngineManagerRef,
-        node_id: u64,
-        region_alive_keepers: Arc<RegionAliveKeepers>,
-    ) -> Self {
-        Self {
-            node_id,
-            catalog_name,
-            backend,
-            engine_manager,
-            region_alive_keepers,
-        }
-    }
-
-    fn build_schema_key(&self, schema_name: impl AsRef<str>) -> SchemaKey {
-        SchemaKey {
-            catalog_name: self.catalog_name.clone(),
-            schema_name: schema_name.as_ref().to_string(),
-        }
-    }
-
-    fn build_schema_provider(&self, schema_name: &str) -> SchemaProviderRef {
-        let provider = RemoteSchemaProvider {
-            catalog_name: self.catalog_name.clone(),
-            schema_name: schema_name.to_string(),
-            node_id: self.node_id,
-            backend: self.backend.clone(),
-            engine_manager: self.engine_manager.clone(),
-            region_alive_keepers: self.region_alive_keepers.clone(),
-        };
-        Arc::new(provider) as Arc<_>
-    }
-}
-
-#[async_trait::async_trait]
-impl CatalogProvider for RemoteCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn schema_names(&self) -> Result<Vec<String>> {
-        let schema_prefix = build_schema_prefix(&self.catalog_name);
-
-        let remote_schemas = self.backend.range(schema_prefix.as_bytes());
-        let res = remote_schemas
-            .map(|kv| {
-                let Kv(k, _) = kv?;
-                let schema_key = SchemaKey::parse(String::from_utf8_lossy(&k))
-                    .context(InvalidCatalogValueSnafu)?;
-                Ok(schema_key.schema_name)
-            })
-            .try_collect()
-            .await?;
-        Ok(res)
-    }
-
-    async fn register_schema(
-        &self,
-        name: String,
-        schema: SchemaProviderRef,
-    ) -> Result<Option<SchemaProviderRef>> {
-        let _ = schema; // we don't care about schema provider
-        let key = self.build_schema_key(&name).to_string();
-        self.backend
-            .set(
-                key.as_bytes(),
-                &SchemaValue {}
-                    .as_bytes()
-                    .context(InvalidCatalogValueSnafu)?,
-            )
-            .await?;
-        // TODO(hl): maybe return preview schema by cas
-        Ok(None)
-    }
-
-    async fn schema(&self, name: &str) -> Result<Option<SchemaProviderRef>> {
-        let key = self.build_schema_key(name).to_string();
-        Ok(self
-            .backend
-            .get(key.as_bytes())
-            .await?
-            .map(|_| self.build_schema_provider(name)))
-    }
-}
-
-pub struct RemoteSchemaProvider {
-    catalog_name: String,
-    schema_name: String,
-    node_id: u64,
-    backend: KvBackendRef,
-    engine_manager: TableEngineManagerRef,
-    region_alive_keepers: Arc<RegionAliveKeepers>,
-}
-
-impl RemoteSchemaProvider {
-    pub fn new(
-        catalog_name: String,
-        schema_name: String,
-        node_id: u64,
-        engine_manager: TableEngineManagerRef,
-        backend: KvBackendRef,
-        region_alive_keepers: Arc<RegionAliveKeepers>,
-    ) -> Self {
-        Self {
-            catalog_name,
-            schema_name,
-            node_id,
-            backend,
-            engine_manager,
-            region_alive_keepers,
-        }
-    }
-
-    fn build_regional_table_key(&self, table_name: impl AsRef<str>) -> TableRegionalKey {
-        TableRegionalKey {
-            catalog_name: self.catalog_name.clone(),
-            schema_name: self.schema_name.clone(),
-            table_name: table_name.as_ref().to_string(),
-            node_id: self.node_id,
-        }
-    }
-}
-
-#[async_trait]
-impl SchemaProvider for RemoteSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn table_names(&self) -> Result<Vec<String>> {
-        let key_prefix = build_table_regional_prefix(&self.catalog_name, &self.schema_name);
-        let iter = self.backend.range(key_prefix.as_bytes());
-        let regional_keys = iter
-            .map(|kv| {
-                let Kv(key, _) = kv?;
-                let regional_key = TableRegionalKey::parse(String::from_utf8_lossy(&key))
-                    .context(InvalidCatalogValueSnafu)?;
-                Ok(regional_key)
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let table_names = regional_keys
-            .into_iter()
-            .filter_map(|x| {
-                if x.node_id == self.node_id {
-                    Some(x.table_name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Ok(table_names)
-    }
-
-    async fn table(&self, name: &str) -> Result<Option<TableRef>> {
-        let key = self.build_regional_table_key(name).to_string();
-        let table_opt = self
-            .backend
-            .get(key.as_bytes())
-            .await?
-            .map(|Kv(_, v)| {
-                let TableRegionalValue {
-                    table_id,
-                    engine_name,
-                    ..
-                } = TableRegionalValue::parse(String::from_utf8_lossy(&v))
-                    .context(InvalidCatalogValueSnafu)?;
-
-                let Some(table_id) = table_id else {
-                    warn!("Cannot find table id for {key}, the value has an old format");
-                    return Ok(None);
-                };
-                let engine_name = engine_name.as_deref().unwrap_or(MITO_ENGINE);
-                let engine = self
-                    .engine_manager
-                    .engine(engine_name)
-                    .context(TableEngineNotFoundSnafu { engine_name })?;
-                let reference = TableReference {
-                    catalog: &self.catalog_name,
-                    schema: &self.schema_name,
-                    table: name,
-                };
-                let table = engine
-                    .get_table(&EngineContext {}, table_id)
-                    .with_context(|_| OpenTableSnafu {
-                        table_info: reference.to_string(),
-                    })?;
-                Ok(table)
-            })
-            .transpose()?
-            .flatten();
-
-        Ok(table_opt)
-    }
-
-    async fn register_table(&self, name: String, table: TableRef) -> Result<Option<TableRef>> {
-        // Currently, initiate_tables() always call this method to register the table to the schema thus we
-        // always update the region value.
-        let table_info = table.table_info();
-        let table_version = table_info.ident.version;
-        let table_value = TableRegionalValue {
-            table_id: Some(table_info.ident.table_id),
-            version: table_version,
-            regions_ids: table.table_info().meta.region_numbers.clone(),
-            engine_name: Some(table_info.meta.engine.clone()),
-        };
-        let table_key = self.build_regional_table_key(&name).to_string();
-        self.backend
-            .set(
-                table_key.as_bytes(),
-                &table_value.as_bytes().context(InvalidCatalogValueSnafu)?,
-            )
-            .await?;
-
-        let table_ident = TableIdent {
-            catalog: table_info.catalog_name.clone(),
-            schema: table_info.schema_name.clone(),
-            table: table_info.name.clone(),
-            table_id: table_info.ident.table_id,
-            engine: table_info.meta.engine.clone(),
-        };
-        self.region_alive_keepers
-            .register_table(table_ident, table)
-            .await?;
-
-        debug!(
-            "Successfully set catalog table entry, key: {}, table value: {:?}",
-            table_key, table_value
-        );
-
-        // TODO(hl): retrieve prev table info using cas
-        Ok(None)
-    }
-
-    async fn rename_table(&self, _name: &str, _new_name: String) -> Result<TableRef> {
-        UnimplementedSnafu {
-            operation: "rename table",
-        }
-        .fail()
-    }
-
-    async fn deregister_table(&self, name: &str) -> Result<Option<TableRef>> {
-        let table_key = self.build_regional_table_key(name).to_string();
-
-        let engine_opt = self
-            .backend
-            .get(table_key.as_bytes())
-            .await?
-            .map(|Kv(_, v)| {
-                let TableRegionalValue {
-                    table_id,
-                    engine_name,
-                    ..
-                } = TableRegionalValue::parse(String::from_utf8_lossy(&v))
-                    .context(InvalidCatalogValueSnafu)?;
-                Ok(engine_name.and_then(|name| table_id.map(|id| (name, id))))
-            })
-            .transpose()?
-            .flatten();
-
-        self.backend.delete(table_key.as_bytes()).await?;
-        debug!(
-            "Successfully deleted catalog table entry, key: {}",
-            table_key
-        );
-
-        let Some((engine_name, table_id)) = engine_opt else {
-            warn!("Cannot find table id and engine name for {table_key}");
-            return Ok(None);
-        };
-        let reference = TableReference {
-            catalog: &self.catalog_name,
-            schema: &self.schema_name,
-            table: name,
-        };
-        // deregistering table does not necessarily mean dropping the table
-        let table = self
-            .engine_manager
-            .engine(&engine_name)
-            .context(TableEngineNotFoundSnafu { engine_name })?
-            .get_table(&EngineContext {}, table_id)
-            .with_context(|_| OpenTableSnafu {
-                table_info: reference.to_string(),
-            })?;
-        Ok(table)
-    }
-
-    /// Checks if table exists in schema provider based on locally opened table map.
-    async fn table_exist(&self, name: &str) -> Result<bool> {
-        let key = self.build_regional_table_key(name).to_string();
-        Ok(self.backend.get(key.as_bytes()).await?.is_some())
     }
 }

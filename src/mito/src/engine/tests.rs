@@ -15,7 +15,6 @@
 //! Tests for mito table engine.
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_query::physical_plan::SessionContext;
 use common_recordbatch::util;
 use common_test_util::temp_dir::TempDir;
 use datatypes::prelude::ConcreteDataType;
@@ -30,8 +29,7 @@ use storage::config::EngineConfig as StorageEngineConfig;
 use storage::region::RegionImpl;
 use storage::EngineImpl;
 use store_api::manifest::Manifest;
-use store_api::storage::ReadContext;
-use table::engine::region_id;
+use store_api::storage::{ReadContext, ScanRequest};
 use table::metadata::TableType;
 use table::requests::{
     AddColumnRequest, AlterKind, DeleteRequest, FlushTableRequest, TableOptions,
@@ -115,19 +113,17 @@ async fn setup_table_with_column_default_constraint() -> (TempDir, String, Table
 async fn test_column_default_constraint() {
     let (_dir, table_name, table) = setup_table_with_column_default_constraint().await;
 
-    let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
     let names: VectorRef = Arc::new(StringVector::from(vec!["first", "second"]));
     let tss: VectorRef = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2]));
-
-    columns_values.insert("name".to_string(), names.clone());
-    columns_values.insert("ts".to_string(), tss.clone());
+    let columns_values = HashMap::from([
+        ("name".to_string(), names.clone()),
+        ("ts".to_string(), tss.clone()),
+    ]);
 
     let insert_req = new_insert_request(table_name.to_string(), columns_values);
     assert_eq!(2, table.insert(insert_req).await.unwrap());
 
-    let session_ctx = SessionContext::new();
-    let stream = table.scan(None, &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let stream = table.scan_to_stream(ScanRequest::default()).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     assert_eq!(1, batches.len());
 
@@ -145,21 +141,19 @@ async fn test_column_default_constraint() {
 async fn test_insert_with_column_default_constraint() {
     let (_dir, table_name, table) = setup_table_with_column_default_constraint().await;
 
-    let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
     let names: VectorRef = Arc::new(StringVector::from(vec!["first", "second"]));
     let nums: VectorRef = Arc::new(Int32Vector::from(vec![None, Some(66)]));
     let tss: VectorRef = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2]));
-
-    columns_values.insert("name".to_string(), names.clone());
-    columns_values.insert("n".to_string(), nums.clone());
-    columns_values.insert("ts".to_string(), tss.clone());
+    let columns_values = HashMap::from([
+        ("name".to_string(), names.clone()),
+        ("n".to_string(), nums.clone()),
+        ("ts".to_string(), tss.clone()),
+    ]);
 
     let insert_req = new_insert_request(table_name.to_string(), columns_values);
     assert_eq!(2, table.insert(insert_req).await.unwrap());
 
-    let session_ctx = SessionContext::new();
-    let stream = table.scan(None, &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let stream = table.scan_to_stream(ScanRequest::default()).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     assert_eq!(1, batches.len());
 
@@ -226,7 +220,7 @@ fn test_validate_create_table_request() {
         .contains("Invalid primary key: time index column can't be included in primary key"));
 
     request.primary_key_indices = vec![0];
-    assert!(validate_create_table_request(&request).is_ok());
+    validate_create_table_request(&request).unwrap();
 }
 
 #[tokio::test]
@@ -243,23 +237,21 @@ async fn test_create_table_insert_scan() {
     let insert_req = new_insert_request("demo".to_string(), HashMap::default());
     assert_eq!(0, table.insert(insert_req).await.unwrap());
 
-    let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
     let hosts: VectorRef = Arc::new(StringVector::from(vec!["host1", "host2"]));
     let cpus: VectorRef = Arc::new(Float64Vector::from_vec(vec![55.5, 66.6]));
     let memories: VectorRef = Arc::new(Float64Vector::from_vec(vec![1024f64, 4096f64]));
     let tss: VectorRef = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2]));
-
-    columns_values.insert("host".to_string(), hosts.clone());
-    columns_values.insert("cpu".to_string(), cpus.clone());
-    columns_values.insert("memory".to_string(), memories.clone());
-    columns_values.insert("ts".to_string(), tss.clone());
+    let columns_values = HashMap::from([
+        ("host".to_string(), hosts.clone()),
+        ("cpu".to_string(), cpus.clone()),
+        ("memory".to_string(), memories.clone()),
+        ("ts".to_string(), tss.clone()),
+    ]);
 
     let insert_req = new_insert_request("demo".to_string(), columns_values);
     assert_eq!(2, table.insert(insert_req).await.unwrap());
 
-    let session_ctx = SessionContext::new();
-    let stream = table.scan(None, &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let stream = table.scan_to_stream(ScanRequest::default()).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     assert_eq!(1, batches.len());
     assert_eq!(batches[0].num_columns(), 4);
@@ -279,8 +271,11 @@ async fn test_create_table_insert_scan() {
     assert_eq!(tss, *batch.column(3));
 
     // Scan with projections: cpu and memory
-    let stream = table.scan(Some(&vec![1, 2]), &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let scan_req = ScanRequest {
+        projection: Some(vec![1, 2]),
+        ..Default::default()
+    };
+    let stream = table.scan_to_stream(scan_req).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     assert_eq!(1, batches.len());
     assert_eq!(batches[0].num_columns(), 2);
@@ -297,8 +292,11 @@ async fn test_create_table_insert_scan() {
     assert_eq!(memories, *batch.column(1));
 
     // Scan with projections: only ts
-    let stream = table.scan(Some(&vec![3]), &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let scan_req = ScanRequest {
+        projection: Some(vec![3]),
+        ..Default::default()
+    };
+    let stream = table.scan_to_stream(scan_req).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     assert_eq!(1, batches.len());
     assert_eq!(batches[0].num_columns(), 1);
@@ -327,7 +325,6 @@ async fn test_create_table_scan_batches() {
     let default_batch_size = ReadContext::default().batch_size;
     // Insert more than batch size rows to the table.
     let test_batch_size = default_batch_size * 4;
-    let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
     let hosts: VectorRef = Arc::new(StringVector::from(vec!["host1"; test_batch_size]));
     let cpus: VectorRef = Arc::new(Float64Vector::from_vec(vec![55.5; test_batch_size]));
     let memories: VectorRef = Arc::new(Float64Vector::from_vec(vec![1024f64; test_batch_size]));
@@ -335,17 +332,17 @@ async fn test_create_table_scan_batches() {
         (0..test_batch_size).map(|v| v as i64),
     ));
 
-    columns_values.insert("host".to_string(), hosts);
-    columns_values.insert("cpu".to_string(), cpus);
-    columns_values.insert("memory".to_string(), memories);
-    columns_values.insert("ts".to_string(), tss.clone());
+    let columns_values = HashMap::from([
+        ("host".to_string(), hosts),
+        ("cpu".to_string(), cpus),
+        ("memory".to_string(), memories),
+        ("ts".to_string(), tss.clone()),
+    ]);
 
     let insert_req = new_insert_request("demo".to_string(), columns_values);
     assert_eq!(test_batch_size, table.insert(insert_req).await.unwrap());
 
-    let session_ctx = SessionContext::new();
-    let stream = table.scan(None, &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let stream = table.scan_to_stream(ScanRequest::default()).await.unwrap();
     let batches = util::collect(stream).await.unwrap();
     let mut total = 0;
     for batch in batches {
@@ -527,16 +524,6 @@ async fn test_open_table() {
     assert_eq!(reopened.manifest().last_version(), 1);
 }
 
-#[test]
-fn test_region_id() {
-    assert_eq!(1, region_id(0, 1));
-    assert_eq!(4294967296, region_id(1, 0));
-    assert_eq!(4294967297, region_id(1, 1));
-    assert_eq!(4294967396, region_id(1, 100));
-    assert_eq!(8589934602, region_id(2, 10));
-    assert_eq!(18446744069414584330, region_id(u32::MAX, 10));
-}
-
 fn new_add_columns_req(
     table_id: TableId,
     new_tag: &ColumnSchema,
@@ -561,6 +548,7 @@ fn new_add_columns_req(
                 },
             ],
         },
+        table_version: None,
     }
 }
 
@@ -590,6 +578,7 @@ pub(crate) fn new_add_columns_req_with_location(
                 },
             ],
         },
+        table_version: None,
     }
 }
 
@@ -685,6 +674,7 @@ async fn test_alter_table_remove_column() {
         alter_kind: AlterKind::DropColumns {
             names: vec![String::from("memory"), String::from("my_field")],
         },
+        table_version: None,
     };
     let table = table_engine
         .alter_table(&EngineContext::default(), req)
@@ -732,6 +722,7 @@ async fn test_alter_rename_table() {
         alter_kind: AlterKind::RenameTable {
             new_table_name: new_table_name.to_string(),
         },
+        table_version: None,
     };
     let table = table_engine.alter_table(&ctx, req).await.unwrap();
 
@@ -822,7 +813,7 @@ async fn test_drop_table() {
         region_numbers: vec![0],
         engine: MITO_ENGINE.to_string(),
     };
-    table_engine.create_table(&ctx, request).await.unwrap();
+    let _ = table_engine.create_table(&ctx, request).await.unwrap();
     assert!(table_engine.table_exists(&engine_ctx, table_id));
 }
 
@@ -834,31 +825,28 @@ async fn test_table_delete_rows() {
         ..
     } = test_util::setup_test_engine_and_table().await;
 
-    let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(4);
     let hosts: VectorRef = Arc::new(StringVector::from(vec!["host1", "host2", "host3", "host4"]));
     let cpus: VectorRef = Arc::new(Float64Vector::from_vec(vec![1.0, 2.0, 3.0, 4.0]));
     let memories: VectorRef = Arc::new(Float64Vector::from_vec(vec![1.0, 2.0, 3.0, 4.0]));
     let tss: VectorRef = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2, 2, 1]));
-
-    columns_values.insert("host".to_string(), hosts.clone());
-    columns_values.insert("cpu".to_string(), cpus.clone());
-    columns_values.insert("memory".to_string(), memories.clone());
-    columns_values.insert("ts".to_string(), tss.clone());
+    let columns_values = HashMap::from([
+        ("host".to_string(), hosts.clone()),
+        ("cpu".to_string(), cpus.clone()),
+        ("memory".to_string(), memories.clone()),
+        ("ts".to_string(), tss.clone()),
+    ]);
 
     let insert_req = new_insert_request("demo".to_string(), columns_values);
     assert_eq!(4, table.insert(insert_req).await.unwrap());
 
     let del_hosts: VectorRef = Arc::new(StringVector::from(vec!["host1", "host3"]));
     let del_tss: VectorRef = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2]));
-    let mut key_column_values = HashMap::with_capacity(2);
-    key_column_values.insert("host".to_string(), del_hosts);
-    key_column_values.insert("ts".to_string(), del_tss);
+    let key_column_values =
+        HashMap::from([("host".to_string(), del_hosts), ("ts".to_string(), del_tss)]);
     let del_req = DeleteRequest { key_column_values };
-    table.delete(del_req).await.unwrap();
+    let _ = table.delete(del_req).await.unwrap();
 
-    let session_ctx = SessionContext::new();
-    let stream = table.scan(None, &[], None).await.unwrap();
-    let stream = stream.execute(0, session_ctx.task_ctx()).unwrap();
+    let stream = table.scan_to_stream(ScanRequest::default()).await.unwrap();
     let batches = util::collect_batches(stream).await.unwrap();
 
     assert_eq!(

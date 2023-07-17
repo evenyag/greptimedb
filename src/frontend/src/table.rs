@@ -21,8 +21,9 @@ use api::v1::AlterExpr;
 use async_trait::async_trait;
 use catalog::helper::{TableGlobalKey, TableGlobalValue};
 use client::Database;
-use common_error::prelude::BoxedError;
-use common_meta::key::TableRouteKey;
+use common_error::ext::BoxedError;
+use common_meta::key::{TableMetadataManagerRef, TableRouteKey};
+use common_meta::rpc::store::{MoveValueRequest, PutRequest};
 use common_meta::table_name::TableName;
 use common_query::error::Result as QueryResult;
 use common_query::logical_plan::Expr;
@@ -55,7 +56,9 @@ use table::Table;
 use tokio::sync::RwLock;
 
 use crate::catalog::FrontendCatalogManager;
-use crate::error::{self, FindDatanodeSnafu, FindTableRouteSnafu, Result};
+use crate::error::{
+    self, FindDatanodeSnafu, FindTableRouteSnafu, Result, TableMetadataManagerSnafu,
+};
 use crate::instance::distributed::inserter::DistInserter;
 use crate::table::delete::to_grpc_delete_request;
 use crate::table::scan::{DatanodeInstance, TableScanPlan};
@@ -69,6 +72,8 @@ pub struct DistTable {
     table_name: TableName,
     table_info: TableInfoRef,
     catalog_manager: Arc<FrontendCatalogManager>,
+    #[allow(unused)]
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 #[async_trait]
@@ -97,55 +102,6 @@ impl Table for DistTable {
             .map_err(BoxedError::new)
             .context(TableOperationSnafu)?;
         Ok(affected_rows as usize)
-    }
-
-    async fn scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> table::Result<PhysicalPlanRef> {
-        let partition_manager = self.catalog_manager.partition_manager();
-        let datanode_clients = self.catalog_manager.datanode_clients();
-
-        let partition_rule = partition_manager
-            .find_table_partition_rule(&self.table_name)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-
-        let regions = partition_manager
-            .find_regions_by_filters(partition_rule, filters)
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-        let datanodes = partition_manager
-            .find_region_datanodes(&self.table_name, regions)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-
-        let table_name = &self.table_name;
-        let mut partition_execs = Vec::with_capacity(datanodes.len());
-        for (datanode, _regions) in datanodes.iter() {
-            let client = datanode_clients.get_client(datanode).await;
-            let db = Database::new(&table_name.catalog_name, &table_name.schema_name, client);
-            let datanode_instance = DatanodeInstance::new(Arc::new(self.clone()) as _, db);
-
-            partition_execs.push(Arc::new(PartitionExec {
-                table_name: table_name.clone(),
-                datanode_instance,
-                projection: projection.cloned(),
-                filters: filters.to_vec(),
-                limit,
-                batches: Arc::new(RwLock::new(None)),
-            }));
-        }
-
-        let dist_scan = DistTableScan {
-            schema: project_schema(self.schema(), projection),
-            partition_execs,
-        };
-        Ok(Arc::new(dist_scan))
     }
 
     // TODO(ruihang): DistTable should not call this method directly
@@ -288,11 +244,13 @@ impl DistTable {
         table_name: TableName,
         table_info: TableInfoRef,
         catalog_manager: Arc<FrontendCatalogManager>,
+        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             table_name,
             table_info,
             catalog_manager,
+            table_metadata_manager,
         }
     }
 
@@ -305,9 +263,9 @@ impl DistTable {
             .backend()
             .get(key.to_string().as_bytes())
             .await
-            .context(error::CatalogSnafu)?;
+            .context(TableMetadataManagerSnafu)?;
         Ok(if let Some(raw) = raw {
-            Some(TableGlobalValue::from_bytes(raw.1).context(error::CatalogEntrySerdeSnafu)?)
+            Some(TableGlobalValue::from_bytes(raw.value).context(error::CatalogEntrySerdeSnafu)?)
         } else {
             None
         })
@@ -319,19 +277,26 @@ impl DistTable {
         value: TableGlobalValue,
     ) -> Result<()> {
         let value = value.as_bytes().context(error::CatalogEntrySerdeSnafu)?;
-        self.catalog_manager
+        let req = PutRequest::new()
+            .with_key(key.to_string().as_bytes())
+            .with_value(value);
+        let _ = self
+            .catalog_manager
             .backend()
-            .set(key.to_string().as_bytes(), &value)
+            .put(req)
             .await
-            .context(error::CatalogSnafu)
+            .context(TableMetadataManagerSnafu)?;
+        Ok(())
     }
 
     async fn delete_table_global_value(&self, key: TableGlobalKey) -> Result<()> {
-        self.catalog_manager
+        let _ = self
+            .catalog_manager
             .backend()
-            .delete(key.to_string().as_bytes())
+            .delete(key.to_string().as_bytes(), false)
             .await
-            .context(error::CatalogSnafu)
+            .context(TableMetadataManagerSnafu)?;
+        Ok(())
     }
 
     async fn move_table_route_value(
@@ -343,26 +308,27 @@ impl DistTable {
         new_table_name: &str,
     ) -> Result<()> {
         let old_key = TableRouteKey {
-            table_id: table_id.into(),
+            table_id,
             catalog_name,
             schema_name,
             table_name: old_table_name,
         }
-        .key();
+        .to_string();
 
         let new_key = TableRouteKey {
-            table_id: table_id.into(),
+            table_id,
             catalog_name,
             schema_name,
             table_name: new_table_name,
         }
-        .key();
+        .to_string();
 
+        let req = MoveValueRequest::new(old_key.as_bytes(), new_key.as_bytes());
         self.catalog_manager
             .backend()
-            .move_value(old_key.as_bytes(), new_key.as_bytes())
+            .move_value(req)
             .await
-            .context(error::CatalogSnafu)?;
+            .context(TableMetadataManagerSnafu)?;
 
         self.catalog_manager
             .partition_manager()
@@ -383,6 +349,7 @@ impl DistTable {
             table_name,
             alter_kind,
             table_id: _table_id,
+            ..
         } = request;
 
         let alter_expr = context
@@ -669,7 +636,7 @@ pub(crate) mod test {
             vec![
                 RegionRoute {
                     region: Region {
-                        id: 3,
+                        id: 3.into(),
                         name: "r1".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -686,7 +653,7 @@ pub(crate) mod test {
                 },
                 RegionRoute {
                     region: Region {
-                        id: 2,
+                        id: 2.into(),
                         name: "r2".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -703,7 +670,7 @@ pub(crate) mod test {
                 },
                 RegionRoute {
                     region: Region {
-                        id: 1,
+                        id: 1.into(),
                         name: "r3".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -738,7 +705,7 @@ pub(crate) mod test {
             vec![
                 RegionRoute {
                     region: Region {
-                        id: 1,
+                        id: 1.into(),
                         name: "r1".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -758,7 +725,7 @@ pub(crate) mod test {
                 },
                 RegionRoute {
                     region: Region {
-                        id: 2,
+                        id: 2.into(),
                         name: "r2".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -778,7 +745,7 @@ pub(crate) mod test {
                 },
                 RegionRoute {
                     region: Region {
-                        id: 3,
+                        id: 3.into(),
                         name: "r3".to_string(),
                         partition: Some(
                             PartitionDef::new(
@@ -980,7 +947,8 @@ pub(crate) mod test {
 
     impl Collect for MockCollector {
         fn on_write(&self, record: WriteRecord) {
-            self.write_sum
+            let _ = self
+                .write_sum
                 .fetch_add(record.byte_count, Ordering::Relaxed);
         }
 

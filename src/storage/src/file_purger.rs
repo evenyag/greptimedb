@@ -155,7 +155,7 @@ mod tests {
         (
             FileHandle::new(
                 FileMeta {
-                    region_id: 0,
+                    region_id: 0.into(),
                     file_id: sst_file_id,
                     time_range: None,
                     level: 0,
@@ -173,7 +173,7 @@ mod tests {
     async fn test_file_purger_handler() {
         let dir = create_temp_dir("file-purge");
         let mut builder = Fs::default();
-        builder.root(dir.path().to_str().unwrap());
+        let _ = builder.root(dir.path().to_str().unwrap());
         let object_store = ObjectStore::new(builder).unwrap().finish();
 
         let sst_file_id = FileId::random();
@@ -185,7 +185,7 @@ mod tests {
         let (_file, path, layer) =
             create_sst_file(object_store.clone(), sst_file_id, noop_file_purger).await;
         let request = FilePurgeRequest {
-            region_id: 0,
+            region_id: 0.into(),
             file_id: sst_file_id,
             sst_layer: layer,
         };
@@ -210,7 +210,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let dir = create_temp_dir("file-purge");
         let mut builder = Fs::default();
-        builder.root(dir.path().to_str().unwrap());
+        let _ = builder.root(dir.path().to_str().unwrap());
         let object_store = ObjectStore::new(builder).unwrap().finish();
         let sst_file_id = FileId::random();
         let scheduler = Arc::new(LocalScheduler::new(

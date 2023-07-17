@@ -13,10 +13,12 @@
 // limitations under the License.
 
 pub(crate) mod parquet;
+mod pruning;
 mod stream_writer;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -130,7 +132,7 @@ impl LevelMetas {
         // we only update region's compaction time window iff region's window is not set and VersionEdit's
         // compaction time window is present.
         if let Some(window) = compaction_time_window {
-            merged.compaction_time_window.get_or_insert(window);
+            let _ = merged.compaction_time_window.get_or_insert(window);
         }
         merged
     }
@@ -178,7 +180,7 @@ impl LevelMeta {
     }
 
     fn add_file(&mut self, file: FileHandle) {
-        self.files.insert(file.file_id(), file);
+        let _ = self.files.insert(file.file_id(), file);
     }
 
     fn remove_file(&mut self, file_to_remove: FileId) -> Option<FileHandle> {
@@ -225,9 +227,23 @@ fn new_level_meta_vec() -> LevelMetaVec {
         .unwrap() // safety: LevelMetaVec is a fixed length array with length MAX_LEVEL
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FileHandle {
     inner: Arc<FileHandleInner>,
+}
+
+impl Debug for FileHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileHandle")
+            .field("file_id", &self.inner.meta.file_id)
+            .field("region_id", &self.inner.meta.region_id)
+            .field("time_range", &self.inner.meta.time_range)
+            .field("size", &self.inner.meta.file_size)
+            .field("level", &self.inner.meta.level)
+            .field("compacting", &self.inner.compacting)
+            .field("deleted", &self.inner.deleted)
+            .finish()
+    }
 }
 
 impl FileHandle {
@@ -710,7 +726,7 @@ mod tests {
 
     fn create_file_meta(file_id: FileId, level: Level) -> FileMeta {
         FileMeta {
-            region_id: 0,
+            region_id: 0.into(),
             file_id,
             time_range: None,
             level,

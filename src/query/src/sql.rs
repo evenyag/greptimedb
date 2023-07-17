@@ -19,14 +19,14 @@ use std::sync::Arc;
 
 use catalog::CatalogManagerRef;
 use common_catalog::consts::{
-    DEFAULT_CATALOG_NAME, SEMANTIC_TYPE_FIELD, SEMANTIC_TYPE_PRIMARY_KEY, SEMANTIC_TYPE_TIME_INDEX,
+    SEMANTIC_TYPE_FIELD, SEMANTIC_TYPE_PRIMARY_KEY, SEMANTIC_TYPE_TIME_INDEX,
 };
 use common_datasource::file_format::{infer_schemas, FileFormat, Format};
 use common_datasource::lister::{Lister, Source};
 use common_datasource::object_store::build_backend;
 use common_datasource::util::find_dir_and_filename;
 use common_query::Output;
-use common_recordbatch::RecordBatches;
+use common_recordbatch::{RecordBatch, RecordBatches};
 use datatypes::prelude::*;
 use datatypes::schema::{ColumnSchema, RawSchema, Schema};
 use datatypes::vectors::{Helper, StringVector};
@@ -42,6 +42,7 @@ use sql::statements::show::{ShowDatabases, ShowKind, ShowTables};
 use table::requests::{IMMUTABLE_TABLE_LOCATION_KEY, IMMUTABLE_TABLE_PATTERN_KEY};
 use table::TableRef;
 
+use crate::datafusion::execute_show_with_filter;
 use crate::error::{self, Result};
 
 const SCHEMAS_COLUMN: &str = "Schemas";
@@ -95,6 +96,7 @@ static SHOW_CREATE_TABLE_OUTPUT_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 pub async fn show_databases(
     stmt: ShowDatabases,
     catalog_manager: CatalogManagerRef,
+    query_ctx: QueryContextRef,
 ) -> Result<Output> {
     ensure!(
         matches!(stmt.kind, ShowKind::All | ShowKind::Like(_)),
@@ -103,14 +105,11 @@ pub async fn show_databases(
         }
     );
 
-    let catalog = catalog_manager
-        .catalog(DEFAULT_CATALOG_NAME)
+    let mut databases = catalog_manager
+        .schema_names(&query_ctx.current_catalog())
         .await
-        .context(error::CatalogSnafu)?
-        .context(error::CatalogNotFoundSnafu {
-            catalog: DEFAULT_CATALOG_NAME,
-        })?;
-    let mut databases = catalog.schema_names().await.context(error::CatalogSnafu)?;
+        .context(error::CatalogSnafu)?;
+
     // TODO(dennis): Specify the order of the results in catalog manager API
     databases.sort();
 
@@ -135,42 +134,46 @@ pub async fn show_tables(
     catalog_manager: CatalogManagerRef,
     query_ctx: QueryContextRef,
 ) -> Result<Output> {
-    ensure!(
-        matches!(stmt.kind, ShowKind::All | ShowKind::Like(_)),
-        error::UnsupportedExprSnafu {
-            name: stmt.kind.to_string(),
-        }
-    );
-
     let schema = if let Some(database) = stmt.database {
         database
     } else {
         query_ctx.current_schema()
     };
     // TODO(sunng87): move this function into query_ctx
-    let schema = catalog_manager
-        .schema(&query_ctx.current_catalog(), &schema)
+    let mut tables = catalog_manager
+        .table_names(&query_ctx.current_catalog(), &schema)
         .await
-        .context(error::CatalogSnafu)?
-        .context(error::SchemaNotFoundSnafu { schema })?;
-    let mut tables = schema.table_names().await.context(error::CatalogSnafu)?;
+        .context(error::CatalogSnafu)?;
+
     // TODO(dennis): Specify the order of the results in schema provider API
     tables.sort();
-
-    let tables = if let ShowKind::Like(ident) = stmt.kind {
-        Helper::like_utf8(tables, &ident.value).context(error::VectorComputationSnafu)?
-    } else {
-        Arc::new(StringVector::from(tables))
-    };
-
     let schema = Arc::new(Schema::new(vec![ColumnSchema::new(
         TABLES_COLUMN,
         ConcreteDataType::string_datatype(),
         false,
     )]));
-    let records = RecordBatches::try_from_columns(schema, vec![tables])
-        .context(error::CreateRecordBatchSnafu)?;
-    Ok(Output::RecordBatches(records))
+    match stmt.kind {
+        ShowKind::All => {
+            let tables = Arc::new(StringVector::from(tables)) as _;
+            let records = RecordBatches::try_from_columns(schema, vec![tables])
+                .context(error::CreateRecordBatchSnafu)?;
+            Ok(Output::RecordBatches(records))
+        }
+        ShowKind::Where(filter) => {
+            let columns = vec![Arc::new(StringVector::from(tables)) as _];
+            let record_batch =
+                RecordBatch::new(schema, columns).context(error::CreateRecordBatchSnafu)?;
+            let result = execute_show_with_filter(record_batch, Some(filter)).await?;
+            Ok(result)
+        }
+        ShowKind::Like(ident) => {
+            let tables =
+                Helper::like_utf8(tables, &ident.value).context(error::VectorComputationSnafu)?;
+            let records = RecordBatches::try_from_columns(schema, vec![tables])
+                .context(error::CreateRecordBatchSnafu)?;
+            Ok(Output::RecordBatches(records))
+        }
+    }
 }
 
 pub fn show_create_table(table: TableRef, partitions: Option<Partitions>) -> Result<Output> {

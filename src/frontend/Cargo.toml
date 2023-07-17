@@ -50,7 +50,7 @@ openmetrics-parser = "0.4"
 partition = { path = "../partition" }
 prost.workspace = true
 query = { path = "../query" }
-regex = "1.6"
+regex.workspace = true
 script = { path = "../script", features = ["python"], optional = true }
 serde = "1.0"
 serde_json = "1.0"
@@ -63,6 +63,7 @@ store-api = { path = "../store-api" }
 substrait = { path = "../common/substrait" }
 table = { path = "../table" }
 tokio.workspace = true
+toml.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
@@ -72,6 +73,5 @@ datanode = { path = "../datanode" }
 futures = "0.3"
 meta-srv = { path = "../meta-srv", features = ["mock"] }
 strfmt = "0.2"
-toml = "0.5"
 tower = "0.4"
 uuid.workspace = true

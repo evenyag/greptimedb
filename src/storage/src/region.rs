@@ -28,13 +28,17 @@ use common_time::util;
 use metrics::{decrement_gauge, increment_gauge};
 use snafu::ResultExt;
 use store_api::logstore::LogStore;
-use store_api::manifest::{self, Manifest, ManifestVersion, MetaActionIterator};
+use store_api::manifest::{
+    self, Manifest, ManifestLogStorage, ManifestVersion, MetaActionIterator,
+};
 use store_api::storage::{
-    AlterRequest, CloseContext, FlushContext, FlushReason, OpenOptions, ReadContext, Region,
-    RegionId, SequenceNumber, WriteContext, WriteResponse,
+    AlterRequest, CloseContext, CompactContext, CompactionStrategy, FlushContext, FlushReason,
+    OpenOptions, ReadContext, Region, RegionId, SequenceNumber, WriteContext, WriteResponse,
 };
 
-use crate::compaction::CompactionSchedulerRef;
+use crate::compaction::{
+    compaction_strategy_to_picker, CompactionPickerRef, CompactionSchedulerRef,
+};
 use crate::config::EngineConfig;
 use crate::error::{self, Error, Result};
 use crate::file_purger::FilePurgerRef;
@@ -47,7 +51,9 @@ use crate::memtable::MemtableBuilderRef;
 use crate::metadata::{RegionMetaImpl, RegionMetadata, RegionMetadataRef};
 pub(crate) use crate::region::writer::schedule_compaction;
 use crate::region::writer::DropContext;
-pub use crate::region::writer::{AlterContext, RegionWriter, RegionWriterRef, WriterContext};
+pub use crate::region::writer::{
+    AlterContext, RegionWriter, RegionWriterRef, WriterCompactRequest, WriterContext,
+};
 use crate::schema::compat::CompatWrite;
 use crate::snapshot::SnapshotImpl;
 use crate::sst::AccessLayerRef;
@@ -127,6 +133,7 @@ impl<S: LogStore> Region for RegionImpl<S> {
     }
 
     async fn drop_region(&self) -> Result<()> {
+        decrement_gauge!(crate::metrics::REGION_COUNT, 1.0);
         self.inner.drop_region().await
     }
 
@@ -142,6 +149,10 @@ impl<S: LogStore> Region for RegionImpl<S> {
 
     async fn flush(&self, ctx: &FlushContext) -> Result<()> {
         self.inner.flush(ctx).await
+    }
+
+    async fn compact(&self, ctx: &CompactContext) -> std::result::Result<(), Self::Error> {
+        self.inner.compact(ctx).await
     }
 }
 
@@ -161,27 +172,11 @@ pub struct StoreConfig<S: LogStore> {
     pub file_purger: FilePurgerRef,
     pub ttl: Option<Duration>,
     pub write_buffer_size: usize,
+    pub compaction_strategy: CompactionStrategy,
 }
 
 pub type RecoveredMetadata = (SequenceNumber, (ManifestVersion, RawRegionMetadata));
 pub type RecoveredMetadataMap = BTreeMap<SequenceNumber, (ManifestVersion, RawRegionMetadata)>;
-
-#[derive(Debug)]
-pub struct CompactContext {
-    /// Whether to wait the compaction result.
-    pub wait: bool,
-    /// Max file number in level 0.
-    pub max_files_in_l0: usize,
-}
-
-impl Default for CompactContext {
-    fn default() -> CompactContext {
-        CompactContext {
-            wait: true,
-            max_files_in_l0: 1,
-        }
-    }
-}
 
 impl<S: LogStore> RegionImpl<S> {
     /// Create a new region and also persist the region metadata to manifest.
@@ -232,6 +227,7 @@ impl<S: LogStore> RegionImpl<S> {
         let version_control = VersionControl::with_version(version);
         let wal = Wal::new(id, store_config.log_store);
 
+        let compaction_picker = compaction_strategy_to_picker(&store_config.compaction_strategy);
         let inner = Arc::new(RegionInner {
             shared: Arc::new(SharedData {
                 id,
@@ -244,11 +240,14 @@ impl<S: LogStore> RegionImpl<S> {
                 store_config.engine_config.clone(),
                 store_config.ttl,
                 store_config.write_buffer_size,
+                store_config.compaction_scheduler.clone(),
+                compaction_picker.clone(),
             )),
             wal,
             flush_strategy: store_config.flush_strategy,
             flush_scheduler: store_config.flush_scheduler,
             compaction_scheduler: store_config.compaction_scheduler,
+            compaction_picker,
             sst_layer: store_config.sst_layer,
             manifest: store_config.manifest,
         });
@@ -327,12 +326,16 @@ impl<S: LogStore> RegionImpl<S> {
             last_flush_millis: AtomicI64::new(0),
         });
 
+        let compaction_picker = compaction_strategy_to_picker(&store_config.compaction_strategy);
         let writer = Arc::new(RegionWriter::new(
             store_config.memtable_builder,
             store_config.engine_config.clone(),
             store_config.ttl,
             store_config.write_buffer_size,
+            store_config.compaction_scheduler.clone(),
+            compaction_picker.clone(),
         ));
+
         let writer_ctx = WriterContext {
             shared: &shared,
             flush_strategy: &store_config.flush_strategy,
@@ -342,6 +345,7 @@ impl<S: LogStore> RegionImpl<S> {
             wal: &wal,
             writer: &writer,
             manifest: &store_config.manifest,
+            compaction_picker: compaction_picker.clone(),
         };
         // Replay all unflushed data.
         writer
@@ -361,6 +365,7 @@ impl<S: LogStore> RegionImpl<S> {
             flush_strategy: store_config.flush_strategy,
             flush_scheduler: store_config.flush_scheduler,
             compaction_scheduler: store_config.compaction_scheduler,
+            compaction_picker,
             sst_layer: store_config.sst_layer,
             manifest: store_config.manifest,
         });
@@ -477,9 +482,25 @@ impl<S: LogStore> RegionImpl<S> {
                         }
                     }
                     (RegionMetaAction::Change(c), Some(v)) => {
-                        recovered_metadata
+                        let _ = recovered_metadata
                             .insert(c.committed_sequence, (manifest_version, c.metadata));
                         version = Some(v);
+                    }
+                    (RegionMetaAction::Remove(r), Some(v)) => {
+                        manifest.stop().await?;
+
+                        let files = v.ssts().mark_all_files_deleted();
+                        logging::info!(
+                            "Try to remove all SSTs, region: {}, files: {:?}",
+                            r.region_id,
+                            files
+                        );
+
+                        manifest
+                            .manifest_store()
+                            .delete_all(v.manifest_version())
+                            .await?;
+                        return Ok((None, recovered_metadata));
                     }
                     (action, None) => {
                         actions.push((manifest_version, action));
@@ -528,7 +549,7 @@ impl<S: LogStore> RegionImpl<S> {
     }
 
     /// Compact the region manually.
-    pub async fn compact(&self, ctx: CompactContext) -> Result<()> {
+    pub async fn compact(&self, ctx: &CompactContext) -> Result<()> {
         self.inner.compact(ctx).await
     }
 
@@ -567,6 +588,7 @@ impl<S: LogStore> RegionImpl<S> {
             wal: &inner.wal,
             writer: &inner.writer,
             manifest: &inner.manifest,
+            compaction_picker: inner.compaction_picker.clone(),
         };
 
         inner.writer.replay(recovered_metadata, writer_ctx).await
@@ -618,11 +640,12 @@ pub type SharedDataRef = Arc<SharedData>;
 
 struct RegionInner<S: LogStore> {
     shared: SharedDataRef,
-    writer: RegionWriterRef,
+    writer: RegionWriterRef<S>,
     wal: Wal<S>,
     flush_strategy: FlushStrategyRef,
     flush_scheduler: FlushSchedulerRef<S>,
     compaction_scheduler: CompactionSchedulerRef<S>,
+    compaction_picker: CompactionPickerRef<S>,
     sst_layer: AccessLayerRef,
     manifest: RegionManifest,
 }
@@ -666,6 +689,7 @@ impl<S: LogStore> RegionInner<S> {
             wal: &self.wal,
             writer: &self.writer,
             manifest: &self.manifest,
+            compaction_picker: self.compaction_picker.clone(),
         };
         // The writer would also try to compat the schema of write batch if it finds out the
         // schema version of request is less than current schema version.
@@ -727,22 +751,22 @@ impl<S: LogStore> RegionInner<S> {
             wal: &self.wal,
             writer: &self.writer,
             manifest: &self.manifest,
+            compaction_picker: self.compaction_picker.clone(),
         };
         self.writer.flush(writer_ctx, ctx).await
     }
 
     /// Compact the region manually.
-    async fn compact(&self, ctx: CompactContext) -> Result<()> {
-        let writer_ctx = WriterContext {
-            shared: &self.shared,
-            flush_strategy: &self.flush_strategy,
-            flush_scheduler: &self.flush_scheduler,
-            compaction_scheduler: &self.compaction_scheduler,
-            sst_layer: &self.sst_layer,
-            wal: &self.wal,
-            writer: &self.writer,
-            manifest: &self.manifest,
-        };
-        self.writer.compact(writer_ctx, ctx).await
+    async fn compact(&self, compact_ctx: &CompactContext) -> Result<()> {
+        self.writer
+            .compact(WriterCompactRequest {
+                shared_data: self.shared.clone(),
+                sst_layer: self.sst_layer.clone(),
+                manifest: self.manifest.clone(),
+                wal: self.wal.clone(),
+                region_writer: self.writer.clone(),
+                compact_ctx: *compact_ctx,
+            })
+            .await
     }
 }

@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
 use serde_json::error::Error as JsonError;
-use snafu::Location;
+use snafu::{Location, Snafu};
+use store_api::storage::RegionNumber;
+use table::metadata::TableId;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -55,6 +58,40 @@ pub enum Error {
 
     #[snafu(display("Invalid protobuf message, err: {}", err_msg))]
     InvalidProtoMsg { err_msg: String, location: Location },
+
+    #[snafu(display("Concurrent modify regions placement: {err_msg}"))]
+    ConcurrentModifyRegionsPlacement { err_msg: String, location: Location },
+
+    #[snafu(display("Invalid table metadata, err: {}", err_msg))]
+    InvalidTableMetadata { err_msg: String, location: Location },
+
+    #[snafu(display("Failed to get kv cache, err: {}", err_msg))]
+    GetKvCache { err_msg: String },
+
+    #[snafu(display("Get null from cache, key: {}", key))]
+    CacheNotGet { key: String, location: Location },
+
+    #[snafu(display("{source}"))]
+    MetaSrv {
+        source: BoxedError,
+        location: Location,
+    },
+
+    #[snafu(display("Etcd txn error: {err_msg}"))]
+    EtcdTxnOpResponse { err_msg: String, location: Location },
+
+    #[snafu(display(
+        "Failed to move region {} in table {}, err: {}",
+        region,
+        table_id,
+        err_msg
+    ))]
+    MoveRegion {
+        table_id: TableId,
+        region: RegionNumber,
+        err_msg: String,
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -63,17 +100,24 @@ impl ErrorExt for Error {
     fn status_code(&self) -> StatusCode {
         use Error::*;
         match self {
-            IllegalServerState { .. } => StatusCode::Internal,
+            IllegalServerState { .. } | EtcdTxnOpResponse { .. } => StatusCode::Internal,
 
-            SerdeJson { .. } | RouteInfoCorrupted { .. } | InvalidProtoMsg { .. } => {
-                StatusCode::Unexpected
-            }
+            SerdeJson { .. }
+            | RouteInfoCorrupted { .. }
+            | InvalidProtoMsg { .. }
+            | InvalidTableMetadata { .. }
+            | MoveRegion { .. } => StatusCode::Unexpected,
 
-            SendMessage { .. } => StatusCode::Internal,
+            SendMessage { .. }
+            | GetKvCache { .. }
+            | CacheNotGet { .. }
+            | ConcurrentModifyRegionsPlacement { .. } => StatusCode::Internal,
 
             EncodeJson { .. } | DecodeJson { .. } | PayloadNotExist { .. } => {
                 StatusCode::Unexpected
             }
+
+            MetaSrv { source, .. } => source.status_code(),
         }
     }
 

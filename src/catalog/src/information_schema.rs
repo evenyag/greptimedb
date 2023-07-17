@@ -16,63 +16,51 @@ mod columns;
 mod tables;
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use common_error::prelude::BoxedError;
-use common_query::physical_plan::PhysicalPlanRef;
-use common_query::prelude::Expr;
+use common_error::ext::BoxedError;
 use common_recordbatch::{RecordBatchStreamAdaptor, SendableRecordBatchStream};
 use datatypes::schema::SchemaRef;
 use futures_util::StreamExt;
 use snafu::ResultExt;
 use store_api::storage::ScanRequest;
 use table::error::{SchemaConversionSnafu, TablesRecordBatchSnafu};
+use table::metadata::TableType;
 use table::{Result as TableResult, Table, TableRef};
 
 use self::columns::InformationSchemaColumns;
 use crate::error::Result;
 use crate::information_schema::tables::InformationSchemaTables;
-use crate::{CatalogProviderRef, SchemaProvider};
+use crate::CatalogManager;
 
 const TABLES: &str = "tables";
 const COLUMNS: &str = "columns";
 
-pub(crate) struct InformationSchemaProvider {
+pub struct InformationSchemaProvider {
     catalog_name: String,
-    catalog_provider: CatalogProviderRef,
-    tables: Vec<String>,
+    catalog_manager: Weak<dyn CatalogManager>,
 }
 
 impl InformationSchemaProvider {
-    pub(crate) fn new(catalog_name: String, catalog_provider: CatalogProviderRef) -> Self {
+    pub fn new(catalog_name: String, catalog_manager: Weak<dyn CatalogManager>) -> Self {
         Self {
             catalog_name,
-            catalog_provider,
-            tables: vec![TABLES.to_string(), COLUMNS.to_string()],
+            catalog_manager,
         }
     }
 }
 
-#[async_trait]
-impl SchemaProvider for InformationSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn table_names(&self) -> Result<Vec<String>> {
-        Ok(self.tables.clone())
-    }
-
-    async fn table(&self, name: &str) -> Result<Option<TableRef>> {
+impl InformationSchemaProvider {
+    pub fn table(&self, name: &str) -> Result<Option<TableRef>> {
         let stream_builder = match name.to_ascii_lowercase().as_ref() {
             TABLES => Arc::new(InformationSchemaTables::new(
                 self.catalog_name.clone(),
-                self.catalog_provider.clone(),
+                self.catalog_manager.clone(),
             )) as _,
             COLUMNS => Arc::new(InformationSchemaColumns::new(
                 self.catalog_name.clone(),
-                self.catalog_provider.clone(),
+                self.catalog_manager.clone(),
             )) as _,
             _ => {
                 return Ok(None);
@@ -80,11 +68,6 @@ impl SchemaProvider for InformationSchemaProvider {
         };
 
         Ok(Some(Arc::new(InformationTable::new(stream_builder))))
-    }
-
-    async fn table_exist(&self, name: &str) -> Result<bool> {
-        let normalized_name = name.to_ascii_lowercase();
-        Ok(self.tables.contains(&normalized_name))
     }
 }
 
@@ -120,18 +103,8 @@ impl Table for InformationTable {
         unreachable!("Should not call table_info() of InformationTable directly")
     }
 
-    /// Scan the table and returns a SendableRecordBatchStream.
-    async fn scan(
-        &self,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        // limit can be used to reduce the amount scanned
-        // from the datasource as a performance optimization.
-        // If set, it contains the amount of rows needed by the `LogicalPlan`,
-        // The datasource should return *at least* this number of rows if available.
-        _limit: Option<usize>,
-    ) -> TableResult<PhysicalPlanRef> {
-        unimplemented!()
+    fn table_type(&self) -> table::metadata::TableType {
+        TableType::View
     }
 
     async fn scan_to_stream(&self, request: ScanRequest) -> TableResult<SendableRecordBatchStream> {

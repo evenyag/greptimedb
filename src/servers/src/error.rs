@@ -20,12 +20,14 @@ use axum::response::{IntoResponse, Response};
 use axum::{http, Json};
 use base64::DecodeError;
 use catalog;
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
+use common_error::{INNER_ERROR_CODE, INNER_ERROR_MSG};
 use common_telemetry::logging;
 use datatypes::prelude::ConcreteDataType;
 use query::parser::PromQuery;
 use serde_json::json;
-use snafu::Location;
+use snafu::{ErrorCompat, Location, Snafu};
 use tonic::codegen::http::{HeaderMap, HeaderValue};
 use tonic::metadata::MetadataMap;
 use tonic::Code;
@@ -432,7 +434,7 @@ fn status_to_tonic_code(status_code: StatusCode) -> Code {
         | StatusCode::DatabaseNotFound
         | StatusCode::UserNotFound => Code::NotFound,
         StatusCode::StorageUnavailable => Code::Unavailable,
-        StatusCode::RuntimeResourcesExhausted => Code::ResourceExhausted,
+        StatusCode::RuntimeResourcesExhausted | StatusCode::RateLimited => Code::ResourceExhausted,
         StatusCode::UnsupportedPasswordType
         | StatusCode::UserPasswordMismatch
         | StatusCode::AuthHeaderNotFound
@@ -449,11 +451,11 @@ impl From<Error> for tonic::Status {
         // (which is a very rare case), just ignore. Client will use Tonic status code and message.
         let status_code = err.status_code();
         if let Ok(code) = HeaderValue::from_bytes(status_code.to_string().as_bytes()) {
-            headers.insert(INNER_ERROR_CODE, code);
+            let _ = headers.insert(INNER_ERROR_CODE, code);
         }
         let root_error = err.iter_chain().last().unwrap();
         if let Ok(err_msg) = HeaderValue::from_bytes(root_error.to_string().as_bytes()) {
-            headers.insert(INNER_ERROR_MSG, err_msg);
+            let _ = headers.insert(INNER_ERROR_MSG, err_msg);
         }
 
         let metadata = MetadataMap::from_headers(headers);

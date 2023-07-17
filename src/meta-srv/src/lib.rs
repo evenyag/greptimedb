@@ -14,9 +14,11 @@
 
 #![feature(async_closure)]
 #![feature(btree_drain_filter)]
+#![feature(result_flattening)]
 
 pub mod bootstrap;
 pub mod cluster;
+pub mod ddl;
 pub mod election;
 pub mod error;
 mod failure_detector;
@@ -35,9 +37,7 @@ mod sequence;
 pub mod service;
 pub mod table_routes;
 
+pub use crate::error::Result;
+
 #[cfg(test)]
 mod test_util;
-
-pub mod util;
-
-pub use crate::error::Result;

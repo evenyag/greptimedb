@@ -29,7 +29,7 @@ use store_api::storage::RegionNumber;
 use crate::engine::TableReference;
 use crate::error;
 use crate::error::ParseTableOptionSnafu;
-use crate::metadata::TableId;
+use crate::metadata::{TableId, TableVersion};
 
 pub const IMMUTABLE_TABLE_META_KEY: &str = "__private.immutable_table_meta";
 pub const IMMUTABLE_TABLE_LOCATION_KEY: &str = "location";
@@ -128,14 +128,14 @@ impl From<&TableOptions> for HashMap<String, String> {
     fn from(opts: &TableOptions) -> Self {
         let mut res = HashMap::with_capacity(2 + opts.extra_options.len());
         if let Some(write_buffer_size) = opts.write_buffer_size {
-            res.insert(
+            let _ = res.insert(
                 WRITE_BUFFER_SIZE_KEY.to_string(),
                 write_buffer_size.to_string(),
             );
         }
         if let Some(ttl) = opts.ttl {
             let ttl_str = humantime::format_duration(ttl).to_string();
-            res.insert(TTL_KEY.to_string(), ttl_str);
+            let _ = res.insert(TTL_KEY.to_string(), ttl_str);
         }
         res.extend(
             opts.extra_options
@@ -164,6 +164,8 @@ pub struct AlterTableRequest {
     pub table_name: String,
     pub table_id: TableId,
     pub alter_kind: AlterKind,
+    // None in standalone.
+    pub table_version: Option<TableVersion>,
 }
 
 impl AlterTableRequest {
@@ -282,6 +284,16 @@ pub struct FlushTableRequest {
     pub table_name: Option<String>,
     pub region_number: Option<RegionNumber>,
     /// Wait until the flush is done.
+    pub wait: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompactTableRequest {
+    pub catalog_name: String,
+    pub schema_name: String,
+    pub table_name: Option<String>,
+    pub region_number: Option<RegionNumber>,
+    /// Wait until the compaction is done.
     pub wait: Option<bool>,
 }
 

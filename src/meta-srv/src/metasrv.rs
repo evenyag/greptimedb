@@ -19,6 +19,9 @@ use std::sync::Arc;
 
 use api::v1::meta::Peer;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_grpc::channel_manager;
+use common_meta::key::TableMetadataManagerRef;
+use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging::LoggingOptions;
 use common_telemetry::{error, info, warn};
@@ -27,7 +30,8 @@ use servers::http::HttpOptions;
 use snafu::ResultExt;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::cluster::MetaPeerClient;
+use crate::cluster::MetaPeerClientRef;
+use crate::ddl::DdlManagerRef;
 use crate::election::{Election, LeaderChangeMessage};
 use crate::error::{RecoverProcedureSnafu, Result};
 use crate::handler::HeartbeatHandlerGroup;
@@ -37,7 +41,6 @@ use crate::selector::{Selector, SelectorType};
 use crate::sequence::SequenceRef;
 use crate::service::mailbox::MailboxRef;
 use crate::service::store::kv::{KvStoreRef, ResettableKvStoreRef};
-
 pub const TABLE_ID_SEQ: &str = "table_id";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,8 @@ pub struct MetaSrvOptions {
     pub disable_region_failover: bool,
     pub http_opts: HttpOptions,
     pub logging: LoggingOptions,
+    pub procedure: ProcedureConfig,
+    pub datanode: DatanodeOptions,
 }
 
 impl Default for MetaSrvOptions {
@@ -66,6 +71,38 @@ impl Default for MetaSrvOptions {
             disable_region_failover: false,
             http_opts: HttpOptions::default(),
             logging: LoggingOptions::default(),
+            procedure: ProcedureConfig::default(),
+            datanode: DatanodeOptions::default(),
+        }
+    }
+}
+
+impl MetaSrvOptions {
+    pub fn to_toml_string(&self) -> String {
+        toml::to_string(&self).unwrap()
+    }
+}
+
+// Options for datanode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DatanodeOptions {
+    client_options: DatanodeClientOptions,
+}
+
+// Options for datanode client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatanodeClientOptions {
+    pub timeout_millis: u64,
+    pub connect_timeout_millis: u64,
+    pub tcp_nodelay: bool,
+}
+
+impl Default for DatanodeClientOptions {
+    fn default() -> Self {
+        Self {
+            timeout_millis: channel_manager::DEFAULT_GRPC_REQUEST_TIMEOUT_SECS * 1000,
+            connect_timeout_millis: channel_manager::DEFAULT_GRPC_CONNECT_TIMEOUT_SECS * 1000,
+            tcp_nodelay: true,
         }
     }
 }
@@ -75,10 +112,13 @@ pub struct Context {
     pub server_addr: String,
     pub in_memory: ResettableKvStoreRef,
     pub kv_store: KvStoreRef,
+    pub leader_cached_kv_store: ResettableKvStoreRef,
+    pub meta_peer_client: MetaPeerClientRef,
     pub mailbox: MailboxRef,
     pub election: Option<ElectionRef>,
     pub skip_all: Arc<AtomicBool>,
     pub is_infancy: bool,
+    pub table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl Context {
@@ -93,6 +133,10 @@ impl Context {
     pub fn reset_in_memory(&self) {
         self.in_memory.reset();
     }
+
+    pub fn reset_leader_cached_kv_store(&self) {
+        self.leader_cached_kv_store.reset();
+    }
 }
 
 pub struct LeaderValue(pub String);
@@ -102,6 +146,7 @@ pub struct SelectorContext {
     pub datanode_lease_secs: i64,
     pub server_addr: String,
     pub kv_store: KvStoreRef,
+    pub meta_peer_client: MetaPeerClientRef,
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub table: Option<String>,
@@ -118,15 +163,18 @@ pub struct MetaSrv {
     // store some data that will not be persisted.
     in_memory: ResettableKvStoreRef,
     kv_store: KvStoreRef,
+    leader_cached_kv_store: ResettableKvStoreRef,
     table_id_sequence: SequenceRef,
+    meta_peer_client: MetaPeerClientRef,
     selector: SelectorRef,
     handler_group: HeartbeatHandlerGroup,
     election: Option<ElectionRef>,
-    meta_peer_client: Option<MetaPeerClient>,
     lock: DistLockRef,
     procedure_manager: ProcedureManagerRef,
     metadata_service: MetadataServiceRef,
     mailbox: MailboxRef,
+    ddl_manager: DdlManagerRef,
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl MetaSrv {
@@ -144,20 +192,30 @@ impl MetaSrv {
 
         if let Some(election) = self.election() {
             let procedure_manager = self.procedure_manager.clone();
+            let in_memory = self.in_memory.clone();
+            let leader_cached_kv_store = self.leader_cached_kv_store.clone();
             let mut rx = election.subscribe_leader_change();
-            common_runtime::spawn_bg(async move {
+            let _handle = common_runtime::spawn_bg(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(msg) => match msg {
-                            LeaderChangeMessage::Elected(_) => {
-                                if let Err(e) = procedure_manager.recover().await {
-                                    error!("Failed to recover procedures, error: {e}");
+                        Ok(msg) => {
+                            in_memory.reset();
+                            leader_cached_kv_store.reset();
+                            info!(
+                                "Leader's cache has bean cleared on leader change: {:?}",
+                                msg
+                            );
+                            match msg {
+                                LeaderChangeMessage::Elected(_) => {
+                                    if let Err(e) = procedure_manager.recover().await {
+                                        error!("Failed to recover procedures, error: {e}");
+                                    }
+                                }
+                                LeaderChangeMessage::StepDown(leader) => {
+                                    error!("Leader :{:?} step down", leader);
                                 }
                             }
-                            LeaderChangeMessage::StepDown(leader) => {
-                                error!("Leader :{:?} step down", leader);
-                            }
-                        },
+                        }
                         Err(RecvError::Closed) => {
                             error!("Not expected, is leader election loop still running?");
                             break;
@@ -171,7 +229,7 @@ impl MetaSrv {
 
             let election = election.clone();
             let started = self.started.clone();
-            common_runtime::spawn_bg(async move {
+            let _handle = common_runtime::spawn_bg(async move {
                 while started.load(Ordering::Relaxed) {
                     let res = election.campaign().await;
                     if let Err(e) = res {
@@ -207,71 +265,79 @@ impl MetaSrv {
         &self.options
     }
 
-    #[inline]
-    pub fn in_memory(&self) -> ResettableKvStoreRef {
-        self.in_memory.clone()
+    pub fn in_memory(&self) -> &ResettableKvStoreRef {
+        &self.in_memory
     }
 
-    #[inline]
-    pub fn kv_store(&self) -> KvStoreRef {
-        self.kv_store.clone()
+    pub fn kv_store(&self) -> &KvStoreRef {
+        &self.kv_store
     }
 
-    #[inline]
-    pub fn table_id_sequence(&self) -> SequenceRef {
-        self.table_id_sequence.clone()
+    pub fn leader_cached_kv_store(&self) -> &ResettableKvStoreRef {
+        &self.leader_cached_kv_store
     }
 
-    #[inline]
-    pub fn selector(&self) -> SelectorRef {
-        self.selector.clone()
+    pub fn meta_peer_client(&self) -> &MetaPeerClientRef {
+        &self.meta_peer_client
     }
 
-    #[inline]
-    pub fn handler_group(&self) -> HeartbeatHandlerGroup {
-        self.handler_group.clone()
+    pub fn table_id_sequence(&self) -> &SequenceRef {
+        &self.table_id_sequence
     }
 
-    #[inline]
-    pub fn election(&self) -> Option<ElectionRef> {
-        self.election.clone()
+    pub fn selector(&self) -> &SelectorRef {
+        &self.selector
     }
 
-    #[inline]
-    pub fn meta_peer_client(&self) -> Option<MetaPeerClient> {
-        self.meta_peer_client.clone()
+    pub fn handler_group(&self) -> &HeartbeatHandlerGroup {
+        &self.handler_group
     }
 
-    #[inline]
+    pub fn election(&self) -> Option<&ElectionRef> {
+        self.election.as_ref()
+    }
+
     pub fn lock(&self) -> &DistLockRef {
         &self.lock
     }
 
-    #[inline]
-    pub fn mailbox(&self) -> MailboxRef {
-        self.mailbox.clone()
+    pub fn mailbox(&self) -> &MailboxRef {
+        &self.mailbox
+    }
+
+    pub fn ddl_manager(&self) -> &DdlManagerRef {
+        &self.ddl_manager
     }
 
     pub fn procedure_manager(&self) -> &ProcedureManagerRef {
         &self.procedure_manager
     }
 
+    pub fn table_metadata_manager(&self) -> &TableMetadataManagerRef {
+        &self.table_metadata_manager
+    }
+
     #[inline]
     pub fn new_ctx(&self) -> Context {
         let server_addr = self.options().server_addr.clone();
-        let in_memory = self.in_memory();
-        let kv_store = self.kv_store();
-        let mailbox = self.mailbox();
-        let election = self.election();
+        let in_memory = self.in_memory.clone();
+        let kv_store = self.kv_store.clone();
+        let leader_cached_kv_store = self.leader_cached_kv_store.clone();
+        let meta_peer_client = self.meta_peer_client.clone();
+        let mailbox = self.mailbox.clone();
+        let election = self.election.clone();
         let skip_all = Arc::new(AtomicBool::new(false));
         Context {
             server_addr,
             in_memory,
             kv_store,
+            leader_cached_kv_store,
+            meta_peer_client,
             mailbox,
             election,
             skip_all,
             is_infancy: false,
+            table_metadata_manager: self.table_metadata_manager.clone(),
         }
     }
 }

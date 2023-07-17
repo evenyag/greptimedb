@@ -9,6 +9,9 @@ enable_memory_catalog = false
 addr = "127.0.0.1:4000"
 # HTTP request timeout, 30s by default.
 timeout = "30s"
+# HTTP request body limit, 64Mb by default.
+# the following units are supported: B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, PiB
+body_limit = "64MB"
 
 # gRPC server options.
 [grpc_options]
@@ -66,13 +69,13 @@ runtime_size = 2
 # Whether to enable InfluxDB protocol in HTTP API, true by default.
 enable = true
 
-# Prometheus protocol options.
-[prometheus_options]
+# Prometheus remote storage options
+[prom_store_options]
 # Whether to enable Prometheus remote write and read in HTTP API, true by default.
 enable = true
 
-# Prom protocol options.
-[prom_options]
+# Prometheus protocol options
+[prometheus_options]
 # Prometheus API server address, "127.0.0.1:4004" by default.
 addr = "127.0.0.1:4004"
 

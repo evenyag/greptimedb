@@ -15,7 +15,7 @@
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use common_error::prelude::BoxedError;
+use common_error::ext::BoxedError;
 use common_query::Output;
 use common_telemetry::logging::info;
 use common_telemetry::timer;
@@ -41,9 +41,12 @@ impl Instance {
     async fn do_execute_sql(&self, stmt: Statement, query_ctx: QueryContextRef) -> Result<Output> {
         match stmt {
             Statement::Insert(insert) => {
-                let request =
-                    SqlHandler::insert_to_request(self.catalog_manager.clone(), *insert, query_ctx)
-                        .await?;
+                let request = SqlHandler::insert_to_request(
+                    self.catalog_manager.clone(),
+                    &insert,
+                    query_ctx.clone(),
+                )
+                .await?;
                 self.sql_handler.insert(request).await
             }
             Statement::CreateDatabase(create_database) => {

@@ -81,7 +81,7 @@ impl Server for MockGrpcServer {
 
         let service = self.create_service();
         // Would block to serve requests.
-        tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
                 .serve_with_incoming(TcpListenerStream::new(listener))
@@ -121,16 +121,17 @@ fn create_grpc_server(table: MemTable) -> Result<Arc<dyn Server>> {
 async fn test_grpc_server_startup() {
     let server = create_grpc_server(MemTable::default_numbers_table()).unwrap();
     let re = server.start(LOCALHOST_WITH_0.parse().unwrap()).await;
-    assert!(re.is_ok());
+    let _ = re.unwrap();
 }
 
 #[tokio::test]
 async fn test_grpc_query() {
     let server = create_grpc_server(MemTable::default_numbers_table()).unwrap();
-    let re = server.start(LOCALHOST_WITH_0.parse().unwrap()).await;
-    assert!(re.is_ok());
-
-    let grpc_client = Client::with_urls(vec![re.unwrap().to_string()]);
+    let re = server
+        .start(LOCALHOST_WITH_0.parse().unwrap())
+        .await
+        .unwrap();
+    let grpc_client = Client::with_urls(vec![re.to_string()]);
     let mut db = Database::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, grpc_client);
 
     let re = db.sql("select * from numbers").await;
@@ -142,5 +143,5 @@ async fn test_grpc_query() {
         password: greptime.clone(),
     }));
     let re = db.sql("select * from numbers").await;
-    assert!(re.is_ok());
+    let _ = re.unwrap();
 }

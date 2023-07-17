@@ -308,7 +308,7 @@ pub type ProcedureManagerRef = Arc<dyn ProcedureManager>;
 #[cfg(test)]
 mod tests {
     use common_error::mock::MockError;
-    use common_error::prelude::StatusCode;
+    use common_error::status_code::StatusCode;
 
     use super::*;
 
@@ -388,6 +388,6 @@ mod tests {
             StatusCode::Unexpected,
         ))));
         assert!(state.is_failed());
-        assert!(state.error().is_some());
+        let _ = state.error().unwrap();
     }
 }

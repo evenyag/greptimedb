@@ -1,10 +1,15 @@
 # Node running mode, see `standalone.example.toml`.
 mode = "distributed"
+# Interval for sending heartbeat task to the Metasrv in milliseconds, 5000 by default.
+heartbeat_interval_millis = 5000
+# Interval for retry sending heartbeat task in milliseconds, 5000 by default.
+retry_interval_millis = 5000
 
 # HTTP server options, see `standalone.example.toml`.
 [http_options]
 addr = "127.0.0.1:4000"
 timeout = "30s"
+body_limit = "64MB"
 
 # gRPC server options, see `standalone.example.toml`.
 [grpc_options]
@@ -42,18 +47,20 @@ runtime_size = 2
 [influxdb_options]
 enable = true
 
-# Prometheus protocol options, see `standalone.example.toml`.
-[prometheus_options]
+# Prometheus remote storage options, see `standalone.example.toml`.
+[prom_store_options]
 enable = true
 
 # Prometheus protocol options, see `standalone.example.toml`.
-[prom_options]
+[prometheus_options]
 addr = "127.0.0.1:4004"
 
 # Metasrv client options, see `datanode.example.toml`.
 [meta_client_options]
 metasrv_addrs = ["127.0.0.1:3002"]
 timeout_millis = 3000
+# DDL timeouts options.
+ddl_timeout_millis = 10000
 connect_timeout_millis = 5000
 tcp_nodelay = true
 

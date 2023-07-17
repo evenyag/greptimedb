@@ -332,7 +332,7 @@ impl Runner {
         // Add the id of the subprocedure to the metadata.
         self.meta.push_child(procedure_id);
 
-        common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_bg(async move {
             // Run the root procedure.
             runner.run().await
         });
@@ -455,7 +455,7 @@ mod tests {
     use async_trait::async_trait;
     use common_error::ext::PlainError;
     use common_error::mock::MockError;
-    use common_error::prelude::StatusCode;
+    use common_error::status_code::StatusCode;
     use common_test_util::temp_dir::create_temp_dir;
     use futures_util::future::BoxFuture;
     use futures_util::{FutureExt, TryStreamExt};

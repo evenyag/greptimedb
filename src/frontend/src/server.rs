@@ -28,7 +28,7 @@ use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
 use servers::opentsdb::OpentsdbServer;
 use servers::postgres::PostgresServer;
-use servers::prom::PromServer;
+use servers::prometheus::PrometheusServer;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerAdaptor;
 use servers::query_handler::sql::ServerSqlQueryHandlerAdaptor;
 use servers::server::Server;
@@ -38,7 +38,7 @@ use crate::error::Error::StartServer;
 use crate::error::{self, Result};
 use crate::frontend::FrontendOptions;
 use crate::instance::FrontendInstance;
-use crate::service_config::{InfluxdbOptions, PrometheusOptions};
+use crate::service_config::{InfluxdbOptions, PromStoreOptions};
 
 pub(crate) struct Services;
 
@@ -153,43 +153,44 @@ impl Services {
             let http_addr = parse_addr(&http_options.addr)?;
 
             let mut http_server_builder = HttpServerBuilder::new(http_options.clone());
-            http_server_builder
+            let _ = http_server_builder
                 .with_sql_handler(ServerSqlQueryHandlerAdaptor::arc(instance.clone()))
                 .with_grpc_handler(ServerGrpcQueryHandlerAdaptor::arc(instance.clone()));
 
             if let Some(user_provider) = user_provider.clone() {
-                http_server_builder.with_user_provider(user_provider);
+                let _ = http_server_builder.with_user_provider(user_provider);
             }
 
             if set_opentsdb_handler {
-                http_server_builder.with_opentsdb_handler(instance.clone());
+                let _ = http_server_builder.with_opentsdb_handler(instance.clone());
             }
             if matches!(
                 opts.influxdb_options,
                 Some(InfluxdbOptions { enable: true })
             ) {
-                http_server_builder.with_influxdb_handler(instance.clone());
+                let _ = http_server_builder.with_influxdb_handler(instance.clone());
             }
 
             if matches!(
-                opts.prometheus_options,
-                Some(PrometheusOptions { enable: true })
+                opts.prom_store_options,
+                Some(PromStoreOptions { enable: true })
             ) {
-                http_server_builder.with_prom_handler(instance.clone());
+                let _ = http_server_builder.with_prom_handler(instance.clone());
             }
-            http_server_builder.with_metrics_handler(MetricsHandler);
-            http_server_builder.with_script_handler(instance.clone());
 
-            http_server_builder.with_configurator(plugins.get::<ConfiguratorRef>());
-
-            let http_server = http_server_builder.build();
+            let http_server = http_server_builder
+                .with_metrics_handler(MetricsHandler)
+                .with_script_handler(instance.clone())
+                .with_configurator(plugins.get::<ConfiguratorRef>())
+                .with_greptime_config_options(opts.to_toml_string())
+                .build();
             result.push((Box::new(http_server), http_addr));
         }
 
-        if let Some(prom_options) = &opts.prom_options {
-            let prom_addr = parse_addr(&prom_options.addr)?;
+        if let Some(prometheus_options) = &opts.prometheus_options {
+            let prom_addr = parse_addr(&prometheus_options.addr)?;
 
-            let mut prom_server = PromServer::create_server(instance);
+            let mut prom_server = PrometheusServer::create_server(instance);
             if let Some(user_provider) = user_provider {
                 prom_server.set_user_provider(user_provider);
             }

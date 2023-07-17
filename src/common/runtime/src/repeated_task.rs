@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use common_error::prelude::ErrorExt;
+use common_error::ext::ErrorExt;
 use common_telemetry::logging;
 use snafu::{ensure, ResultExt};
 use tokio::task::JoinHandle;
@@ -172,8 +172,7 @@ mod tests {
         }
 
         async fn call(&mut self) -> Result<()> {
-            self.n.fetch_add(1, Ordering::Relaxed);
-
+            let _ = self.n.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }

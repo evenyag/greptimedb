@@ -186,7 +186,7 @@ impl TableMeta {
             // No need to rebuild table meta when renaming tables.
             AlterKind::RenameTable { .. } => {
                 let mut meta_builder = TableMetaBuilder::default();
-                meta_builder
+                let _ = meta_builder
                     .schema(self.schema.clone())
                     .primary_key_indices(self.primary_key_indices.clone())
                     .engine(self.engine.clone())
@@ -225,7 +225,7 @@ impl TableMeta {
 
     fn new_meta_builder(&self) -> TableMetaBuilder {
         let mut builder = TableMetaBuilder::default();
-        builder
+        let _ = builder
             .engine(&self.engine)
             .engine_options(self.engine_options.clone())
             .options(self.options.clone())
@@ -301,7 +301,7 @@ impl TableMeta {
         })?;
 
         // value_indices would be generated automatically.
-        meta_builder
+        let _ = meta_builder
             .schema(Arc::new(new_schema))
             .primary_key_indices(primary_key_indices);
 
@@ -380,7 +380,7 @@ impl TableMeta {
             .map(|name| new_schema.column_index_by_name(name).unwrap())
             .collect();
 
-        meta_builder
+        let _ = meta_builder
             .schema(Arc::new(new_schema))
             .primary_key_indices(primary_key_indices);
 
@@ -462,6 +462,12 @@ pub struct TableInfo {
 }
 
 pub type TableInfoRef = Arc<TableInfo>;
+
+impl TableInfo {
+    pub fn table_id(&self) -> TableId {
+        self.ident.table_id
+    }
+}
 
 impl TableInfoBuilder {
     pub fn new<S: Into<String>>(name: S, meta: TableMeta) -> Self {
@@ -592,7 +598,9 @@ impl TryFrom<RawTableInfo> for TableInfo {
 
 #[cfg(test)]
 mod tests {
-    use common_error::prelude::*;
+
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use datatypes::data_type::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema, SchemaBuilder};
 

@@ -83,7 +83,7 @@ impl UpdateRegionMetadata {
             region_numbers.retain(|x| *x != failed_region.region_number);
 
             if !region_numbers.is_empty() {
-                value
+                let _ = value
                     .regions_id_map
                     .insert(failed_region.datanode_id, region_numbers);
             }
@@ -121,7 +121,7 @@ impl UpdateRegionMetadata {
         let table_route = value
             .table_route
             .with_context(|| CorruptedTableRouteSnafu {
-                key: key.key(),
+                key: key.to_string(),
                 reason: "'table_route' is empty",
             })?;
         let mut table_route = TableRoute::try_from_raw(&value.peers, table_route)
@@ -177,7 +177,7 @@ fn pretty_log_table_route_change(
     info!(
         "Updating region routes in table route value (key = '{}') to [{}]. \
         Failed region {} was on Datanode {}.",
-        key.key(),
+        key.to_string(),
         region_routes.join(", "),
         failed_region.region_number,
         failed_region.datanode_id,
@@ -329,7 +329,7 @@ mod tests {
                 .unwrap();
 
             let key = TableRouteKey {
-                table_id: failed_region.table_ident.table_id as u64,
+                table_id: failed_region.table_ident.table_id,
                 catalog_name: &failed_region.table_ident.catalog,
                 schema_name: &failed_region.table_ident.schema,
                 table_name: &failed_region.table_ident.table,
@@ -465,9 +465,9 @@ mod tests {
             let catalog_name = failed_region_1.table_ident.catalog.clone();
             let schema_name = failed_region_1.table_ident.schema.clone();
             let table_name = failed_region_1.table_ident.table.clone();
-            let table_id = failed_region_1.table_ident.table_id as u64;
+            let table_id = failed_region_1.table_ident.table_id;
 
-            futures::future::join_all(vec![
+            let _ = futures::future::join_all(vec![
                 tokio::spawn(async move {
                     let state = UpdateRegionMetadata::new(Peer::new(2, ""));
                     state

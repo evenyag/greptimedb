@@ -19,7 +19,9 @@ use std::time::Instant;
 use catalog::remote::CachedMetaKvBackend;
 use client::client_manager::DatanodeClients;
 use client::{Client, Database, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_error::prelude::ErrorExt;
+use common_base::Plugins;
+use common_error::ext::ErrorExt;
+use common_meta::key::TableMetadataManager;
 use common_query::Output;
 use common_recordbatch::RecordBatches;
 use common_telemetry::logging;
@@ -107,7 +109,7 @@ impl Repl {
             Ok(ref line) => {
                 let request = line.trim();
 
-                self.rl.add_history_entry(request.to_string());
+                let _ = self.rl.add_history_entry(request.to_string());
 
                 request.try_into()
             }
@@ -136,7 +138,7 @@ impl Repl {
                     }
                 }
                 ReplCommand::Sql { sql } => {
-                    self.execute_sql(sql).await;
+                    let _ = self.execute_sql(sql).await;
                 }
                 ReplCommand::Exit => {
                     return Ok(());
@@ -262,17 +264,19 @@ async fn create_query_engine(meta_addr: &str) -> Result<DatafusionQueryEngine> {
 
     let catalog_list = Arc::new(FrontendCatalogManager::new(
         cached_meta_backend.clone(),
-        cached_meta_backend,
+        cached_meta_backend.clone(),
         partition_manager,
         datanode_clients,
+        Arc::new(TableMetadataManager::new(cached_meta_backend)),
     ));
+    let plugins: Arc<Plugins> = Default::default();
     let state = Arc::new(QueryEngineState::new(
         catalog_list,
         false,
         None,
         None,
-        Default::default(),
+        plugins.clone(),
     ));
 
-    Ok(DatafusionQueryEngine::new(state))
+    Ok(DatafusionQueryEngine::new(state, plugins))
 }

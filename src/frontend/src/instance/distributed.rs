@@ -18,29 +18,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::helper::ColumnDataTypeWrapper;
-use api::v1::ddl_request::Expr as DdlExpr;
+use api::v1::ddl_request::{Expr as DdlExpr, Expr};
 use api::v1::greptime_request::Request;
 use api::v1::{
-    column_def, AlterExpr, CreateDatabaseExpr, CreateTableExpr, DeleteRequest, DropTableExpr,
-    FlushTableExpr, InsertRequests, TableId,
+    column_def, AlterExpr, CompactTableExpr, CreateDatabaseExpr, CreateTableExpr, DeleteRequest,
+    FlushTableExpr, InsertRequests,
 };
 use async_trait::async_trait;
 use catalog::helper::{SchemaKey, SchemaValue};
-use catalog::{CatalogManager, DeregisterTableRequest, RegisterTableRequest};
+use catalog::{CatalogManager, RegisterTableRequest};
 use chrono::DateTime;
 use client::client_manager::DatanodeClients;
 use client::Database;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::format_full_table_name;
-use common_error::prelude::BoxedError;
-use common_meta::rpc::router::{
-    CreateRequest as MetaCreateRequest, DeleteRequest as MetaDeleteRequest,
-    Partition as MetaPartition, RouteRequest, RouteResponse,
-};
+use common_error::ext::BoxedError;
+use common_meta::key::TableMetadataManagerRef;
+use common_meta::peer::Peer;
+use common_meta::rpc::ddl::{DdlTask, SubmitDdlTaskRequest, SubmitDdlTaskResponse};
+use common_meta::rpc::router::{Partition as MetaPartition, RouteRequest};
 use common_meta::rpc::store::CompareAndPutRequest;
 use common_meta::table_name::TableName;
 use common_query::Output;
-use common_telemetry::{debug, info, warn};
+use common_telemetry::{debug, info};
 use datanode::instance::sql::table_idents_to_full_name;
 use datanode::sql::SqlHandler;
 use datatypes::prelude::ConcreteDataType;
@@ -58,10 +58,9 @@ use sql::statements::create::{PartitionEntry, Partitions};
 use sql::statements::statement::Statement;
 use sql::statements::{self, sql_value_to_value};
 use store_api::storage::RegionNumber;
-use table::engine::{self, TableReference};
-use table::metadata::{RawTableInfo, RawTableMeta, TableIdent, TableType};
-use table::requests::TableOptions;
-use table::table::AlterContext;
+use table::engine::TableReference;
+use table::metadata::{RawTableInfo, RawTableMeta, TableId, TableIdent, TableInfo, TableType};
+use table::requests::{AlterTableRequest, TableOptions};
 use table::TableRef;
 
 use crate::catalog::FrontendCatalogManager;
@@ -83,6 +82,7 @@ pub struct DistInstance {
     meta_client: Arc<MetaClient>,
     catalog_manager: Arc<FrontendCatalogManager>,
     datanode_clients: Arc<DatanodeClients>,
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl DistInstance {
@@ -90,23 +90,14 @@ impl DistInstance {
         meta_client: Arc<MetaClient>,
         catalog_manager: Arc<FrontendCatalogManager>,
         datanode_clients: Arc<DatanodeClients>,
+        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             meta_client,
             catalog_manager,
             datanode_clients,
+            table_metadata_manager,
         }
-    }
-
-    async fn find_table(&self, table_name: &TableName) -> Result<Option<TableRef>> {
-        self.catalog_manager
-            .table(
-                &table_name.catalog_name,
-                &table_name.schema_name,
-                &table_name.table_name,
-            )
-            .await
-            .context(CatalogSnafu)
     }
 
     pub async fn create_table(
@@ -121,65 +112,27 @@ impl DistInstance {
             &create_table.table_name,
         );
 
-        if let Some(table) = self.find_table(&table_name).await? {
-            return if create_table.create_if_not_exists {
-                Ok(table)
-            } else {
-                TableAlreadyExistSnafu {
-                    table: table_name.to_string(),
-                }
-                .fail()
-            };
-        }
-
         let mut table_info = create_table_info(create_table)?;
 
-        let response = self
-            .create_table_in_meta(create_table, partitions, &table_info)
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(e) => {
-                return if let Some(table) = self.find_table(&table_name).await? {
-                    warn!("Table '{table_name}' is created concurrently by other Frontend nodes!");
-                    Ok(table)
-                } else {
-                    Err(e)
-                }
-            }
-        };
+        let resp = self
+            .create_table_procedure(create_table, partitions, table_info.clone())
+            .await?;
 
-        let table_routes = response.table_routes;
-        ensure!(
-            table_routes.len() == 1,
-            error::CreateTableRouteSnafu {
-                table_name: create_table.table_name.to_string()
-            }
-        );
-        let table_route = table_routes.first().unwrap();
-        info!(
-            "Creating distributed table {table_name} with table routes: {}",
-            serde_json::to_string_pretty(table_route)
-                .unwrap_or_else(|_| format!("{table_route:#?}"))
-        );
-        let region_routes = &table_route.region_routes;
-        ensure!(
-            !region_routes.is_empty(),
-            error::FindRegionRouteSnafu {
-                table_name: create_table.table_name.to_string()
-            }
-        );
+        let table_id = resp.table_id.context(error::UnexpectedSnafu {
+            violated: "expected table_id",
+        })?;
+        info!("Successfully created distributed table '{table_name}' with table id {table_id}");
 
-        let table_id = table_route.table.id as u32;
         table_info.ident.table_id = table_id;
         let table_info = Arc::new(table_info.try_into().context(error::CreateTableInfoSnafu)?);
 
-        create_table.table_id = Some(TableId { id: table_id });
+        create_table.table_id = Some(api::v1::TableId { id: table_id });
 
         let table = Arc::new(DistTable::new(
             table_name.clone(),
             table_info,
             self.catalog_manager.clone(),
+            self.table_metadata_manager.clone(),
         ));
 
         let request = RegisterTableRequest {
@@ -199,26 +152,6 @@ impl DistInstance {
             }
         );
 
-        for datanode in table_route.find_leaders() {
-            let client = self.datanode_clients.get_client(&datanode).await;
-            let client = Database::new(&table_name.catalog_name, &table_name.schema_name, client);
-
-            let regions = table_route.find_leader_regions(&datanode);
-            let mut create_expr_for_region = create_table.clone();
-            create_expr_for_region.region_numbers = regions;
-
-            debug!(
-                "Creating table {:?} on Datanode {:?} with regions {:?}",
-                create_table, datanode, create_expr_for_region.region_numbers,
-            );
-
-            let _timer = common_telemetry::timer!(crate::metrics::DIST_CREATE_TABLE_IN_DATANODE);
-            client
-                .create(create_expr_for_region)
-                .await
-                .context(RequestDatanodeSnafu)?;
-        }
-
         // Since the table information created on meta does not go through KvBackend, so we
         // manually invalidate the cache here.
         //
@@ -235,7 +168,7 @@ impl DistInstance {
     }
 
     async fn drop_table(&self, table_name: TableName) -> Result<Output> {
-        let _ = self
+        let table = self
             .catalog_manager
             .table(
                 &table_name.catalog_name,
@@ -248,46 +181,9 @@ impl DistInstance {
                 table_name: table_name.to_string(),
             })?;
 
-        let route_response = self
-            .meta_client
-            .delete_route(MetaDeleteRequest {
-                table_name: table_name.clone(),
-            })
-            .await
-            .context(RequestMetaSnafu)?;
+        let table_id = table.table_info().ident.table_id;
 
-        let request = DeregisterTableRequest {
-            catalog: table_name.catalog_name.clone(),
-            schema: table_name.schema_name.clone(),
-            table_name: table_name.table_name.clone(),
-        };
-        ensure!(
-            self.catalog_manager
-                .deregister_table(request)
-                .await
-                .context(CatalogSnafu)?,
-            error::TableNotFoundSnafu {
-                table_name: table_name.to_string()
-            }
-        );
-
-        let expr = DropTableExpr {
-            catalog_name: table_name.catalog_name.clone(),
-            schema_name: table_name.schema_name.clone(),
-            table_name: table_name.table_name.clone(),
-        };
-        for table_route in route_response.table_routes.iter() {
-            for datanode in table_route.find_leaders() {
-                debug!("Dropping table {table_name} on Datanode {datanode:?}");
-
-                let client = self.datanode_clients.get_client(&datanode).await;
-                let client = Database::new(&expr.catalog_name, &expr.schema_name, client);
-                client
-                    .drop_table(expr.clone())
-                    .await
-                    .context(RequestDatanodeSnafu)?;
-            }
-        }
+        self.drop_table_procedure(&table_name, table_id).await?;
 
         // Since the table information dropped on meta does not go through KvBackend, so we
         // manually invalidate the cache here.
@@ -309,6 +205,66 @@ impl DistInstance {
         table_name: TableName,
         region_number: Option<RegionNumber>,
     ) -> Result<Output> {
+        let candidates = self
+            .find_flush_or_compaction_candidates(&table_name, region_number)
+            .await?;
+
+        let expr = FlushTableExpr {
+            catalog_name: table_name.catalog_name.clone(),
+            schema_name: table_name.schema_name.clone(),
+            table_name: table_name.table_name.clone(),
+            region_number,
+            ..Default::default()
+        };
+
+        for candidate in candidates {
+            debug!("Flushing table {table_name} on Datanode {candidate:?}");
+
+            let client = self.datanode_clients.get_client(&candidate).await;
+            let client = Database::new(&expr.catalog_name, &expr.schema_name, client);
+            client
+                .flush_table(expr.clone())
+                .await
+                .context(RequestDatanodeSnafu)?;
+        }
+
+        Ok(Output::AffectedRows(0))
+    }
+
+    async fn compact_table(
+        &self,
+        table_name: TableName,
+        region_number: Option<RegionNumber>,
+    ) -> Result<Output> {
+        let candidates = self
+            .find_flush_or_compaction_candidates(&table_name, region_number)
+            .await?;
+
+        let expr = CompactTableExpr {
+            catalog_name: table_name.catalog_name.clone(),
+            schema_name: table_name.schema_name.clone(),
+            table_name: table_name.table_name.clone(),
+            region_number,
+        };
+
+        for candidate in candidates {
+            debug!("Compacting table {table_name} on Datanode {candidate:?}");
+
+            let client = self.datanode_clients.get_client(&candidate).await;
+            let client = Database::new(&expr.catalog_name, &expr.schema_name, client);
+            client
+                .compact_table(expr.clone())
+                .await
+                .context(RequestDatanodeSnafu)?;
+        }
+        Ok(Output::AffectedRows(0))
+    }
+
+    async fn find_flush_or_compaction_candidates(
+        &self,
+        table_name: &TableName,
+        region_number: Option<RegionNumber>,
+    ) -> Result<Vec<Peer>> {
         let _ = self
             .catalog_manager
             .table(
@@ -330,37 +286,18 @@ impl DistInstance {
             .await
             .context(RequestMetaSnafu)?;
 
-        let expr = FlushTableExpr {
-            catalog_name: table_name.catalog_name.clone(),
-            schema_name: table_name.schema_name.clone(),
-            table_name: table_name.table_name.clone(),
-            region_number,
-        };
-
-        for table_route in &route_response.table_routes {
-            let should_send_rpc = table_route.region_routes.iter().any(|route| {
-                if let Some(n) = region_number {
-                    n == engine::region_number(route.region.id)
-                } else {
-                    true
-                }
-            });
-
-            if !should_send_rpc {
-                continue;
-            }
-            for datanode in table_route.find_leaders() {
-                debug!("Flushing table {table_name} on Datanode {datanode:?}");
-
-                let client = self.datanode_clients.get_client(&datanode).await;
-                let client = Database::new(&expr.catalog_name, &expr.schema_name, client);
-                client
-                    .flush_table(expr.clone())
-                    .await
-                    .context(RequestDatanodeSnafu)?;
-            }
-        }
-        Ok(Output::AffectedRows(0))
+        let res = route_response
+            .table_routes
+            .iter()
+            .filter(|route| {
+                route.region_routes.iter().any(|r| {
+                    let Some(n) = region_number else { return true; };
+                    n == r.region.id.region_number()
+                })
+            })
+            .flat_map(|route| route.find_leaders().into_iter())
+            .collect::<Vec<_>>();
+        Ok(res)
     }
 
     async fn handle_statement(
@@ -383,7 +320,7 @@ impl DistInstance {
             }
             Statement::CreateExternalTable(stmt) => {
                 let create_expr = &mut expr_factory::create_external_expr(stmt, query_ctx).await?;
-                self.create_table(create_expr, None).await?;
+                let _ = self.create_table(create_expr, None).await?;
                 Ok(Output::AffectedRows(0))
             }
             Statement::Alter(alter_table) => {
@@ -412,7 +349,7 @@ impl DistInstance {
                     .context(TableNotFoundSnafu { table_name: table })?;
 
                 let insert_request =
-                    SqlHandler::insert_to_request(self.catalog_manager.clone(), *insert, query_ctx)
+                    SqlHandler::insert_to_request(self.catalog_manager.clone(), &insert, query_ctx)
                         .await
                         .context(InvokeDatanodeSnafu)?;
 
@@ -467,10 +404,9 @@ impl DistInstance {
         let catalog = query_ctx.current_catalog();
         if self
             .catalog_manager
-            .schema(&catalog, &expr.database_name)
+            .schema_exist(&catalog, &expr.database_name)
             .await
             .context(CatalogSnafu)?
-            .is_some()
         {
             return if expr.create_if_not_exists {
                 Ok(Output::AffectedRows(1))
@@ -519,7 +455,29 @@ impl DistInstance {
         Ok(Output::AffectedRows(1))
     }
 
-    async fn handle_alter_table(&self, expr: AlterExpr) -> Result<Output> {
+    fn verify_alter(
+        &self,
+        table_id: TableId,
+        table_info: Arc<TableInfo>,
+        expr: AlterExpr,
+    ) -> Result<()> {
+        let request: table::requests::AlterTableRequest =
+            common_grpc_expr::alter_expr_to_request(table_id, expr)
+                .context(AlterExprToRequestSnafu)?;
+
+        let AlterTableRequest { table_name, .. } = &request;
+
+        let _ = table_info
+            .meta
+            .builder_with_alter_kind(table_name, &request.alter_kind)
+            .context(error::TableSnafu)?
+            .build()
+            .context(error::BuildTableMetaSnafu { table_name })?;
+
+        Ok(())
+    }
+
+    async fn handle_alter_table(&self, mut expr: AlterExpr) -> Result<Output> {
         let catalog_name = if expr.catalog_name.is_empty() {
             DEFAULT_CATALOG_NAME
         } else {
@@ -543,48 +501,69 @@ impl DistInstance {
                 table_name: format_full_table_name(catalog_name, schema_name, table_name),
             })?;
 
-        let request = common_grpc_expr::alter_expr_to_request(
-            table.table_info().ident.table_id,
-            expr.clone(),
-        )
-        .context(AlterExprToRequestSnafu)?;
+        let table_id = table.table_info().ident.table_id;
+        expr.table_id = Some(api::v1::TableId { id: table_id });
 
-        let mut context = AlterContext::with_capacity(1);
+        self.verify_alter(table_id, table.table_info(), expr.clone())?;
 
-        context.insert(expr);
+        let req = SubmitDdlTaskRequest {
+            task: DdlTask::new_alter_table(expr.clone()),
+        };
 
-        table.alter(context, &request).await.context(TableSnafu)?;
+        self.meta_client
+            .submit_ddl_task(req)
+            .await
+            .context(error::RequestMetaSnafu)?;
+
+        let table_info = table.table_info();
+        self.catalog_manager
+            .invalidate_table(
+                &table_info.catalog_name,
+                &table_info.schema_name,
+                &table_info.name,
+            )
+            .await;
 
         Ok(Output::AffectedRows(0))
     }
 
-    async fn create_table_in_meta(
+    async fn create_table_procedure(
         &self,
         create_table: &CreateTableExpr,
         partitions: Option<Partitions>,
-        table_info: &RawTableInfo,
-    ) -> Result<RouteResponse> {
-        let _timer = common_telemetry::timer!(crate::metrics::DIST_CREATE_TABLE_IN_META);
-        let mut catalog_name = create_table.catalog_name.clone();
-        if catalog_name.is_empty() {
-            catalog_name = DEFAULT_CATALOG_NAME.to_string();
-        }
-        let mut schema_name = create_table.schema_name.clone();
-        if schema_name.is_empty() {
-            schema_name = DEFAULT_SCHEMA_NAME.to_string();
-        }
-        let table_name = TableName::new(catalog_name, schema_name, create_table.table_name.clone());
-
+        table_info: RawTableInfo,
+    ) -> Result<SubmitDdlTaskResponse> {
         let partitions = parse_partitions(create_table, partitions)?;
-        let request = MetaCreateRequest {
-            table_name,
-            partitions,
-            table_info,
+        let partitions = partitions.into_iter().map(Into::into).collect();
+
+        let request = SubmitDdlTaskRequest {
+            task: DdlTask::new_create_table(create_table.clone(), partitions, table_info),
         };
+
         self.meta_client
-            .create_route(request)
+            .submit_ddl_task(request)
             .await
-            .context(RequestMetaSnafu)
+            .context(error::RequestMetaSnafu)
+    }
+
+    async fn drop_table_procedure(
+        &self,
+        table_name: &TableName,
+        table_id: TableId,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            task: DdlTask::new_drop_table(
+                table_name.catalog_name.to_string(),
+                table_name.schema_name.to_string(),
+                table_name.table_name.to_string(),
+                table_id,
+            ),
+        };
+
+        self.meta_client
+            .submit_ddl_task(request)
+            .await
+            .context(error::RequestMetaSnafu)
     }
 
     async fn handle_dist_insert(
@@ -664,7 +643,7 @@ impl GrpcQueryHandler for DistInstance {
                 match expr {
                     DdlExpr::CreateDatabase(expr) => self.handle_create_database(expr, ctx).await,
                     DdlExpr::CreateTable(mut expr) => {
-                        let _ = self.create_table(&mut expr, None).await;
+                        let _ = self.create_table(&mut expr, None).await?;
                         Ok(Output::AffectedRows(0))
                     }
                     DdlExpr::Alter(expr) => self.handle_alter_table(expr).await,
@@ -677,6 +656,11 @@ impl GrpcQueryHandler for DistInstance {
                         let table_name =
                             TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
                         self.flush_table(table_name, expr.region_number).await
+                    }
+                    Expr::CompactTable(expr) => {
+                        let table_name =
+                            TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
+                        self.compact_table(table_name, expr.region_number).await
                     }
                 }
             }
@@ -700,7 +684,7 @@ fn create_partitions_stmt(partitions: Vec<PartitionInfo>) -> Result<Option<Parti
         .into_iter()
         .map(|info| {
             // Generated the partition name from id
-            let name = &format!("r{}", info.id);
+            let name = &format!("r{}", info.id.as_u64());
             let bounds = info.partition.partition_bounds();
             let value_list = bounds
                 .iter()
@@ -736,7 +720,7 @@ fn create_table_info(create_table: &CreateTableExpr) -> Result<RawTableInfo> {
         let schema = schema.with_time_index(column.name == create_table.time_index);
 
         column_schemas.push(schema);
-        column_name_to_index_map.insert(column.name.clone(), idx);
+        let _ = column_name_to_index_map.insert(column.name.clone(), idx);
     }
 
     let timestamp_index = column_name_to_index_map

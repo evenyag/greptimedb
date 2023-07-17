@@ -43,9 +43,9 @@ impl heartbeat_server::Heartbeat for MetaSrv {
     ) -> GrpcResult<Self::HeartbeatStream> {
         let mut in_stream = req.into_inner();
         let (tx, rx) = mpsc::channel(128);
-        let handler_group = self.handler_group();
+        let handler_group = self.handler_group().clone();
         let ctx = self.new_ctx();
-        common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_bg(async move {
             let mut pusher_key = None;
             while let Some(msg) = in_stream.next().await {
                 let mut is_not_leader = false;

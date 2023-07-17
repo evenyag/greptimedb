@@ -27,10 +27,10 @@ mod tests {
 
     impl Repl {
         fn send_line(&mut self, line: &str) {
-            self.repl.send_line(line).unwrap();
+            let _ = self.repl.send_line(line).unwrap();
 
             // read a line to consume the prompt
-            self.read_line();
+            let _ = self.read_line();
         }
 
         fn read_line(&mut self) -> String {
@@ -76,7 +76,7 @@ mod tests {
         std::thread::sleep(Duration::from_secs(3));
 
         let mut repl_cmd = Command::new("./greptime");
-        repl_cmd.current_dir(bin_path).args([
+        let _ = repl_cmd.current_dir(bin_path).args([
             "--log-level=off",
             "cli",
             "attach",
@@ -105,7 +105,7 @@ mod tests {
         test_select(repl);
 
         datanode.kill().unwrap();
-        datanode.wait().unwrap();
+        let _ = datanode.wait().unwrap();
     }
 
     fn test_create_database(repl: &mut Repl) {

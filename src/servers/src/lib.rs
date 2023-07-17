@@ -16,6 +16,8 @@
 #![feature(try_blocks)]
 
 use common_catalog::consts::DEFAULT_CATALOG_NAME;
+use datatypes::schema::Schema;
+use query::plan::LogicalPlan;
 use serde::{Deserialize, Serialize};
 
 pub mod auth;
@@ -31,7 +33,7 @@ pub mod metrics_handler;
 pub mod mysql;
 pub mod opentsdb;
 pub mod postgres;
-pub mod prom;
+pub mod prom_store;
 pub mod prometheus;
 pub mod query_handler;
 pub mod server;
@@ -70,6 +72,14 @@ pub fn parse_catalog_and_schema_from_client_database_name(db: &str) -> (&str, &s
     } else {
         (DEFAULT_CATALOG_NAME, db)
     }
+}
+
+/// Cached SQL and logical plan for database interfaces
+#[derive(Clone)]
+pub struct SqlPlan {
+    query: String,
+    plan: Option<LogicalPlan>,
+    schema: Option<Schema>,
 }
 
 #[cfg(test)]

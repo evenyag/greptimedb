@@ -23,8 +23,8 @@ use snafu::ResultExt;
 use store_api::logstore::LogStore;
 use store_api::manifest::Manifest;
 use store_api::storage::{
-    CloseContext, CloseOptions, CreateOptions, EngineContext, OpenOptions, Region,
-    RegionDescriptor, StorageEngine,
+    CloseContext, CloseOptions, CompactionStrategy, CreateOptions, EngineContext, OpenOptions,
+    Region, RegionDescriptor, StorageEngine,
 };
 
 use crate::compaction::CompactionSchedulerRef;
@@ -259,7 +259,7 @@ impl<S: LogStore> RegionMap<S> {
         }
 
         // No slot in map, we can insert the slot now.
-        regions.insert(name.to_string(), slot);
+        let _ = regions.insert(name.to_string(), slot);
 
         None
     }
@@ -281,7 +281,7 @@ impl<S: LogStore> RegionMap<S> {
     /// Remove region by name.
     fn remove(&self, name: &str) {
         let mut regions = self.0.write().unwrap();
-        regions.remove(name);
+        let _ = regions.remove(name);
     }
 
     /// Collects regions.
@@ -395,6 +395,7 @@ impl<S: LogStore> EngineInner<S> {
                 name,
                 &self.config,
                 opts.ttl,
+                opts.compaction_strategy.clone(),
             )
             .await?;
 
@@ -440,6 +441,7 @@ impl<S: LogStore> EngineInner<S> {
                 &region_name,
                 &self.config,
                 opts.ttl,
+                opts.compaction_strategy.clone(),
             )
             .await?;
 
@@ -471,6 +473,7 @@ impl<S: LogStore> EngineInner<S> {
         region_name: &str,
         config: &EngineConfig,
         region_ttl: Option<Duration>,
+        compaction_strategy: CompactionStrategy,
     ) -> Result<StoreConfig<S>> {
         let parent_dir = util::normalize_dir(parent_dir);
 
@@ -503,6 +506,7 @@ impl<S: LogStore> EngineInner<S> {
             ttl,
             write_buffer_size: write_buffer_size
                 .unwrap_or(self.config.region_write_buffer_size.as_bytes() as usize),
+            compaction_strategy,
         })
     }
 
@@ -557,7 +561,7 @@ mod tests {
         let store_dir = tmp_dir.path().to_string_lossy();
 
         let mut builder = Fs::default();
-        builder.root(&store_dir);
+        let _ = builder.root(&store_dir);
         let object_store = ObjectStore::new(builder).unwrap().finish();
 
         let compaction_scheduler = Arc::new(NoopCompactionScheduler::default());
@@ -652,13 +656,13 @@ mod tests {
         let v1 = Arc::new(Float32Vector::from_slice([0.1, 0.2, 0.3])) as VectorRef;
         let tsv = Arc::new(TimestampMillisecondVector::from_slice([0, 0, 0])) as VectorRef;
 
-        let mut put_data = HashMap::with_capacity(4);
-        put_data.insert("k1".to_string(), k1);
-        put_data.insert("v1".to_string(), v1);
-        put_data.insert("ts".to_string(), tsv);
-
+        let put_data = HashMap::from([
+            ("k1".to_string(), k1),
+            ("v1".to_string(), v1),
+            ("ts".to_string(), tsv),
+        ]);
         wb.put(put_data).unwrap();
-        region.write(&WriteContext::default(), wb).await.unwrap();
+        let _ = region.write(&WriteContext::default(), wb).await.unwrap();
 
         // Flush memtable to sst.
         region.flush(&FlushContext::default()).await.unwrap();
@@ -680,7 +684,14 @@ mod tests {
                 .unwrap();
 
             engine.drop_region(&ctx, region).await.unwrap();
+
             assert!(engine.get_region(&ctx, region_name).unwrap().is_none());
+            assert!(!engine
+                .inner
+                .object_store
+                .is_exist(dir_path.join("manifest").to_str().unwrap())
+                .await
+                .unwrap());
         }
 
         // Wait for gc

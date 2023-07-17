@@ -170,7 +170,9 @@ impl StartCommand {
         logging::info!("Datanode start command: {:#?}", self);
         logging::info!("Datanode options: {:#?}", opts);
 
-        let datanode = Datanode::new(opts).await.context(StartDatanodeSnafu)?;
+        let datanode = Datanode::new(opts, Default::default())
+            .await
+            .context(StartDatanodeSnafu)?;
 
         Ok(Instance { datanode })
     }
@@ -204,6 +206,7 @@ mod tests {
             metasrv_addrs = ["127.0.0.1:3002"]
             timeout_millis = 3000
             connect_timeout_millis = 5000
+            ddl_timeout_millis= 10000
             tcp_nodelay = true
 
             [wal]
@@ -257,10 +260,12 @@ mod tests {
             timeout_millis,
             connect_timeout_millis,
             tcp_nodelay,
+            ddl_timeout_millis,
         } = options.meta_client_options.unwrap();
 
         assert_eq!(vec!["127.0.0.1:3002".to_string()], metasrv_addr);
         assert_eq!(5000, connect_timeout_millis);
+        assert_eq!(10000, ddl_timeout_millis);
         assert_eq!(3000, timeout_millis);
         assert!(tcp_nodelay);
 
@@ -271,6 +276,7 @@ mod tests {
             ObjectStoreConfig::S3 { .. } => unreachable!(),
             ObjectStoreConfig::Oss { .. } => unreachable!(),
             ObjectStoreConfig::Azblob { .. } => unreachable!(),
+            ObjectStoreConfig::Gcs { .. } => unreachable!(),
         };
 
         assert_eq!(
@@ -324,12 +330,12 @@ mod tests {
         .is_err());
 
         // Providing node_id but leave metasrv_addr absent is ok since metasrv_addr has default value
-        (StartCommand {
+        assert!((StartCommand {
             node_id: Some(42),
             ..Default::default()
         })
         .load_options(TopLevelOptions::default())
-        .unwrap();
+        .is_ok());
     }
 
     #[test]

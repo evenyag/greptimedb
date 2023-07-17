@@ -21,11 +21,11 @@ use arrow::compute::SortOptions;
 use common_query::prelude::Expr;
 use common_recordbatch::OrderOption;
 use common_test_util::temp_dir::create_temp_dir;
+use common_time::timestamp::TimeUnit;
 use datafusion_common::Column;
+use datatypes::value::timestamp_to_scalar_value;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
-use store_api::storage::{
-    FlushContext, FlushReason, OpenOptions, Region, ScanRequest, WriteResponse,
-};
+use store_api::storage::{FlushContext, FlushReason, OpenOptions, Region, ScanRequest};
 
 use crate::config::EngineConfig;
 use crate::engine::{self, RegionMap};
@@ -114,12 +114,12 @@ impl FlushTester {
         self.base.as_ref().unwrap()
     }
 
-    async fn put(&self, data: &[(i64, Option<i64>)]) -> WriteResponse {
+    async fn put(&self, data: &[(i64, Option<i64>)]) {
         let data = data
             .iter()
             .map(|(ts, v0)| (*ts, v0.map(|v| v.to_string())))
             .collect::<Vec<_>>();
-        self.base().put(&data).await
+        let _ = self.base().put(&data).await;
     }
 
     async fn full_scan(&self) -> Vec<(i64, Option<String>)> {
@@ -252,7 +252,7 @@ async fn test_flush_empty() {
 }
 
 #[tokio::test]
-async fn test_read_after_flush() {
+async fn test_read_after_flush_across_window() {
     common_telemetry::init_default_ut_logging();
 
     let dir = create_temp_dir("read-flush");
@@ -275,6 +275,44 @@ async fn test_read_after_flush() {
         (1000, Some(100.to_string())),
         (2000, Some(200.to_string())),
         (3000, Some(300.to_string())),
+    ];
+
+    let output = tester.full_scan().await;
+    assert_eq!(expect, output);
+
+    // Reopen
+    let mut tester = tester;
+    tester.reopen().await;
+
+    // Scan after reopen.
+    let output = tester.full_scan().await;
+    assert_eq!(expect, output);
+}
+
+#[tokio::test]
+async fn test_read_after_flush_same_window() {
+    common_telemetry::init_default_ut_logging();
+
+    let dir = create_temp_dir("read-flush");
+    let store_dir = dir.path().to_str().unwrap();
+
+    let flush_switch = Arc::new(FlushSwitch::default());
+    let tester = FlushTester::new(store_dir, flush_switch.clone()).await;
+
+    // Put elements so we have content to flush.
+    tester.put(&[(1000, Some(100))]).await;
+    tester.put(&[(2000, Some(200))]).await;
+
+    // Flush.
+    tester.flush(None).await;
+
+    // Put element again.
+    tester.put(&[(1003, Some(300))]).await;
+
+    let expect = vec![
+        (1000, Some(100.to_string())),
+        (1003, Some(300.to_string())),
+        (2000, Some(200.to_string())),
     ];
 
     let output = tester.full_scan().await;
@@ -347,7 +385,7 @@ async fn test_schedule_engine_flush() {
     assert_eq!(0, tester.base().region.last_flush_millis());
 
     // Insert the region to the region map.
-    tester.regions.get_or_occupy_slot(
+    let _ = tester.regions.get_or_occupy_slot(
         REGION_NAME,
         engine::RegionSlot::Ready(tester.base().region.clone()),
     );
@@ -406,7 +444,10 @@ async fn test_flush_and_query_empty() {
         filters: vec![Expr::from(datafusion_expr::binary_expr(
             DfExpr::Column(Column::from("timestamp")),
             datafusion_expr::Operator::GtEq,
-            datafusion_expr::lit(20000),
+            datafusion_expr::lit(timestamp_to_scalar_value(
+                TimeUnit::Millisecond,
+                Some(20000),
+            )),
         ))],
         output_ordering: Some(vec![OrderOption {
             name: "timestamp".to_string(),

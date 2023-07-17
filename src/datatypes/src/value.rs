@@ -294,7 +294,7 @@ fn new_item_field(data_type: ArrowDataType) -> Field {
     Field::new("item", data_type, false)
 }
 
-fn timestamp_to_scalar_value(unit: TimeUnit, val: Option<i64>) -> ScalarValue {
+pub fn timestamp_to_scalar_value(unit: TimeUnit, val: Option<i64>) -> ScalarValue {
     match unit {
         TimeUnit::Second => ScalarValue::TimestampSecond(val, None),
         TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(val, None),
@@ -1006,10 +1006,10 @@ mod tests {
         );
 
         let result: Result<Value> = ScalarValue::Decimal128(Some(1), 0, 0).try_into();
-        result
+        assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Unsupported arrow data type, type: Decimal(0, 0)");
+            .contains("Unsupported arrow data type, type: Decimal128(0, 0)"));
     }
 
     #[test]

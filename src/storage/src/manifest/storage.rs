@@ -321,6 +321,49 @@ impl ManifestLogStorage for ManifestObjectStore {
         Ok(ret)
     }
 
+    async fn delete_all(&self, remove_action_manifest: ManifestVersion) -> Result<()> {
+        let entries: Vec<Entry> = self.get_paths(Some).await?;
+
+        // Filter out the latest delta file.
+        let paths: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                let name = e.name();
+                if is_delta_file(name) && file_version(name) == remove_action_manifest {
+                    return false;
+                }
+                true
+            })
+            .map(|e| e.path().to_string())
+            .collect();
+
+        logging::info!(
+            "Deleting {} from manifest storage path {} paths: {:?}",
+            paths.len(),
+            self.path,
+            paths,
+        );
+
+        // Delete all files except the latest delta file.
+        self.object_store
+            .remove(paths)
+            .await
+            .with_context(|_| DeleteObjectSnafu {
+                path: self.path.clone(),
+            })?;
+
+        // Delete the latest delta file and the manifest directory.
+        self.object_store
+            .remove_all(&self.path)
+            .await
+            .with_context(|_| DeleteObjectSnafu {
+                path: self.path.clone(),
+            })?;
+        logging::info!("Deleted manifest storage path {}", self.path);
+
+        Ok(())
+    }
+
     async fn save(&self, version: ManifestVersion, bytes: &[u8]) -> Result<()> {
         let path = self.delta_file_path(version);
         logging::debug!("Save log to manifest storage, version: {}", version);
@@ -534,7 +577,7 @@ mod tests {
         common_telemetry::init_default_ut_logging();
         let tmp_dir = create_temp_dir("test_manifest_log_store");
         let mut builder = Fs::default();
-        builder.root(&tmp_dir.path().to_string_lossy());
+        let _ = builder.root(&tmp_dir.path().to_string_lossy());
         let object_store = ObjectStore::new(builder).unwrap().finish();
         ManifestObjectStore::new("/", object_store, CompressionType::Uncompressed)
     }
@@ -610,9 +653,9 @@ mod tests {
         assert_eq!(3, v);
 
         //delete (,4) logs and keep checkpoint 3.
-        log_store.delete_until(4, true).await.unwrap();
-        assert!(log_store.load_checkpoint(3).await.unwrap().is_some());
-        assert!(log_store.load_last_checkpoint().await.unwrap().is_some());
+        let _ = log_store.delete_until(4, true).await.unwrap();
+        let _ = log_store.load_checkpoint(3).await.unwrap().unwrap();
+        let _ = log_store.load_last_checkpoint().await.unwrap().unwrap();
         let mut it = log_store.scan(0, 11).await.unwrap();
         let (version, bytes) = it.next_log().await.unwrap().unwrap();
         assert_eq!(4, version);
@@ -620,7 +663,7 @@ mod tests {
         assert!(it.next_log().await.unwrap().is_none());
 
         // delete all logs and checkpoints
-        log_store.delete_until(11, false).await.unwrap();
+        let _ = log_store.delete_until(11, false).await.unwrap();
         assert!(log_store.load_checkpoint(3).await.unwrap().is_none());
         assert!(log_store.load_last_checkpoint().await.unwrap().is_none());
         let mut it = log_store.scan(0, 11).await.unwrap();

@@ -15,8 +15,8 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use api::v1::ddl_request::Expr as DdlExpr;
-use api::v1::greptime_request::Request as GrpcRequest;
+use api::v1::ddl_request::{Expr as DdlExpr, Expr};
+use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use api::v1::{CreateDatabaseExpr, DdlRequest, DeleteRequest, InsertRequests};
 use async_trait::async_trait;
@@ -42,9 +42,9 @@ use table::requests::CreateDatabaseRequest;
 use table::table::adapter::DfTableProviderAdapter;
 
 use crate::error::{
-    self, CatalogNotFoundSnafu, CatalogSnafu, DecodeLogicalPlanSnafu, DeleteExprToRequestSnafu,
-    DeleteSnafu, ExecuteLogicalPlanSnafu, ExecuteSqlSnafu, InsertDataSnafu, InsertSnafu,
-    JoinTaskSnafu, PlanStatementSnafu, Result, SchemaNotFoundSnafu, TableNotFoundSnafu,
+    self, CatalogSnafu, DecodeLogicalPlanSnafu, DeleteExprToRequestSnafu, DeleteSnafu,
+    ExecuteLogicalPlanSnafu, ExecuteSqlSnafu, InsertDataSnafu, InsertSnafu, JoinTaskSnafu,
+    PlanStatementSnafu, Result, TableNotFoundSnafu,
 };
 use crate::instance::Instance;
 
@@ -74,7 +74,12 @@ impl Instance {
         .await?;
 
         let logical_plan = DFLogicalSubstraitConvertor
-            .decode(plan_bytes.as_slice(), Arc::new(catalog_list) as Arc<_>)
+            .decode(
+                plan_bytes.as_slice(),
+                Arc::new(catalog_list) as Arc<_>,
+                &ctx.current_catalog(),
+                &ctx.current_schema(),
+            )
             .await
             .context(DecodeLogicalPlanSnafu)?;
 
@@ -193,6 +198,7 @@ impl Instance {
             DdlExpr::CreateDatabase(expr) => self.handle_create_database(expr, query_ctx).await,
             DdlExpr::DropTable(expr) => self.handle_drop_table(expr).await,
             DdlExpr::FlushTable(expr) => self.handle_flush_table(expr).await,
+            Expr::CompactTable(expr) => self.handle_compact_table(expr).await,
         }
     }
 }
@@ -201,11 +207,11 @@ impl Instance {
 impl GrpcQueryHandler for Instance {
     type Error = error::Error;
 
-    async fn do_query(&self, request: GrpcRequest, ctx: QueryContextRef) -> Result<Output> {
+    async fn do_query(&self, request: Request, ctx: QueryContextRef) -> Result<Output> {
         match request {
-            GrpcRequest::Inserts(requests) => self.handle_inserts(requests, &ctx).await,
-            GrpcRequest::Delete(request) => self.handle_delete(request, ctx).await,
-            GrpcRequest::Query(query_request) => {
+            Request::Inserts(requests) => self.handle_inserts(requests, &ctx).await,
+            Request::Delete(request) => self.handle_delete(request, ctx).await,
+            Request::Query(query_request) => {
                 let query = query_request
                     .query
                     .context(error::MissingRequiredFieldSnafu {
@@ -213,7 +219,7 @@ impl GrpcQueryHandler for Instance {
                     })?;
                 self.handle_query(query, ctx).await
             }
-            GrpcRequest::Ddl(request) => self.handle_ddl(request, ctx).await,
+            Request::Ddl(request) => self.handle_ddl(request, ctx).await,
         }
     }
 }
@@ -231,19 +237,10 @@ impl DummySchemaProvider {
         schema_name: String,
         catalog_manager: CatalogManagerRef,
     ) -> Result<Self> {
-        let catalog = catalog_manager
-            .catalog(&catalog_name)
+        let table_names = catalog_manager
+            .table_names(&catalog_name, &schema_name)
             .await
-            .context(CatalogSnafu)?
-            .context(CatalogNotFoundSnafu {
-                name: &catalog_name,
-            })?;
-        let schema = catalog
-            .schema(&schema_name)
-            .await
-            .context(CatalogSnafu)?
-            .context(SchemaNotFoundSnafu { name: &schema_name })?;
-        let table_names = schema.table_names().await.context(CatalogSnafu)?;
+            .unwrap();
         Ok(Self {
             catalog: catalog_name,
             schema: schema_name,
@@ -290,11 +287,11 @@ async fn new_dummy_catalog_list(
     )
     .await?;
     let catalog_provider = MemoryCatalogProvider::new();
-    catalog_provider
+    assert!(catalog_provider
         .register_schema(schema_name, Arc::new(schema_provider) as Arc<_>)
-        .unwrap();
+        .is_ok());
     let catalog_list = MemoryCatalogList::new();
-    catalog_list.register_catalog(
+    let _ = catalog_list.register_catalog(
         catalog_name.to_string(),
         Arc::new(catalog_provider) as Arc<_>,
     );
@@ -335,7 +332,7 @@ mod test {
         let instance = MockInstance::new("test_handle_ddl").await;
         let instance = instance.inner();
 
-        let query = GrpcRequest::Ddl(DdlRequest {
+        let query = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
@@ -344,7 +341,7 @@ mod test {
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
         assert!(matches!(output, Output::AffectedRows(1)));
 
-        let query = GrpcRequest::Ddl(DdlRequest {
+        let query = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::CreateTable(CreateTableExpr {
                 catalog_name: "greptime".to_string(),
                 schema_name: "my_database".to_string(),
@@ -372,7 +369,7 @@ mod test {
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
         assert!(matches!(output, Output::AffectedRows(0)));
 
-        let query = GrpcRequest::Ddl(DdlRequest {
+        let query = Request::Ddl(DdlRequest {
             expr: Some(DdlExpr::Alter(AlterExpr {
                 catalog_name: "greptime".to_string(),
                 schema_name: "my_database".to_string(),
@@ -417,6 +414,7 @@ mod test {
                         },
                     ],
                 })),
+                ..Default::default()
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -447,9 +445,12 @@ mod test {
     async fn test_handle_insert() {
         let instance = MockInstance::new("test_handle_insert").await;
         let instance = instance.inner();
-        test_util::create_test_table(instance, ConcreteDataType::timestamp_millisecond_datatype())
-            .await
-            .unwrap();
+        assert!(test_util::create_test_table(
+            instance,
+            ConcreteDataType::timestamp_millisecond_datatype()
+        )
+        .await
+        .is_ok());
 
         let insert = InsertRequest {
             table_name: "demo".to_string(),
@@ -493,7 +494,7 @@ mod test {
             ..Default::default()
         };
 
-        let query = GrpcRequest::Inserts(InsertRequests {
+        let query = Request::Inserts(InsertRequests {
             inserts: vec![insert],
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -517,11 +518,14 @@ mod test {
     async fn test_handle_delete() {
         let instance = MockInstance::new("test_handle_delete").await;
         let instance = instance.inner();
-        test_util::create_test_table(instance, ConcreteDataType::timestamp_millisecond_datatype())
-            .await
-            .unwrap();
+        assert!(test_util::create_test_table(
+            instance,
+            ConcreteDataType::timestamp_millisecond_datatype()
+        )
+        .await
+        .is_ok());
 
-        let query = GrpcRequest::Query(QueryRequest {
+        let query = Request::Query(QueryRequest {
             query: Some(Query::Sql(
                 "INSERT INTO demo(host, cpu, memory, ts) VALUES \
                             ('host1', 66.6, 1024, 1672201025000),\
@@ -559,7 +563,7 @@ mod test {
             row_count: 1,
         };
 
-        let request = GrpcRequest::Delete(request);
+        let request = Request::Delete(request);
         let output = instance
             .do_query(request, QueryContext::arc())
             .await
@@ -583,11 +587,14 @@ mod test {
     async fn test_handle_query() {
         let instance = MockInstance::new("test_handle_query").await;
         let instance = instance.inner();
-        test_util::create_test_table(instance, ConcreteDataType::timestamp_millisecond_datatype())
-            .await
-            .unwrap();
+        assert!(test_util::create_test_table(
+            instance,
+            ConcreteDataType::timestamp_millisecond_datatype()
+        )
+        .await
+        .is_ok());
 
-        let query = GrpcRequest::Query(QueryRequest {
+        let query = Request::Query(QueryRequest {
             query: Some(Query::Sql(
                 "INSERT INTO demo(host, cpu, memory, ts) VALUES \
                             ('host1', 66.6, 1024, 1672201025000),\
@@ -598,7 +605,7 @@ mod test {
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
         assert!(matches!(output, Output::AffectedRows(2)));
 
-        let query = GrpcRequest::Query(QueryRequest {
+        let query = Request::Query(QueryRequest {
             query: Some(Query::Sql(
                 "SELECT ts, host, cpu, memory FROM demo".to_string(),
             )),

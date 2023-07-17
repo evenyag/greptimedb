@@ -16,6 +16,7 @@ mod health;
 mod heartbeat;
 mod leader;
 mod meta;
+mod node_lease;
 mod route;
 
 use std::collections::HashMap;
@@ -33,51 +34,60 @@ pub fn make_admin_service(meta_srv: MetaSrv) -> Admin {
     let router = Router::new().route("/health", health::HealthHandler);
 
     let router = router.route(
+        "/node-lease",
+        node_lease::NodeLeaseHandler {
+            meta_peer_client: meta_srv.meta_peer_client().clone(),
+        },
+    );
+
+    let router = router.route(
         "/heartbeat",
         heartbeat::HeartBeatHandler {
-            meta_peer_client: meta_srv.meta_peer_client(),
+            meta_peer_client: meta_srv.meta_peer_client().clone(),
         },
     );
 
     let router = router.route(
         "/catalogs",
         meta::CatalogsHandler {
-            kv_store: meta_srv.kv_store(),
+            kv_store: meta_srv.kv_store().clone(),
         },
     );
 
     let router = router.route(
         "/schemas",
         meta::SchemasHandler {
-            kv_store: meta_srv.kv_store(),
+            kv_store: meta_srv.kv_store().clone(),
         },
     );
 
     let router = router.route(
         "/tables",
         meta::TablesHandler {
-            kv_store: meta_srv.kv_store(),
+            kv_store: meta_srv.kv_store().clone(),
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
         },
     );
 
     let router = router.route(
         "/table",
         meta::TableHandler {
-            kv_store: meta_srv.kv_store(),
+            kv_store: meta_srv.kv_store().clone(),
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
         },
     );
 
     let router = router.route(
         "/leader",
         leader::LeaderHandler {
-            election: meta_srv.election(),
+            election: meta_srv.election().cloned(),
         },
     );
 
     let router = router.route(
         "/route",
         route::RouteHandler {
-            kv_store: meta_srv.kv_store(),
+            kv_store: meta_srv.kv_store().clone(),
         },
     );
 
@@ -119,7 +129,7 @@ impl<T> Service<http::Request<T>> for Admin
 where
     T: Send,
 {
-    type Response = http::Response<tonic::body::BoxBody>;
+    type Response = http::Response<BoxBody>;
     type Error = Infallible;
     type Future = BoxFuture<Self::Response, Self::Error>;
 
@@ -170,7 +180,7 @@ impl Router {
     pub fn route(mut self, path: &str, handler: impl HttpHandler + 'static) -> Self {
         check_path(path);
 
-        self.handlers.insert(path.to_owned(), Box::new(handler));
+        let _ = self.handlers.insert(path.to_owned(), Box::new(handler));
 
         self
     }

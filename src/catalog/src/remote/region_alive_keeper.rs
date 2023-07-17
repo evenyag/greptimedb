@@ -92,7 +92,7 @@ impl RegionAliveKeepers {
         }
 
         let mut keepers = self.keepers.lock().await;
-        keepers.insert(table_ident.clone(), keeper.clone());
+        let _ = keepers.insert(table_ident.clone(), keeper.clone());
 
         if self.started.load(Ordering::Relaxed) {
             keeper.start().await;
@@ -237,7 +237,7 @@ impl RegionAliveKeeper {
         let countdown_task_handles = Arc::downgrade(&self.countdown_task_handles);
         let on_task_finished = async move {
             if let Some(x) = countdown_task_handles.upgrade() {
-                x.lock().await.remove(&region);
+                let _ = x.lock().await.remove(&region);
             } // Else the countdown task handles map could be dropped because the keeper is dropped.
         };
         let handle = Arc::new(CountdownTaskHandle::new(
@@ -248,7 +248,7 @@ impl RegionAliveKeeper {
         ));
 
         let mut handles = self.countdown_task_handles.lock().await;
-        handles.insert(region, handle.clone());
+        let _ = handles.insert(region, handle.clone());
 
         if self.started.load(Ordering::Relaxed) {
             handle.start(self.heartbeat_interval_millis).await;
@@ -311,6 +311,10 @@ impl RegionAliveKeeper {
             }
         }
         deadline
+    }
+
+    pub fn table_ident(&self) -> &TableIdent {
+        &self.table_ident
     }
 }
 
@@ -677,7 +681,7 @@ mod test {
         let region = 1;
         assert!(keeper.find_handle(&region).await.is_none());
         keeper.register_region(region).await;
-        assert!(keeper.find_handle(&region).await.is_some());
+        let _ = keeper.find_handle(&region).await.unwrap();
 
         let ten_seconds_later = || Instant::now() + Duration::from_secs(10);
 
@@ -720,7 +724,7 @@ mod test {
         let tx = handle.tx.clone();
 
         // assert countdown task is running
-        assert!(tx.send(CountdownCommand::Start(5000)).await.is_ok());
+        tx.send(CountdownCommand::Start(5000)).await.unwrap();
         assert!(!finished.load(Ordering::Relaxed));
 
         drop(handle);
@@ -772,7 +776,7 @@ mod test {
         };
 
         let table_engine = Arc::new(MockTableEngine::default());
-        table_engine.create_table(ctx, request).await.unwrap();
+        let _ = table_engine.create_table(ctx, request).await.unwrap();
 
         let table_ident = TableIdent {
             catalog: catalog.to_string(),
@@ -788,7 +792,7 @@ mod test {
             region: 1,
             rx,
         };
-        common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_bg(async move {
             task.run().await;
         });
 

@@ -14,10 +14,11 @@
 
 use std::any::Any;
 
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
 use common_procedure::ProcedureId;
 use serde_json::error::Error as JsonError;
-use snafu::Location;
+use snafu::{Location, Snafu};
 use store_api::storage::RegionNumber;
 use table::error::Error as TableError;
 
@@ -196,8 +197,11 @@ pub enum Error {
         source: sql::error::Error,
     },
 
-    #[snafu(display("Missing insert body"))]
-    MissingInsertBody { location: Location },
+    #[snafu(display("Missing insert body, source: {source}"))]
+    MissingInsertBody {
+        source: sql::error::Error,
+        location: Location,
+    },
 
     #[snafu(display("Failed to insert value to table: {}, source: {}", table_name, source))]
     Insert {
@@ -339,13 +343,6 @@ pub enum Error {
 
     #[snafu(display("Failed to access catalog, source: {}", source))]
     Catalog {
-        location: Location,
-        source: catalog::error::Error,
-    },
-
-    #[snafu(display("Failed to find table {} from catalog, source: {}", table_name, source))]
-    FindTable {
-        table_name: String,
         location: Location,
         source: catalog::error::Error,
     },
@@ -496,7 +493,6 @@ impl ErrorExt for Error {
 
             DecodeLogicalPlan { source, .. } => source.status_code(),
             NewCatalog { source, .. } | RegisterSchema { source, .. } => source.status_code(),
-            FindTable { source, .. } => source.status_code(),
             CreateTable { source, .. } => source.status_code(),
             DropTable { source, .. } => source.status_code(),
             FlushTable { source, .. } => source.status_code(),
@@ -527,7 +523,6 @@ impl ErrorExt for Error {
             | ConstraintNotSupported { .. }
             | SchemaExists { .. }
             | ParseTimestamp { .. }
-            | MissingInsertBody { .. }
             | DatabaseNotFound { .. }
             | MissingNodeId { .. }
             | MissingMetasrvOpts { .. }
@@ -555,6 +550,7 @@ impl ErrorExt for Error {
             | Catalog { .. }
             | MissingRequiredField { .. }
             | IncorrectInternalState { .. }
+            | MissingInsertBody { .. }
             | ShutdownInstance { .. }
             | CloseTableEngine { .. }
             | JoinTask { .. } => StatusCode::Internal,
@@ -596,6 +592,8 @@ impl From<Error> for tonic::Status {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
+    use snafu::ResultExt;
 
     use super::*;
 

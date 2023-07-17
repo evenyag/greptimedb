@@ -19,8 +19,9 @@ use api::v1::meta::{HeartbeatRequest, RegionLease, Role};
 use async_trait::async_trait;
 use catalog::helper::TableGlobalKey;
 use common_meta::ident::TableIdent;
+use common_meta::key::TableMetadataManagerRef;
 use common_meta::ClusterId;
-use store_api::storage::RegionNumber;
+use store_api::storage::{RegionId, RegionNumber};
 
 use crate::error::Result;
 use crate::handler::{HeartbeatAccumulator, HeartbeatHandler};
@@ -37,16 +38,20 @@ pub(crate) const REGION_LEASE_SECONDS: u64 = 20;
 pub(crate) struct RegionLeaseHandler {
     kv_store: KvStoreRef,
     region_failover_manager: Option<Arc<RegionFailoverManager>>,
+    #[allow(unused)]
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl RegionLeaseHandler {
     pub(crate) fn new(
         kv_store: KvStoreRef,
         region_failover_manager: Option<Arc<RegionFailoverManager>>,
+        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             kv_store,
             region_failover_manager,
+            table_metadata_manager,
         }
     }
 
@@ -102,7 +107,7 @@ impl HeartbeatHandler for RegionLeaseHandler {
             datanode_regions
                 .entry(key)
                 .or_insert_with(Vec::new)
-                .push(table::engine::region_number(x.id));
+                .push(RegionId::from(x.id).region_number());
         });
 
         // TODO(LFC): Retrieve table global values from some cache here.
@@ -149,10 +154,12 @@ impl HeartbeatHandler for RegionLeaseHandler {
 #[cfg(test)]
 mod test {
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_meta::key::TableMetadataManager;
 
     use super::*;
     use crate::handler::node_stat::{RegionStat, Stat};
     use crate::metasrv::builder::MetaSrvBuilder;
+    use crate::service::store::kv::KvBackendAdapter;
     use crate::test_util;
 
     #[tokio::test]
@@ -165,6 +172,9 @@ mod test {
             .clone();
 
         let table_name = "my_table";
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(KvBackendAdapter::wrap(
+            kv_store.clone(),
+        )));
         let _ = table_routes::tests::prepare_table_global_value(&kv_store, table_name).await;
 
         let table_ident = TableIdent {
@@ -174,7 +184,7 @@ mod test {
             table_id: 1,
             engine: "mito".to_string(),
         };
-        region_failover_manager
+        let _ = region_failover_manager
             .running_procedures()
             .write()
             .unwrap()
@@ -184,7 +194,11 @@ mod test {
                 region_number: 1,
             });
 
-        let handler = RegionLeaseHandler::new(kv_store, Some(region_failover_manager));
+        let handler = RegionLeaseHandler::new(
+            kv_store,
+            Some(region_failover_manager),
+            table_metadata_manager,
+        );
 
         let req = HeartbeatRequest {
             duration_since_epoch: 1234,

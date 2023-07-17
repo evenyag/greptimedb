@@ -16,7 +16,7 @@ pub mod distributed;
 mod grpc;
 mod influxdb;
 mod opentsdb;
-mod prometheus;
+mod prom_store;
 mod script;
 mod standalone;
 
@@ -39,6 +39,7 @@ use common_error::ext::BoxedError;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::HandlerGroupExecutor;
+use common_meta::key::TableMetadataManager;
 use common_query::Output;
 use common_telemetry::logging::{debug, info};
 use common_telemetry::timer;
@@ -47,9 +48,7 @@ use datanode::instance::sql::table_idents_to_full_name;
 use datanode::instance::InstanceRef as DnInstanceRef;
 use datatypes::schema::Schema;
 use distributed::DistInstance;
-use futures::future;
 use meta_client::client::{MetaClient, MetaClientBuilder};
-use meta_client::MetaClientOptions;
 use partition::manager::PartitionRuleManager;
 use partition::route::TableRoutes;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
@@ -59,12 +58,14 @@ use query::query_engine::DescribeResult;
 use query::{QueryEngineFactory, QueryEngineRef};
 use servers::error as server_error;
 use servers::error::{ExecuteQuerySnafu, ParsePromQLSnafu};
-use servers::interceptor::{SqlQueryInterceptor, SqlQueryInterceptorRef};
-use servers::prom::PromHandler;
+use servers::interceptor::{
+    PromQueryInterceptor, PromQueryInterceptorRef, SqlQueryInterceptor, SqlQueryInterceptorRef,
+};
+use servers::prometheus::PrometheusHandler;
 use servers::query_handler::grpc::{GrpcQueryHandler, GrpcQueryHandlerRef};
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
-    InfluxdbLineProtocolHandler, OpentsdbProtocolHandler, PrometheusProtocolHandler, ScriptHandler,
+    InfluxdbLineProtocolHandler, OpentsdbProtocolHandler, PromStoreProtocolHandler, ScriptHandler,
 };
 use session::context::QueryContextRef;
 use snafu::prelude::*;
@@ -95,9 +96,9 @@ pub trait FrontendInstance:
     + SqlQueryHandler<Error = Error>
     + OpentsdbProtocolHandler
     + InfluxdbLineProtocolHandler
-    + PrometheusProtocolHandler
+    + PromStoreProtocolHandler
     + ScriptHandler
-    + PromHandler
+    + PrometheusHandler
     + Send
     + Sync
     + 'static
@@ -136,29 +137,33 @@ impl Instance {
 
         let datanode_clients = Arc::new(DatanodeClients::default());
 
-        Self::try_new_distributed_with(meta_client, datanode_clients, plugins).await
+        Self::try_new_distributed_with(meta_client, datanode_clients, plugins, opts).await
     }
 
     pub async fn try_new_distributed_with(
         meta_client: Arc<MetaClient>,
         datanode_clients: Arc<DatanodeClients>,
         plugins: Arc<Plugins>,
+        opts: &FrontendOptions,
     ) -> Result<Self> {
         let meta_backend = Arc::new(CachedMetaKvBackend::new(meta_client.clone()));
         let table_routes = Arc::new(TableRoutes::new(meta_client.clone()));
         let partition_manager = Arc::new(PartitionRuleManager::new(table_routes));
 
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(meta_backend.clone()));
         let mut catalog_manager = FrontendCatalogManager::new(
             meta_backend.clone(),
             meta_backend.clone(),
             partition_manager.clone(),
             datanode_clients.clone(),
+            table_metadata_manager.clone(),
         );
 
         let dist_instance = DistInstance::new(
             meta_client.clone(),
             Arc::new(catalog_manager.clone()),
             datanode_clients.clone(),
+            table_metadata_manager.clone(),
         );
         let dist_instance = Arc::new(dist_instance);
 
@@ -195,8 +200,8 @@ impl Instance {
 
         let heartbeat_task = Some(HeartbeatTask::new(
             meta_client,
-            5,
-            5,
+            opts.heartbeat_interval_millis,
+            opts.retry_interval_millis,
             Arc::new(handlers_executor),
         ));
 
@@ -214,33 +219,37 @@ impl Instance {
     }
 
     async fn create_meta_client(opts: &FrontendOptions) -> Result<Arc<MetaClient>> {
-        let metasrv_addr = &opts
+        let meta_client_options = opts
             .meta_client_options
             .as_ref()
-            .context(MissingMetasrvOptsSnafu)?
-            .metasrv_addrs;
+            .context(MissingMetasrvOptsSnafu)?;
         info!(
             "Creating Frontend instance in distributed mode with Meta server addr {:?}",
-            metasrv_addr
+            meta_client_options.metasrv_addrs
         );
 
-        let meta_config = MetaClientOptions::default();
         let channel_config = ChannelConfig::new()
-            .timeout(Duration::from_millis(meta_config.timeout_millis))
-            .connect_timeout(Duration::from_millis(meta_config.connect_timeout_millis))
-            .tcp_nodelay(meta_config.tcp_nodelay);
-
+            .timeout(Duration::from_millis(meta_client_options.timeout_millis))
+            .connect_timeout(Duration::from_millis(
+                meta_client_options.connect_timeout_millis,
+            ))
+            .tcp_nodelay(meta_client_options.tcp_nodelay);
+        let ddl_channel_config = channel_config.clone().timeout(Duration::from_millis(
+            meta_client_options.ddl_timeout_millis,
+        ));
         let channel_manager = ChannelManager::with_config(channel_config);
-        channel_manager.start_channel_recycle();
+        let ddl_channel_manager = ChannelManager::with_config(ddl_channel_config);
 
         let mut meta_client = MetaClientBuilder::new(0, 0, Role::Frontend)
             .enable_router()
             .enable_store()
             .enable_heartbeat()
+            .enable_ddl()
             .channel_manager(channel_manager)
+            .ddl_channel_manager(ddl_channel_manager)
             .build();
         meta_client
-            .start(metasrv_addr)
+            .start(&meta_client_options.metasrv_addrs)
             .await
             .context(error::StartMetaClientSnafu)?;
         Ok(Arc::new(meta_client))
@@ -288,13 +297,10 @@ impl Instance {
         requests: InsertRequests,
         ctx: QueryContextRef,
     ) -> Result<Output> {
-        let _ = future::join_all(
-            requests
-                .inserts
-                .iter()
-                .map(|x| self.create_or_alter_table_on_demand(ctx.clone(), x)),
-        )
-        .await;
+        for req in requests.inserts.iter() {
+            self.create_or_alter_table_on_demand(ctx.clone(), req)
+                .await?;
+        }
 
         let query = Request::Inserts(requests);
         GrpcQueryHandler::do_query(&*self.grpc_query_handler, query, ctx).await
@@ -324,7 +330,8 @@ impl Instance {
                     "Table {}.{}.{} does not exist, try create table",
                     catalog_name, schema_name, table_name,
                 );
-                self.create_table_by_columns(ctx, table_name, columns, MITO_ENGINE)
+                let _ = self
+                    .create_table_by_columns(ctx, table_name, columns, MITO_ENGINE)
                     .await?;
                 info!(
                     "Successfully created table on insertion: {}.{}.{}",
@@ -343,7 +350,8 @@ impl Instance {
                         "Find new columns {:?} on insertion, try to alter table: {}.{}.{}",
                         add_columns, catalog_name, schema_name, table_name
                     );
-                    self.add_new_columns_to_table(ctx, table_name, add_columns)
+                    let _ = self
+                        .add_new_columns_to_table(ctx, table_name, add_columns)
                         .await?;
                     info!(
                         "Successfully altered table on insertion: {}.{}.{}",
@@ -402,6 +410,7 @@ impl Instance {
             schema_name: ctx.current_schema(),
             table_name: table_name.to_string(),
             kind: Some(Kind::AddColumns(add_columns)),
+            ..Default::default()
         };
 
         self.grpc_query_handler
@@ -522,7 +531,7 @@ impl SqlQueryHandler for Instance {
         query: &PromQuery,
         query_ctx: QueryContextRef,
     ) -> Vec<Result<Output>> {
-        let result = PromHandler::do_query(self, query, query_ctx)
+        let result = PrometheusHandler::do_query(self, query, query_ctx)
             .await
             .with_context(|_| ExecutePromqlSnafu {
                 query: format!("{query:?}"),
@@ -557,31 +566,38 @@ impl SqlQueryHandler for Instance {
 
     async fn is_valid_schema(&self, catalog: &str, schema: &str) -> Result<bool> {
         self.catalog_manager
-            .schema(catalog, schema)
+            .schema_exist(catalog, schema)
             .await
-            .map(|s| s.is_some())
             .context(error::CatalogSnafu)
     }
 }
 
 #[async_trait]
-impl PromHandler for Instance {
+impl PrometheusHandler for Instance {
     async fn do_query(
         &self,
         query: &PromQuery,
         query_ctx: QueryContextRef,
     ) -> server_error::Result<Output> {
+        let interceptor = self
+            .plugins
+            .get::<PromQueryInterceptorRef<server_error::Error>>();
+        interceptor.pre_execute(query, query_ctx.clone())?;
+
         let stmt = QueryLanguageParser::parse_promql(query).with_context(|_| ParsePromQLSnafu {
             query: query.clone(),
         })?;
 
-        self.statement_executor
-            .execute_stmt(stmt, query_ctx)
+        let output = self
+            .statement_executor
+            .execute_stmt(stmt, query_ctx.clone())
             .await
             .map_err(BoxedError::new)
             .with_context(|_| ExecuteQuerySnafu {
                 query: format!("{query:?}"),
-            })
+            })?;
+
+        Ok(interceptor.post_execute(output, query_ctx)?)
     }
 }
 
@@ -635,6 +651,9 @@ pub fn check_permission(
         },
         Statement::Copy(sql::statements::copy::Copy::CopyDatabase(stmt)) => {
             validate_param(&stmt.database_name, query_ctx)?
+        }
+        Statement::TruncateTable(stmt) => {
+            validate_param(stmt.table_name(), query_ctx)?;
         }
     }
     Ok(())
@@ -710,7 +729,7 @@ mod tests {
             ..Default::default()
         };
         // If nullable is true, it doesn't matter whether the insert request has the column.
-        assert!(validate_insert_request(&schema, &request).is_ok());
+        validate_insert_request(&schema, &request).unwrap();
 
         let schema = Schema::new(vec![
             ColumnSchema::new("a", ConcreteDataType::int32_datatype(), false)
@@ -734,7 +753,7 @@ mod tests {
         };
         // If nullable is false, but the column is defined with default value,
         // it also doesn't matter whether the insert request has the column.
-        assert!(validate_insert_request(&schema, &request).is_ok());
+        validate_insert_request(&schema, &request).unwrap();
 
         let request = InsertRequest {
             columns: vec![Column {
@@ -771,7 +790,7 @@ mod tests {
         assert_eq!(stmts.len(), 4);
         for stmt in stmts {
             let re = check_permission(plugins.clone(), &stmt, &query_ctx);
-            assert!(re.is_ok());
+            re.unwrap();
         }
 
         let sql = r#"
@@ -782,13 +801,13 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         for stmt in stmts {
             let re = check_permission(plugins.clone(), &stmt, &query_ctx);
-            assert!(re.is_ok());
+            re.unwrap();
         }
 
         let sql = "USE randomschema";
         let stmts = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
         let re = check_permission(plugins.clone(), &stmts[0], &query_ctx);
-        assert!(re.is_ok());
+        re.unwrap();
 
         fn replace_test(template_sql: &str, plugins: Arc<Plugins>, query_ctx: &QueryContextRef) {
             // test right
@@ -811,10 +830,10 @@ mod tests {
         }
 
         fn do_fmt(template: &str, catalog: &str, schema: &str) -> String {
-            let mut vars = HashMap::new();
-            vars.insert("catalog".to_string(), catalog);
-            vars.insert("schema".to_string(), schema);
-
+            let vars = HashMap::from([
+                ("catalog".to_string(), catalog),
+                ("schema".to_string(), schema),
+            ]);
             template.format(&vars).unwrap()
         }
 
@@ -822,7 +841,7 @@ mod tests {
             let stmt = &parse_stmt(sql, &GreptimeDbDialect {}).unwrap()[0];
             let re = check_permission(plugins, stmt, query_ctx);
             if is_ok {
-                assert!(re.is_ok());
+                re.unwrap();
             } else {
                 assert!(re.is_err());
             }
@@ -848,8 +867,7 @@ mod tests {
         // test show tables
         let sql = "SHOW TABLES FROM public";
         let stmt = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
-        let re = check_permission(plugins.clone(), &stmt[0], &query_ctx);
-        assert!(re.is_ok());
+        check_permission(plugins.clone(), &stmt[0], &query_ctx).unwrap();
 
         let sql = "SHOW TABLES FROM wrongschema";
         let stmt = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();

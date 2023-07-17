@@ -21,7 +21,7 @@ use api::v1::{
     AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, CreateTableExpr, DropColumn,
     DropColumns, RenameTable,
 };
-use common_error::prelude::BoxedError;
+use common_error::ext::BoxedError;
 use datanode::instance::sql::table_idents_to_full_name;
 use datatypes::schema::ColumnSchema;
 use file_table_engine::table::immutable::ImmutableFileTableOptions;
@@ -99,7 +99,7 @@ pub(crate) async fn create_external_expr(
         .context(error::PrepareImmutableTableSnafu)?;
 
     let meta = ImmutableFileTableOptions { files };
-    options.insert(
+    let _ = options.insert(
         IMMUTABLE_TABLE_META_KEY.to_string(),
         serde_json::to_string(&meta).context(error::EncodeJsonSnafu)?,
     );
@@ -320,6 +320,7 @@ pub(crate) fn to_alter_expr(
         schema_name,
         table_name,
         kind: Some(kind),
+        ..Default::default()
     })
 }
 

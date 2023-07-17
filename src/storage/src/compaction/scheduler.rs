@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +23,8 @@ use store_api::storage::RegionId;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::Notify;
 
-use crate::compaction::picker::Picker;
 use crate::compaction::task::CompactionTask;
+use crate::compaction::CompactionPickerRef;
 use crate::error::Result;
 use crate::manifest::region::RegionManifest;
 use crate::region::{RegionWriterRef, SharedDataRef};
@@ -55,7 +56,7 @@ impl<S: LogStore> Request for CompactionRequestImpl<S> {
 pub struct CompactionRequestImpl<S: LogStore> {
     pub region_id: RegionId,
     pub sst_layer: AccessLayerRef,
-    pub writer: RegionWriterRef,
+    pub writer: RegionWriterRef<S>,
     pub shared: SharedDataRef,
     pub manifest: RegionManifest,
     pub wal: Wal<S>,
@@ -63,8 +64,10 @@ pub struct CompactionRequestImpl<S: LogStore> {
     pub compaction_time_window: Option<i64>,
     /// Compaction result sender.
     pub sender: Option<Sender<Result<()>>>,
-
+    pub picker: CompactionPickerRef<S>,
     pub sst_write_buffer_size: ReadableSize,
+    /// Whether to immediately reschedule another compaction when finished.
+    pub reschedule_on_finish: bool,
 }
 
 impl<S: LogStore> CompactionRequestImpl<S> {
@@ -79,18 +82,40 @@ impl<S: LogStore> CompactionRequestImpl<S> {
     }
 }
 
-pub struct CompactionHandler<P> {
-    pub picker: P,
+pub struct CompactionHandler<S: LogStore> {
+    _phantom_data: PhantomData<S>,
     #[cfg(test)]
     pub pending_tasks: Arc<tokio::sync::RwLock<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
+impl<S: LogStore> Default for CompactionHandler<S> {
+    fn default() -> Self {
+        Self {
+            _phantom_data: Default::default(),
+            #[cfg(test)]
+            pending_tasks: Arc::new(Default::default()),
+        }
+    }
+}
+
+impl<S: LogStore> CompactionHandler<S> {
+    #[cfg(test)]
+    pub fn new_with_pending_tasks(
+        tasks: Arc<tokio::sync::RwLock<Vec<tokio::task::JoinHandle<()>>>>,
+    ) -> Self {
+        Self {
+            _phantom_data: Default::default(),
+            pending_tasks: tasks,
+        }
+    }
+}
+
 #[async_trait::async_trait]
-impl<P> Handler for CompactionHandler<P>
+impl<S> Handler for CompactionHandler<S>
 where
-    P: Picker + Send + Sync,
+    S: LogStore,
 {
-    type Request = P::Request;
+    type Request = CompactionRequestImpl<S>;
 
     async fn handle_request(
         &self,
@@ -99,7 +124,7 @@ where
         finish_notifier: Arc<Notify>,
     ) -> Result<()> {
         let region_id = req.key();
-        let Some(task) = self.picker.pick(&req)? else {
+        let Some(task) = req.picker.pick(&req)? else {
             info!("No file needs compaction in region: {:?}", region_id);
             req.complete(Ok(()));
             return Ok(());

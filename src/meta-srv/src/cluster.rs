@@ -13,24 +13,31 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use api::v1::meta::cluster_client::ClusterClient;
 use api::v1::meta::{
-    BatchGetRequest, BatchGetResponse, KeyValue, RangeRequest, RangeResponse, ResponseHeader,
+    BatchGetRequest as PbBatchGetRequest, BatchGetResponse as PbBatchGetResponse,
+    RangeRequest as PbRangeRequest, RangeResponse as PbRangeResponse, ResponseHeader,
 };
 use common_grpc::channel_manager::ChannelManager;
+use common_meta::rpc::store::{BatchGetRequest, RangeRequest};
+use common_meta::rpc::KeyValue;
+use common_meta::util;
 use common_telemetry::warn;
 use derive_builder::Builder;
 use snafu::{ensure, OptionExt, ResultExt};
 
+use crate::error;
 use crate::error::{match_for_io_error, Result};
 use crate::keys::{StatKey, StatValue, DN_STAT_PREFIX};
 use crate::metasrv::ElectionRef;
 use crate::service::store::kv::ResettableKvStoreRef;
-use crate::{error, util};
 
-#[derive(Builder, Clone)]
+pub type MetaPeerClientRef = Arc<MetaPeerClient>;
+
+#[derive(Builder)]
 pub struct MetaPeerClient {
     election: Option<ElectionRef>,
     in_memory: ResettableKvStoreRef,
@@ -109,13 +116,13 @@ impl MetaPeerClient {
             .get(&leader_addr)
             .context(error::CreateChannelSnafu)?;
 
-        let request = tonic::Request::new(RangeRequest {
+        let request = tonic::Request::new(PbRangeRequest {
             key,
             range_end,
             ..Default::default()
         });
 
-        let response: RangeResponse = ClusterClient::new(channel)
+        let response: PbRangeResponse = ClusterClient::new(channel)
             .range(request)
             .await
             .context(error::RangeSnafu)?
@@ -123,16 +130,13 @@ impl MetaPeerClient {
 
         check_resp_header(&response.header, Context { addr: &leader_addr })?;
 
-        Ok(response.kvs)
+        Ok(response.kvs.into_iter().map(KeyValue::new).collect())
     }
 
     // Get kv information from the leader's in_mem kv store
     pub async fn batch_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<KeyValue>> {
         if self.is_leader() {
-            let request = BatchGetRequest {
-                keys,
-                ..Default::default()
-            };
+            let request = BatchGetRequest { keys };
 
             return self.in_memory.batch_get(request).await.map(|resp| resp.kvs);
         }
@@ -172,12 +176,12 @@ impl MetaPeerClient {
             .get(&leader_addr)
             .context(error::CreateChannelSnafu)?;
 
-        let request = tonic::Request::new(BatchGetRequest {
+        let request = tonic::Request::new(PbBatchGetRequest {
             keys,
             ..Default::default()
         });
 
-        let response: BatchGetResponse = ClusterClient::new(channel)
+        let response: PbBatchGetResponse = ClusterClient::new(channel)
             .batch_get(request)
             .await
             .context(error::BatchGetSnafu)?
@@ -185,7 +189,7 @@ impl MetaPeerClient {
 
         check_resp_header(&response.header, Context { addr: &leader_addr })?;
 
-        Ok(response.kvs)
+        Ok(response.kvs.into_iter().map(KeyValue::new).collect())
     }
 
     // Check if the meta node is a leader node.
@@ -201,7 +205,7 @@ impl MetaPeerClient {
 fn to_stat_kv_map(kvs: Vec<KeyValue>) -> Result<HashMap<StatKey, StatValue>> {
     let mut map = HashMap::with_capacity(kvs.len());
     for kv in kvs {
-        map.insert(kv.key.try_into()?, kv.value.try_into()?);
+        let _ = map.insert(kv.key.try_into()?, kv.value.try_into()?);
     }
     Ok(map)
 }
@@ -237,7 +241,8 @@ fn need_retry(error: &error::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use api::v1::meta::{Error, ErrorCode, KeyValue, ResponseHeader};
+    use api::v1::meta::{Error, ErrorCode, ResponseHeader};
+    use common_meta::rpc::KeyValue;
 
     use super::{check_resp_header, to_stat_kv_map, Context};
     use crate::error;
@@ -255,7 +260,6 @@ mod tests {
             cluster_id: 0,
             id: 100,
             addr: "127.0.0.1:3001".to_string(),
-            is_leader: true,
             ..Default::default()
         };
         let stat_val = StatValue { stats: vec![stat] }.try_into().unwrap();
@@ -267,7 +271,7 @@ mod tests {
 
         let kv_map = to_stat_kv_map(vec![kv]).unwrap();
         assert_eq!(1, kv_map.len());
-        assert!(kv_map.get(&stat_key).is_some());
+        let _ = kv_map.get(&stat_key).unwrap();
 
         let stat_val = kv_map.get(&stat_key).unwrap();
         let stat = stat_val.stats.get(0).unwrap();
@@ -275,7 +279,6 @@ mod tests {
         assert_eq!(0, stat.cluster_id);
         assert_eq!(100, stat.id);
         assert_eq!("127.0.0.1:3001", stat.addr);
-        assert!(stat.is_leader);
     }
 
     #[test]
@@ -284,8 +287,7 @@ mod tests {
             error: None,
             ..Default::default()
         });
-        let result = check_resp_header(&header, mock_ctx());
-        assert!(result.is_ok());
+        check_resp_header(&header, mock_ctx()).unwrap();
 
         let result = check_resp_header(&None, mock_ctx());
         assert!(result.is_err());

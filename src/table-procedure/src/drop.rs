@@ -23,13 +23,12 @@ use common_procedure::{
 };
 use common_telemetry::logging;
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt};
+use snafu::{ensure, ResultExt};
 use table::engine::{EngineContext, TableEngineProcedureRef, TableReference};
 use table::requests::DropTableRequest;
 
 use crate::error::{
-    AccessCatalogSnafu, DeregisterTableSnafu, DeserializeProcedureSnafu, SerializeProcedureSnafu,
-    TableNotFoundSnafu,
+    AccessCatalogSnafu, DeserializeProcedureSnafu, SerializeProcedureSnafu, TableNotFoundSnafu,
 };
 
 /// Procedure to drop a table.
@@ -123,17 +122,21 @@ impl DropTableProcedure {
     async fn on_prepare(&mut self) -> Result<Status> {
         let request = &self.data.request;
         // Ensure the table exists.
-        self.catalog_manager
-            .table(
+        let table_exists = self
+            .catalog_manager
+            .table_exist(
                 &request.catalog_name,
                 &request.schema_name,
                 &request.table_name,
             )
             .await
-            .context(AccessCatalogSnafu)?
-            .context(TableNotFoundSnafu {
+            .context(AccessCatalogSnafu)?;
+        ensure!(
+            table_exists,
+            TableNotFoundSnafu {
                 name: &request.table_name,
-            })?;
+            }
+        );
 
         self.data.state = DropTableState::RemoveFromCatalog;
 
@@ -159,17 +162,10 @@ impl DropTableProcedure {
                 schema: self.data.request.schema_name.clone(),
                 table_name: self.data.request.table_name.clone(),
             };
-            if !self
-                .catalog_manager
+            self.catalog_manager
                 .deregister_table(deregister_table_req)
                 .await
-                .context(AccessCatalogSnafu)?
-            {
-                return DeregisterTableSnafu {
-                    name: request.table_ref().to_string(),
-                }
-                .fail()?;
-            }
+                .context(AccessCatalogSnafu)?;
         }
 
         self.data.state = DropTableState::EngineDropTable;
@@ -298,13 +294,11 @@ mod tests {
         let mut watcher = procedure_manager.submit(procedure_with_id).await.unwrap();
         watcher.changed().await.unwrap();
 
-        let catalog = catalog_manager
-            .catalog(DEFAULT_CATALOG_NAME)
+        assert!(!catalog_manager
+            .table_exist(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, table_name)
             .await
-            .unwrap()
-            .unwrap();
-        let schema = catalog.schema(DEFAULT_SCHEMA_NAME).await.unwrap().unwrap();
-        assert!(schema.table(table_name).await.unwrap().is_none());
+            .unwrap());
+
         let ctx = EngineContext::default();
         assert!(!table_engine.table_exists(&ctx, table_id,));
     }

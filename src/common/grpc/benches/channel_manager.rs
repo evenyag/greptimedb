@@ -27,7 +27,7 @@ async fn do_bench_channel_manager() {
             for _ in 0..10000 {
                 let idx = rand::random::<usize>() % 100;
                 let ret = m_clone.get(format!("{idx}"));
-                assert!(ret.is_ok());
+                let _ = ret.unwrap();
             }
         });
         joins.push(join);
@@ -39,7 +39,7 @@ async fn do_bench_channel_manager() {
 }
 
 fn bench_channel_manager(c: &mut Criterion) {
-    c.bench_function("bench channel manager", |b| {
+    let _ = c.bench_function("bench channel manager", |b| {
         b.iter(do_bench_channel_manager);
     });
 }

@@ -23,7 +23,7 @@ use object_store::services::{Fs, S3};
 use object_store::test_util::TempFolder;
 use object_store::{util, ObjectStore, ObjectStoreBuilder};
 use opendal::raw::Accessor;
-use opendal::services::{Azblob, Oss};
+use opendal::services::{Azblob, Gcs, Oss};
 use opendal::{EntryMode, Operator, OperatorBuilder};
 
 async fn test_object_crud(store: &ObjectStore) -> Result<()> {
@@ -47,7 +47,7 @@ async fn test_object_crud(store: &ObjectStore) -> Result<()> {
 
     // Delete object.
     store.delete(file_name).await.unwrap();
-    store.read(file_name).await.unwrap_err();
+    assert!(store.read(file_name).await.is_err());
     Ok(())
 }
 
@@ -89,7 +89,7 @@ async fn test_fs_backend() -> Result<()> {
     let data_dir = create_temp_dir("test_fs_backend");
     let tmp_dir = create_temp_dir("test_fs_backend");
     let mut builder = Fs::default();
-    builder
+    let _ = builder
         .root(&data_dir.path().to_string_lossy())
         .atomic_write_dir(&tmp_dir.path().to_string_lossy());
 
@@ -111,7 +111,7 @@ async fn test_s3_backend() -> Result<()> {
             let root = uuid::Uuid::new_v4().to_string();
 
             let mut builder = S3::default();
-            builder
+            let _ = builder
                 .root(&root)
                 .access_key_id(&env::var("GT_S3_ACCESS_KEY_ID")?)
                 .secret_access_key(&env::var("GT_S3_ACCESS_KEY")?)
@@ -140,7 +140,7 @@ async fn test_oss_backend() -> Result<()> {
             let root = uuid::Uuid::new_v4().to_string();
 
             let mut builder = Oss::default();
-            builder
+            let _ = builder
                 .root(&root)
                 .access_key_id(&env::var("GT_OSS_ACCESS_KEY_ID")?)
                 .access_key_secret(&env::var("GT_OSS_ACCESS_KEY")?)
@@ -168,11 +168,37 @@ async fn test_azblob_backend() -> Result<()> {
             let root = uuid::Uuid::new_v4().to_string();
 
             let mut builder = Azblob::default();
-            builder
+            let _ = builder
                 .root(&root)
                 .account_name(&env::var("GT_AZBLOB_ACCOUNT_NAME")?)
                 .account_key(&env::var("GT_AZBLOB_ACCOUNT_KEY")?)
                 .container(&container);
+
+            let store = ObjectStore::new(builder).unwrap().finish();
+
+            let guard = TempFolder::new(&store, "/");
+            test_object_crud(&store).await?;
+            test_object_list(&store).await?;
+            guard.remove_all().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_gcs_backend() -> Result<()> {
+    logging::init_default_ut_logging();
+    if let Ok(container) = env::var("GT_AZBLOB_CONTAINER") {
+        if !container.is_empty() {
+            logging::info!("Running azblob test.");
+
+            let mut builder = Gcs::default();
+            builder
+                .root(&uuid::Uuid::new_v4().to_string())
+                .bucket(&env::var("GT_GCS_BUCKET").unwrap())
+                .scope(&env::var("GT_GCS_SCOPE").unwrap())
+                .credential_path(&env::var("GT_GCS_CREDENTIAL_PATH").unwrap())
+                .endpoint(&env::var("GT_GCS_ENDPOINT").unwrap());
 
             let store = ObjectStore::new(builder).unwrap().finish();
 
@@ -238,7 +264,7 @@ async fn test_object_store_cache_policy() -> Result<()> {
     // create file cache layer
     let cache_dir = create_temp_dir("test_object_store_cache_policy_cache");
     let mut builder = Fs::default();
-    builder
+    let _ = builder
         .root(&cache_dir.path().to_string_lossy())
         .atomic_write_dir(&cache_dir.path().to_string_lossy());
     let cache_accessor = Arc::new(builder.build().unwrap());
@@ -258,11 +284,11 @@ async fn test_object_store_cache_policy() -> Result<()> {
     store.write(p2, "Hello, object2!").await.unwrap();
 
     // create cache by read object
-    store.range_read(p1, 0..).await?;
-    store.read(p1).await?;
-    store.range_read(p2, 0..).await?;
-    store.range_read(p2, 7..).await?;
-    store.read(p2).await?;
+    let _ = store.range_read(p1, 0..).await?;
+    let _ = store.read(p1).await?;
+    let _ = store.range_read(p2, 0..).await?;
+    let _ = store.range_read(p2, 7..).await?;
+    let _ = store.read(p2).await?;
 
     assert_cache_files(
         &cache_store,
@@ -300,8 +326,8 @@ async fn test_object_store_cache_policy() -> Result<()> {
     let p3 = "test_file3";
     store.write(p3, "Hello, object3!").await.unwrap();
 
-    store.read(p3).await.unwrap();
-    store.range_read(p3, 0..5).await.unwrap();
+    let _ = store.read(p3).await.unwrap();
+    let _ = store.range_read(p3, 0..5).await.unwrap();
 
     assert_cache_files(
         &cache_store,

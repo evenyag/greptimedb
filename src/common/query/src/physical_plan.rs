@@ -150,7 +150,7 @@ impl PhysicalPlan for PhysicalPlanAdapter {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metric.clone_inner())
+        self.df_plan.metrics()
     }
 }
 
@@ -373,7 +373,7 @@ mod test {
             Arc::new(Schema::try_from(df_schema.clone()).unwrap()),
             Arc::new(EmptyExec::new(true, df_schema.clone())),
         );
-        assert!(plan.df_plan.as_any().downcast_ref::<EmptyExec>().is_some());
+        let _ = plan.df_plan.as_any().downcast_ref::<EmptyExec>().unwrap();
 
         let df_plan = DfPhysicalPlanAdapter(Arc::new(plan));
         assert_eq!(df_schema, df_plan.schema());

@@ -14,7 +14,7 @@
 
 use api::v1::InsertRequests;
 use async_trait::async_trait;
-use common_error::prelude::BoxedError;
+use common_error::ext::BoxedError;
 use servers::error as server_error;
 use servers::opentsdb::codec::DataPoint;
 use servers::query_handler::OpentsdbProtocolHandler;
@@ -29,7 +29,8 @@ impl OpentsdbProtocolHandler for Instance {
         let requests = InsertRequests {
             inserts: vec![data_point.as_grpc_insert()],
         };
-        self.handle_inserts(requests, ctx)
+        let _ = self
+            .handle_inserts(requests, ctx)
             .await
             .map_err(BoxedError::new)
             .with_context(|_| server_error::ExecuteQuerySnafu {

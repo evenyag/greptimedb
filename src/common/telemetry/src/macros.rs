@@ -140,6 +140,50 @@ macro_rules! warn {
         $crate::log!(target: $target, $crate::logging::Level::WARN, $($arg)+)
     };
 
+    // warn!(e; "a {} event", "log")
+    ($e:expr; $($arg:tt)+) => ({
+        use std::error::Error;
+        use $crate::common_error::ext::ErrorExt;
+        match ($e.source(), $e.location_opt()) {
+            (Some(source), Some(location)) => {
+                $crate::log!(
+                    $crate::logging::Level::WARN,
+                    err.msg = %$e,
+                    err.code = %$e.status_code(),
+                    err.source = source,
+                    err.location = %location,
+                    $($arg)+
+                )
+            },
+            (Some(source), None) => {
+                $crate::log!(
+                    $crate::logging::Level::WARN,
+                    err.msg = %$e,
+                    err.code = %$e.status_code(),
+                    err.source = source,
+                    $($arg)+
+                )
+            },
+            (None, Some(location)) => {
+                $crate::log!(
+                    $crate::logging::Level::WARN,
+                    err.msg = %$e,
+                    err.code = %$e.status_code(),
+                    err.location = %location,
+                    $($arg)+
+                )
+            },
+            (None, None) => {
+                $crate::log!(
+                    $crate::logging::Level::WARN,
+                    err.msg = %$e,
+                    err.code = %$e.status_code(),
+                    $($arg)+
+                )
+            }
+        }
+    });
+
     // warn!("a {} event", "log")
     ($($arg:tt)+) => {
         $crate::log!($crate::logging::Level::WARN, $($arg)+)
@@ -191,7 +235,7 @@ macro_rules! trace {
 #[cfg(test)]
 mod tests {
     use common_error::mock::MockError;
-    use common_error::prelude::*;
+    use common_error::status_code::StatusCode;
 
     use crate::logging::Level;
 

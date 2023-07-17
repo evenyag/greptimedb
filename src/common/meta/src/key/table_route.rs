@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Display;
+
 use api::v1::meta::TableName;
+use table::metadata::TableId;
 
 use crate::key::to_removed_key;
 
 pub const TABLE_ROUTE_PREFIX: &str = "__meta_table_route";
 
 pub struct TableRouteKey<'a> {
-    pub table_id: u64,
+    pub table_id: TableId,
     pub catalog_name: &'a str,
     pub schema_name: &'a str,
     pub table_name: &'a str,
 }
 
 impl<'a> TableRouteKey<'a> {
-    pub fn with_table_name(table_id: u64, t: &'a TableName) -> Self {
+    pub fn with_table_name(table_id: TableId, t: &'a TableName) -> Self {
         Self {
             table_id,
             catalog_name: &t.catalog_name,
@@ -42,12 +45,14 @@ impl<'a> TableRouteKey<'a> {
         )
     }
 
-    pub fn key(&self) -> String {
-        format!("{}-{}", self.prefix(), self.table_id)
-    }
-
     pub fn removed_key(&self) -> String {
-        to_removed_key(&self.key())
+        to_removed_key(&self.to_string())
+    }
+}
+
+impl<'a> Display for TableRouteKey<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.prefix(), self.table_id)
     }
 }
 
@@ -69,7 +74,7 @@ mod tests {
         let prefix = key.prefix();
         assert_eq!("__meta_table_route-greptime-public-demo", prefix);
 
-        let key_string = key.key();
+        let key_string = key.to_string();
         assert_eq!("__meta_table_route-greptime-public-demo-123", key_string);
 
         let removed = key.removed_key();

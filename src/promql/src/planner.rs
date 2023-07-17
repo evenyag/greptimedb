@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -184,11 +184,8 @@ impl PromPlanner {
                         self.ctx.time_index_column = Some(DEFAULT_TIME_INDEX_COLUMN.to_string());
                         self.ctx.field_columns = vec![DEFAULT_FIELD_COLUMN.to_string()];
                         self.ctx.table_name = Some(String::new());
-                        let field_expr = DfExpr::BinaryExpr(BinaryExpr {
-                            left: Box::new(lhs),
-                            op: Self::prom_token_to_binary_op(*op)?,
-                            right: Box::new(rhs),
-                        });
+                        let field_expr_builder = Self::prom_token_to_binary_expr_builder(*op)?;
+                        let field_expr = field_expr_builder(lhs, rhs)?;
 
                         LogicalPlan::Extension(Extension {
                             node: Arc::new(
@@ -208,11 +205,10 @@ impl PromPlanner {
                     (Some(expr), None) => {
                         let input = self.prom_expr_to_plan(*rhs.clone()).await?;
                         let bin_expr_builder = |col: &String| {
-                            let mut binary_expr = DfExpr::BinaryExpr(BinaryExpr {
-                                left: Box::new(expr.clone()),
-                                op: Self::prom_token_to_binary_op(*op)?,
-                                right: Box::new(DfExpr::Column(col.into())),
-                            });
+                            let binary_expr_builder = Self::prom_token_to_binary_expr_builder(*op)?;
+                            let mut binary_expr =
+                                binary_expr_builder(expr.clone(), DfExpr::Column(col.into()))?;
+
                             if is_comparison_op && should_return_bool {
                                 binary_expr = DfExpr::Cast(Cast {
                                     expr: Box::new(binary_expr),
@@ -231,11 +227,10 @@ impl PromPlanner {
                     (None, Some(expr)) => {
                         let input = self.prom_expr_to_plan(*lhs.clone()).await?;
                         let bin_expr_builder = |col: &String| {
-                            let mut binary_expr = DfExpr::BinaryExpr(BinaryExpr {
-                                left: Box::new(DfExpr::Column(col.into())),
-                                op: Self::prom_token_to_binary_op(*op)?,
-                                right: Box::new(expr.clone()),
-                            });
+                            let binary_expr_builder = Self::prom_token_to_binary_expr_builder(*op)?;
+                            let mut binary_expr =
+                                binary_expr_builder(DfExpr::Column(col.into()), expr.clone())?;
+
                             if is_comparison_op && should_return_bool {
                                 binary_expr = DfExpr::Cast(Cast {
                                     expr: Box::new(binary_expr),
@@ -275,11 +270,11 @@ impl PromPlanner {
                                 .context(DataFusionPlanningSnafu)?
                                 .qualified_column();
 
-                            let mut binary_expr = DfExpr::BinaryExpr(BinaryExpr {
-                                left: Box::new(DfExpr::Column(left_col)),
-                                op: Self::prom_token_to_binary_op(*op)?,
-                                right: Box::new(DfExpr::Column(right_col)),
-                            });
+                            let binary_expr_builder = Self::prom_token_to_binary_expr_builder(*op)?;
+                            let mut binary_expr = binary_expr_builder(
+                                DfExpr::Column(left_col),
+                                DfExpr::Column(right_col),
+                            )?;
                             if is_comparison_op && should_return_bool {
                                 binary_expr = DfExpr::Cast(Cast {
                                     expr: Box::new(binary_expr),
@@ -487,7 +482,7 @@ impl PromPlanner {
                     .get_or_insert_default()
                     .push(matcher.clone());
             } else {
-                matchers.insert(matcher.clone());
+                let _ = matchers.insert(matcher.clone());
             }
         }
         Ok(Matchers { matchers })
@@ -538,7 +533,7 @@ impl PromPlanner {
                 match &matcher.op {
                     MatchOp::Equal => {
                         if col_set.contains(&matcher.value) {
-                            result_set.insert(matcher.value.clone());
+                            let _ = result_set.insert(matcher.value.clone());
                         } else {
                             return Err(ColumnNotFoundSnafu {
                                 col: matcher.value.clone(),
@@ -548,7 +543,7 @@ impl PromPlanner {
                     }
                     MatchOp::NotEqual => {
                         if col_set.contains(&matcher.value) {
-                            reverse_set.insert(matcher.value.clone());
+                            let _ = reverse_set.insert(matcher.value.clone());
                         } else {
                             return Err(ColumnNotFoundSnafu {
                                 col: matcher.value.clone(),
@@ -559,14 +554,14 @@ impl PromPlanner {
                     MatchOp::Re(regex) => {
                         for col in &self.ctx.field_columns {
                             if regex.is_match(col) {
-                                result_set.insert(col.clone());
+                                let _ = result_set.insert(col.clone());
                             }
                         }
                     }
                     MatchOp::NotRe(regex) => {
                         for col in &self.ctx.field_columns {
                             if regex.is_match(col) {
-                                reverse_set.insert(col.clone());
+                                let _ = reverse_set.insert(col.clone());
                             }
                         }
                     }
@@ -577,7 +572,7 @@ impl PromPlanner {
                 result_set = col_set.into_iter().cloned().collect();
             }
             for col in reverse_set {
-                result_set.remove(&col);
+                let _ = result_set.remove(&col);
             }
 
             self.ctx.field_columns = result_set.iter().cloned().collect();
@@ -670,15 +665,15 @@ impl PromPlanner {
                 // remove "without"-ed fields
                 // nonexistence label will be ignored
                 for label in labels {
-                    all_fields.remove(label);
+                    let _ = all_fields.remove(label);
                 }
 
                 // remove time index and value fields
                 if let Some(time_index) = &self.ctx.time_index_column {
-                    all_fields.remove(time_index);
+                    let _ = all_fields.remove(time_index);
                 }
                 for value in &self.ctx.field_columns {
-                    all_fields.remove(value);
+                    let _ = all_fields.remove(value);
                 }
 
                 // change the tag columns in context
@@ -833,9 +828,10 @@ impl PromPlanner {
     fn create_function_expr(
         &mut self,
         func: &Function,
-        mut other_input_exprs: Vec<DfExpr>,
+        other_input_exprs: Vec<DfExpr>,
     ) -> Result<Vec<DfExpr>> {
         // TODO(ruihang): check function args list
+        let mut other_input_exprs: VecDeque<DfExpr> = other_input_exprs.into();
 
         // TODO(ruihang): set this according to in-param list
         let field_column_pos = 0;
@@ -865,8 +861,8 @@ impl PromPlanner {
             "stddev_over_time" => ScalarFunc::Udf(StddevOverTime::scalar_udf()),
             "stdvar_over_time" => ScalarFunc::Udf(StdvarOverTime::scalar_udf()),
             "quantile_over_time" => {
-                let quantile_expr = match other_input_exprs.get(0) {
-                    Some(DfExpr::Literal(ScalarValue::Float64(Some(quantile)))) => *quantile,
+                let quantile_expr = match other_input_exprs.pop_front() {
+                    Some(DfExpr::Literal(ScalarValue::Float64(Some(quantile)))) => quantile,
                     other => UnexpectedPlanExprSnafu {
                         desc: format!("expect f64 literal as quantile, but found {:?}", other),
                     }
@@ -875,8 +871,8 @@ impl PromPlanner {
                 ScalarFunc::Udf(QuantileOverTime::scalar_udf(quantile_expr))
             }
             "predict_linear" => {
-                let t_expr = match other_input_exprs.get(0) {
-                    Some(DfExpr::Literal(ScalarValue::Time64Microsecond(Some(t)))) => *t,
+                let t_expr = match other_input_exprs.pop_front() {
+                    Some(DfExpr::Literal(ScalarValue::Time64Microsecond(Some(t)))) => t,
                     other => UnexpectedPlanExprSnafu {
                         desc: format!("expect i64 literal as t, but found {:?}", other),
                     }
@@ -885,8 +881,8 @@ impl PromPlanner {
                 ScalarFunc::Udf(PredictLinear::scalar_udf(t_expr))
             }
             "holt_winters" => {
-                let sf_exp = match other_input_exprs.get(0) {
-                    Some(DfExpr::Literal(ScalarValue::Float64(Some(sf)))) => *sf,
+                let sf_exp = match other_input_exprs.pop_front() {
+                    Some(DfExpr::Literal(ScalarValue::Float64(Some(sf)))) => sf,
                     other => UnexpectedPlanExprSnafu {
                         desc: format!(
                             "expect f64 literal as smoothing factor, but found {:?}",
@@ -895,8 +891,8 @@ impl PromPlanner {
                     }
                     .fail()?,
                 };
-                let tf_exp = match other_input_exprs.get(1) {
-                    Some(DfExpr::Literal(ScalarValue::Float64(Some(tf)))) => *tf,
+                let tf_exp = match other_input_exprs.pop_front() {
+                    Some(DfExpr::Literal(ScalarValue::Float64(Some(tf)))) => tf,
                     other => UnexpectedPlanExprSnafu {
                         desc: format!("expect f64 literal as trend factor, but found {:?}", other),
                     }
@@ -924,10 +920,10 @@ impl PromPlanner {
                     other_input_exprs.insert(field_column_pos, col_expr);
                     let fn_expr = DfExpr::ScalarFunction(ScalarFunction {
                         fun,
-                        args: other_input_exprs.clone(),
+                        args: other_input_exprs.clone().into(),
                     });
                     exprs.push(fn_expr);
-                    other_input_exprs.remove(field_column_pos);
+                    let _ = other_input_exprs.remove(field_column_pos);
                 }
                 ScalarFunc::Udf(fun) => {
                     let ts_range_expr = DfExpr::Column(Column::from_name(
@@ -939,11 +935,11 @@ impl PromPlanner {
                     other_input_exprs.insert(field_column_pos + 1, col_expr);
                     let fn_expr = DfExpr::ScalarUDF(ScalarUDF {
                         fun: Arc::new(fun),
-                        args: other_input_exprs.clone(),
+                        args: other_input_exprs.clone().into(),
                     });
                     exprs.push(fn_expr);
-                    other_input_exprs.remove(field_column_pos + 1);
-                    other_input_exprs.remove(field_column_pos);
+                    let _ = other_input_exprs.remove(field_column_pos + 1);
+                    let _ = other_input_exprs.remove(field_column_pos);
                 }
                 ScalarFunc::ExtrapolateUdf(fun) => {
                     let ts_range_expr = DfExpr::Column(Column::from_name(
@@ -957,12 +953,12 @@ impl PromPlanner {
                         .insert(field_column_pos + 2, self.create_time_index_column_expr()?);
                     let fn_expr = DfExpr::ScalarUDF(ScalarUDF {
                         fun: Arc::new(fun),
-                        args: other_input_exprs.clone(),
+                        args: other_input_exprs.clone().into(),
                     });
                     exprs.push(fn_expr);
-                    other_input_exprs.remove(field_column_pos + 2);
-                    other_input_exprs.remove(field_column_pos + 1);
-                    other_input_exprs.remove(field_column_pos);
+                    let _ = other_input_exprs.remove(field_column_pos + 2);
+                    let _ = other_input_exprs.remove(field_column_pos + 1);
+                    let _ = other_input_exprs.remove(field_column_pos);
                 }
             }
         }
@@ -1102,35 +1098,65 @@ impl PromPlanner {
             PromExpr::Paren(ParenExpr { expr }) => Self::try_build_literal_expr(expr),
             // TODO(ruihang): support Unary operator
             PromExpr::Unary(UnaryExpr { expr, .. }) => Self::try_build_literal_expr(expr),
-            PromExpr::Binary(PromBinaryExpr { lhs, rhs, op, .. }) => {
+            PromExpr::Binary(PromBinaryExpr {
+                lhs,
+                rhs,
+                op,
+                modifier,
+            }) => {
                 let lhs = Self::try_build_literal_expr(lhs)?;
                 let rhs = Self::try_build_literal_expr(rhs)?;
-                let op = Self::prom_token_to_binary_op(*op).ok()?;
-                Some(DfExpr::BinaryExpr(BinaryExpr {
-                    left: Box::new(lhs),
-                    op,
-                    right: Box::new(rhs),
-                }))
+                let is_comparison_op = Self::is_token_a_comparison_op(*op);
+                let expr_builder = Self::prom_token_to_binary_expr_builder(*op).ok()?;
+                let expr = expr_builder(lhs, rhs).ok()?;
+
+                let should_return_bool = if let Some(m) = modifier {
+                    m.return_bool
+                } else {
+                    false
+                };
+                if is_comparison_op && should_return_bool {
+                    Some(DfExpr::Cast(Cast {
+                        expr: Box::new(expr),
+                        data_type: ArrowDataType::Float64,
+                    }))
+                } else {
+                    Some(expr)
+                }
             }
         }
     }
 
-    fn prom_token_to_binary_op(token: TokenType) -> Result<Operator> {
+    /// Return a lambda to build binary expression from token.
+    /// Because some binary operator are function in DataFusion like `atan2` or `^`.
+    #[allow(clippy::type_complexity)]
+    fn prom_token_to_binary_expr_builder(
+        token: TokenType,
+    ) -> Result<Box<dyn Fn(DfExpr, DfExpr) -> Result<DfExpr>>> {
         match token.id() {
-            token::T_ADD => Ok(Operator::Plus),
-            token::T_SUB => Ok(Operator::Minus),
-            token::T_MUL => Ok(Operator::Multiply),
-            token::T_DIV => Ok(Operator::Divide),
-            token::T_MOD => Ok(Operator::Modulo),
-            token::T_EQLC => Ok(Operator::Eq),
-            token::T_NEQ => Ok(Operator::NotEq),
-            token::T_GTR => Ok(Operator::Gt),
-            token::T_LSS => Ok(Operator::Lt),
-            token::T_GTE => Ok(Operator::GtEq),
-            token::T_LTE => Ok(Operator::LtEq),
-            // TODO(ruihang): support these two operators
-            // token::T_POW => Ok(Operator::Power),
-            // token::T_ATAN2 => Ok(Operator::Atan2),
+            token::T_ADD => Ok(Box::new(|lhs, rhs| Ok(lhs + rhs))),
+            token::T_SUB => Ok(Box::new(|lhs, rhs| Ok(lhs - rhs))),
+            token::T_MUL => Ok(Box::new(|lhs, rhs| Ok(lhs * rhs))),
+            token::T_DIV => Ok(Box::new(|lhs, rhs| Ok(lhs / rhs))),
+            token::T_MOD => Ok(Box::new(|lhs: DfExpr, rhs| Ok(lhs % rhs))),
+            token::T_EQLC => Ok(Box::new(|lhs, rhs| Ok(lhs.eq(rhs)))),
+            token::T_NEQ => Ok(Box::new(|lhs, rhs| Ok(lhs.not_eq(rhs)))),
+            token::T_GTR => Ok(Box::new(|lhs, rhs| Ok(lhs.gt(rhs)))),
+            token::T_LSS => Ok(Box::new(|lhs, rhs| Ok(lhs.lt(rhs)))),
+            token::T_GTE => Ok(Box::new(|lhs, rhs| Ok(lhs.gt_eq(rhs)))),
+            token::T_LTE => Ok(Box::new(|lhs, rhs| Ok(lhs.lt_eq(rhs)))),
+            token::T_POW => Ok(Box::new(|lhs, rhs| {
+                Ok(DfExpr::ScalarFunction(ScalarFunction {
+                    fun: BuiltinScalarFunction::Power,
+                    args: vec![lhs, rhs],
+                }))
+            })),
+            token::T_ATAN2 => Ok(Box::new(|lhs, rhs| {
+                Ok(DfExpr::ScalarFunction(ScalarFunction {
+                    fun: BuiltinScalarFunction::Atan2,
+                    args: vec![lhs, rhs],
+                }))
+            })),
             _ => UnexpectedTokenSnafu { token }.fail(),
         }
     }
@@ -1338,7 +1364,7 @@ mod test {
             .unwrap();
         let table = Arc::new(EmptyTable::from_table_info(&table_info));
         let catalog_list = Arc::new(MemoryCatalogManager::default());
-        catalog_list
+        assert!(catalog_list
             .register_table(RegisterTableRequest {
                 catalog: DEFAULT_CATALOG_NAME.to_string(),
                 schema: DEFAULT_SCHEMA_NAME.to_string(),
@@ -1347,7 +1373,7 @@ mod test {
                 table,
             })
             .await
-            .unwrap();
+            .is_ok());
         DfTableSourceProvider::new(catalog_list, false, &QueryContext::new())
     }
 

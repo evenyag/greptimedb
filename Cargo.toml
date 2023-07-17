@@ -33,6 +33,7 @@ members = [
     "src/meta-client",
     "src/meta-srv",
     "src/mito",
+    "src/mito2",
     "src/object-store",
     "src/partition",
     "src/promql",
@@ -50,7 +51,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.3.2"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -70,14 +71,17 @@ datafusion-optimizer = { git = "https://github.com/waynexia/arrow-datafusion.git
 datafusion-physical-expr = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "63e52dde9e44cac4b1f6c6e6b6bf6368ba3bd323" }
 datafusion-sql = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "63e52dde9e44cac4b1f6c6e6b6bf6368ba3bd323" }
 datafusion-substrait = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "63e52dde9e44cac4b1f6c6e6b6bf6368ba3bd323" }
+etcd-client = "0.11"
 futures = "0.3"
 futures-util = "0.3"
-greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "7aeaeaba1e0ca6a5c736b6ab2eb63144ae3d284b" }
+greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "9b26cca2132df83916692cc6fc092a26a1a76f0b" }
 itertools = "0.10"
+lazy_static = "1.4"
 parquet = "40.0"
 paste = "1.0"
 prost = "0.11"
 rand = "0.8"
+regex = "1.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 snafu = { version = "0.7", features = ["backtraces"] }
@@ -85,14 +89,15 @@ sqlparser = "0.34"
 tempfile = "3"
 tokio = { version = "1.28", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io-util", "compat"] }
+toml = "0.7"
 tonic = { version = "0.9", features = ["tls"] }
 uuid = { version = "1", features = ["serde", "v4", "fast-rng"] }
 metrics = "0.20"
-meter-core = { git = "https://github.com/GreptimeTeam/greptime-meter.git", rev = "f0798c4c648d89f51abe63e870919c75dd463199" }
+meter-core = { git = "https://github.com/GreptimeTeam/greptime-meter.git", rev = "abbd357c1e193cd270ea65ee7652334a150b628f" }
 
 [workspace.dependencies.meter-macros]
 git = "https://github.com/GreptimeTeam/greptime-meter.git"
-rev = "f0798c4c648d89f51abe63e870919c75dd463199"
+rev = "abbd357c1e193cd270ea65ee7652334a150b628f"
 
 [profile.release]
 debug = true

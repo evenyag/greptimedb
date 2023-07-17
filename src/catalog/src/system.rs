@@ -20,8 +20,6 @@ use common_catalog::consts::{
     DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, INFORMATION_SCHEMA_NAME, MITO_ENGINE,
     SYSTEM_CATALOG_NAME, SYSTEM_CATALOG_TABLE_ID, SYSTEM_CATALOG_TABLE_NAME,
 };
-use common_query::logical_plan::Expr;
-use common_query::physical_plan::{PhysicalPlanRef, SessionContext};
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::debug;
 use common_time::util;
@@ -58,15 +56,6 @@ impl Table for SystemCatalogTable {
 
     fn schema(&self) -> SchemaRef {
         self.0.schema()
-    }
-
-    async fn scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> table::Result<PhysicalPlanRef> {
-        self.0.scan(projection, filters, limit).await
     }
 
     async fn scan_to_stream(&self, request: ScanRequest) -> TableResult<SendableRecordBatchStream> {
@@ -136,14 +125,17 @@ impl SystemCatalogTable {
     /// Create a stream of all entries inside system catalog table
     pub async fn records(&self) -> Result<SendableRecordBatchStream> {
         let full_projection = None;
-        let ctx = SessionContext::new();
-        let scan = self
-            .scan(full_projection, &[], None)
+        let scan_req = ScanRequest {
+            sequence: None,
+            projection: full_projection,
+            filters: vec![],
+            output_ordering: None,
+            limit: None,
+        };
+        let stream = self
+            .scan_to_stream(scan_req)
             .await
             .context(error::SystemCatalogTableScanSnafu)?;
-        let stream = scan
-            .execute(0, ctx.task_ctx())
-            .context(error::SystemCatalogTableScanExecSnafu)?;
         Ok(stream)
     }
 }
@@ -211,38 +203,50 @@ pub fn build_table_insert_request(
     build_insert_request(
         EntryType::Table,
         entry_key.as_bytes(),
-        serde_json::to_string(&TableEntryValue { table_name, engine })
-            .unwrap()
-            .as_bytes(),
+        serde_json::to_string(&TableEntryValue {
+            table_name,
+            engine,
+            is_deleted: false,
+        })
+        .unwrap()
+        .as_bytes(),
     )
 }
 
 pub(crate) fn build_table_deletion_request(
     request: &DeregisterTableRequest,
     table_id: TableId,
-) -> DeleteRequest {
-    let table_key = format_table_entry_key(&request.catalog, &request.schema, table_id);
-    DeleteRequest {
-        key_column_values: build_primary_key_columns(EntryType::Table, table_key.as_bytes()),
-    }
+) -> InsertRequest {
+    let entry_key = format_table_entry_key(&request.catalog, &request.schema, table_id);
+    build_insert_request(
+        EntryType::Table,
+        entry_key.as_bytes(),
+        serde_json::to_string(&TableEntryValue {
+            table_name: "".to_string(),
+            engine: "".to_string(),
+            is_deleted: true,
+        })
+        .unwrap()
+        .as_bytes(),
+    )
 }
 
 fn build_primary_key_columns(entry_type: EntryType, key: &[u8]) -> HashMap<String, VectorRef> {
-    let mut m = HashMap::with_capacity(3);
-    m.insert(
-        "entry_type".to_string(),
-        Arc::new(UInt8Vector::from_slice([entry_type as u8])) as _,
-    );
-    m.insert(
-        "key".to_string(),
-        Arc::new(BinaryVector::from_slice(&[key])) as _,
-    );
-    // Timestamp in key part is intentionally left to 0
-    m.insert(
-        "timestamp".to_string(),
-        Arc::new(TimestampMillisecondVector::from_slice([0])) as _,
-    );
-    m
+    HashMap::from([
+        (
+            "entry_type".to_string(),
+            Arc::new(UInt8Vector::from_slice([entry_type as u8])) as VectorRef,
+        ),
+        (
+            "key".to_string(),
+            Arc::new(BinaryVector::from_slice(&[key])) as VectorRef,
+        ),
+        (
+            "timestamp".to_string(),
+            // Timestamp in key part is intentionally left to 0
+            Arc::new(TimestampMillisecondVector::from_slice([0])) as VectorRef,
+        ),
+    ])
 }
 
 pub fn build_schema_insert_request(catalog_name: String, schema_name: String) -> InsertRequest {
@@ -262,18 +266,18 @@ pub fn build_insert_request(entry_type: EntryType, key: &[u8], value: &[u8]) -> 
     let mut columns_values = HashMap::with_capacity(6);
     columns_values.extend(primary_key_columns.into_iter());
 
-    columns_values.insert(
+    let _ = columns_values.insert(
         "value".to_string(),
         Arc::new(BinaryVector::from_slice(&[value])) as _,
     );
 
     let now = util::current_time_millis();
-    columns_values.insert(
+    let _ = columns_values.insert(
         "gmt_created".to_string(),
         Arc::new(TimestampMillisecondVector::from_slice([now])) as _,
     );
 
-    columns_values.insert(
+    let _ = columns_values.insert(
         "gmt_modified".to_string(),
         Arc::new(TimestampMillisecondVector::from_slice([now])) as _,
     );
@@ -343,6 +347,7 @@ pub fn decode_system_catalog(
                 table_name: table_meta.table_name,
                 table_id,
                 engine: table_meta.engine,
+                is_deleted: table_meta.is_deleted,
             }))
         }
     }
@@ -399,6 +404,7 @@ pub struct TableEntry {
     pub table_name: String,
     pub table_id: TableId,
     pub engine: String,
+    pub is_deleted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -407,10 +413,17 @@ pub struct TableEntryValue {
 
     #[serde(default = "mito_engine")]
     pub engine: String,
+
+    #[serde(default = "not_deleted")]
+    pub is_deleted: bool,
 }
 
 fn mito_engine() -> String {
     MITO_ENGINE.to_string()
+}
+
+fn not_deleted() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -482,14 +495,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     pub fn test_decode_mismatch() {
-        decode_system_catalog(
+        assert!(decode_system_catalog(
             Some(EntryType::Table as u8),
             Some("some_catalog.some_schema.42".as_bytes()),
             None,
         )
-        .unwrap();
+        .is_err());
     }
 
     #[test]
@@ -504,7 +516,7 @@ mod tests {
         let dir = create_temp_dir("system-table-test");
         let store_dir = dir.path().to_string_lossy();
         let mut builder = object_store::services::Fs::default();
-        builder.root(&store_dir);
+        let _ = builder.root(&store_dir);
         let object_store = ObjectStore::new(builder).unwrap().finish();
         let noop_compaction_scheduler = Arc::new(NoopCompactionScheduler::default());
         let table_engine = Arc::new(MitoEngine::new(
@@ -572,6 +584,7 @@ mod tests {
             table_name: "my_table".to_string(),
             table_id: 1,
             engine: MITO_ENGINE.to_string(),
+            is_deleted: false,
         });
         assert_eq!(entry, expected);
 
@@ -583,11 +596,11 @@ mod tests {
             },
             1,
         );
-        let result = catalog_table.delete(table_deletion).await.unwrap();
+        let result = catalog_table.insert(table_deletion).await.unwrap();
         assert_eq!(result, 1);
 
         let records = catalog_table.records().await.unwrap();
         let batches = RecordBatches::try_collect(records).await.unwrap().take();
-        assert_eq!(batches.len(), 0);
+        assert_eq!(batches.len(), 1);
     }
 }

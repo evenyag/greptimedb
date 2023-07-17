@@ -16,6 +16,7 @@
 
 pub mod error;
 pub mod local;
+pub mod options;
 mod procedure;
 pub mod store;
 pub mod watcher;

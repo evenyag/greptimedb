@@ -36,7 +36,8 @@ lazy_static! {
     static ref DATANODE_STAT_KEY_PATTERN: Regex =
         Regex::new(&format!("^{DN_STAT_PREFIX}-([0-9]+)-([0-9]+)$")).unwrap();
 }
-#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct LeaseKey {
     pub cluster_id: u64,
     pub node_id: u64,
@@ -277,7 +278,6 @@ mod tests {
         let stat = Stat {
             cluster_id: 0,
             id: 101,
-            is_leader: false,
             region_num: Some(100),
             ..Default::default()
         };
@@ -293,7 +293,6 @@ mod tests {
         let stat = stats.get(0).unwrap();
         assert_eq!(0, stat.cluster_id);
         assert_eq!(101, stat.id);
-        assert!(!stat.is_leader);
         assert_eq!(Some(100), stat.region_num);
     }
 

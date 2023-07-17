@@ -27,6 +27,13 @@ name: CI
 # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks
 
 jobs:
+  typos:
+    name: Spell Check with Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: crate-ci/typos@v1.13.10
+
   check:
     name: Check
     if: github.event.pull_request.draft == false
@@ -49,6 +56,13 @@ jobs:
       - run: 'echo "No action required"'
 
   coverage:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "No action required"'
+
+  sqlness:
+    name: Sqlness Test
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:

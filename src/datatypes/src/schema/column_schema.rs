@@ -87,10 +87,11 @@ impl ColumnSchema {
     pub fn with_time_index(mut self, is_time_index: bool) -> Self {
         self.is_time_index = is_time_index;
         if is_time_index {
-            self.metadata
+            let _ = self
+                .metadata
                 .insert(TIME_INDEX_KEY.to_string(), "true".to_string());
         } else {
-            self.metadata.remove(TIME_INDEX_KEY);
+            let _ = self.metadata.remove(TIME_INDEX_KEY);
         }
         self
     }
@@ -266,8 +267,7 @@ mod tests {
 
     #[test]
     fn test_column_schema_with_metadata() {
-        let mut metadata = Metadata::new();
-        metadata.insert("k1".to_string(), "v1".to_string());
+        let metadata = Metadata::from([("k1".to_string(), "v1".to_string())]);
         let column_schema = ColumnSchema::new("test", ConcreteDataType::int32_datatype(), true)
             .with_metadata(metadata)
             .with_default_constraint(Some(ColumnDefaultConstraint::null_value()))
@@ -280,7 +280,7 @@ mod tests {
 
         let field = Field::try_from(&column_schema).unwrap();
         assert_eq!("v1", field.metadata().get("k1").unwrap());
-        assert!(field.metadata().get(DEFAULT_CONSTRAINT_KEY).is_some());
+        let _ = field.metadata().get(DEFAULT_CONSTRAINT_KEY).unwrap();
 
         let new_column_schema = ColumnSchema::try_from(&field).unwrap();
         assert_eq!(column_schema, new_column_schema);
@@ -288,20 +288,21 @@ mod tests {
 
     #[test]
     fn test_column_schema_with_duplicate_metadata() {
-        let mut metadata = Metadata::new();
-        metadata.insert(DEFAULT_CONSTRAINT_KEY.to_string(), "v1".to_string());
+        let metadata = Metadata::from([(DEFAULT_CONSTRAINT_KEY.to_string(), "v1".to_string())]);
         let column_schema = ColumnSchema::new("test", ConcreteDataType::int32_datatype(), true)
             .with_metadata(metadata)
             .with_default_constraint(Some(ColumnDefaultConstraint::null_value()))
             .unwrap();
-        Field::try_from(&column_schema).unwrap_err();
+        assert!(Field::try_from(&column_schema).is_err());
     }
 
     #[test]
     fn test_column_schema_invalid_default_constraint() {
-        ColumnSchema::new("test", ConcreteDataType::int32_datatype(), false)
-            .with_default_constraint(Some(ColumnDefaultConstraint::null_value()))
-            .unwrap_err();
+        assert!(
+            ColumnSchema::new("test", ConcreteDataType::int32_datatype(), false)
+                .with_default_constraint(Some(ColumnDefaultConstraint::null_value()))
+                .is_err()
+        );
     }
 
     #[test]

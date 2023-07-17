@@ -15,16 +15,23 @@
 use std::any::Any;
 
 use common_datasource::file_format::Format;
-use common_error::prelude::*;
+use common_error::ext::{BoxedError, ErrorExt};
+use common_error::status_code::StatusCode;
 use datafusion::parquet;
 use datatypes::arrow::error::ArrowError;
 use datatypes::value::Value;
-use snafu::Location;
+use snafu::{Location, Snafu};
 use store_api::storage::RegionNumber;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("Unexpected, violated: {}", violated))]
+    Unexpected {
+        violated: String,
+        location: Location,
+    },
+
     #[snafu(display("Failed to handle heartbeat response, source: {}", source))]
     HandleHeartbeatResponse {
         location: Location,
@@ -382,7 +389,7 @@ pub enum Error {
         "Failed to create logical plan for prometheus query, source: {}",
         source
     ))]
-    PrometheusRemoteQueryPlan {
+    PromStoreRemoteQueryPlan {
         #[snafu(backtrace)]
         source: servers::error::Error,
     },
@@ -565,6 +572,12 @@ pub enum Error {
         value: String,
         location: Location,
     },
+
+    #[snafu(display("Table metadata manager error: {}", source))]
+    TableMetadataManager {
+        source: common_meta::error::Error,
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -593,7 +606,7 @@ impl ErrorExt for Error {
             Error::HandleHeartbeatResponse { source, .. } => source.status_code(),
 
             Error::RuntimeResource { source, .. } => source.status_code(),
-            Error::PrometheusRemoteQueryPlan { source, .. }
+            Error::PromStoreRemoteQueryPlan { source, .. }
             | Error::ExecutePromql { source, .. } => source.status_code(),
 
             Error::SqlExecIntercepted { source, .. } => source.status_code(),
@@ -639,7 +652,8 @@ impl ErrorExt for Error {
             | Error::BuildParquetRecordBatchStream { .. }
             | Error::ReadRecordBatch { .. }
             | Error::BuildFileStream { .. }
-            | Error::WriteStreamToFile { .. } => StatusCode::Unexpected,
+            | Error::WriteStreamToFile { .. }
+            | Error::Unexpected { .. } => StatusCode::Unexpected,
 
             Error::Catalog { source, .. } => source.status_code(),
             Error::CatalogEntrySerde { source, .. } => source.status_code(),
@@ -688,6 +702,7 @@ impl ErrorExt for Error {
 
             Error::WriteParquet { source, .. } => source.status_code(),
             Error::InvalidCopyParameter { .. } => StatusCode::InvalidArguments,
+            Error::TableMetadataManager { source, .. } => source.status_code(),
         }
     }
 

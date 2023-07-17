@@ -179,10 +179,12 @@ mod tests {
     use catalog::helper::{
         CatalogKey, CatalogValue, SchemaKey, SchemaValue, TableGlobalKey, TableGlobalValue,
     };
-    use catalog::remote::mock::MockKvBackend;
-    use catalog::remote::{KvBackend, KvBackendRef};
     use client::client_manager::DatanodeClients;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_meta::key::TableMetadataManager;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::kv_backend::{KvBackend, KvBackendRef};
+    use common_meta::rpc::store::PutRequest;
     use datatypes::prelude::{ConcreteDataType, VectorRef};
     use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, Schema};
     use datatypes::vectors::Int32Vector;
@@ -193,32 +195,26 @@ mod tests {
     use crate::table::test::create_partition_rule_manager;
 
     async fn prepare_mocked_backend() -> KvBackendRef {
-        let backend = Arc::new(MockKvBackend::default());
+        let backend = Arc::new(MemoryKvBackend::default());
 
         let default_catalog = CatalogKey {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
         }
         .to_string();
-        backend
-            .set(
-                default_catalog.as_bytes(),
-                CatalogValue.as_bytes().unwrap().as_slice(),
-            )
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(default_catalog.as_bytes())
+            .with_value(CatalogValue.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
 
         let default_schema = SchemaKey {
             catalog_name: DEFAULT_CATALOG_NAME.to_string(),
             schema_name: DEFAULT_SCHEMA_NAME.to_string(),
         }
         .to_string();
-        backend
-            .set(
-                default_schema.as_bytes(),
-                SchemaValue.as_bytes().unwrap().as_slice(),
-            )
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(default_schema.as_bytes())
+            .with_value(SchemaValue.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
 
         backend
     }
@@ -240,11 +236,12 @@ mod tests {
             ColumnSchema::new("a", ConcreteDataType::int32_datatype(), true),
         ]));
 
-        let mut builder = TableMetaBuilder::default();
-        builder.schema(schema);
-        builder.primary_key_indices(vec![]);
-        builder.next_column_id(1);
-        let table_meta = builder.build().unwrap();
+        let table_meta = TableMetaBuilder::default()
+            .schema(schema)
+            .primary_key_indices(vec![])
+            .next_column_id(1)
+            .build()
+            .unwrap();
 
         let table_info = TableInfoBuilder::new(table_name, table_meta)
             .build()
@@ -256,19 +253,17 @@ mod tests {
             table_info: table_info.into(),
         };
 
-        backend
-            .set(
-                table_global_key.to_string().as_bytes(),
-                table_global_value.as_bytes().unwrap().as_slice(),
-            )
-            .await
-            .unwrap();
+        let req = PutRequest::new()
+            .with_key(table_global_key.to_string().as_bytes())
+            .with_value(table_global_value.as_bytes().unwrap());
+        backend.put(req).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_split_inserts() {
         let backend = prepare_mocked_backend().await;
 
+        let table_metadata_manager = Arc::new(TableMetadataManager::new(backend.clone()));
         let table_name = "one_column_partitioning_table";
         create_testing_table(&backend, table_name).await;
 
@@ -277,6 +272,7 @@ mod tests {
             Arc::new(MockKvCacheInvalidator::default()),
             create_partition_rule_manager().await,
             Arc::new(DatanodeClients::default()),
+            table_metadata_manager,
         ));
 
         let inserter = DistInserter::new(

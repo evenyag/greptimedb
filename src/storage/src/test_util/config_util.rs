@@ -20,8 +20,9 @@ use log_store::LogConfig;
 use object_store::services::Fs;
 use object_store::ObjectStore;
 use store_api::manifest::Manifest;
+use store_api::storage::{CompactionStrategy, TwcsOptions};
 
-use crate::compaction::noop::NoopCompactionScheduler;
+use crate::compaction::CompactionHandler;
 use crate::config::{EngineConfig, DEFAULT_REGION_WRITE_BUFFER_SIZE};
 use crate::engine::{self, RegionMap};
 use crate::file_purger::noop::NoopFilePurgeHandler;
@@ -33,7 +34,7 @@ use crate::scheduler::{LocalScheduler, SchedulerConfig};
 use crate::sst::FsAccessLayer;
 
 fn log_store_dir(store_dir: &str) -> String {
-    format!("{store_dir}/logstore")
+    format!("{store_dir}/wal")
 }
 
 /// Create a new StoreConfig for test.
@@ -43,7 +44,7 @@ pub async fn new_store_config(
     engine_config: EngineConfig,
 ) -> StoreConfig<RaftEngineLogStore> {
     let mut builder = Fs::default();
-    builder.root(store_dir);
+    let _ = builder.root(store_dir);
     let object_store = ObjectStore::new(builder).unwrap().finish();
 
     new_store_config_with_object_store(region_name, store_dir, object_store, engine_config)
@@ -61,7 +62,7 @@ pub async fn new_store_config_and_region_map(
     Arc<RegionMap<RaftEngineLogStore>>,
 ) {
     let mut builder = Fs::default();
-    builder.root(store_dir);
+    let _ = builder.root(store_dir);
     let object_store = ObjectStore::new(builder).unwrap().finish();
 
     new_store_config_with_object_store(region_name, store_dir, object_store, engine_config).await
@@ -96,7 +97,10 @@ pub async fn new_store_config_with_object_store(
     };
     let log_store = Arc::new(RaftEngineLogStore::try_new(log_config).await.unwrap());
 
-    let compaction_scheduler = Arc::new(NoopCompactionScheduler::default());
+    let compaction_scheduler = Arc::new(LocalScheduler::new(
+        SchedulerConfig::default(),
+        CompactionHandler::default(),
+    ));
     // We use an empty region map so actually the background worker of the picker is disabled.
     let regions = Arc::new(RegionMap::new());
     let flush_scheduler = Arc::new(
@@ -125,6 +129,7 @@ pub async fn new_store_config_with_object_store(
             file_purger,
             ttl: None,
             write_buffer_size: DEFAULT_REGION_WRITE_BUFFER_SIZE.as_bytes() as usize,
+            compaction_strategy: CompactionStrategy::Twcs(TwcsOptions::default()),
         },
         regions,
     )

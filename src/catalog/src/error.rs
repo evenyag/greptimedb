@@ -16,10 +16,10 @@ use std::any::Any;
 use std::fmt::Debug;
 
 use common_error::ext::{BoxedError, ErrorExt};
-use common_error::prelude::{Snafu, StatusCode};
+use common_error::status_code::StatusCode;
 use datafusion::error::DataFusionError;
 use datatypes::prelude::ConcreteDataType;
-use snafu::Location;
+use snafu::{Location, Snafu};
 use tokio::task::JoinError;
 
 use crate::DeregisterTableRequest;
@@ -192,11 +192,18 @@ pub enum Error {
         source: BoxedError,
     },
 
+    #[snafu(display(
+        "Failed to upgrade weak catalog manager reference. location: {}",
+        location
+    ))]
+    UpgradeWeakCatalogManagerRef { location: Location },
+
     #[snafu(display("Failed to execute system catalog table scan, source: {}", source))]
     SystemCatalogTableScanExec {
         location: Location,
         source: common_query::error::Error,
     },
+
     #[snafu(display("Cannot parse catalog value, source: {}", source))]
     InvalidCatalogValue {
         location: Location,
@@ -236,6 +243,12 @@ pub enum Error {
 
     #[snafu(display("A generic error has occurred, msg: {}", msg))]
     Generic { msg: String, location: Location },
+
+    #[snafu(display("Table metadata manager error: {}", source))]
+    TableMetadataManager {
+        source: common_meta::error::Error,
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -256,7 +269,9 @@ impl ErrorExt for Error {
             | Error::EmptyValue { .. }
             | Error::ValueDeserialize { .. } => StatusCode::StorageUnavailable,
 
-            Error::Generic { .. } | Error::SystemCatalogTypeMismatch { .. } => StatusCode::Internal,
+            Error::Generic { .. }
+            | Error::SystemCatalogTypeMismatch { .. }
+            | Error::UpgradeWeakCatalogManagerRef { .. } => StatusCode::Internal,
 
             Error::ReadSystemCatalog { source, .. } | Error::CreateRecordBatch { source, .. } => {
                 source.status_code()
@@ -289,6 +304,7 @@ impl ErrorExt for Error {
             Error::Unimplemented { .. } | Error::NotSupported { .. } => StatusCode::Unsupported,
             Error::QueryAccessDenied { .. } => StatusCode::AccessDenied,
             Error::Datafusion { .. } => StatusCode::EngineExecuteQuery,
+            Error::TableMetadataManager { source, .. } => source.status_code(),
         }
     }
 

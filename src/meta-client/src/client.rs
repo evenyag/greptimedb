@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod ask_leader;
+mod ddl;
 mod heartbeat;
 mod load_balance;
 mod lock;
@@ -20,6 +22,7 @@ mod store;
 
 use api::v1::meta::Role;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
+use common_meta::rpc::ddl::{SubmitDdlTaskRequest, SubmitDdlTaskResponse};
 use common_meta::rpc::lock::{LockRequest, LockResponse, UnlockRequest};
 use common_meta::rpc::router::{CreateRequest, DeleteRequest, RouteRequest, RouteResponse};
 use common_meta::rpc::store::{
@@ -29,6 +32,7 @@ use common_meta::rpc::store::{
     RangeRequest, RangeResponse,
 };
 use common_telemetry::info;
+use ddl::Client as DdlClient;
 use heartbeat::Client as HeartbeatClient;
 use lock::Client as LockClient;
 use router::Client as RouterClient;
@@ -49,7 +53,9 @@ pub struct MetaClientBuilder {
     enable_router: bool,
     enable_store: bool,
     enable_lock: bool,
+    enable_ddl: bool,
     channel_manager: Option<ChannelManager>,
+    ddl_channel_manager: Option<ChannelManager>,
 }
 
 impl MetaClientBuilder {
@@ -89,9 +95,23 @@ impl MetaClientBuilder {
         }
     }
 
+    pub fn enable_ddl(self) -> Self {
+        Self {
+            enable_ddl: true,
+            ..self
+        }
+    }
+
     pub fn channel_manager(self, channel_manager: ChannelManager) -> Self {
         Self {
             channel_manager: Some(channel_manager),
+            ..self
+        }
+    }
+
+    pub fn ddl_channel_manager(self, channel_manager: ChannelManager) -> Self {
+        Self {
+            ddl_channel_manager: Some(channel_manager),
             ..self
         }
     }
@@ -119,7 +139,11 @@ impl MetaClientBuilder {
             client.store = Some(StoreClient::new(self.id, self.role, mgr.clone()));
         }
         if self.enable_lock {
-            client.lock = Some(LockClient::new(self.id, self.role, mgr));
+            client.lock = Some(LockClient::new(self.id, self.role, mgr.clone()));
+        }
+        if self.enable_ddl {
+            let mgr = self.ddl_channel_manager.unwrap_or(mgr);
+            client.ddl = Some(DdlClient::new(self.id, self.role, mgr));
         }
 
         client
@@ -134,6 +158,7 @@ pub struct MetaClient {
     router: Option<RouterClient>,
     store: Option<StoreClient>,
     lock: Option<LockClient>,
+    ddl: Option<DdlClient>,
 }
 
 impl MetaClient {
@@ -171,10 +196,13 @@ impl MetaClient {
             client.start(urls.clone()).await?;
             info!("Store client started");
         }
-
         if let Some(client) = &mut self.lock {
-            client.start(urls).await?;
+            client.start(urls.clone()).await?;
             info!("Lock client started");
+        }
+        if let Some(client) = &mut self.ddl {
+            client.start(urls).await?;
+            info!("DDL client started");
         }
 
         Ok(())
@@ -330,8 +358,22 @@ impl MetaClient {
     }
 
     pub async fn unlock(&self, req: UnlockRequest) -> Result<()> {
-        self.lock_client()?.unlock(req.into()).await?;
+        let _ = self.lock_client()?.unlock(req.into()).await?;
         Ok(())
+    }
+
+    pub async fn submit_ddl_task(
+        &self,
+        req: SubmitDdlTaskRequest,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let res = self
+            .ddl_client()?
+            .submit_ddl_task(req.try_into().context(error::ConvertMetaRequestSnafu)?)
+            .await?
+            .try_into()
+            .context(error::ConvertMetaResponseSnafu)?;
+
+        Ok(res)
     }
 
     #[inline]
@@ -360,6 +402,13 @@ impl MetaClient {
         self.lock.clone().context(error::NotStartedSnafu {
             name: "lock_client",
         })
+    }
+
+    #[inline]
+    pub fn ddl_client(&self) -> Result<DdlClient> {
+        self.ddl
+            .clone()
+            .context(error::NotStartedSnafu { name: "ddl_client" })
     }
 
     #[inline]
@@ -421,7 +470,7 @@ mod tests {
                     .with_value(format!("{}-{}", "value", i).into_bytes())
                     .with_prev_kv();
                 let res = self.client.put(req).await;
-                assert!(res.is_ok());
+                let _ = res.unwrap();
             }
         }
 
@@ -429,7 +478,7 @@ mod tests {
             let req =
                 DeleteRangeRequest::new().with_prefix(format!("{}-{}", TEST_KEY_PREFIX, self.ns));
             let res = self.client.delete_range(req).await;
-            assert!(res.is_ok());
+            let _ = res.unwrap();
         }
     }
 
@@ -446,7 +495,7 @@ mod tests {
         let mut meta_client = MetaClientBuilder::new(0, 0, Role::Datanode)
             .enable_heartbeat()
             .build();
-        assert!(meta_client.heartbeat_client().is_ok());
+        let _ = meta_client.heartbeat_client().unwrap();
         assert!(meta_client.router_client().is_err());
         assert!(meta_client.store_client().is_err());
         meta_client.start(urls).await.unwrap();
@@ -456,7 +505,7 @@ mod tests {
             .enable_router()
             .build();
         assert!(meta_client.heartbeat_client().is_err());
-        assert!(meta_client.router_client().is_ok());
+        let _ = meta_client.router_client().unwrap();
         assert!(meta_client.store_client().is_err());
         meta_client.start(urls).await.unwrap();
         assert!(meta_client.router_client().unwrap().is_started().await);
@@ -466,7 +515,7 @@ mod tests {
             .build();
         assert!(meta_client.heartbeat_client().is_err());
         assert!(meta_client.router_client().is_err());
-        assert!(meta_client.store_client().is_ok());
+        let _ = meta_client.store_client().unwrap();
         meta_client.start(urls).await.unwrap();
         assert!(meta_client.store_client().unwrap().is_started().await);
 
@@ -477,9 +526,9 @@ mod tests {
             .build();
         assert_eq!(1, meta_client.id().0);
         assert_eq!(2, meta_client.id().1);
-        assert!(meta_client.heartbeat_client().is_ok());
-        assert!(meta_client.router_client().is_ok());
-        assert!(meta_client.store_client().is_ok());
+        let _ = meta_client.heartbeat_client().unwrap();
+        let _ = meta_client.router_client().unwrap();
+        let _ = meta_client.store_client().unwrap();
         meta_client.start(urls).await.unwrap();
         assert!(meta_client.heartbeat_client().unwrap().is_started().await);
         assert!(meta_client.router_client().unwrap().is_started().await);
@@ -498,16 +547,16 @@ mod tests {
         assert!(matches!(res.err(), Some(error::Error::NotStarted { .. })));
     }
 
-    fn new_table_info() -> RawTableInfo {
+    fn new_table_info(table_name: &TableName) -> RawTableInfo {
         RawTableInfo {
             ident: TableIdent {
                 table_id: 0,
                 version: 0,
             },
-            name: "t".to_string(),
+            name: table_name.table_name.clone(),
             desc: None,
-            catalog_name: "c".to_string(),
-            schema_name: "s".to_string(),
+            catalog_name: table_name.catalog_name.clone(),
+            schema_name: table_name.schema_name.clone(),
             meta: RawTableMeta {
                 schema: RawSchema {
                     column_schemas: vec![ColumnSchema::new(
@@ -540,8 +589,9 @@ mod tests {
             .build();
         meta_client.start(urls).await.unwrap();
 
-        let table_info = new_table_info();
-        let req = CreateRequest::new(TableName::new("c", "s", "t"), &table_info);
+        let table_name = TableName::new("c", "s", "t");
+        let table_info = new_table_info(&table_name);
+        let req = CreateRequest::new(table_name, &table_info);
         let res = meta_client.create_route(req).await;
         assert!(matches!(res.err(), Some(error::Error::NotStarted { .. })));
     }
@@ -568,8 +618,7 @@ mod tests {
     #[tokio::test]
     async fn test_ask_leader() {
         let tc = new_client("test_ask_leader").await;
-        let res = tc.client.ask_leader().await;
-        assert!(res.is_ok());
+        tc.client.ask_leader().await.unwrap();
     }
 
     #[tokio::test]
@@ -577,7 +626,7 @@ mod tests {
         let tc = new_client("test_heartbeat").await;
         let (sender, mut receiver) = tc.client.heartbeat().await.unwrap();
         // send heartbeats
-        tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             for _ in 0..5 {
                 let req = HeartbeatRequest {
                     peer: Some(Peer {
@@ -590,7 +639,7 @@ mod tests {
             }
         });
 
-        tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             while let Some(res) = receiver.message().await.unwrap() {
                 assert_eq!(1000, res.header.unwrap().cluster_id);
             }
@@ -636,7 +685,7 @@ mod tests {
             value_list: vec![b"Max1".to_vec(), b"Max2".to_vec()],
         };
         let table_name = TableName::new("test_catalog", "test_schema", "test_table");
-        let table_info = new_table_info();
+        let table_info = new_table_info(&table_name);
         let req = CreateRequest::new(table_name.clone(), &table_info)
             .add_partition(p1)
             .add_partition(p2);
@@ -650,7 +699,7 @@ mod tests {
 
         let req = DeleteRequest::new(table_name.clone());
         let res = client.delete_route(req).await;
-        assert!(res.is_ok());
+        let _ = res.unwrap();
     }
 
     #[tokio::test]
@@ -726,7 +775,7 @@ mod tests {
             .with_key(tc.key("key"))
             .with_value(b"value".to_vec());
         let res = tc.client.put(req).await;
-        assert!(res.unwrap().take_prev_kv().is_none());
+        assert!(res.unwrap().prev_kv.is_none());
     }
 
     #[tokio::test]
@@ -739,14 +788,14 @@ mod tests {
             .with_value(b"value".to_vec())
             .with_prev_kv();
         let res = tc.client.put(req).await;
-        assert!(res.unwrap().take_prev_kv().is_none());
+        assert!(res.unwrap().prev_kv.is_none());
 
         let req = PutRequest::new()
             .with_key(key.as_slice())
             .with_value(b"value1".to_vec())
             .with_prev_kv();
         let res = tc.client.put(req).await;
-        let mut kv = res.unwrap().take_prev_kv().unwrap();
+        let mut kv = res.unwrap().prev_kv.unwrap();
         assert_eq!(key, kv.take_key());
         assert_eq!(b"value".to_vec(), kv.take_value());
     }
@@ -781,16 +830,14 @@ mod tests {
         for i in 0..256 {
             req = req.add_key(tc.key(&format!("key-{}", i)));
         }
-        let mut res = tc.client.batch_get(req).await.unwrap();
-
-        assert_eq!(10, res.take_kvs().len());
+        let res = tc.client.batch_get(req).await.unwrap();
+        assert_eq!(10, res.kvs.len());
 
         let req = BatchGetRequest::default()
             .add_key(tc.key("key-1"))
             .add_key(tc.key("key-999"));
-        let mut res = tc.client.batch_get(req).await.unwrap();
-
-        assert_eq!(1, res.take_kvs().len());
+        let res = tc.client.batch_get(req).await.unwrap();
+        assert_eq!(1, res.kvs.len());
     }
 
     #[tokio::test]
@@ -854,7 +901,9 @@ mod tests {
         let res = tc.client.compare_and_put(req).await;
         let mut res = res.unwrap();
         assert!(res.is_success());
-        assert_eq!(b"value".to_vec(), res.take_prev_kv().unwrap().take_value());
+
+        // If compare-and-put is success, previous value doesn't need to be returned.
+        assert!(res.take_prev_kv().is_none());
     }
 
     #[tokio::test]

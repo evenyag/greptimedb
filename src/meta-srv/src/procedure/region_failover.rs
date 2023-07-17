@@ -27,6 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use catalog::helper::TableGlobalKey;
 use common_meta::ident::TableIdent;
+use common_meta::key::TableMetadataManagerRef;
 use common_meta::{ClusterId, RegionIdent};
 use common_procedure::error::{
     Error as ProcedureError, FromJsonSnafu, Result as ProcedureResult, ToJsonSnafu,
@@ -45,7 +46,6 @@ use crate::error::{Error, RegisterProcedureLoaderSnafu, Result};
 use crate::lock::DistLockRef;
 use crate::metasrv::{SelectorContext, SelectorRef};
 use crate::service::mailbox::MailboxRef;
-use crate::service::store::ext::KvStoreExt;
 
 const OPEN_REGION_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_REGION_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -75,6 +75,7 @@ pub(crate) struct RegionFailoverManager {
     selector_ctx: SelectorContext,
     dist_lock: DistLockRef,
     running_procedures: Arc<RwLock<HashSet<RegionFailoverKey>>>,
+    table_metadata_manager: TableMetadataManagerRef,
 }
 
 struct FailoverProcedureGuard {
@@ -84,7 +85,7 @@ struct FailoverProcedureGuard {
 
 impl Drop for FailoverProcedureGuard {
     fn drop(&mut self) {
-        self.running_procedures.write().unwrap().remove(&self.key);
+        let _ = self.running_procedures.write().unwrap().remove(&self.key);
     }
 }
 
@@ -95,6 +96,7 @@ impl RegionFailoverManager {
         selector: SelectorRef,
         selector_ctx: SelectorContext,
         dist_lock: DistLockRef,
+        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             mailbox,
@@ -103,6 +105,7 @@ impl RegionFailoverManager {
             selector_ctx,
             dist_lock,
             running_procedures: Arc::new(RwLock::new(HashSet::new())),
+            table_metadata_manager,
         }
     }
 
@@ -112,6 +115,7 @@ impl RegionFailoverManager {
             selector: self.selector.clone(),
             selector_ctx: self.selector_ctx.clone(),
             dist_lock: self.dist_lock.clone(),
+            table_metadata_manager: self.table_metadata_manager.clone(),
         }
     }
 
@@ -177,7 +181,7 @@ impl RegionFailoverManager {
 
         let procedure_manager = self.procedure_manager.clone();
         let failed_region = failed_region.clone();
-        common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_bg(async move {
             let _ = guard;
 
             let watcher = &mut match procedure_manager.submit(procedure_with_id).await {
@@ -208,7 +212,7 @@ impl RegionFailoverManager {
         let table_global_value = self
             .selector_ctx
             .kv_store
-            .get(table_global_key.to_raw_key())
+            .get(&table_global_key.to_raw_key())
             .await?;
         Ok(table_global_value.is_some())
     }
@@ -229,6 +233,7 @@ pub struct RegionFailoverContext {
     pub selector: SelectorRef,
     pub selector_ctx: SelectorContext,
     pub dist_lock: DistLockRef,
+    pub table_metadata_manager: TableMetadataManagerRef,
 }
 
 /// The state machine of region failover procedure. Driven by the call to `next`.
@@ -375,17 +380,20 @@ mod tests {
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
     use common_meta::ident::TableIdent;
     use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
+    use common_meta::key::TableMetadataManager;
     use common_meta::DatanodeId;
     use common_procedure::BoxedProcedure;
     use rand::prelude::SliceRandom;
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
+    use crate::cluster::MetaPeerClientBuilder;
     use crate::handler::{HeartbeatMailbox, Pusher, Pushers};
     use crate::lock::memory::MemLock;
     use crate::selector::{Namespace, Selector};
     use crate::sequence::Sequence;
     use crate::service::mailbox::Channel;
+    use crate::service::store::kv::{KvBackendAdapter, KvStoreRef};
     use crate::service::store::memory::MemStore;
     use crate::table_routes;
 
@@ -468,13 +476,23 @@ mod tests {
         }
 
         pub async fn build(self) -> TestingEnv {
-            let kv_store = Arc::new(MemStore::new()) as _;
+            let kv_store: KvStoreRef = Arc::new(MemStore::new());
+            let meta_peer_client = MetaPeerClientBuilder::default()
+                .election(None)
+                .in_memory(Arc::new(MemStore::new()))
+                .build()
+                .map(Arc::new)
+                // Safety: all required fields set at initialization
+                .unwrap();
 
             let table = "my_table";
+            let table_metadata_manager = Arc::new(TableMetadataManager::new(
+                KvBackendAdapter::wrap(kv_store.clone()),
+            ));
             let (_, table_global_value) =
                 table_routes::tests::prepare_table_global_value(&kv_store, table).await;
 
-            table_routes::tests::prepare_table_route_value(&kv_store, table).await;
+            let _ = table_routes::tests::prepare_table_route_value(&kv_store, table).await;
 
             let pushers = Pushers::default();
             let mut heartbeat_receivers = HashMap::with_capacity(3);
@@ -485,7 +503,7 @@ mod tests {
                 let pusher = Pusher::new(tx, &RequestHeader::default());
                 let _ = pushers.insert(pusher_id, pusher).await;
 
-                heartbeat_receivers.insert(datanode_id, rx);
+                let _ = heartbeat_receivers.insert(datanode_id, rx);
             }
 
             let mailbox_sequence =
@@ -505,6 +523,7 @@ mod tests {
                 datanode_lease_secs: 10,
                 server_addr: "127.0.0.1:3002".to_string(),
                 kv_store,
+                meta_peer_client,
                 catalog: Some(DEFAULT_CATALOG_NAME.to_string()),
                 schema: Some(DEFAULT_SCHEMA_NAME.to_string()),
                 table: Some(table.to_string()),
@@ -516,6 +535,7 @@ mod tests {
                     selector,
                     selector_ctx,
                     dist_lock: Arc::new(MemLock::default()),
+                    table_metadata_manager,
                 },
                 pushers,
                 heartbeat_receivers,
@@ -541,7 +561,7 @@ mod tests {
             .unwrap();
         let mailbox_clone = env.context.mailbox.clone();
         let failed_region_clone = failed_region.clone();
-        common_runtime::spawn_bg(async move {
+        let _handle = common_runtime::spawn_bg(async move {
             let resp = failed_datanode.recv().await.unwrap().unwrap();
             let received = &resp.mailbox_message.unwrap();
             assert_eq!(
@@ -580,7 +600,7 @@ mod tests {
             let mailbox_clone = env.context.mailbox.clone();
             let failed_region_clone = failed_region.clone();
             let candidate_tx = candidate_tx.clone();
-            common_runtime::spawn_bg(async move {
+            let _handle = common_runtime::spawn_bg(async move {
                 let resp = recv.recv().await.unwrap().unwrap();
                 let received = &resp.mailbox_message.unwrap();
                 assert_eq!(

@@ -60,12 +60,14 @@ mod alter;
 mod basic;
 mod close;
 mod compact;
+mod drop;
 mod flush;
 mod projection;
 
 /// Create metadata of a region with schema: (timestamp, v0).
 pub fn new_metadata(region_name: &str) -> RegionMetadata {
     let desc = RegionDescBuilder::new(region_name)
+        .id(123)
         .push_field_column(("v0", LogicalTypeId::String, true))
         .build();
     desc.try_into().unwrap()
@@ -90,7 +92,7 @@ impl<S: LogStore> TesterBase<S> {
     pub async fn checkpoint_manifest(&self) {
         let manifest = &self.region.inner.manifest;
         manifest.set_flushed_manifest_version(manifest.last_version() - 1);
-        manifest.do_checkpoint().await.unwrap().unwrap();
+        let _ = manifest.do_checkpoint().await.unwrap().unwrap();
     }
 
     pub async fn close(&self) {
@@ -256,33 +258,26 @@ fn new_write_batch_for_test(enable_version_column: bool) -> WriteBatch {
 }
 
 fn new_put_data(data: &[(TimestampMillisecond, Option<String>)]) -> HashMap<String, VectorRef> {
-    let mut put_data = HashMap::with_capacity(2);
-
     let timestamps =
         TimestampMillisecondVector::from_vec(data.iter().map(|v| v.0.into()).collect());
     let values = StringVector::from(data.iter().map(|kv| kv.1.clone()).collect::<Vec<_>>());
 
-    put_data.insert(
-        test_util::TIMESTAMP_NAME.to_string(),
-        Arc::new(timestamps) as VectorRef,
-    );
-    put_data.insert("v0".to_string(), Arc::new(values) as VectorRef);
-
-    put_data
+    HashMap::from([
+        (
+            test_util::TIMESTAMP_NAME.to_string(),
+            Arc::new(timestamps) as VectorRef,
+        ),
+        ("v0".to_string(), Arc::new(values) as VectorRef),
+    ])
 }
 
 fn new_delete_data(keys: &[TimestampMillisecond]) -> HashMap<String, VectorRef> {
-    let mut delete_data = HashMap::new();
-
     let timestamps =
         TimestampMillisecondVector::from_vec(keys.iter().map(|v| v.0.into()).collect());
-
-    delete_data.insert(
+    HashMap::from([(
         test_util::TIMESTAMP_NAME.to_string(),
         Arc::new(timestamps) as VectorRef,
-    );
-
-    delete_data
+    )])
 }
 
 fn append_chunk_to(chunk: &Chunk, dst: &mut Vec<(i64, Option<String>)>) {
@@ -357,7 +352,7 @@ async fn test_recover_region_manifets(compress: bool) {
     let memtable_builder = Arc::new(DefaultMemtableBuilder::default()) as _;
 
     let mut builder = Fs::default();
-    builder.root(&tmp_dir.path().to_string_lossy());
+    let _ = builder.root(&tmp_dir.path().to_string_lossy());
     let object_store = ObjectStore::new(builder).unwrap().finish();
 
     let manifest = RegionManifest::with_checkpointer(
@@ -392,7 +387,7 @@ async fn test_recover_region_manifets(compress: bool) {
 
     {
         // save some actions into region_meta
-        manifest
+        assert!(manifest
             .update(RegionMetaActionList::with_action(RegionMetaAction::Change(
                 RegionChange {
                     metadata: region_meta.as_ref().into(),
@@ -400,17 +395,17 @@ async fn test_recover_region_manifets(compress: bool) {
                 },
             )))
             .await
-            .unwrap();
+            .is_ok());
 
-        manifest
+        assert!(manifest
             .update(RegionMetaActionList::new(vec![
                 RegionMetaAction::Edit(build_region_edit(1, &[file_id_a], &[])),
                 RegionMetaAction::Edit(build_region_edit(2, &[file_id_b, file_id_c], &[])),
             ]))
             .await
-            .unwrap();
+            .is_ok());
 
-        manifest
+        assert!(manifest
             .update(RegionMetaActionList::with_action(RegionMetaAction::Change(
                 RegionChange {
                     metadata: region_meta.as_ref().into(),
@@ -418,7 +413,7 @@ async fn test_recover_region_manifets(compress: bool) {
                 },
             )))
             .await
-            .unwrap();
+            .is_ok());
     }
 
     // try to recover
@@ -516,7 +511,7 @@ fn create_region_meta(region_name: &str) -> RegionMetadata {
 
 async fn create_store_config(region_name: &str, root: &str) -> StoreConfig<NoopLogStore> {
     let mut builder = Fs::default();
-    builder.root(root);
+    let _ = builder.root(root);
     let object_store = ObjectStore::new(builder).unwrap().finish();
     let parent_dir = "";
     let sst_dir = engine::region_sst_dir(parent_dir, region_name);
@@ -564,6 +559,7 @@ async fn create_store_config(region_name: &str, root: &str) -> StoreConfig<NoopL
         file_purger,
         ttl: None,
         write_buffer_size: ReadableSize::mb(32).0 as usize,
+        compaction_strategy: Default::default(),
     }
 }
 
@@ -618,10 +614,11 @@ impl WindowedReaderTester {
             .collect::<HashMap<String, VectorRef>>();
             write_batch.put(columns).unwrap();
 
-            self.region
+            assert!(self
+                .region
                 .write(&WriteContext {}, write_batch)
                 .await
-                .unwrap();
+                .is_ok());
 
             // flush the region to ensure data resides across SST files.
             self.region

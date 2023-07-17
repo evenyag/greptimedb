@@ -18,7 +18,7 @@ use common_error::status_code::StatusCode as ErrorCode;
 use serde_json::json;
 use servers::http::handler::HealthResponse;
 use servers::http::{JsonOutput, JsonResponse};
-use servers::prom::{PromJsonResponse, PromResponse};
+use servers::prometheus::{PrometheusJsonResponse, PrometheusResponse};
 use tests_integration::test_util::{
     setup_test_http_app, setup_test_http_app_with_frontend, setup_test_prom_app_with_frontend,
     StorageType,
@@ -59,6 +59,7 @@ macro_rules! http_tests {
                 test_metrics_api,
                 test_scripts_api,
                 test_health_api,
+                test_config_api,
                 test_dashboard_path,
             );
         )*
@@ -75,7 +76,7 @@ pub async fn test_sql_api(store_type: StorageType) {
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.code(), 1004);
     assert_eq!(body.error().unwrap(), "sql parameter is required.");
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
 
     let res = client
         .get("/v1/sql?sql=select * from numbers limit 10")
@@ -85,7 +86,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
 
     let output = body.output().unwrap();
     assert_eq!(output.len(), 1);
@@ -112,7 +113,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let output = body.output().unwrap();
     assert_eq!(output.len(), 1);
 
@@ -132,7 +133,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let output = body.output().unwrap();
     assert_eq!(output.len(), 1);
 
@@ -152,7 +153,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let output = body.output().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(
@@ -171,7 +172,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let outputs = body.output().unwrap();
     assert_eq!(outputs.len(), 2);
     assert_eq!(
@@ -197,7 +198,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(!body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     assert!(body.error().unwrap().contains("Table not found"));
 
     // test database given
@@ -209,7 +210,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let outputs = body.output().unwrap();
     assert_eq!(outputs.len(), 1);
     assert_eq!(
@@ -237,7 +238,7 @@ pub async fn test_sql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let outputs = body.output().unwrap();
     assert_eq!(outputs.len(), 1);
     assert_eq!(
@@ -281,7 +282,7 @@ pub async fn test_prometheus_promql_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
     assert!(body.success());
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
 
     guard.remove_all().await;
 }
@@ -328,12 +329,14 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = serde_json::from_str::<PromJsonResponse>(&res.text().await).unwrap();
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.status, "success");
     assert_eq!(
         body.data,
-        serde_json::from_value::<PromResponse>(json!(["__name__", "cpu", "host", "memory", "ts"]))
-            .unwrap()
+        serde_json::from_value::<PrometheusResponse>(json!([
+            "__name__", "cpu", "host", "memory", "ts"
+        ]))
+        .unwrap()
     );
 
     // labels query with multiple match[] params
@@ -355,11 +358,11 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = serde_json::from_str::<PromJsonResponse>(&res.text().await).unwrap();
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.status, "success");
     assert_eq!(
         body.data,
-        serde_json::from_value::<PromResponse>(json!(
+        serde_json::from_value::<PrometheusResponse>(json!(
             [{"__name__" : "demo","ts":"1970-01-01 00:00:00+0000","cpu":"1.1","host":"host1","memory":"2.2"}]
         ))
         .unwrap()
@@ -376,7 +379,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     // should return error if there is no match[]
     let res = client.get("/api/v1/label/instance/values").send().await;
     assert_eq!(res.status(), StatusCode::OK);
-    let prom_resp = res.json::<PromJsonResponse>().await;
+    let prom_resp = res.json::<PrometheusJsonResponse>().await;
     assert_eq!(prom_resp.status, "error");
     assert!(prom_resp.error.is_some_and(|err| !err.is_empty()));
     assert!(prom_resp.error_type.is_some_and(|err| !err.is_empty()));
@@ -387,11 +390,11 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
-    let body = serde_json::from_str::<PromJsonResponse>(&res.text().await).unwrap();
+    let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.status, "success");
     assert_eq!(
         body.data,
-        serde_json::from_value::<PromResponse>(json!(["host1", "host2"])).unwrap()
+        serde_json::from_value::<PrometheusResponse>(json!(["host1", "host2"])).unwrap()
     );
 
     // multiple match[]
@@ -400,7 +403,7 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .send()
         .await;
     assert_eq!(res.status(), StatusCode::OK);
-    let prom_resp = res.json::<PromJsonResponse>().await;
+    let prom_resp = res.json::<PrometheusJsonResponse>().await;
     assert_eq!(prom_resp.status, "success");
     assert!(prom_resp.error.is_none());
     assert!(prom_resp.error_type.is_none());
@@ -460,7 +463,7 @@ def test(n) -> vector[f64]:
     let body = serde_json::from_str::<JsonResponse>(&res.text().await).unwrap();
 
     assert_eq!(body.code(), 0);
-    assert!(body.execution_time_ms().is_some());
+    let _ = body.execution_time_ms().unwrap();
     let output = body.output().unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(
@@ -493,6 +496,93 @@ pub async fn test_health_api(store_type: StorageType) {
 
     let body = serde_json::from_str::<HealthResponse>(&body_text).unwrap();
     assert_eq!(body, HealthResponse {});
+}
+
+pub async fn test_config_api(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, _guard) = setup_test_http_app_with_frontend(store_type, "config_api").await;
+    let client = TestClient::new(app);
+
+    let res_get = client.get("/config").send().await;
+    assert_eq!(res_get.status(), StatusCode::OK);
+    let expected_toml_str = format!(
+        r#"
+    mode = "standalone"
+    enable_memory_catalog = false
+    rpc_addr = "127.0.0.1:3001"
+    rpc_runtime_size = 8
+    heartbeat_interval_millis = 5000
+
+    [http_opts]
+    addr = "127.0.0.1:4000"
+    timeout = "30s"
+    body_limit = "64MiB"
+
+    [wal]
+    file_size = "256MiB"
+    purge_threshold = "4GiB"
+    purge_interval = "10m"
+    read_batch_size = 128
+    sync_write = false
+
+    [storage]
+    type = "{}"
+
+    [storage.compaction]
+    max_inflight_tasks = 4
+    max_files_in_level0 = 8
+    max_purge_tasks = 32
+    sst_write_buffer_size = "8MiB"
+
+    [storage.manifest]
+    checkpoint_margin = 10
+    gc_duration = "10m"
+    checkpoint_on_startup = false
+    compress = false
+
+    [storage.flush]
+    max_flush_tasks = 8
+    region_write_buffer_size = "32MiB"
+    picker_schedule_interval = "5m"
+    auto_flush_interval = "1h"
+
+    [procedure]
+    max_retry_times = 3
+    retry_delay = "500ms"
+
+    [logging]
+    enable_jaeger_tracing = false"#,
+        store_type
+    );
+    let body_text = drop_lines_with_inconsistent_results(res_get.text().await);
+    assert_eq!(
+        normalize_str(body_text.as_str()),
+        normalize_str(&expected_toml_str)
+    );
+}
+
+fn drop_lines_with_inconsistent_results(input: String) -> String {
+    input
+        .lines()
+        .filter(|line| {
+            // ignores
+            !line.trim().starts_with("dir =")
+                && !line.trim().starts_with("data_home =")
+                && !line.trim().starts_with("bucket =")
+                && !line.trim().starts_with("root =")
+                && !line.trim().starts_with("endpoint =")
+                && !line.trim().starts_with("region =")
+                && !line.trim().starts_with("cache_path =")
+                && !line.trim().starts_with("cache_capacity =")
+                && !line.trim().starts_with("sas_token =")
+                && !line.trim().starts_with("scope =")
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+fn normalize_str(s: &str) -> String {
+    s.replace([' ', '\n'], "")
 }
 
 #[cfg(feature = "dashboard")]

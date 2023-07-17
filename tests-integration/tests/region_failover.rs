@@ -18,10 +18,11 @@ use std::time::Duration;
 
 use api::v1::meta::Peer;
 use catalog::helper::TableGlobalKey;
-use catalog::remote::{CachedMetaKvBackend, Kv};
+use catalog::remote::CachedMetaKvBackend;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
 use common_meta::ident::TableIdent;
 use common_meta::rpc::router::TableRoute;
+use common_meta::rpc::KeyValue;
 use common_meta::table_name::TableName;
 use common_meta::RegionIdent;
 use common_procedure::{watcher, ProcedureWithId};
@@ -117,9 +118,9 @@ pub async fn test_region_failover(store_type: StorageType) {
     };
 
     let cache = get_table_cache(&frontend, &cache_key).unwrap();
-    assert!(cache.is_some());
+    let _ = cache.unwrap();
     let route_cache = get_route_cache(&frontend, &table_name);
-    assert!(route_cache.is_some());
+    let _ = route_cache.unwrap();
 
     let distribution = find_region_distribution(&cluster).await;
     info!("Find region distribution: {distribution:?}");
@@ -151,7 +152,7 @@ pub async fn test_region_failover(store_type: StorageType) {
     time::sleep(Duration::from_millis(100)).await;
 
     let cache = get_table_cache(&frontend, &cache_key);
-    assert!(cache.is_none());
+    assert!(cache.unwrap().is_none());
     let route_cache = get_route_cache(&frontend, &table_name);
     assert!(route_cache.is_none());
 
@@ -174,7 +175,7 @@ pub async fn test_region_failover(store_type: StorageType) {
     assert!(success)
 }
 
-fn get_table_cache(instance: &Arc<Instance>, key: &str) -> Option<Option<Kv>> {
+fn get_table_cache(instance: &Arc<Instance>, key: &str) -> Option<Option<KeyValue>> {
     let catalog_manager = instance
         .catalog_manager()
         .as_any()
@@ -189,7 +190,7 @@ fn get_table_cache(instance: &Arc<Instance>, key: &str) -> Option<Option<Kv>> {
         .unwrap();
     let cache = kvbackend.cache();
 
-    cache.get(key.as_bytes())
+    Some(cache.get(key.as_bytes()))
 }
 
 fn get_route_cache(instance: &Arc<Instance>, table_name: &TableName) -> Option<Arc<TableRoute>> {
@@ -264,7 +265,7 @@ CREATE TABLE my_table (
     PARTITION r3 VALUES LESS THAN (MAXVALUE),
 )";
     let result = cluster.frontend.do_query(sql, QueryContext::arc()).await;
-    assert!(result[0].is_ok());
+    result.get(0).unwrap().as_ref().unwrap();
 }
 
 async fn find_region_distribution(cluster: &GreptimeDbCluster) -> HashMap<u64, Vec<u32>> {
@@ -331,17 +332,19 @@ async fn run_region_failover_procedure(
     let procedure = RegionFailoverProcedure::new(
         failed_region.clone(),
         RegionFailoverContext {
-            mailbox: meta_srv.mailbox(),
+            mailbox: meta_srv.mailbox().clone(),
             selector,
             selector_ctx: SelectorContext {
                 datanode_lease_secs: meta_srv.options().datanode_lease_secs,
                 server_addr: meta_srv.options().server_addr.clone(),
-                kv_store: meta_srv.kv_store(),
+                kv_store: meta_srv.kv_store().clone(),
+                meta_peer_client: meta_srv.meta_peer_client().clone(),
                 catalog: None,
                 schema: None,
                 table: None,
             },
             dist_lock: meta_srv.lock().clone(),
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
         },
     );
     let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));

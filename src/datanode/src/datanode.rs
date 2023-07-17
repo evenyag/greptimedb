@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common_base::readable_size::ReadableSize;
+use common_base::Plugins;
+use common_error::ext::BoxedError;
+pub use common_procedure::options::ProcedureConfig;
 use common_telemetry::info;
 use common_telemetry::logging::LoggingOptions;
 use meta_client::MetaClientOptions;
@@ -25,13 +28,15 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use servers::http::HttpOptions;
 use servers::Mode;
+use snafu::ResultExt;
 use storage::config::{
     EngineConfig as StorageEngineConfig, DEFAULT_AUTO_FLUSH_INTERVAL, DEFAULT_MAX_FLUSH_TASKS,
     DEFAULT_PICKER_SCHEDULE_INTERVAL, DEFAULT_REGION_WRITE_BUFFER_SIZE,
 };
 use storage::scheduler::SchedulerConfig;
 
-use crate::error::Result;
+use crate::error::{Result, ShutdownInstanceSnafu};
+use crate::heartbeat::HeartbeatTask;
 use crate::instance::{Instance, InstanceRef};
 use crate::server::Services;
 
@@ -48,6 +53,7 @@ pub enum ObjectStoreConfig {
     S3(S3Config),
     Oss(OssConfig),
     Azblob(AzblobConfig),
+    Gcs(GcsConfig),
 }
 
 /// Storage engine config
@@ -118,6 +124,19 @@ pub struct AzblobConfig {
     pub cache_capacity: Option<ReadableSize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcsConfig {
+    pub root: String,
+    pub bucket: String,
+    pub scope: String,
+    #[serde(skip_serializing)]
+    pub credential_path: SecretString,
+    pub endpoint: String,
+    pub cache_path: Option<String>,
+    pub cache_capacity: Option<ReadableSize>,
+}
+
 impl Default for S3Config {
     fn default() -> Self {
         Self {
@@ -158,6 +177,20 @@ impl Default for AzblobConfig {
             cache_path: Option::default(),
             cache_capacity: Option::default(),
             sas_token: Option::default(),
+        }
+    }
+}
+
+impl Default for GcsConfig {
+    fn default() -> Self {
+        Self {
+            root: String::default(),
+            bucket: String::default(),
+            scope: String::default(),
+            credential_path: SecretString::from(String::default()),
+            endpoint: String::default(),
+            cache_path: Option::default(),
+            cache_capacity: Option::default(),
         }
     }
 }
@@ -312,25 +345,6 @@ impl From<&DatanodeOptions> for StorageEngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProcedureConfig {
-    /// Max retry times of procedure.
-    pub max_retry_times: usize,
-    /// Initial retry delay of procedures, increases exponentially.
-    #[serde(with = "humantime_serde")]
-    pub retry_delay: Duration,
-}
-
-impl Default for ProcedureConfig {
-    fn default() -> ProcedureConfig {
-        ProcedureConfig {
-            max_retry_times: 3,
-            retry_delay: Duration::from_millis(500),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatanodeOptions {
@@ -340,6 +354,7 @@ pub struct DatanodeOptions {
     pub rpc_addr: String,
     pub rpc_hostname: Option<String>,
     pub rpc_runtime_size: usize,
+    pub heartbeat_interval_millis: u64,
     pub http_opts: HttpOptions,
     pub meta_client_options: Option<MetaClientOptions>,
     pub wal: WalConfig,
@@ -363,6 +378,7 @@ impl Default for DatanodeOptions {
             storage: StorageConfig::default(),
             procedure: ProcedureConfig::default(),
             logging: LoggingOptions::default(),
+            heartbeat_interval_millis: 5000,
         }
     }
 }
@@ -371,6 +387,10 @@ impl DatanodeOptions {
     pub fn env_list_keys() -> Option<&'static [&'static str]> {
         Some(&["meta_client_options.metasrv_addrs"])
     }
+
+    pub fn to_toml_string(&self) -> String {
+        toml::to_string(&self).unwrap()
+    }
 }
 
 /// Datanode service.
@@ -378,11 +398,12 @@ pub struct Datanode {
     opts: DatanodeOptions,
     services: Option<Services>,
     instance: InstanceRef,
+    heartbeat_task: Option<HeartbeatTask>,
 }
 
 impl Datanode {
-    pub async fn new(opts: DatanodeOptions) -> Result<Datanode> {
-        let instance = Arc::new(Instance::with_opts(&opts).await?);
+    pub async fn new(opts: DatanodeOptions, plugins: Arc<Plugins>) -> Result<Datanode> {
+        let (instance, heartbeat_task) = Instance::with_opts(&opts, plugins).await?;
         let services = match opts.mode {
             Mode::Distributed => Some(Services::try_new(instance.clone(), &opts).await?),
             Mode::Standalone => None,
@@ -391,6 +412,7 @@ impl Datanode {
             opts,
             services,
             instance,
+            heartbeat_task,
         })
     }
 
@@ -402,7 +424,11 @@ impl Datanode {
 
     /// Start only the internal component of datanode.
     pub async fn start_instance(&mut self) -> Result<()> {
-        self.instance.start().await
+        let _ = self.instance.start().await;
+        if let Some(task) = &self.heartbeat_task {
+            task.start().await?;
+        }
+        Ok(())
     }
 
     /// Start services of datanode. This method call will block until services are shutdown.
@@ -419,7 +445,15 @@ impl Datanode {
     }
 
     pub async fn shutdown_instance(&self) -> Result<()> {
-        self.instance.shutdown().await
+        if let Some(heartbeat_task) = &self.heartbeat_task {
+            heartbeat_task
+                .close()
+                .await
+                .map_err(BoxedError::new)
+                .context(ShutdownInstanceSnafu)?;
+        }
+        let _ = self.instance.shutdown().await;
+        Ok(())
     }
 
     async fn shutdown_services(&self) -> Result<()> {

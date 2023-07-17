@@ -24,10 +24,10 @@ use datatypes::schema::{Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 use snafu::{ensure, ResultExt};
 use store_api::storage::{
-    ColumnId, CreateOptions, EngineContext, OpenOptions, RegionDescriptorBuilder, RegionNumber,
-    StorageEngine,
+    ColumnId, CompactionStrategy, CreateOptions, EngineContext, OpenOptions,
+    RegionDescriptorBuilder, RegionId, RegionNumber, StorageEngine,
 };
-use table::engine::{region_id, table_dir};
+use table::engine::table_dir;
 use table::metadata::{TableInfoBuilder, TableMetaBuilder, TableType};
 use table::requests::CreateTableRequest;
 use table::TableRef;
@@ -165,7 +165,7 @@ impl<S: StorageEngine> CreateMitoTable<S> {
         );
 
         let _lock = self.creator.engine_inner.table_mutex.lock(table_id).await;
-        self.creator.create_table().await?;
+        let _ = self.creator.create_table().await?;
 
         Ok(Status::Done)
     }
@@ -232,15 +232,18 @@ impl<S: StorageEngine> TableCreator<S> {
         let table_options = &self.data.request.table_options;
         let write_buffer_size = table_options.write_buffer_size.map(|size| size.0 as usize);
         let ttl = table_options.ttl;
+        let compaction_strategy = CompactionStrategy::from(&table_options.extra_options);
         let open_opts = OpenOptions {
             parent_dir: table_dir.to_string(),
             write_buffer_size,
             ttl,
+            compaction_strategy: compaction_strategy.clone(),
         };
         let create_opts = CreateOptions {
             parent_dir: table_dir.to_string(),
             write_buffer_size,
             ttl,
+            compaction_strategy,
         };
 
         let primary_key_indices = &self.data.request.primary_key_indices;
@@ -275,12 +278,12 @@ impl<S: StorageEngine> TableCreator<S> {
                 .map_err(Error::from_error_ext)?
             {
                 // Region already exists.
-                self.regions.insert(*number, region);
+                let _ = self.regions.insert(*number, region);
                 continue;
             }
 
             // We need to create that region.
-            let region_id = region_id(self.data.request.id, *number);
+            let region_id = RegionId::new(self.data.request.id, *number);
             let region_desc = RegionDescriptorBuilder::default()
                 .id(region_id)
                 .name(region_name.clone())
@@ -308,7 +311,7 @@ impl<S: StorageEngine> TableCreator<S> {
                 region_id
             );
 
-            self.regions.insert(*number, region);
+            let _ = self.regions.insert(*number, region);
         }
 
         Ok(())
@@ -324,7 +327,8 @@ impl<S: StorageEngine> TableCreator<S> {
         {
             let table = Arc::new(MitoTable::new(table_info, self.regions.clone(), manifest));
 
-            self.engine_inner
+            let _ = self
+                .engine_inner
                 .tables
                 .insert(self.data.request.id, table.clone());
             return Ok(table);
@@ -334,7 +338,8 @@ impl<S: StorageEngine> TableCreator<S> {
         let table = self.write_manifest_and_create_table(table_dir).await?;
         let table = Arc::new(table);
 
-        self.engine_inner
+        let _ = self
+            .engine_inner
             .tables
             .insert(self.data.request.id, table.clone());
 

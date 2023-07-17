@@ -75,9 +75,7 @@ pub trait Memtable: Send + Sync + fmt::Debug {
     /// Iterates the memtable.
     fn iter(&self, ctx: IterContext) -> Result<BoxedBatchIterator>;
 
-    /// Returns the estimated bytes allocated by this memtable from heap. Result
-    /// of this method may be larger than the estimated based on [`num_rows`] because
-    /// of the implementor's pre-alloc behavior.
+    /// Returns the number of rows in the memtable.
     fn num_rows(&self) -> usize;
 
     /// Returns stats of this memtable.
@@ -101,11 +99,6 @@ pub struct IterContext {
     /// Max visible sequence (inclusive).
     pub visible_sequence: SequenceNumber,
 
-    // TODO(yingwen): [flush] Maybe delay deduping and visiblility handling, just returns all rows
-    // in memtable.
-    /// Returns all rows, ignores sequence visibility and key duplication.
-    pub for_flush: bool,
-
     /// Schema the reader expect to read.
     ///
     /// Set to `None` to read all columns.
@@ -121,7 +114,6 @@ impl Default for IterContext {
             batch_size: consts::READ_BATCH_SIZE,
             // All data in memory is visible by default.
             visible_sequence: SequenceNumber::MAX,
-            for_flush: false,
             projected_schema: None,
             time_range: None,
         }
@@ -229,7 +221,7 @@ impl AllocTracker {
 
     /// Tracks `bytes` memory is allocated.
     pub(crate) fn on_allocate(&self, bytes: usize) {
-        self.bytes_allocated.fetch_add(bytes, Ordering::Relaxed);
+        let _ = self.bytes_allocated.fetch_add(bytes, Ordering::Relaxed);
         increment_gauge!(WRITE_BUFFER_BYTES, bytes as f64);
         if let Some(flush_strategy) = &self.flush_strategy {
             flush_strategy.reserve_mem(bytes);

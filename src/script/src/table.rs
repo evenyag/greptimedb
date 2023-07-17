@@ -22,12 +22,11 @@ use common_catalog::consts::{
     DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE, SCRIPTS_TABLE_ID,
 };
 use common_catalog::format_full_table_name;
-use common_error::prelude::BoxedError;
+use common_error::ext::BoxedError;
 use common_query::Output;
 use common_recordbatch::{util as record_util, RecordBatch};
 use common_telemetry::logging;
 use common_time::util;
-use datafusion::prelude::SessionContext;
 use datatypes::prelude::{ConcreteDataType, ScalarVector};
 use datatypes::schema::{ColumnSchema, RawSchema};
 use datatypes::vectors::{StringVector, TimestampMillisecondVector, Vector, VectorRef};
@@ -35,6 +34,7 @@ use query::parser::QueryLanguageParser;
 use query::QueryEngineRef;
 use session::context::QueryContext;
 use snafu::{ensure, OptionExt, ResultExt};
+use store_api::storage::ScanRequest;
 use table::requests::{CreateTableRequest, InsertRequest, TableOptions};
 use table::TableRef;
 
@@ -78,14 +78,9 @@ impl ScriptsTable {
         table: TableRef,
         query_engine: QueryEngineRef,
     ) -> catalog::error::Result<()> {
-        let scan_stream = table
-            .scan(None, &[], None)
+        let rbs = table
+            .scan_to_stream(ScanRequest::default())
             .await
-            .map_err(BoxedError::new)
-            .context(CompileScriptInternalSnafu)?;
-        let ctx = SessionContext::new();
-        let rbs = scan_stream
-            .execute(0, ctx.task_ctx())
             .map_err(BoxedError::new)
             .context(CompileScriptInternalSnafu)?;
         let records = record_util::collect(rbs)
@@ -183,38 +178,36 @@ impl ScriptsTable {
     }
 
     pub async fn insert(&self, schema: &str, name: &str, script: &str) -> Result<()> {
-        let mut columns_values: HashMap<String, VectorRef> = HashMap::with_capacity(8);
-        columns_values.insert(
-            "schema".to_string(),
-            Arc::new(StringVector::from(vec![schema])) as _,
-        );
-        columns_values.insert(
-            "name".to_string(),
-            Arc::new(StringVector::from(vec![name])) as _,
-        );
-        columns_values.insert(
-            "script".to_string(),
-            Arc::new(StringVector::from(vec![script])) as _,
-        );
-        // TODO(dennis): we only supports python right now.
-        columns_values.insert(
-            "engine".to_string(),
-            Arc::new(StringVector::from(vec!["python"])) as _,
-        );
-        // Timestamp in key part is intentionally left to 0
-        columns_values.insert(
-            "timestamp".to_string(),
-            Arc::new(TimestampMillisecondVector::from_slice([0])) as _,
-        );
         let now = util::current_time_millis();
-        columns_values.insert(
-            "gmt_created".to_string(),
-            Arc::new(TimestampMillisecondVector::from_slice([now])) as _,
-        );
-        columns_values.insert(
-            "gmt_modified".to_string(),
-            Arc::new(TimestampMillisecondVector::from_slice([now])) as _,
-        );
+        let columns_values: HashMap<String, VectorRef> = HashMap::from([
+            (
+                "schema".to_string(),
+                Arc::new(StringVector::from(vec![schema])) as VectorRef,
+            ),
+            ("name".to_string(), Arc::new(StringVector::from(vec![name]))),
+            (
+                "script".to_string(),
+                Arc::new(StringVector::from(vec![script])) as VectorRef,
+            ),
+            (
+                "engine".to_string(),
+                // TODO(dennis): we only supports python right now.
+                Arc::new(StringVector::from(vec!["python"])) as VectorRef,
+            ),
+            (
+                "timestamp".to_string(),
+                // Timestamp in key part is intentionally left to 0
+                Arc::new(TimestampMillisecondVector::from_slice([0])) as VectorRef,
+            ),
+            (
+                "gmt_created".to_string(),
+                Arc::new(TimestampMillisecondVector::from_slice([now])) as VectorRef,
+            ),
+            (
+                "gmt_modified".to_string(),
+                Arc::new(TimestampMillisecondVector::from_slice([now])) as VectorRef,
+            ),
+        ]);
         let table = self
             .catalog_manager
             .table(

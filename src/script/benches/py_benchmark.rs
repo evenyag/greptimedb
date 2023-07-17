@@ -15,8 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use catalog::local::{MemoryCatalogProvider, MemorySchemaProvider};
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use catalog::local::MemoryCatalogManager;
 use common_query::Output;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use futures::Future;
@@ -50,22 +49,10 @@ where
 }
 
 pub(crate) fn sample_script_engine() -> PyEngine {
-    let catalog_list = catalog::local::new_memory_catalog_list().unwrap();
-
-    let default_schema = Arc::new(MemorySchemaProvider::new());
-    default_schema
-        .register_table_sync("numbers".to_string(), Arc::new(NumbersTable::default()))
-        .unwrap();
-    let default_catalog = Arc::new(MemoryCatalogProvider::new());
-    default_catalog
-        .register_schema_sync(DEFAULT_SCHEMA_NAME.to_string(), default_schema)
-        .unwrap();
-    catalog_list
-        .register_catalog_sync(DEFAULT_CATALOG_NAME.to_string(), default_catalog)
-        .unwrap();
-
-    let factory = QueryEngineFactory::new(catalog_list, false);
-    let query_engine = factory.query_engine();
+    let catalog_manager = Arc::new(MemoryCatalogManager::new_with_table(Arc::new(
+        NumbersTable::default(),
+    )));
+    let query_engine = QueryEngineFactory::new(catalog_manager, false).query_engine();
 
     PyEngine::new(query_engine.clone())
 }
@@ -123,7 +110,7 @@ def entry() -> vector[i64]:
     );
     let source = Arc::new(source);
     // execute the script in parallel for every thread in the pool
-    pool.broadcast(|_| {
+    let _ = pool.broadcast(|_| {
         let source = source.clone();
         let rt = get_local_runtime().unwrap();
         rt.block_on(async move {
@@ -176,44 +163,44 @@ fn criterion_benchmark(c: &mut Criterion) {
     // which require a local mock library
     // TODO(discord9): revisit once mock library is ready
 
-    c.bench_function("fib 20 rspy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| fibonacci(black_box(20), "rspy"))
-    });
-    c.bench_function("fib 20 pyo3", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| fibonacci(black_box(20), "pyo3"))
-    });
-
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(16)
         .build()
         .unwrap();
-    c.bench_function("par fib 20 rspy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| parallel_fibonacci(black_box(20), "rspy", &pool))
-    });
-    c.bench_function("par fib 20 pyo3", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| parallel_fibonacci(black_box(20), "pyo3", &pool))
-    });
 
-    c.bench_function("loop 1M rspy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| loop_1_million(black_box("rspy")))
-    });
-    c.bench_function("loop 1M pyo3", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| loop_1_million(black_box("pyo3")))
-    });
-    c.bench_function("api heavy rspy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| api_heavy(black_box("rspy")))
-    });
-    c.bench_function("api heavy pyo3", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
-            .iter(|| api_heavy(black_box("pyo3")))
-    });
+    let _ = c
+        .bench_function("fib 20 rspy", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| fibonacci(black_box(20), "rspy"))
+        })
+        .bench_function("fib 20 pyo3", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| fibonacci(black_box(20), "pyo3"))
+        })
+        .bench_function("par fib 20 rspy", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| parallel_fibonacci(black_box(20), "rspy", &pool))
+        })
+        .bench_function("par fib 20 pyo3", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| parallel_fibonacci(black_box(20), "pyo3", &pool))
+        })
+        .bench_function("loop 1M rspy", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| loop_1_million(black_box("rspy")))
+        })
+        .bench_function("loop 1M pyo3", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| loop_1_million(black_box("pyo3")))
+        })
+        .bench_function("api heavy rspy", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| api_heavy(black_box("rspy")))
+        })
+        .bench_function("api heavy pyo3", |b| {
+            b.to_async(tokio::runtime::Runtime::new().unwrap())
+                .iter(|| api_heavy(black_box("pyo3")))
+        });
 }
 
 criterion_group!(benches, criterion_benchmark);

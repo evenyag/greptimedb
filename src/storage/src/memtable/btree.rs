@@ -137,7 +137,7 @@ impl Memtable for BTreeMemtable {
             if ts > max_ts {
                 *max_ts = ts.clone();
             }
-            map.insert(inner_key, row_value);
+            let _ = map.insert(inner_key, row_value);
         }
 
         self.update_stats(kvs.estimated_memory_size(), min_ts, max_ts);
@@ -238,12 +238,8 @@ impl BTreeIterator {
             map.range(..)
         };
 
-        let (keys, sequences, op_types, values) = if self.ctx.for_flush {
-            collect_iter(iter, self.ctx.batch_size)
-        } else {
-            let iter = MapIterWrapper::new(iter, self.ctx.visible_sequence, self.ctx.time_range);
-            collect_iter(iter, self.ctx.batch_size)
-        };
+        let iter = MapIterWrapper::new(iter, self.ctx.visible_sequence, self.ctx.time_range);
+        let (keys, sequences, op_types, values) = collect_iter(iter, self.ctx.batch_size);
 
         if keys.is_empty() {
             return Ok(None);

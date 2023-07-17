@@ -35,8 +35,7 @@ rows |  protobuf    |    arrow       |
 fn encode_arrow(batch: &WriteBatch) {
     let encoder = codec::PayloadEncoder::new();
     let mut dst = vec![];
-    let result = encoder.encode(batch.payload(), &mut dst);
-    assert!(result.is_ok());
+    encoder.encode(batch.payload(), &mut dst).unwrap();
 }
 
 fn bench_wal_encode(c: &mut Criterion) {
@@ -45,15 +44,16 @@ fn bench_wal_encode(c: &mut Criterion) {
     let (batch_10000, _) = gen_new_batch_and_types(100);
 
     let mut group = c.benchmark_group("wal_encode");
-    group.bench_function("arrow_encode_with_10_num_rows", |b| {
-        b.iter(|| encode_arrow(&batch_10))
-    });
-    group.bench_function("arrow_encode_with_100_num_rows", |b| {
-        b.iter(|| encode_arrow(&batch_100))
-    });
-    group.bench_function("arrow_encode_with_10000_num_rows", |b| {
-        b.iter(|| encode_arrow(&batch_10000))
-    });
+    let _ = group
+        .bench_function("arrow_encode_with_10_num_rows", |b| {
+            b.iter(|| encode_arrow(&batch_10))
+        })
+        .bench_function("arrow_encode_with_100_num_rows", |b| {
+            b.iter(|| encode_arrow(&batch_100))
+        })
+        .bench_function("arrow_encode_with_10000_num_rows", |b| {
+            b.iter(|| encode_arrow(&batch_10000))
+        });
     group.finish();
 }
 

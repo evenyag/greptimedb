@@ -11,21 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use api::v1::meta::heartbeat_client::HeartbeatClient;
-use api::v1::meta::{AskLeaderRequest, HeartbeatRequest, HeartbeatResponse, RequestHeader, Role};
+use api::v1::meta::{HeartbeatRequest, HeartbeatResponse, RequestHeader, Role};
 use common_grpc::channel_manager::ChannelManager;
 use common_meta::rpc::util;
-use common_telemetry::{debug, info};
+use common_telemetry::info;
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
+use crate::client::ask_leader::AskLeader;
 use crate::client::Id;
 use crate::error;
 use crate::error::{InvalidResponseHeaderSnafu, Result};
@@ -95,14 +94,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(id: Id, role: Role, channel_manager: ChannelManager) -> Self {
-        let inner = Arc::new(RwLock::new(Inner {
-            id,
-            role,
-            channel_manager,
-            peers: HashSet::default(),
-            leader: None,
-        }));
-
+        let inner = Arc::new(RwLock::new(Inner::new(id, role, channel_manager)));
         Self { inner }
     }
 
@@ -116,12 +108,12 @@ impl Client {
     }
 
     pub async fn ask_leader(&mut self) -> Result<()> {
-        let mut inner = self.inner.write().await;
+        let inner = self.inner.read().await;
         inner.ask_leader().await
     }
 
     pub async fn heartbeat(&mut self) -> Result<(HeartbeatSender, HeartbeatStream)> {
-        let mut inner = self.inner.write().await;
+        let inner = self.inner.read().await;
         inner.ask_leader().await?;
         inner.heartbeat().await
     }
@@ -137,11 +129,19 @@ struct Inner {
     id: Id,
     role: Role,
     channel_manager: ChannelManager,
-    peers: HashSet<String>,
-    leader: Option<String>,
+    ask_leader: Option<AskLeader>,
 }
 
 impl Inner {
+    fn new(id: Id, role: Role, channel_manager: ChannelManager) -> Self {
+        Self {
+            id,
+            role,
+            channel_manager,
+            ask_leader: None,
+        }
+    }
+
     async fn start<U, A>(&mut self, urls: A) -> Result<()>
     where
         U: AsRef<str>,
@@ -154,16 +154,22 @@ impl Inner {
             }
         );
 
-        self.peers = urls
+        let peers = urls
             .as_ref()
             .iter()
             .map(|url| url.as_ref().to_string())
-            .collect();
+            .collect::<Vec<_>>();
+        self.ask_leader = Some(AskLeader::new(
+            self.id,
+            self.role,
+            peers,
+            self.channel_manager.clone(),
+        ));
 
         Ok(())
     }
 
-    async fn ask_leader(&mut self) -> Result<()> {
+    async fn ask_leader(&self) -> Result<()> {
         ensure!(
             self.is_started(),
             error::IllegalGrpcClientStateSnafu {
@@ -171,31 +177,24 @@ impl Inner {
             }
         );
 
-        let header = RequestHeader::new(self.id, self.role);
-        let mut leader = None;
-        for addr in &self.peers {
-            let req = AskLeaderRequest {
-                header: Some(header.clone()),
-            };
-            let mut client = self.make_client(addr)?;
-            match client.ask_leader(req).await {
-                Ok(res) => {
-                    if let Some(endpoint) = res.into_inner().leader {
-                        leader = Some(endpoint.addr);
-                        break;
-                    }
-                }
-                Err(status) => {
-                    debug!("Failed to ask leader from: {}, {}", addr, status);
-                }
-            }
-        }
-        self.leader = Some(leader.context(error::AskLeaderSnafu)?);
+        let _ = self.ask_leader.as_ref().unwrap().ask_leader().await;
         Ok(())
     }
 
     async fn heartbeat(&self) -> Result<(HeartbeatSender, HeartbeatStream)> {
-        let leader = self.leader.as_ref().context(error::NoLeaderSnafu)?;
+        ensure!(
+            self.is_started(),
+            error::IllegalGrpcClientStateSnafu {
+                err_msg: "Heartbeat client not start"
+            }
+        );
+
+        let leader = self
+            .ask_leader
+            .as_ref()
+            .unwrap()
+            .get_leader()
+            .context(error::NoLeaderSnafu)?;
         let mut leader = self.make_client(leader)?;
 
         let (sender, receiver) = mpsc::channel::<HeartbeatRequest>(128);
@@ -242,8 +241,8 @@ impl Inner {
     }
 
     #[inline]
-    fn is_started(&self) -> bool {
-        !self.peers.is_empty()
+    pub(crate) fn is_started(&self) -> bool {
+        self.ask_leader.is_some()
     }
 }
 
@@ -279,20 +278,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_start_with_duplicate_peers() {
-        let mut client = Client::new((0, 0), Role::Datanode, ChannelManager::default());
-        client
-            .start(&["127.0.0.1:1000", "127.0.0.1:1000", "127.0.0.1:1000"])
-            .await
-            .unwrap();
-        assert_eq!(1, client.inner.write().await.peers.len());
-    }
-
-    #[tokio::test]
     async fn test_heartbeat_stream() {
         let (sender, mut receiver) = mpsc::channel::<HeartbeatRequest>(100);
         let sender = HeartbeatSender::new((8, 8), Role::Datanode, sender);
-        tokio::spawn(async move {
+        let _handle = tokio::spawn(async move {
             for _ in 0..10 {
                 sender.send(HeartbeatRequest::default()).await.unwrap();
             }
