@@ -17,7 +17,7 @@ use std::ops::Deref;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Bytes buffer.
-#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Hash)]
 pub struct Bytes(bytes::Bytes);
 
 impl From<Bytes> for bytes::Bytes {
