@@ -23,13 +23,27 @@ use crate::datanode::FileConfig;
 use crate::error::{self, Result};
 use crate::store;
 
-pub(crate) async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
+/// Creates a new fs object store with default atomic dir.
+pub async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
+    new_fs_with_atomic_dir_suffix(file_config, ".tmp").await
+}
+
+/// Creates a new fs object store with atomic dir suffix.
+///
+/// This function also cleans the atomic dir.
+pub async fn new_fs_with_atomic_dir_suffix(
+    file_config: &FileConfig,
+    atomic_dir_suffix: &str,
+) -> Result<ObjectStore> {
     let data_home = util::normalize_dir(&file_config.data_home);
     fs::create_dir_all(path::Path::new(&data_home))
         .context(error::CreateDirSnafu { dir: &data_home })?;
-    info!("The file storage home is: {}", &data_home);
 
-    let atomic_write_dir = format!("{data_home}.tmp/");
+    let atomic_write_dir = util::join_dir(&data_home, atomic_dir_suffix);
+    info!(
+        "The file storage home is: {}, atomic_write_dir is: {}",
+        &data_home, atomic_write_dir
+    );
     store::clean_temp_dir(&atomic_write_dir)?;
 
     let mut builder = FsBuilder::default();
