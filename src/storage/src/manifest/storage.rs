@@ -158,7 +158,7 @@ impl ManifestObjectStore {
 
     #[inline]
     /// Returns the checkpoint file path under the **current** compression algorithm
-    fn checkpoint_file_path(&self, version: ManifestVersion) -> String {
+    pub fn checkpoint_file_path(&self, version: ManifestVersion) -> String {
         gen_path(&self.path, &checkpoint_file(version), self.compress_type)
     }
 

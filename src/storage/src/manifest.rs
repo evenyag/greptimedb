@@ -13,12 +13,12 @@
 // limitations under the License.
 
 //! manifest storage
-pub(crate) mod action;
+pub mod action;
 pub mod checkpoint;
 pub mod helper;
 mod impl_;
 pub mod region;
-pub(crate) mod storage;
+pub mod storage;
 #[cfg(test)]
 pub mod test_utils;
 

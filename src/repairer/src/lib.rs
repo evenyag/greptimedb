@@ -12,30 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod manifest;
 mod object_store_util;
 
 use datanode::datanode::StorageConfig;
 use object_store::ObjectStore;
+
+use crate::manifest::{ManifestRebuilder, RebuildOneRegion};
 
 pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 
 /// DB repairer.
 #[derive(Debug)]
 pub struct Repairer {
-    /// Storage config of the db.
-    storage_config: StorageConfig,
     /// Object store from storage config.
     object_store: ObjectStore,
+    /// Dry run mode
+    dry_run: bool,
 }
 
 impl Repairer {
     /// Creates a new repairer.
     pub async fn new(storage_config: StorageConfig) -> Result<Repairer> {
-        let object_store = object_store_util::new_object_store(&storage_config).await?;
+        let object_store = object_store_util::new_object_store(&storage_config.store).await?;
 
         Ok(Repairer {
-            storage_config,
             object_store,
+            dry_run: false,
         })
+    }
+
+    /// Set dry run mode.
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Repair one region manifest.
+    pub async fn repair_region_manifest(&self, req: RebuildOneRegion) -> Result<()> {
+        let rebulder = ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
+        rebulder.rebuild_one(&req).await
     }
 }

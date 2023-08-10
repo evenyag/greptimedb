@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-compat = "0.2"
+common-datasource = { workspace = true }
 common-telemetry = { workspace = true }
+common-time = { workspace = true }
 datanode = { workspace = true }
+datatypes.workspace = true
+futures.workspace = true
 object-store = { workspace = true }
+parquet.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 storage = { workspace = true }
+store-api = { workspace = true }
+tokio.workspace = true

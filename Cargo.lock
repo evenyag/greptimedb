@@ -7569,11 +7569,20 @@ dependencies = [
 name = "repairer"
 version = "0.3.2"
 dependencies = [
+ "async-compat",
+ "common-datasource",
  "common-telemetry",
+ "common-time",
  "datanode",
+ "datatypes",
+ "futures",
  "object-store",
+ "parquet",
+ "serde_json",
  "snafu",
  "storage",
+ "store-api",
+ "tokio",
 ]
 
 [[package]]
