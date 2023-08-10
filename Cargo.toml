@@ -40,6 +40,7 @@ members = [
     "src/partition",
     "src/promql",
     "src/query",
+    "src/repairer",
     "src/script",
     "src/servers",
     "src/session",

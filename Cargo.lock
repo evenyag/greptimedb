@@ -7566,6 +7566,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "repairer"
+version = "0.3.2"
+dependencies = [
+ "object-store",
+ "storage",
+]
+
+[[package]]
 name = "reqsign"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
