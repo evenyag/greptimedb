@@ -7570,9 +7570,8 @@ name = "repairer"
 version = "0.3.2"
 dependencies = [
  "common-telemetry",
- "datanode-options",
+ "datanode",
  "object-store",
- "secrecy",
  "snafu",
  "storage",
 ]

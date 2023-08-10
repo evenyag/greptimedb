@@ -14,56 +14,53 @@
 
 //! object storage utilities.
 
-use crate::Result;
-use common_telemetry::info;
-use object_store::{util, ObjectStore};
-use datanode_options::{FileConfig, S3Config};
-use object_store::services::Fs;
-use object_store::services::S3;
+use datanode::datanode::{FileConfig, ObjectStoreConfig};
+use datanode::store;
+use datanode::store::fs::new_fs_with_atomic_dir_suffix;
+use object_store::layers::RetryLayer;
+use object_store::ObjectStore;
 use snafu::ResultExt;
-use secrecy::ExposeSecret;
 
-/// Creates a new fs object store.
+use crate::Result;
+
+/// Dir for atomic write in repair mode.
+///
+/// We choose another dir to avoid collision with exisitng atomic dir.
+const REPAIR_ATOMIC_WRITE_DIR: &str = ".repair";
+
+/// Creates a new fs object store with a atomic dir for repairer.
 pub(crate) async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
-    let data_home = util::normalize_dir(&file_config.data_home);
+    new_fs_with_atomic_dir_suffix(file_config, REPAIR_ATOMIC_WRITE_DIR)
+        .await
+        .whatever_context("new fs object store")
+}
 
-    info!("The file storage home is: {}", &data_home);
+/// Creates a new object store.
+pub(crate) async fn new_object_store(store_config: &ObjectStoreConfig) -> Result<ObjectStore> {
+    let object_store = match store_config {
+        ObjectStoreConfig::File(file_config) => new_fs_object_store(file_config).await,
+        ObjectStoreConfig::S3(s3_config) => store::s3::new_s3_object_store(s3_config)
+            .await
+            .whatever_context("new s3 object store"),
+        ObjectStoreConfig::Oss(oss_config) => store::oss::new_oss_object_store(oss_config)
+            .await
+            .whatever_context("new oss object store"),
+        ObjectStoreConfig::Azblob(azblob_config) => {
+            store::azblob::new_azblob_object_store(azblob_config)
+                .await
+                .whatever_context("new azblob object store")
+        }
+        ObjectStoreConfig::Gcs(gcs_config) => store::gcs::new_gcs_object_store(gcs_config)
+            .await
+            .whatever_context("new gcs object store"),
+    }?;
 
-    let mut builder = Fs::default();
-    builder.root(&data_home);
-
-    let object_store = ObjectStore::new(builder)
-        .whatever_context("Create fs object store")?
-        .finish();
+    // Enable retry layer and cache layer for non-fs object storages
+    let object_store = if !matches!(store_config, ObjectStoreConfig::File(..)) {
+        object_store.layer(RetryLayer::new().with_jitter())
+    } else {
+        object_store
+    };
 
     Ok(object_store)
 }
-
-/// Creates a new s3 object store.
-pub(crate) async fn new_s3_object_store(s3_config: &S3Config) -> Result<ObjectStore> {
-    let root = util::normalize_dir(&s3_config.root);
-
-    info!(
-        "The s3 storage bucket is: {}, root is: {}",
-        s3_config.bucket, &root
-    );
-
-    let mut builder = S3::default();
-    builder
-        .root(&root)
-        .bucket(&s3_config.bucket)
-        .access_key_id(s3_config.access_key_id.expose_secret())
-        .secret_access_key(s3_config.secret_access_key.expose_secret());
-
-    if s3_config.endpoint.is_some() {
-        builder.endpoint(s3_config.endpoint.as_ref().unwrap());
-    }
-    if s3_config.region.is_some() {
-        builder.region(s3_config.region.as_ref().unwrap());
-    }
-
-    Ok(ObjectStore::new(builder)
-        .whatever_context("create s3 object store")?
-        .finish())
-}
-

@@ -21,7 +21,8 @@ use snafu::prelude::*;
 use crate::datanode::GcsConfig;
 use crate::error::{self, Result};
 
-pub(crate) async fn new_gcs_object_store(gcs_config: &GcsConfig) -> Result<ObjectStore> {
+/// Creates a new gcs object store without cache.
+pub async fn new_gcs_object_store(gcs_config: &GcsConfig) -> Result<ObjectStore> {
     let root = util::normalize_dir(&gcs_config.root);
     info!(
         "The gcs storage bucket is: {}, root is: {}",

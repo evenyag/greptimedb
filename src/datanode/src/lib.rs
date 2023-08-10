@@ -25,7 +25,7 @@ pub mod metrics;
 mod mock;
 pub mod server;
 pub mod sql;
-mod store;
+pub mod store;
 
 use greptimedb_telemetry::telemetry;
 

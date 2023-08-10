@@ -14,11 +14,11 @@
 
 //! object storage utilities
 
-mod azblob;
-mod fs;
-mod gcs;
-mod oss;
-mod s3;
+pub mod azblob;
+pub mod fs;
+pub mod gcs;
+pub mod oss;
+pub mod s3;
 
 use std::path;
 use std::sync::Arc;

@@ -6,8 +6,7 @@ license.workspace = true
 
 [dependencies]
 common-telemetry = { workspace = true }
-datanode-options = { workspace = true }
+datanode = { workspace = true }
 object-store = { workspace = true }
-secrecy.workspace = true
 snafu.workspace = true
 storage = { workspace = true }

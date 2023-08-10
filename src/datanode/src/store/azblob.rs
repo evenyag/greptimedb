@@ -21,7 +21,8 @@ use snafu::prelude::*;
 use crate::datanode::AzblobConfig;
 use crate::error::{self, Result};
 
-pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Result<ObjectStore> {
+/// Creates a new azblob object store without cache.
+pub async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Result<ObjectStore> {
     let root = util::normalize_dir(&azblob_config.root);
 
     info!(
@@ -30,7 +31,7 @@ pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Res
     );
 
     let mut builder = AzureBuilder::default();
-    let _ = builder
+    builder
         .root(&root)
         .container(&azblob_config.container)
         .endpoint(&azblob_config.endpoint)
@@ -38,7 +39,7 @@ pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Res
         .account_key(azblob_config.account_key.expose_secret());
 
     if let Some(token) = &azblob_config.sas_token {
-        let _ = builder.sas_token(token);
+        builder.sas_token(token);
     }
 
     Ok(ObjectStore::new(builder)

@@ -21,7 +21,8 @@ use snafu::prelude::*;
 use crate::datanode::OssConfig;
 use crate::error::{self, Result};
 
-pub(crate) async fn new_oss_object_store(oss_config: &OssConfig) -> Result<ObjectStore> {
+/// Creates a new oss object store without cache.
+pub async fn new_oss_object_store(oss_config: &OssConfig) -> Result<ObjectStore> {
     let root = util::normalize_dir(&oss_config.root);
     info!(
         "The oss storage bucket is: {}, root is: {}",
@@ -29,7 +30,7 @@ pub(crate) async fn new_oss_object_store(oss_config: &OssConfig) -> Result<Objec
     );
 
     let mut builder = OSSBuilder::default();
-    let _ = builder
+    builder
         .root(&root)
         .bucket(&oss_config.bucket)
         .endpoint(&oss_config.endpoint)

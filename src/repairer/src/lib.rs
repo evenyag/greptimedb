@@ -14,7 +14,7 @@
 
 mod object_store_util;
 
-use datanode_options::StorageConfig;
+use datanode::datanode::StorageConfig;
 
 pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 
@@ -28,6 +28,6 @@ pub struct Repairer {
 impl Repairer {
     /// Creates a new repairer.
     pub fn new(storage_config: StorageConfig) -> Repairer {
-        Repairer { storage_config, }
+        Repairer { storage_config }
     }
 }
