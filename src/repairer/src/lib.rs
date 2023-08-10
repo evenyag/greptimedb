@@ -12,6 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod object_store_util;
+
+use datanode_options::StorageConfig;
+
+pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
+
 /// DB repairer.
 #[derive(Debug)]
-pub struct Repairer {}
+pub struct Repairer {
+    /// Storage config of the db.
+    storage_config: StorageConfig,
+}
+
+impl Repairer {
+    /// Creates a new repairer.
+    pub fn new(storage_config: StorageConfig) -> Repairer {
+        Repairer { storage_config, }
+    }
+}
