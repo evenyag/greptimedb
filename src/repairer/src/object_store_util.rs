@@ -29,7 +29,7 @@ use crate::Result;
 const REPAIR_ATOMIC_WRITE_DIR: &str = ".repair";
 
 /// Creates a new fs object store with a atomic dir for repairer.
-pub(crate) async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
+async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
     new_fs_with_atomic_dir_suffix(file_config, REPAIR_ATOMIC_WRITE_DIR)
         .await
         .whatever_context("new fs object store")

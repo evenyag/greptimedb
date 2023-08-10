@@ -15,6 +15,7 @@
 mod object_store_util;
 
 use datanode::datanode::StorageConfig;
+use object_store::ObjectStore;
 
 pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 
@@ -23,11 +24,18 @@ pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 pub struct Repairer {
     /// Storage config of the db.
     storage_config: StorageConfig,
+    /// Object store from storage config.
+    object_store: ObjectStore,
 }
 
 impl Repairer {
     /// Creates a new repairer.
-    pub fn new(storage_config: StorageConfig) -> Repairer {
-        Repairer { storage_config }
+    pub async fn new(storage_config: StorageConfig) -> Result<Repairer> {
+        let object_store = object_store_util::new_object_store(&storage_config).await?;
+
+        Ok(Repairer {
+            storage_config,
+            object_store,
+        })
     }
 }
