@@ -109,6 +109,9 @@ impl ManifestRebuilder {
         info!("Rebuild region {:?} start", req);
 
         let manifest_dir = join_dir(&req.region_dir, "manifest");
+
+        info!("Manifest dir is {}", manifest_dir);
+
         let store = ManifestObjectStore::new(
             &manifest_dir,
             self.object_store.clone(),
@@ -127,7 +130,13 @@ impl ManifestRebuilder {
             return Ok(());
         };
 
-        debug!("load checkpoint to rebuild, manifest_dir: {}, checkpoint_version: {}, checkpoint: {:?}", manifest_dir, checkpoint_version, checkpoint);
+        // Safety: checkpoint is deserialized from json.
+        debug!(
+            "load checkpoint to rebuild, manifest_dir: {}, checkpoint_version: {}, checkpoint: {}",
+            manifest_dir,
+            checkpoint_version,
+            serde_json::to_string(&checkpoint).unwrap()
+        );
         assert_eq!(checkpoint_version, checkpoint.last_version);
 
         let start_version = checkpoint.last_version + 1;
@@ -140,12 +149,25 @@ impl ManifestRebuilder {
         let file_names = list_ssts(&self.object_store, &req.region_dir).await?;
         let file_ids = parse_file_names(&file_names);
 
+        // Safety: they are deserialized from json.
+        info!(
+            "compute diff for region {}, checkpoint: {}, file_ids: {:?}, action_lists: {}",
+            region_id,
+            serde_json::to_string(&checkpoint).unwrap(),
+            file_ids,
+            serde_json::to_string(&action_lists).unwrap()
+        );
         let Some(diff) = diff_checkpoint(&checkpoint, &file_ids, &action_lists) else {
             info!("checkpoint of region {} has no data", region_id);
             return Ok(());
         };
 
         info!("Region {} checkpoint diff is {:?}", region_id, diff);
+
+        if diff.files_to_remove.is_empty() && diff.files_to_add.is_empty() {
+            info!("No need to rebuild manifest for region {}", region_id);
+            return Ok(());
+        }
 
         let meta_to_add = diff
             .detect_file_meta_to_add(&self.object_store, &req.region_dir, region_id)
@@ -383,7 +405,11 @@ impl RegionManifestOperator {
 
     /// Save checkpoint to path of given version.
     async fn save_checkpoint(&self, checkpoint: &RegionCheckpoint) -> Result<()> {
-        info!("Save checkpoint {:?} under {}", checkpoint, self.path);
+        info!(
+            "Save checkpoint {} under {}",
+            serde_json::to_string(&checkpoint).unwrap_or_else(|_| { format!("{:?}", checkpoint) }),
+            self.path
+        );
 
         if self.dry_run {
             return Ok(());
@@ -558,6 +584,13 @@ fn diff_checkpoint(
         for action in &action_list.actions {
             if let RegionMetaAction::Edit(edit) = action {
                 for meta in &edit.files_to_remove {
+                    // We will remove this file later, so we should keep it in the checkpoint
+                    // before removing it.
+                    sst_files.insert(meta.file_id);
+                }
+                for meta in &edit.files_to_add {
+                    // Remaining action adds this file, so we remove it from sst files
+                    // to avoid adding it to the checkpoint.
                     sst_files.remove(&meta.file_id);
                 }
             }

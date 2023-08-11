@@ -541,6 +541,9 @@ impl ManifestLogStorage for ManifestObjectStore {
 
     async fn load_last_checkpoint(&self) -> Result<Option<(ManifestVersion, Vec<u8>)>> {
         let last_checkpoint_path = self.last_checkpoint_path();
+
+        logging::info!("Try to load checkpoint from {}", last_checkpoint_path);
+
         let last_checkpoint_data = match self.object_store.read(&last_checkpoint_path).await {
             Ok(data) => data,
             Err(e) if e.kind() == ErrorKind::NotFound => {

@@ -18,7 +18,7 @@ mod object_store_util;
 pub use anyhow::{Error, Result};
 use common_telemetry::info;
 use datanode::datanode::StorageConfig;
-use object_store::ObjectStore;
+use object_store::{util, ObjectStore};
 
 use crate::manifest::{ManifestRebuilder, RebuildCatalog, RebuildDb, RebuildRegion, RebuildSchema};
 
@@ -51,28 +51,32 @@ impl Repairer {
     }
 
     /// Repair a region manifest.
-    pub async fn repair_region_manifest(&self, req: RebuildRegion) -> Result<()> {
+    pub async fn repair_region_manifest(&self, mut req: RebuildRegion) -> Result<()> {
+        req.region_dir = util::normalize_dir(&req.region_dir);
         let rebuilder =
             ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
         rebuilder.rebuild_region(&req).await
     }
 
     /// Repair db manifest.
-    pub async fn repair_db_manifest(&self, req: RebuildDb) -> Result<()> {
+    pub async fn repair_db_manifest(&self, mut req: RebuildDb) -> Result<()> {
+        req.db_dir = util::normalize_dir(&req.db_dir);
         let rebuilder =
             ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
         rebuilder.rebuild_db(&req).await
     }
 
     /// Repair catalog manifest.
-    pub async fn repair_catalog_manifest(&self, req: RebuildCatalog) -> Result<()> {
+    pub async fn repair_catalog_manifest(&self, mut req: RebuildCatalog) -> Result<()> {
+        req.catalog_dir = util::normalize_dir(&req.catalog_dir);
         let rebuilder =
             ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
         rebuilder.rebuild_catalog(&req).await
     }
 
     /// Repair schema manifest.
-    pub async fn repair_schema_manifest(&self, req: RebuildSchema) -> Result<()> {
+    pub async fn repair_schema_manifest(&self, mut req: RebuildSchema) -> Result<()> {
+        req.schema_dir = util::normalize_dir(&req.schema_dir);
         let rebuilder =
             ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
         rebuilder.rebuild_schema(&req).await

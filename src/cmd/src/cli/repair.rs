@@ -26,7 +26,7 @@ use crate::options::{Options, RepairOptions};
 
 #[derive(Debug, Parser)]
 pub struct RepairCommand {
-    #[clap(long, default_value_t = false)]
+    #[clap(long, action = clap::ArgAction::SetFalse)]
     dry_run: bool,
     #[clap(short, long)]
     config_file: Option<String>,
