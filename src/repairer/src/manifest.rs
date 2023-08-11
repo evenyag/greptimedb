@@ -165,7 +165,7 @@ impl ManifestRebuilder {
 
         info!("Region {} checkpoint diff is {:?}", region_id, diff);
 
-        if diff.files_to_remove.is_empty() && diff.files_to_add.is_empty() {
+        if diff.files_to_remove.is_empty() {
             info!("No need to rebuild manifest for region {}", region_id);
             return Ok(());
         }
