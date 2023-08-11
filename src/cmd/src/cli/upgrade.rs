@@ -44,7 +44,7 @@ pub struct UpgradeCommand {
     #[clap(long)]
     etcd_addr: String,
     #[clap(long)]
-    dryrun: bool,
+    dry_run: bool,
 }
 
 impl UpgradeCommand {
@@ -56,7 +56,7 @@ impl UpgradeCommand {
             })?;
         let tool = MigrateTableMetadata {
             etcd_store: EtcdStore::with_etcd_client(client),
-            dryrun: self.dryrun,
+            dry_run: self.dry_run,
         };
         Ok(Instance::Tool(Box::new(tool)))
     }
@@ -64,7 +64,7 @@ impl UpgradeCommand {
 
 struct MigrateTableMetadata {
     etcd_store: KvStoreRef,
-    dryrun: bool,
+    dry_run: bool,
 }
 
 #[async_trait]
@@ -117,8 +117,8 @@ impl MigrateTableMetadata {
 
         info!("Creating '{new_key}'");
 
-        if self.dryrun {
-            info!("Dryrun: do nothing");
+        if self.dry_run {
+            info!("Dry run: do nothing");
         } else {
             self.etcd_store
                 .put(
@@ -169,8 +169,8 @@ impl MigrateTableMetadata {
 
         info!("Creating '{new_key}'");
 
-        if self.dryrun {
-            info!("Dryrun: do nothing");
+        if self.dry_run {
+            info!("Dry run: do nothing");
         } else {
             self.etcd_store
                 .put(
@@ -225,8 +225,8 @@ impl MigrateTableMetadata {
                 keys: keys.to_vec(),
                 prev_kv: false,
             };
-            if self.dryrun {
-                info!("Dryrun: do nothing");
+            if self.dry_run {
+                info!("Dry run: do nothing");
             } else {
                 self.etcd_store.batch_delete(req).await.unwrap();
             }
@@ -245,8 +245,8 @@ impl MigrateTableMetadata {
 
         info!("Splitting TableGlobalKey '{key}' into '{table_info_key}' and '{table_region_key}'");
 
-        if self.dryrun {
-            info!("Dryrun: do nothing");
+        if self.dry_run {
+            info!("Dry run: do nothing");
         } else {
             self.etcd_store
                 .batch_put(
@@ -278,8 +278,8 @@ impl MigrateTableMetadata {
 
         info!("Creating '{table_name_key}' => {table_id}");
 
-        if self.dryrun {
-            info!("Dryrun: do nothing");
+        if self.dry_run {
+            info!("Dry run: do nothing");
         } else {
             self.etcd_store
                 .put(
@@ -306,8 +306,8 @@ impl MigrateTableMetadata {
             })
             .collect::<Vec<_>>();
 
-        if self.dryrun {
-            info!("Dryrun: do nothing");
+        if self.dry_run {
+            info!("Dry run: do nothing");
         } else {
             let mut req = BatchPutRequest::new();
             for (key, value) in datanode_table_kvs {
