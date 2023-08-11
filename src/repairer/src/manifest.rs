@@ -20,7 +20,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context};
 use async_compat::CompatExt;
 use common_datasource::compression::CompressionType;
-use common_telemetry::{debug, info};
+use common_telemetry::{debug, info, warn};
 use common_time::timestamp::TimeUnit;
 use common_time::util::current_time_millis;
 use common_time::Timestamp;
@@ -238,7 +238,9 @@ impl ManifestRebuilder {
         let mut table_reqs: Vec<_> = table_entries
             .iter()
             .filter_map(|entry| {
-                let Ok(table_id) = entry.name().parse::<TableId>() else {
+                let table_id_str = entry.name().trim_end_matches('/');
+                let Ok(table_id) = table_id_str.parse::<TableId>() else {
+                    warn!("Invalid table id {} under {}", entry.name(), req.schema_dir);
                     return None;
                 };
 
@@ -341,13 +343,21 @@ impl ManifestRebuilder {
         let current_millis = current_time_millis();
         let to_path = format!("{path}.{current_millis}.backup");
 
-        info!("Copy {} to {}", path, to_path);
+        info!("{}Copy {} to {}", dry_run_str(self.dry_run), path, to_path);
 
         if self.dry_run {
             return Ok(());
         }
 
         self.object_store.copy(path, &to_path).await.context("copy")
+    }
+}
+
+fn dry_run_str(dry_run: bool) -> &'static str {
+    if dry_run {
+        "Dry run: "
+    } else {
+        ""
     }
 }
 
@@ -406,7 +416,8 @@ impl RegionManifestOperator {
     /// Save checkpoint to path of given version.
     async fn save_checkpoint(&self, checkpoint: &RegionCheckpoint) -> Result<()> {
         info!(
-            "Save checkpoint {} under {}",
+            "{}Save checkpoint {} under {}",
+            dry_run_str(self.dry_run),
             serde_json::to_string(&checkpoint).unwrap_or_else(|_| { format!("{:?}", checkpoint) }),
             self.path
         );
