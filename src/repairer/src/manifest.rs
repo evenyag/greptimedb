@@ -25,6 +25,7 @@ use common_time::timestamp::TimeUnit;
 use common_time::util::current_time_millis;
 use common_time::Timestamp;
 use datatypes::prelude::ConcreteDataType;
+use futures::future::try_join_all;
 use futures::TryStreamExt;
 use object_store::util::join_dir;
 use object_store::{util, Entry, EntryMode, ErrorKind, Metakey, ObjectStore};
@@ -82,7 +83,7 @@ pub struct RebuildDb {
 }
 
 /// Rebuilder to rebuild manifests from existing SSTs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ManifestRebuilder {
     object_store: ObjectStore,
     /// Dry run mode.
@@ -276,18 +277,45 @@ impl ManifestRebuilder {
         );
 
         let total = table_reqs.len();
+        let group_size = 10;
+        let mut batch = Vec::with_capacity(group_size);
         for (i, (_, table_req)) in table_reqs.into_iter().enumerate() {
-            self.rebuild_table(&table_req).await?;
+            batch.push((i, table_req));
+            if batch.len() == group_size {
+                self.rebuild_table_group(&mut batch).await?;
 
-            info!(
-                "Rebuild one table, progress of schema {} is {}/{}",
-                req.schema_dir,
-                i + 1,
-                total
-            );
+                info!(
+                    "Rebuild {} table, progress of schema {} is {}/{}",
+                    group_size,
+                    req.schema_dir,
+                    i + 1,
+                    total
+                );
+
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() {
+            self.rebuild_table_group(&mut batch).await?;
         }
 
         info!("Rebuild schema {:?} end", req);
+
+        Ok(())
+    }
+
+    async fn rebuild_table_group(&self, batch: &mut Vec<(usize, RebuildTable)>) -> Result<()> {
+        info!("Start one group, batch: {:?}", batch);
+
+        let mut handles = Vec::with_capacity(batch.len());
+        for (_, table_req) in batch.drain(..) {
+            let rebuilder = self.clone();
+            let handle = tokio::spawn(async move { rebuilder.rebuild_table(&table_req).await });
+            handles.push(handle);
+        }
+
+        try_join_all(handles).await.context("join all")?;
 
         Ok(())
     }
