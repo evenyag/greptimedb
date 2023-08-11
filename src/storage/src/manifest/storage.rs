@@ -594,6 +594,11 @@ mod tests {
         assert_eq!(file_path.as_str(), "/foo/bar/00000000000000000000.json.gz")
     }
 
+    #[test]
+    fn test_is_checkpoint() {
+        assert!(is_checkpoint_file("000000000391.checkpoint.123.backup"));
+    }
+
     #[tokio::test]
     async fn test_manifest_log_store_uncompress() {
         let mut log_store = new_test_manifest_store();

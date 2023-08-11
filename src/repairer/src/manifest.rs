@@ -27,7 +27,7 @@ use common_time::Timestamp;
 use datatypes::prelude::ConcreteDataType;
 use futures::TryStreamExt;
 use object_store::util::join_dir;
-use object_store::{util, Entry, EntryMode, Metakey, ObjectStore};
+use object_store::{util, Entry, EntryMode, ErrorKind, Metakey, ObjectStore};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use storage::manifest::action::{RegionCheckpoint, RegionMetaAction, RegionMetaActionList};
@@ -174,6 +174,14 @@ impl ManifestRebuilder {
             .await?;
 
         info!("Region {} meta to add is {:?}", region_id, meta_to_add);
+
+        if diff.files_to_remove.is_empty() && meta_to_add.is_empty() {
+            info!(
+                "No need to rebuild manifest for region {} due to no meta to add",
+                region_id
+            );
+            return Ok(());
+        }
 
         // We have diff so checkpoint is not None.
         let mut checkpoint = checkpoint;
@@ -340,8 +348,7 @@ impl ManifestRebuilder {
 
     /// Backup a file.
     async fn backup_file(&self, path: &str) -> Result<()> {
-        let current_millis = current_time_millis();
-        let to_path = format!("{path}.{current_millis}.backup");
+        let to_path = append_backup(path);
 
         info!("{}Copy {} to {}", dry_run_str(self.dry_run), path, to_path);
 
@@ -351,6 +358,23 @@ impl ManifestRebuilder {
 
         self.object_store.copy(path, &to_path).await.context("copy")
     }
+}
+
+fn append_backup(path: &str) -> String {
+    let mut splitted = path.rsplit('.');
+    let Some(suffix) = splitted.next() else {
+        return fallback_path(path);
+    };
+    let Some(prefix) = splitted.next() else {
+        return fallback_path(path);
+    };
+    let current_millis = current_time_millis();
+    format!("{prefix}.backup-{suffix}-{current_millis}")
+}
+
+fn fallback_path(path: &str) -> String {
+    let current_millis = current_time_millis();
+    format!("{path}.{current_millis}.backup")
 }
 
 fn dry_run_str(dry_run: bool) -> &'static str {
@@ -531,7 +555,17 @@ impl CheckpointDiff {
         for file_id in &self.files_to_add {
             let file_path = util::join_path(sst_dir, &format!("{file_id}.parquet"));
             // Get file size.
-            let object_meta = object_store.stat(&file_path).await.context("stat")?;
+            let object_meta = match object_store.stat(&file_path).await {
+                Ok(v) => v,
+                Err(e) => {
+                    if e.kind() == ErrorKind::NotFound {
+                        warn!("file {} is not found during detect, it might be compacted to another file", file_path);
+                        continue;
+                    } else {
+                        return Err(e).context("stat");
+                    }
+                }
+            };
             let file_size = object_meta.content_length();
 
             let reader = object_store
