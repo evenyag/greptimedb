@@ -275,8 +275,16 @@ impl ManifestRebuilder {
             req.schema_dir, table_reqs
         );
 
-        for (_, table_req) in table_reqs {
+        let total = table_reqs.len();
+        for (i, (_, table_req)) in table_reqs.into_iter().enumerate() {
             self.rebuild_table(&table_req).await?;
+
+            info!(
+                "Rebuild one table, progress of schema {} is {}/{}",
+                req.schema_dir,
+                i + 1,
+                total
+            );
         }
 
         info!("Rebuild schema {:?} end", req);
