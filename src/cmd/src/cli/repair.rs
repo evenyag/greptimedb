@@ -26,7 +26,7 @@ use crate::options::{Options, RepairOptions};
 
 #[derive(Debug, Parser)]
 pub struct RepairCommand {
-    #[clap(long, action = clap::ArgAction::SetFalse)]
+    #[clap(long, action = clap::ArgAction::SetTrue)]
     dry_run: bool,
     #[clap(short, long)]
     config_file: Option<String>,
@@ -48,7 +48,7 @@ impl RepairCommand {
     }
 
     pub async fn build(&self, opts: RepairOptions) -> Result<Instance> {
-        self.cmd.build(opts).await
+        self.cmd.build(opts, self.dry_run).await
     }
 }
 
@@ -61,8 +61,11 @@ enum SubCommand {
 }
 
 impl SubCommand {
-    pub async fn build(&self, opts: RepairOptions) -> Result<Instance> {
-        let repairer = Repairer::new(opts.storage).await.context(RepairerSnafu)?;
+    pub async fn build(&self, opts: RepairOptions, dry_run: bool) -> Result<Instance> {
+        let repairer = Repairer::new(opts.storage)
+            .await
+            .context(RepairerSnafu)?
+            .with_dry_run(dry_run);
 
         Ok(Instance::Tool(Box::new(RepairTool {
             repairer,

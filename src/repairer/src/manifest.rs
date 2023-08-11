@@ -106,7 +106,7 @@ impl ManifestRebuilder {
 
     /// Rebuild a region's checkpoint.
     pub(crate) async fn rebuild_region(&self, req: &RebuildRegion) -> Result<()> {
-        info!("Rebuild region {:?} start", req);
+        info!("Rebuild region {:?} start, dry_run: {}", req, self.dry_run);
 
         let manifest_dir = join_dir(&req.region_dir, "manifest");
 
@@ -206,7 +206,7 @@ impl ManifestRebuilder {
 
     /// Rebuild a table's checkpoint.
     pub(crate) async fn rebuild_table(&self, req: &RebuildTable) -> Result<()> {
-        info!("Rebuild table {:?} start", req);
+        info!("Rebuild table {:?} start, dry_run: {}", req, self.dry_run);
 
         let region_entries = list_dir(&self.object_store, &req.table_dir).await?;
         let region_reqs: Vec<_> = region_entries
@@ -232,7 +232,7 @@ impl ManifestRebuilder {
 
     /// Rebuild a schema's checkpoint.
     pub(crate) async fn rebuild_schema(&self, req: &RebuildSchema) -> Result<()> {
-        info!("Rebuild schema {:?} start", req);
+        info!("Rebuild schema {:?} start, dry_run: {}", req, self.dry_run);
 
         let table_entries = list_dir(&self.object_store, &req.schema_dir).await?;
         let mut table_reqs: Vec<_> = table_entries
@@ -276,7 +276,7 @@ impl ManifestRebuilder {
 
     /// Rebuild a catalog's checkpoint.
     pub(crate) async fn rebuild_catalog(&self, req: &RebuildCatalog) -> Result<()> {
-        info!("Rebuild catalog {:?} start", req);
+        info!("Rebuild catalog {:?} start, dry_run: {}", req, self.dry_run);
 
         let schema_entries = list_dir(&self.object_store, &req.catalog_dir).await?;
         let schema_reqs: Vec<_> = schema_entries
@@ -303,7 +303,7 @@ impl ManifestRebuilder {
 
     /// Rebuild a db's checkpoint.
     pub(crate) async fn rebuild_db(&self, req: &RebuildDb) -> Result<()> {
-        info!("Rebuild catalog {:?} start", req);
+        info!("Rebuild catalog {:?} start, dry_run: {}", req, self.dry_run);
 
         let catalog_entries = list_dir(&self.object_store, &req.db_dir).await?;
         let mut catalog_reqs: Vec<_> = catalog_entries
