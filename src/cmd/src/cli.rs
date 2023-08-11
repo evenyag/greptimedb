@@ -15,6 +15,7 @@
 mod bench;
 mod cmd;
 mod helper;
+mod repair;
 mod repl;
 mod upgrade;
 
@@ -25,8 +26,9 @@ use common_telemetry::logging::LoggingOptions;
 pub use repl::Repl;
 use upgrade::UpgradeCommand;
 
+use crate::cli::repair::RepairCommand;
 use crate::error::Result;
-use crate::options::{Options, TopLevelOptions};
+use crate::options::{CliOptions, Options, TopLevelOptions};
 
 #[async_trait]
 pub trait Tool {
@@ -58,19 +60,12 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn build(self) -> Result<Instance> {
-        self.cmd.build().await
+    pub async fn build(self, opts: CliOptions) -> Result<Instance> {
+        self.cmd.build(opts).await
     }
 
     pub fn load_options(&self, top_level_opts: TopLevelOptions) -> Result<Options> {
-        let mut logging_opts = LoggingOptions::default();
-        if let Some(dir) = top_level_opts.log_dir {
-            logging_opts.dir = dir;
-        }
-        if top_level_opts.log_level.is_some() {
-            logging_opts.level = top_level_opts.log_level;
-        }
-        Ok(Options::Cli(Box::new(logging_opts)))
+        self.cmd.load_options(top_level_opts)
     }
 }
 
@@ -79,14 +74,39 @@ enum SubCommand {
     Attach(AttachCommand),
     Upgrade(UpgradeCommand),
     Bench(BenchTableMetadataCommand),
+    Repair(RepairCommand),
 }
 
 impl SubCommand {
-    async fn build(self) -> Result<Instance> {
+    async fn build(self, opts: CliOptions) -> Result<Instance> {
         match self {
             SubCommand::Attach(cmd) => cmd.build().await,
             SubCommand::Upgrade(cmd) => cmd.build().await,
             SubCommand::Bench(cmd) => cmd.build().await,
+            SubCommand::Repair(cmd) => {
+                let CliOptions::Repair(repair_opts) = opts else {
+                    // We always load repair options in this subcommand
+                    unreachable!()
+                };
+                cmd.build(repair_opts).await
+            }
+        }
+    }
+
+    fn load_options(&self, top_level_opts: TopLevelOptions) -> Result<Options> {
+        let mut logging_opts = LoggingOptions::default();
+        if let Some(dir) = top_level_opts.log_dir {
+            logging_opts.dir = dir;
+        }
+        if top_level_opts.log_level.is_some() {
+            logging_opts.level = top_level_opts.log_level;
+        }
+
+        match self {
+            SubCommand::Attach(_) | SubCommand::Bench(_) | SubCommand::Upgrade(_) => {
+                Ok(Options::Cli(Box::new(CliOptions::Other(logging_opts))))
+            }
+            SubCommand::Repair(cmd) => cmd.load_options(logging_opts),
         }
     }
 }

@@ -143,6 +143,7 @@ object-store = { path = "src/object-store" }
 partition = { path = "src/partition" }
 promql = { path = "src/promql" }
 query = { path = "src/query" }
+repairer = { path = "src/repairer" }
 script = { path = "src/script" }
 servers = { path = "src/servers" }
 session = { path = "src/session" }

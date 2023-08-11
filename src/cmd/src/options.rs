@@ -14,7 +14,7 @@
 
 use common_telemetry::logging::LoggingOptions;
 use config::{Config, Environment, File, FileFormat};
-use datanode::datanode::DatanodeOptions;
+use datanode::datanode::{DatanodeOptions, StorageConfig};
 use frontend::frontend::FrontendOptions;
 use meta_srv::metasrv::MetaSrvOptions;
 use serde::{Deserialize, Serialize};
@@ -31,12 +31,32 @@ pub struct MixOptions {
     pub logging: LoggingOptions,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+pub struct RepairOptions {
+    pub storage: StorageConfig,
+    pub logging: LoggingOptions,
+}
+
+pub enum CliOptions {
+    Repair(RepairOptions),
+    Other(LoggingOptions),
+}
+
+impl CliOptions {
+    fn logging_options(&self) -> &LoggingOptions {
+        match self {
+            CliOptions::Repair(opts) => &opts.logging,
+            CliOptions::Other(opts) => opts,
+        }
+    }
+}
+
 pub enum Options {
     Datanode(Box<DatanodeOptions>),
     Frontend(Box<FrontendOptions>),
     Metasrv(Box<MetaSrvOptions>),
     Standalone(Box<MixOptions>),
-    Cli(Box<LoggingOptions>),
+    Cli(Box<CliOptions>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,7 +72,7 @@ impl Options {
             Options::Frontend(opts) => &opts.logging,
             Options::Metasrv(opts) => &opts.logging,
             Options::Standalone(opts) => &opts.logging,
-            Options::Cli(opts) => opts,
+            Options::Cli(opts) => opts.logging_options(),
         }
     }
 

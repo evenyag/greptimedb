@@ -119,8 +119,8 @@ impl SubCommand {
                 let app = cmd.build(opts.fe_opts, opts.dn_opts).await?;
                 Ok(Application::Standalone(app))
             }
-            (SubCommand::Cli(cmd), Options::Cli(_)) => {
-                let app = cmd.build().await?;
+            (SubCommand::Cli(cmd), Options::Cli(opts)) => {
+                let app = cmd.build(*opts).await?;
                 Ok(Application::Cli(app))
             }
 

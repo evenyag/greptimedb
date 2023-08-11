@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
+use anyhow::{bail, Context};
 use async_compat::CompatExt;
 use common_datasource::compression::CompressionType;
 use common_telemetry::{debug, info};
@@ -29,7 +30,6 @@ use object_store::util::join_dir;
 use object_store::{util, Entry, EntryMode, Metakey, ObjectStore};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
-use snafu::{whatever, OptionExt, ResultExt};
 use storage::manifest::action::{RegionCheckpoint, RegionMetaAction, RegionMetaActionList};
 use storage::manifest::storage::ManifestObjectStore;
 use storage::schema::StoreSchema;
@@ -52,8 +52,6 @@ pub struct RebuildRegion {
 /// Request to rebuild a table's manifest checkpoint.
 #[derive(Debug)]
 pub struct RebuildTable {
-    /// Table id to rebuild.
-    pub table_id: TableId,
     /// Relative dir of the table.
     pub table_dir: String,
 }
@@ -85,7 +83,7 @@ pub struct RebuildDb {
 
 /// Rebuilder to rebuild manifests from existing SSTs.
 #[derive(Debug)]
-pub struct ManifestRebuilder {
+pub(crate) struct ManifestRebuilder {
     object_store: ObjectStore,
     /// Dry run mode.
     dry_run: bool,
@@ -93,7 +91,7 @@ pub struct ManifestRebuilder {
 
 impl ManifestRebuilder {
     /// Returns a new rebuilder.
-    pub fn new(object_store: ObjectStore) -> Self {
+    pub(crate) fn new(object_store: ObjectStore) -> Self {
         Self {
             object_store,
             dry_run: false,
@@ -101,13 +99,13 @@ impl ManifestRebuilder {
     }
 
     /// Set dry run.
-    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+    pub(crate) fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
     /// Rebuild a region's checkpoint.
-    pub async fn rebuild_region(&self, req: &RebuildRegion) -> Result<()> {
+    pub(crate) async fn rebuild_region(&self, req: &RebuildRegion) -> Result<()> {
         info!("Rebuild region {:?} start", req);
 
         let manifest_dir = join_dir(&req.region_dir, "manifest");
@@ -136,7 +134,7 @@ impl ManifestRebuilder {
         let action_lists = operator.scan_actions(start_version).await?;
 
         let Some(region_id) = region_id_from_actions(&checkpoint, &action_lists) else {
-            whatever!("No region id in {manifest_dir}");
+            bail!("No region id in {manifest_dir}");
         };
 
         let file_names = list_ssts(&self.object_store, &req.region_dir).await?;
@@ -185,7 +183,7 @@ impl ManifestRebuilder {
     }
 
     /// Rebuild a table's checkpoint.
-    pub async fn rebuild_table(&self, req: &RebuildTable) -> Result<()> {
+    pub(crate) async fn rebuild_table(&self, req: &RebuildTable) -> Result<()> {
         info!("Rebuild table {:?} start", req);
 
         let region_entries = list_dir(&self.object_store, &req.table_dir).await?;
@@ -198,7 +196,7 @@ impl ManifestRebuilder {
 
         info!(
             "Rebuild table {} regions, paths: {:?}",
-            req.table_id, region_reqs
+            req.table_dir, region_reqs
         );
 
         for region_req in region_reqs {
@@ -211,14 +209,14 @@ impl ManifestRebuilder {
     }
 
     /// Rebuild a schema's checkpoint.
-    pub async fn rebuild_schema(&self, req: &RebuildSchema) -> Result<()> {
+    pub(crate) async fn rebuild_schema(&self, req: &RebuildSchema) -> Result<()> {
         info!("Rebuild schema {:?} start", req);
 
         let table_entries = list_dir(&self.object_store, &req.schema_dir).await?;
         let mut table_reqs: Vec<_> = table_entries
             .iter()
             .filter_map(|entry| {
-                let Ok(table_id) = entry.name().parse() else {
+                let Ok(table_id) = entry.name().parse::<TableId>() else {
                     return None;
                 };
 
@@ -228,22 +226,24 @@ impl ManifestRebuilder {
                     }
                 }
 
-                Some(RebuildTable {
+                Some((
                     table_id,
-                    table_dir: entry.path().to_string(),
-                })
+                    RebuildTable {
+                        table_dir: entry.path().to_string(),
+                    },
+                ))
             })
             .collect();
 
         // Sort reqs by table id.
-        table_reqs.sort_unstable_by_key(|req| req.table_id);
+        table_reqs.sort_unstable_by_key(|req| req.0);
 
         info!(
             "Rebuild schema {}, tables: {:?}",
             req.schema_dir, table_reqs
         );
 
-        for table_req in table_reqs {
+        for (_, table_req) in table_reqs {
             self.rebuild_table(&table_req).await?;
         }
 
@@ -253,7 +253,7 @@ impl ManifestRebuilder {
     }
 
     /// Rebuild a catalog's checkpoint.
-    pub async fn rebuild_catalog(&self, req: &RebuildCatalog) -> Result<()> {
+    pub(crate) async fn rebuild_catalog(&self, req: &RebuildCatalog) -> Result<()> {
         info!("Rebuild catalog {:?} start", req);
 
         let schema_entries = list_dir(&self.object_store, &req.catalog_dir).await?;
@@ -280,7 +280,7 @@ impl ManifestRebuilder {
     }
 
     /// Rebuild a db's checkpoint.
-    pub async fn rebuild_db(&self, req: &RebuildDb) -> Result<()> {
+    pub(crate) async fn rebuild_db(&self, req: &RebuildDb) -> Result<()> {
         info!("Rebuild catalog {:?} start", req);
 
         let catalog_entries = list_dir(&self.object_store, &req.db_dir).await?;
@@ -325,10 +325,7 @@ impl ManifestRebuilder {
             return Ok(());
         }
 
-        self.object_store
-            .copy(path, &to_path)
-            .await
-            .whatever_context("copy")
+        self.object_store.copy(path, &to_path).await.context("copy")
     }
 }
 
@@ -356,7 +353,7 @@ impl RegionManifestOperator {
             .store
             .load_last_checkpoint()
             .await
-            .whatever_context("load last checkpoint")?;
+            .context("load last checkpoint")?;
 
         if let Some((version, bytes)) = last_checkpoint {
             let checkpoint = decode_checkpoint(&bytes)?;
@@ -375,8 +372,8 @@ impl RegionManifestOperator {
             .store
             .scan(start, MAX_VERSION)
             .await
-            .whatever_context("scan actions")?;
-        while let Some((_version, bytes)) = entries.next_log().await.whatever_context("next log")? {
+            .context("scan actions")?;
+        while let Some((_version, bytes)) = entries.next_log().await.context("next log")? {
             let action_list = decode_action_list(&bytes)?;
             action_lists.push(action_list);
         }
@@ -392,18 +389,18 @@ impl RegionManifestOperator {
             return Ok(());
         }
 
-        let bytes = checkpoint.encode().whatever_context("encode checkpoint")?;
+        let bytes = checkpoint.encode().context("encode checkpoint")?;
         self.store
             .save_checkpoint(checkpoint.last_version, &bytes)
             .await
-            .whatever_context("save checkpoint")
+            .context("save checkpoint")
     }
 }
 
 /// Decode checkpoint directly.
 fn decode_checkpoint(bs: &[u8]) -> Result<RegionCheckpoint> {
-    let s = std::str::from_utf8(bs).whatever_context("not a valid UTF-8")?;
-    let checkpoint: RegionCheckpoint = serde_json::from_str(s).whatever_context("decode json")?;
+    let s = std::str::from_utf8(bs).context("not a valid UTF-8")?;
+    let checkpoint: RegionCheckpoint = serde_json::from_str(s).context("decode json")?;
 
     Ok(checkpoint)
 }
@@ -416,13 +413,12 @@ fn decode_action_list(bs: &[u8]) -> Result<RegionMetaActionList> {
     // Skip header.
     lines
         .next()
-        .whatever_context("empty header")?
-        .whatever_context("invalid header")?;
+        .context("empty header")?
+        .context("invalid header")?;
     let mut actions = Vec::new();
     for line in lines {
-        let line = line.whatever_context("invalid line")?;
-        let action: RegionMetaAction =
-            serde_json::from_str(&line).whatever_context("parse json action")?;
+        let line = line.context("invalid line")?;
+        let action: RegionMetaAction = serde_json::from_str(&line).context("parse json action")?;
         if let RegionMetaAction::Protocol(_) = &action {
             continue;
         }
@@ -438,12 +434,9 @@ fn decode_action_list(bs: &[u8]) -> Result<RegionMetaActionList> {
 
 /// List parquet SST names under `sst_dir`.
 async fn list_ssts(object_store: &ObjectStore, sst_dir: &str) -> Result<Vec<String>> {
-    let mut entries = object_store
-        .list(sst_dir)
-        .await
-        .whatever_context("list ssts")?;
+    let mut entries = object_store.list(sst_dir).await.context("list ssts")?;
     let mut file_names = Vec::new();
-    while let Some(entry) = entries.try_next().await.whatever_context("next entry")? {
+    while let Some(entry) = entries.try_next().await.context("next entry")? {
         if entry.name().ends_with(".parquet") {
             file_names.push(entry.name().to_string());
         }
@@ -454,16 +447,13 @@ async fn list_ssts(object_store: &ObjectStore, sst_dir: &str) -> Result<Vec<Stri
 
 /// List dir entries under `dir_to_list`.
 async fn list_dir(object_store: &ObjectStore, dir_to_list: &str) -> Result<Vec<Entry>> {
-    let mut entries = object_store
-        .list(dir_to_list)
-        .await
-        .whatever_context("list dir")?;
+    let mut entries = object_store.list(dir_to_list).await.context("list dir")?;
     let mut children = Vec::new();
-    while let Some(entry) = entries.try_next().await.whatever_context("next entry")? {
+    while let Some(entry) = entries.try_next().await.context("next entry")? {
         let meta = object_store
             .metadata(&entry, Metakey::Mode)
             .await
-            .whatever_context("get metadata")?;
+            .context("get metadata")?;
         if let EntryMode::DIR = meta.mode() {
             children.push(entry);
         }
@@ -504,28 +494,24 @@ impl CheckpointDiff {
         for file_id in &self.files_to_add {
             let file_path = util::join_path(sst_dir, &format!("{file_id}.parquet"));
             // Get file size.
-            let object_meta = object_store
-                .stat(&file_path)
-                .await
-                .whatever_context("stat")?;
+            let object_meta = object_store.stat(&file_path).await.context("stat")?;
             let file_size = object_meta.content_length();
 
             let reader = object_store
                 .reader(&file_path)
                 .await
-                .whatever_context("read file")?
+                .context("read file")?
                 .compat();
             let buf_reader = BufReader::new(reader);
             let builder = ParquetRecordBatchStreamBuilder::new(buf_reader)
                 .await
-                .whatever_context("build parquet reader")?;
+                .context("build parquet reader")?;
             let parquet_meta = builder.metadata();
             let arrow_schema = builder.schema().clone();
-            let store_schema =
-                StoreSchema::try_from(arrow_schema).whatever_context("to store schema")?;
+            let store_schema = StoreSchema::try_from(arrow_schema).context("to store schema")?;
 
             let time_range = decode_timestamp_range(&parquet_meta, store_schema.schema())
-                .whatever_context("decode time range")?;
+                .context("decode time range")?;
             let file_meta = FileMeta {
                 region_id,
                 file_id: *file_id,
@@ -628,7 +614,7 @@ fn decode_timestamp_range_inner(
         ConcreteDataType::Int64(_) => TimeUnit::Millisecond,
         ConcreteDataType::Timestamp(type_) => type_.unit(),
         _ => {
-            whatever!("Unexpected timestamp column datatype: {ts_datatype:?}");
+            bail!("Unexpected timestamp column datatype: {ts_datatype:?}");
         }
     };
 
@@ -636,7 +622,7 @@ fn decode_timestamp_range_inner(
         let Some(stats) = rg
             .columns()
             .get(ts_index)
-            .whatever_context("get ts column")?
+            .context("get ts column")?
             .statistics()
         else {
             return Ok(None);
@@ -651,12 +637,12 @@ fn decode_timestamp_range_inner(
         let min = i64::from_le_bytes(
             min_value[..8]
                 .try_into()
-                .whatever_context("Failed to decode min value from stats")?,
+                .context("Failed to decode min value from stats")?,
         );
         let max = i64::from_le_bytes(
             max_value[..8]
                 .try_into()
-                .whatever_context("Failed to decode max value from stats")?,
+                .context("Failed to decode max value from stats")?,
         );
         start = start.min(min);
         end = end.max(max);

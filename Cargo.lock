@@ -1576,6 +1576,7 @@ dependencies = [
  "partition",
  "query",
  "rand",
+ "repairer",
  "rexpect",
  "rustyline 10.1.1",
  "serde",
@@ -7569,6 +7570,7 @@ dependencies = [
 name = "repairer"
 version = "0.3.2"
 dependencies = [
+ "anyhow",
  "async-compat",
  "common-datasource",
  "common-telemetry",

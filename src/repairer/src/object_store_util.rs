@@ -14,12 +14,12 @@
 
 //! object storage utilities.
 
+use anyhow::Context;
 use datanode::datanode::{FileConfig, ObjectStoreConfig};
 use datanode::store;
 use datanode::store::fs::new_fs_with_atomic_dir_suffix;
 use object_store::layers::RetryLayer;
 use object_store::ObjectStore;
-use snafu::ResultExt;
 
 use crate::Result;
 
@@ -32,7 +32,7 @@ const REPAIR_ATOMIC_WRITE_DIR: &str = ".repair";
 async fn new_fs_object_store(file_config: &FileConfig) -> Result<ObjectStore> {
     new_fs_with_atomic_dir_suffix(file_config, REPAIR_ATOMIC_WRITE_DIR)
         .await
-        .whatever_context("new fs object store")
+        .context("new fs object store")
 }
 
 /// Creates a new object store.
@@ -41,18 +41,18 @@ pub(crate) async fn new_object_store(store_config: &ObjectStoreConfig) -> Result
         ObjectStoreConfig::File(file_config) => new_fs_object_store(file_config).await,
         ObjectStoreConfig::S3(s3_config) => store::s3::new_s3_object_store(s3_config)
             .await
-            .whatever_context("new s3 object store"),
+            .context("new s3 object store"),
         ObjectStoreConfig::Oss(oss_config) => store::oss::new_oss_object_store(oss_config)
             .await
-            .whatever_context("new oss object store"),
+            .context("new oss object store"),
         ObjectStoreConfig::Azblob(azblob_config) => {
             store::azblob::new_azblob_object_store(azblob_config)
                 .await
-                .whatever_context("new azblob object store")
+                .context("new azblob object store")
         }
         ObjectStoreConfig::Gcs(gcs_config) => store::gcs::new_gcs_object_store(gcs_config)
             .await
-            .whatever_context("new gcs object store"),
+            .context("new gcs object store"),
     }?;
 
     // Enable retry layer and cache layer for non-fs object storages

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod manifest;
+pub mod manifest;
 mod object_store_util;
 
+pub use anyhow::{Error, Result};
+use common_telemetry::info;
 use datanode::datanode::StorageConfig;
 use object_store::ObjectStore;
 
 use crate::manifest::{ManifestRebuilder, RebuildCatalog, RebuildDb, RebuildRegion, RebuildSchema};
-
-pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 
 /// DB repairer.
 #[derive(Debug)]
@@ -34,6 +34,8 @@ pub struct Repairer {
 impl Repairer {
     /// Creates a new repairer.
     pub async fn new(storage_config: StorageConfig) -> Result<Repairer> {
+        info!("Init repairer, storage_config: {:?}", storage_config);
+
         let object_store = object_store_util::new_object_store(&storage_config.store).await?;
 
         Ok(Repairer {

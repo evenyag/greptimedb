@@ -47,6 +47,7 @@ nu-ansi-term = "0.46"
 partition = { workspace = true }
 query = { workspace = true }
 rand.workspace = true
+repairer = { workspace = true }
 rustyline = "10.1"
 serde.workspace = true
 servers = { workspace = true }

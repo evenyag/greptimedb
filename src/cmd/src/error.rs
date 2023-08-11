@@ -167,6 +167,9 @@ pub enum Error {
         source: etcd_client::Error,
         location: Location,
     },
+
+    #[snafu(display("Repairer error, source: {}", source))]
+    Repairer { source: repairer::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -200,6 +203,7 @@ impl ErrorExt for Error {
             }
             Error::SubstraitEncodeLogicalPlan { source, .. } => source.status_code(),
             Error::StartCatalogManager { source, .. } => source.status_code(),
+            Error::Repairer { .. } => StatusCode::Internal,
         }
     }
 
