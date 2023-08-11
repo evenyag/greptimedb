@@ -26,7 +26,7 @@ use common_time::Timestamp;
 use datatypes::prelude::ConcreteDataType;
 use futures::TryStreamExt;
 use object_store::util::join_dir;
-use object_store::{util, ObjectStore};
+use object_store::{util, Entry, EntryMode, Metakey, ObjectStore};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use snafu::{whatever, OptionExt, ResultExt};
@@ -37,16 +37,50 @@ use storage::sst::{FileId, FileMeta};
 use store_api::manifest::{
     Checkpoint, LogIterator, ManifestLogStorage, ManifestVersion, MAX_VERSION,
 };
-use store_api::storage::RegionId;
+use store_api::storage::{RegionId, TableId};
 use tokio::io::BufReader;
 
 use crate::Result;
 
-/// Request to rebuild one region.
+/// Request to rebuild a region's manifest checkpoint.
 #[derive(Debug)]
-pub struct RebuildOneRegion {
+pub struct RebuildRegion {
     /// Relative dir of the region.
     pub region_dir: String,
+}
+
+/// Request to rebuild a table's manifest checkpoint.
+#[derive(Debug)]
+pub struct RebuildTable {
+    /// Table id to rebuild.
+    pub table_id: TableId,
+    /// Relative dir of the table.
+    pub table_dir: String,
+}
+
+/// Request to rebuild a schema's manifest checkpoint.
+#[derive(Debug)]
+pub struct RebuildSchema {
+    /// Relative dir of the schema.
+    pub schema_dir: String,
+    /// Rebuild from this table id (inclusive).
+    pub start_table_id: Option<TableId>,
+}
+
+/// Request to rebuild a catalog's manifest checkpoint.
+#[derive(Debug)]
+pub struct RebuildCatalog {
+    /// Relative dir of the catalog.
+    pub catalog_dir: String,
+}
+
+/// Request to rebuild a db's manifest checkpoint.
+#[derive(Debug)]
+pub struct RebuildDb {
+    /// Relative dir of the db.
+    pub db_dir: String,
+    /// Rebuild from this catalog (inclusive).
+    pub start_catalog: Option<String>,
 }
 
 /// Rebuilder to rebuild manifests from existing SSTs.
@@ -72,8 +106,10 @@ impl ManifestRebuilder {
         self
     }
 
-    /// Rebuild one region's checkpoint.
-    pub async fn rebuild_one(&self, req: &RebuildOneRegion) -> Result<()> {
+    /// Rebuild a region's checkpoint.
+    pub async fn rebuild_region(&self, req: &RebuildRegion) -> Result<()> {
+        info!("Rebuild region {:?} start", req);
+
         let manifest_dir = join_dir(&req.region_dir, "manifest");
         let store = ManifestObjectStore::new(
             &manifest_dir,
@@ -142,6 +178,138 @@ impl ManifestRebuilder {
 
         // Overwrite checkpoint.
         operator.save_checkpoint(&checkpoint).await?;
+
+        info!("Rebuild region {:?} end", req);
+
+        Ok(())
+    }
+
+    /// Rebuild a table's checkpoint.
+    pub async fn rebuild_table(&self, req: &RebuildTable) -> Result<()> {
+        info!("Rebuild table {:?} start", req);
+
+        let region_entries = list_dir(&self.object_store, &req.table_dir).await?;
+        let region_reqs: Vec<_> = region_entries
+            .iter()
+            .map(|entry| RebuildRegion {
+                region_dir: entry.path().to_string(),
+            })
+            .collect();
+
+        info!(
+            "Rebuild table {} regions, paths: {:?}",
+            req.table_id, region_reqs
+        );
+
+        for region_req in region_reqs {
+            self.rebuild_region(&region_req).await?;
+        }
+
+        info!("Rebuild table {:?} end", req);
+
+        Ok(())
+    }
+
+    /// Rebuild a schema's checkpoint.
+    pub async fn rebuild_schema(&self, req: &RebuildSchema) -> Result<()> {
+        info!("Rebuild schema {:?} start", req);
+
+        let table_entries = list_dir(&self.object_store, &req.schema_dir).await?;
+        let mut table_reqs: Vec<_> = table_entries
+            .iter()
+            .filter_map(|entry| {
+                let Ok(table_id) = entry.name().parse() else {
+                    return None;
+                };
+
+                if let Some(start_table_id) = req.start_table_id {
+                    if table_id < start_table_id {
+                        return None;
+                    }
+                }
+
+                Some(RebuildTable {
+                    table_id,
+                    table_dir: entry.path().to_string(),
+                })
+            })
+            .collect();
+
+        // Sort reqs by table id.
+        table_reqs.sort_unstable_by_key(|req| req.table_id);
+
+        info!(
+            "Rebuild schema {}, tables: {:?}",
+            req.schema_dir, table_reqs
+        );
+
+        for table_req in table_reqs {
+            self.rebuild_table(&table_req).await?;
+        }
+
+        info!("Rebuild schema {:?} end", req);
+
+        Ok(())
+    }
+
+    /// Rebuild a catalog's checkpoint.
+    pub async fn rebuild_catalog(&self, req: &RebuildCatalog) -> Result<()> {
+        info!("Rebuild catalog {:?} start", req);
+
+        let schema_entries = list_dir(&self.object_store, &req.catalog_dir).await?;
+        let schema_reqs: Vec<_> = schema_entries
+            .iter()
+            .map(|entry| RebuildSchema {
+                schema_dir: entry.path().to_string(),
+                start_table_id: None,
+            })
+            .collect();
+
+        info!(
+            "Rebuild catalog {}, schema: {:?}",
+            req.catalog_dir, schema_reqs
+        );
+
+        for schema_req in schema_reqs {
+            self.rebuild_schema(&schema_req).await?;
+        }
+
+        info!("Rebuild catalog {:?} end", req);
+
+        Ok(())
+    }
+
+    /// Rebuild a db's checkpoint.
+    pub async fn rebuild_db(&self, req: &RebuildDb) -> Result<()> {
+        info!("Rebuild catalog {:?} start", req);
+
+        let catalog_entries = list_dir(&self.object_store, &req.db_dir).await?;
+        let mut catalog_reqs: Vec<_> = catalog_entries
+            .iter()
+            .filter_map(|entry| {
+                if let Some(start_catalog) = &req.start_catalog {
+                    if entry.name() < start_catalog.as_str() {
+                        return None;
+                    }
+                }
+
+                Some((
+                    entry.name().to_string(),
+                    RebuildCatalog {
+                        catalog_dir: entry.path().to_string(),
+                    },
+                ))
+            })
+            .collect();
+
+        // Sorts by catalog name.
+        catalog_reqs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for (_, catalog_req) in catalog_reqs {
+            self.rebuild_catalog(&catalog_req).await?;
+        }
+
+        info!("Rebuild catalog {:?} end", req);
 
         Ok(())
     }
@@ -268,9 +436,12 @@ fn decode_action_list(bs: &[u8]) -> Result<RegionMetaActionList> {
     })
 }
 
-/// List parquet SSTs under `sst_dir`.
+/// List parquet SST names under `sst_dir`.
 async fn list_ssts(object_store: &ObjectStore, sst_dir: &str) -> Result<Vec<String>> {
-    let mut entries = object_store.list(sst_dir).await.whatever_context("list")?;
+    let mut entries = object_store
+        .list(sst_dir)
+        .await
+        .whatever_context("list ssts")?;
     let mut file_names = Vec::new();
     while let Some(entry) = entries.try_next().await.whatever_context("next entry")? {
         if entry.name().ends_with(".parquet") {
@@ -279,6 +450,26 @@ async fn list_ssts(object_store: &ObjectStore, sst_dir: &str) -> Result<Vec<Stri
     }
 
     Ok(file_names)
+}
+
+/// List dir entries under `dir_to_list`.
+async fn list_dir(object_store: &ObjectStore, dir_to_list: &str) -> Result<Vec<Entry>> {
+    let mut entries = object_store
+        .list(dir_to_list)
+        .await
+        .whatever_context("list dir")?;
+    let mut children = Vec::new();
+    while let Some(entry) = entries.try_next().await.whatever_context("next entry")? {
+        let meta = object_store
+            .metadata(&entry, Metakey::Mode)
+            .await
+            .whatever_context("get metadata")?;
+        if let EntryMode::DIR = meta.mode() {
+            children.push(entry);
+        }
+    }
+
+    Ok(children)
 }
 
 /// Parse file names into file ids.

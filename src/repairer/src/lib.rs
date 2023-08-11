@@ -18,7 +18,7 @@ mod object_store_util;
 use datanode::datanode::StorageConfig;
 use object_store::ObjectStore;
 
-use crate::manifest::{ManifestRebuilder, RebuildOneRegion};
+use crate::manifest::{ManifestRebuilder, RebuildCatalog, RebuildDb, RebuildRegion, RebuildSchema};
 
 pub type Result<T, E = snafu::Whatever> = std::result::Result<T, E>;
 
@@ -48,9 +48,31 @@ impl Repairer {
         self
     }
 
-    /// Repair one region manifest.
-    pub async fn repair_region_manifest(&self, req: RebuildOneRegion) -> Result<()> {
-        let rebulder = ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
-        rebulder.rebuild_one(&req).await
+    /// Repair a region manifest.
+    pub async fn repair_region_manifest(&self, req: RebuildRegion) -> Result<()> {
+        let rebuilder =
+            ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
+        rebuilder.rebuild_region(&req).await
+    }
+
+    /// Repair db manifest.
+    pub async fn repair_db_manifest(&self, req: RebuildDb) -> Result<()> {
+        let rebuilder =
+            ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
+        rebuilder.rebuild_db(&req).await
+    }
+
+    /// Repair catalog manifest.
+    pub async fn repair_catalog_manifest(&self, req: RebuildCatalog) -> Result<()> {
+        let rebuilder =
+            ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
+        rebuilder.rebuild_catalog(&req).await
+    }
+
+    /// Repair schema manifest.
+    pub async fn repair_schema_manifest(&self, req: RebuildSchema) -> Result<()> {
+        let rebuilder =
+            ManifestRebuilder::new(self.object_store.clone()).with_dry_run(self.dry_run);
+        rebuilder.rebuild_schema(&req).await
     }
 }
