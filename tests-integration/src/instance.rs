@@ -19,13 +19,13 @@ mod tests {
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
 
-    use catalog::helper::{TableGlobalKey, TableGlobalValue};
     use common_base::Plugins;
+    use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use common_meta::key::table_name::TableNameKey;
     use common_query::Output;
     use common_recordbatch::RecordBatches;
     use frontend::error::{self, Error, Result};
     use frontend::instance::Instance;
-    use frontend::table::DistTable;
     use query::parser::QueryLanguageParser;
     use servers::interceptor::{SqlQueryInterceptor, SqlQueryInterceptorRef};
     use servers::query_handler::sql::SqlQueryHandler;
@@ -141,7 +141,9 @@ mod tests {
 
     async fn create_table(instance: &Instance, sql: &str) {
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else { unreachable!() };
+        let Output::AffectedRows(x) = output else {
+            unreachable!()
+        };
         assert_eq!(x, 0);
     }
 
@@ -153,12 +155,16 @@ mod tests {
                                 ('MOSS', 100000000, 10000000000, 2335190400000)
                                 "#;
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else { unreachable!() };
+        let Output::AffectedRows(x) = output else {
+            unreachable!()
+        };
         assert_eq!(x, 4);
 
         let sql = "SELECT * FROM demo WHERE ts > cast(1000000000 as timestamp) ORDER BY host"; // use nanoseconds as where condition
         let output = query(instance, sql).await;
-        let Output::Stream(s) = output else { unreachable!() };
+        let Output::Stream(s) = output else {
+            unreachable!()
+        };
         let batches = common_recordbatch::util::collect_batches(s).await.unwrap();
         let pretty_print = batches.pretty_print().unwrap();
         let expected = "\
@@ -177,25 +183,27 @@ mod tests {
         instance: &MockDistributedInstance,
         expected_distribution: HashMap<u32, &str>,
     ) {
-        let table = instance
-            .frontend()
-            .catalog_manager()
-            .table("greptime", "public", "demo")
+        let manager = instance.table_metadata_manager();
+        let table_id = manager
+            .table_name_manager()
+            .get(TableNameKey::new(
+                DEFAULT_CATALOG_NAME,
+                DEFAULT_SCHEMA_NAME,
+                "demo",
+            ))
             .await
             .unwrap()
-            .unwrap();
-        let table = table.as_any().downcast_ref::<DistTable>().unwrap();
+            .unwrap()
+            .table_id();
 
-        let TableGlobalValue { regions_id_map, .. } = table
-            .table_global_value(&TableGlobalKey {
-                catalog_name: "greptime".to_string(),
-                schema_name: "public".to_string(),
-                table_name: "demo".to_string(),
-            })
+        let table_region_value = manager
+            .table_region_manager()
+            .get(table_id)
             .await
             .unwrap()
             .unwrap();
-        let region_to_dn_map = regions_id_map
+        let region_to_dn_map = table_region_value
+            .region_distribution
             .iter()
             .map(|(k, v)| (v[0], *k))
             .collect::<HashMap<u32, u64>>();
@@ -211,7 +219,9 @@ mod tests {
                 .await
                 .unwrap();
             let output = engine.execute(plan, QueryContext::arc()).await.unwrap();
-            let Output::Stream(stream) = output else { unreachable!() };
+            let Output::Stream(stream) = output else {
+                unreachable!()
+            };
             let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
             let actual = recordbatches.pretty_print().unwrap();
 
@@ -223,7 +233,9 @@ mod tests {
     async fn drop_table(instance: &Instance) {
         let sql = "DROP TABLE demo";
         let output = query(instance, sql).await;
-        let Output::AffectedRows(x) = output else { unreachable!() };
+        let Output::AffectedRows(x) = output else {
+            unreachable!()
+        };
         assert_eq!(x, 1);
     }
 
@@ -354,13 +366,13 @@ mod tests {
             }
         }
 
-        let query_ctx = Arc::new(QueryContext::new());
+        let query_ctx = QueryContext::arc();
 
         let standalone = tests::create_standalone_instance("test_db_hook").await;
         let mut instance = standalone.instance;
 
         let plugins = Plugins::new();
-        let hook = Arc::new(DisableDBOpHook::default());
+        let hook = Arc::new(DisableDBOpHook);
         plugins.insert::<SqlQueryInterceptorRef<Error>>(hook.clone());
         Arc::make_mut(&mut instance).set_plugins(Arc::new(plugins));
 

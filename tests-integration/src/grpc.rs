@@ -16,16 +16,15 @@
 mod test {
     use std::collections::HashMap;
 
-    use api::v1::column::{SemanticType, Values};
+    use api::v1::column::Values;
     use api::v1::ddl_request::Expr as DdlExpr;
     use api::v1::greptime_request::Request;
     use api::v1::query_request::Query;
     use api::v1::{
         alter_expr, AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDef,
         CreateDatabaseExpr, CreateTableExpr, DdlRequest, DeleteRequest, DropTableExpr,
-        FlushTableExpr, InsertRequest, InsertRequests, QueryRequest,
+        FlushTableExpr, InsertRequest, InsertRequests, QueryRequest, SemanticType,
     };
-    use catalog::helper::{TableGlobalKey, TableGlobalValue};
     use common_catalog::consts::MITO_ENGINE;
     use common_query::Output;
     use common_recordbatch::RecordBatches;
@@ -35,6 +34,7 @@ mod test {
     use servers::query_handler::grpc::GrpcQueryHandler;
     use session::context::QueryContext;
     use store_api::storage::RegionNumber;
+    use table::Table;
     use tests::{has_parquet_file, test_region_dir};
 
     use crate::tests;
@@ -138,7 +138,9 @@ mod test {
             )),
         });
         let output = query(instance, request).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+---+---+
@@ -332,20 +334,18 @@ CREATE TABLE {table_name} (
             .unwrap()
             .unwrap();
         let table = table.as_any().downcast_ref::<DistTable>().unwrap();
+        let table_id = table.table_info().table_id();
 
-        let tgv = table
-            .table_global_value(&TableGlobalKey {
-                catalog_name: "greptime".to_string(),
-                schema_name: "public".to_string(),
-                table_name: table_name.to_string(),
-            })
+        let table_region_value = instance
+            .table_metadata_manager()
+            .table_region_manager()
+            .get(table_id)
             .await
             .unwrap()
             .unwrap();
-        let table_id = tgv.table_id();
 
-        let region_to_dn_map = tgv
-            .regions_id_map
+        let region_to_dn_map = table_region_value
+            .region_distribution
             .iter()
             .map(|(k, v)| (v[0], *k))
             .collect::<HashMap<u32, u64>>();
@@ -500,7 +500,9 @@ CREATE TABLE {table_name} (
             ))),
         });
         let output = query(instance, request.clone()).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+----+-------------------+
@@ -576,7 +578,9 @@ CREATE TABLE {table_name} (
         assert!(matches!(output, Output::AffectedRows(4)));
 
         let output = query(instance, request).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+----+-------------------+
@@ -611,17 +615,17 @@ CREATE TABLE {table_name} (
             .unwrap()
             .unwrap();
         let table = table.as_any().downcast_ref::<DistTable>().unwrap();
-
-        let TableGlobalValue { regions_id_map, .. } = table
-            .table_global_value(&TableGlobalKey {
-                catalog_name: "greptime".to_string(),
-                schema_name: "public".to_string(),
-                table_name: table_name.to_string(),
-            })
+        let table_id = table.table_info().ident.table_id;
+        let table_region_value = instance
+            .table_metadata_manager()
+            .table_region_manager()
+            .get(table_id)
             .await
             .unwrap()
             .unwrap();
-        let region_to_dn_map = regions_id_map
+
+        let region_to_dn_map = table_region_value
+            .region_distribution
             .iter()
             .map(|(k, v)| (v[0], *k))
             .collect::<HashMap<u32, u64>>();
@@ -640,7 +644,9 @@ CREATE TABLE {table_name} (
                 .await
                 .unwrap();
             let output = engine.execute(plan, QueryContext::arc()).await.unwrap();
-            let Output::Stream(stream) = output else { unreachable!() };
+            let Output::Stream(stream) = output else {
+                unreachable!()
+            };
             let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
             let actual = recordbatches.pretty_print().unwrap();
 
@@ -726,7 +732,9 @@ CREATE TABLE {table_name} (
             )),
         });
         let output = query(instance, request.clone()).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+---+---+
@@ -761,7 +769,9 @@ CREATE TABLE {table_name} (
         assert!(matches!(output, Output::AffectedRows(2)));
 
         let output = query(instance, request).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+---+---+
@@ -857,7 +867,9 @@ CREATE TABLE {table_name} (
             })),
         });
         let output = query(instance, request).await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---+------+---------------------+

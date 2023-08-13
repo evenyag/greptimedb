@@ -18,25 +18,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::helper::ColumnDataTypeWrapper;
-use api::v1::ddl_request::{Expr as DdlExpr, Expr};
+use api::v1::ddl_request::Expr as DdlExpr;
 use api::v1::greptime_request::Request;
 use api::v1::{
     column_def, AlterExpr, CompactTableExpr, CreateDatabaseExpr, CreateTableExpr, DeleteRequest,
-    FlushTableExpr, InsertRequests,
+    FlushTableExpr, InsertRequests, TruncateTableExpr,
 };
 use async_trait::async_trait;
-use catalog::helper::{SchemaKey, SchemaValue};
-use catalog::{CatalogManager, RegisterTableRequest};
+use catalog::{CatalogManager, DeregisterTableRequest, RegisterTableRequest};
 use chrono::DateTime;
 use client::client_manager::DatanodeClients;
 use client::Database;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::format_full_table_name;
 use common_error::ext::BoxedError;
-use common_meta::key::TableMetadataManagerRef;
+use common_meta::helper::{SchemaKey, SchemaValue};
 use common_meta::peer::Peer;
 use common_meta::rpc::ddl::{DdlTask, SubmitDdlTaskRequest, SubmitDdlTaskResponse};
-use common_meta::rpc::router::{Partition as MetaPartition, RouteRequest};
+use common_meta::rpc::router::{Partition, Partition as MetaPartition, RouteRequest};
 use common_meta::rpc::store::CompareAndPutRequest;
 use common_meta::table_name::TableName;
 use common_query::Output;
@@ -66,7 +65,7 @@ use table::TableRef;
 use crate::catalog::FrontendCatalogManager;
 use crate::error::{
     self, AlterExprToRequestSnafu, CatalogEntrySerdeSnafu, CatalogSnafu, ColumnDataTypeSnafu,
-    DeserializePartitionSnafu, InvokeDatanodeSnafu, ParseSqlSnafu, PrimaryKeyNotFoundSnafu,
+    ColumnNotFoundSnafu, DeserializePartitionSnafu, InvokeDatanodeSnafu, ParseSqlSnafu,
     RequestDatanodeSnafu, RequestMetaSnafu, Result, SchemaExistsSnafu, StartMetaClientSnafu,
     TableAlreadyExistSnafu, TableNotFoundSnafu, TableSnafu, ToTableDeleteRequestSnafu,
     UnrecognizedTableOptionSnafu,
@@ -80,9 +79,8 @@ const MAX_VALUE: &str = "MAXVALUE";
 #[derive(Clone)]
 pub struct DistInstance {
     meta_client: Arc<MetaClient>,
-    catalog_manager: Arc<FrontendCatalogManager>,
+    pub(crate) catalog_manager: Arc<FrontendCatalogManager>,
     datanode_clients: Arc<DatanodeClients>,
-    table_metadata_manager: TableMetadataManagerRef,
 }
 
 impl DistInstance {
@@ -90,13 +88,11 @@ impl DistInstance {
         meta_client: Arc<MetaClient>,
         catalog_manager: Arc<FrontendCatalogManager>,
         datanode_clients: Arc<DatanodeClients>,
-        table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
             meta_client,
             catalog_manager,
             datanode_clients,
-            table_metadata_manager,
         }
     }
 
@@ -112,7 +108,9 @@ impl DistInstance {
             &create_table.table_name,
         );
 
-        let mut table_info = create_table_info(create_table)?;
+        let (partitions, partition_cols) = parse_partitions(create_table, partitions)?;
+
+        let mut table_info = create_table_info(create_table, partition_cols)?;
 
         let resp = self
             .create_table_procedure(create_table, partitions, table_info.clone())
@@ -132,7 +130,6 @@ impl DistInstance {
             table_name.clone(),
             table_info,
             self.catalog_manager.clone(),
-            self.table_metadata_manager.clone(),
         ));
 
         let request = RegisterTableRequest {
@@ -161,6 +158,7 @@ impl DistInstance {
                 &table_name.catalog_name,
                 &table_name.schema_name,
                 &table_name.table_name,
+                table_id,
             )
             .await;
 
@@ -180,10 +178,19 @@ impl DistInstance {
             .with_context(|| TableNotFoundSnafu {
                 table_name: table_name.to_string(),
             })?;
-
-        let table_id = table.table_info().ident.table_id;
+        let table_id = table.table_info().table_id();
 
         self.drop_table_procedure(&table_name, table_id).await?;
+
+        let request = DeregisterTableRequest {
+            catalog: table_name.catalog_name.clone(),
+            schema: table_name.schema_name.clone(),
+            table_name: table_name.table_name.clone(),
+        };
+        self.catalog_manager
+            .deregister_table(request)
+            .await
+            .context(CatalogSnafu)?;
 
         // Since the table information dropped on meta does not go through KvBackend, so we
         // manually invalidate the cache here.
@@ -194,6 +201,7 @@ impl DistInstance {
                 &table_name.catalog_name,
                 &table_name.schema_name,
                 &table_name.table_name,
+                table_id,
             )
             .await;
 
@@ -265,7 +273,7 @@ impl DistInstance {
         table_name: &TableName,
         region_number: Option<RegionNumber>,
     ) -> Result<Vec<Peer>> {
-        let _ = self
+        let table = self
             .catalog_manager
             .table(
                 &table_name.catalog_name,
@@ -277,11 +285,12 @@ impl DistInstance {
             .with_context(|| TableNotFoundSnafu {
                 table_name: table_name.to_string(),
             })?;
+        let table_id = table.table_info().table_id();
 
         let route_response = self
             .meta_client
             .route(RouteRequest {
-                table_names: vec![table_name.clone()],
+                table_ids: vec![table_id],
             })
             .await
             .context(RequestMetaSnafu)?;
@@ -291,13 +300,41 @@ impl DistInstance {
             .iter()
             .filter(|route| {
                 route.region_routes.iter().any(|r| {
-                    let Some(n) = region_number else { return true; };
+                    let Some(n) = region_number else {
+                        return true;
+                    };
                     n == r.region.id.region_number()
                 })
             })
             .flat_map(|route| route.find_leaders().into_iter())
             .collect::<Vec<_>>();
         Ok(res)
+    }
+
+    async fn truncate_table(&self, table_name: TableName) -> Result<Output> {
+        let table = self
+            .catalog_manager
+            .table(
+                &table_name.catalog_name,
+                &table_name.schema_name,
+                &table_name.table_name,
+            )
+            .await
+            .context(CatalogSnafu)?
+            .with_context(|| TableNotFoundSnafu {
+                table_name: table_name.to_string(),
+            })?;
+        let table_id = table.table_info().ident.table_id;
+
+        let expr = TruncateTableExpr {
+            catalog_name: table_name.catalog_name.clone(),
+            schema_name: table_name.schema_name.clone(),
+            table_name: table_name.table_name.clone(),
+            table_id: Some(api::v1::TableId { id: table_id }),
+        };
+        self.truncate_table_procedure(&expr).await?;
+
+        Ok(Output::AffectedRows(0))
     }
 
     async fn handle_statement(
@@ -373,6 +410,14 @@ impl DistInstance {
 
                 self.show_create_table(table_name, table_ref).await
             }
+            Statement::TruncateTable(stmt) => {
+                let (catalog, schema, table) =
+                    table_idents_to_full_name(stmt.table_name(), query_ctx)
+                        .map_err(BoxedError::new)
+                        .context(error::ExternalSnafu)?;
+                let table_name = TableName::new(catalog, schema, table);
+                self.truncate_table(table_name).await
+            }
             _ => error::NotSupportedSnafu {
                 feat: format!("{stmt:?}"),
             }
@@ -384,7 +429,7 @@ impl DistInstance {
         let partitions = self
             .catalog_manager
             .partition_manager()
-            .find_table_partitions(&table_name)
+            .find_table_partitions(table.table_info().table_id())
             .await
             .context(error::FindTablePartitionRuleSnafu {
                 table_name: &table_name.table_name,
@@ -404,7 +449,7 @@ impl DistInstance {
         let catalog = query_ctx.current_catalog();
         if self
             .catalog_manager
-            .schema_exist(&catalog, &expr.database_name)
+            .schema_exist(catalog, &expr.database_name)
             .await
             .context(CatalogSnafu)?
         {
@@ -419,7 +464,7 @@ impl DistInstance {
         }
 
         let key = SchemaKey {
-            catalog_name: catalog.clone(),
+            catalog_name: catalog.to_owned(),
             schema_name: expr.database_name.clone(),
         };
         let value = SchemaValue {};
@@ -449,7 +494,7 @@ impl DistInstance {
         //
         // TODO(fys): when the meta invalidation cache mechanism is established, remove it.
         self.catalog_manager()
-            .invalidate_schema(&catalog, &expr.database_name)
+            .invalidate_schema(catalog, &expr.database_name)
             .await;
 
         Ok(Output::AffectedRows(1))
@@ -515,25 +560,15 @@ impl DistInstance {
             .await
             .context(error::RequestMetaSnafu)?;
 
-        let table_info = table.table_info();
-        self.catalog_manager
-            .invalidate_table(
-                &table_info.catalog_name,
-                &table_info.schema_name,
-                &table_info.name,
-            )
-            .await;
-
         Ok(Output::AffectedRows(0))
     }
 
     async fn create_table_procedure(
         &self,
         create_table: &CreateTableExpr,
-        partitions: Option<Partitions>,
+        partitions: Vec<Partition>,
         table_info: RawTableInfo,
     ) -> Result<SubmitDdlTaskResponse> {
-        let partitions = parse_partitions(create_table, partitions)?;
         let partitions = partitions.into_iter().map(Into::into).collect();
 
         let request = SubmitDdlTaskRequest {
@@ -566,14 +601,28 @@ impl DistInstance {
             .context(error::RequestMetaSnafu)
     }
 
+    async fn truncate_table_procedure(
+        &self,
+        truncate_table: &TruncateTableExpr,
+    ) -> Result<SubmitDdlTaskResponse> {
+        let request = SubmitDdlTaskRequest {
+            task: DdlTask::new_truncate_table(truncate_table.clone()),
+        };
+
+        self.meta_client
+            .submit_ddl_task(request)
+            .await
+            .context(error::RequestMetaSnafu)
+    }
+
     async fn handle_dist_insert(
         &self,
         requests: InsertRequests,
         ctx: QueryContextRef,
     ) -> Result<Output> {
         let inserter = DistInserter::new(
-            ctx.current_catalog(),
-            ctx.current_schema(),
+            ctx.current_catalog().to_owned(),
+            ctx.current_schema().to_owned(),
             self.catalog_manager.clone(),
         );
         let affected_rows = inserter.grpc_insert(requests).await?;
@@ -585,8 +634,8 @@ impl DistInstance {
         request: DeleteRequest,
         ctx: QueryContextRef,
     ) -> Result<Output> {
-        let catalog = &ctx.current_catalog();
-        let schema = &ctx.current_schema();
+        let catalog = ctx.current_catalog();
+        let schema = ctx.current_schema();
         let table_name = &request.table_name;
         let table_ref = TableReference::full(catalog, schema, table_name);
 
@@ -657,10 +706,15 @@ impl GrpcQueryHandler for DistInstance {
                             TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
                         self.flush_table(table_name, expr.region_number).await
                     }
-                    Expr::CompactTable(expr) => {
+                    DdlExpr::CompactTable(expr) => {
                         let table_name =
                             TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
                         self.compact_table(table_name, expr.region_number).await
+                    }
+                    DdlExpr::TruncateTable(expr) => {
+                        let table_name =
+                            TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
+                        self.truncate_table(table_name).await
                     }
                 }
             }
@@ -708,7 +762,10 @@ fn create_partitions_stmt(partitions: Vec<PartitionInfo>) -> Result<Option<Parti
     }))
 }
 
-fn create_table_info(create_table: &CreateTableExpr) -> Result<RawTableInfo> {
+fn create_table_info(
+    create_table: &CreateTableExpr,
+    partition_columns: Vec<String>,
+) -> Result<RawTableInfo> {
     let mut column_schemas = Vec::with_capacity(create_table.column_defs.len());
     let mut column_name_to_index_map = HashMap::new();
 
@@ -740,7 +797,17 @@ fn create_table_info(create_table: &CreateTableExpr) -> Result<RawTableInfo> {
             column_name_to_index_map
                 .get(name)
                 .cloned()
-                .context(PrimaryKeyNotFoundSnafu { msg: name })
+                .context(ColumnNotFoundSnafu { msg: name })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let partition_key_indices = partition_columns
+        .into_iter()
+        .map(|col_name| {
+            column_name_to_index_map
+                .get(&col_name)
+                .cloned()
+                .context(ColumnNotFoundSnafu { msg: col_name })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -755,6 +822,7 @@ fn create_table_info(create_table: &CreateTableExpr) -> Result<RawTableInfo> {
         options: TableOptions::try_from(&create_table.table_options)
             .context(UnrecognizedTableOptionSnafu)?,
         created_on: DateTime::default(),
+        partition_key_indices,
     };
 
     let desc = if create_table.desc.is_empty() {
@@ -782,17 +850,20 @@ fn create_table_info(create_table: &CreateTableExpr) -> Result<RawTableInfo> {
 fn parse_partitions(
     create_table: &CreateTableExpr,
     partitions: Option<Partitions>,
-) -> Result<Vec<MetaPartition>> {
+) -> Result<(Vec<MetaPartition>, Vec<String>)> {
     // If partitions are not defined by user, use the timestamp column (which has to be existed) as
     // the partition column, and create only one partition.
-    let partition_columns = find_partition_columns(create_table, &partitions)?;
+    let partition_columns = find_partition_columns(&partitions)?;
     let partition_entries = find_partition_entries(create_table, &partitions, &partition_columns)?;
 
-    partition_entries
-        .into_iter()
-        .map(|x| MetaPartition::try_from(PartitionDef::new(partition_columns.clone(), x)))
-        .collect::<std::result::Result<_, _>>()
-        .context(DeserializePartitionSnafu)
+    Ok((
+        partition_entries
+            .into_iter()
+            .map(|x| MetaPartition::try_from(PartitionDef::new(partition_columns.clone(), x)))
+            .collect::<std::result::Result<_, _>>()
+            .context(DeserializePartitionSnafu)?,
+        partition_columns,
+    ))
 }
 
 fn find_partition_entries(
@@ -844,10 +915,7 @@ fn find_partition_entries(
     Ok(entries)
 }
 
-fn find_partition_columns(
-    create_table: &CreateTableExpr,
-    partitions: &Option<Partitions>,
-) -> Result<Vec<String>> {
+fn find_partition_columns(partitions: &Option<Partitions>) -> Result<Vec<String>> {
     let columns = if let Some(partitions) = partitions {
         partitions
             .column_list
@@ -855,7 +923,7 @@ fn find_partition_columns(
             .map(|x| x.value.clone())
             .collect::<Vec<_>>()
     } else {
-        vec![create_table.time_index.clone()]
+        vec![]
     };
     Ok(columns)
 }
@@ -901,7 +969,7 @@ ENGINE=mito",
             match &result[0] {
                 Statement::CreateTable(c) => {
                     let expr = expr_factory::create_to_expr(c, QueryContext::arc()).unwrap();
-                    let partitions = parse_partitions(&expr, c.partitions.clone()).unwrap();
+                    let (partitions, _) = parse_partitions(&expr, c.partitions.clone()).unwrap();
                     let json = serde_json::to_string(&partitions).unwrap();
                     assert_eq!(json, expected);
                 }

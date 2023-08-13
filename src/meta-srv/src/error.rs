@@ -21,6 +21,8 @@ use tokio::sync::mpsc::error::SendError;
 use tonic::codegen::http;
 use tonic::Code;
 
+use crate::pubsub::Message;
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -424,8 +426,8 @@ pub enum Error {
     #[snafu(display("Expected to retry later, reason: {}", reason))]
     RetryLater { reason: String, location: Location },
 
-    #[snafu(display("Combine error: {}", err_msg))]
-    Combine { err_msg: String, location: Location },
+    #[snafu(display("Failed to update table metadata, err_msg: {}", err_msg))]
+    UpdateTableMetadata { err_msg: String, location: Location },
 
     #[snafu(display("Failed to convert table route, source: {}", source))]
     TableRouteConversion {
@@ -458,6 +460,18 @@ pub enum Error {
         source: common_meta::error::Error,
         location: Location,
     },
+
+    #[snafu(display("Invalid heartbeat request: {}", err_msg))]
+    InvalidHeartbeatRequest { err_msg: String, location: Location },
+
+    #[snafu(display("Failed to publish message: {:?}", source))]
+    PublishMessage {
+        source: SendError<Message>,
+        location: Location,
+    },
+
+    #[snafu(display("Too many partitions, location: {}", location))]
+    TooManyPartitions { location: Location },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -469,10 +483,6 @@ impl From<Error> for tonic::Status {
 }
 
 impl ErrorExt for Error {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn status_code(&self) -> StatusCode {
         match self {
             Error::EtcdFailed { .. }
@@ -504,9 +514,10 @@ impl ErrorExt for Error {
             | Error::MailboxReceiver { .. }
             | Error::RetryLater { .. }
             | Error::StartGrpc { .. }
-            | Error::Combine { .. }
+            | Error::UpdateTableMetadata { .. }
             | Error::NoEnoughAvailableDatanode { .. }
             | Error::ConvertGrpcExpr { .. }
+            | Error::PublishMessage { .. }
             | Error::Join { .. } => StatusCode::Internal,
             Error::EmptyKey { .. }
             | Error::MissingRequiredParameter { .. }
@@ -516,7 +527,9 @@ impl ErrorExt for Error {
             | Error::InvalidStatKey { .. }
             | Error::ParseNum { .. }
             | Error::UnsupportedSelectorType { .. }
-            | Error::InvalidArguments { .. } => StatusCode::InvalidArguments,
+            | Error::InvalidArguments { .. }
+            | Error::InvalidHeartbeatRequest { .. }
+            | Error::TooManyPartitions { .. } => StatusCode::InvalidArguments,
             Error::LeaseKeyFromUtf8 { .. }
             | Error::LeaseValueFromUtf8 { .. }
             | Error::StatKeyFromUtf8 { .. }
@@ -557,6 +570,10 @@ impl ErrorExt for Error {
 
             Error::Other { source, .. } => source.status_code(),
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

@@ -14,8 +14,8 @@
 
 #![feature(assert_matches)]
 #![feature(try_blocks)]
+#![feature(exclusive_wrapper)]
 
-use common_catalog::consts::DEFAULT_CATALOG_NAME;
 use datatypes::schema::Schema;
 use query::plan::LogicalPlan;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ pub mod auth;
 pub mod configurator;
 pub mod error;
 pub mod grpc;
+pub mod heartbeat_options;
 pub mod http;
 pub mod influxdb;
 pub mod interceptor;
@@ -32,6 +33,7 @@ mod metrics;
 pub mod metrics_handler;
 pub mod mysql;
 pub mod opentsdb;
+pub mod otlp;
 pub mod postgres;
 pub mod prom_store;
 pub mod prometheus;
@@ -47,60 +49,10 @@ pub enum Mode {
     Distributed,
 }
 
-/// Attempt to parse catalog and schema from given database name
-///
-/// The database name may come from different sources:
-///
-/// - MySQL `schema` name in MySQL protocol login request: it's optional and user
-/// and switch database using `USE` command
-/// - Postgres `database` parameter in Postgres wire protocol, required
-/// - HTTP RESTful API: the database parameter, optional
-/// - gRPC: the dbname field in header, optional but has a higher priority than
-/// original catalog/schema
-///
-/// When database name is provided, we attempt to parse catalog and schema from
-/// it. We assume the format `[<catalog>-]<schema>`:
-///
-/// - If `[<catalog>-]` part is not provided, we use whole database name as
-/// schema name
-/// - if `[<catalog>-]` is provided, we split database name with `-` and use
-/// `<catalog>` and `<schema>`.
-pub fn parse_catalog_and_schema_from_client_database_name(db: &str) -> (&str, &str) {
-    let parts = db.splitn(2, '-').collect::<Vec<&str>>();
-    if parts.len() == 2 {
-        (parts[0], parts[1])
-    } else {
-        (DEFAULT_CATALOG_NAME, db)
-    }
-}
-
 /// Cached SQL and logical plan for database interfaces
 #[derive(Clone)]
 pub struct SqlPlan {
     query: String,
     plan: Option<LogicalPlan>,
     schema: Option<Schema>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_catalog_and_schema() {
-        assert_eq!(
-            (DEFAULT_CATALOG_NAME, "fullschema"),
-            parse_catalog_and_schema_from_client_database_name("fullschema")
-        );
-
-        assert_eq!(
-            ("catalog", "schema"),
-            parse_catalog_and_schema_from_client_database_name("catalog-schema")
-        );
-
-        assert_eq!(
-            ("catalog", "schema1-schema2"),
-            parse_catalog_and_schema_from_client_database_name("catalog-schema1-schema2")
-        );
-    }
 }

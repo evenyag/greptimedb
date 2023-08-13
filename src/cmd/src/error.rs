@@ -23,6 +23,12 @@ use snafu::{Location, Snafu};
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("Failed to iter stream, source: {}", source))]
+    IterStream {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
     #[snafu(display("Failed to start datanode, source: {}", source))]
     StartDatanode {
         location: Location,
@@ -154,6 +160,13 @@ pub enum Error {
         location: Location,
         source: catalog::error::Error,
     },
+
+    #[snafu(display("Failed to connect to Etcd at {etcd_addr}, source: {}", source))]
+    ConnectEtcd {
+        etcd_addr: String,
+        source: etcd_client::Error,
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -169,11 +182,14 @@ impl ErrorExt for Error {
             Error::ShutdownMetaServer { source, .. } => source.status_code(),
             Error::BuildMetaServer { source, .. } => source.status_code(),
             Error::UnsupportedSelectorType { source, .. } => source.status_code(),
+            Error::IterStream { source, .. } => source.status_code(),
             Error::MissingConfig { .. }
             | Error::LoadLayeredConfig { .. }
             | Error::IllegalConfig { .. }
             | Error::InvalidReplCommand { .. }
-            | Error::IllegalAuthConfig { .. } => StatusCode::InvalidArguments,
+            | Error::IllegalAuthConfig { .. }
+            | Error::ConnectEtcd { .. } => StatusCode::InvalidArguments,
+
             Error::ReplCreation { .. } | Error::Readline { .. } => StatusCode::Internal,
             Error::RequestDatabase { source, .. } => source.status_code(),
             Error::CollectRecordBatches { source, .. }

@@ -10,8 +10,10 @@ rpc_addr = "127.0.0.1:3001"
 rpc_hostname = "127.0.0.1"
 # The number of gRPC server worker threads, 8 by default.
 rpc_runtime_size = 8
+
+[heartbeat]
 # Interval for sending heartbeat messages to the Metasrv in milliseconds, 5000 by default.
-heartbeat_interval_millis = 5000
+interval_millis = 5000
 
 # Metasrv client options.
 [meta_client_options]
@@ -36,8 +38,9 @@ sync_write = false
 
 # Storage options, see `standalone.example.toml`.
 [storage]
-type = "File"
+# The working home directory.
 data_home = "/tmp/greptimedb/"
+type = "File"
 # TTL for all tables. Disabled by default.
 # global_ttl = "7d"
 

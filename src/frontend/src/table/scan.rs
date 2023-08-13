@@ -55,15 +55,17 @@ impl DatanodeInstance {
         let logical_plan = self.build_logical_plan(&plan)?;
 
         let substrait_plan = DFLogicalSubstraitConvertor
-            .encode(logical_plan)
+            .encode(&logical_plan)
             .context(error::EncodeSubstraitLogicalPlanSnafu)?;
 
         let result = self
             .db
-            .logical_plan(substrait_plan.to_vec())
+            .logical_plan(substrait_plan.to_vec(), None)
             .await
             .context(error::RequestDatanodeSnafu)?;
-        let Output::RecordBatches(record_batches) = result else { unreachable!() };
+        let Output::RecordBatches(record_batches) = result else {
+            unreachable!()
+        };
         Ok(record_batches)
     }
 

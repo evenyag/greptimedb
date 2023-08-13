@@ -26,6 +26,7 @@ use common_telemetry::logging::LoggingOptions;
 use meta_client::MetaClientOptions;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use servers::heartbeat_options::HeartbeatOptions;
 use servers::http::HttpOptions;
 use servers::Mode;
 use snafu::ResultExt;
@@ -57,7 +58,7 @@ pub enum ObjectStoreConfig {
 }
 
 /// Storage engine config
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Retention period for all tables.
@@ -67,6 +68,8 @@ pub struct StorageConfig {
     /// The precedence order is: ttl in table options > global ttl.
     #[serde(with = "humantime_serde")]
     pub global_ttl: Option<Duration>,
+    /// The working directory of database
+    pub data_home: String,
     #[serde(flatten)]
     pub store: ObjectStoreConfig,
     pub compaction: CompactionConfig,
@@ -74,11 +77,22 @@ pub struct StorageConfig {
     pub flush: FlushConfig,
 }
 
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            global_ttl: None,
+            data_home: DEFAULT_DATA_HOME.to_string(),
+            store: ObjectStoreConfig::default(),
+            compaction: CompactionConfig::default(),
+            manifest: RegionManifestConfig::default(),
+            flush: FlushConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default, Deserialize)]
 #[serde(default)]
-pub struct FileConfig {
-    pub data_home: String,
-}
+pub struct FileConfig {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -197,9 +211,7 @@ impl Default for GcsConfig {
 
 impl Default for ObjectStoreConfig {
     fn default() -> Self {
-        ObjectStoreConfig::File(FileConfig {
-            data_home: DEFAULT_DATA_HOME.to_string(),
-        })
+        ObjectStoreConfig::File(FileConfig {})
     }
 }
 
@@ -354,13 +366,14 @@ pub struct DatanodeOptions {
     pub rpc_addr: String,
     pub rpc_hostname: Option<String>,
     pub rpc_runtime_size: usize,
-    pub heartbeat_interval_millis: u64,
+    pub heartbeat: HeartbeatOptions,
     pub http_opts: HttpOptions,
     pub meta_client_options: Option<MetaClientOptions>,
     pub wal: WalConfig,
     pub storage: StorageConfig,
     pub procedure: ProcedureConfig,
     pub logging: LoggingOptions,
+    pub enable_telemetry: bool,
 }
 
 impl Default for DatanodeOptions {
@@ -378,7 +391,8 @@ impl Default for DatanodeOptions {
             storage: StorageConfig::default(),
             procedure: ProcedureConfig::default(),
             logging: LoggingOptions::default(),
-            heartbeat_interval_millis: 5000,
+            heartbeat: HeartbeatOptions::default(),
+            enable_telemetry: true,
         }
     }
 }

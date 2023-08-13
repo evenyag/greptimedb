@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::fmt::Debug;
+use std::sync::Exclusive;
 
 use async_trait::async_trait;
+use common_catalog::parse_catalog_and_schema_from_db_string;
 use common_error::ext::ErrorExt;
 use futures::{Sink, SinkExt};
 use metrics::increment_counter;
@@ -118,12 +120,11 @@ fn set_client_info<C>(client: &C, session: &Session)
 where
     C: ClientInfo,
 {
-    let ctx = session.context();
     if let Some(current_catalog) = client.metadata().get(super::METADATA_CATALOG) {
-        ctx.set_current_catalog(current_catalog);
+        session.set_catalog(current_catalog.clone());
     }
     if let Some(current_schema) = client.metadata().get(super::METADATA_SCHEMA) {
-        ctx.set_current_schema(current_schema);
+        session.set_schema(current_schema.clone());
     }
     if let Some(username) = client.metadata().get(super::METADATA_USER) {
         session.set_user_info(UserInfo::new(username));
@@ -153,7 +154,7 @@ impl StartupHandler for PostgresServerHandler {
                 auth::save_startup_parameters_to_metadata(client, startup);
 
                 // check if db is valid
-                match resolve_db_info(client, self.query_handler.clone()).await? {
+                match resolve_db_info(Exclusive::new(client), self.query_handler.clone()).await? {
                     DbResolution::Resolved(catalog, schema) => {
                         let metadata = client.metadata_mut();
                         let _ = metadata.insert(super::METADATA_CATALOG.to_owned(), catalog);
@@ -226,15 +227,15 @@ enum DbResolution {
 
 /// A function extracted to resolve lifetime and readability issues:
 async fn resolve_db_info<C>(
-    client: &mut C,
+    client: Exclusive<&mut C>,
     query_handler: ServerSqlQueryHandlerRef,
 ) -> PgWireResult<DbResolution>
 where
     C: ClientInfo + Unpin + Send,
 {
-    let db_ref = client.metadata().get(super::METADATA_DATABASE);
+    let db_ref = client.into_inner().metadata().get(super::METADATA_DATABASE);
     if let Some(db) = db_ref {
-        let (catalog, schema) = crate::parse_catalog_and_schema_from_client_database_name(db);
+        let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
         if query_handler
             .is_valid_schema(catalog, schema)
             .await

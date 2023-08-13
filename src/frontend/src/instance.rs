@@ -16,6 +16,7 @@ pub mod distributed;
 mod grpc;
 mod influxdb;
 mod opentsdb;
+mod otlp;
 mod prom_store;
 mod script;
 mod standalone;
@@ -43,7 +44,6 @@ use common_meta::key::TableMetadataManager;
 use common_query::Output;
 use common_telemetry::logging::{debug, info};
 use common_telemetry::timer;
-use datafusion::sql::sqlparser::ast::ObjectName;
 use datanode::instance::sql::table_idents_to_full_name;
 use datanode::instance::InstanceRef as DnInstanceRef;
 use datatypes::schema::Schema;
@@ -65,7 +65,8 @@ use servers::prometheus::PrometheusHandler;
 use servers::query_handler::grpc::{GrpcQueryHandler, GrpcQueryHandlerRef};
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
-    InfluxdbLineProtocolHandler, OpentsdbProtocolHandler, PromStoreProtocolHandler, ScriptHandler,
+    InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
+    PromStoreProtocolHandler, ScriptHandler,
 };
 use session::context::QueryContextRef;
 use snafu::prelude::*;
@@ -73,6 +74,7 @@ use sql::dialect::Dialect;
 use sql::parser::ParserContext;
 use sql::statements::copy::CopyTable;
 use sql::statements::statement::Statement;
+use sqlparser::ast::ObjectName;
 
 use crate::catalog::FrontendCatalogManager;
 use crate::error::{
@@ -97,6 +99,7 @@ pub trait FrontendInstance:
     + OpentsdbProtocolHandler
     + InfluxdbLineProtocolHandler
     + PromStoreProtocolHandler
+    + OpenTelemetryProtocolHandler
     + ScriptHandler
     + PrometheusHandler
     + Send
@@ -163,7 +166,6 @@ impl Instance {
             meta_client.clone(),
             Arc::new(catalog_manager.clone()),
             datanode_clients.clone(),
-            table_metadata_manager.clone(),
         );
         let dist_instance = Arc::new(dist_instance);
 
@@ -191,7 +193,7 @@ impl Instance {
         plugins.insert::<StatementExecutorRef>(statement_executor.clone());
 
         let handlers_executor = HandlerGroupExecutor::new(vec![
-            Arc::new(ParseMailboxMessageHandler::default()),
+            Arc::new(ParseMailboxMessageHandler),
             Arc::new(InvalidateTableCacheHandler::new(
                 meta_backend,
                 partition_manager,
@@ -200,10 +202,11 @@ impl Instance {
 
         let heartbeat_task = Some(HeartbeatTask::new(
             meta_client,
-            opts.heartbeat_interval_millis,
-            opts.retry_interval_millis,
+            opts.heartbeat.clone(),
             Arc::new(handlers_executor),
         ));
+
+        common_telemetry::init_node_id(opts.node_id.clone());
 
         Ok(Instance {
             catalog_manager,
@@ -314,8 +317,8 @@ impl Instance {
         ctx: QueryContextRef,
         request: &InsertRequest,
     ) -> Result<()> {
-        let catalog_name = &ctx.current_catalog();
-        let schema_name = &ctx.current_schema();
+        let catalog_name = &ctx.current_catalog().to_owned();
+        let schema_name = &ctx.current_schema().to_owned();
         let table_name = &request.table_name;
         let columns = &request.columns;
 
@@ -371,8 +374,8 @@ impl Instance {
         columns: &[Column],
         engine: &str,
     ) -> Result<Output> {
-        let catalog_name = &ctx.current_catalog();
-        let schema_name = &ctx.current_schema();
+        let catalog_name = ctx.current_catalog();
+        let schema_name = ctx.current_schema();
 
         // Create table automatically, build schema from data.
         let create_expr = self
@@ -406,8 +409,8 @@ impl Instance {
             add_columns, table_name
         );
         let expr = AlterExpr {
-            catalog_name: ctx.current_catalog(),
-            schema_name: ctx.current_schema(),
+            catalog_name: ctx.current_catalog().to_owned(),
+            schema_name: ctx.current_schema().to_owned(),
             table_name: table_name.to_string(),
             kind: Some(Kind::AddColumns(add_columns)),
             ..Default::default()
@@ -579,6 +582,7 @@ impl PrometheusHandler for Instance {
         query: &PromQuery,
         query_ctx: QueryContextRef,
     ) -> server_error::Result<Output> {
+        let _timer = timer!(metrics::METRIC_HANDLE_PROMQL_ELAPSED);
         let interceptor = self
             .plugins
             .get::<PromQueryInterceptorRef<server_error::Error>>();
@@ -598,6 +602,10 @@ impl PrometheusHandler for Instance {
             })?;
 
         Ok(interceptor.post_execute(output, query_ctx)?)
+    }
+
+    fn catalog_manager(&self) -> CatalogManagerRef {
+        self.catalog_manager.clone()
     }
 }
 
@@ -619,7 +627,7 @@ pub fn check_permission(
         // These are executed by query engine, and will be checked there.
         Statement::Query(_) | Statement::Explain(_) | Statement::Tql(_) | Statement::Delete(_) => {}
         // database ops won't be checked
-        Statement::CreateDatabase(_) | Statement::ShowDatabases(_) | Statement::Use(_) => {}
+        Statement::CreateDatabase(_) | Statement::ShowDatabases(_) => {}
         // show create table and alter are not supported yet
         Statement::ShowCreateTable(_) | Statement::CreateExternalTable(_) | Statement::Alter(_) => {
         }
@@ -635,7 +643,7 @@ pub fn check_permission(
         }
         Statement::ShowTables(stmt) => {
             if let Some(database) = &stmt.database {
-                validate_catalog_and_schema(&query_ctx.current_catalog(), database, query_ctx)
+                validate_catalog_and_schema(query_ctx.current_catalog(), database, query_ctx)
                     .map_err(BoxedError::new)
                     .context(SqlExecInterceptedSnafu)?;
             }
@@ -773,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_exec_validation() {
-        let query_ctx = Arc::new(QueryContext::new());
+        let query_ctx = QueryContext::arc();
         let plugins = Plugins::new();
         plugins.insert(QueryOptions {
             disallow_cross_schema_query: true,
@@ -803,11 +811,6 @@ mod tests {
             let re = check_permission(plugins.clone(), &stmt, &query_ctx);
             re.unwrap();
         }
-
-        let sql = "USE randomschema";
-        let stmts = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
-        let re = check_permission(plugins.clone(), &stmts[0], &query_ctx);
-        re.unwrap();
 
         fn replace_test(template_sql: &str, plugins: Arc<Plugins>, query_ctx: &QueryContextRef) {
             // test right

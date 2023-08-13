@@ -474,7 +474,10 @@ impl ProcedureManager for LocalManager {
             if message.parent_id.is_none() {
                 // This is the root procedure. We only submit the root procedure as it will
                 // submit sub-procedures to the manager.
-                let Some(loaded_procedure) = self.manager_ctx.load_one_procedure_from_message(*procedure_id, message) else {
+                let Some(loaded_procedure) = self
+                    .manager_ctx
+                    .load_one_procedure_from_message(*procedure_id, message)
+                else {
                     // Try to load other procedures.
                     continue;
                 };
@@ -545,7 +548,7 @@ impl TaskFunction<Error> for RemoveOutdatedMetaFunction {
 
 /// Create a new [ProcedureMeta] for test purpose.
 #[cfg(test)]
-mod test_util {
+pub(crate) mod test_util {
     use common_test_util::temp_dir::TempDir;
     use object_store::services::Fs as Builder;
     use object_store::ObjectStore;

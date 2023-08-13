@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use api::v1::ddl_request::{Expr as DdlExpr, Expr};
+use api::v1::ddl_request::Expr as DdlExpr;
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use api::v1::{CreateDatabaseExpr, DdlRequest, DeleteRequest, InsertRequests};
@@ -23,10 +23,8 @@ use async_trait::async_trait;
 use catalog::CatalogManagerRef;
 use common_grpc_expr::insert::to_table_insert_request;
 use common_query::Output;
-use datafusion::catalog::catalog::{
-    CatalogList, CatalogProvider, MemoryCatalogList, MemoryCatalogProvider,
-};
 use datafusion::catalog::schema::SchemaProvider;
+use datafusion::catalog::{CatalogList, CatalogProvider, MemoryCatalogList, MemoryCatalogProvider};
 use datafusion::datasource::TableProvider;
 use futures::future;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
@@ -67,8 +65,8 @@ impl Instance {
         ctx: QueryContextRef,
     ) -> Result<Output> {
         let catalog_list = new_dummy_catalog_list(
-            &ctx.current_catalog(),
-            &ctx.current_schema(),
+            ctx.current_catalog(),
+            ctx.current_schema(),
             self.catalog_manager.clone(),
         )
         .await?;
@@ -77,8 +75,8 @@ impl Instance {
             .decode(
                 plan_bytes.as_slice(),
                 Arc::new(catalog_list) as Arc<_>,
-                &ctx.current_catalog(),
-                &ctx.current_schema(),
+                ctx.current_catalog(),
+                ctx.current_schema(),
             )
             .await
             .context(DecodeLogicalPlanSnafu)?;
@@ -96,7 +94,9 @@ impl Instance {
                 match stmt {
                     // TODO(LFC): Remove SQL execution branch here.
                     // Keep this because substrait can't handle much of SQLs now.
-                    QueryStatement::Sql(Statement::Query(_)) | QueryStatement::Promql(_) => {
+                    QueryStatement::Sql(Statement::Query(_))
+                    | QueryStatement::Sql(Statement::Explain(_))
+                    | QueryStatement::Promql(_) => {
                         let plan = self
                             .query_engine
                             .planner()
@@ -133,8 +133,8 @@ impl Instance {
     ) -> Result<Output> {
         let results = future::try_join_all(requests.inserts.into_iter().map(|insert| {
             let catalog_manager = self.catalog_manager.clone();
-            let catalog = ctx.current_catalog();
-            let schema = ctx.current_schema();
+            let catalog = ctx.current_catalog().to_owned();
+            let schema = ctx.current_schema().to_owned();
 
             common_runtime::spawn_write(async move {
                 let table_name = &insert.table_name.clone();
@@ -165,8 +165,8 @@ impl Instance {
     }
 
     async fn handle_delete(&self, request: DeleteRequest, ctx: QueryContextRef) -> Result<Output> {
-        let catalog = &ctx.current_catalog();
-        let schema = &ctx.current_schema();
+        let catalog = ctx.current_catalog();
+        let schema = ctx.current_schema();
         let table_name = &request.table_name.clone();
         let table_ref = TableReference::full(catalog, schema, table_name);
 
@@ -193,12 +193,13 @@ impl Instance {
             name: "DdlRequest.expr",
         })?;
         match expr {
-            DdlExpr::CreateTable(expr) => self.handle_create(expr).await,
-            DdlExpr::Alter(expr) => self.handle_alter(expr).await,
+            DdlExpr::CreateTable(expr) => self.handle_create(expr, query_ctx).await,
+            DdlExpr::Alter(expr) => self.handle_alter(expr, query_ctx).await,
             DdlExpr::CreateDatabase(expr) => self.handle_create_database(expr, query_ctx).await,
-            DdlExpr::DropTable(expr) => self.handle_drop_table(expr).await,
-            DdlExpr::FlushTable(expr) => self.handle_flush_table(expr).await,
-            Expr::CompactTable(expr) => self.handle_compact_table(expr).await,
+            DdlExpr::DropTable(expr) => self.handle_drop_table(expr, query_ctx).await,
+            DdlExpr::FlushTable(expr) => self.handle_flush_table(expr, query_ctx).await,
+            DdlExpr::CompactTable(expr) => self.handle_compact_table(expr, query_ctx).await,
+            DdlExpr::TruncateTable(expr) => self.handle_truncate_table(expr, query_ctx).await,
         }
     }
 }
@@ -302,12 +303,15 @@ async fn new_dummy_catalog_list(
 mod test {
     use api::v1::add_column::location::LocationType;
     use api::v1::add_column::Location;
-    use api::v1::column::{SemanticType, Values};
+    use api::v1::column::Values;
     use api::v1::{
         alter_expr, AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDef,
-        CreateDatabaseExpr, CreateTableExpr, InsertRequest, InsertRequests, QueryRequest,
+        CreateDatabaseExpr, CreateTableExpr, DropTableExpr, InsertRequest, InsertRequests,
+        QueryRequest, RenameTable, SemanticType, TableId, TruncateTableExpr,
     };
     use common_catalog::consts::MITO_ENGINE;
+    use common_error::ext::ErrorExt;
+    use common_error::status_code::StatusCode;
     use common_recordbatch::RecordBatches;
     use datatypes::prelude::*;
     use query::parser::QueryLanguageParser;
@@ -325,6 +329,303 @@ mod test {
             .await
             .unwrap();
         engine.execute(plan, QueryContext::arc()).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_same_table_twice() {
+        // It should return TableAlreadyExists(4000)
+        let instance = MockInstance::new("test_create_same_table_twice").await;
+        let instance = instance.inner();
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
+                database_name: "my_database".to_string(),
+                create_if_not_exists: true,
+            })),
+        });
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateTable(CreateTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                desc: "blabla".to_string(),
+                column_defs: vec![
+                    ColumnDef {
+                        name: "a".to_string(),
+                        datatype: ColumnDataType::String as i32,
+                        is_nullable: true,
+                        default_constraint: vec![],
+                    },
+                    ColumnDef {
+                        name: "ts".to_string(),
+                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        is_nullable: false,
+                        default_constraint: vec![],
+                    },
+                ],
+                time_index: "ts".to_string(),
+                engine: MITO_ENGINE.to_string(),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        let err = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap_err();
+        assert!(matches!(err.status_code(), StatusCode::TableAlreadyExists));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_same_table_twice() {
+        // It should return TableNotFound(4001)
+        let instance = MockInstance::new("test_drop_same_table_twice").await;
+        let instance = instance.inner();
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
+                database_name: "my_database".to_string(),
+                create_if_not_exists: true,
+            })),
+        });
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateTable(CreateTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                desc: "blabla".to_string(),
+                column_defs: vec![
+                    ColumnDef {
+                        name: "a".to_string(),
+                        datatype: ColumnDataType::String as i32,
+                        is_nullable: true,
+                        default_constraint: vec![],
+                    },
+                    ColumnDef {
+                        name: "ts".to_string(),
+                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        is_nullable: false,
+                        default_constraint: vec![],
+                    },
+                ],
+                time_index: "ts".to_string(),
+                engine: MITO_ENGINE.to_string(),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::DropTable(DropTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                table_id: Some(TableId { id: 1025 }),
+            })),
+        });
+
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+
+        let err = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap_err();
+        assert!(matches!(err.status_code(), StatusCode::TableNotFound));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_alter_table_twice() {
+        let instance = MockInstance::new("test_alter_table_twice").await;
+        let instance = instance.inner();
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
+                database_name: "my_database".to_string(),
+                create_if_not_exists: true,
+            })),
+        });
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateTable(CreateTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                desc: "blabla".to_string(),
+                column_defs: vec![
+                    ColumnDef {
+                        name: "a".to_string(),
+                        datatype: ColumnDataType::String as i32,
+                        is_nullable: true,
+                        default_constraint: vec![],
+                    },
+                    ColumnDef {
+                        name: "ts".to_string(),
+                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        is_nullable: false,
+                        default_constraint: vec![],
+                    },
+                ],
+                time_index: "ts".to_string(),
+                engine: MITO_ENGINE.to_string(),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::Alter(AlterExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                kind: Some(alter_expr::Kind::AddColumns(AddColumns {
+                    add_columns: vec![AddColumn {
+                        column_def: Some(ColumnDef {
+                            name: "b".to_string(),
+                            datatype: ColumnDataType::Int32 as i32,
+                            is_nullable: true,
+                            default_constraint: vec![],
+                        }),
+                        is_key: true,
+                        location: None,
+                    }],
+                })),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        // Updates `table_version` to latest.
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::Alter(AlterExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                kind: Some(alter_expr::Kind::AddColumns(AddColumns {
+                    add_columns: vec![AddColumn {
+                        column_def: Some(ColumnDef {
+                            name: "b".to_string(),
+                            datatype: ColumnDataType::Int32 as i32,
+                            is_nullable: true,
+                            default_constraint: vec![],
+                        }),
+                        is_key: true,
+                        location: None,
+                    }],
+                })),
+                table_version: 1,
+                ..Default::default()
+            })),
+        });
+        let err = instance
+            .do_query(query, QueryContext::arc())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::TableColumnExists);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rename_table_twice() {
+        common_telemetry::init_default_ut_logging();
+        let instance = MockInstance::new("test_alter_table_twice").await;
+        let instance = instance.inner();
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
+                database_name: "my_database".to_string(),
+                create_if_not_exists: true,
+            })),
+        });
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::CreateTable(CreateTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                desc: "blabla".to_string(),
+                column_defs: vec![
+                    ColumnDef {
+                        name: "a".to_string(),
+                        datatype: ColumnDataType::String as i32,
+                        is_nullable: true,
+                        default_constraint: vec![],
+                    },
+                    ColumnDef {
+                        name: "ts".to_string(),
+                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        is_nullable: false,
+                        default_constraint: vec![],
+                    },
+                ],
+                time_index: "ts".to_string(),
+                engine: MITO_ENGINE.to_string(),
+                table_id: Some(TableId { id: 1025 }),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::Alter(AlterExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                kind: Some(alter_expr::Kind::RenameTable(RenameTable {
+                    new_table_name: "new_my_table".to_string(),
+                })),
+                table_id: Some(TableId { id: 1025 }),
+                ..Default::default()
+            })),
+        });
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+
+        // renames it again.
+        let output = instance
+            .do_query(query.clone(), QueryContext::arc())
+            .await
+            .unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -422,7 +723,9 @@ mod test {
 
         let Ok(QueryStatement::Sql(stmt)) = QueryLanguageParser::parse_sql(
             "INSERT INTO my_database.my_table (a, b, ts) VALUES ('s', 1, 1672384140000)",
-        ) else { unreachable!() };
+        ) else {
+            unreachable!()
+        };
         let output = instance
             .execute_sql(stmt, QueryContext::arc())
             .await
@@ -430,7 +733,9 @@ mod test {
         assert!(matches!(output, Output::AffectedRows(1)));
 
         let output = exec_selection(instance, "SELECT * FROM my_database.my_table").await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---+---+---+---------------------+---+
@@ -439,6 +744,61 @@ mod test {
 |   | s |   | 2022-12-30T07:09:00 | 1 |
 +---+---+---+---------------------+---+";
         assert_eq!(recordbatches.pretty_print().unwrap(), expected);
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::DropTable(DropTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "my_database".to_string(),
+                table_name: "my_table".to_string(),
+                table_id: None,
+            })),
+        });
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(1)));
+        assert!(!instance
+            .catalog_manager
+            .table_exist("greptime", "my_database", "my_table")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_truncate_table() {
+        let instance = MockInstance::new("test_handle_truncate_table").await;
+        let instance = instance.inner();
+        assert!(test_util::create_test_table(
+            instance,
+            ConcreteDataType::timestamp_millisecond_datatype()
+        )
+        .await
+        .is_ok());
+
+        // Insert data.
+        let query = Request::Query(QueryRequest {
+            query: Some(Query::Sql(
+                "INSERT INTO demo(host, cpu, memory, ts) VALUES \
+                            ('host1', 66.6, 1024, 1672201025000),\
+                            ('host2', 88.8, 333.3, 1672201026000),\
+                            ('host3', 88.8, 333.3, 1672201026000)"
+                    .to_string(),
+            )),
+        });
+
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(3)));
+
+        let query = Request::Ddl(DdlRequest {
+            expr: Some(DdlExpr::TruncateTable(TruncateTableExpr {
+                catalog_name: "greptime".to_string(),
+                schema_name: "public".to_string(),
+                table_name: "demo".to_string(),
+                table_id: None,
+            })),
+        });
+
+        let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
+        assert!(matches!(output, Output::AffectedRows(0)));
+        // TODO(DevilExileSu): Validate is an empty table.
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -501,7 +861,9 @@ mod test {
         assert!(matches!(output, Output::AffectedRows(3)));
 
         let output = exec_selection(instance, "SELECT ts, host, cpu FROM demo").await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+-------+-----+
@@ -571,7 +933,9 @@ mod test {
         assert!(matches!(output, Output::AffectedRows(1)));
 
         let output = exec_selection(instance, "SELECT ts, host, cpu FROM demo").await;
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+-------+------+
@@ -611,7 +975,9 @@ mod test {
             )),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
-        let Output::Stream(stream) = output else { unreachable!() };
+        let Output::Stream(stream) = output else {
+            unreachable!()
+        };
         let recordbatch = RecordBatches::try_collect(stream).await.unwrap();
         let expected = "\
 +---------------------+-------+------+--------+

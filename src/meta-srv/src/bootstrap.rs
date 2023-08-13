@@ -76,15 +76,12 @@ impl MetaSrvInstance {
     pub async fn start(&mut self) -> Result<()> {
         self.meta_srv.try_start().await?;
 
-        let (tx, mut rx) = mpsc::channel::<()>(1);
+        let (tx, rx) = mpsc::channel::<()>(1);
 
         self.signal_sender = Some(tx);
 
-        let meta_srv = bootstrap_meta_srv_with_router(
-            &self.opts.bind_addr,
-            router(self.meta_srv.clone()),
-            &mut rx,
-        );
+        let meta_srv =
+            bootstrap_meta_srv_with_router(&self.opts.bind_addr, router(self.meta_srv.clone()), rx);
         let addr = self
             .opts
             .http_opts
@@ -124,7 +121,7 @@ impl MetaSrvInstance {
 pub async fn bootstrap_meta_srv_with_router(
     bind_addr: &str,
     router: Router,
-    signal: &mut Receiver<()>,
+    mut signal: Receiver<()>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -166,7 +163,7 @@ pub async fn build_meta_srv(opts: &MetaSrvOptions) -> Result<MetaSrv> {
             .await
             .context(error::ConnectEtcdSnafu)?;
         (
-            EtcdStore::with_etcd_client(etcd_client.clone())?,
+            EtcdStore::with_etcd_client(etcd_client.clone()),
             Some(EtcdElection::with_etcd_client(&opts.server_addr, etcd_client.clone()).await?),
             Some(EtcdLock::with_etcd_client(etcd_client)?),
         )

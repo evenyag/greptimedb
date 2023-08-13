@@ -17,12 +17,15 @@
 
 pub mod datanode;
 pub mod error;
+mod greptimedb_telemetry;
 pub mod heartbeat;
 pub mod instance;
 pub mod metrics;
+#[cfg(any(test, feature = "testing"))]
 mod mock;
 pub mod server;
 pub mod sql;
 mod store;
+
 #[cfg(test)]
 mod tests;

@@ -153,7 +153,7 @@ pub fn convert_value(param: &ParamValue, t: &ConcreteDataType) -> Result<ScalarV
             }
             .fail(),
         },
-        ValueInner::NULL => Ok(value::to_null_scalar_value(t)),
+        ValueInner::NULL => value::to_null_scalar_value(t).context(error::ConvertScalarValueSnafu),
         ValueInner::Bytes(b) => match t {
             ConcreteDataType::String(_) => Ok(ScalarValue::Utf8(Some(
                 String::from_utf8_lossy(b).to_string(),
@@ -218,21 +218,27 @@ mod tests {
     #[test]
     fn test_transform_placeholders() {
         let insert = parse_sql("insert into demo values(?,?,?)");
-        let Statement::Insert(insert) = transform_placeholders(insert) else { unreachable!()};
+        let Statement::Insert(insert) = transform_placeholders(insert) else {
+            unreachable!()
+        };
         assert_eq!(
             "INSERT INTO demo VALUES ($1, $2, $3)",
             insert.inner.to_string()
         );
 
         let delete = parse_sql("delete from demo where host=? and idc=?");
-        let Statement::Delete(delete) = transform_placeholders(delete) else { unreachable!()};
+        let Statement::Delete(delete) = transform_placeholders(delete) else {
+            unreachable!()
+        };
         assert_eq!(
             "DELETE FROM demo WHERE host = $1 AND idc = $2",
             delete.inner.to_string()
         );
 
         let select = parse_sql("select from demo where host=? and idc in (select idc from idcs where name=?) and cpu>?");
-        let Statement::Query(select) = transform_placeholders(select) else { unreachable!()};
+        let Statement::Query(select) = transform_placeholders(select) else {
+            unreachable!()
+        };
         assert_eq!("SELECT from AS demo WHERE host = $1 AND idc IN (SELECT idc FROM idcs WHERE name = $2) AND cpu > $3", select.inner.to_string());
     }
 }

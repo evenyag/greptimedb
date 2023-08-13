@@ -12,16 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Mito region engine.
+
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use store_api::logstore::LogStore;
+use store_api::storage::RegionId;
 
 use crate::config::MitoConfig;
-use crate::error::{RecvSnafu, Result};
-pub use crate::worker::request::CreateRequest;
-use crate::worker::request::{RegionRequest, RequestBody};
+use crate::error::{RecvSnafu, RegionNotFoundSnafu, Result};
+use crate::request::{
+    CloseRequest, CreateRequest, OpenRequest, RegionRequest, RequestBody, WriteRequest,
+};
 use crate::worker::WorkerGroup;
 
 /// Region engine implementation for timeseries data.
@@ -45,13 +52,59 @@ impl MitoEngine {
     }
 
     /// Stop the engine.
+    ///
+    /// Stopping the engine doesn't stop the underlying log store as other components might
+    /// still use it.
     pub async fn stop(&self) -> Result<()> {
         self.inner.stop().await
     }
 
     /// Creates a new region.
-    pub async fn create_region(&self, request: CreateRequest) -> Result<()> {
-        self.inner.create_region(request).await
+    pub async fn create_region(&self, create_request: CreateRequest) -> Result<()> {
+        self.inner
+            .handle_request_body(RequestBody::Create(create_request))
+            .await
+    }
+
+    /// Opens an existing region.
+    ///
+    /// Returns error if the region does not exist.
+    pub async fn open_region(&self, open_request: OpenRequest) -> Result<()> {
+        self.inner
+            .handle_request_body(RequestBody::Open(open_request))
+            .await
+    }
+
+    /// Closes a region.
+    ///
+    /// Does nothing if the region is already closed.
+    pub async fn close_region(&self, close_request: CloseRequest) -> Result<()> {
+        self.inner
+            .handle_request_body(RequestBody::Close(close_request))
+            .await
+    }
+
+    /// Returns true if the specific region exists.
+    pub fn is_region_exists(&self, region_id: RegionId) -> bool {
+        self.inner.workers.is_region_exists(region_id)
+    }
+
+    /// Write to a region.
+    pub async fn write_region(&self, mut write_request: WriteRequest) -> Result<()> {
+        let region = self
+            .inner
+            .workers
+            .get_region(write_request.region_id)
+            .context(RegionNotFoundSnafu {
+                region_id: write_request.region_id,
+            })?;
+        let metadata = region.metadata();
+
+        write_request.fill_missing_columns(&metadata)?;
+
+        self.inner
+            .handle_request_body(RequestBody::Write(write_request))
+            .await
     }
 }
 
@@ -69,7 +122,7 @@ impl EngineInner {
         object_store: ObjectStore,
     ) -> EngineInner {
         EngineInner {
-            workers: WorkerGroup::start(&config, log_store, object_store),
+            workers: WorkerGroup::start(config, log_store, object_store),
         }
     }
 
@@ -78,25 +131,11 @@ impl EngineInner {
         self.workers.stop().await
     }
 
-    /// Creates a new region.
-    async fn create_region(&self, create_request: CreateRequest) -> Result<()> {
-        let (request, receiver) = RegionRequest::from_body(RequestBody::Create(create_request));
+    /// Handles [RequestBody] and return its executed result.
+    async fn handle_request_body(&self, body: RequestBody) -> Result<()> {
+        let (request, receiver) = RegionRequest::from_body(body);
         self.workers.submit_to_worker(request).await?;
 
         receiver.await.context(RecvSnafu)?
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_util::TestEnv;
-
-    #[tokio::test]
-    async fn test_engine_new_stop() {
-        let env = TestEnv::new("engine-stop");
-        let engine = env.create_engine(MitoConfig::default()).await;
-
-        engine.stop().await.unwrap();
     }
 }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::str::Utf8Error;
+
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
 use serde_json::error::Error as JsonError;
@@ -59,8 +61,39 @@ pub enum Error {
     #[snafu(display("Invalid protobuf message, err: {}", err_msg))]
     InvalidProtoMsg { err_msg: String, location: Location },
 
-    #[snafu(display("Concurrent modify regions placement: {err_msg}"))]
-    ConcurrentModifyRegionsPlacement { err_msg: String, location: Location },
+    #[snafu(display("Unexpected: {err_msg}"))]
+    Unexpected { err_msg: String, location: Location },
+
+    #[snafu(display("Table already exists, table_id: {}", table_id))]
+    TableAlreadyExists {
+        table_id: TableId,
+        location: Location,
+    },
+
+    #[snafu(display("Catalog already exists, catalog: {}", catalog))]
+    CatalogAlreadyExists { catalog: String, location: Location },
+
+    #[snafu(display("Schema already exists, catalog:{}, schema: {}", catalog, schema))]
+    SchemaAlreadyExists {
+        catalog: String,
+        schema: String,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to convert raw key to str, source: {}", source))]
+    ConvertRawKey {
+        location: Location,
+        source: Utf8Error,
+    },
+
+    #[snafu(display("Table does not exist, table_name: {}", table_name))]
+    TableNotExist {
+        table_name: String,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to rename table, reason: {}", reason))]
+    RenameTable { reason: String, location: Location },
 
     #[snafu(display("Invalid table metadata, err: {}", err_msg))]
     InvalidTableMetadata { err_msg: String, location: Location },
@@ -92,6 +125,15 @@ pub enum Error {
         err_msg: String,
         location: Location,
     },
+
+    #[snafu(display("Invalid catalog value, source: {}", source))]
+    InvalidCatalogValue {
+        source: common_catalog::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("External error: {}", err_msg))]
+    External { location: Location, err_msg: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -106,18 +148,27 @@ impl ErrorExt for Error {
             | RouteInfoCorrupted { .. }
             | InvalidProtoMsg { .. }
             | InvalidTableMetadata { .. }
-            | MoveRegion { .. } => StatusCode::Unexpected,
+            | MoveRegion { .. }
+            | Unexpected { .. }
+            | External { .. } => StatusCode::Unexpected,
 
             SendMessage { .. }
             | GetKvCache { .. }
             | CacheNotGet { .. }
-            | ConcurrentModifyRegionsPlacement { .. } => StatusCode::Internal,
+            | TableAlreadyExists { .. }
+            | CatalogAlreadyExists { .. }
+            | SchemaAlreadyExists { .. }
+            | TableNotExist { .. }
+            | RenameTable { .. } => StatusCode::Internal,
 
-            EncodeJson { .. } | DecodeJson { .. } | PayloadNotExist { .. } => {
-                StatusCode::Unexpected
-            }
+            EncodeJson { .. }
+            | DecodeJson { .. }
+            | PayloadNotExist { .. }
+            | ConvertRawKey { .. } => StatusCode::Unexpected,
 
             MetaSrv { source, .. } => source.status_code(),
+
+            InvalidCatalogValue { source, .. } => source.status_code(),
         }
     }
 

@@ -15,9 +15,11 @@
 mod admin;
 pub mod authorize;
 pub mod handler;
+pub mod header;
 pub mod influxdb;
 pub mod mem_prof;
 pub mod opentsdb;
+pub mod otlp;
 mod pprof;
 pub mod prom_store;
 pub mod script;
@@ -40,6 +42,8 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json};
 use axum::{routing, BoxError, Extension, Router};
 use common_base::readable_size::ReadableSize;
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_catalog::parse_catalog_and_schema_from_db_string;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_query::Output;
@@ -66,15 +70,15 @@ use crate::configurator::ConfiguratorRef;
 use crate::error::{AlreadyStartedSnafu, Result, StartHttpSnafu};
 use crate::http::admin::{compact, flush};
 use crate::metrics::{
-    METRIC_HTTP_REQUESTS_ELAPSED, METRIC_HTTP_REQUESTS_TOTAL, METRIC_METHOD_LABEL,
-    METRIC_PATH_LABEL, METRIC_STATUS_LABEL,
+    METRIC_CODE_LABEL, METRIC_HTTP_REQUESTS_ELAPSED, METRIC_HTTP_REQUESTS_TOTAL,
+    METRIC_METHOD_LABEL, METRIC_PATH_LABEL,
 };
 use crate::metrics_handler::MetricsHandler;
 use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
-    InfluxdbLineProtocolHandlerRef, OpentsdbProtocolHandlerRef, PromStoreProtocolHandlerRef,
-    ScriptHandlerRef,
+    InfluxdbLineProtocolHandlerRef, OpenTelemetryProtocolHandlerRef, OpentsdbProtocolHandlerRef,
+    PromStoreProtocolHandlerRef, ScriptHandlerRef,
 };
 use crate::server::Server;
 
@@ -84,23 +88,28 @@ pub(crate) async fn query_context_from_db(
     query_handler: ServerSqlQueryHandlerRef,
     db: Option<String>,
 ) -> std::result::Result<Arc<QueryContext>, JsonResponse> {
-    if let Some(db) = &db {
-        let (catalog, schema) = super::parse_catalog_and_schema_from_client_database_name(db);
+    let (catalog, schema) = if let Some(db) = &db {
+        let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
 
         match query_handler.is_valid_schema(catalog, schema).await {
-            Ok(true) => Ok(Arc::new(QueryContext::with(catalog, schema))),
-            Ok(false) => Err(JsonResponse::with_error(
-                format!("Database not found: {db}"),
-                StatusCode::DatabaseNotFound,
-            )),
-            Err(e) => Err(JsonResponse::with_error(
-                format!("Error checking database: {db}, {e}"),
-                StatusCode::Internal,
-            )),
+            Ok(true) => (catalog, schema),
+            Ok(false) => {
+                return Err(JsonResponse::with_error(
+                    format!("Database not found: {db}"),
+                    StatusCode::DatabaseNotFound,
+                ))
+            }
+            Err(e) => {
+                return Err(JsonResponse::with_error(
+                    format!("Error checking database: {db}, {e}"),
+                    StatusCode::Internal,
+                ))
+            }
         }
     } else {
-        Ok(QueryContext::arc())
-    }
+        (DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME)
+    };
+    Ok(QueryContext::with(catalog, schema))
 }
 
 pub const HTTP_API_VERSION: &str = "v1";
@@ -119,6 +128,7 @@ pub struct HttpServer {
     influxdb_handler: Option<InfluxdbLineProtocolHandlerRef>,
     opentsdb_handler: Option<OpentsdbProtocolHandlerRef>,
     prom_handler: Option<PromStoreProtocolHandlerRef>,
+    otlp_handler: Option<OpenTelemetryProtocolHandlerRef>,
     script_handler: Option<ScriptHandlerRef>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     user_provider: Option<UserProviderRef>,
@@ -399,6 +409,7 @@ impl HttpServerBuilder {
                 opentsdb_handler: None,
                 influxdb_handler: None,
                 prom_handler: None,
+                otlp_handler: None,
                 user_provider: None,
                 script_handler: None,
                 metrics_handler: None,
@@ -436,6 +447,11 @@ impl HttpServerBuilder {
 
     pub fn with_prom_handler(&mut self, handler: PromStoreProtocolHandlerRef) -> &mut Self {
         let _ = self.inner.prom_handler.get_or_insert(handler);
+        self
+    }
+
+    pub fn with_otlp_handler(&mut self, handler: OpenTelemetryProtocolHandlerRef) -> &mut Self {
+        let _ = self.inner.otlp_handler.get_or_insert(handler);
         self
     }
 
@@ -518,6 +534,13 @@ impl HttpServer {
             router = router.nest(
                 &format!("/{HTTP_API_VERSION}/prometheus"),
                 self.route_prom(prom_handler),
+            );
+        }
+
+        if let Some(otlp_handler) = self.otlp_handler.clone() {
+            router = router.nest(
+                &format!("/{HTTP_API_VERSION}/otlp"),
+                self.route_otlp(otlp_handler),
             );
         }
 
@@ -647,6 +670,12 @@ impl HttpServer {
             .with_state(opentsdb_handler)
     }
 
+    fn route_otlp<S>(&self, otlp_handler: OpenTelemetryProtocolHandlerRef) -> Router<S> {
+        Router::new()
+            .route("/v1/metrics", routing::post(otlp::metrics))
+            .with_state(otlp_handler)
+    }
+
     fn route_admin<S>(&self, grpc_handler: ServerGrpcQueryHandlerRef) -> Router<S> {
         Router::new()
             .route("/flush", routing::post(flush))
@@ -681,7 +710,7 @@ pub(crate) async fn track_metrics<B>(req: Request<B>, next: Next<B>) -> impl Int
     let labels = [
         (METRIC_METHOD_LABEL, method.to_string()),
         (METRIC_PATH_LABEL, path),
-        (METRIC_STATUS_LABEL, status),
+        (METRIC_CODE_LABEL, status),
     ];
 
     metrics::increment_counter!(METRIC_HTTP_REQUESTS_TOTAL, &labels);

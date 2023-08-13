@@ -26,11 +26,17 @@
 //!       schemas).
 //!     - This key is mainly used in constructing the table in Datanode and Frontend.
 //!
-//! 3. Table name key: `__table_name/{catalog_name}/{schema_name}/{table_name}`
+//! 3. Catalog name key: `__catalog_name/{catalog_name}`
+//!     - Indices all catalog names
+//!
+//! 4. Schema name key: `__schema_name/{catalog_name}/{schema_name}`
+//!     - Indices all schema names belong to the {catalog_name}
+//!
+//! 5. Table name key: `__table_name/{catalog_name}/{schema_name}/{table_name}`
 //!     - The value is a [TableNameValue] struct; it contains the table id.
 //!     - Used in the table name to table id lookup.
 //!
-//! 4. Table region key: `__table_region/{table_id}`
+//! 6. Table region key: `__table_region/{table_id}`
 //!     - The value is a [TableRegionValue] struct; it contains the region distribution of the
 //!       table in the Datanodes.
 //!
@@ -41,7 +47,9 @@
 //! table metadata manager: [TableMetadataManager]. It contains all the managers defined above.
 //! It's recommended to just use this manager only.
 
+pub mod catalog_name;
 pub mod datanode_table;
+pub mod schema_name;
 pub mod table_info;
 pub mod table_name;
 pub mod table_region;
@@ -49,26 +57,30 @@ mod table_route;
 
 use std::sync::Arc;
 
-use datanode_table::{DatanodeTableManager, DatanodeTableValue};
+use datanode_table::{DatanodeTableKey, DatanodeTableManager, DatanodeTableValue};
 use lazy_static::lazy_static;
 use regex::Regex;
 use snafu::ResultExt;
-use table_info::{TableInfoManager, TableInfoValue};
-use table_name::{TableNameManager, TableNameValue};
-use table_region::{TableRegionManager, TableRegionValue};
+use table_info::{TableInfoKey, TableInfoManager, TableInfoValue};
+use table_name::{TableNameKey, TableNameManager, TableNameValue};
+use table_region::{TableRegionKey, TableRegionManager, TableRegionValue};
 
+use self::catalog_name::CatalogNameValue;
+use self::schema_name::SchemaNameValue;
 use crate::error::{InvalidTableMetadataSnafu, Result, SerdeJsonSnafu};
 pub use crate::key::table_route::{TableRouteKey, TABLE_ROUTE_PREFIX};
 use crate::kv_backend::KvBackendRef;
 
 pub const REMOVED_PREFIX: &str = "__removed";
 
-const TABLE_NAME_PATTERN: &str = "[a-zA-Z_:][a-zA-Z0-9_:]*";
+const NAME_PATTERN: &str = "[a-zA-Z_:-][a-zA-Z0-9_:-]*";
 
 const DATANODE_TABLE_KEY_PREFIX: &str = "__dn_table";
 const TABLE_INFO_KEY_PREFIX: &str = "__table_info";
 const TABLE_NAME_KEY_PREFIX: &str = "__table_name";
 const TABLE_REGION_KEY_PREFIX: &str = "__table_region";
+const CATALOG_NAME_KEY_PREFIX: &str = "__catalog_name";
+const SCHEMA_NAME_KEY_PREFIX: &str = "__schema_name";
 
 lazy_static! {
     static ref DATANODE_TABLE_KEY_PATTERN: Regex =
@@ -77,7 +89,23 @@ lazy_static! {
 
 lazy_static! {
     static ref TABLE_NAME_KEY_PATTERN: Regex = Regex::new(&format!(
-        "^{TABLE_NAME_KEY_PREFIX}/({TABLE_NAME_PATTERN})/({TABLE_NAME_PATTERN})/({TABLE_NAME_PATTERN})$"
+        "^{TABLE_NAME_KEY_PREFIX}/({NAME_PATTERN})/({NAME_PATTERN})/({NAME_PATTERN})$"
+    ))
+    .unwrap();
+}
+
+lazy_static! {
+    /// CATALOG_NAME_KEY: {CATALOG_NAME_KEY_PREFIX}/{catalog_name}
+    static ref CATALOG_NAME_KEY_PATTERN: Regex = Regex::new(&format!(
+        "^{CATALOG_NAME_KEY_PREFIX}/({NAME_PATTERN})$"
+    ))
+    .unwrap();
+}
+
+lazy_static! {
+    /// SCHEMA_NAME_KEY: {SCHEMA_NAME_KEY_PREFIX}/{catalog_name}/{schema_name}
+    static ref SCHEMA_NAME_KEY_PATTERN:Regex=Regex::new(&format!(
+        "^{SCHEMA_NAME_KEY_PREFIX}/({NAME_PATTERN})/({NAME_PATTERN})$"
     ))
     .unwrap();
 }
@@ -126,8 +154,27 @@ impl TableMetadataManager {
     }
 }
 
+macro_rules! impl_table_meta_key {
+    ($($val_ty: ty), *) => {
+        $(
+            impl std::fmt::Display for $val_ty {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "{}", String::from_utf8_lossy(&self.as_raw_key()))
+                }
+            }
+        )*
+    }
+}
+
+impl_table_meta_key!(
+    TableNameKey<'_>,
+    TableInfoKey,
+    TableRegionKey,
+    DatanodeTableKey
+);
+
 macro_rules! impl_table_meta_value {
-    ( $($val_ty: ty), *) => {
+    ($($val_ty: ty), *) => {
         $(
             impl $val_ty {
                 pub fn try_from_raw_value(raw_value: Vec<u8>) -> Result<Self> {
@@ -148,6 +195,8 @@ macro_rules! impl_table_meta_value {
 }
 
 impl_table_meta_value! {
+    CatalogNameValue,
+    SchemaNameValue,
     TableNameValue,
     TableInfoValue,
     TableRegionValue,

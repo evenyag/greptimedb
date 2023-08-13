@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::offset::Local;
+use arrow::datatypes::TimeUnit as ArrowTimeUnit;
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone as ChronoTimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
@@ -27,7 +27,7 @@ use snafu::{OptionExt, ResultExt};
 use crate::error;
 use crate::error::{ArithmeticOverflowSnafu, Error, ParseTimestampSnafu, TimestampOverflowSnafu};
 use crate::timezone::TimeZone;
-use crate::util::div_ceil;
+use crate::util::{div_ceil, format_utc_datetime, local_datetime_to_utc};
 
 #[derive(Debug, Clone, Default, Copy, Serialize, Deserialize)]
 pub struct Timestamp {
@@ -194,10 +194,7 @@ impl Timestamp {
                 Some(TimeZone::Named(tz)) => {
                     format!("{}", tz.from_utc_datetime(&v).format(pattern))
                 }
-                None => {
-                    let local = Local {};
-                    format!("{}", local.from_utc_datetime(&v).format(pattern))
-                }
+                None => format_utc_datetime(&v, pattern),
             }
         } else {
             format!("[Timestamp{}: {}]", self.unit, self.value)
@@ -226,6 +223,7 @@ impl FromStr for Timestamp {
     /// - `2022-09-20 14:16:43.012345` (local timezone, without T)
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // RFC3339 timestamp (with a T)
+        let s = s.trim();
         if let Ok(ts) = DateTime::parse_from_rfc3339(s) {
             return Ok(Timestamp::new(ts.timestamp_nanos(), TimeUnit::Nanosecond));
         }
@@ -263,18 +261,11 @@ fn naive_datetime_to_timestamp(
     s: &str,
     datetime: NaiveDateTime,
 ) -> crate::error::Result<Timestamp> {
-    let l = Local {};
-
-    match l.from_local_datetime(&datetime) {
+    match local_datetime_to_utc(&datetime) {
         LocalResult::None => ParseTimestampSnafu { raw: s }.fail(),
-        LocalResult::Single(local_datetime) => Ok(Timestamp::new(
-            local_datetime.with_timezone(&Utc).timestamp_nanos(),
-            TimeUnit::Nanosecond,
-        )),
-        LocalResult::Ambiguous(local_datetime, _) => Ok(Timestamp::new(
-            local_datetime.with_timezone(&Utc).timestamp_nanos(),
-            TimeUnit::Nanosecond,
-        )),
+        LocalResult::Single(utc) | LocalResult::Ambiguous(utc, _) => {
+            Ok(Timestamp::new(utc.timestamp_nanos(), TimeUnit::Nanosecond))
+        }
     }
 }
 
@@ -306,6 +297,23 @@ pub enum TimeUnit {
     Millisecond,
     Microsecond,
     Nanosecond,
+}
+
+impl From<&ArrowTimeUnit> for TimeUnit {
+    fn from(unit: &ArrowTimeUnit) -> Self {
+        match unit {
+            ArrowTimeUnit::Second => Self::Second,
+            ArrowTimeUnit::Millisecond => Self::Millisecond,
+            ArrowTimeUnit::Microsecond => Self::Microsecond,
+            ArrowTimeUnit::Nanosecond => Self::Nanosecond,
+        }
+    }
+}
+
+impl From<ArrowTimeUnit> for TimeUnit {
+    fn from(unit: ArrowTimeUnit) -> Self {
+        (&unit).into()
+    }
 }
 
 impl Display for TimeUnit {
@@ -343,6 +351,15 @@ impl TimeUnit {
             TimeUnit::Millisecond => "ms",
             TimeUnit::Microsecond => "us",
             TimeUnit::Nanosecond => "ns",
+        }
+    }
+
+    pub fn as_arrow_time_unit(&self) -> ArrowTimeUnit {
+        match self {
+            Self::Second => ArrowTimeUnit::Second,
+            Self::Millisecond => ArrowTimeUnit::Millisecond,
+            Self::Microsecond => ArrowTimeUnit::Microsecond,
+            Self::Nanosecond => ArrowTimeUnit::Nanosecond,
         }
     }
 }
@@ -393,7 +410,7 @@ impl Hash for Timestamp {
 mod tests {
     use std::collections::hash_map::DefaultHasher;
 
-    use chrono::Offset;
+    use chrono::{Local, Offset};
     use rand::Rng;
     use serde_json::Value;
 
@@ -926,6 +943,11 @@ mod tests {
             Timestamp::new(0, TimeUnit::Second),
             Timestamp::from_str("1970-01-01 08:00:00").unwrap()
         );
+
+        assert_eq!(
+            Timestamp::new(0, TimeUnit::Second),
+            Timestamp::from_str("      1970-01-01        08:00:00    ").unwrap()
+        );
     }
 
     #[test]
@@ -1008,6 +1030,23 @@ mod tests {
             "1970-01-01 03:00:00.001",
             Timestamp::new(1, TimeUnit::Millisecond)
                 .to_timezone_aware_string(TimeZone::from_tz_string("Europe/Moscow").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_from_arrow_time_unit() {
+        assert_eq!(TimeUnit::Second, TimeUnit::from(ArrowTimeUnit::Second));
+        assert_eq!(
+            TimeUnit::Millisecond,
+            TimeUnit::from(ArrowTimeUnit::Millisecond)
+        );
+        assert_eq!(
+            TimeUnit::Microsecond,
+            TimeUnit::from(ArrowTimeUnit::Microsecond)
+        );
+        assert_eq!(
+            TimeUnit::Nanosecond,
+            TimeUnit::from(ArrowTimeUnit::Nanosecond)
         );
     }
 }

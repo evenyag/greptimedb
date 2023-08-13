@@ -30,7 +30,7 @@ impl DistTable {
         let regions = requests.iter().map(|x| x.region_number).collect::<Vec<_>>();
         let instances = self.find_datanode_instances(&regions).await?;
 
-        let results = future::try_join_all(instances.into_iter().zip(requests.into_iter()).map(
+        let results = future::try_join_all(instances.into_iter().zip(requests).map(
             |(instance, request)| {
                 common_runtime::spawn_write(async move {
                     instance
@@ -68,8 +68,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use api::v1::column::{SemanticType, Values};
-    use api::v1::{Column, ColumnDataType};
+    use api::v1::column::Values;
+    use api::v1::{Column, ColumnDataType, SemanticType};
     use datatypes::prelude::{ConcreteDataType, VectorRef};
     use datatypes::schema::{ColumnSchema, Schema};
     use datatypes::vectors::Int32Vector;

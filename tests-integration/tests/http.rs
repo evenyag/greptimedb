@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use axum::http::StatusCode;
 use axum_test_helper::TestClient;
 use common_error::status_code::StatusCode as ErrorCode;
 use serde_json::json;
+use servers::auth::user_provider::StaticUserProvider;
 use servers::http::handler::HealthResponse;
 use servers::http::{JsonOutput, JsonResponse};
 use servers::prometheus::{PrometheusJsonResponse, PrometheusResponse};
 use tests_integration::test_util::{
-    setup_test_http_app, setup_test_http_app_with_frontend, setup_test_prom_app_with_frontend,
+    setup_test_http_app, setup_test_http_app_with_frontend,
+    setup_test_http_app_with_frontend_and_user_provider, setup_test_prom_app_with_frontend,
     StorageType,
 };
 
@@ -53,17 +58,60 @@ macro_rules! http_tests {
             http_test!(
                 $service,
 
+                test_http_auth,
                 test_sql_api,
                 test_prometheus_promql_api,
                 test_prom_http_api,
                 test_metrics_api,
                 test_scripts_api,
                 test_health_api,
+                test_status_api,
                 test_config_api,
                 test_dashboard_path,
             );
         )*
     };
+}
+
+pub async fn test_http_auth(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+
+    let user_provider = StaticUserProvider::try_from("cmd:greptime_user=greptime_pwd").unwrap();
+
+    let (app, mut guard) = setup_test_http_app_with_frontend_and_user_provider(
+        store_type,
+        "sql_api",
+        Some(Arc::new(user_provider)),
+    )
+    .await;
+    let client = TestClient::new(app);
+
+    // 1. no auth
+    let res = client
+        .get("/v1/sql?db=public&sql=show tables;")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. wrong auth
+    let res = client
+        .get("/v1/sql?db=public&sql=show tables;")
+        .header("Authorization", "basic Z3JlcHRpbWVfdXNlcjp3cm9uZ19wd2Q=")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. right auth
+    let res = client
+        .get("/v1/sql?db=public&sql=show tables;")
+        .header(
+            "Authorization",
+            "basic Z3JlcHRpbWVfdXNlcjpncmVwdGltZV9wd2Q=",
+        )
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    guard.remove_all().await;
 }
 
 pub async fn test_sql_api(store_type: StorageType) {
@@ -339,6 +387,10 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .unwrap()
     );
 
+    // labels without match[] param
+    let res = client.get("/api/v1/labels").send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+
     // labels query with multiple match[] params
     let res = client
         .get("/api/v1/labels?match[]=up&match[]=down")
@@ -360,13 +412,22 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     assert_eq!(res.status(), StatusCode::OK);
     let body = serde_json::from_str::<PrometheusJsonResponse>(&res.text().await).unwrap();
     assert_eq!(body.status, "success");
-    assert_eq!(
-        body.data,
-        serde_json::from_value::<PrometheusResponse>(json!(
-            [{"__name__" : "demo","ts":"1970-01-01 00:00:00+0000","cpu":"1.1","host":"host1","memory":"2.2"}]
-        ))
-        .unwrap()
-    );
+
+    let PrometheusResponse::Series(mut series) = body.data else {
+        unreachable!()
+    };
+    let actual = series
+        .remove(0)
+        .into_iter()
+        .collect::<BTreeMap<String, String>>();
+    let expected = BTreeMap::from([
+        ("__name__".to_string(), "demo".to_string()),
+        ("ts".to_string(), "1970-01-01 00:00:00+0000".to_string()),
+        ("cpu".to_string(), "1.1".to_string()),
+        ("host".to_string(), "host1".to_string()),
+        ("memory".to_string(), "2.2".to_string()),
+    ]);
+    assert_eq!(actual, expected);
 
     let res = client
         .post("/api/v1/series?match[]=up&match[]=down")
@@ -402,6 +463,14 @@ pub async fn test_prom_http_api(store_type: StorageType) {
         .get("/api/v1/label/instance/values?match[]=up&match[]=system_metrics")
         .send()
         .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let prom_resp = res.json::<PrometheusJsonResponse>().await;
+    assert_eq!(prom_resp.status, "success");
+    assert!(prom_resp.error.is_none());
+    assert!(prom_resp.error_type.is_none());
+
+    // query `__name__` without match[]
+    let res = client.get("/api/v1/label/__name__/values").send().await;
     assert_eq!(res.status(), StatusCode::OK);
     let prom_resp = res.json::<PrometheusJsonResponse>().await;
     assert_eq!(prom_resp.status, "success");
@@ -498,6 +567,23 @@ pub async fn test_health_api(store_type: StorageType) {
     assert_eq!(body, HealthResponse {});
 }
 
+pub async fn test_status_api(store_type: StorageType) {
+    common_telemetry::init_default_ut_logging();
+    let (app, _guard) = setup_test_http_app_with_frontend(store_type, "status_api").await;
+    let client = TestClient::new(app);
+
+    let res_get = client.get("/status").send().await;
+    assert_eq!(res_get.status(), StatusCode::OK);
+
+    let res_body = res_get.text().await;
+    assert!(res_body.contains("{\"source_time\""));
+    assert!(res_body.contains("\"commit\":"));
+    assert!(res_body.contains("\"branch\":"));
+    assert!(res_body.contains("\"rustc_version\":"));
+    assert!(res_body.contains("\"hostname\":"));
+    assert!(res_body.contains("\"version\":"));
+}
+
 pub async fn test_config_api(store_type: StorageType) {
     common_telemetry::init_default_ut_logging();
     let (app, _guard) = setup_test_http_app_with_frontend(store_type, "config_api").await;
@@ -511,7 +597,11 @@ pub async fn test_config_api(store_type: StorageType) {
     enable_memory_catalog = false
     rpc_addr = "127.0.0.1:3001"
     rpc_runtime_size = 8
-    heartbeat_interval_millis = 5000
+    enable_telemetry = true
+
+    [heartbeat]
+    interval_millis = 5000
+    retry_interval_millis = 5000
 
     [http_opts]
     addr = "127.0.0.1:4000"

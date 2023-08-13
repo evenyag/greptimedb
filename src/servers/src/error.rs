@@ -136,6 +136,12 @@ pub enum Error {
         source: common_grpc::error::Error,
     },
 
+    #[snafu(display("Failed to write OTLP metrics, source: {}", source))]
+    OtlpMetricsWrite {
+        location: Location,
+        source: common_grpc::error::Error,
+    },
+
     #[snafu(display("Failed to convert time precision, name: {}", name))]
     TimePrecision { name: String, location: Location },
 
@@ -159,6 +165,12 @@ pub enum Error {
 
     #[snafu(display("Failed to decode prometheus remote request, source: {}", source))]
     DecodePromRemoteRequest {
+        location: Location,
+        source: prost::DecodeError,
+    },
+
+    #[snafu(display("Failed to decode OTLP request, source: {}", source))]
+    DecodeOtlpRequest {
         location: Location,
         source: prost::DecodeError,
     },
@@ -285,11 +297,8 @@ pub enum Error {
     #[snafu(display("Failed to dump pprof data, source: {}", source))]
     DumpPprof { source: common_pprof::Error },
 
-    #[snafu(display("Failed to update jemalloc metrics, source: {source}, location: {location}"))]
-    UpdateJemallocMetrics {
-        source: tikv_jemalloc_ctl::Error,
-        location: Location,
-    },
+    #[snafu(display("{source}"))]
+    Metrics { source: BoxedError },
 
     #[snafu(display("DataFrame operation error, source: {source}, location: {location}"))]
     DataFrame {
@@ -356,6 +365,7 @@ impl ErrorExt for Error {
             | InvalidOpentsdbLine { .. }
             | InvalidOpentsdbJsonRequest { .. }
             | DecodePromRemoteRequest { .. }
+            | DecodeOtlpRequest { .. }
             | DecompressPromRemoteRequest { .. }
             | InvalidPromRemoteRequest { .. }
             | InvalidFlightTicket { .. }
@@ -364,9 +374,9 @@ impl ErrorExt for Error {
             | PreparedStmtTypeMismatch { .. }
             | TimePrecision { .. } => StatusCode::InvalidArguments,
 
-            InfluxdbLinesWrite { source, .. } | PromSeriesWrite { source, .. } => {
-                source.status_code()
-            }
+            InfluxdbLinesWrite { source, .. }
+            | PromSeriesWrite { source, .. }
+            | OtlpMetricsWrite { source, .. } => source.status_code(),
 
             Hyper { .. } => StatusCode::Unknown,
             TlsRequired { .. } => StatusCode::Unknown,
@@ -405,7 +415,7 @@ impl ErrorExt for Error {
             #[cfg(feature = "pprof")]
             DumpPprof { source, .. } => source.status_code(),
 
-            UpdateJemallocMetrics { .. } => StatusCode::Internal,
+            Metrics { source } => source.status_code(),
 
             ConvertScalarValue { source, .. } => source.status_code(),
         }
@@ -478,6 +488,7 @@ impl IntoResponse for Error {
             | Error::InvalidOpentsdbLine { .. }
             | Error::InvalidOpentsdbJsonRequest { .. }
             | Error::DecodePromRemoteRequest { .. }
+            | Error::DecodeOtlpRequest { .. }
             | Error::DecompressPromRemoteRequest { .. }
             | Error::InvalidPromRemoteRequest { .. }
             | Error::InvalidQuery { .. }

@@ -17,7 +17,7 @@ use std::iter::Iterator;
 use std::str::FromStr;
 
 use common_datasource::compression::CompressionType;
-use common_telemetry::logging;
+use common_telemetry::{debug, info};
 use futures::TryStreamExt;
 use lazy_static::lazy_static;
 use object_store::{raw_normalize_path, util, Entry, ErrorKind, ObjectStore};
@@ -106,7 +106,7 @@ pub struct ObjectStoreLogIterator {
 }
 
 impl ObjectStoreLogIterator {
-    async fn next_log(&mut self) -> Result<Option<(ManifestVersion, Vec<u8>)>> {
+    pub async fn next_log(&mut self) -> Result<Option<(ManifestVersion, Vec<u8>)>> {
         match self.iter.next() {
             Some((v, entry)) => {
                 let compress_type = file_compress_type(entry.name());
@@ -182,31 +182,8 @@ impl ManifestObjectStore {
     pub(crate) fn path(&self) -> &str {
         &self.path
     }
-}
 
-#[derive(Serialize, Deserialize, Debug)]
-struct CheckpointMetadata {
-    pub size: usize,
-    /// The latest version this checkpoint contains.
-    pub version: ManifestVersion,
-    pub checksum: Option<String>,
-    pub extend_metadata: Option<HashMap<String, String>>,
-}
-
-impl CheckpointMetadata {
-    fn encode(&self) -> Result<impl AsRef<[u8]>> {
-        serde_json::to_string(self).context(SerdeJsonSnafu)
-    }
-
-    fn decode(bs: &[u8]) -> Result<Self> {
-        let data = std::str::from_utf8(bs).context(Utf8Snafu)?;
-
-        serde_json::from_str(data).context(SerdeJsonSnafu)
-    }
-}
-
-impl ManifestObjectStore {
-    async fn scan(
+    pub async fn scan(
         &self,
         start: ManifestVersion,
         end: ManifestVersion,
@@ -290,7 +267,7 @@ impl ManifestObjectStore {
             .collect();
         let ret = paths.len();
 
-        logging::debug!(
+        debug!(
             "Deleting {} logs from manifest storage path {} until {}, checkpoint: {:?}, paths: {:?}",
             ret,
             self.path,
@@ -323,7 +300,7 @@ impl ManifestObjectStore {
             .map(|e| e.path().to_string())
             .collect();
 
-        logging::info!(
+        info!(
             "Deleting {} from manifest storage path {} paths: {:?}",
             paths.len(),
             self.path,
@@ -341,14 +318,14 @@ impl ManifestObjectStore {
             .remove_all(&self.path)
             .await
             .context(OpenDalSnafu)?;
-        logging::info!("Deleted manifest storage path {}", self.path);
+        info!("Deleted manifest storage path {}", self.path);
 
         Ok(())
     }
 
-    async fn save(&self, version: ManifestVersion, bytes: &[u8]) -> Result<()> {
+    pub async fn save(&self, version: ManifestVersion, bytes: &[u8]) -> Result<()> {
         let path = self.delta_file_path(version);
-        logging::debug!("Save log to manifest storage, version: {}", version);
+        debug!("Save log to manifest storage, version: {}", version);
         let data = self
             .compress_type
             .encode(bytes)
@@ -380,10 +357,9 @@ impl ManifestObjectStore {
             }
         }
 
-        logging::debug!(
+        debug!(
             "Deleting logs from manifest storage, start: {}, end: {}",
-            start,
-            end
+            start, end
         );
 
         self.object_store
@@ -416,18 +392,17 @@ impl ManifestObjectStore {
             size: bytes.len(),
             version,
             checksum: None,
-            extend_metadata: None,
+            extend_metadata: HashMap::new(),
         };
 
-        logging::debug!(
+        debug!(
             "Save checkpoint in path: {},  metadata: {:?}",
-            last_checkpoint_path,
-            checkpoint_metadata
+            last_checkpoint_path, checkpoint_metadata
         );
 
-        let bs = checkpoint_metadata.encode()?;
+        let bytes = checkpoint_metadata.encode()?;
         self.object_store
-            .write(&last_checkpoint_path, bs.as_ref().to_vec())
+            .write(&last_checkpoint_path, bytes)
             .await
             .context(OpenDalSnafu)?;
 
@@ -460,10 +435,9 @@ impl ManifestObjectStore {
                                 &checkpoint_file(version),
                                 FALL_BACK_COMPRESS_TYPE,
                             );
-                            logging::debug!(
+                            debug!(
                                 "Failed to load checkpoint from path: {}, fall back to path: {}",
-                                path,
-                                fall_back_path
+                                path, fall_back_path
                             );
                             match self.object_store.read(&fall_back_path).await {
                                 Ok(checkpoint) => {
@@ -513,7 +487,9 @@ impl ManifestObjectStore {
         Ok(())
     }
 
-    async fn load_last_checkpoint(&self) -> Result<Option<(ManifestVersion, Vec<u8>)>> {
+    /// Load the latest checkpoint.
+    /// Return manifest version and the raw [RegionCheckpoint](crate::manifest::action::RegionCheckpoint) content if any
+    pub async fn load_last_checkpoint(&self) -> Result<Option<(ManifestVersion, Vec<u8>)>> {
         let last_checkpoint_path = self.last_checkpoint_path();
         let last_checkpoint_data = match self.object_store.read(&last_checkpoint_path).await {
             Ok(data) => data,
@@ -527,13 +503,35 @@ impl ManifestObjectStore {
 
         let checkpoint_metadata = CheckpointMetadata::decode(&last_checkpoint_data)?;
 
-        logging::debug!(
+        debug!(
             "Load checkpoint in path: {}, metadata: {:?}",
-            last_checkpoint_path,
-            checkpoint_metadata
+            last_checkpoint_path, checkpoint_metadata
         );
 
         self.load_checkpoint(checkpoint_metadata.version).await
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CheckpointMetadata {
+    pub size: usize,
+    /// The latest version this checkpoint contains.
+    pub version: ManifestVersion,
+    pub checksum: Option<String>,
+    pub extend_metadata: HashMap<String, String>,
+}
+
+impl CheckpointMetadata {
+    fn encode(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_string(self)
+            .context(SerdeJsonSnafu)?
+            .into_bytes())
+    }
+
+    fn decode(bs: &[u8]) -> Result<Self> {
+        let data = std::str::from_utf8(bs).context(Utf8Snafu)?;
+
+        serde_json::from_str(data).context(SerdeJsonSnafu)
     }
 }
 

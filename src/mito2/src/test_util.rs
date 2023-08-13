@@ -16,26 +16,48 @@
 
 use std::sync::Arc;
 
+use common_datasource::compression::CompressionType;
 use common_test_util::temp_dir::{create_temp_dir, TempDir};
+use datatypes::prelude::ConcreteDataType;
+use datatypes::schema::ColumnSchema;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::test_util::log_store_util;
 use object_store::services::Fs;
-use object_store::util::join_dir;
 use object_store::ObjectStore;
+use store_api::storage::RegionId;
 
 use crate::config::MitoConfig;
 use crate::engine::MitoEngine;
+use crate::error::Result;
+use crate::manifest::manager::RegionManifestManager;
+use crate::manifest::options::RegionManifestOptions;
+use crate::metadata::{ColumnMetadata, RegionMetadataRef, SemanticType};
+use crate::request::{CreateRequest, RegionOptions};
 use crate::worker::WorkerGroup;
 
 /// Env to test mito engine.
 pub struct TestEnv {
     /// Path to store data.
     data_home: TempDir,
+    // TODO(yingwen): Maybe provide a way to close the log store.
+}
+
+impl Default for TestEnv {
+    fn default() -> Self {
+        TestEnv::new()
+    }
 }
 
 impl TestEnv {
+    /// Returns a new env with empty prefix for test.
+    pub fn new() -> TestEnv {
+        TestEnv {
+            data_home: create_temp_dir(""),
+        }
+    }
+
     /// Returns a new env with specific `prefix` for test.
-    pub fn new(prefix: &str) -> TestEnv {
+    pub fn with_prefix(prefix: &str) -> TestEnv {
         TestEnv {
             data_home: create_temp_dir(prefix),
         }
@@ -49,16 +71,16 @@ impl TestEnv {
     }
 
     /// Creates a new [WorkerGroup] with specific config under this env.
-    pub(crate) async fn create_worker_group(&self, config: &MitoConfig) -> WorkerGroup {
+    pub(crate) async fn create_worker_group(&self, config: MitoConfig) -> WorkerGroup {
         let (log_store, object_store) = self.create_log_and_object_store().await;
 
         WorkerGroup::start(config, Arc::new(log_store), object_store)
     }
 
     async fn create_log_and_object_store(&self) -> (RaftEngineLogStore, ObjectStore) {
-        let data_home = self.data_home.path().to_str().unwrap();
-        let wal_path = join_dir(data_home, "wal");
-        let data_path = join_dir(data_home, "data");
+        let data_home = self.data_home.path();
+        let wal_path = data_home.join("wal");
+        let data_path = data_home.join("data").as_path().display().to_string();
 
         let log_store = log_store_util::create_tmp_local_file_log_store(&wal_path).await;
         let mut builder = Fs::default();
@@ -66,5 +88,142 @@ impl TestEnv {
         let object_store = ObjectStore::new(builder).unwrap().finish();
 
         (log_store, object_store)
+    }
+
+    /// If `initial_metadata` is `Some`, creates a new manifest. If `initial_metadata`
+    /// is `None`, opens an existing manifest and returns `None` if no such manifest.
+    pub async fn create_manifest_manager(
+        &self,
+        compress_type: CompressionType,
+        checkpoint_interval: u64,
+        initial_metadata: Option<RegionMetadataRef>,
+    ) -> Result<Option<RegionManifestManager>> {
+        let data_home = self.data_home.path();
+        let manifest_dir = data_home.join("manifest").as_path().display().to_string();
+
+        let mut builder = Fs::default();
+        builder.root(&manifest_dir);
+        let object_store = ObjectStore::new(builder).unwrap().finish();
+
+        // The "manifest_dir" here should be the relative path from the `object_store`'s root.
+        // Otherwise the OpenDal's list operation would fail with "StripPrefixError". This is
+        // because the `object_store`'s root path is "canonicalize"d; and under the Windows,
+        // canonicalize a path will prepend "\\?\" to it. This behavior will cause the original
+        // happen-to-be-working list on an absolute path failed on Windows.
+        let manifest_dir = "/".to_string();
+
+        let manifest_opts = RegionManifestOptions {
+            manifest_dir,
+            object_store,
+            compress_type,
+            checkpoint_interval,
+        };
+
+        if let Some(metadata) = initial_metadata {
+            RegionManifestManager::new(metadata, manifest_opts)
+                .await
+                .map(Some)
+        } else {
+            RegionManifestManager::open(manifest_opts).await
+        }
+    }
+}
+
+/// Builder to mock a [CreateRequest].
+pub struct CreateRequestBuilder {
+    region_id: RegionId,
+    region_dir: String,
+    tag_num: usize,
+    field_num: usize,
+    create_if_not_exists: bool,
+}
+
+impl Default for CreateRequestBuilder {
+    fn default() -> Self {
+        CreateRequestBuilder {
+            region_id: RegionId::default(),
+            region_dir: "test".to_string(),
+            tag_num: 1,
+            field_num: 1,
+            create_if_not_exists: false,
+        }
+    }
+}
+
+impl CreateRequestBuilder {
+    pub fn new(region_id: RegionId) -> CreateRequestBuilder {
+        CreateRequestBuilder {
+            region_id,
+            ..Default::default()
+        }
+    }
+
+    pub fn region_dir(mut self, value: &str) -> Self {
+        self.region_dir = value.to_string();
+        self
+    }
+
+    pub fn tag_num(mut self, value: usize) -> Self {
+        self.tag_num = value;
+        self
+    }
+
+    pub fn field_num(mut self, value: usize) -> Self {
+        self.tag_num = value;
+        self
+    }
+
+    pub fn create_if_not_exists(mut self, value: bool) -> Self {
+        self.create_if_not_exists = value;
+        self
+    }
+
+    pub fn build(&self) -> CreateRequest {
+        let mut column_id = 0;
+        let mut column_metadatas = Vec::with_capacity(self.tag_num + self.field_num + 1);
+        let mut primary_key = Vec::with_capacity(self.tag_num);
+        for i in 0..self.tag_num {
+            column_metadatas.push(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    format!("tag_{i}"),
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id,
+            });
+            primary_key.push(column_id);
+            column_id += 1;
+        }
+        for i in 0..self.field_num {
+            column_metadatas.push(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    format!("field_{i}"),
+                    ConcreteDataType::float64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id,
+            });
+            column_id += 1;
+        }
+        column_metadatas.push(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            semantic_type: SemanticType::Timestamp,
+            column_id,
+        });
+
+        CreateRequest {
+            region_id: self.region_id,
+            region_dir: self.region_dir.clone(),
+            column_metadatas,
+            primary_key,
+            create_if_not_exists: self.create_if_not_exists,
+            options: RegionOptions::default(),
+        }
     }
 }

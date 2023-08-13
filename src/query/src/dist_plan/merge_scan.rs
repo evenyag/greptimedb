@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef as ArrowSchemaRef;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use async_stream::try_stream;
 use client::client_manager::DatanodeClients;
 use client::Database;
@@ -28,18 +28,19 @@ use common_query::Output;
 use common_recordbatch::adapter::DfRecordBatchStreamAdapter;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{
-    DfSendableRecordBatchStream, RecordBatchStreamAdaptor, SendableRecordBatchStream,
+    DfSendableRecordBatchStream, RecordBatch, RecordBatchStreamAdaptor, SendableRecordBatchStream,
 };
-use datafusion::physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion_common::{DataFusionError, Result, Statistics};
 use datafusion_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion_physical_expr::PhysicalSortExpr;
+use datatypes::schema::Schema;
 use futures_util::StreamExt;
 use snafu::ResultExt;
 
 use crate::error::{ConvertSchemaSnafu, RemoteRequestSnafu, UnexpectedOutputKindSnafu};
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct MergeScanLogicalPlan {
     /// In logical plan phase it only contains one input
     input: LogicalPlan,
@@ -52,29 +53,27 @@ impl UserDefinedLogicalNodeCore for MergeScanLogicalPlan {
         Self::name()
     }
 
+    // Prevent further optimization.
+    // The input can be retrieved by `self.input()`
     fn inputs(&self) -> Vec<&LogicalPlan> {
-        vec![&self.input]
+        vec![]
     }
 
     fn schema(&self) -> &datafusion_common::DFSchemaRef {
         self.input.schema()
     }
 
+    // Prevent further optimization
     fn expressions(&self) -> Vec<datafusion_expr::Expr> {
-        self.input.expressions()
+        vec![]
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "MergeScan [is_placeholder={}]", self.is_placeholder)
     }
 
-    // todo: maybe contains exprs will be useful
-    // todo: add check for inputs' length
-    fn from_template(&self, _exprs: &[datafusion_expr::Expr], inputs: &[LogicalPlan]) -> Self {
-        Self {
-            input: inputs[0].clone(),
-            is_placeholder: self.is_placeholder,
-        }
+    fn from_template(&self, _exprs: &[datafusion_expr::Expr], _inputs: &[LogicalPlan]) -> Self {
+        self.clone()
     }
 }
 
@@ -123,6 +122,8 @@ impl MergeScanExec {
         arrow_schema: ArrowSchemaRef,
         clients: Arc<DatanodeClients>,
     ) -> Self {
+        // remove all metadata
+        let arrow_schema = Arc::new(ArrowSchema::new(arrow_schema.fields().to_vec()));
         Self {
             table,
             peers,
@@ -132,18 +133,19 @@ impl MergeScanExec {
         }
     }
 
-    pub fn to_stream(&self) -> Result<SendableRecordBatchStream> {
+    pub fn to_stream(&self, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let substrait_plan = self.substrait_plan.to_vec();
         let peers = self.peers.clone();
         let clients = self.clients.clone();
         let table = self.table.clone();
+        let trace_id = context.task_id().and_then(|id| id.parse().ok());
 
         let stream = try_stream! {
             for peer in peers {
                 let client = clients.get_client(&peer).await;
                 let database = Database::new(&table.catalog_name, &table.schema_name, client);
                 let output: Output = database
-                    .logical_plan(substrait_plan.clone())
+                    .logical_plan(substrait_plan.clone(), trace_id)
                     .await
                     .context(RemoteRequestSnafu)
                     .map_err(BoxedError::new)
@@ -162,12 +164,12 @@ impl MergeScanExec {
                     }
                     Output::RecordBatches(record_batches) => {
                         for batch in record_batches.into_iter() {
-                            yield batch;
+                            yield Self::remove_metadata_from_record_batch(batch);
                         }
                     }
                     Output::Stream(mut stream) => {
                         while let Some(batch) = stream.next().await {
-                            yield batch?;
+                            yield Self::remove_metadata_from_record_batch(batch?);
                         }
                     }
                 }
@@ -184,6 +186,15 @@ impl MergeScanExec {
             stream: Box::pin(stream),
             output_ordering: None,
         }))
+    }
+
+    fn remove_metadata_from_record_batch(batch: RecordBatch) -> RecordBatch {
+        let schema = ArrowSchema::new(batch.schema.arrow_schema().fields().to_vec());
+        RecordBatch::new(
+            Arc::new(Schema::try_from(schema).unwrap()),
+            batch.columns().iter().cloned(),
+        )
+        .unwrap()
     }
 }
 
@@ -220,15 +231,19 @@ impl ExecutionPlan for MergeScanExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<DfSendableRecordBatchStream> {
-        Ok(Box::pin(DfRecordBatchStreamAdapter::new(self.to_stream()?)))
+        Ok(Box::pin(DfRecordBatchStreamAdapter::new(
+            self.to_stream(context)?,
+        )))
     }
 
     fn statistics(&self) -> Statistics {
         Statistics::default()
     }
+}
 
+impl DisplayAs for MergeScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "MergeScanExec: peers=[")?;
         for peer in self.peers.iter() {
