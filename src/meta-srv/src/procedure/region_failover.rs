@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common_meta::ident::TableIdent;
+use common_meta::key::datanode_table::DatanodeTableKey;
 use common_meta::key::TableMetadataManagerRef;
 use common_meta::{ClusterId, RegionIdent};
 use common_procedure::error::{
@@ -48,7 +49,6 @@ use crate::service::mailbox::MailboxRef;
 use crate::service::store::kv::ResettableKvStoreRef;
 
 const OPEN_REGION_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
-const CLOSE_REGION_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A key for the preventing running multiple failover procedures for the same region.
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -69,6 +69,7 @@ impl From<RegionIdent> for RegionFailoverKey {
 }
 
 pub(crate) struct RegionFailoverManager {
+    region_lease_secs: u64,
     in_memory: ResettableKvStoreRef,
     mailbox: MailboxRef,
     procedure_manager: ProcedureManagerRef,
@@ -92,15 +93,16 @@ impl Drop for FailoverProcedureGuard {
 
 impl RegionFailoverManager {
     pub(crate) fn new(
+        region_lease_secs: u64,
         in_memory: ResettableKvStoreRef,
         mailbox: MailboxRef,
         procedure_manager: ProcedureManagerRef,
-        selector: SelectorRef,
-        selector_ctx: SelectorContext,
+        (selector, selector_ctx): (SelectorRef, SelectorContext),
         dist_lock: DistLockRef,
         table_metadata_manager: TableMetadataManagerRef,
     ) -> Self {
         Self {
+            region_lease_secs,
             in_memory,
             mailbox,
             procedure_manager,
@@ -114,6 +116,7 @@ impl RegionFailoverManager {
 
     pub(crate) fn create_context(&self) -> RegionFailoverContext {
         RegionFailoverContext {
+            region_lease_secs: self.region_lease_secs,
             in_memory: self.in_memory.clone(),
             mailbox: self.mailbox.clone(),
             selector: self.selector.clone(),
@@ -168,6 +171,11 @@ impl RegionFailoverManager {
             return Ok(());
         }
 
+        if !self.failed_region_exists(failed_region).await? {
+            // The failed region could be failover by another procedure.
+            return Ok(());
+        }
+
         let context = self.create_context();
         let procedure = RegionFailoverProcedure::new(failed_region.clone(), context);
         let procedure_with_id = ProcedureWithId::with_random_id(Box::new(procedure));
@@ -201,11 +209,32 @@ impl RegionFailoverManager {
         let table_ident = &failed_region.table_ident;
         Ok(self
             .table_metadata_manager
-            .table_region_manager()
-            .get(table_ident.table_id)
+            .table_route_manager()
+            .get_region_distribution(table_ident.table_id)
             .await
             .context(TableMetadataManagerSnafu)?
             .is_some())
+    }
+
+    async fn failed_region_exists(&self, failed_region: &RegionIdent) -> Result<bool> {
+        let table_id = failed_region.table_ident.table_id;
+        let datanode_id = failed_region.datanode_id;
+
+        let value = self
+            .table_metadata_manager
+            .datanode_table_manager()
+            .get(&DatanodeTableKey::new(datanode_id, table_id))
+            .await
+            .context(TableMetadataManagerSnafu)?;
+
+        Ok(value
+            .map(|value| {
+                value
+                    .regions
+                    .iter()
+                    .any(|region| *region == failed_region.region_number)
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -214,12 +243,13 @@ impl RegionFailoverManager {
 #[derive(Serialize, Deserialize, Debug)]
 struct Node {
     failed_region: RegionIdent,
-    state: Option<Box<dyn State>>,
+    state: Box<dyn State>,
 }
 
 /// The "Context" of region failover procedure state machine.
 #[derive(Clone)]
 pub struct RegionFailoverContext {
+    pub region_lease_secs: u64,
     pub in_memory: ResettableKvStoreRef,
     pub mailbox: MailboxRef,
     pub selector: SelectorRef,
@@ -233,7 +263,7 @@ pub struct RegionFailoverContext {
 #[typetag::serde(tag = "region_failover_state")]
 trait State: Sync + Send + Debug {
     async fn next(
-        mut self: Box<Self>,
+        &mut self,
         ctx: &RegionFailoverContext,
         failed_region: &RegionIdent,
     ) -> Result<Box<dyn State>>;
@@ -304,7 +334,7 @@ impl RegionFailoverProcedure {
         let state = RegionFailoverStart::new();
         let node = Node {
             failed_region,
-            state: Some(Box::new(state)),
+            state: Box::new(state),
         };
         Self { node, context }
     }
@@ -322,25 +352,18 @@ impl Procedure for RegionFailoverProcedure {
     }
 
     async fn execute(&mut self, _ctx: &ProcedureContext) -> ProcedureResult<Status> {
-        if let Some(state) = self.node.state.take() {
-            let next_state = state
-                .next(&self.context, &self.node.failed_region)
-                .await
-                .map_err(|e| {
-                    if matches!(e, Error::RetryLater { .. }) {
-                        ProcedureError::retry_later(e)
-                    } else {
-                        ProcedureError::external(e)
-                    }
-                })?;
-            self.node.state = Some(next_state);
-        }
-        Ok(self
-            .node
-            .state
-            .as_ref()
-            .map(|s| s.status())
-            .unwrap_or(Status::Done))
+        let state = &mut self.node.state;
+        *state = state
+            .next(&self.context, &self.node.failed_region)
+            .await
+            .map_err(|e| {
+                if matches!(e, Error::RetryLater { .. }) {
+                    ProcedureError::retry_later(e)
+                } else {
+                    ProcedureError::external(e)
+                }
+            })?;
+        Ok(state.status())
     }
 
     fn dump(&self) -> ProcedureResult<String> {
@@ -362,6 +385,7 @@ impl Procedure for RegionFailoverProcedure {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use api::v1::meta::mailbox_message::Payload;
     use api::v1::meta::{HeartbeatResponse, MailboxMessage, Peer, RequestHeader};
@@ -369,8 +393,10 @@ mod tests {
     use common_meta::ident::TableIdent;
     use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
     use common_meta::key::TableMetadataManager;
+    use common_meta::sequence::Sequence;
     use common_meta::DatanodeId;
-    use common_procedure::BoxedProcedure;
+    use common_procedure::{BoxedProcedure, ProcedureId};
+    use common_procedure_test::MockContextProvider;
     use rand::prelude::SliceRandom;
     use tokio::sync::mpsc::Receiver;
 
@@ -379,7 +405,6 @@ mod tests {
     use crate::handler::{HeartbeatMailbox, Pusher, Pushers};
     use crate::lock::memory::MemLock;
     use crate::selector::{Namespace, Selector};
-    use crate::sequence::Sequence;
     use crate::service::mailbox::Channel;
     use crate::service::store::kv::{KvBackendAdapter, KvStoreRef};
     use crate::service::store::memory::MemStore;
@@ -410,16 +435,15 @@ mod tests {
 
     impl TestingEnv {
         pub async fn failed_region(&self, region_number: u32) -> RegionIdent {
-            let value = self
+            let region_distribution = self
                 .context
                 .table_metadata_manager
-                .table_region_manager()
-                .get(1)
+                .table_route_manager()
+                .get_region_distribution(1)
                 .await
                 .unwrap()
                 .unwrap();
-            let failed_datanode = value
-                .region_distribution
+            let failed_datanode = region_distribution
                 .iter()
                 .find_map(|(&datanode_id, regions)| {
                     if regions.contains(&region_number) {
@@ -453,8 +477,7 @@ mod tests {
             Self { selector: None }
         }
 
-        #[allow(unused)]
-        pub fn with_selector(mut self, selector: SelectorRef) -> Self {
+        fn with_selector(mut self, selector: SelectorRef) -> Self {
             self.selector = Some(selector);
             self
         }
@@ -479,14 +502,12 @@ mod tests {
                 table,
             )
             .await;
-            let table_region_value = table_metadata_manager
-                .table_region_manager()
-                .get(1)
+            let region_distribution = table_metadata_manager
+                .table_route_manager()
+                .get_region_distribution(1)
                 .await
                 .unwrap()
                 .unwrap();
-
-            let _ = table_routes::tests::prepare_table_route_value(&kv_store, table).await;
 
             let pushers = Pushers::default();
             let mut heartbeat_receivers = HashMap::with_capacity(3);
@@ -500,12 +521,16 @@ mod tests {
                 let _ = heartbeat_receivers.insert(datanode_id, rx);
             }
 
-            let mailbox_sequence =
-                Sequence::new("test_heartbeat_mailbox", 0, 100, kv_store.clone());
+            let mailbox_sequence = Sequence::new(
+                "test_heartbeat_mailbox",
+                0,
+                100,
+                KvBackendAdapter::wrap(kv_store.clone()),
+            );
             let mailbox = HeartbeatMailbox::create(pushers.clone(), mailbox_sequence);
 
             let selector = self.selector.unwrap_or_else(|| {
-                let nodes = (1..=table_region_value.region_distribution.len())
+                let nodes = (1..=region_distribution.len())
                     .map(|id| Peer {
                         id: id as u64,
                         addr: "".to_string(),
@@ -525,6 +550,7 @@ mod tests {
 
             TestingEnv {
                 context: RegionFailoverContext {
+                    region_lease_secs: 10,
                     in_memory,
                     mailbox,
                     selector,
@@ -540,8 +566,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_region_failover_procedure() {
-        common_telemetry::init_default_ut_logging();
-
         let mut env = TestingEnvBuilder::new().build().await;
         let failed_region = env.failed_region(1).await;
 
@@ -645,23 +669,19 @@ mod tests {
         );
 
         // Verifies that the failed region (region 1) is moved from failed datanode (datanode 1) to the candidate datanode.
-        let value = env
+        let region_distribution = env
             .context
             .table_metadata_manager
-            .table_region_manager()
-            .get(1)
+            .table_route_manager()
+            .get_region_distribution(1)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            value
-                .region_distribution
-                .get(&failed_region.datanode_id)
-                .unwrap(),
+            region_distribution.get(&failed_region.datanode_id).unwrap(),
             &vec![2]
         );
-        assert!(value
-            .region_distribution
+        assert!(region_distribution
             .get(&candidate_rx.recv().await.unwrap())
             .unwrap()
             .contains(&1));
@@ -675,7 +695,7 @@ mod tests {
         let state = RegionFailoverStart::new();
         let node = Node {
             failed_region,
-            state: Some(Box::new(state)),
+            state: Box::new(state),
         };
         let procedure = RegionFailoverProcedure {
             node,
@@ -690,7 +710,76 @@ mod tests {
         let n: Node = serde_json::from_str(&s).unwrap();
         assert_eq!(
             format!("{n:?}"),
-            r#"Node { failed_region: RegionIdent { cluster_id: 0, datanode_id: 1, table_ident: TableIdent { catalog: "greptime", schema: "public", table: "my_table", table_id: 1, engine: "mito" }, region_number: 1 }, state: Some(RegionFailoverStart { failover_candidate: None }) }"#
+            r#"Node { failed_region: RegionIdent { cluster_id: 0, datanode_id: 1, table_ident: TableIdent { catalog: "greptime", schema: "public", table: "my_table", table_id: 1, engine: "mito" }, region_number: 1 }, state: RegionFailoverStart { failover_candidate: None } }"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_not_changed_upon_failure() {
+        struct MySelector {
+            peers: Arc<Mutex<Vec<Option<Peer>>>>,
+        }
+
+        #[async_trait]
+        impl Selector for MySelector {
+            type Context = SelectorContext;
+            type Output = Vec<Peer>;
+
+            async fn select(&self, _ns: Namespace, _ctx: &Self::Context) -> Result<Self::Output> {
+                let mut peers = self.peers.lock().unwrap();
+                Ok(if let Some(Some(peer)) = peers.pop() {
+                    vec![peer]
+                } else {
+                    vec![]
+                })
+            }
+        }
+
+        // Returns a valid peer the second time called "select".
+        let selector = MySelector {
+            peers: Arc::new(Mutex::new(vec![
+                Some(Peer {
+                    id: 42,
+                    addr: "".to_string(),
+                }),
+                None,
+            ])),
+        };
+
+        let env = TestingEnvBuilder::new()
+            .with_selector(Arc::new(selector))
+            .build()
+            .await;
+        let failed_region = env.failed_region(1).await;
+
+        let state = RegionFailoverStart::new();
+        let node = Node {
+            failed_region,
+            state: Box::new(state),
+        };
+        let mut procedure = RegionFailoverProcedure {
+            node,
+            context: env.context,
+        };
+
+        let ctx = ProcedureContext {
+            procedure_id: ProcedureId::random(),
+            provider: Arc::new(MockContextProvider::default()),
+        };
+
+        let result = procedure.execute(&ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_retry_later());
+        assert_eq!(
+            r#"{"region_failover_state":"RegionFailoverStart","failover_candidate":null}"#,
+            serde_json::to_string(&procedure.node.state).unwrap()
+        );
+
+        let result = procedure.execute(&ctx).await;
+        assert!(matches!(result, Ok(Status::Executing { persist: true })));
+        assert_eq!(
+            r#"{"region_failover_state":"DeactivateRegion","candidate":{"id":42,"addr":""}}"#,
+            serde_json::to_string(&procedure.node.state).unwrap()
         );
     }
 }

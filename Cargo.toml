@@ -2,11 +2,13 @@
 members = [
     "benchmarks",
     "src/api",
+    "src/auth",
     "src/catalog",
     "src/client",
     "src/cmd",
     "src/common/base",
     "src/common/catalog",
+    "src/common/config",
     "src/common/datasource",
     "src/common/error",
     "src/common/function",
@@ -47,13 +49,14 @@ members = [
     "src/store-api",
     "src/table",
     "src/table-procedure",
-    "tests-integration",
+    # TODO: add this back once the region server is available
+    # "tests-integration",
     "tests/runner",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0-nightly"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -66,17 +69,18 @@ arrow-schema = { version = "43.0", features = ["serde"] }
 async-stream = "0.3"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-datafusion = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-common = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-expr = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-optimizer = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-physical-expr = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-sql = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
-datafusion-substrait = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "2ceb7f927c40787773fdc466d6a4b79f3a6c0001" }
+datafusion = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-common = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-expr = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-optimizer = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-physical-expr = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-sql = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
+datafusion-substrait = { git = "https://github.com/waynexia/arrow-datafusion.git", rev = "c0b0fca548e99d020c76e1a1cd7132aab26000e1" }
 derive_builder = "0.12"
 futures = "0.3"
 futures-util = "0.3"
-greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "940694cfd05c1e93c1dd7aab486184c9e2853098" }
+greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "1969b5d610209ad1c2ad8e4cd3e9c3c24e40f1c2" }
+humantime-serde = "1.1"
 itertools = "0.10"
 lazy_static = "1.4"
 once_cell = "1.18"
@@ -86,12 +90,19 @@ paste = "1.0"
 prost = "0.11"
 rand = "0.8"
 regex = "1.8"
+reqwest = { version = "0.11", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "stream",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+smallvec = "1"
 snafu = { version = "0.7", features = ["backtraces"] }
-sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "c3814f08afa19786b13d72b1731a1e8b3cac4ab9", features = [
+sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4", features = [
     "visitor",
 ] }
+strum = { version = "0.25", features = ["derive"] }
 tempfile = "3"
 tokio = { version = "1.28", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io-util", "compat"] }
@@ -102,11 +113,13 @@ metrics = "0.20"
 meter-core = { git = "https://github.com/GreptimeTeam/greptime-meter.git", rev = "abbd357c1e193cd270ea65ee7652334a150b628f" }
 ## workspaces members
 api = { path = "src/api" }
+auth = { path = "src/auth" }
 catalog = { path = "src/catalog" }
 client = { path = "src/client" }
 cmd = { path = "src/cmd" }
 common-base = { path = "src/common/base" }
 common-catalog = { path = "src/common/catalog" }
+common-config = { path = "src/common/config" }
 common-datasource = { path = "src/common/datasource" }
 common-error = { path = "src/common/error" }
 common-function = { path = "src/common/function" }
@@ -140,6 +153,7 @@ object-store = { path = "src/object-store" }
 partition = { path = "src/partition" }
 promql = { path = "src/promql" }
 query = { path = "src/query" }
+raft-engine = { version = "0.4" }
 script = { path = "src/script" }
 servers = { path = "src/servers" }
 session = { path = "src/session" }

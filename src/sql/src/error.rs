@@ -57,7 +57,7 @@ pub enum Error {
     UnsupportedDefaultValue { column_name: String, expr: Expr },
 
     // Syntax error from sql parser.
-    #[snafu(display("Syntax error, sql: {}, source: {}", sql, source))]
+    #[snafu(display("Syntax error, source: {}, sql: {}", source, sql))]
     Syntax { sql: String, source: ParserError },
 
     #[snafu(display("Missing time index constraint"))]
@@ -102,6 +102,9 @@ pub enum Error {
         location: Location,
         source: datatypes::error::Error,
     },
+
+    #[snafu(display("Invalid table option key: {}", key))]
+    InvalidTableOption { key: String, location: Location },
 
     #[snafu(display("Failed to serialize column default constraint, source: {}", source))]
     SerializeColumnDefaultConstraint {
@@ -168,7 +171,8 @@ impl ErrorExt for Error {
             | ColumnTypeMismatch { .. }
             | InvalidTableName { .. }
             | InvalidSqlValue { .. }
-            | TimestampOverflow { .. } => StatusCode::InvalidArguments,
+            | TimestampOverflow { .. }
+            | InvalidTableOption { .. } => StatusCode::InvalidArguments,
 
             SerializeColumnDefaultConstraint { source, .. } => source.status_code(),
             ConvertToGrpcDataType { source, .. } => source.status_code(),

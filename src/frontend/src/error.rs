@@ -20,12 +20,31 @@ use common_error::status_code::StatusCode;
 use datafusion::parquet;
 use datatypes::arrow::error::ArrowError;
 use datatypes::value::Value;
+use servers::define_into_tonic_status;
 use snafu::{Location, Snafu};
 use store_api::storage::RegionNumber;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("Failed to invalidate table cache, source: {}", source))]
+    InvalidateTableCache {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to open raft engine backend, source: {}", source))]
+    OpenRaftEngineBackend {
+        location: Location,
+        source: BoxedError,
+    },
+
+    #[snafu(display("Failed to execute ddl, source: {}", source))]
+    ExecuteDdl {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
     #[snafu(display("Unexpected, violated: {}", violated))]
     Unexpected {
         violated: String,
@@ -48,6 +67,24 @@ pub enum Error {
     RequestDatanode {
         #[snafu(backtrace)]
         source: client::Error,
+    },
+
+    #[snafu(display("Failed to query, source: {}", source))]
+    RequestQuery {
+        #[snafu(backtrace)]
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to insert data, source: {}", source))]
+    RequestInserts {
+        #[snafu(backtrace)]
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to delete data, source: {}", source))]
+    RequestDeletes {
+        #[snafu(backtrace)]
+        source: common_meta::error::Error,
     },
 
     #[snafu(display("Runtime resource error, source: {}", source))]
@@ -133,7 +170,13 @@ pub enum Error {
     #[snafu(display("Invalid InsertRequest, reason: {}", reason))]
     InvalidInsertRequest { reason: String, location: Location },
 
-    #[snafu(display("Table not found: {}", table_name))]
+    #[snafu(display("Invalid DeleteRequest, reason: {}", reason))]
+    InvalidDeleteRequest { reason: String, location: Location },
+
+    #[snafu(display("Invalid system table definition: {err_msg}, at {location}"))]
+    InvalidSystemTableDef { err_msg: String, location: Location },
+
+    #[snafu(display("Table not found: '{}', at {location}", table_name))]
     TableNotFound {
         table_name: String,
         location: Location,
@@ -182,12 +225,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to find table route for table {}, source: {}",
-        table_name,
+        "Failed to find table route for table id {}, source: {}",
+        table_id,
         source
     ))]
     FindTableRoute {
-        table_name: String,
+        table_id: u32,
         #[snafu(backtrace)]
         source: partition::error::Error,
     },
@@ -205,6 +248,12 @@ pub enum Error {
 
     #[snafu(display("Failed to split insert request, source: {}", source))]
     SplitInsert {
+        source: partition::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to split delete request, source: {}", source))]
+    SplitDelete {
         source: partition::error::Error,
         location: Location,
     },
@@ -312,6 +361,12 @@ pub enum Error {
         source: datanode::error::Error,
     },
 
+    #[snafu(display("{source}"))]
+    InvokeRegionServer {
+        #[snafu(backtrace)]
+        source: servers::error::Error,
+    },
+
     #[snafu(display("Missing meta_client_options section in config"))]
     MissingMetasrvOpts { location: Location },
 
@@ -409,6 +464,12 @@ pub enum Error {
         source: table::error::Error,
     },
 
+    #[snafu(display("Missing time index column: {}", source))]
+    MissingTimeIndexColumn {
+        location: Location,
+        source: table::error::Error,
+    },
+
     #[snafu(display("Failed to start script manager, source: {}", source))]
     StartScriptManager {
         #[snafu(backtrace)]
@@ -500,7 +561,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to read record batch, source: {}", source))]
-    ReadRecordBatch {
+    ReadDfRecordBatch {
         source: datafusion::error::DataFusionError,
         location: Location,
     },
@@ -578,6 +639,50 @@ pub enum Error {
         source: common_meta::error::Error,
         location: Location,
     },
+
+    #[snafu(display("Failed to pass permission check, source: {}", source))]
+    Permission {
+        source: auth::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Empty data: {}", msg))]
+    EmptyData { msg: String, location: Location },
+
+    #[snafu(display("Failed to read record batch, source: {}", source))]
+    ReadRecordBatch {
+        source: common_recordbatch::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to build column vectors, source: {}", source))]
+    BuildColumnVectors {
+        source: common_recordbatch::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Missing insert body, source: {source}"))]
+    MissingInsertBody {
+        source: sql::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to build default value, column: {}, source: {}",
+        column,
+        source
+    ))]
+    ColumnDefaultValue {
+        column: String,
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display(
+        "No valid default value can be built automatically, column: {}",
+        column,
+    ))]
+    ColumnNoneDefaultValue { column: String, location: Location },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -588,6 +693,7 @@ impl ErrorExt for Error {
             Error::ParseAddr { .. }
             | Error::InvalidSql { .. }
             | Error::InvalidInsertRequest { .. }
+            | Error::InvalidDeleteRequest { .. }
             | Error::IllegalPrimaryKeysDef { .. }
             | Error::CatalogNotFound { .. }
             | Error::SchemaNotFound { .. }
@@ -599,9 +705,13 @@ impl ErrorExt for Error {
             | Error::PrepareImmutableTable { .. }
             | Error::BuildCsvConfig { .. }
             | Error::ProjectSchema { .. }
-            | Error::UnsupportedFormat { .. } => StatusCode::InvalidArguments,
+            | Error::UnsupportedFormat { .. }
+            | Error::EmptyData { .. }
+            | Error::ColumnNoneDefaultValue { .. } => StatusCode::InvalidArguments,
 
             Error::NotSupported { .. } => StatusCode::Unsupported,
+
+            Error::Permission { source, .. } => source.status_code(),
 
             Error::HandleHeartbeatResponse { source, .. }
             | Error::TableMetadataManager { source, .. } => source.status_code(),
@@ -618,6 +728,8 @@ impl ErrorExt for Error {
                 source.status_code()
             }
 
+            Error::InvalidateTableCache { source, .. } => source.status_code(),
+
             Error::ParseFileFormat { source, .. } | Error::InferSchema { source, .. } => {
                 source.status_code()
             }
@@ -630,28 +742,37 @@ impl ErrorExt for Error {
             | Error::CreateTableInfo { source }
             | Error::IntoVectors { source } => source.status_code(),
 
+            Error::OpenRaftEngineBackend { .. } => StatusCode::StorageUnavailable,
+
             Error::RequestDatanode { source } => source.status_code(),
+            Error::RequestQuery { source } => source.status_code(),
+            Error::RequestInserts { source } => source.status_code(),
+            Error::RequestDeletes { source } => source.status_code(),
 
             Error::ColumnDataType { source } | Error::InvalidColumnDef { source, .. } => {
                 source.status_code()
             }
+
+            Error::MissingTimeIndexColumn { source, .. } => source.status_code(),
 
             Error::FindDatanode { .. }
             | Error::CreateTableRoute { .. }
             | Error::FindRegionRoute { .. }
             | Error::BuildDfLogicalPlan { .. }
             | Error::BuildTableMeta { .. }
-            | Error::VectorToGrpcColumn { .. } => StatusCode::Internal,
+            | Error::VectorToGrpcColumn { .. }
+            | Error::MissingInsertBody { .. } => StatusCode::Internal,
 
             Error::IncompleteGrpcResult { .. }
             | Error::ContextValueNotFound { .. }
+            | Error::InvalidSystemTableDef { .. }
             | Error::EncodeJson { .. } => StatusCode::Unexpected,
 
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
 
             Error::JoinTask { .. }
             | Error::BuildParquetRecordBatchStream { .. }
-            | Error::ReadRecordBatch { .. }
+            | Error::ReadDfRecordBatch { .. }
             | Error::BuildFileStream { .. }
             | Error::WriteStreamToFile { .. }
             | Error::Unexpected { .. } => StatusCode::Unexpected,
@@ -680,12 +801,14 @@ impl ErrorExt for Error {
             Error::TableAlreadyExist { .. } => StatusCode::TableAlreadyExists,
             Error::EncodeSubstraitLogicalPlan { source } => source.status_code(),
             Error::InvokeDatanode { source } => source.status_code(),
+            Error::InvokeRegionServer { source } => source.status_code(),
 
             Error::External { source } => source.status_code(),
             Error::DeserializePartition { source, .. }
             | Error::FindTablePartitionRule { source, .. }
             | Error::FindTableRoute { source, .. }
-            | Error::SplitInsert { source, .. } => source.status_code(),
+            | Error::SplitInsert { source, .. }
+            | Error::SplitDelete { source, .. } => source.status_code(),
 
             Error::UnrecognizedTableOption { .. } => StatusCode::InvalidArguments,
 
@@ -702,7 +825,14 @@ impl ErrorExt for Error {
             | Error::BuildBackend { source } => source.status_code(),
 
             Error::WriteParquet { source, .. } => source.status_code(),
+            Error::ExecuteDdl { source, .. } => source.status_code(),
             Error::InvalidCopyParameter { .. } => StatusCode::InvalidArguments,
+
+            Error::ReadRecordBatch { source, .. } | Error::BuildColumnVectors { source, .. } => {
+                source.status_code()
+            }
+
+            Error::ColumnDefaultValue { source, .. } => source.status_code(),
         }
     }
 
@@ -711,8 +841,4 @@ impl ErrorExt for Error {
     }
 }
 
-impl From<Error> for tonic::Status {
-    fn from(err: Error) -> Self {
-        tonic::Status::new(tonic::Code::Internal, err.to_string())
-    }
-}
+define_into_tonic_status!(Error);

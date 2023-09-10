@@ -8,12 +8,14 @@ license.workspace = true
 dashboard = []
 mem-prof = ["dep:common-mem-prof"]
 pprof = ["dep:pprof"]
+testing = []
 
 [dependencies]
 aide = { version = "0.9", features = ["axum"] }
 api = { workspace = true }
 arrow-flight.workspace = true
 async-trait = "0.1"
+auth.workspace = true
 axum = { version = "0.6", features = ["headers"] }
 axum-macros = "0.3.8"
 base64 = "0.13"
@@ -34,7 +36,6 @@ common-time = { workspace = true }
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion.workspace = true
-
 datatypes = { workspace = true }
 derive_builder.workspace = true
 digest = "0.10"
@@ -43,7 +44,7 @@ headers = "0.3"
 hex = { version = "0.4" }
 hostname = "0.3.1"
 http-body = "0.4"
-humantime-serde = "1.1"
+humantime-serde.workspace = true
 hyper = { version = "0.14", features = ["full"] }
 influxdb_line_protocol = { git = "https://github.com/evenyag/influxdb_iox", branch = "feat/line-protocol" }
 itertools.workspace = true
@@ -79,10 +80,10 @@ serde.workspace = true
 serde_json = "1.0"
 session = { workspace = true }
 sha1 = "0.10"
-snafu = { version = "0.7", features = ["backtraces"] }
+snafu.workspace = true
 snap = "1"
 sql = { workspace = true }
-strum = { version = "0.24", features = ["derive"] }
+strum.workspace = true
 table = { workspace = true }
 tokio-rustls = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -96,6 +97,7 @@ tower-http = { version = "0.3", features = ["full"] }
 tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
 
 [dev-dependencies]
+auth = { workspace = true, features = ["testing"] }
 axum-test-helper = { git = "https://github.com/sunng87/axum-test-helper.git", branch = "patch-1" }
 catalog = { workspace = true, features = ["testing"] }
 client = { workspace = true }

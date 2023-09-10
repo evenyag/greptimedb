@@ -12,11 +12,11 @@ common-error = { workspace = true }
 common-runtime = { workspace = true }
 common-telemetry = { workspace = true }
 futures.workspace = true
-humantime-serde = "1.1"
+humantime-serde.workspace = true
 object-store = { workspace = true }
 serde.workspace = true
 serde_json = "1.0"
-smallvec = "1"
+smallvec.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 uuid.workspace = true

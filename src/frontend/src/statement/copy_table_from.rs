@@ -40,6 +40,7 @@ use datatypes::vectors::Helper;
 use futures_util::StreamExt;
 use object_store::{Entry, EntryMode, Metakey, ObjectStore};
 use regex::Regex;
+use session::context::QueryContextRef;
 use snafu::ResultExt;
 use table::engine::TableReference;
 use table::requests::{CopyTableRequest, InsertRequest};
@@ -214,7 +215,11 @@ impl StatementExecutor {
                     .build()
                     .context(error::BuildParquetRecordBatchStreamSnafu)?;
 
-                Ok(Box::pin(ParquetRecordBatchStreamAdapter::new(upstream)))
+                Ok(Box::pin(ParquetRecordBatchStreamAdapter::new(
+                    schema,
+                    upstream,
+                    Some(projection),
+                )))
             }
             Format::Orc(_) => {
                 let reader = object_store
@@ -231,7 +236,11 @@ impl StatementExecutor {
         }
     }
 
-    pub async fn copy_table_from(&self, req: CopyTableRequest) -> Result<usize> {
+    pub async fn copy_table_from(
+        &self,
+        req: CopyTableRequest,
+        query_ctx: QueryContextRef,
+    ) -> Result<usize> {
         let table_ref = TableReference {
             catalog: &req.catalog_name,
             schema: &req.schema_name,
@@ -306,7 +315,7 @@ impl StatementExecutor {
             let mut pending = vec![];
 
             while let Some(r) = stream.next().await {
-                let record_batch = r.context(error::ReadRecordBatchSnafu)?;
+                let record_batch = r.context(error::ReadDfRecordBatchSnafu)?;
                 let vectors =
                     Helper::try_into_vectors(record_batch.columns()).context(IntoVectorsSnafu)?;
 
@@ -318,24 +327,25 @@ impl StatementExecutor {
                     .zip(vectors)
                     .collect::<HashMap<_, _>>();
 
-                pending.push(table.insert(InsertRequest {
-                    catalog_name: req.catalog_name.to_string(),
-                    schema_name: req.schema_name.to_string(),
-                    table_name: req.table_name.to_string(),
-                    columns_values,
-                    //TODO: support multi-regions
-                    region_number: 0,
-                }));
+                pending.push(self.handle_table_insert_request(
+                    InsertRequest {
+                        catalog_name: req.catalog_name.to_string(),
+                        schema_name: req.schema_name.to_string(),
+                        table_name: req.table_name.to_string(),
+                        columns_values,
+                        // TODO: support multi-regions
+                        region_number: 0,
+                    },
+                    query_ctx.clone(),
+                ));
 
                 if pending_mem_size as u64 >= pending_mem_threshold {
-                    rows_inserted +=
-                        batch_insert(&mut pending, &mut pending_mem_size, &req.table_name).await?;
+                    rows_inserted += batch_insert(&mut pending, &mut pending_mem_size).await?;
                 }
             }
 
             if !pending.is_empty() {
-                rows_inserted +=
-                    batch_insert(&mut pending, &mut pending_mem_size, &req.table_name).await?;
+                rows_inserted += batch_insert(&mut pending, &mut pending_mem_size).await?;
             }
         }
 
@@ -345,16 +355,11 @@ impl StatementExecutor {
 
 /// Executes all pending inserts all at once, drain pending requests and reset pending bytes.
 async fn batch_insert(
-    pending: &mut Vec<impl Future<Output = table::error::Result<usize>>>,
+    pending: &mut Vec<impl Future<Output = Result<usize>>>,
     pending_bytes: &mut usize,
-    table_name: &str,
 ) -> Result<usize> {
     let batch = pending.drain(..);
-    let res: usize = futures::future::try_join_all(batch)
-        .await
-        .context(error::InsertSnafu { table_name })?
-        .iter()
-        .sum();
+    let res: usize = futures::future::try_join_all(batch).await?.iter().sum();
     *pending_bytes = 0;
     Ok(res)
 }

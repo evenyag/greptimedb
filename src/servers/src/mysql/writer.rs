@@ -14,11 +14,12 @@
 
 use std::ops::Deref;
 
+use common_error::ext::BoxedError;
 use common_query::Output;
-use common_recordbatch::{util, RecordBatch};
-use common_telemetry::warn;
+use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
 use datatypes::prelude::{ConcreteDataType, Value};
 use datatypes::schema::SchemaRef;
+use futures::StreamExt;
 use metrics::increment_counter;
 use opensrv_mysql::{
     Column, ColumnFlags, ColumnType, ErrorKind, OkResponse, QueryResultWriter, RowWriter,
@@ -27,13 +28,12 @@ use session::context::QueryContextRef;
 use snafu::prelude::*;
 use tokio::io::AsyncWrite;
 
-use crate::error::{self, Error, Result};
+use crate::error::{self, Error, OtherSnafu, Result};
 use crate::metrics::*;
 
 /// Try to write multiple output to the writer if possible.
-pub async fn write_output<'a, W: AsyncWrite + Send + Sync + Unpin>(
-    w: QueryResultWriter<'a, W>,
-    query: &str,
+pub async fn write_output<W: AsyncWrite + Send + Sync + Unpin>(
+    w: QueryResultWriter<'_, W>,
     query_context: QueryContextRef,
     outputs: Vec<Result<Output>>,
 ) -> Result<()> {
@@ -42,7 +42,7 @@ pub async fn write_output<'a, W: AsyncWrite + Send + Sync + Unpin>(
         let result_writer = writer.take().context(error::InternalSnafu {
             err_msg: "Sending multiple result set is unsupported",
         })?;
-        writer = result_writer.try_write_one(query, output).await?;
+        writer = result_writer.try_write_one(output).await?;
     }
 
     if let Some(result_writer) = writer {
@@ -52,8 +52,8 @@ pub async fn write_output<'a, W: AsyncWrite + Send + Sync + Unpin>(
 }
 
 struct QueryResult {
-    recordbatches: Vec<RecordBatch>,
     schema: SchemaRef,
+    stream: SendableRecordBatchStream,
 }
 
 pub struct MysqlResultWriter<'a, W: AsyncWrite + Unpin> {
@@ -75,7 +75,6 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
     /// Try to write one result set. If there are more than one result set, return `Some`.
     pub async fn try_write_one(
         self,
-        query: &str,
         output: Result<Output>,
     ) -> Result<Option<MysqlResultWriter<'a, W>>> {
         // We don't support sending multiple query result because the RowWriter's lifetime is bound to
@@ -83,24 +82,18 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
         match output {
             Ok(output) => match output {
                 Output::Stream(stream) => {
-                    let schema = stream.schema().clone();
-                    let recordbatches = util::collect(stream)
-                        .await
-                        .context(error::CollectRecordbatchSnafu)?;
                     let query_result = QueryResult {
-                        recordbatches,
-                        schema,
+                        schema: stream.schema(),
+                        stream,
                     };
-                    Self::write_query_result(query, query_result, self.writer, self.query_context)
-                        .await?;
+                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
                 }
                 Output::RecordBatches(recordbatches) => {
                     let query_result = QueryResult {
                         schema: recordbatches.schema(),
-                        recordbatches: recordbatches.take(),
+                        stream: recordbatches.as_stream(),
                     };
-                    Self::write_query_result(query, query_result, self.writer, self.query_context)
-                        .await?;
+                    Self::write_query_result(query_result, self.writer, self.query_context).await?;
                 }
                 Output::AffectedRows(rows) => {
                     let next_writer = Self::write_affected_rows(self.writer, rows).await?;
@@ -110,7 +103,7 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                     )));
                 }
             },
-            Err(error) => Self::write_query_error(query, error, self.writer).await?,
+            Err(error) => Self::write_query_error(error, self.writer).await?,
         }
         Ok(None)
     }
@@ -135,8 +128,7 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
     }
 
     async fn write_query_result(
-        query: &str,
-        query_result: QueryResult,
+        mut query_result: QueryResult,
         writer: QueryResultWriter<'a, W>,
         query_context: QueryContextRef,
     ) -> Result<()> {
@@ -145,14 +137,25 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
                 // The RowWriter's lifetime is bound to `column_def` thus we can't use finish_one()
                 // to return a new QueryResultWriter.
                 let mut row_writer = writer.start(&column_def).await?;
-                for recordbatch in &query_result.recordbatches {
-                    Self::write_recordbatch(&mut row_writer, recordbatch, query_context.clone())
-                        .await?;
+                while let Some(record_batch) = query_result.stream.next().await {
+                    match record_batch {
+                        Ok(record_batch) => {
+                            Self::write_recordbatch(
+                                &mut row_writer,
+                                &record_batch,
+                                query_context.clone(),
+                            )
+                            .await?
+                        }
+                        Err(e) => {
+                            return Err(e).map_err(BoxedError::new).context(OtherSnafu);
+                        }
+                    }
                 }
                 row_writer.finish().await?;
                 Ok(())
             }
-            Err(error) => Self::write_query_error(query, error, writer).await,
+            Err(error) => Self::write_query_error(error, writer).await,
         }
     }
 
@@ -200,12 +203,7 @@ impl<'a, W: AsyncWrite + Unpin> MysqlResultWriter<'a, W> {
         Ok(())
     }
 
-    async fn write_query_error(
-        query: &str,
-        error: Error,
-        w: QueryResultWriter<'a, W>,
-    ) -> Result<()> {
-        warn!(error; "Failed to execute query '{}'", query);
+    async fn write_query_error(error: Error, w: QueryResultWriter<'a, W>) -> Result<()> {
         increment_counter!(
             METRIC_ERROR_COUNTER,
             &[(METRIC_PROTOCOL_LABEL, METRIC_ERROR_COUNTER_LABEL_MYSQL)]

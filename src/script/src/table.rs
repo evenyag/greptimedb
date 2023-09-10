@@ -17,33 +17,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use catalog::error::CompileScriptInternalSnafu;
-use catalog::{CatalogManagerRef, OpenSystemTableHook, RegisterSystemTableRequest};
-use common_catalog::consts::{
-    DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE, SCRIPTS_TABLE_ID,
-};
+use catalog::CatalogManagerRef;
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::format_full_table_name;
 use common_error::ext::BoxedError;
 use common_query::Output;
-use common_recordbatch::{util as record_util, RecordBatch};
+use common_recordbatch::{util as record_util, RecordBatch, SendableRecordBatchStream};
 use common_telemetry::logging;
 use common_time::util;
+use datafusion::datasource::DefaultTableSource;
+use datafusion_common::TableReference;
+use datafusion_expr::LogicalPlanBuilder;
 use datatypes::prelude::{ConcreteDataType, ScalarVector};
 use datatypes::schema::{ColumnSchema, RawSchema};
 use datatypes::vectors::{StringVector, TimestampMillisecondVector, Vector, VectorRef};
 use query::parser::QueryLanguageParser;
+use query::plan::LogicalPlan;
 use query::QueryEngineRef;
 use session::context::QueryContextBuilder;
 use snafu::{ensure, OptionExt, ResultExt};
-use store_api::storage::ScanRequest;
-use table::requests::{CreateTableRequest, InsertRequest, TableOptions};
+use table::requests::InsertRequest;
+use table::table::adapter::DfTableProviderAdapter;
 use table::TableRef;
 
 use crate::error::{
-    CastTypeSnafu, CollectRecordsSnafu, FindColumnInScriptsTableSnafu, FindScriptSnafu,
-    FindScriptsTableSnafu, InsertScriptSnafu, RegisterScriptsTableSnafu, Result,
-    ScriptNotFoundSnafu, ScriptsTableNotFoundSnafu,
+    BuildDfLogicalPlanSnafu, CastTypeSnafu, CollectRecordsSnafu, ExecuteInternalStatementSnafu,
+    FindColumnInScriptsTableSnafu, FindScriptSnafu, FindScriptsTableSnafu, InsertScriptSnafu,
+    Result, ScriptNotFoundSnafu, ScriptsTableNotFoundSnafu,
 };
-use crate::python::utils::block_on_async;
 use crate::python::PyScript;
 
 pub const SCRIPTS_TABLE_NAME: &str = "scripts";
@@ -78,8 +79,7 @@ impl ScriptsTable {
         table: TableRef,
         query_engine: QueryEngineRef,
     ) -> catalog::error::Result<()> {
-        let rbs = table
-            .scan_to_stream(ScanRequest::default())
+        let rbs = Self::table_full_scan(table, &query_engine)
             .await
             .map_err(BoxedError::new)
             .context(CompileScriptInternalSnafu)?;
@@ -128,44 +128,26 @@ impl ScriptsTable {
         }
         Ok(())
     }
+
+    pub fn new_empty(
+        catalog_manager: CatalogManagerRef,
+        query_engine: QueryEngineRef,
+    ) -> Result<Self> {
+        Ok(Self {
+            catalog_manager,
+            query_engine,
+            name: format_full_table_name(
+                DEFAULT_CATALOG_NAME,
+                DEFAULT_SCHEMA_NAME,
+                SCRIPTS_TABLE_NAME,
+            ),
+        })
+    }
+
     pub async fn new(
         catalog_manager: CatalogManagerRef,
         query_engine: QueryEngineRef,
     ) -> Result<Self> {
-        let schema = build_scripts_schema();
-        // TODO(dennis): we put scripts table into default catalog and schema.
-        // maybe put into system catalog?
-        let request = CreateTableRequest {
-            id: SCRIPTS_TABLE_ID,
-            catalog_name: DEFAULT_CATALOG_NAME.to_string(),
-            schema_name: DEFAULT_SCHEMA_NAME.to_string(),
-            table_name: SCRIPTS_TABLE_NAME.to_string(),
-            desc: Some("Scripts table".to_string()),
-            schema,
-            region_numbers: vec![0],
-            //schema and name as primary key
-            primary_key_indices: vec![0, 1],
-            create_if_not_exists: true,
-            table_options: TableOptions::default(),
-            engine: MITO_ENGINE.to_string(),
-        };
-        let callback_query_engine = query_engine.clone();
-        let script_recompile_callback: OpenSystemTableHook = Arc::new(move |table: TableRef| {
-            let callback_query_engine = callback_query_engine.clone();
-            block_on_async(async move {
-                Self::recompile_register_udf(table, callback_query_engine.clone()).await
-            })
-            .unwrap()
-        });
-
-        catalog_manager
-            .register_system_table(RegisterSystemTableRequest {
-                create_table_request: request,
-                open_hook: Some(script_recompile_callback),
-            })
-            .await
-            .context(RegisterScriptsTableSnafu)?;
-
         Ok(Self {
             catalog_manager,
             query_engine,
@@ -291,6 +273,40 @@ impl ScriptsTable {
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    async fn table_full_scan(
+        table: TableRef,
+        query_engine: &QueryEngineRef,
+    ) -> Result<SendableRecordBatchStream> {
+        let table_info = table.table_info();
+        let table_name = TableReference::full(
+            table_info.catalog_name.clone(),
+            table_info.schema_name.clone(),
+            table_info.name.clone(),
+        );
+
+        let table_provider = Arc::new(DfTableProviderAdapter::new(table));
+        let table_source = Arc::new(DefaultTableSource::new(table_provider));
+
+        let plan = LogicalPlanBuilder::scan(table_name, table_source, None)
+            .context(BuildDfLogicalPlanSnafu)?
+            .build()
+            .context(BuildDfLogicalPlanSnafu)?;
+
+        let output = query_engine
+            .execute(
+                LogicalPlan::DfPlan(plan),
+                QueryContextBuilder::default().build(),
+            )
+            .await
+            .context(ExecuteInternalStatementSnafu)?;
+        let stream = match output {
+            Output::Stream(stream) => stream,
+            Output::RecordBatches(record_batches) => record_batches.as_stream(),
+            _ => unreachable!(),
+        };
+        Ok(stream)
     }
 }
 

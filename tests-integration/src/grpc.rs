@@ -22,20 +22,17 @@ mod test {
     use api::v1::query_request::Query;
     use api::v1::{
         alter_expr, AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDef,
-        CreateDatabaseExpr, CreateTableExpr, DdlRequest, DeleteRequest, DropTableExpr,
-        FlushTableExpr, InsertRequest, InsertRequests, QueryRequest, SemanticType,
+        CreateDatabaseExpr, CreateTableExpr, DdlRequest, DeleteRequest, DeleteRequests,
+        DropTableExpr, InsertRequest, InsertRequests, QueryRequest, SemanticType,
     };
     use common_catalog::consts::MITO_ENGINE;
+    use common_meta::rpc::router::region_distribution;
     use common_query::Output;
     use common_recordbatch::RecordBatches;
     use frontend::instance::Instance;
-    use frontend::table::DistTable;
     use query::parser::QueryLanguageParser;
     use servers::query_handler::grpc::GrpcQueryHandler;
     use session::context::QueryContext;
-    use store_api::storage::RegionNumber;
-    use table::Table;
-    use tests::{has_parquet_file, test_region_dir};
 
     use crate::tests;
     use crate::tests::MockDistributedInstance;
@@ -70,6 +67,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "database_created_through_grpc".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = query(instance, request).await;
@@ -216,7 +214,6 @@ CREATE TABLE {table_name} (
 | ts                  | a | b                 |
 +---------------------+---+-------------------+
 | 2023-01-01T07:26:12 | 1 | ts: 1672557972000 |
-| 2023-01-01T07:26:14 | 3 | ts: 1672557974000 |
 | 2023-01-01T07:26:15 | 4 | ts: 1672557975000 |
 | 2023-01-01T07:26:16 | 5 | ts: 1672557976000 |
 | 2023-01-01T07:26:17 |   | ts: 1672557977000 |
@@ -250,7 +247,6 @@ CREATE TABLE {table_name} (
 +---------------------+----+-------------------+
 | 2023-01-01T07:26:24 | 50 | ts: 1672557984000 |
 | 2023-01-01T07:26:25 | 51 | ts: 1672557985000 |
-| 2023-01-01T07:26:27 | 53 | ts: 1672557987000 |
 +---------------------+----+-------------------+",
                 ),
             ]),
@@ -296,132 +292,10 @@ CREATE TABLE {table_name} (
         test_insert_delete_and_query_on_auto_created_table(instance).await
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_distributed_flush_table() {
-        common_telemetry::init_default_ut_logging();
-
-        let instance = tests::create_distributed_instance("test_distributed_flush_table").await;
-        let data_tmp_dirs = instance.data_tmp_dirs();
-        let frontend = instance.frontend();
-        let frontend = frontend.as_ref();
-
-        let table_name = "my_dist_table";
-        let sql = format!(
-            r"
-CREATE TABLE {table_name} (
-    a INT,
-    ts TIMESTAMP,
-    TIME INDEX (ts)
-) PARTITION BY RANGE COLUMNS(a) (
-    PARTITION r0 VALUES LESS THAN (10),
-    PARTITION r1 VALUES LESS THAN (20),
-    PARTITION r2 VALUES LESS THAN (50),
-    PARTITION r3 VALUES LESS THAN (MAXVALUE),
-)"
-        );
-        create_table(frontend, sql).await;
-
-        test_insert_delete_and_query_on_existing_table(frontend, table_name).await;
-
-        flush_table(frontend, "greptime", "public", table_name, None).await;
-        // Wait for previous task finished
-        flush_table(frontend, "greptime", "public", table_name, None).await;
-
-        let table = frontend
-            .catalog_manager()
-            .table("greptime", "public", table_name)
-            .await
-            .unwrap()
-            .unwrap();
-        let table = table.as_any().downcast_ref::<DistTable>().unwrap();
-        let table_id = table.table_info().table_id();
-
-        let table_region_value = instance
-            .table_metadata_manager()
-            .table_region_manager()
-            .get(table_id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let region_to_dn_map = table_region_value
-            .region_distribution
-            .iter()
-            .map(|(k, v)| (v[0], *k))
-            .collect::<HashMap<u32, u64>>();
-
-        for (region, dn) in region_to_dn_map.iter() {
-            // data_tmp_dirs -> dn: 1..4
-            let data_tmp_dir = data_tmp_dirs.get((*dn - 1) as usize).unwrap();
-            let region_dir = test_region_dir(
-                data_tmp_dir.path().to_str().unwrap(),
-                "greptime",
-                "public",
-                table_id,
-                *region,
-            );
-            assert!(has_parquet_file(&region_dir));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_standalone_flush_table() {
-        common_telemetry::init_default_ut_logging();
-
-        let standalone = tests::create_standalone_instance("test_standalone_flush_table").await;
-        let instance = &standalone.instance;
-        let data_tmp_dir = standalone.data_tmp_dir();
-
-        let table_name = "my_table";
-        let sql = format!("CREATE TABLE {table_name} (a INT, b STRING, ts TIMESTAMP, TIME INDEX (ts), PRIMARY KEY (a, b))");
-
-        create_table(instance, sql).await;
-
-        test_insert_delete_and_query_on_existing_table(instance, table_name).await;
-
-        let table_id = 1024;
-        let region_id = 0;
-        let region_dir = test_region_dir(
-            data_tmp_dir.path().to_str().unwrap(),
-            "greptime",
-            "public",
-            table_id,
-            region_id,
-        );
-        assert!(!has_parquet_file(&region_dir));
-
-        flush_table(instance, "greptime", "public", "my_table", None).await;
-        // Wait for previous task finished
-        flush_table(instance, "greptime", "public", "my_table", None).await;
-
-        assert!(has_parquet_file(&region_dir));
-    }
-
     async fn create_table(frontend: &Instance, sql: String) {
         let request = Request::Query(QueryRequest {
             query: Some(Query::Sql(sql)),
         });
-        let output = query(frontend, request).await;
-        assert!(matches!(output, Output::AffectedRows(0)));
-    }
-
-    async fn flush_table(
-        frontend: &Instance,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        region_number: Option<RegionNumber>,
-    ) {
-        let request = Request::Ddl(DdlRequest {
-            expr: Some(DdlExpr::FlushTable(FlushTableExpr {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
-                region_number,
-                ..Default::default()
-            })),
-        });
-
         let output = query(frontend, request).await;
         assert!(matches!(output, Output::AffectedRows(0)));
     }
@@ -527,7 +401,7 @@ CREATE TABLE {table_name} (
 +---------------------+----+-------------------+";
         assert_eq!(recordbatches.pretty_print().unwrap(), expected);
 
-        let delete = DeleteRequest {
+        let new_grpc_delete_request = |a, b, ts, row_count| DeleteRequest {
             table_name: table_name.to_string(),
             region_number: 0,
             key_columns: vec![
@@ -535,7 +409,7 @@ CREATE TABLE {table_name} (
                     column_name: "a".to_string(),
                     semantic_type: SemanticType::Field as i32,
                     values: Some(Values {
-                        i32_values: vec![2, 12, 22, 52],
+                        i32_values: a,
                         ..Default::default()
                     }),
                     datatype: ColumnDataType::Int32 as i32,
@@ -545,12 +419,7 @@ CREATE TABLE {table_name} (
                     column_name: "b".to_string(),
                     semantic_type: SemanticType::Tag as i32,
                     values: Some(Values {
-                        string_values: vec![
-                            "ts: 1672557973000".to_string(),
-                            "ts: 1672557979000".to_string(),
-                            "ts: 1672557982000".to_string(),
-                            "ts: 1672557986000".to_string(),
-                        ],
+                        string_values: b,
                         ..Default::default()
                     }),
                     datatype: ColumnDataType::String as i32,
@@ -560,22 +429,43 @@ CREATE TABLE {table_name} (
                     column_name: "ts".to_string(),
                     semantic_type: SemanticType::Timestamp as i32,
                     values: Some(Values {
-                        ts_millisecond_values: vec![
-                            1672557973000,
-                            1672557979000,
-                            1672557982000,
-                            1672557986000,
-                        ],
+                        ts_millisecond_values: ts,
                         ..Default::default()
                     }),
                     datatype: ColumnDataType::TimestampMillisecond as i32,
                     ..Default::default()
                 },
             ],
-            row_count: 4,
+            row_count,
         };
-        let output = query(instance, Request::Delete(delete)).await;
-        assert!(matches!(output, Output::AffectedRows(4)));
+        let delete1 = new_grpc_delete_request(
+            vec![2, 12, 22, 52],
+            vec![
+                "ts: 1672557973000".to_string(),
+                "ts: 1672557979000".to_string(),
+                "ts: 1672557982000".to_string(),
+                "ts: 1672557986000".to_string(),
+            ],
+            vec![1672557973000, 1672557979000, 1672557982000, 1672557986000],
+            4,
+        );
+        let delete2 = new_grpc_delete_request(
+            vec![3, 53],
+            vec![
+                "ts: 1672557974000".to_string(),
+                "ts: 1672557987000".to_string(),
+            ],
+            vec![1672557974000, 1672557987000],
+            2,
+        );
+        let output = query(
+            instance,
+            Request::Deletes(DeleteRequests {
+                deletes: vec![delete1, delete2],
+            }),
+        )
+        .await;
+        assert!(matches!(output, Output::AffectedRows(6)));
 
         let output = query(instance, request).await;
         let Output::Stream(stream) = output else {
@@ -587,7 +477,6 @@ CREATE TABLE {table_name} (
 | ts                  | a  | b                 |
 +---------------------+----+-------------------+
 | 2023-01-01T07:26:12 | 1  | ts: 1672557972000 |
-| 2023-01-01T07:26:14 | 3  | ts: 1672557974000 |
 | 2023-01-01T07:26:15 | 4  | ts: 1672557975000 |
 | 2023-01-01T07:26:16 | 5  | ts: 1672557976000 |
 | 2023-01-01T07:26:17 |    | ts: 1672557977000 |
@@ -597,7 +486,6 @@ CREATE TABLE {table_name} (
 | 2023-01-01T07:26:23 | 23 | ts: 1672557983000 |
 | 2023-01-01T07:26:24 | 50 | ts: 1672557984000 |
 | 2023-01-01T07:26:25 | 51 | ts: 1672557985000 |
-| 2023-01-01T07:26:27 | 53 | ts: 1672557987000 |
 +---------------------+----+-------------------+";
         assert_eq!(recordbatches.pretty_print().unwrap(), expected);
     }
@@ -614,18 +502,17 @@ CREATE TABLE {table_name} (
             .await
             .unwrap()
             .unwrap();
-        let table = table.as_any().downcast_ref::<DistTable>().unwrap();
         let table_id = table.table_info().ident.table_id;
-        let table_region_value = instance
+        let table_route_value = instance
             .table_metadata_manager()
-            .table_region_manager()
+            .table_route_manager()
             .get(table_id)
             .await
             .unwrap()
             .unwrap();
 
-        let region_to_dn_map = table_region_value
-            .region_distribution
+        let region_to_dn_map = region_distribution(&table_route_value.region_routes)
+            .unwrap()
             .iter()
             .map(|(k, v)| (v[0], *k))
             .collect::<HashMap<u32, u64>>();
@@ -765,7 +652,13 @@ CREATE TABLE {table_name} (
             row_count: 2,
         };
 
-        let output = query(instance, Request::Delete(delete)).await;
+        let output = query(
+            instance,
+            Request::Deletes(DeleteRequests {
+                deletes: vec![delete],
+            }),
+        )
+        .await;
         assert!(matches!(output, Output::AffectedRows(2)));
 
         let output = query(instance, request).await;

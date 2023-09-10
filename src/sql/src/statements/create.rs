@@ -130,6 +130,15 @@ pub struct Partitions {
     pub entries: Vec<PartitionEntry>,
 }
 
+impl Partitions {
+    /// set quotes to all [Ident]s from column list
+    pub fn set_quote(&mut self, quote_style: char) {
+        self.column_list
+            .iter_mut()
+            .for_each(|c| c.quote_style = Some(quote_style));
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PartitionEntry {
     pub name: Ident,
@@ -149,14 +158,18 @@ impl Display for PartitionEntry {
 
 impl Display for Partitions {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            r#"PARTITION BY RANGE COLUMNS ({}) (
-{}
-)"#,
-            format_list_comma!(self.column_list),
-            format_list_indent!(self.entries),
-        )
+        if !self.column_list.is_empty() {
+            write!(
+                f,
+                r#"PARTITION BY RANGE COLUMNS ({}) (
+                    {}
+                )"#,
+                format_list_comma!(self.column_list),
+                format_list_indent!(self.entries),
+            )
+        } else {
+            write!(f, "")
+        }
     }
 }
 
@@ -209,6 +222,7 @@ pub struct CreateExternalTable {
 #[cfg(test)]
 mod tests {
     use crate::dialect::GreptimeDbDialect;
+    use crate::error::Error::InvalidTableOption;
     use crate::parser::ParserContext;
     use crate::statements::statement::Statement;
 
@@ -216,7 +230,7 @@ mod tests {
     fn test_display_create_table() {
         let sql = r"create table if not exists demo(
                              host string,
-                             ts bigint,
+                             ts timestamp,
                              cpu double default 0,
                              memory double,
                              TIME INDEX (ts),
@@ -240,17 +254,17 @@ mod tests {
                     r#"
 CREATE TABLE IF NOT EXISTS demo (
   host STRING,
-  ts BIGINT,
+  ts TIMESTAMP,
   cpu DOUBLE DEFAULT 0,
   memory DOUBLE,
   TIME INDEX (ts),
   PRIMARY KEY (ts, host)
 )
 PARTITION BY RANGE COLUMNS (ts) (
-  PARTITION r0 VALUES LESS THAN (5),
+                      PARTITION r0 VALUES LESS THAN (5),
   PARTITION r1 VALUES LESS THAN (9),
   PARTITION r2 VALUES LESS THAN (MAXVALUE)
-)
+                )
 ENGINE=mito
 WITH(
   regions = 1,
@@ -265,5 +279,67 @@ WITH(
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_display_empty_partition_column() {
+        let sql = r"create table if not exists demo(
+            host string,
+            ts timestamp,
+            cpu double default 0,
+            memory double,
+            TIME INDEX (ts),
+            PRIMARY KEY(ts, host)
+            );
+        ";
+        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}).unwrap();
+        assert_eq!(1, result.len());
+
+        match &result[0] {
+            Statement::CreateTable(c) => {
+                let new_sql = format!("\n{}", c);
+                assert_eq!(
+                    r#"
+CREATE TABLE IF NOT EXISTS demo (
+  host STRING,
+  ts TIMESTAMP,
+  cpu DOUBLE DEFAULT 0,
+  memory DOUBLE,
+  TIME INDEX (ts),
+  PRIMARY KEY (ts, host)
+)
+ENGINE=mito
+"#,
+                    &new_sql
+                );
+
+                let new_result =
+                    ParserContext::create_with_dialect(&new_sql, &GreptimeDbDialect {}).unwrap();
+                assert_eq!(result, new_result);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_validate_table_options() {
+        let sql = r"create table if not exists demo(
+            host string,
+            ts bigint,
+            cpu double default 0,
+            memory double,
+            TIME INDEX (ts),
+            PRIMARY KEY(ts, host)
+      )
+      PARTITION BY RANGE COLUMNS (ts) (
+        PARTITION r0 VALUES LESS THAN (5),
+        PARTITION r1 VALUES LESS THAN (9),
+        PARTITION r2 VALUES LESS THAN (MAXVALUE),
+      )
+      engine=mito
+      with(regions=1, ttl='7d', hello='world');
+";
+        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        assert!(matches!(result, Err(InvalidTableOption { .. })))
     }
 }

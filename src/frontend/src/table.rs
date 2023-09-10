@@ -12,379 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
-use std::iter;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use client::Database;
 use common_error::ext::BoxedError;
-use common_meta::table_name::TableName;
-use common_query::error::Result as QueryResult;
-use common_query::logical_plan::Expr;
-use common_query::physical_plan::{PhysicalPlan, PhysicalPlanRef};
-use common_query::Output;
-use common_recordbatch::adapter::AsyncRecordBatchStreamAdapter;
-use common_recordbatch::error::{
-    InitRecordbatchStreamSnafu, PollStreamSnafu, Result as RecordBatchResult,
-};
-use common_recordbatch::{
-    RecordBatch, RecordBatchStreamAdaptor, RecordBatches, SendableRecordBatchStream,
-};
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::{
-    Partitioning, SendableRecordBatchStream as DfSendableRecordBatchStream,
-};
-use datafusion_common::DataFusionError;
-use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
-use futures_util::{Stream, StreamExt};
-use partition::splitter::WriteSplitter;
-use snafu::prelude::*;
-use store_api::storage::{RegionNumber, ScanRequest};
-use table::error::TableOperationSnafu;
-use table::metadata::{FilterPushDownType, TableInfoRef, TableType};
-use table::requests::{DeleteRequest, InsertRequest};
-use table::Table;
-use tokio::sync::RwLock;
+use common_recordbatch::SendableRecordBatchStream;
+use session::context::QueryContextRef;
+use sqlparser::ast::ObjectName;
+use store_api::data_source::DataSource;
+use store_api::storage::ScanRequest;
+use table::metadata::{FilterPushDownType, TableInfoRef};
+use table::thin_table::{ThinTable, ThinTableAdapter};
+use table::TableRef;
 
-use crate::catalog::FrontendCatalogManager;
-use crate::error::{FindDatanodeSnafu, FindTableRouteSnafu, Result};
-use crate::instance::distributed::inserter::DistInserter;
-use crate::table::delete::to_grpc_delete_request;
-use crate::table::scan::{DatanodeInstance, TableScanPlan};
-
-mod delete;
-pub mod insert;
-pub(crate) mod scan;
+use crate::error::{InvalidSqlSnafu, NotSupportedSnafu, Result};
 
 #[derive(Clone)]
-pub struct DistTable {
-    table_name: TableName,
-    table_info: TableInfoRef,
-    catalog_manager: Arc<FrontendCatalogManager>,
-}
-
-#[async_trait]
-impl Table for DistTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.table_info.meta.schema.clone()
-    }
-
-    fn table_info(&self) -> TableInfoRef {
-        self.table_info.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.table_info.table_type
-    }
-
-    async fn insert(&self, request: InsertRequest) -> table::Result<usize> {
-        let inserter = DistInserter::new(
-            request.catalog_name.clone(),
-            request.schema_name.clone(),
-            self.catalog_manager.clone(),
-        );
-        let affected_rows = inserter
-            .insert(vec![request])
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-        Ok(affected_rows as usize)
-    }
-
-    // TODO(ruihang): DistTable should not call this method directly
-    async fn scan_to_stream(
-        &self,
-        request: ScanRequest,
-    ) -> table::Result<SendableRecordBatchStream> {
-        let partition_manager = self.catalog_manager.partition_manager();
-        let datanode_clients = self.catalog_manager.datanode_clients();
-
-        let table_id = self.table_info.table_id();
-        let partition_rule = partition_manager
-            .find_table_partition_rule(table_id)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-
-        let regions = partition_manager
-            .find_regions_by_filters(partition_rule, &request.filters)
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-        let datanodes = partition_manager
-            .find_region_datanodes(table_id, regions)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-
-        let table_name = &self.table_name;
-        let mut partition_execs = Vec::with_capacity(datanodes.len());
-        for (datanode, _regions) in datanodes.iter() {
-            let client = datanode_clients.get_client(datanode).await;
-            let db = Database::new(&table_name.catalog_name, &table_name.schema_name, client);
-            let datanode_instance = DatanodeInstance::new(Arc::new(self.clone()) as _, db);
-
-            partition_execs.push(Arc::new(PartitionExec {
-                table_name: table_name.clone(),
-                datanode_instance,
-                projection: request.projection.clone(),
-                filters: request.filters.clone(),
-                limit: request.limit,
-                batches: Arc::new(RwLock::new(None)),
-            }));
-        }
-
-        let schema = project_schema(self.schema(), request.projection.as_ref());
-        let schema_to_move = schema.clone();
-        let stream: Pin<Box<dyn Stream<Item = RecordBatchResult<RecordBatch>> + Send>> = Box::pin(
-            async_stream::try_stream! {
-                for partition_exec in partition_execs {
-                    partition_exec
-                        .maybe_init()
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))
-                        .context(InitRecordbatchStreamSnafu)?;
-                    let mut stream = partition_exec.as_stream().await.context(InitRecordbatchStreamSnafu)?;
-
-                    while let Some(batch) = stream.next().await{
-                        yield RecordBatch::try_from_df_record_batch(schema_to_move.clone(),batch.context(PollStreamSnafu)?)?
-                    }
-                }
-            },
-        );
-        let record_batch_stream = RecordBatchStreamAdaptor {
-            schema,
-            stream,
-            output_ordering: None,
-        };
-
-        Ok(Box::pin(record_batch_stream))
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> table::Result<Vec<FilterPushDownType>> {
-        Ok(vec![FilterPushDownType::Inexact; filters.len()])
-    }
-
-    async fn delete(&self, request: DeleteRequest) -> table::Result<usize> {
-        let partition_manager = self.catalog_manager.partition_manager();
-
-        let table_id = self.table_info.table_id();
-        let partition_rule = partition_manager
-            .find_table_partition_rule(table_id)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-
-        let schema = self.schema();
-        let time_index = &schema
-            .timestamp_column()
-            .with_context(|| table::error::MissingTimeIndexColumnSnafu {
-                table_name: self.table_name.to_string(),
-            })?
-            .name;
-
-        let table_info = self.table_info();
-        let key_column_names = table_info
-            .meta
-            .row_key_column_names()
-            .chain(iter::once(time_index))
-            .collect::<Vec<_>>();
-
-        let requests = WriteSplitter::with_partition_rule(partition_rule)
-            .split_delete(request, key_column_names)
-            .map_err(BoxedError::new)
-            .and_then(|requests| {
-                requests
-                    .into_iter()
-                    .map(|(region_number, request)| {
-                        to_grpc_delete_request(
-                            &table_info.meta,
-                            &self.table_name,
-                            region_number,
-                            request,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(BoxedError::new)
-            })
-            .context(TableOperationSnafu)?;
-
-        let output = self
-            .dist_delete(requests)
-            .await
-            .map_err(BoxedError::new)
-            .context(TableOperationSnafu)?;
-        let Output::AffectedRows(rows) = output else {
-            unreachable!()
-        };
-        Ok(rows)
-    }
-}
+pub struct DistTable;
 
 impl DistTable {
-    pub fn new(
-        table_name: TableName,
-        table_info: TableInfoRef,
-        catalog_manager: Arc<FrontendCatalogManager>,
-    ) -> Self {
-        Self {
-            table_name,
-            table_info,
-            catalog_manager,
-        }
+    pub fn table(table_info: TableInfoRef) -> TableRef {
+        let thin_table = ThinTable::new(table_info, FilterPushDownType::Inexact);
+        let data_source = Arc::new(DummyDataSource);
+        Arc::new(ThinTableAdapter::new(thin_table, data_source))
     }
+}
 
-    async fn find_datanode_instances(
+pub struct DummyDataSource;
+
+impl DataSource for DummyDataSource {
+    fn get_stream(
         &self,
-        regions: &[RegionNumber],
-    ) -> Result<Vec<DatanodeInstance>> {
-        let table_name = &self.table_name;
-        let route = self
-            .catalog_manager
-            .partition_manager()
-            .find_table_route(self.table_info.table_id())
-            .await
-            .with_context(|_| FindTableRouteSnafu {
-                table_name: table_name.to_string(),
-            })?;
-
-        let datanodes = regions
-            .iter()
-            .map(|&n| {
-                route
-                    .find_region_leader(n)
-                    .context(FindDatanodeSnafu { region: n })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let datanode_clients = self.catalog_manager.datanode_clients();
-        let mut instances = Vec::with_capacity(datanodes.len());
-        for datanode in datanodes {
-            let client = datanode_clients.get_client(datanode).await;
-            let db = Database::new(&table_name.catalog_name, &table_name.schema_name, client);
-            instances.push(DatanodeInstance::new(Arc::new(self.clone()) as _, db));
+        _request: ScanRequest,
+    ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
+        NotSupportedSnafu {
+            feat: "get stream from a distributed table",
         }
-        Ok(instances)
+        .fail()
+        .map_err(BoxedError::new)
     }
 }
 
-fn project_schema(table_schema: SchemaRef, projection: Option<&Vec<usize>>) -> SchemaRef {
-    if let Some(projection) = projection {
-        let columns = table_schema.column_schemas();
-        let projected = projection
-            .iter()
-            .map(|x| columns[*x].clone())
-            .collect::<Vec<ColumnSchema>>();
-        Arc::new(Schema::new(projected))
-    } else {
-        table_schema
-    }
-}
-
-#[derive(Debug)]
-struct DistTableScan {
-    schema: SchemaRef,
-    partition_execs: Vec<Arc<PartitionExec>>,
-}
-
-impl PhysicalPlan for DistTableScan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.partition_execs.len())
-    }
-
-    fn children(&self) -> Vec<PhysicalPlanRef> {
-        vec![]
-    }
-
-    fn with_new_children(&self, _children: Vec<PhysicalPlanRef>) -> QueryResult<PhysicalPlanRef> {
-        unimplemented!()
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> QueryResult<SendableRecordBatchStream> {
-        let exec = self.partition_execs[partition].clone();
-        let stream = Box::pin(async move {
-            exec.maybe_init()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            exec.as_stream().await
-        });
-        let stream = AsyncRecordBatchStreamAdapter::new(self.schema(), stream);
-        Ok(Box::pin(stream))
-    }
-}
-
-#[derive(Debug)]
-struct PartitionExec {
-    table_name: TableName,
-    datanode_instance: DatanodeInstance,
-    projection: Option<Vec<usize>>,
-    filters: Vec<Expr>,
-    limit: Option<usize>,
-    batches: Arc<RwLock<Option<RecordBatches>>>,
-}
-
-impl PartitionExec {
-    async fn maybe_init(&self) -> Result<()> {
-        if self.batches.read().await.is_some() {
-            return Ok(());
-        }
-
-        let mut batches = self.batches.write().await;
-        if batches.is_some() {
-            return Ok(());
-        }
-
-        let plan: TableScanPlan = TableScanPlan {
-            table_name: self.table_name.clone(),
-            projection: self.projection.clone(),
-            filters: self.filters.clone(),
-            limit: self.limit,
-        };
-        let result = self.datanode_instance.grpc_table_scan(plan).await?;
-        let _ = batches.insert(result);
-        Ok(())
-    }
-
-    /// Notice: the record batch will be consumed.
-    async fn as_stream(&self) -> std::result::Result<DfSendableRecordBatchStream, DataFusionError> {
-        let mut batches = self.batches.write().await;
-        Ok(batches
-            .take()
-            .expect("should have been initialized in \"maybe_init\"")
-            .into_df_stream())
+// TODO(LFC): Refactor consideration: move this function to some helper mod,
+// could be done together or after `TableReference`'s refactoring, when issue #559 is resolved.
+/// Converts maybe fully-qualified table name (`<catalog>.<schema>.<table>`) to tuple.
+pub fn table_idents_to_full_name(
+    obj_name: &ObjectName,
+    query_ctx: QueryContextRef,
+) -> Result<(String, String, String)> {
+    match &obj_name.0[..] {
+        [table] => Ok((
+            query_ctx.current_catalog().to_owned(),
+            query_ctx.current_schema().to_owned(),
+            table.value.clone(),
+        )),
+        [schema, table] => Ok((
+            query_ctx.current_catalog().to_owned(),
+            schema.value.clone(),
+            table.value.clone(),
+        )),
+        [catalog, schema, table] => Ok((
+            catalog.value.clone(),
+            schema.value.clone(),
+            table.value.clone(),
+        )),
+        _ => InvalidSqlSnafu {
+            err_msg: format!(
+                "expect table name to be <catalog>.<schema>.<table>, <schema>.<table> or <table>, actual: {obj_name}",
+            ),
+        }.fail(),
     }
 }
 
 #[cfg(test)]
 pub(crate) mod test {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+    use catalog::remote::MetaKvBackend;
+    use common_meta::key::TableMetadataManager;
+    use common_meta::kv_backend::memory::MemoryKvBackend;
+    use common_meta::kv_backend::KvBackendRef;
     use common_meta::peer::Peer;
-    use common_meta::rpc::router::{Region, RegionRoute, Table, TableRoute};
+    use common_meta::rpc::router::{Region, RegionRoute};
+    use common_query::prelude::Expr;
     use datafusion_expr::expr_fn::{and, binary_expr, col, or};
     use datafusion_expr::{lit, Operator};
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::{ColumnSchema, SchemaBuilder};
     use meta_client::client::MetaClient;
     use meter_core::collect::Collect;
     use meter_core::data::{ReadRecord, WriteRecord};
@@ -394,12 +108,51 @@ pub(crate) mod test {
     use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
     use partition::partition::{PartitionBound, PartitionDef};
     use partition::range::RangePartitionRule;
-    use partition::route::TableRoutes;
     use partition::PartitionRuleRef;
     use store_api::storage::RegionNumber;
+    use table::metadata::{TableInfo, TableInfoBuilder, TableMetaBuilder};
     use table::meter_insert_request;
+    use table::requests::InsertRequest;
 
     use super::*;
+
+    fn new_test_table_info(
+        table_id: u32,
+        table_name: &str,
+        region_numbers: impl Iterator<Item = u32>,
+    ) -> TableInfo {
+        let column_schemas = vec![
+            ColumnSchema::new("col1", ConcreteDataType::int32_datatype(), true),
+            ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            )
+            .with_time_index(true),
+            ColumnSchema::new("col2", ConcreteDataType::int32_datatype(), true),
+        ];
+        let schema = SchemaBuilder::try_from(column_schemas)
+            .unwrap()
+            .version(123)
+            .build()
+            .unwrap();
+
+        let meta = TableMetaBuilder::default()
+            .schema(Arc::new(schema))
+            .primary_key_indices(vec![0])
+            .engine("engine")
+            .next_column_id(3)
+            .region_numbers(region_numbers.collect::<Vec<_>>())
+            .build()
+            .unwrap();
+        TableInfoBuilder::default()
+            .table_id(table_id)
+            .table_version(5)
+            .name(table_name)
+            .meta(meta)
+            .build()
+            .unwrap()
+    }
 
     /// Create a partition rule manager with two tables, one is partitioned by single column, and
     /// the other one is two. The tables are under default catalog and schema.
@@ -417,160 +170,145 @@ pub(crate) mod test {
     ///   PARTITION r2 VALUES LESS THAN (50, 'sh'),
     ///   PARTITION r3 VALUES LESS THAN (MAXVALUE, MAXVALUE),
     /// )
-    pub(crate) async fn create_partition_rule_manager() -> PartitionRuleManagerRef {
-        let table_routes = Arc::new(TableRoutes::new(Arc::new(MetaClient::default())));
-        let partition_manager = Arc::new(PartitionRuleManager::new(table_routes.clone()));
+    pub(crate) async fn create_partition_rule_manager(
+        kv_backend: KvBackendRef,
+    ) -> PartitionRuleManagerRef {
+        let table_metadata_manager = TableMetadataManager::new(kv_backend.clone());
+        let partition_manager = Arc::new(PartitionRuleManager::new(kv_backend));
 
-        let table_name = TableName::new(
-            DEFAULT_CATALOG_NAME,
-            DEFAULT_SCHEMA_NAME,
-            "one_column_partitioning_table",
-        );
-        let table_route = TableRoute::new(
-            Table {
-                id: 1,
-                table_name: table_name.clone(),
-                table_schema: vec![],
-            },
-            vec![
-                RegionRoute {
-                    region: Region {
-                        id: 3.into(),
-                        name: "r1".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string()],
-                                vec![PartitionBound::Value(10_i32.into())],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+        table_metadata_manager
+            .create_table_metadata(
+                new_test_table_info(1, "table_1", vec![0u32, 1, 2].into_iter()).into(),
+                vec![
+                    RegionRoute {
+                        region: Region {
+                            id: 3.into(),
+                            name: "r1".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string()],
+                                    vec![PartitionBound::Value(10_i32.into())],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: Some(Peer::new(3, "")),
+                        follower_peers: vec![],
                     },
-                    leader_peer: Some(Peer::new(3, "")),
-                    follower_peers: vec![],
-                },
-                RegionRoute {
-                    region: Region {
-                        id: 2.into(),
-                        name: "r2".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string()],
-                                vec![PartitionBound::Value(50_i32.into())],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+                    RegionRoute {
+                        region: Region {
+                            id: 2.into(),
+                            name: "r2".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string()],
+                                    vec![PartitionBound::Value(50_i32.into())],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: Some(Peer::new(2, "")),
+                        follower_peers: vec![],
                     },
-                    leader_peer: Some(Peer::new(2, "")),
-                    follower_peers: vec![],
-                },
-                RegionRoute {
-                    region: Region {
-                        id: 1.into(),
-                        name: "r3".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string()],
-                                vec![PartitionBound::MaxValue],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+                    RegionRoute {
+                        region: Region {
+                            id: 1.into(),
+                            name: "r3".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string()],
+                                    vec![PartitionBound::MaxValue],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: Some(Peer::new(1, "")),
+                        follower_peers: vec![],
                     },
-                    leader_peer: Some(Peer::new(1, "")),
-                    follower_peers: vec![],
-                },
-            ],
-        );
-        table_routes
-            .insert_table_route(1, Arc::new(table_route))
-            .await;
+                ],
+            )
+            .await
+            .unwrap();
 
-        let table_name = TableName::new(
-            DEFAULT_CATALOG_NAME,
-            DEFAULT_SCHEMA_NAME,
-            "two_column_partitioning_table",
-        );
-        let table_route = TableRoute::new(
-            Table {
-                id: 2,
-                table_name: table_name.clone(),
-                table_schema: vec![],
-            },
-            vec![
-                RegionRoute {
-                    region: Region {
-                        id: 1.into(),
-                        name: "r1".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string(), "b".to_string()],
-                                vec![
-                                    PartitionBound::Value(10_i32.into()),
-                                    PartitionBound::Value("hz".into()),
-                                ],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+        table_metadata_manager
+            .create_table_metadata(
+                new_test_table_info(2, "table_2", vec![0u32, 1, 2].into_iter()).into(),
+                vec![
+                    RegionRoute {
+                        region: Region {
+                            id: 1.into(),
+                            name: "r1".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string(), "b".to_string()],
+                                    vec![
+                                        PartitionBound::Value(10_i32.into()),
+                                        PartitionBound::Value("hz".into()),
+                                    ],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: None,
+                        follower_peers: vec![],
                     },
-                    leader_peer: None,
-                    follower_peers: vec![],
-                },
-                RegionRoute {
-                    region: Region {
-                        id: 2.into(),
-                        name: "r2".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string(), "b".to_string()],
-                                vec![
-                                    PartitionBound::Value(50_i32.into()),
-                                    PartitionBound::Value("sh".into()),
-                                ],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+                    RegionRoute {
+                        region: Region {
+                            id: 2.into(),
+                            name: "r2".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string(), "b".to_string()],
+                                    vec![
+                                        PartitionBound::Value(50_i32.into()),
+                                        PartitionBound::Value("sh".into()),
+                                    ],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: None,
+                        follower_peers: vec![],
                     },
-                    leader_peer: None,
-                    follower_peers: vec![],
-                },
-                RegionRoute {
-                    region: Region {
-                        id: 3.into(),
-                        name: "r3".to_string(),
-                        partition: Some(
-                            PartitionDef::new(
-                                vec!["a".to_string(), "b".to_string()],
-                                vec![PartitionBound::MaxValue, PartitionBound::MaxValue],
-                            )
-                            .try_into()
-                            .unwrap(),
-                        ),
-                        attrs: HashMap::new(),
+                    RegionRoute {
+                        region: Region {
+                            id: 3.into(),
+                            name: "r3".to_string(),
+                            partition: Some(
+                                PartitionDef::new(
+                                    vec!["a".to_string(), "b".to_string()],
+                                    vec![PartitionBound::MaxValue, PartitionBound::MaxValue],
+                                )
+                                .try_into()
+                                .unwrap(),
+                            ),
+                            attrs: BTreeMap::new(),
+                        },
+                        leader_peer: None,
+                        follower_peers: vec![],
                     },
-                    leader_peer: None,
-                    follower_peers: vec![],
-                },
-            ],
-        );
-        table_routes
-            .insert_table_route(2, Arc::new(table_route))
-            .await;
+                ],
+            )
+            .await
+            .unwrap();
 
         partition_manager
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_find_partition_rule() {
-        let partition_manager = create_partition_rule_manager().await;
+        let partition_manager =
+            create_partition_rule_manager(Arc::new(MemoryKvBackend::default())).await;
 
         // "one_column_partitioning_table" has id 1
         let partition_rule = partition_manager
@@ -614,9 +352,10 @@ pub(crate) mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_find_regions() {
-        let partition_manager = Arc::new(PartitionRuleManager::new(Arc::new(TableRoutes::new(
-            Arc::new(MetaClient::default()),
-        ))));
+        let kv_backend = MetaKvBackend {
+            client: Arc::new(MetaClient::default()),
+        };
+        let partition_manager = Arc::new(PartitionRuleManager::new(Arc::new(kv_backend)));
 
         // PARTITION BY RANGE (a) (
         //   PARTITION r1 VALUES LESS THAN (10),

@@ -14,16 +14,26 @@
 
 //! Datanode configurations
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use catalog::local::MemoryCatalogManager;
 use common_base::readable_size::ReadableSize;
 use common_base::Plugins;
+use common_config::WalConfig;
 use common_error::ext::BoxedError;
+use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 pub use common_procedure::options::ProcedureConfig;
+use common_runtime::Runtime;
 use common_telemetry::info;
 use common_telemetry::logging::LoggingOptions;
+use log_store::raft_engine::log_store::RaftEngineLogStore;
 use meta_client::MetaClientOptions;
+use mito2::config::MitoConfig;
+use mito2::engine::MitoEngine;
+use object_store::util::normalize_dir;
+use query::{QueryEngineFactory, QueryEngineRef};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use servers::heartbeat_options::HeartbeatOptions;
@@ -35,11 +45,19 @@ use storage::config::{
     DEFAULT_PICKER_SCHEDULE_INTERVAL, DEFAULT_REGION_WRITE_BUFFER_SIZE,
 };
 use storage::scheduler::SchedulerConfig;
+use store_api::logstore::LogStore;
+use store_api::path_utils::WAL_DIR;
+use store_api::region_engine::RegionEngineRef;
+use tokio::fs;
 
-use crate::error::{Result, ShutdownInstanceSnafu};
+use crate::error::{
+    CreateDirSnafu, OpenLogStoreSnafu, Result, RuntimeResourceSnafu, ShutdownInstanceSnafu,
+};
+use crate::greptimedb_telemetry::get_greptimedb_telemetry_task;
 use crate::heartbeat::HeartbeatTask;
-use crate::instance::{Instance, InstanceRef};
+use crate::region_server::RegionServer;
 use crate::server::Services;
+use crate::store;
 
 pub const DEFAULT_OBJECT_STORE_CACHE_SIZE: ReadableSize = ReadableSize(1024);
 
@@ -215,37 +233,6 @@ impl Default for ObjectStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WalConfig {
-    // wal directory
-    pub dir: Option<String>,
-    // wal file size in bytes
-    pub file_size: ReadableSize,
-    // wal purge threshold in bytes
-    pub purge_threshold: ReadableSize,
-    // purge interval in seconds
-    #[serde(with = "humantime_serde")]
-    pub purge_interval: Duration,
-    // read batch size
-    pub read_batch_size: usize,
-    // whether to sync log file after every write
-    pub sync_write: bool,
-}
-
-impl Default for WalConfig {
-    fn default() -> Self {
-        Self {
-            dir: None,
-            file_size: ReadableSize::mb(256), // log file size 256MB
-            purge_threshold: ReadableSize::gb(4), // purge threshold 4GB
-            purge_interval: Duration::from_secs(600),
-            read_batch_size: 128,
-            sync_write: false,
-        }
-    }
-}
-
 /// Options for region manifest
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -256,8 +243,6 @@ pub struct RegionManifestConfig {
     /// Region manifest logs and checkpoints gc task execution duration.
     #[serde(with = "humantime_serde")]
     pub gc_duration: Option<Duration>,
-    /// Whether to try creating a manifest checkpoint on region opening
-    pub checkpoint_on_startup: bool,
     /// Whether to compress manifest and checkpoint file by gzip
     pub compress: bool,
 }
@@ -267,7 +252,6 @@ impl Default for RegionManifestConfig {
         Self {
             checkpoint_margin: Some(10u16),
             gc_duration: Some(Duration::from_secs(600)),
-            checkpoint_on_startup: false,
             compress: false,
         }
     }
@@ -341,7 +325,6 @@ impl From<&DatanodeOptions> for StorageEngineConfig {
     fn from(value: &DatanodeOptions) -> Self {
         Self {
             compress_manifest: value.storage.manifest.compress,
-            manifest_checkpoint_on_startup: value.storage.manifest.checkpoint_on_startup,
             manifest_checkpoint_margin: value.storage.manifest.checkpoint_margin,
             manifest_gc_duration: value.storage.manifest.gc_duration,
             max_files_in_l0: value.storage.compaction.max_files_in_level0,
@@ -361,7 +344,6 @@ impl From<&DatanodeOptions> for StorageEngineConfig {
 #[serde(default)]
 pub struct DatanodeOptions {
     pub mode: Mode,
-    pub enable_memory_catalog: bool,
     pub node_id: Option<u64>,
     pub rpc_addr: String,
     pub rpc_hostname: Option<String>,
@@ -371,7 +353,8 @@ pub struct DatanodeOptions {
     pub meta_client_options: Option<MetaClientOptions>,
     pub wal: WalConfig,
     pub storage: StorageConfig,
-    pub procedure: ProcedureConfig,
+    /// Options for different store engines.
+    pub region_engine: Vec<RegionEngineConfig>,
     pub logging: LoggingOptions,
     pub enable_telemetry: bool,
 }
@@ -380,7 +363,6 @@ impl Default for DatanodeOptions {
     fn default() -> Self {
         Self {
             mode: Mode::Standalone,
-            enable_memory_catalog: false,
             node_id: None,
             rpc_addr: "127.0.0.1:3001".to_string(),
             rpc_hostname: None,
@@ -389,7 +371,7 @@ impl Default for DatanodeOptions {
             meta_client_options: None,
             wal: WalConfig::default(),
             storage: StorageConfig::default(),
-            procedure: ProcedureConfig::default(),
+            region_engine: vec![],
             logging: LoggingOptions::default(),
             heartbeat: HeartbeatOptions::default(),
             enable_telemetry: true,
@@ -407,42 +389,84 @@ impl DatanodeOptions {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum RegionEngineConfig {
+    #[serde(rename = "mito")]
+    Mito(MitoConfig),
+}
+
 /// Datanode service.
 pub struct Datanode {
     opts: DatanodeOptions,
     services: Option<Services>,
-    instance: InstanceRef,
     heartbeat_task: Option<HeartbeatTask>,
+    region_server: RegionServer,
+    query_engine: QueryEngineRef,
+    greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
 }
 
 impl Datanode {
     pub async fn new(opts: DatanodeOptions, plugins: Arc<Plugins>) -> Result<Datanode> {
-        let (instance, heartbeat_task) = Instance::with_opts(&opts, plugins).await?;
+        let query_engine_factory = QueryEngineFactory::new_with_plugins(
+            // query engine in datanode only executes plan with resolved table source.
+            MemoryCatalogManager::with_default_setup(),
+            None,
+            false,
+            plugins,
+        );
+        let query_engine = query_engine_factory.query_engine();
+
+        let runtime = Arc::new(
+            Runtime::builder()
+                .worker_threads(opts.rpc_runtime_size)
+                .thread_name("io-handlers")
+                .build()
+                .context(RuntimeResourceSnafu)?,
+        );
+
+        let mut region_server = RegionServer::new(query_engine.clone(), runtime.clone());
+        let log_store = Self::build_log_store(&opts).await?;
+        let object_store = store::new_object_store(&opts).await?;
+        let engines = Self::build_store_engines(&opts, log_store, object_store).await?;
+        for engine in engines {
+            region_server.register_engine(engine);
+        }
+
+        // build optional things with different modes
         let services = match opts.mode {
-            Mode::Distributed => Some(Services::try_new(instance.clone(), &opts).await?),
+            Mode::Distributed => Some(Services::try_new(region_server.clone(), &opts).await?),
             Mode::Standalone => None,
         };
+        let heartbeat_task = match opts.mode {
+            Mode::Distributed => {
+                Some(HeartbeatTask::try_new(&opts, Some(region_server.clone())).await?)
+            }
+            Mode::Standalone => None,
+        };
+        let greptimedb_telemetry_task = get_greptimedb_telemetry_task(
+            Some(opts.storage.data_home.clone()),
+            &opts.mode,
+            opts.enable_telemetry,
+        )
+        .await;
+
         Ok(Self {
             opts,
             services,
-            instance,
             heartbeat_task,
+            region_server,
+            query_engine,
+            greptimedb_telemetry_task,
         })
     }
 
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting datanode instance...");
-        self.start_instance().await?;
-        self.start_services().await
-    }
-
-    /// Start only the internal component of datanode.
-    pub async fn start_instance(&mut self) -> Result<()> {
-        let _ = self.instance.start().await;
         if let Some(task) = &self.heartbeat_task {
             task.start().await?;
         }
-        Ok(())
+        let _ = self.greptimedb_telemetry_task.start();
+        self.start_services().await
     }
 
     /// Start services of datanode. This method call will block until services are shutdown.
@@ -452,22 +476,6 @@ impl Datanode {
         } else {
             Ok(())
         }
-    }
-
-    pub fn get_instance(&self) -> InstanceRef {
-        self.instance.clone()
-    }
-
-    pub async fn shutdown_instance(&self) -> Result<()> {
-        if let Some(heartbeat_task) = &self.heartbeat_task {
-            heartbeat_task
-                .close()
-                .await
-                .map_err(BoxedError::new)
-                .context(ShutdownInstanceSnafu)?;
-        }
-        let _ = self.instance.shutdown().await;
-        Ok(())
     }
 
     async fn shutdown_services(&self) -> Result<()> {
@@ -481,7 +489,68 @@ impl Datanode {
     pub async fn shutdown(&self) -> Result<()> {
         // We must shutdown services first
         self.shutdown_services().await?;
-        self.shutdown_instance().await
+        let _ = self.greptimedb_telemetry_task.stop().await;
+        if let Some(heartbeat_task) = &self.heartbeat_task {
+            heartbeat_task
+                .close()
+                .await
+                .map_err(BoxedError::new)
+                .context(ShutdownInstanceSnafu)?;
+        }
+        Ok(())
+    }
+
+    pub fn region_server(&self) -> RegionServer {
+        self.region_server.clone()
+    }
+
+    pub fn query_engine(&self) -> QueryEngineRef {
+        self.query_engine.clone()
+    }
+
+    // internal utils
+
+    /// Build [RaftEngineLogStore]
+    async fn build_log_store(opts: &DatanodeOptions) -> Result<Arc<RaftEngineLogStore>> {
+        let data_home = normalize_dir(&opts.storage.data_home);
+        let wal_dir = format!("{}{WAL_DIR}", data_home);
+        let wal_config = opts.wal.clone();
+
+        // create WAL directory
+        fs::create_dir_all(Path::new(&wal_dir))
+            .await
+            .context(CreateDirSnafu { dir: &wal_dir })?;
+        info!(
+            "Creating logstore with config: {:?} and storage path: {}",
+            wal_config, &wal_dir
+        );
+        let logstore = RaftEngineLogStore::try_new(wal_dir, wal_config)
+            .await
+            .map_err(Box::new)
+            .context(OpenLogStoreSnafu)?;
+        Ok(Arc::new(logstore))
+    }
+
+    /// Build [RegionEngineRef] from `store_engine` section in `opts`
+    async fn build_store_engines<S>(
+        opts: &DatanodeOptions,
+        log_store: Arc<S>,
+        object_store: object_store::ObjectStore,
+    ) -> Result<Vec<RegionEngineRef>>
+    where
+        S: LogStore,
+    {
+        let mut engines = vec![];
+        for engine in &opts.region_engine {
+            match engine {
+                RegionEngineConfig::Mito(config) => {
+                    let engine: MitoEngine =
+                        MitoEngine::new(config.clone(), log_store.clone(), object_store.clone());
+                    engines.push(Arc::new(engine) as _);
+                }
+            }
+        }
+        Ok(engines)
     }
 }
 

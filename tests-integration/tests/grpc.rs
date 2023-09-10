@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use api::v1::alter_expr::Kind;
 use api::v1::promql_request::Promql;
 use api::v1::{
@@ -21,11 +19,12 @@ use api::v1::{
     CreateTableExpr, InsertRequest, InsertRequests, PromInstantQuery, PromRangeQuery,
     PromqlRequest, RequestHeader, SemanticType, TableId,
 };
+use auth::user_provider_from_option;
 use client::{Client, Database, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_catalog::consts::{MIN_USER_TABLE_ID, MITO_ENGINE};
 use common_query::Output;
-use servers::auth::user_provider::StaticUserProvider;
-use servers::prometheus::{PromData, PromSeries, PrometheusJsonResponse, PrometheusResponse};
+use common_recordbatch::RecordBatches;
+use servers::http::prometheus::{PromData, PromSeries, PrometheusJsonResponse, PrometheusResponse};
 use servers::server::Server;
 use tests_integration::test_util::{
     setup_grpc_server, setup_grpc_server_with_user_provider, StorageType,
@@ -118,14 +117,13 @@ pub async fn test_dbname(store_type: StorageType) {
 }
 
 pub async fn test_grpc_auth(store_type: StorageType) {
-    let user_provider = StaticUserProvider::try_from("cmd:greptime_user=greptime_pwd").unwrap();
-
-    let (addr, mut guard, fe_grpc_server) = setup_grpc_server_with_user_provider(
-        store_type,
-        "auto_create_table",
-        Some(Arc::new(user_provider)),
+    let user_provider = user_provider_from_option(
+        &"static_user_provider:cmd:greptime_user=greptime_pwd".to_string(),
     )
-    .await;
+    .unwrap();
+    let (addr, mut guard, fe_grpc_server) =
+        setup_grpc_server_with_user_provider(store_type, "auto_create_table", Some(user_provider))
+            .await;
 
     let grpc_client = Client::with_urls(vec![addr]);
     let mut db = Database::new_with_dbname(
@@ -313,14 +311,19 @@ async fn insert_and_assert(db: &Database) {
     assert!(matches!(result, Output::AffectedRows(2)));
 
     // select
-    let result = db
+    let output = db
         .sql("SELECT host, cpu, memory, ts FROM demo")
         .await
         .unwrap();
-    match result {
-        Output::RecordBatches(recordbatches) => {
-            let pretty = recordbatches.pretty_print().unwrap();
-            let expected = "\
+
+    let record_batches = match output {
+        Output::RecordBatches(record_batches) => record_batches,
+        Output::Stream(stream) => RecordBatches::try_collect(stream).await.unwrap(),
+        Output::AffectedRows(_) => unreachable!(),
+    };
+
+    let pretty = record_batches.pretty_print().unwrap();
+    let expected = "\
 +-------+------+--------+-------------------------+
 | host  | cpu  | memory | ts                      |
 +-------+------+--------+-------------------------+
@@ -332,10 +335,7 @@ async fn insert_and_assert(db: &Database) {
 | host6 | 88.8 | 333.3  | 2022-12-28T04:17:08     |
 +-------+------+--------+-------------------------+\
 ";
-            assert_eq!(pretty, expected);
-        }
-        _ => unreachable!(),
-    }
+    assert_eq!(pretty, expected);
 }
 
 fn testing_create_expr() -> CreateTableExpr {

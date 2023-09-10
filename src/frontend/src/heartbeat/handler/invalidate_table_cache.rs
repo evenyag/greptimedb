@@ -22,15 +22,13 @@ use common_meta::ident::TableIdent;
 use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
 use common_meta::key::table_info::TableInfoKey;
 use common_meta::key::table_name::TableNameKey;
-use common_meta::key::table_region::TableRegionKey;
+use common_meta::key::table_route::NextTableRouteKey;
 use common_meta::key::TableMetaKey;
 use common_telemetry::error;
-use partition::manager::TableRouteCacheInvalidatorRef;
 
 #[derive(Clone)]
 pub struct InvalidateTableCacheHandler {
     backend_cache_invalidator: KvCacheInvalidatorRef,
-    table_route_cache_invalidator: TableRouteCacheInvalidatorRef,
 }
 
 #[async_trait]
@@ -74,13 +72,9 @@ impl HeartbeatResponseHandler for InvalidateTableCacheHandler {
 }
 
 impl InvalidateTableCacheHandler {
-    pub fn new(
-        backend_cache_invalidator: KvCacheInvalidatorRef,
-        table_route_cache_invalidator: TableRouteCacheInvalidatorRef,
-    ) -> Self {
+    pub fn new(backend_cache_invalidator: KvCacheInvalidatorRef) -> Self {
         Self {
             backend_cache_invalidator,
-            table_route_cache_invalidator,
         }
     }
 
@@ -88,10 +82,6 @@ impl InvalidateTableCacheHandler {
         let table_id = table_ident.table_id;
         self.backend_cache_invalidator
             .invalidate_key(&TableInfoKey::new(table_id).as_raw_key())
-            .await;
-
-        self.backend_cache_invalidator
-            .invalidate_key(&TableRegionKey::new(table_id).as_raw_key())
             .await;
 
         self.backend_cache_invalidator
@@ -105,8 +95,8 @@ impl InvalidateTableCacheHandler {
             )
             .await;
 
-        self.table_route_cache_invalidator
-            .invalidate_table_route(table_id)
+        self.backend_cache_invalidator
+            .invalidate_key(&NextTableRouteKey { table_id }.as_raw_key())
             .await;
     }
 }

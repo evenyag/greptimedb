@@ -24,7 +24,7 @@ use common_meta::heartbeat::handler::{
 use common_meta::heartbeat::mailbox::{HeartbeatMailbox, MessageMeta};
 use common_meta::ident::TableIdent;
 use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
-use common_meta::key::table_region::TableRegionKey;
+use common_meta::key::table_info::TableInfoKey;
 use common_meta::key::TableMetaKey;
 use partition::manager::TableRouteCacheInvalidator;
 use table::metadata::TableId;
@@ -58,19 +58,14 @@ impl TableRouteCacheInvalidator for MockTableRouteCacheInvalidator {
 #[tokio::test]
 async fn test_invalidate_table_cache_handler() {
     let table_id = 1;
-    let table_region_key = TableRegionKey::new(table_id);
-    let inner = HashMap::from([(table_region_key.as_raw_key(), 1)]);
+    let table_info_key = TableInfoKey::new(table_id);
+    let inner = HashMap::from([(table_info_key.as_raw_key(), 1)]);
     let backend = Arc::new(MockKvCacheInvalidator {
         inner: Mutex::new(inner),
     });
 
-    let inner = HashMap::from([(table_id, 1)]);
-    let table_route = Arc::new(MockTableRouteCacheInvalidator {
-        inner: Mutex::new(inner),
-    });
-
     let executor = Arc::new(HandlerGroupExecutor::new(vec![Arc::new(
-        InvalidateTableCacheHandler::new(backend.clone(), table_route.clone()),
+        InvalidateTableCacheHandler::new(backend.clone()),
     )]));
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -99,9 +94,7 @@ async fn test_invalidate_table_cache_handler() {
         .inner
         .lock()
         .unwrap()
-        .contains_key(&table_region_key.as_raw_key()));
-
-    assert!(!table_route.inner.lock().unwrap().contains_key(&table_id));
+        .contains_key(&table_info_key.as_raw_key()));
 
     // removes a invalid key
     handle_instruction(

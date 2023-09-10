@@ -18,10 +18,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
-use client::client_manager::DatanodeClients;
-use common_base::bytes::Bytes;
+use client::region_handler::RegionRequestHandlerRef;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_meta::peer::Peer;
 use common_meta::table_name::TableName;
 use datafusion::common::Result;
 use datafusion::datasource::DefaultTableSource;
@@ -29,11 +27,11 @@ use datafusion::execution::context::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeVisitor, VisitRecursion};
-use datafusion_common::{DataFusionError, TableReference};
+use datafusion_common::TableReference;
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion_optimizer::analyzer::Analyzer;
-use partition::manager::PartitionRuleManager;
 use snafu::{OptionExt, ResultExt};
+use store_api::storage::RegionId;
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 pub use table::metadata::TableType;
 use table::table::adapter::DfTableProviderAdapter;
@@ -43,21 +41,18 @@ use crate::error;
 use crate::error::{CatalogSnafu, TableNotFoundSnafu};
 
 pub struct DistExtensionPlanner {
-    partition_manager: Arc<PartitionRuleManager>,
-    clients: Arc<DatanodeClients>,
     catalog_manager: CatalogManagerRef,
+    request_handler: RegionRequestHandlerRef,
 }
 
 impl DistExtensionPlanner {
     pub fn new(
-        partition_manager: Arc<PartitionRuleManager>,
-        clients: Arc<DatanodeClients>,
         catalog_manager: CatalogManagerRef,
+        request_handler: RegionRequestHandlerRef,
     ) -> Self {
         Self {
-            partition_manager,
-            clients,
             catalog_manager,
+            request_handler,
         }
     }
 }
@@ -72,70 +67,67 @@ impl ExtensionPlanner for DistExtensionPlanner {
         _physical_inputs: &[Arc<dyn ExecutionPlan>],
         session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let maybe_merge_scan = { node.as_any().downcast_ref::<MergeScanLogicalPlan>() };
-        if let Some(merge_scan) = maybe_merge_scan {
-            if merge_scan.is_placeholder() {
-                // ignore placeholder
-                planner
-                    .create_physical_plan(merge_scan.input(), session_state)
-                    .await
-                    .map(Some)
-            } else {
-                // TODO(ruihang): generate different execution plans for different variant merge operation
-                let input_plan = merge_scan.input();
-                let optimized_input =
-                    self.optimize_input_logical_plan(session_state, input_plan)?;
-                let input_physical_plan = planner
-                    .create_physical_plan(&optimized_input, session_state)
-                    .await?;
-                let Some(table_name) = self.get_table_name(input_plan)? else {
-                    // no relation found in input plan, going to execute them locally
-                    return Ok(Some(input_physical_plan));
-                };
+        let Some(merge_scan) = node.as_any().downcast_ref::<MergeScanLogicalPlan>() else {
+            return Ok(None);
+        };
 
-                let input_schema = input_physical_plan.schema().clone();
-                let input_plan = self.set_table_name(&table_name, input_plan.clone())?;
-                let substrait_plan: Bytes = DFLogicalSubstraitConvertor
-                    .encode(&input_plan)
-                    .context(error::EncodeSubstraitLogicalPlanSnafu)?
-                    .into();
-                let peers = self.get_peers(&table_name).await;
-                match peers {
-                    Ok(peers) => {
-                        let exec = MergeScanExec::new(
-                            table_name,
-                            peers,
-                            substrait_plan,
-                            input_schema,
-                            self.clients.clone(),
-                        );
+        let input_plan = merge_scan.input();
+        let fallback = |logical_plan| async move {
+            planner
+                .create_physical_plan(logical_plan, session_state)
+                .await
+                .map(Some)
+        };
 
-                        Ok(Some(Arc::new(exec) as _))
-                    }
-                    Err(_) => Ok(Some(input_physical_plan)),
-                }
-            }
-        } else {
-            Ok(None)
+        if merge_scan.is_placeholder() {
+            // ignore placeholder
+            return fallback(input_plan).await;
         }
+
+        let optimized_plan = self.optimize_input_logical_plan(session_state, input_plan)?;
+        let Some(table_name) = Self::extract_full_table_name(input_plan)? else {
+            // no relation found in input plan, going to execute them locally
+            return fallback(&optimized_plan).await;
+        };
+
+        let Ok(regions) = self.get_regions(&table_name).await else {
+            // no peers found, going to execute them locally
+            return fallback(&optimized_plan).await;
+        };
+
+        // TODO(ruihang): generate different execution plans for different variant merge operation
+        let schema = optimized_plan.schema().as_ref().into();
+        // Pass down the original plan, allow execution nodes to do their optimization
+        let amended_plan = Self::plan_with_full_table_name(input_plan.clone(), &table_name)?;
+        let substrait_plan = DFLogicalSubstraitConvertor
+            .encode(&amended_plan)
+            .context(error::EncodeSubstraitLogicalPlanSnafu)?
+            .into();
+        let merge_scan_plan = MergeScanExec::new(
+            table_name,
+            regions,
+            substrait_plan,
+            &schema,
+            self.request_handler.clone(),
+        )?;
+        Ok(Some(Arc::new(merge_scan_plan) as _))
     }
 }
 
 impl DistExtensionPlanner {
-    /// Extract table name from logical plan
-    fn get_table_name(&self, plan: &LogicalPlan) -> Result<Option<TableName>> {
+    /// Extract fully resolved table name from logical plan
+    fn extract_full_table_name(plan: &LogicalPlan) -> Result<Option<TableName>> {
         let mut extractor = TableNameExtractor::default();
         let _ = plan.visit(&mut extractor)?;
         Ok(extractor.table_name)
     }
 
-    /// Set the fully resolved table name to TableScan plan
-    fn set_table_name(&self, name: &TableName, plan: LogicalPlan) -> Result<LogicalPlan> {
-        // let mut rewriter
+    /// Apply the fully resolved table name to the TableScan plan
+    fn plan_with_full_table_name(plan: LogicalPlan, name: &TableName) -> Result<LogicalPlan> {
         plan.transform(&|plan| TableNameRewriter::rewrite_table_name(plan, name))
     }
 
-    async fn get_peers(&self, table_name: &TableName) -> Result<Vec<Peer>> {
+    async fn get_regions(&self, table_name: &TableName) -> Result<Vec<RegionId>> {
         let table = self
             .catalog_manager
             .table(
@@ -148,15 +140,7 @@ impl DistExtensionPlanner {
             .with_context(|| TableNotFoundSnafu {
                 table: table_name.to_string(),
             })?;
-        let table_id = table.table_info().table_id();
-
-        self.partition_manager
-            .find_table_region_leaders(table_id)
-            .await
-            .with_context(|_| error::RoutePartitionSnafu {
-                table: table_name.clone(),
-            })
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+        Ok(table.table_info().region_ids())
     }
 
     // TODO(ruihang): find a more elegant way to optimize input logical plan

@@ -14,10 +14,12 @@
 
 mod health;
 mod heartbeat;
+mod inactive_regions;
 mod leader;
 mod meta;
 mod node_lease;
 mod route;
+mod util;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -50,14 +52,14 @@ pub fn make_admin_service(meta_srv: MetaSrv) -> Admin {
     let router = router.route(
         "/catalogs",
         meta::CatalogsHandler {
-            kv_store: meta_srv.kv_store().clone(),
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
         },
     );
 
     let router = router.route(
         "/schemas",
         meta::SchemasHandler {
-            kv_store: meta_srv.kv_store().clone(),
+            table_metadata_manager: meta_srv.table_metadata_manager().clone(),
         },
     );
 
@@ -86,6 +88,20 @@ pub fn make_admin_service(meta_srv: MetaSrv) -> Admin {
         "/route",
         route::RouteHandler {
             kv_store: meta_srv.kv_store().clone(),
+        },
+    );
+
+    let router = router.route(
+        "/inactive-regions/view",
+        inactive_regions::ViewInactiveRegionsHandler {
+            store: meta_srv.in_memory().clone(),
+        },
+    );
+
+    let router = router.route(
+        "/inactive-regions/clear",
+        inactive_regions::ClearInactiveRegionsHandler {
+            store: meta_srv.in_memory().clone(),
         },
     );
 

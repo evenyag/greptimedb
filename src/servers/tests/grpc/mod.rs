@@ -19,20 +19,21 @@ use api::v1::auth_header::AuthScheme;
 use api::v1::Basic;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use async_trait::async_trait;
+use auth::tests::MockUserProvider;
+use auth::UserProviderRef;
 use client::{Client, Database, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_runtime::{Builder as RuntimeBuilder, Runtime};
-use servers::auth::UserProviderRef;
 use servers::error::{Result, StartGrpcSnafu, TcpBindSnafu};
-use servers::grpc::flight::FlightHandler;
-use servers::grpc::handler::GreptimeRequestHandler;
+use servers::grpc::flight::FlightCraftWrapper;
+use servers::grpc::greptime_handler::GreptimeRequestHandler;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use servers::server::Server;
 use snafu::ResultExt;
 use table::test_util::MemTable;
+use table::TableRef;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
-use crate::auth::MockUserProvider;
 use crate::{create_testing_grpc_query_handler, LOCALHOST_WITH_0};
 
 struct MockGrpcServer {
@@ -55,11 +56,12 @@ impl MockGrpcServer {
     }
 
     fn create_service(&self) -> FlightServiceServer<impl FlightService> {
-        let service = FlightHandler::new(Arc::new(GreptimeRequestHandler::new(
+        let service: FlightCraftWrapper<_> = GreptimeRequestHandler::new(
             self.query_handler.clone(),
             self.user_provider.clone(),
             self.runtime.clone(),
-        )));
+        )
+        .into();
         FlightServiceServer::new(service)
     }
 }
@@ -98,7 +100,7 @@ impl Server for MockGrpcServer {
     }
 }
 
-fn create_grpc_server(table: MemTable) -> Result<Arc<dyn Server>> {
+fn create_grpc_server(table: TableRef) -> Result<Arc<dyn Server>> {
     let query_handler = create_testing_grpc_query_handler(table);
     let io_runtime = Arc::new(
         RuntimeBuilder::default()

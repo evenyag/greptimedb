@@ -21,7 +21,10 @@ mod router;
 mod store;
 
 use api::v1::meta::Role;
+use common_error::ext::BoxedError;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
+use common_meta::ddl::{DdlTaskExecutor, ExecutorContext};
+use common_meta::error::{self as meta_error, Result as MetaResult};
 use common_meta::rpc::ddl::{SubmitDdlTaskRequest, SubmitDdlTaskResponse};
 use common_meta::rpc::lock::{LockRequest, LockResponse, UnlockRequest};
 use common_meta::rpc::router::{RouteRequest, RouteResponse};
@@ -44,6 +47,9 @@ use crate::error;
 use crate::error::{ConvertMetaResponseSnafu, Result};
 
 pub type Id = (u64, u64);
+
+const DEFAULT_ASK_LEADER_MAX_RETRY: usize = 3;
+const DEFAULT_SUBMIT_DDL_MAX_RETRY: usize = 3;
 
 #[derive(Clone, Debug, Default)]
 pub struct MetaClientBuilder {
@@ -130,7 +136,12 @@ impl MetaClientBuilder {
         let mgr = client.channel_manager.clone();
 
         if self.enable_heartbeat {
-            client.heartbeat = Some(HeartbeatClient::new(self.id, self.role, mgr.clone()));
+            client.heartbeat = Some(HeartbeatClient::new(
+                self.id,
+                self.role,
+                mgr.clone(),
+                DEFAULT_ASK_LEADER_MAX_RETRY,
+            ));
         }
         if self.enable_router {
             client.router = Some(RouterClient::new(self.id, self.role, mgr.clone()));
@@ -143,7 +154,12 @@ impl MetaClientBuilder {
         }
         if self.enable_ddl {
             let mgr = self.ddl_channel_manager.unwrap_or(mgr);
-            client.ddl = Some(DdlClient::new(self.id, self.role, mgr));
+            client.ddl = Some(DdlClient::new(
+                self.id,
+                self.role,
+                mgr,
+                DEFAULT_SUBMIT_DDL_MAX_RETRY,
+            ));
         }
 
         client
@@ -159,6 +175,20 @@ pub struct MetaClient {
     store: Option<StoreClient>,
     lock: Option<LockClient>,
     ddl: Option<DdlClient>,
+}
+
+#[async_trait::async_trait]
+impl DdlTaskExecutor for MetaClient {
+    async fn submit_ddl_task(
+        &self,
+        _ctx: &ExecutorContext,
+        request: SubmitDdlTaskRequest,
+    ) -> MetaResult<SubmitDdlTaskResponse> {
+        self.submit_ddl_task(request)
+            .await
+            .map_err(BoxedError::new)
+            .context(meta_error::ExternalSnafu)
+    }
 }
 
 impl MetaClient {

@@ -14,15 +14,14 @@
 
 use std::sync::Arc;
 
+use auth::tests::MockUserProvider;
+use auth::UserProvider;
 use axum::body::BoxBody;
 use axum::http;
 use hyper::Request;
-use servers::auth::UserProvider;
 use servers::http::authorize::HttpAuth;
-use session::context::UserInfo;
+use session::context::QueryContextRef;
 use tower_http::auth::AsyncAuthorizeRequest;
-
-use crate::auth::MockUserProvider;
 
 #[tokio::test]
 async fn test_http_auth() {
@@ -30,9 +29,10 @@ async fn test_http_auth() {
 
     // base64encode("username:password") == "dXNlcm5hbWU6cGFzc3dvcmQ="
     let req = mock_http_request(Some("Basic dXNlcm5hbWU6cGFzc3dvcmQ="), None).unwrap();
-    let auth_res = http_auth.authorize(req).await.unwrap();
-    let user_info: &UserInfo = auth_res.extensions().get().unwrap();
-    let default = UserInfo::default();
+    let req = http_auth.authorize(req).await.unwrap();
+    let ctx: &QueryContextRef = req.extensions().get().unwrap();
+    let user_info = ctx.current_user().unwrap();
+    let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
     // In mock user provider, right username:password == "greptime:greptime"
@@ -42,8 +42,9 @@ async fn test_http_auth() {
     // base64encode("greptime:greptime") == "Z3JlcHRpbWU6Z3JlcHRpbWU="
     let req = mock_http_request(Some("Basic Z3JlcHRpbWU6Z3JlcHRpbWU="), None).unwrap();
     let req = http_auth.authorize(req).await.unwrap();
-    let user_info: &UserInfo = req.extensions().get().unwrap();
-    let default = UserInfo::default();
+    let ctx: &QueryContextRef = req.extensions().get().unwrap();
+    let user_info = ctx.current_user().unwrap();
+    let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
     let req = mock_http_request(None, None).unwrap();
@@ -72,8 +73,9 @@ async fn test_schema_validating() {
     )
     .unwrap();
     let req = http_auth.authorize(req).await.unwrap();
-    let user_info: &UserInfo = req.extensions().get().unwrap();
-    let default = UserInfo::default();
+    let ctx: &QueryContextRef = req.extensions().get().unwrap();
+    let user_info = ctx.current_user().unwrap();
+    let default = auth::userinfo_by_name(None);
     assert_eq!(default.username(), user_info.username());
 
     // wrong database

@@ -14,8 +14,8 @@
 
 use std::fmt::{Debug, Formatter};
 
-use api::greptime_proto::v1::add_column::location::LocationType;
-use api::greptime_proto::v1::add_column::Location;
+use api::greptime_proto::v1::add_column_location::LocationType;
+use api::greptime_proto::v1::AddColumnLocation as Location;
 use common_recordbatch::{RecordBatches, SendableRecordBatchStream};
 use serde::{Deserialize, Serialize};
 
@@ -59,11 +59,11 @@ impl From<&AddColumnLocation> for Location {
         match value {
             AddColumnLocation::First => Location {
                 location_type: LocationType::First.into(),
-                after_cloumn_name: "".to_string(),
+                after_column_name: "".to_string(),
             },
             AddColumnLocation::After { column_name } => Location {
                 location_type: LocationType::After.into(),
-                after_cloumn_name: column_name.to_string(),
+                after_column_name: column_name.to_string(),
             },
         }
     }

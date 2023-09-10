@@ -19,6 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use auth::UserProviderRef;
 use axum::Router;
 use catalog::{CatalogManagerRef, RegisterTableRequest};
 use common_catalog::consts::{
@@ -48,13 +49,12 @@ use object_store::services::{Azblob, Gcs, Oss, S3};
 use object_store::test_util::TempFolder;
 use object_store::ObjectStore;
 use secrecy::ExposeSecret;
-use servers::auth::UserProviderRef;
+use servers::grpc::greptime_handler::GreptimeRequestHandler;
 use servers::grpc::GrpcServer;
 use servers::http::{HttpOptions, HttpServerBuilder};
 use servers::metrics_handler::MetricsHandler;
 use servers::mysql::server::{MysqlServer, MysqlSpawnConfig, MysqlSpawnRef};
 use servers::postgres::PostgresServer;
-use servers::prometheus::PrometheusServer;
 use servers::query_handler::grpc::ServerGrpcQueryHandlerAdaptor;
 use servers::query_handler::sql::ServerSqlQueryHandlerAdaptor;
 use servers::server::Server;
@@ -544,11 +544,10 @@ pub async fn setup_test_prom_app_with_frontend(
         .with_grpc_handler(ServerGrpcQueryHandlerAdaptor::arc(frontend_ref.clone()))
         .with_script_handler(frontend_ref.clone())
         .with_prom_handler(frontend_ref.clone())
+        .with_prometheus_handler(frontend_ref)
         .with_greptime_config_options(opts.to_toml_string())
         .build();
-    let prom_server = PrometheusServer::create_server(frontend_ref);
     let app = http_server.build(http_server.make_app());
-    let app = app.merge(prom_server.make_app());
     (app, guard)
 }
 
@@ -585,9 +584,16 @@ pub async fn setup_grpc_server_with_user_provider(
         heartbeat.start().await.unwrap();
     }
     let fe_instance_ref = Arc::new(fe_instance);
-    let fe_grpc_server = Arc::new(GrpcServer::new(
+    let flight_handler = Arc::new(GreptimeRequestHandler::new(
         ServerGrpcQueryHandlerAdaptor::arc(fe_instance_ref.clone()),
+        user_provider.clone(),
+        runtime.clone(),
+    ));
+    let fe_grpc_server = Arc::new(GrpcServer::new(
+        Some(ServerGrpcQueryHandlerAdaptor::arc(fe_instance_ref.clone())),
         Some(fe_instance_ref.clone()),
+        Some(flight_handler),
+        None,
         user_provider,
         runtime,
     ));

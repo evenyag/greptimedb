@@ -142,12 +142,12 @@ mod tests {
     use std::sync::Arc;
 
     use common_meta::key::TableMetadataManager;
+    use common_meta::sequence::Sequence;
 
     use super::*;
     use crate::cluster::MetaPeerClientBuilder;
     use crate::handler::{HeartbeatMailbox, Pushers};
     use crate::keys::StatKey;
-    use crate::sequence::Sequence;
     use crate::service::store::cached_kv::LeaderCachedKvStore;
     use crate::service::store::kv::KvBackendAdapter;
     use crate::service::store::memory::MemStore;
@@ -158,7 +158,7 @@ mod tests {
         let kv_store = Arc::new(MemStore::new());
         let leader_cached_kv_store =
             Arc::new(LeaderCachedKvStore::with_always_leader(kv_store.clone()));
-        let seq = Sequence::new("test_seq", 0, 10, kv_store.clone());
+        let seq = Sequence::new("test_seq", 0, 10, KvBackendAdapter::wrap(kv_store.clone()));
         let mailbox = HeartbeatMailbox::create(Pushers::default(), seq);
         let meta_peer_client = MetaPeerClientBuilder::default()
             .election(None)
@@ -198,7 +198,7 @@ mod tests {
         let val: StatValue = kv.value.try_into().unwrap();
         // first new stat must be set in kv store immediately
         assert_eq!(1, val.stats.len());
-        assert_eq!(Some(1), val.stats[0].region_num);
+        assert_eq!(1, val.stats[0].region_num);
 
         handle_request_many_times(ctx.clone(), &handler, 10).await;
 
@@ -221,7 +221,7 @@ mod tests {
                 stat: Some(Stat {
                     cluster_id: 3,
                     id: 101,
-                    region_num: Some(i as _),
+                    region_num: i as _,
                     ..Default::default()
                 }),
                 ..Default::default()

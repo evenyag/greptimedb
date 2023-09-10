@@ -14,8 +14,10 @@
 
 use std::marker::PhantomData;
 
+use ::auth::UserProviderRef;
 use axum::http::{self, Request, StatusCode};
 use axum::response::Response;
+use common_catalog::consts::DEFAULT_SCHEMA_NAME;
 use common_catalog::parse_catalog_and_schema_from_db_string;
 use common_error::ext::ErrorExt;
 use common_telemetry::warn;
@@ -24,17 +26,15 @@ use headers::Header;
 use http_body::Body;
 use metrics::increment_counter;
 use secrecy::SecretString;
-use session::context::UserInfo;
-use snafu::{ensure, IntoError, OptionExt, ResultExt};
+use session::context::QueryContext;
+use snafu::{ensure, OptionExt, ResultExt};
 use tower_http::auth::AsyncAuthorizeRequest;
 
 use super::header::GreptimeDbName;
 use super::PUBLIC_APIS;
-use crate::auth::Error::IllegalParam;
-use crate::auth::{Identity, IllegalParamSnafu, UserProviderRef};
 use crate::error::{
-    self, AuthSnafu, InvalidAuthorizationHeaderSnafu, InvisibleASCIISnafu, NotFoundInfluxAuthSnafu,
-    Result, UnsupportedAuthSchemeSnafu,
+    self, InvalidAuthorizationHeaderSnafu, InvalidParameterSnafu, InvisibleASCIISnafu,
+    NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu,
 };
 use crate::http::HTTP_API_PREFIX;
 
@@ -73,12 +73,15 @@ where
     fn authorize(&mut self, mut request: Request<B>) -> Self::Future {
         let user_provider = self.user_provider.clone();
         Box::pin(async move {
+            let (catalog, schema) = extract_catalog_and_schema(&request);
+            let query_ctx = QueryContext::with(catalog, schema);
             let need_auth = need_auth(&request);
 
             let user_provider = if let Some(user_provider) = user_provider.filter(|_| need_auth) {
                 user_provider
             } else {
-                let _ = request.extensions_mut().insert(UserInfo::default());
+                query_ctx.set_current_user(Some(auth::userinfo_by_name(None)));
+                let _ = request.extensions_mut().insert(query_ctx);
                 return Ok(request);
             };
 
@@ -97,32 +100,18 @@ where
                 }
             };
 
-            let (catalog, schema) = match extract_catalog_and_schema(&request) {
-                Ok((catalog, schema)) => (catalog, schema),
-                Err(e) => {
-                    warn!("extract catalog and schema failed: {}", e);
-                    increment_counter!(
-                        crate::metrics::METRIC_AUTH_FAILURE,
-                        &[(
-                            crate::metrics::METRIC_CODE_LABEL,
-                            format!("{}", e.status_code())
-                        )]
-                    );
-                    return Err(unauthorized_resp());
-                }
-            };
-
             match user_provider
                 .auth(
-                    Identity::UserId(username.as_str(), None),
-                    crate::auth::Password::PlainText(password),
+                    ::auth::Identity::UserId(username.as_str(), None),
+                    ::auth::Password::PlainText(password),
                     catalog,
                     schema,
                 )
                 .await
             {
                 Ok(userinfo) => {
-                    let _ = request.extensions_mut().insert(userinfo);
+                    query_ctx.set_current_user(Some(userinfo));
+                    let _ = request.extensions_mut().insert(query_ctx);
                     Ok(request)
                 }
                 Err(e) => {
@@ -141,9 +130,7 @@ where
     }
 }
 
-fn extract_catalog_and_schema<B: Send + Sync + 'static>(
-    request: &Request<B>,
-) -> crate::auth::Result<(&str, &str)> {
+fn extract_catalog_and_schema<B: Send + Sync + 'static>(request: &Request<B>) -> (&str, &str) {
     // parse database from header
     let dbname = request
         .headers()
@@ -154,11 +141,9 @@ fn extract_catalog_and_schema<B: Send + Sync + 'static>(
             let query = request.uri().query().unwrap_or_default();
             extract_db_from_query(query)
         })
-        .context(IllegalParamSnafu {
-            msg: "db not provided or corrupted",
-        })?;
+        .unwrap_or(DEFAULT_SCHEMA_NAME);
 
-    Ok(parse_catalog_and_schema_from_db_string(dbname))
+    parse_catalog_and_schema_from_db_string(dbname)
 }
 
 fn get_influxdb_credentials<B: Send + Sync + 'static>(
@@ -193,9 +178,11 @@ fn get_influxdb_credentials<B: Send + Sync + 'static>(
             (Some(username), Some(password)) => {
                 Ok(Some((username.to_string(), password.to_string().into())))
             }
-            _ => Err(AuthSnafu.into_error(IllegalParam {
-                msg: "influxdb auth: username and password must be provided together".to_string(),
-            })),
+            _ => InvalidParameterSnafu {
+                reason: "influxdb auth: username and password must be provided together"
+                    .to_string(),
+            }
+            .fail(),
         }
     }
 }
@@ -411,7 +398,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        let db = extract_catalog_and_schema(&req).unwrap();
+        let db = extract_catalog_and_schema(&req);
         assert_eq!(db, ("greptime", "tomcat"));
     }
 

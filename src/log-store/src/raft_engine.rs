@@ -20,7 +20,11 @@ use store_api::logstore::namespace::Namespace;
 use crate::error::Error;
 use crate::raft_engine::protos::logstore::{EntryImpl, NamespaceImpl};
 
+mod backend;
 pub mod log_store;
+
+pub use backend::RaftEngineBackend;
+pub use raft_engine::Config;
 
 pub mod protos {
     include!(concat!(env!("OUT_DIR"), concat!("/", "protos/", "mod.rs")));

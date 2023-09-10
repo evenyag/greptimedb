@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod config;
+#![feature(let_chains)]
+
 pub mod error;
 mod noop;
 pub mod raft_engine;
 pub mod test_util;
 
-pub use config::LogConfig;
 pub use noop::NoopLogStore;

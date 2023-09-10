@@ -18,20 +18,25 @@ pub(crate) mod opener;
 pub(crate) mod version;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use common_telemetry::info;
+use common_time::util::current_time_millis;
+use store_api::metadata::RegionMetadataRef;
 use store_api::storage::RegionId;
 
+use crate::access_layer::AccessLayerRef;
 use crate::error::Result;
 use crate::manifest::manager::RegionManifestManager;
-use crate::metadata::RegionMetadataRef;
-use crate::region::version::VersionControlRef;
-
-/// Type to store region version.
-pub type VersionNumber = u32;
+use crate::region::version::{VersionControlRef, VersionRef};
+use crate::sst::file_purger::FilePurgerRef;
 
 /// Metadata and runtime status of a region.
+///
+/// Writing and reading a region follow a single-writer-multi-reader rule:
+/// - Only the region worker thread this region belongs to can modify the metadata.
+/// - Multiple reader threads are allowed to read a specific `version` of a region.
 #[derive(Debug)]
 pub(crate) struct MitoRegion {
     /// Id of this region.
@@ -42,18 +47,27 @@ pub(crate) struct MitoRegion {
 
     /// Version controller for this region.
     pub(crate) version_control: VersionControlRef,
+    /// SSTs accessor for this region.
+    pub(crate) access_layer: AccessLayerRef,
     /// Manager to maintain manifest for this region.
-    manifest_manager: RegionManifestManager,
+    pub(crate) manifest_manager: RegionManifestManager,
+    /// SST file purger.
+    pub(crate) file_purger: FilePurgerRef,
+    /// Last flush time in millis.
+    last_flush_millis: AtomicI64,
 }
 
 pub(crate) type MitoRegionRef = Arc<MitoRegion>;
 
 impl MitoRegion {
-    /// Stop background tasks for this region.
+    /// Stop background managers for this region.
     pub(crate) async fn stop(&self) -> Result<()> {
         self.manifest_manager.stop().await?;
 
-        info!("Stopped region, region_id: {}", self.region_id);
+        info!(
+            "Stopped region manifest manager, region_id: {}",
+            self.region_id
+        );
 
         Ok(())
     }
@@ -62,6 +76,23 @@ impl MitoRegion {
     pub(crate) fn metadata(&self) -> RegionMetadataRef {
         let version_data = self.version_control.current();
         version_data.version.metadata.clone()
+    }
+
+    /// Returns current version of the region.
+    pub(crate) fn version(&self) -> VersionRef {
+        let version_data = self.version_control.current();
+        version_data.version
+    }
+
+    /// Returns last flush timestamp in millis.
+    pub(crate) fn last_flush_millis(&self) -> i64 {
+        self.last_flush_millis.load(Ordering::Relaxed)
+    }
+
+    /// Update flush time to current time.
+    pub(crate) fn update_flush_millis(&self) {
+        let now = current_time_millis();
+        self.last_flush_millis.store(now, Ordering::Relaxed);
     }
 }
 

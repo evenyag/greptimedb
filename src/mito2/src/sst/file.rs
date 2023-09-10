@@ -113,6 +113,11 @@ impl fmt::Debug for FileHandle {
 }
 
 impl FileHandle {
+    pub fn new(meta: FileMeta, file_purger: FilePurgerRef) -> FileHandle {
+        FileHandle {
+            inner: Arc::new(FileHandleInner::new(meta, file_purger)),
+        }
+    }
     /// Returns the file id.
     pub fn file_id(&self) -> FileId {
         self.inner.meta.file_id
@@ -121,6 +126,16 @@ impl FileHandle {
     /// Returns the complete file path of the file.
     pub fn file_path(&self, file_dir: &str) -> String {
         join_path(file_dir, &self.file_id().as_parquet())
+    }
+
+    /// Returns the time range of the file.
+    pub fn time_range(&self) -> FileTimeRange {
+        self.inner.meta.time_range
+    }
+
+    /// Mark the file as deleted and will delete it on drop asynchronously
+    pub fn mark_deleted(&self) {
+        self.inner.deleted.store(true, Ordering::Relaxed);
     }
 }
 
@@ -141,6 +156,17 @@ impl Drop for FileHandleInner {
                 region_id: self.meta.region_id,
                 file_id: self.meta.file_id,
             });
+        }
+    }
+}
+
+impl FileHandleInner {
+    fn new(meta: FileMeta, file_purger: FilePurgerRef) -> FileHandleInner {
+        FileHandleInner {
+            meta,
+            compacting: AtomicBool::new(false),
+            deleted: AtomicBool::new(false),
+            file_purger,
         }
     }
 }

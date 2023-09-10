@@ -23,12 +23,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use client::error::ServerSnafu;
 use client::{
     Client, Database as DB, Error as ClientError, DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME,
 };
 use common_error::ext::ErrorExt;
 use common_error::snafu::ErrorCompat;
 use common_query::Output;
+use common_recordbatch::RecordBatches;
 use serde::Serialize;
 use sqlness::{Database, EnvController, QueryContext};
 use tinytemplate::TinyTemplate;
@@ -177,8 +179,10 @@ impl Env {
                     subcommand.to_string(),
                     "start".to_string(),
                     "--use-memory-store".to_string(),
+                    "true".to_string(),
                     "--http-addr=127.0.0.1:5001".to_string(),
                     "--disable-region-failover".to_string(),
+                    "true".to_string(),
                 ];
                 (args, METASRV_ADDR.to_string())
             }
@@ -199,6 +203,7 @@ impl Env {
 
         let mut process = Command::new(program)
             .current_dir(util::get_binary_dir("debug"))
+            .env("TZ", "UTC")
             .args(args)
             .stdout(log_file)
             .spawn()
@@ -356,7 +361,21 @@ impl Database for GreptimeDB {
                 result: Ok(Output::AffectedRows(0)),
             }) as _
         } else {
-            let result = client.sql(&query).await;
+            let mut result = client.sql(&query).await;
+            if let Ok(Output::Stream(stream)) = result {
+                match RecordBatches::try_collect(stream).await {
+                    Ok(recordbatches) => result = Ok(Output::RecordBatches(recordbatches)),
+                    Err(e) => {
+                        let status_code = e.status_code();
+                        let source_error = e.iter_chain().last().unwrap();
+                        result = ServerSnafu {
+                            code: status_code,
+                            msg: source_error.to_string(),
+                        }
+                        .fail();
+                    }
+                }
+            }
             Box::new(ResultDisplayer { result }) as _
         }
     }

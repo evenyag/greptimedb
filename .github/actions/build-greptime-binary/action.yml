@@ -32,6 +32,10 @@ inputs:
     description: Upload to S3
     required: false
     default: 'true'
+  upload-latest-artifacts:
+    description: Upload the latest artifacts to S3
+    required: false
+    default: 'true'
   working-dir:
     description: Working directory to build the artifacts
     required: false
@@ -43,7 +47,7 @@ runs:
       shell: bash
       run: |
         cd ${{ inputs.working-dir }} && \
-        make build-greptime-by-buildx \
+        make build-by-dev-builder \
           CARGO_PROFILE=${{ inputs.cargo-profile }} \
           FEATURES=${{ inputs.features }} \
           BASE_IMAGE=${{ inputs.base-image }}
@@ -52,11 +56,12 @@ runs:
       uses: ./.github/actions/upload-artifacts
       with:
         artifacts-dir: ${{ inputs.artifacts-dir }}
-        target-file: ./greptime
+        target-file: ./target/${{ inputs.cargo-profile }}/greptime
         version: ${{ inputs.version }}
         release-to-s3-bucket: ${{ inputs.release-to-s3-bucket }}
         aws-access-key-id: ${{ inputs.aws-access-key-id }}
         aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
         aws-region: ${{ inputs.aws-region }}
         upload-to-s3: ${{ inputs.upload-to-s3 }}
+        upload-latest-artifacts: ${{ inputs.upload-latest-artifacts }}
         working-dir: ${{ inputs.working-dir }}

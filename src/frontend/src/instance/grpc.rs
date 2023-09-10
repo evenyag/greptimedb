@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use api::v1::ddl_request::Expr as DdlExpr;
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use async_trait::async_trait;
+use auth::{PermissionChecker, PermissionCheckerRef, PermissionReq};
+use common_meta::table_name::TableName;
 use common_query::Output;
 use query::parser::PromQuery;
 use servers::interceptor::{GrpcQueryInterceptor, GrpcQueryInterceptorRef};
 use servers::query_handler::grpc::GrpcQueryHandler;
 use servers::query_handler::sql::SqlQueryHandler;
 use session::context::QueryContextRef;
-use snafu::{ensure, OptionExt};
+use snafu::{ensure, OptionExt, ResultExt};
 
-use crate::error::{Error, IncompleteGrpcResultSnafu, NotSupportedSnafu, Result};
+use crate::error::{
+    self, Error, IncompleteGrpcResultSnafu, NotSupportedSnafu, PermissionSnafu, Result,
+};
 use crate::instance::Instance;
 
 #[async_trait]
@@ -35,8 +40,17 @@ impl GrpcQueryHandler for Instance {
         let interceptor = interceptor_ref.as_ref();
         interceptor.pre_execute(&request, ctx.clone())?;
 
+        self.plugins
+            .get::<PermissionCheckerRef>()
+            .as_ref()
+            .check_permission(ctx.current_user(), PermissionReq::GrpcRequest(&request))
+            .context(PermissionSnafu)?;
+
         let output = match request {
             Request::Inserts(requests) => self.handle_inserts(requests, ctx.clone()).await?,
+            Request::RowInserts(requests) => self.handle_row_inserts(requests, ctx.clone()).await?,
+            Request::Deletes(requests) => self.handle_deletes(requests, ctx.clone()).await?,
+            Request::RowDeletes(requests) => self.handle_row_deletes(requests, ctx.clone()).await?,
             Request::Query(query_request) => {
                 let query = query_request.query.context(IncompleteGrpcResultSnafu {
                     err_msg: "Missing field 'QueryRequest.query'",
@@ -77,9 +91,41 @@ impl GrpcQueryHandler for Instance {
                     }
                 }
             }
-            Request::Ddl(_) | Request::Delete(_) => {
-                GrpcQueryHandler::do_query(self.grpc_query_handler.as_ref(), request, ctx.clone())
-                    .await?
+            Request::Ddl(request) => {
+                let expr = request.expr.context(error::UnexpectedSnafu {
+                    violated: "expected expr",
+                })?;
+
+                match expr {
+                    DdlExpr::CreateTable(mut expr) => {
+                        // TODO(weny): supports to create multiple region table.
+                        let _ = self
+                            .statement_executor
+                            .create_table_inner(&mut expr, None)
+                            .await?;
+                        Output::AffectedRows(0)
+                    }
+                    DdlExpr::Alter(expr) => self.statement_executor.alter_table_inner(expr).await?,
+                    DdlExpr::CreateDatabase(expr) => {
+                        self.statement_executor
+                            .create_database(
+                                ctx.current_catalog(),
+                                &expr.database_name,
+                                expr.create_if_not_exists,
+                            )
+                            .await?
+                    }
+                    DdlExpr::DropTable(expr) => {
+                        let table_name =
+                            TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
+                        self.statement_executor.drop_table(table_name).await?
+                    }
+                    DdlExpr::TruncateTable(expr) => {
+                        let table_name =
+                            TableName::new(&expr.catalog_name, &expr.schema_name, &expr.table_name);
+                        self.statement_executor.truncate_table(table_name).await?
+                    }
+                }
             }
         };
 

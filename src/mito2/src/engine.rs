@@ -15,20 +15,38 @@
 //! Mito region engine.
 
 #[cfg(test)]
+mod close_test;
+#[cfg(test)]
+mod create_test;
+#[cfg(test)]
+mod drop_test;
+#[cfg(test)]
+mod flush_test;
+#[cfg(test)]
+pub(crate) mod listener;
+#[cfg(test)]
+mod open_test;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use common_error::ext::BoxedError;
+use common_query::Output;
+use common_recordbatch::SendableRecordBatchStream;
 use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt};
 use store_api::logstore::LogStore;
-use store_api::storage::RegionId;
+use store_api::metadata::RegionMetadataRef;
+use store_api::region_engine::RegionEngine;
+use store_api::region_request::RegionRequest;
+use store_api::storage::{RegionId, ScanRequest};
 
 use crate::config::MitoConfig;
 use crate::error::{RecvSnafu, RegionNotFoundSnafu, Result};
-use crate::request::{
-    CloseRequest, CreateRequest, OpenRequest, RegionRequest, RequestBody, WriteRequest,
-};
+use crate::read::scan_region::{ScanRegion, Scanner};
+use crate::request::WorkerRequest;
 use crate::worker::WorkerGroup;
 
 /// Region engine implementation for timeseries data.
@@ -59,52 +77,18 @@ impl MitoEngine {
         self.inner.stop().await
     }
 
-    /// Creates a new region.
-    pub async fn create_region(&self, create_request: CreateRequest) -> Result<()> {
-        self.inner
-            .handle_request_body(RequestBody::Create(create_request))
-            .await
-    }
-
-    /// Opens an existing region.
-    ///
-    /// Returns error if the region does not exist.
-    pub async fn open_region(&self, open_request: OpenRequest) -> Result<()> {
-        self.inner
-            .handle_request_body(RequestBody::Open(open_request))
-            .await
-    }
-
-    /// Closes a region.
-    ///
-    /// Does nothing if the region is already closed.
-    pub async fn close_region(&self, close_request: CloseRequest) -> Result<()> {
-        self.inner
-            .handle_request_body(RequestBody::Close(close_request))
-            .await
-    }
-
     /// Returns true if the specific region exists.
     pub fn is_region_exists(&self, region_id: RegionId) -> bool {
         self.inner.workers.is_region_exists(region_id)
     }
 
-    /// Write to a region.
-    pub async fn write_region(&self, mut write_request: WriteRequest) -> Result<()> {
-        let region = self
-            .inner
-            .workers
-            .get_region(write_request.region_id)
-            .context(RegionNotFoundSnafu {
-                region_id: write_request.region_id,
-            })?;
-        let metadata = region.metadata();
+    fn scan(&self, region_id: RegionId, request: ScanRequest) -> Result<Scanner> {
+        self.inner.handle_query(region_id, request)
+    }
 
-        write_request.fill_missing_columns(&metadata)?;
-
-        self.inner
-            .handle_request_body(RequestBody::Write(write_request))
-            .await
+    #[cfg(test)]
+    pub(crate) fn get_region(&self, id: RegionId) -> Option<crate::region::MitoRegionRef> {
+        self.inner.workers.get_region(id)
     }
 }
 
@@ -131,11 +115,102 @@ impl EngineInner {
         self.workers.stop().await
     }
 
-    /// Handles [RequestBody] and return its executed result.
-    async fn handle_request_body(&self, body: RequestBody) -> Result<()> {
-        let (request, receiver) = RegionRequest::from_body(body);
-        self.workers.submit_to_worker(request).await?;
+    /// Get metadata of a region.
+    ///
+    /// Returns error if the region doesn't exist.
+    fn get_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef> {
+        // Reading a region doesn't need to go through the region worker thread.
+        let region = self
+            .workers
+            .get_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })?;
+        Ok(region.metadata())
+    }
+
+    /// Handles [RegionRequest] and return its executed result.
+    async fn handle_request(&self, region_id: RegionId, request: RegionRequest) -> Result<Output> {
+        let (request, receiver) = WorkerRequest::try_from_region_request(region_id, request)?;
+        self.workers.submit_to_worker(region_id, request).await?;
 
         receiver.await.context(RecvSnafu)?
+    }
+
+    /// Handles the scan `request` and returns a [Scanner] for the `request`.
+    fn handle_query(&self, region_id: RegionId, request: ScanRequest) -> Result<Scanner> {
+        // Reading a region doesn't need to go through the region worker thread.
+        let region = self
+            .workers
+            .get_region(region_id)
+            .context(RegionNotFoundSnafu { region_id })?;
+        let version = region.version();
+        let scan_region = ScanRegion::new(version, region.access_layer.clone(), request);
+
+        scan_region.scanner()
+    }
+}
+
+#[async_trait]
+impl RegionEngine for MitoEngine {
+    fn name(&self) -> &str {
+        "mito"
+    }
+
+    async fn handle_request(
+        &self,
+        region_id: RegionId,
+        request: RegionRequest,
+    ) -> std::result::Result<Output, BoxedError> {
+        self.inner
+            .handle_request(region_id, request)
+            .await
+            .map_err(BoxedError::new)
+    }
+
+    /// Handle substrait query and return a stream of record batches
+    async fn handle_query(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> std::result::Result<SendableRecordBatchStream, BoxedError> {
+        self.scan(region_id, request)
+            .map_err(BoxedError::new)?
+            .scan()
+            .await
+            .map_err(BoxedError::new)
+    }
+
+    /// Retrieve region's metadata.
+    async fn get_metadata(
+        &self,
+        region_id: RegionId,
+    ) -> std::result::Result<RegionMetadataRef, BoxedError> {
+        self.inner.get_metadata(region_id).map_err(BoxedError::new)
+    }
+}
+
+// Tests methods.
+#[cfg(test)]
+impl MitoEngine {
+    /// Returns a new [MitoEngine] for tests.
+    pub fn new_for_test<S: LogStore>(
+        mut config: MitoConfig,
+        log_store: Arc<S>,
+        object_store: ObjectStore,
+        write_buffer_manager: crate::flush::WriteBufferManagerRef,
+        listener: Option<crate::engine::listener::EventListenerRef>,
+    ) -> MitoEngine {
+        config.sanitize();
+
+        MitoEngine {
+            inner: Arc::new(EngineInner {
+                workers: WorkerGroup::start_for_test(
+                    config,
+                    log_store,
+                    object_store,
+                    write_buffer_manager,
+                    listener,
+                ),
+            }),
+        }
     }
 }

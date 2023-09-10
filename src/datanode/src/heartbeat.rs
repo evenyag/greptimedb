@@ -16,22 +16,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::v1::meta::{HeartbeatRequest, NodeStat, Peer};
-use catalog::remote::region_alive_keeper::RegionAliveKeepers;
-use catalog::{datanode_stat, CatalogManagerRef};
+use api::v1::meta::{HeartbeatRequest, Peer, RegionStat, Role};
+use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
+use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::{
-    HeartbeatResponseHandlerContext, HeartbeatResponseHandlerExecutorRef,
+    HandlerGroupExecutor, HeartbeatResponseHandlerContext, HeartbeatResponseHandlerExecutorRef,
 };
 use common_meta::heartbeat::mailbox::{HeartbeatMailbox, MailboxRef};
 use common_meta::heartbeat::utils::outgoing_message_to_mailbox_message;
 use common_telemetry::{debug, error, info, trace, warn};
-use meta_client::client::{HeartbeatSender, MetaClient};
-use snafu::ResultExt;
+use meta_client::client::{HeartbeatSender, MetaClient, MetaClientBuilder};
+use meta_client::MetaClientOptions;
+use snafu::{OptionExt, ResultExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use self::handler::RegionHeartbeatResponseHandler;
+use crate::alive_keeper::RegionAliveKeeper;
 use crate::datanode::DatanodeOptions;
-use crate::error::{self, MetaClientInitSnafu, Result};
+use crate::error::{
+    self, MetaClientInitSnafu, MissingMetasrvOptsSnafu, MissingNodeIdSnafu, Result,
+};
+use crate::region_server::RegionServer;
 
 pub(crate) mod handler;
 
@@ -42,10 +48,10 @@ pub struct HeartbeatTask {
     server_hostname: Option<String>,
     running: Arc<AtomicBool>,
     meta_client: Arc<MetaClient>,
-    catalog_manager: CatalogManagerRef,
+    region_server: RegionServer,
     interval: u64,
     resp_handler_executor: HeartbeatResponseHandlerExecutorRef,
-    region_alive_keepers: Arc<RegionAliveKeepers>,
+    region_alive_keeper: Arc<RegionAliveKeeper>,
 }
 
 impl Drop for HeartbeatTask {
@@ -56,28 +62,44 @@ impl Drop for HeartbeatTask {
 
 impl HeartbeatTask {
     /// Create a new heartbeat task instance.
-    pub fn new(
-        node_id: u64,
+    pub async fn try_new(
         opts: &DatanodeOptions,
-        meta_client: Arc<MetaClient>,
-        catalog_manager: CatalogManagerRef,
-        resp_handler_executor: HeartbeatResponseHandlerExecutorRef,
-        heartbeat_interval_millis: u64,
-        region_alive_keepers: Arc<RegionAliveKeepers>,
-    ) -> Self {
-        Self {
-            node_id,
+        // TODO: remove optional
+        region_server: Option<RegionServer>,
+    ) -> Result<Self> {
+        let meta_client = new_metasrv_client(
+            opts.node_id.context(MissingNodeIdSnafu)?,
+            opts.meta_client_options
+                .as_ref()
+                .context(MissingMetasrvOptsSnafu)?,
+        )
+        .await?;
+
+        let region_server = region_server.unwrap();
+
+        let region_alive_keeper = Arc::new(RegionAliveKeeper::new(
+            region_server.clone(),
+            opts.heartbeat.interval_millis,
+        ));
+        let resp_handler_executor = Arc::new(HandlerGroupExecutor::new(vec![
+            Arc::new(ParseMailboxMessageHandler),
+            Arc::new(RegionHeartbeatResponseHandler::new(region_server.clone())),
+            region_alive_keeper.clone(),
+        ]));
+
+        Ok(Self {
+            node_id: opts.node_id.unwrap_or(0),
             // We use datanode's start time millis as the node's epoch.
             node_epoch: common_time::util::current_time_millis() as u64,
             server_addr: opts.rpc_addr.clone(),
             server_hostname: opts.rpc_hostname.clone(),
             running: Arc::new(AtomicBool::new(false)),
-            meta_client,
-            catalog_manager,
-            interval: heartbeat_interval_millis,
+            meta_client: Arc::new(meta_client),
+            region_server,
+            interval: opts.heartbeat.interval_millis,
             resp_handler_executor,
-            region_alive_keepers,
-        }
+            region_alive_keeper,
+        })
     }
 
     pub async fn create_streams(
@@ -141,10 +163,10 @@ impl HeartbeatTask {
         let addr = resolve_addr(&self.server_addr, &self.server_hostname);
         info!("Starting heartbeat to Metasrv with interval {interval}. My node id is {node_id}, address is {addr}.");
 
-        self.region_alive_keepers.start().await;
+        self.region_alive_keeper.start().await;
 
         let meta_client = self.meta_client.clone();
-        let catalog_manager_clone = self.catalog_manager.clone();
+        let region_server_clone = self.region_server.clone();
 
         let handler_executor = self.resp_handler_executor.clone();
 
@@ -159,13 +181,13 @@ impl HeartbeatTask {
         )
         .await?;
 
-        let epoch = self.region_alive_keepers.epoch();
-        let _handle = common_runtime::spawn_bg(async move {
+        let epoch = self.region_alive_keeper.epoch();
+        common_runtime::spawn_bg(async move {
             let sleep = tokio::time::sleep(Duration::from_millis(0));
             tokio::pin!(sleep);
 
             loop {
-                if !running.load(Ordering::Acquire) {
+                if !running.load(Ordering::Relaxed) {
                     info!("shutdown heartbeat task");
                     break;
                 }
@@ -194,15 +216,12 @@ impl HeartbeatTask {
                         }
                     }
                     _ = &mut sleep => {
-                        let (region_num, region_stats) = datanode_stat(&catalog_manager_clone).await;
+                        // TODO(jeremy): refactor load_status
+                        let (_,region_stats) = Self::load_stats(&region_server_clone).await;
                         let req = HeartbeatRequest {
                             peer: Some(Peer {
                                 id: node_id,
                                 addr: addr.clone(),
-                            }),
-                            node_stat: Some(NodeStat {
-                                region_num: region_num as _,
-                                ..Default::default()
                             }),
                             region_stats,
                             duration_since_epoch: (Instant::now() - epoch).as_millis() as u64,
@@ -241,6 +260,21 @@ impl HeartbeatTask {
         Ok(())
     }
 
+    async fn load_stats(region_server: &RegionServer) -> (u64, Vec<RegionStat>) {
+        let region_ids = region_server.opened_region_ids();
+        let region_stats = region_ids
+            .into_iter()
+            .map(|region_id| RegionStat {
+                // TODO(ruihang): scratch more info
+                region_id: region_id.as_u64(),
+                engine: "MitoEngine".to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        (region_stats.len() as _, region_stats)
+    }
+
     pub async fn close(&self) -> Result<()> {
         let running = self.running.clone();
         if running
@@ -271,6 +305,39 @@ fn resolve_addr(bind_addr: &str, hostname_addr: &Option<String>) -> String {
         }
         None => bind_addr.to_owned(),
     }
+}
+
+/// Create metasrv client instance and spawn heartbeat loop.
+pub async fn new_metasrv_client(
+    node_id: u64,
+    meta_config: &MetaClientOptions,
+) -> Result<MetaClient> {
+    let cluster_id = 0; // TODO(hl): read from config
+    let member_id = node_id;
+
+    let config = ChannelConfig::new()
+        .timeout(Duration::from_millis(meta_config.timeout_millis))
+        .connect_timeout(Duration::from_millis(meta_config.connect_timeout_millis))
+        .tcp_nodelay(meta_config.tcp_nodelay);
+    let channel_manager = ChannelManager::with_config(config);
+
+    let mut meta_client = MetaClientBuilder::new(cluster_id, member_id, Role::Datanode)
+        .enable_heartbeat()
+        .enable_router()
+        .enable_store()
+        .channel_manager(channel_manager)
+        .build();
+    meta_client
+        .start(&meta_config.metasrv_addrs)
+        .await
+        .context(MetaClientInitSnafu)?;
+
+    // required only when the heartbeat_client is enabled
+    meta_client
+        .ask_leader()
+        .await
+        .context(MetaClientInitSnafu)?;
+    Ok(meta_client)
 }
 
 #[cfg(test)]

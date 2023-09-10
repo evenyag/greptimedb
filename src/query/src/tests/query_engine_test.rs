@@ -47,7 +47,7 @@ async fn test_datafusion_query_engine() -> Result<()> {
     let catalog_list = catalog::local::new_memory_catalog_manager()
         .map_err(BoxedError::new)
         .context(QueryExecutionSnafu)?;
-    let factory = QueryEngineFactory::new(catalog_list, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, false);
     let engine = factory.query_engine();
 
     let column_schemas = vec![ColumnSchema::new(
@@ -60,7 +60,7 @@ async fn test_datafusion_query_engine() -> Result<()> {
         (0..100).collect::<Vec<_>>(),
     ))];
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = Arc::new(MemTable::new("numbers", recordbatch));
+    let table = MemTable::table("numbers", recordbatch);
 
     let limit = 10;
     let table_provider = Arc::new(DfTableProviderAdapter::new(table.clone()));
@@ -110,7 +110,7 @@ fn catalog_manager() -> Result<Arc<MemoryCatalogManager>> {
         schema: DEFAULT_SCHEMA_NAME.to_string(),
         table_name: NUMBERS_TABLE_NAME.to_string(),
         table_id: NUMBERS_TABLE_ID,
-        table: Arc::new(NumbersTable::default()),
+        table: NumbersTable::table(NUMBERS_TABLE_ID),
     };
     let _ = catalog_manager.register_table_sync(req).unwrap();
 
@@ -129,7 +129,7 @@ async fn test_query_validate() -> Result<()> {
     });
     let plugins = Arc::new(plugins);
 
-    let factory = QueryEngineFactory::new_with_plugins(catalog_list, false, None, None, plugins);
+    let factory = QueryEngineFactory::new_with_plugins(catalog_list, None, false, plugins);
     let engine = factory.query_engine();
 
     let stmt = QueryLanguageParser::parse_sql("select number from public.numbers").unwrap();
@@ -153,7 +153,7 @@ async fn test_udf() -> Result<()> {
     common_telemetry::init_default_ut_logging();
     let catalog_list = catalog_manager()?;
 
-    let factory = QueryEngineFactory::new(catalog_list, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, false);
     let engine = factory.query_engine();
 
     let pow = make_scalar_function(pow);

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common_runtime::error::{Error, Result};
-use common_runtime::{BoxedTaskFunction, RepeatedTask, Runtime, TaskFunction};
+use common_runtime::{BoxedTaskFunction, RepeatedTask, TaskFunction};
 use common_telemetry::{debug, info};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
@@ -49,11 +49,12 @@ impl GreptimeDBTelemetryTask {
         GreptimeDBTelemetryTask::Disable
     }
 
-    pub fn start(&self, runtime: Runtime) -> Result<()> {
-        print_anonymous_usage_data_disclaimer();
-
+    pub fn start(&self) -> Result<()> {
         match self {
-            GreptimeDBTelemetryTask::Enable(task) => task.start(runtime),
+            GreptimeDBTelemetryTask::Enable(task) => {
+                print_anonymous_usage_data_disclaimer();
+                task.start(common_runtime::bg_runtime())
+            }
             GreptimeDBTelemetryTask::Disable => Ok(()),
         }
     }
@@ -412,6 +413,6 @@ mod tests {
         let uuid = default_get_uuid(&Some(working_home.clone()));
         assert!(uuid.is_some());
         assert_eq!(uuid, default_get_uuid(&Some(working_home.clone())));
-        assert_eq!(uuid, default_get_uuid(&Some(working_home.clone())));
+        assert_eq!(uuid, default_get_uuid(&Some(working_home)));
     }
 }

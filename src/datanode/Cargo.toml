@@ -9,14 +9,17 @@ testing = ["meta-srv/mock"]
 
 [dependencies]
 api = { workspace = true }
+arrow-flight.workspace = true
 async-compat = "0.2"
 async-stream.workspace = true
 async-trait.workspace = true
 axum = "0.6"
 axum-macros = "0.3"
+bytes = "1.1"
 catalog = { workspace = true }
 common-base = { workspace = true }
 common-catalog = { workspace = true }
+common-config = { workspace = true }
 common-datasource = { workspace = true }
 common-error = { workspace = true }
 common-function = { workspace = true }
@@ -30,6 +33,7 @@ common-recordbatch = { workspace = true }
 common-runtime = { workspace = true }
 common-telemetry = { workspace = true }
 common-time = { workspace = true }
+dashmap = "5.4"
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion.workspace = true
@@ -37,7 +41,7 @@ datatypes = { workspace = true }
 file-table-engine = { workspace = true }
 futures = "0.3"
 futures-util.workspace = true
-humantime-serde = "1.1"
+humantime-serde.workspace = true
 hyper = { version = "0.14", features = ["full"] }
 key-lock = "0.1"
 log-store = { workspace = true }
@@ -45,10 +49,12 @@ meta-client = { workspace = true }
 meta-srv = { workspace = true }
 metrics.workspace = true
 mito = { workspace = true }
+mito2 = { workspace = true }
 object-store = { workspace = true }
 pin-project = "1.0"
 prost.workspace = true
 query = { workspace = true }
+reqwest = { workspace = true }
 secrecy = { version = "0.8", features = ["serde", "alloc"] }
 serde.workspace = true
 serde_json = "1.0"
@@ -76,5 +82,6 @@ client = { workspace = true }
 common-query = { workspace = true }
 common-test-util = { workspace = true }
 datafusion-common.workspace = true
+meta-srv = { workspace = true, features = ["mock"] }
 mito = { workspace = true, features = ["test"] }
 session = { workspace = true }

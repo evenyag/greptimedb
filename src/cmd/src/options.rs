@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use common_config::KvStoreConfig;
 use common_telemetry::logging::LoggingOptions;
 use config::{Config, Environment, File, FileFormat};
-use datanode::datanode::DatanodeOptions;
+use datanode::datanode::{DatanodeOptions, ProcedureConfig};
 use frontend::frontend::FrontendOptions;
 use meta_srv::metasrv::MetaSrvOptions;
 use serde::{Deserialize, Serialize};
@@ -26,9 +27,12 @@ pub const ENV_VAR_SEP: &str = "__";
 pub const ENV_LIST_SEP: &str = ",";
 
 pub struct MixOptions {
+    pub data_home: String,
+    pub procedure_cfg: ProcedureConfig,
+    pub kv_store_cfg: KvStoreConfig,
     pub fe_opts: FrontendOptions,
     pub dn_opts: DatanodeOptions,
-    pub logging: LoggingOptions,
+    pub logging_opts: LoggingOptions,
 }
 
 pub enum Options {
@@ -51,7 +55,7 @@ impl Options {
             Options::Datanode(opts) => &opts.logging,
             Options::Frontend(opts) => &opts.logging,
             Options::Metasrv(opts) => &opts.logging,
-            Options::Standalone(opts) => &opts.logging,
+            Options::Standalone(opts) => &opts.logging_opts,
             Options::Cli(opts) => opts,
         }
     }
@@ -202,17 +206,6 @@ mod tests {
                     Some("42s"),
                 ),
                 (
-                    // storage.manifest.checkpoint_on_startup = true
-                    [
-                        env_prefix.to_string(),
-                        "storage".to_uppercase(),
-                        "manifest".to_uppercase(),
-                        "checkpoint_on_startup".to_uppercase(),
-                    ]
-                    .join(ENV_VAR_SEP),
-                    Some("true"),
-                ),
-                (
                     // wal.dir = /other/wal/dir
                     [
                         env_prefix.to_string(),
@@ -253,7 +246,6 @@ mod tests {
                     opts.storage.manifest.gc_duration,
                     Some(Duration::from_secs(42))
                 );
-                assert!(opts.storage.manifest.checkpoint_on_startup);
                 assert_eq!(
                     opts.meta_client_options.unwrap().metasrv_addrs,
                     vec![
@@ -262,9 +254,6 @@ mod tests {
                         "127.0.0.1:3003".to_string()
                     ]
                 );
-
-                // Should be the values from config file, not environment variables.
-                assert_eq!(opts.wal.dir.unwrap(), "/tmp/greptimedb/wal");
 
                 // Should be default values.
                 assert_eq!(opts.node_id, None);

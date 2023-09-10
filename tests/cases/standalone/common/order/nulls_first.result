@@ -1,4 +1,4 @@
-CREATE TABLE test(i INTEGER, j INTEGER, t BIGINT TIME INDEX);
+CREATE TABLE test(i INTEGER, j INTEGER, t TIMESTAMP TIME INDEX);
 
 Affected Rows: 0
 
@@ -8,85 +8,101 @@ Affected Rows: 3
 
 SELECT * FROM test ORDER BY i NULLS FIRST, j NULLS LAST;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-|   | 1 | 2 |
-| 1 | 1 | 1 |
-| 1 |   | 3 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+|   | 1 | 1970-01-01T00:00:00.002 |
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+| 1 |   | 1970-01-01T00:00:00.003 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i NULLS FIRST, j NULLS FIRST;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-|   | 1 | 2 |
-| 1 |   | 3 |
-| 1 | 1 | 1 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+|   | 1 | 1970-01-01T00:00:00.002 |
+| 1 |   | 1970-01-01T00:00:00.003 |
+| 1 | 1 | 1970-01-01T00:00:00.001 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i NULLS LAST, j NULLS FIRST;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-| 1 |   | 3 |
-| 1 | 1 | 1 |
-|   | 1 | 2 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+| 1 |   | 1970-01-01T00:00:00.003 |
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+|   | 1 | 1970-01-01T00:00:00.002 |
++---+---+-------------------------+
 
--- TODO(ruihang): The following two SQL will fail under distributed mode with error
--- Error: 1003(Internal), status: Internal, message: "Failed to collect recordbatch, source: Failed to poll stream, source: Arrow error: Invalid argument error: batches[0] schema is different with argument schema.\n            batches[0] schema: Schema { fields: [Field { name: \"i\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: \"j\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: \"t\", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {\"greptime:time_index\": \"true\"} }], metadata: {\"greptime:version\": \"0\"} },\n            argument schema: Schema { fields: [Field { name: \"i\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: \"j\", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: \"t\", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {\"greptime:time_index\": \"true\"} }], metadata: {} }\n            ", details: [], metadata: MetadataMap { headers: {"inner_error_code": "Internal"} }
--- SELECT i, j, row_number() OVER (PARTITION BY i ORDER BY j NULLS FIRST) FROM test ORDER BY i NULLS FIRST, j NULLS FIRST;
--- SELECT i, j, row_number() OVER (PARTITION BY i ORDER BY j NULLS LAST) FROM test ORDER BY i NULLS FIRST, j NULLS FIRST;
+SELECT i, j, row_number() OVER (PARTITION BY i ORDER BY j NULLS FIRST) FROM test ORDER BY i NULLS FIRST, j NULLS FIRST;
+
++---+---+------------------------------------------------------------------------------------------------------------------------+
+| i | j | ROW_NUMBER() PARTITION BY [test.i] ORDER BY [test.j ASC NULLS FIRST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW |
++---+---+------------------------------------------------------------------------------------------------------------------------+
+|   | 1 | 1                                                                                                                      |
+| 1 |   | 1                                                                                                                      |
+| 1 | 1 | 2                                                                                                                      |
++---+---+------------------------------------------------------------------------------------------------------------------------+
+
+SELECT i, j, row_number() OVER (PARTITION BY i ORDER BY j NULLS LAST) FROM test ORDER BY i NULLS FIRST, j NULLS FIRST;
+
++---+---+-----------------------------------------------------------------------------------------------------------------------+
+| i | j | ROW_NUMBER() PARTITION BY [test.i] ORDER BY [test.j ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW |
++---+---+-----------------------------------------------------------------------------------------------------------------------+
+|   | 1 | 1                                                                                                                     |
+| 1 |   | 2                                                                                                                     |
+| 1 | 1 | 1                                                                                                                     |
++---+---+-----------------------------------------------------------------------------------------------------------------------+
+
 SELECT * FROM test ORDER BY i NULLS FIRST, j NULLS LAST LIMIT 2;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-|   | 1 | 2 |
-| 1 | 1 | 1 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+|   | 1 | 1970-01-01T00:00:00.002 |
+| 1 | 1 | 1970-01-01T00:00:00.001 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i NULLS LAST, j NULLS LAST LIMIT 2;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-| 1 | 1 | 1 |
-| 1 |   | 3 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+| 1 |   | 1970-01-01T00:00:00.003 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-| 1 | 1 | 1 |
-| 1 |   | 3 |
-|   | 1 | 2 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+| 1 |   | 1970-01-01T00:00:00.003 |
+|   | 1 | 1970-01-01T00:00:00.002 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i NULLS FIRST;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-|   | 1 | 2 |
-| 1 | 1 | 1 |
-| 1 |   | 3 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+|   | 1 | 1970-01-01T00:00:00.002 |
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+| 1 |   | 1970-01-01T00:00:00.003 |
++---+---+-------------------------+
 
 SELECT * FROM test ORDER BY i NULLS LAST;
 
-+---+---+---+
-| i | j | t |
-+---+---+---+
-| 1 | 1 | 1 |
-| 1 |   | 3 |
-|   | 1 | 2 |
-+---+---+---+
++---+---+-------------------------+
+| i | j | t                       |
++---+---+-------------------------+
+| 1 | 1 | 1970-01-01T00:00:00.001 |
+| 1 |   | 1970-01-01T00:00:00.003 |
+|   | 1 | 1970-01-01T00:00:00.002 |
++---+---+-------------------------+
 
 DROP TABLE test;
 

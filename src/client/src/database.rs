@@ -17,20 +17,23 @@ use api::v1::ddl_request::Expr as DdlExpr;
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use api::v1::{
-    AlterExpr, AuthHeader, CompactTableExpr, CreateTableExpr, DdlRequest, DeleteRequest,
-    DropTableExpr, FlushTableExpr, GreptimeRequest, InsertRequests, PromRangeQuery, QueryRequest,
-    RequestHeader, TruncateTableExpr,
+    AlterExpr, AuthHeader, CreateTableExpr, DdlRequest, DeleteRequests, DropTableExpr,
+    GreptimeRequest, InsertRequests, PromRangeQuery, QueryRequest, RequestHeader,
+    RowInsertRequests, TruncateTableExpr,
 };
-use arrow_flight::{FlightData, Ticket};
+use arrow_flight::Ticket;
+use async_stream::stream;
 use common_error::ext::{BoxedError, ErrorExt};
-use common_grpc::flight::{flight_messages_to_recordbatches, FlightDecoder, FlightMessage};
+use common_grpc::flight::{FlightDecoder, FlightMessage};
 use common_query::Output;
+use common_recordbatch::error::ExternalSnafu;
+use common_recordbatch::RecordBatchStreamAdaptor;
 use common_telemetry::{logging, timer};
-use futures_util::{TryFutureExt, TryStreamExt};
+use futures_util::StreamExt;
 use prost::Message;
 use snafu::{ensure, ResultExt};
 
-use crate::error::{ConvertFlightDataSnafu, IllegalFlightMessagesSnafu, ServerSnafu};
+use crate::error::{ConvertFlightDataSnafu, Error, IllegalFlightMessagesSnafu, ServerSnafu};
 use crate::{error, from_grpc_response, metrics, Client, Result, StreamInserter};
 
 #[derive(Clone, Debug, Default)]
@@ -112,6 +115,11 @@ impl Database {
         self.handle(Request::Inserts(requests)).await
     }
 
+    pub async fn row_insert(&self, requests: RowInsertRequests) -> Result<u32> {
+        let _timer = timer!(metrics::METRIC_GRPC_INSERT);
+        self.handle(Request::RowInserts(requests)).await
+    }
+
     pub fn streaming_inserter(&self) -> Result<StreamInserter> {
         self.streaming_inserter_with_channel_size(65536)
     }
@@ -132,20 +140,20 @@ impl Database {
         Ok(stream_inserter)
     }
 
-    pub async fn delete(&self, request: DeleteRequest) -> Result<u32> {
+    pub async fn delete(&self, request: DeleteRequests) -> Result<u32> {
         let _timer = timer!(metrics::METRIC_GRPC_DELETE);
-        self.handle(Request::Delete(request)).await
+        self.handle(Request::Deletes(request)).await
     }
 
     async fn handle(&self, request: Request) -> Result<u32> {
         let mut client = self.client.make_database_client()?.inner;
-        let request = self.to_rpc_request(request, None);
+        let request = self.to_rpc_request(request, 0);
         let response = client.handle(request).await?.into_inner();
         from_grpc_response(response)
     }
 
     #[inline]
-    fn to_rpc_request(&self, request: Request, trace_id: Option<u64>) -> GreptimeRequest {
+    fn to_rpc_request(&self, request: Request, trace_id: u64) -> GreptimeRequest {
         GreptimeRequest {
             header: Some(RequestHeader {
                 catalog: self.catalog.clone(),
@@ -153,7 +161,7 @@ impl Database {
                 authorization: self.ctx.auth_header.clone(),
                 dbname: self.dbname.clone(),
                 trace_id,
-                span_id: None,
+                span_id: 0,
             }),
             request: Some(request),
         }
@@ -165,16 +173,12 @@ impl Database {
             Request::Query(QueryRequest {
                 query: Some(Query::Sql(sql.to_string())),
             }),
-            None,
+            0,
         )
         .await
     }
 
-    pub async fn logical_plan(
-        &self,
-        logical_plan: Vec<u8>,
-        trace_id: Option<u64>,
-    ) -> Result<Output> {
+    pub async fn logical_plan(&self, logical_plan: Vec<u8>, trace_id: u64) -> Result<Output> {
         let _timer = timer!(metrics::METRIC_GRPC_LOGICAL_PLAN);
         self.do_get(
             Request::Query(QueryRequest {
@@ -202,7 +206,7 @@ impl Database {
                     step: step.to_string(),
                 })),
             }),
-            None,
+            0,
         )
         .await
     }
@@ -213,7 +217,7 @@ impl Database {
             Request::Ddl(DdlRequest {
                 expr: Some(DdlExpr::CreateTable(expr)),
             }),
-            None,
+            0,
         )
         .await
     }
@@ -224,7 +228,7 @@ impl Database {
             Request::Ddl(DdlRequest {
                 expr: Some(DdlExpr::Alter(expr)),
             }),
-            None,
+            0,
         )
         .await
     }
@@ -235,29 +239,7 @@ impl Database {
             Request::Ddl(DdlRequest {
                 expr: Some(DdlExpr::DropTable(expr)),
             }),
-            None,
-        )
-        .await
-    }
-
-    pub async fn flush_table(&self, expr: FlushTableExpr) -> Result<Output> {
-        let _timer = timer!(metrics::METRIC_GRPC_FLUSH_TABLE);
-        self.do_get(
-            Request::Ddl(DdlRequest {
-                expr: Some(DdlExpr::FlushTable(expr)),
-            }),
-            None,
-        )
-        .await
-    }
-
-    pub async fn compact_table(&self, expr: CompactTableExpr) -> Result<Output> {
-        let _timer = timer!(metrics::METRIC_GRPC_COMPACT_TABLE);
-        self.do_get(
-            Request::Ddl(DdlRequest {
-                expr: Some(DdlExpr::CompactTable(expr)),
-            }),
-            None,
+            0,
         )
         .await
     }
@@ -268,12 +250,12 @@ impl Database {
             Request::Ddl(DdlRequest {
                 expr: Some(DdlExpr::TruncateTable(expr)),
             }),
-            None,
+            0,
         )
         .await
     }
 
-    async fn do_get(&self, request: Request, trace_id: Option<u64>) -> Result<Output> {
+    async fn do_get(&self, request: Request, trace_id: u64) -> Result<Output> {
         // FIXME(paomian): should be added some labels for metrics
         let _timer = timer!(metrics::METRIC_GRPC_DO_GET);
         let request = self.to_rpc_request(request, trace_id);
@@ -283,55 +265,81 @@ impl Database {
 
         let mut client = self.client.make_flight_client()?;
 
-        let flight_data: Vec<FlightData> = client
-            .mut_inner()
-            .do_get(request)
-            .and_then(|response| response.into_inner().try_collect())
-            .await
-            .map_err(|e| {
-                let tonic_code = e.code();
-                let e: error::Error = e.into();
-                let code = e.status_code();
-                let msg = e.to_string();
-                ServerSnafu { code, msg }
-                    .fail::<()>()
-                    .map_err(BoxedError::new)
-                    .context(error::FlightGetSnafu {
-                        tonic_code,
-                        addr: client.addr(),
-                    })
-                    .map_err(|error| {
-                        logging::error!(
-                            "Failed to do Flight get, addr: {}, code: {}, source: {}",
-                            client.addr(),
-                            tonic_code,
-                            error
-                        );
-                        error
-                    })
-                    .unwrap_err()
-            })?;
-
-        let decoder = &mut FlightDecoder::default();
-        let flight_messages = flight_data
-            .into_iter()
-            .map(|x| decoder.try_decode(x).context(ConvertFlightDataSnafu))
-            .collect::<Result<Vec<_>>>()?;
-
-        let output = if let Some(FlightMessage::AffectedRows(rows)) = flight_messages.get(0) {
-            ensure!(
-                flight_messages.len() == 1,
-                IllegalFlightMessagesSnafu {
-                    reason: "Expect 'AffectedRows' Flight messages to be one and only!"
-                }
+        let response = client.mut_inner().do_get(request).await.map_err(|e| {
+            let tonic_code = e.code();
+            let e: error::Error = e.into();
+            let code = e.status_code();
+            let msg = e.to_string();
+            let error = Error::FlightGet {
+                tonic_code,
+                addr: client.addr().to_string(),
+                source: BoxedError::new(ServerSnafu { code, msg }.build()),
+            };
+            logging::error!(
+                "Failed to do Flight get, addr: {}, code: {}, source: {}",
+                client.addr(),
+                tonic_code,
+                error
             );
-            Output::AffectedRows(*rows)
-        } else {
-            let recordbatches = flight_messages_to_recordbatches(flight_messages)
-                .context(ConvertFlightDataSnafu)?;
-            Output::RecordBatches(recordbatches)
+            error
+        })?;
+
+        let flight_data_stream = response.into_inner();
+        let mut decoder = FlightDecoder::default();
+
+        let mut flight_message_stream = flight_data_stream.map(move |flight_data| {
+            flight_data
+                .map_err(Error::from)
+                .and_then(|data| decoder.try_decode(data).context(ConvertFlightDataSnafu))
+        });
+
+        let Some(first_flight_message) = flight_message_stream.next().await else {
+            return IllegalFlightMessagesSnafu {
+                reason: "Expect the response not to be empty",
+            }
+            .fail();
         };
-        Ok(output)
+
+        let first_flight_message = first_flight_message?;
+
+        match first_flight_message {
+            FlightMessage::AffectedRows(rows) => {
+                ensure!(
+                    flight_message_stream.next().await.is_none(),
+                    IllegalFlightMessagesSnafu {
+                        reason: "Expect 'AffectedRows' Flight messages to be the one and the only!"
+                    }
+                );
+                Ok(Output::AffectedRows(rows))
+            }
+            FlightMessage::Recordbatch(_) => IllegalFlightMessagesSnafu {
+                reason: "The first flight message cannot be a RecordBatch message",
+            }
+            .fail(),
+            FlightMessage::Schema(schema) => {
+                let stream = Box::pin(stream!({
+                    while let Some(flight_message) = flight_message_stream.next().await {
+                        let flight_message = flight_message
+                            .map_err(BoxedError::new)
+                            .context(ExternalSnafu)?;
+                        let FlightMessage::Recordbatch(record_batch) = flight_message else {
+                            yield IllegalFlightMessagesSnafu {reason: "A Schema message must be succeeded exclusively by a set of RecordBatch messages"}
+                                        .fail()
+                                        .map_err(BoxedError::new)
+                                        .context(ExternalSnafu);
+                            break;
+                        };
+                        yield Ok(record_batch);
+                    }
+                }));
+                let record_batch_stream = RecordBatchStreamAdaptor {
+                    schema,
+                    stream,
+                    output_ordering: None,
+                };
+                Ok(Output::Stream(Box::pin(record_batch_stream)))
+            }
+        }
     }
 }
 
@@ -342,105 +350,10 @@ pub struct FlightContext {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use api::helper::ColumnDataTypeWrapper;
     use api::v1::auth_header::AuthScheme;
-    use api::v1::{AuthHeader, Basic, Column};
-    use common_grpc::select::{null_mask, values};
-    use common_grpc_expr::column_to_vector;
-    use datatypes::prelude::{Vector, VectorRef};
-    use datatypes::vectors::{
-        BinaryVector, BooleanVector, DateTimeVector, DateVector, Float32Vector, Float64Vector,
-        Int16Vector, Int32Vector, Int64Vector, Int8Vector, StringVector, UInt16Vector,
-        UInt32Vector, UInt64Vector, UInt8Vector,
-    };
+    use api::v1::{AuthHeader, Basic};
 
     use crate::database::FlightContext;
-
-    #[test]
-    fn test_column_to_vector() {
-        let mut column = create_test_column(Arc::new(BooleanVector::from(vec![true])));
-        column.datatype = -100;
-        let result = column_to_vector(&column, 1);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Column datatype error, source: Unknown proto column datatype: -100"
-        );
-
-        macro_rules! test_with_vector {
-            ($vector: expr) => {
-                let vector = Arc::new($vector);
-                let column = create_test_column(vector.clone());
-                let result = column_to_vector(&column, vector.len() as u32).unwrap();
-                assert_eq!(result, vector as VectorRef);
-            };
-        }
-
-        test_with_vector!(BooleanVector::from(vec![Some(true), None, Some(false)]));
-        test_with_vector!(Int8Vector::from(vec![Some(i8::MIN), None, Some(i8::MAX)]));
-        test_with_vector!(Int16Vector::from(vec![
-            Some(i16::MIN),
-            None,
-            Some(i16::MAX)
-        ]));
-        test_with_vector!(Int32Vector::from(vec![
-            Some(i32::MIN),
-            None,
-            Some(i32::MAX)
-        ]));
-        test_with_vector!(Int64Vector::from(vec![
-            Some(i64::MIN),
-            None,
-            Some(i64::MAX)
-        ]));
-        test_with_vector!(UInt8Vector::from(vec![Some(u8::MIN), None, Some(u8::MAX)]));
-        test_with_vector!(UInt16Vector::from(vec![
-            Some(u16::MIN),
-            None,
-            Some(u16::MAX)
-        ]));
-        test_with_vector!(UInt32Vector::from(vec![
-            Some(u32::MIN),
-            None,
-            Some(u32::MAX)
-        ]));
-        test_with_vector!(UInt64Vector::from(vec![
-            Some(u64::MIN),
-            None,
-            Some(u64::MAX)
-        ]));
-        test_with_vector!(Float32Vector::from(vec![
-            Some(f32::MIN),
-            None,
-            Some(f32::MAX)
-        ]));
-        test_with_vector!(Float64Vector::from(vec![
-            Some(f64::MIN),
-            None,
-            Some(f64::MAX)
-        ]));
-        test_with_vector!(BinaryVector::from(vec![
-            Some(b"".to_vec()),
-            None,
-            Some(b"hello".to_vec())
-        ]));
-        test_with_vector!(StringVector::from(vec![Some(""), None, Some("foo"),]));
-        test_with_vector!(DateVector::from(vec![Some(1), None, Some(3)]));
-        test_with_vector!(DateTimeVector::from(vec![Some(4), None, Some(6)]));
-    }
-
-    fn create_test_column(vector: VectorRef) -> Column {
-        let wrapper: ColumnDataTypeWrapper = vector.data_type().try_into().unwrap();
-        Column {
-            column_name: "test".to_string(),
-            semantic_type: 1,
-            values: Some(values(&[vector.clone()]).unwrap()),
-            null_mask: null_mask(&[vector.clone()], vector.len()),
-            datatype: wrapper.datatype() as i32,
-        }
-    }
 
     #[test]
     fn test_flight_ctx() {

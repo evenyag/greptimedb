@@ -13,16 +13,15 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use api::helper::ColumnDataTypeWrapper;
 use api::v1::alter_expr::Kind;
 use api::v1::{
     AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, CreateTableExpr, DropColumn,
-    DropColumns, RenameTable,
+    DropColumns, RenameTable, SemanticType,
 };
 use common_error::ext::BoxedError;
-use datanode::instance::sql::table_idents_to_full_name;
+use common_grpc_expr::util::ColumnExpr;
 use datatypes::schema::ColumnSchema;
 use file_table_engine::table::immutable::ImmutableFileTableOptions;
 use query::sql::prepare_immutable_file_table_files_and_schema;
@@ -33,49 +32,52 @@ use sql::statements::alter::{AlterTable, AlterTableOperation};
 use sql::statements::create::{CreateExternalTable, CreateTable, TIME_INDEX};
 use sql::statements::{column_def_to_schema, sql_column_def_to_grpc_column_def};
 use sql::util::to_lowercase_options_map;
+use table::engine::TableReference;
 use table::requests::{TableOptions, IMMUTABLE_TABLE_META_KEY};
 
 use crate::error::{
-    self, BuildCreateExprOnInsertionSnafu, ColumnDataTypeSnafu,
-    ConvertColumnDefaultConstraintSnafu, ExternalSnafu, IllegalPrimaryKeysDefSnafu,
-    InvalidSqlSnafu, ParseSqlSnafu, Result,
+    BuildCreateExprOnInsertionSnafu, ColumnDataTypeSnafu, ConvertColumnDefaultConstraintSnafu,
+    EncodeJsonSnafu, ExternalSnafu, IllegalPrimaryKeysDefSnafu, InvalidSqlSnafu, NotSupportedSnafu,
+    ParseSqlSnafu, PrepareImmutableTableSnafu, Result, UnrecognizedTableOptionSnafu,
 };
+use crate::table::table_idents_to_full_name;
 
-pub type CreateExprFactoryRef = Arc<dyn CreateExprFactory + Send + Sync>;
+#[derive(Debug, Copy, Clone)]
+pub struct CreateExprFactory;
 
-#[async_trait::async_trait]
-pub trait CreateExprFactory {
-    async fn create_expr_by_columns(
+impl CreateExprFactory {
+    pub fn create_table_expr_by_columns(
         &self,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        columns: &[Column],
-        engine: &str,
-    ) -> crate::error::Result<CreateTableExpr>;
-}
-
-#[derive(Debug)]
-pub struct DefaultCreateExprFactory;
-
-#[async_trait::async_trait]
-impl CreateExprFactory for DefaultCreateExprFactory {
-    async fn create_expr_by_columns(
-        &self,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
+        table_name: &TableReference<'_>,
         columns: &[Column],
         engine: &str,
     ) -> Result<CreateTableExpr> {
-        let table_id = None;
-        let create_expr = common_grpc_expr::build_create_expr_from_insertion(
-            catalog_name,
-            schema_name,
-            table_id,
+        let column_exprs = ColumnExpr::from_columns(columns);
+        let create_expr = common_grpc_expr::util::build_create_table_expr(
+            None,
             table_name,
-            columns,
+            column_exprs,
             engine,
+            "Created on insertion",
+        )
+        .context(BuildCreateExprOnInsertionSnafu)?;
+
+        Ok(create_expr)
+    }
+
+    pub fn create_table_expr_by_column_schemas(
+        &self,
+        table_name: &TableReference<'_>,
+        column_schemas: &[api::v1::ColumnSchema],
+        engine: &str,
+    ) -> Result<CreateTableExpr> {
+        let column_exprs = ColumnExpr::from_column_schemas(column_schemas);
+        let create_expr = common_grpc_expr::util::build_create_table_expr(
+            None,
+            table_name,
+            column_exprs,
+            engine,
+            "Created on insertion",
         )
         .context(BuildCreateExprOnInsertionSnafu)?;
 
@@ -90,26 +92,28 @@ pub(crate) async fn create_external_expr(
     let (catalog_name, schema_name, table_name) =
         table_idents_to_full_name(&create.name, query_ctx)
             .map_err(BoxedError::new)
-            .context(error::ExternalSnafu)?;
+            .context(ExternalSnafu)?;
 
     let mut options = create.options;
 
     let (files, schema) = prepare_immutable_file_table_files_and_schema(&options, &create.columns)
         .await
-        .context(error::PrepareImmutableTableSnafu)?;
+        .context(PrepareImmutableTableSnafu)?;
 
     let meta = ImmutableFileTableOptions { files };
     let _ = options.insert(
         IMMUTABLE_TABLE_META_KEY.to_string(),
-        serde_json::to_string(&meta).context(error::EncodeJsonSnafu)?,
+        serde_json::to_string(&meta).context(EncodeJsonSnafu)?,
     );
+
+    let primary_keys = vec![];
 
     let expr = CreateTableExpr {
         catalog_name,
         schema_name,
         table_name,
         desc: "".to_string(),
-        column_defs: column_schemas_to_defs(schema.column_schemas)?,
+        column_defs: column_schemas_to_defs(schema.column_schemas, &primary_keys)?,
         time_index: "".to_string(),
         primary_keys: vec![],
         create_if_not_exists: create.if_not_exists,
@@ -126,21 +130,24 @@ pub fn create_to_expr(create: &CreateTable, query_ctx: QueryContextRef) -> Resul
     let (catalog_name, schema_name, table_name) =
         table_idents_to_full_name(&create.name, query_ctx)
             .map_err(BoxedError::new)
-            .context(error::ExternalSnafu)?;
+            .context(ExternalSnafu)?;
 
     let time_index = find_time_index(&create.constraints)?;
     let table_options = HashMap::from(
         &TableOptions::try_from(&to_lowercase_options_map(&create.options))
-            .context(error::UnrecognizedTableOptionSnafu)?,
+            .context(UnrecognizedTableOptionSnafu)?,
     );
+
+    let primary_keys = find_primary_keys(&create.columns, &create.constraints)?;
+
     let expr = CreateTableExpr {
         catalog_name,
         schema_name,
         table_name,
         desc: "".to_string(),
-        column_defs: columns_to_expr(&create.columns, &time_index)?,
+        column_defs: columns_to_expr(&create.columns, &time_index, &primary_keys)?,
         time_index,
-        primary_keys: find_primary_keys(&create.columns, &create.constraints)?,
+        primary_keys,
         create_if_not_exists: create.if_not_exists,
         table_options,
         table_id: None,
@@ -201,7 +208,7 @@ fn find_primary_keys(
     Ok(primary_keys)
 }
 
-pub fn find_time_index(constraints: &[TableConstraint]) -> crate::error::Result<String> {
+pub fn find_time_index(constraints: &[TableConstraint]) -> Result<String> {
     let time_index = constraints
         .iter()
         .filter_map(|constraint| match constraint {
@@ -232,16 +239,19 @@ pub fn find_time_index(constraints: &[TableConstraint]) -> crate::error::Result<
 fn columns_to_expr(
     column_defs: &[ColumnDef],
     time_index: &str,
-) -> crate::error::Result<Vec<api::v1::ColumnDef>> {
+    primary_keys: &[String],
+) -> Result<Vec<api::v1::ColumnDef>> {
     let column_schemas = column_defs
         .iter()
         .map(|c| column_def_to_schema(c, c.name.to_string() == time_index).context(ParseSqlSnafu))
         .collect::<Result<Vec<ColumnSchema>>>()?;
-    column_schemas_to_defs(column_schemas)
+
+    column_schemas_to_defs(column_schemas, primary_keys)
 }
 
 pub(crate) fn column_schemas_to_defs(
     column_schemas: Vec<ColumnSchema>,
+    primary_keys: &[String],
 ) -> Result<Vec<api::v1::ColumnDef>> {
     let column_datatypes = column_schemas
         .iter()
@@ -256,9 +266,17 @@ pub(crate) fn column_schemas_to_defs(
         .iter()
         .zip(column_datatypes)
         .map(|(schema, datatype)| {
+            let semantic_type = if schema.is_time_index() {
+                SemanticType::Timestamp
+            } else if primary_keys.contains(&schema.name) {
+                SemanticType::Tag
+            } else {
+                SemanticType::Field
+            } as i32;
+
             Ok(api::v1::ColumnDef {
                 name: schema.name.clone(),
-                datatype: datatype as i32,
+                data_type: datatype as i32,
                 is_nullable: schema.is_nullable(),
                 default_constraint: match schema.default_constraint() {
                     None => vec![],
@@ -270,6 +288,7 @@ pub(crate) fn column_schemas_to_defs(
                             })?
                     }
                 },
+                semantic_type,
             })
         })
         .collect()
@@ -286,7 +305,7 @@ pub(crate) fn to_alter_expr(
 
     let kind = match alter_table.alter_operation() {
         AlterTableOperation::AddConstraint(_) => {
-            return error::NotSupportedSnafu {
+            return NotSupportedSnafu {
                 feat: "ADD CONSTRAINT",
             }
             .fail();
@@ -301,7 +320,6 @@ pub(crate) fn to_alter_expr(
                         .map_err(BoxedError::new)
                         .context(ExternalSnafu)?,
                 ),
-                is_key: false,
                 location: location.as_ref().map(From::from),
             }],
         }),
@@ -320,7 +338,6 @@ pub(crate) fn to_alter_expr(
         schema_name,
         table_name,
         kind: Some(kind),
-        ..Default::default()
     })
 }
 

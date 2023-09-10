@@ -16,15 +16,21 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use crate::memtable::MemtableRef;
 
 /// A version of current memtables in a region.
 #[derive(Debug)]
 pub(crate) struct MemtableVersion {
     /// Mutable memtable.
-    mutable: MemtableRef,
+    pub(crate) mutable: MemtableRef,
     /// Immutable memtables.
-    immutables: Vec<MemtableRef>,
+    ///
+    /// We only allow one flush job per region but if a flush job failed, then we
+    /// might need to store more than one immutable memtable on the next time we
+    /// flush the region.
+    immutables: SmallVec<[MemtableRef; 2]>,
 }
 
 pub(crate) type MemtableVersionRef = Arc<MemtableVersion>;
@@ -34,12 +40,53 @@ impl MemtableVersion {
     pub(crate) fn new(mutable: MemtableRef) -> MemtableVersion {
         MemtableVersion {
             mutable,
-            immutables: vec![],
+            immutables: SmallVec::new(),
         }
     }
 
-    /// Returns the mutable memtable.
-    pub(crate) fn mutable(&self) -> &MemtableRef {
-        &self.mutable
+    /// Immutable memtables.
+    pub(crate) fn immutables(&self) -> &[MemtableRef] {
+        &self.immutables
+    }
+
+    /// Lists mutable and immutable memtables.
+    pub(crate) fn list_memtables(&self) -> Vec<MemtableRef> {
+        let mut mems = Vec::with_capacity(self.immutables.len() + 1);
+        mems.push(self.mutable.clone());
+        mems.extend_from_slice(&self.immutables);
+        mems
+    }
+
+    /// Returns a new [MemtableVersion] which switches the old mutable memtable to immutable
+    /// memtable.
+    ///
+    /// Returns `None` if the mutable memtable is empty.
+    #[must_use]
+    pub(crate) fn freeze_mutable(&self, mutable: MemtableRef) -> Option<MemtableVersion> {
+        debug_assert!(mutable.is_empty());
+        if self.mutable.is_empty() {
+            // No need to freeze the mutable memtable.
+            return None;
+        }
+
+        // Marks the mutable memtable as immutable so it can free the memory usage from our
+        // soft limit.
+        self.mutable.mark_immutable();
+        // Pushes the mutable memtable to immutable list.
+        let immutables = self
+            .immutables
+            .iter()
+            .cloned()
+            .chain([self.mutable.clone()])
+            .collect();
+        Some(MemtableVersion {
+            mutable,
+            immutables,
+        })
+    }
+
+    /// Returns the memory usage of the mutable memtable.
+    pub(crate) fn mutable_usage(&self) -> usize {
+        self.mutable.stats().estimated_bytes
     }
 }

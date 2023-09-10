@@ -16,29 +16,31 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use async_stream::try_stream;
-use client::client_manager::DatanodeClients;
-use client::Database;
+use async_stream::stream;
+use client::region_handler::RegionRequestHandlerRef;
 use common_base::bytes::Bytes;
 use common_error::ext::BoxedError;
-use common_meta::peer::Peer;
 use common_meta::table_name::TableName;
 use common_query::physical_plan::TaskContext;
-use common_query::Output;
 use common_recordbatch::adapter::DfRecordBatchStreamAdapter;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{
     DfSendableRecordBatchStream, RecordBatch, RecordBatchStreamAdaptor, SendableRecordBatchStream,
 };
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion_common::{DataFusionError, Result, Statistics};
 use datafusion_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion_physical_expr::PhysicalSortExpr;
-use datatypes::schema::Schema;
+use datatypes::schema::{Schema, SchemaRef};
 use futures_util::StreamExt;
+use greptime_proto::v1::region::QueryRequest;
 use snafu::ResultExt;
+use store_api::storage::RegionId;
 
-use crate::error::{ConvertSchemaSnafu, RemoteRequestSnafu, UnexpectedOutputKindSnafu};
+use crate::error::ConvertSchemaSnafu;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct MergeScanLogicalPlan {
@@ -105,96 +107,116 @@ impl MergeScanLogicalPlan {
     }
 }
 
-#[derive(Debug)]
 pub struct MergeScanExec {
     table: TableName,
-    peers: Vec<Peer>,
+    regions: Vec<RegionId>,
     substrait_plan: Bytes,
+    schema: SchemaRef,
     arrow_schema: ArrowSchemaRef,
-    clients: Arc<DatanodeClients>,
+    request_handler: RegionRequestHandlerRef,
+    metric: ExecutionPlanMetricsSet,
+}
+
+impl std::fmt::Debug for MergeScanExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeScanExec")
+            .field("table", &self.table)
+            .field("regions", &self.regions)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl MergeScanExec {
     pub fn new(
         table: TableName,
-        peers: Vec<Peer>,
+        regions: Vec<RegionId>,
         substrait_plan: Bytes,
-        arrow_schema: ArrowSchemaRef,
-        clients: Arc<DatanodeClients>,
-    ) -> Self {
-        // remove all metadata
-        let arrow_schema = Arc::new(ArrowSchema::new(arrow_schema.fields().to_vec()));
-        Self {
+        arrow_schema: &ArrowSchema,
+        request_handler: RegionRequestHandlerRef,
+    ) -> Result<Self> {
+        let arrow_schema_without_metadata = Self::arrow_schema_without_metadata(arrow_schema);
+        let schema_without_metadata =
+            Self::arrow_schema_to_schema(arrow_schema_without_metadata.clone())?;
+        Ok(Self {
             table,
-            peers,
+            regions,
             substrait_plan,
-            arrow_schema,
-            clients,
-        }
+            schema: schema_without_metadata,
+            arrow_schema: arrow_schema_without_metadata,
+            request_handler,
+            metric: ExecutionPlanMetricsSet::new(),
+        })
     }
 
-    pub fn to_stream(&self, context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+    pub fn to_stream(&self, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let substrait_plan = self.substrait_plan.to_vec();
-        let peers = self.peers.clone();
-        let clients = self.clients.clone();
-        let table = self.table.clone();
-        let trace_id = context.task_id().and_then(|id| id.parse().ok());
+        let regions = self.regions.clone();
+        let request_handler = self.request_handler.clone();
+        let metric = MergeScanMetric::new(&self.metric);
 
-        let stream = try_stream! {
-            for peer in peers {
-                let client = clients.get_client(&peer).await;
-                let database = Database::new(&table.catalog_name, &table.schema_name, client);
-                let output: Output = database
-                    .logical_plan(substrait_plan.clone(), trace_id)
+        let stream = Box::pin(stream!({
+            let _finish_timer = metric.finish_time().timer();
+            let mut ready_timer = metric.ready_time().timer();
+            let mut first_consume_timer = Some(metric.first_consume_time().timer());
+
+            for region_id in regions {
+                let request = QueryRequest {
+                    region_id: region_id.into(),
+                    plan: substrait_plan.clone(),
+                };
+                let mut stream = request_handler
+                    .do_get(request)
                     .await
-                    .context(RemoteRequestSnafu)
                     .map_err(BoxedError::new)
                     .context(ExternalSnafu)?;
 
-                match output {
-                    Output::AffectedRows(_) => {
-                        Err(BoxedError::new(
-                            UnexpectedOutputKindSnafu {
-                                expected: "RecordBatches or Stream",
-                                got: "AffectedRows",
-                            }
-                            .build(),
-                        ))
-                        .context(ExternalSnafu)?;
-                    }
-                    Output::RecordBatches(record_batches) => {
-                        for batch in record_batches.into_iter() {
-                            yield Self::remove_metadata_from_record_batch(batch);
-                        }
-                    }
-                    Output::Stream(mut stream) => {
-                        while let Some(batch) = stream.next().await {
-                            yield Self::remove_metadata_from_record_batch(batch?);
-                        }
+                ready_timer.stop();
+
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    metric.record_output_batch_rows(batch.num_rows());
+                    yield Ok(Self::remove_metadata_from_record_batch(batch));
+
+                    if let Some(first_consume_timer) = first_consume_timer.as_mut().take() {
+                        first_consume_timer.stop();
                     }
                 }
             }
-        };
+        }));
 
         Ok(Box::pin(RecordBatchStreamAdaptor {
-            schema: Arc::new(
-                self.arrow_schema
-                    .clone()
-                    .try_into()
-                    .context(ConvertSchemaSnafu)?,
-            ),
-            stream: Box::pin(stream),
+            schema: self.schema.clone(),
+            stream,
             output_ordering: None,
         }))
     }
 
     fn remove_metadata_from_record_batch(batch: RecordBatch) -> RecordBatch {
-        let schema = ArrowSchema::new(batch.schema.arrow_schema().fields().to_vec());
-        RecordBatch::new(
-            Arc::new(Schema::try_from(schema).unwrap()),
-            batch.columns().iter().cloned(),
-        )
-        .unwrap()
+        let arrow_schema = batch.schema.arrow_schema().as_ref();
+        let arrow_schema_without_metadata = Self::arrow_schema_without_metadata(arrow_schema);
+        let schema_without_metadata =
+            Self::arrow_schema_to_schema(arrow_schema_without_metadata).unwrap();
+        RecordBatch::new(schema_without_metadata, batch.columns().iter().cloned()).unwrap()
+    }
+
+    fn arrow_schema_without_metadata(arrow_schema: &ArrowSchema) -> ArrowSchemaRef {
+        Arc::new(ArrowSchema::new(
+            arrow_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let field = field.as_ref().clone();
+                    let field_without_metadata = field.with_metadata(Default::default());
+                    Arc::new(field_without_metadata)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn arrow_schema_to_schema(arrow_schema: ArrowSchemaRef) -> Result<SchemaRef> {
+        let schema = Schema::try_from(arrow_schema).context(ConvertSchemaSnafu)?;
+        Ok(Arc::new(schema))
     }
 }
 
@@ -241,14 +263,57 @@ impl ExecutionPlan for MergeScanExec {
     fn statistics(&self) -> Statistics {
         Statistics::default()
     }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metric.clone_inner())
+    }
 }
 
 impl DisplayAs for MergeScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "MergeScanExec: peers=[")?;
-        for peer in self.peers.iter() {
-            write!(f, "{}, ", peer)?;
+        for region_id in self.regions.iter() {
+            write!(f, "{}, ", region_id)?;
         }
         write!(f, "]")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MergeScanMetric {
+    /// Nanosecond elapsed till the scan operator is ready to emit data
+    ready_time: Time,
+    /// Nanosecond elapsed till the first record batch emitted from the scan operator gets consumed
+    first_consume_time: Time,
+    /// Nanosecond elapsed till the scan operator finished execution
+    finish_time: Time,
+    /// Count of rows fetched from remote
+    output_rows: Count,
+}
+
+impl MergeScanMetric {
+    pub fn new(metric: &ExecutionPlanMetricsSet) -> Self {
+        Self {
+            ready_time: MetricBuilder::new(metric).subset_time("ready_time", 1),
+            first_consume_time: MetricBuilder::new(metric).subset_time("first_consume_time", 1),
+            finish_time: MetricBuilder::new(metric).subset_time("finish_time", 1),
+            output_rows: MetricBuilder::new(metric).output_rows(1),
+        }
+    }
+
+    pub fn ready_time(&self) -> &Time {
+        &self.ready_time
+    }
+
+    pub fn first_consume_time(&self) -> &Time {
+        &self.first_consume_time
+    }
+
+    pub fn finish_time(&self) -> &Time {
+        &self.finish_time
+    }
+
+    pub fn record_output_batch_rows(&self, num_rows: usize) {
+        self.output_rows.add(num_rows);
     }
 }

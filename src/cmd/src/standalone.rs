@@ -14,18 +14,24 @@
 
 use std::sync::Arc;
 
+use catalog::remote::DummyKvCacheInvalidator;
+use catalog::CatalogManagerRef;
 use clap::Parser;
 use common_base::Plugins;
+use common_config::{kv_store_dir, KvStoreConfig, WalConfig};
+use common_meta::kv_backend::KvBackendRef;
+use common_procedure::ProcedureManagerRef;
 use common_telemetry::info;
 use common_telemetry::logging::LoggingOptions;
-use datanode::datanode::{Datanode, DatanodeOptions, ProcedureConfig, StorageConfig, WalConfig};
-use datanode::instance::InstanceRef;
+use datanode::datanode::{Datanode, DatanodeOptions, ProcedureConfig, StorageConfig};
+use datanode::region_server::RegionServer;
+use frontend::catalog::FrontendCatalogManager;
 use frontend::frontend::FrontendOptions;
-use frontend::instance::{FrontendInstance, Instance as FeInstance};
+use frontend::instance::{FrontendInstance, Instance as FeInstance, StandaloneDatanodeManager};
 use frontend::service_config::{
     GrpcOptions, InfluxdbOptions, MysqlOptions, OpentsdbOptions, PostgresOptions, PromStoreOptions,
-    PrometheusOptions,
 };
+use query::QueryEngineRef;
 use serde::{Deserialize, Serialize};
 use servers::http::HttpOptions;
 use servers::tls::{TlsMode, TlsOption};
@@ -46,12 +52,8 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn build(
-        self,
-        fe_opts: FrontendOptions,
-        dn_opts: DatanodeOptions,
-    ) -> Result<Instance> {
-        self.subcmd.build(fe_opts, dn_opts).await
+    pub async fn build(self, opts: MixOptions) -> Result<Instance> {
+        self.subcmd.build(opts).await
     }
 
     pub fn load_options(&self, top_level_options: TopLevelOptions) -> Result<Options> {
@@ -65,9 +67,9 @@ enum SubCommand {
 }
 
 impl SubCommand {
-    async fn build(self, fe_opts: FrontendOptions, dn_opts: DatanodeOptions) -> Result<Instance> {
+    async fn build(self, opts: MixOptions) -> Result<Instance> {
         match self {
-            SubCommand::Start(cmd) => cmd.build(fe_opts, dn_opts).await,
+            SubCommand::Start(cmd) => cmd.build(opts).await,
         }
     }
 
@@ -82,18 +84,17 @@ impl SubCommand {
 #[serde(default)]
 pub struct StandaloneOptions {
     pub mode: Mode,
-    pub enable_memory_catalog: bool,
     pub enable_telemetry: bool,
-    pub http_options: Option<HttpOptions>,
-    pub grpc_options: Option<GrpcOptions>,
-    pub mysql_options: Option<MysqlOptions>,
-    pub postgres_options: Option<PostgresOptions>,
-    pub opentsdb_options: Option<OpentsdbOptions>,
-    pub influxdb_options: Option<InfluxdbOptions>,
-    pub prom_store_options: Option<PromStoreOptions>,
-    pub prometheus_options: Option<PrometheusOptions>,
+    pub http_options: HttpOptions,
+    pub grpc_options: GrpcOptions,
+    pub mysql_options: MysqlOptions,
+    pub postgres_options: PostgresOptions,
+    pub opentsdb_options: OpentsdbOptions,
+    pub influxdb_options: InfluxdbOptions,
+    pub prom_store_options: PromStoreOptions,
     pub wal: WalConfig,
     pub storage: StorageConfig,
+    pub kv_store: KvStoreConfig,
     pub procedure: ProcedureConfig,
     pub logging: LoggingOptions,
 }
@@ -102,18 +103,17 @@ impl Default for StandaloneOptions {
     fn default() -> Self {
         Self {
             mode: Mode::Standalone,
-            enable_memory_catalog: false,
             enable_telemetry: true,
-            http_options: Some(HttpOptions::default()),
-            grpc_options: Some(GrpcOptions::default()),
-            mysql_options: Some(MysqlOptions::default()),
-            postgres_options: Some(PostgresOptions::default()),
-            opentsdb_options: Some(OpentsdbOptions::default()),
-            influxdb_options: Some(InfluxdbOptions::default()),
-            prom_store_options: Some(PromStoreOptions::default()),
-            prometheus_options: Some(PrometheusOptions::default()),
+            http_options: HttpOptions::default(),
+            grpc_options: GrpcOptions::default(),
+            mysql_options: MysqlOptions::default(),
+            postgres_options: PostgresOptions::default(),
+            opentsdb_options: OpentsdbOptions::default(),
+            influxdb_options: InfluxdbOptions::default(),
+            prom_store_options: PromStoreOptions::default(),
             wal: WalConfig::default(),
             storage: StorageConfig::default(),
+            kv_store: KvStoreConfig::default(),
             procedure: ProcedureConfig::default(),
             logging: LoggingOptions::default(),
         }
@@ -131,7 +131,6 @@ impl StandaloneOptions {
             opentsdb_options: self.opentsdb_options,
             influxdb_options: self.influxdb_options,
             prom_store_options: self.prom_store_options,
-            prometheus_options: self.prometheus_options,
             meta_client_options: None,
             logging: self.logging,
             ..Default::default()
@@ -140,11 +139,9 @@ impl StandaloneOptions {
 
     fn datanode_options(self) -> DatanodeOptions {
         DatanodeOptions {
-            enable_memory_catalog: self.enable_memory_catalog,
             enable_telemetry: self.enable_telemetry,
             wal: self.wal,
             storage: self.storage,
-            procedure: self.procedure,
             ..Default::default()
         }
     }
@@ -158,10 +155,7 @@ pub struct Instance {
 impl Instance {
     pub async fn start(&mut self) -> Result<()> {
         // Start datanode instance before starting services, to avoid requests come in before internal components are started.
-        self.datanode
-            .start_instance()
-            .await
-            .context(StartDatanodeSnafu)?;
+        self.datanode.start().await.context(StartDatanodeSnafu)?;
         info!("Datanode instance started");
 
         self.frontend.start().await.context(StartFrontendSnafu)?;
@@ -175,7 +169,7 @@ impl Instance {
             .context(ShutdownFrontendSnafu)?;
 
         self.datanode
-            .shutdown_instance()
+            .shutdown()
             .await
             .context(ShutdownDatanodeSnafu)?;
         info!("Datanode instance stopped.");
@@ -193,8 +187,6 @@ struct StartCommand {
     #[clap(long)]
     mysql_addr: Option<String>,
     #[clap(long)]
-    prom_addr: Option<String>,
-    #[clap(long)]
     postgres_addr: Option<String>,
     #[clap(long)]
     opentsdb_addr: Option<String>,
@@ -202,8 +194,6 @@ struct StartCommand {
     influxdb_enable: bool,
     #[clap(short, long)]
     config_file: Option<String>,
-    #[clap(short = 'm', long = "memory-catalog")]
-    enable_memory_catalog: bool,
     #[clap(long)]
     tls_mode: Option<TlsMode>,
     #[clap(long)]
@@ -224,8 +214,6 @@ impl StartCommand {
             None,
         )?;
 
-        opts.enable_memory_catalog = self.enable_memory_catalog;
-
         opts.mode = Mode::Standalone;
 
         if let Some(dir) = top_level_options.log_dir {
@@ -243,9 +231,7 @@ impl StartCommand {
         );
 
         if let Some(addr) = &self.http_addr {
-            if let Some(http_opts) = &mut opts.http_options {
-                http_opts.addr = addr.clone()
-            }
+            opts.http_options.addr = addr.clone()
         }
 
         if let Some(addr) = &self.rpc_addr {
@@ -259,52 +245,52 @@ impl StartCommand {
                 }
                 .fail();
             }
-            if let Some(grpc_opts) = &mut opts.grpc_options {
-                grpc_opts.addr = addr.clone()
-            }
+            opts.grpc_options.addr = addr.clone()
         }
 
         if let Some(addr) = &self.mysql_addr {
-            if let Some(mysql_opts) = &mut opts.mysql_options {
-                mysql_opts.addr = addr.clone();
-                mysql_opts.tls = tls_opts.clone();
-            }
-        }
-
-        if let Some(addr) = &self.prom_addr {
-            opts.prometheus_options = Some(PrometheusOptions { addr: addr.clone() })
+            opts.mysql_options.enable = true;
+            opts.mysql_options.addr = addr.clone();
+            opts.mysql_options.tls = tls_opts.clone();
         }
 
         if let Some(addr) = &self.postgres_addr {
-            if let Some(postgres_opts) = &mut opts.postgres_options {
-                postgres_opts.addr = addr.clone();
-                postgres_opts.tls = tls_opts;
-            }
+            opts.postgres_options.enable = true;
+            opts.postgres_options.addr = addr.clone();
+            opts.postgres_options.tls = tls_opts;
         }
 
         if let Some(addr) = &self.opentsdb_addr {
-            if let Some(opentsdb_addr) = &mut opts.opentsdb_options {
-                opentsdb_addr.addr = addr.clone();
-            }
+            opts.opentsdb_options.enable = true;
+            opts.opentsdb_options.addr = addr.clone();
         }
 
         if self.influxdb_enable {
-            opts.influxdb_options = Some(InfluxdbOptions { enable: true });
+            opts.influxdb_options.enable = self.influxdb_enable;
         }
-
+        let kv_store_cfg = opts.kv_store.clone();
+        let procedure_cfg = opts.procedure.clone();
         let fe_opts = opts.clone().frontend_options();
-        let logging = opts.logging.clone();
+        let logging_opts = opts.logging.clone();
         let dn_opts = opts.datanode_options();
 
         Ok(Options::Standalone(Box::new(MixOptions {
+            procedure_cfg,
+            kv_store_cfg,
+            data_home: dn_opts.storage.data_home.to_string(),
             fe_opts,
             dn_opts,
-            logging,
+            logging_opts,
         })))
     }
 
-    async fn build(self, fe_opts: FrontendOptions, dn_opts: DatanodeOptions) -> Result<Instance> {
+    #[allow(unreachable_code)]
+    #[allow(unused_variables)]
+    #[allow(clippy::diverging_sub_expression)]
+    async fn build(self, opts: MixOptions) -> Result<Instance> {
         let plugins = Arc::new(load_frontend_plugins(&self.user_provider)?);
+        let fe_opts = opts.fe_opts;
+        let dn_opts = opts.dn_opts;
 
         info!("Standalone start command: {:#?}", self);
         info!(
@@ -312,11 +298,36 @@ impl StartCommand {
             fe_opts, dn_opts
         );
 
-        let datanode = Datanode::new(dn_opts.clone(), Default::default())
+        let kv_dir = kv_store_dir(&opts.data_home);
+        let (kv_store, procedure_manager) = FeInstance::try_build_standalone_components(
+            kv_dir,
+            opts.kv_store_cfg,
+            opts.procedure_cfg,
+        )
+        .await
+        .context(StartFrontendSnafu)?;
+
+        let datanode = Datanode::new(dn_opts.clone(), plugins.clone())
             .await
             .context(StartDatanodeSnafu)?;
+        let region_server = datanode.region_server();
 
-        let mut frontend = build_frontend(plugins.clone(), datanode.get_instance()).await?;
+        let catalog_manager = Arc::new(FrontendCatalogManager::new(
+            kv_store.clone(),
+            Arc::new(DummyKvCacheInvalidator),
+            Arc::new(StandaloneDatanodeManager(region_server.clone())),
+        ));
+
+        // TODO: build frontend instance like in distributed mode
+        let mut frontend = build_frontend(
+            plugins,
+            kv_store,
+            procedure_manager,
+            catalog_manager,
+            datanode.query_engine(),
+            region_server,
+        )
+        .await?;
 
         frontend
             .build_servers(&fe_opts)
@@ -330,11 +341,21 @@ impl StartCommand {
 /// Build frontend instance in standalone mode
 async fn build_frontend(
     plugins: Arc<Plugins>,
-    datanode_instance: InstanceRef,
+    kv_store: KvBackendRef,
+    procedure_manager: ProcedureManagerRef,
+    catalog_manager: CatalogManagerRef,
+    query_engine: QueryEngineRef,
+    region_server: RegionServer,
 ) -> Result<FeInstance> {
-    let mut frontend_instance = FeInstance::try_new_standalone(datanode_instance.clone())
-        .await
-        .context(StartFrontendSnafu)?;
+    let mut frontend_instance = FeInstance::try_new_standalone(
+        kv_store,
+        procedure_manager,
+        catalog_manager,
+        query_engine,
+        region_server,
+    )
+    .await
+    .context(StartFrontendSnafu)?;
     frontend_instance.set_plugins(plugins.clone());
     Ok(frontend_instance)
 }
@@ -345,9 +366,9 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
+    use auth::{Identity, Password, UserProviderRef};
     use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_named_temp_file;
-    use servers::auth::{Identity, Password, UserProviderRef};
     use servers::Mode;
 
     use super::*;
@@ -408,7 +429,6 @@ mod tests {
             [storage.manifest]
             checkpoint_margin = 9
             gc_duration = '7s'
-            checkpoint_on_startup = true
 
             [http_options]
             addr = "127.0.0.1:4000"
@@ -432,36 +452,18 @@ mod tests {
         };
         let fe_opts = options.fe_opts;
         let dn_opts = options.dn_opts;
-        let logging_opts = options.logging;
+        let logging_opts = options.logging_opts;
         assert_eq!(Mode::Standalone, fe_opts.mode);
-        assert_eq!(
-            "127.0.0.1:4000".to_string(),
-            fe_opts.http_options.as_ref().unwrap().addr
-        );
-        assert_eq!(
-            Duration::from_secs(30),
-            fe_opts.http_options.as_ref().unwrap().timeout
-        );
-        assert_eq!(
-            ReadableSize::mb(128),
-            fe_opts.http_options.as_ref().unwrap().body_limit
-        );
-        assert_eq!(
-            "127.0.0.1:4001".to_string(),
-            fe_opts.grpc_options.unwrap().addr
-        );
-        assert_eq!(
-            "127.0.0.1:4002",
-            fe_opts.mysql_options.as_ref().unwrap().addr
-        );
-        assert_eq!(2, fe_opts.mysql_options.as_ref().unwrap().runtime_size);
-        assert_eq!(
-            None,
-            fe_opts.mysql_options.as_ref().unwrap().reject_no_database
-        );
-        assert!(fe_opts.influxdb_options.as_ref().unwrap().enable);
+        assert_eq!("127.0.0.1:4000".to_string(), fe_opts.http_options.addr);
+        assert_eq!(Duration::from_secs(30), fe_opts.http_options.timeout);
+        assert_eq!(ReadableSize::mb(128), fe_opts.http_options.body_limit);
+        assert_eq!("127.0.0.1:4001".to_string(), fe_opts.grpc_options.addr);
+        assert!(fe_opts.mysql_options.enable);
+        assert_eq!("127.0.0.1:4002", fe_opts.mysql_options.addr);
+        assert_eq!(2, fe_opts.mysql_options.runtime_size);
+        assert_eq!(None, fe_opts.mysql_options.reject_no_database);
+        assert!(fe_opts.influxdb_options.enable);
 
-        assert_eq!("/tmp/greptimedb/test/wal", dn_opts.wal.dir.unwrap());
         match &dn_opts.storage.store {
             datanode::datanode::ObjectStoreConfig::S3(s3_config) => {
                 assert_eq!(
@@ -495,8 +497,8 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!("/tmp/greptimedb/test/logs", opts.logging.dir);
-        assert_eq!("debug", opts.logging.level.unwrap());
+        assert_eq!("/tmp/greptimedb/test/logs", opts.logging_opts.dir);
+        assert_eq!("debug", opts.logging_opts.level.unwrap());
     }
 
     #[test]
@@ -565,26 +567,17 @@ mod tests {
                 };
 
                 // Should be read from env, env > default values.
-                assert_eq!(opts.logging.dir, "/other/log/dir");
+                assert_eq!(opts.logging_opts.dir, "/other/log/dir");
 
                 // Should be read from config file, config file > env > default values.
-                assert_eq!(opts.logging.level.as_ref().unwrap(), "debug");
+                assert_eq!(opts.logging_opts.level.as_ref().unwrap(), "debug");
 
                 // Should be read from cli, cli > config file > env > default values.
-                assert_eq!(
-                    opts.fe_opts.http_options.as_ref().unwrap().addr,
-                    "127.0.0.1:14000"
-                );
-                assert_eq!(
-                    ReadableSize::mb(64),
-                    opts.fe_opts.http_options.as_ref().unwrap().body_limit
-                );
+                assert_eq!(opts.fe_opts.http_options.addr, "127.0.0.1:14000");
+                assert_eq!(ReadableSize::mb(64), opts.fe_opts.http_options.body_limit);
 
                 // Should be default value.
-                assert_eq!(
-                    opts.fe_opts.grpc_options.unwrap().addr,
-                    GrpcOptions::default().addr
-                );
+                assert_eq!(opts.fe_opts.grpc_options.addr, GrpcOptions::default().addr);
             },
         );
     }

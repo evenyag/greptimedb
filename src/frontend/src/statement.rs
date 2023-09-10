@@ -15,54 +15,79 @@
 mod backup;
 mod copy_table_from;
 mod copy_table_to;
+mod ddl;
 mod describe;
+mod dml;
 mod show;
 mod tql;
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
+use api::v1::region::region_request;
 use catalog::CatalogManagerRef;
+use client::region_handler::RegionRequestHandlerRef;
 use common_error::ext::BoxedError;
+use common_meta::cache_invalidator::CacheInvalidatorRef;
+use common_meta::ddl::DdlTaskExecutorRef;
+use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
+use common_meta::kv_backend::KvBackendRef;
+use common_meta::table_name::TableName;
 use common_query::Output;
 use common_time::range::TimestampRange;
 use common_time::Timestamp;
-use datanode::instance::sql::{idents_to_full_database_name, table_idents_to_full_name};
+use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
 use query::parser::QueryStatement;
-use query::query_engine::SqlStatementExecutorRef;
+use query::plan::LogicalPlan;
 use query::QueryEngineRef;
 use session::context::QueryContextRef;
 use snafu::{OptionExt, ResultExt};
 use sql::statements::copy::{CopyDatabaseArgument, CopyTable, CopyTableArgument};
 use sql::statements::statement::Statement;
+use sqlparser::ast::ObjectName;
 use table::engine::TableReference;
-use table::requests::{CopyDatabaseRequest, CopyDirection, CopyTableRequest};
+use table::requests::{
+    CopyDatabaseRequest, CopyDirection, CopyTableRequest, DeleteRequest, InsertRequest,
+};
 use table::TableRef;
 
-use crate::error;
 use crate::error::{
-    CatalogSnafu, ExecLogicalPlanSnafu, ExecuteStatementSnafu, ExternalSnafu, PlanStatementSnafu,
-    Result, TableNotFoundSnafu,
+    self, CatalogSnafu, ExecLogicalPlanSnafu, ExternalSnafu, InvalidSqlSnafu, PlanStatementSnafu,
+    RequestDatanodeSnafu, Result, TableNotFoundSnafu,
 };
+use crate::req_convert::{delete, insert};
 use crate::statement::backup::{COPY_DATABASE_TIME_END_KEY, COPY_DATABASE_TIME_START_KEY};
+use crate::table::table_idents_to_full_name;
 
 #[derive(Clone)]
 pub struct StatementExecutor {
     catalog_manager: CatalogManagerRef,
     query_engine: QueryEngineRef,
-    sql_stmt_executor: SqlStatementExecutorRef,
+    region_request_handler: RegionRequestHandlerRef,
+    ddl_executor: DdlTaskExecutorRef,
+    table_metadata_manager: TableMetadataManagerRef,
+    partition_manager: PartitionRuleManagerRef,
+    cache_invalidator: CacheInvalidatorRef,
 }
 
 impl StatementExecutor {
     pub(crate) fn new(
         catalog_manager: CatalogManagerRef,
         query_engine: QueryEngineRef,
-        sql_stmt_executor: SqlStatementExecutorRef,
+        region_request_handler: RegionRequestHandlerRef,
+        ddl_task_executor: DdlTaskExecutorRef,
+        kv_backend: KvBackendRef,
+        cache_invalidator: CacheInvalidatorRef,
     ) -> Self {
         Self {
             catalog_manager,
             query_engine,
-            sql_stmt_executor,
+            region_request_handler,
+            ddl_executor: ddl_task_executor,
+            table_metadata_manager: Arc::new(TableMetadataManager::new(kv_backend.clone())),
+            partition_manager: Arc::new(PartitionRuleManager::new(kv_backend)),
+            cache_invalidator,
         }
     }
 
@@ -79,23 +104,13 @@ impl StatementExecutor {
 
     pub async fn execute_sql(&self, stmt: Statement, query_ctx: QueryContextRef) -> Result<Output> {
         match stmt {
-            Statement::Query(_) | Statement::Explain(_) | Statement::Delete(_) => {
+            Statement::Query(_) | Statement::Explain(_) => {
                 self.plan_exec(QueryStatement::Sql(stmt), query_ctx).await
             }
 
-            // For performance consideration, only requests that can't extract values is executed by query engine.
-            // Plain insert ("insert with literal values") is still executed directly in statement.
-            Statement::Insert(insert) => {
-                if insert.can_extract_values() {
-                    self.sql_stmt_executor
-                        .execute_sql(Statement::Insert(insert), query_ctx)
-                        .await
-                        .context(ExecuteStatementSnafu)
-                } else {
-                    self.plan_exec(QueryStatement::Sql(Statement::Insert(insert)), query_ctx)
-                        .await
-                }
-            }
+            Statement::Insert(insert) => self.insert(insert, query_ctx).await,
+
+            Statement::Delete(delete) => self.delete(delete, query_ctx).await,
 
             Statement::Tql(tql) => self.execute_tql(tql, query_ctx).await,
 
@@ -106,14 +121,16 @@ impl StatementExecutor {
             Statement::ShowTables(stmt) => self.show_tables(stmt, query_ctx).await,
 
             Statement::Copy(sql::statements::copy::Copy::CopyTable(stmt)) => {
-                let req = to_copy_table_request(stmt, query_ctx)?;
+                let req = to_copy_table_request(stmt, query_ctx.clone())?;
                 match req.direction {
-                    CopyDirection::Export => {
-                        self.copy_table_to(req).await.map(Output::AffectedRows)
-                    }
-                    CopyDirection::Import => {
-                        self.copy_table_from(req).await.map(Output::AffectedRows)
-                    }
+                    CopyDirection::Export => self
+                        .copy_table_to(req, query_ctx)
+                        .await
+                        .map(Output::AffectedRows),
+                    CopyDirection::Import => self
+                        .copy_table_from(req, query_ctx)
+                        .await
+                        .map(Output::AffectedRows),
                 }
             }
 
@@ -122,26 +139,71 @@ impl StatementExecutor {
                     .await
             }
 
-            Statement::CreateDatabase(_)
-            | Statement::CreateTable(_)
-            | Statement::CreateExternalTable(_)
-            | Statement::Alter(_)
-            | Statement::DropTable(_)
-            | Statement::TruncateTable(_)
-            | Statement::ShowCreateTable(_) => self
-                .sql_stmt_executor
-                .execute_sql(stmt, query_ctx)
+            Statement::CreateTable(stmt) => {
+                let _ = self.create_table(stmt, query_ctx).await?;
+                Ok(Output::AffectedRows(0))
+            }
+            Statement::CreateExternalTable(stmt) => {
+                let _ = self.create_external_table(stmt, query_ctx).await?;
+                Ok(Output::AffectedRows(0))
+            }
+            Statement::Alter(alter_table) => self.alter_table(alter_table, query_ctx).await,
+            Statement::DropTable(stmt) => {
+                let (catalog, schema, table) =
+                    table_idents_to_full_name(stmt.table_name(), query_ctx)
+                        .map_err(BoxedError::new)
+                        .context(error::ExternalSnafu)?;
+                let table_name = TableName::new(catalog, schema, table);
+                self.drop_table(table_name).await
+            }
+            Statement::TruncateTable(stmt) => {
+                let (catalog, schema, table) =
+                    table_idents_to_full_name(stmt.table_name(), query_ctx)
+                        .map_err(BoxedError::new)
+                        .context(error::ExternalSnafu)?;
+                let table_name = TableName::new(catalog, schema, table);
+                self.truncate_table(table_name).await
+            }
+
+            Statement::CreateDatabase(stmt) => {
+                self.create_database(
+                    query_ctx.current_catalog(),
+                    &stmt.name.to_string(),
+                    stmt.if_not_exists,
+                )
                 .await
-                .context(ExecuteStatementSnafu),
+            }
+
+            Statement::ShowCreateTable(show) => {
+                let (catalog, schema, table) =
+                    table_idents_to_full_name(&show.table_name, query_ctx.clone())
+                        .map_err(BoxedError::new)
+                        .context(error::ExternalSnafu)?;
+
+                let table_ref = self
+                    .catalog_manager
+                    .table(&catalog, &schema, &table)
+                    .await
+                    .context(error::CatalogSnafu)?
+                    .context(error::TableNotFoundSnafu { table_name: &table })?;
+                let table_name = TableName::new(catalog, schema, table);
+
+                self.show_create_table(table_name, table_ref, query_ctx)
+                    .await
+            }
         }
     }
 
-    async fn plan_exec(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<Output> {
-        let planner = self.query_engine.planner();
-        let plan = planner
-            .plan(stmt, query_ctx.clone())
+    async fn plan(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<LogicalPlan> {
+        self.query_engine
+            .planner()
+            .plan(stmt, query_ctx)
             .await
-            .context(PlanStatementSnafu)?;
+            .context(PlanStatementSnafu)
+    }
+
+    async fn plan_exec(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<Output> {
+        let plan = self.plan(stmt, query_ctx.clone()).await?;
         self.query_engine
             .execute(plan, query_ctx)
             .await
@@ -161,6 +223,50 @@ impl StatementExecutor {
             .with_context(|| TableNotFoundSnafu {
                 table_name: table_ref.to_string(),
             })
+    }
+
+    async fn handle_table_insert_request(
+        &self,
+        request: InsertRequest,
+        query_ctx: QueryContextRef,
+    ) -> Result<usize> {
+        let table_ref = TableReference::full(
+            &request.catalog_name,
+            &request.schema_name,
+            &request.table_name,
+        );
+        let table = self.get_table(&table_ref).await?;
+        let table_info = table.table_info();
+
+        let request = insert::TableToRegion::new(&table_info).convert(request)?;
+        let affected_rows = self
+            .region_request_handler
+            .handle(region_request::Body::Inserts(request), query_ctx)
+            .await
+            .context(RequestDatanodeSnafu)?;
+        Ok(affected_rows as _)
+    }
+
+    async fn handle_table_delete_request(
+        &self,
+        request: DeleteRequest,
+        query_ctx: QueryContextRef,
+    ) -> Result<usize> {
+        let table_ref = TableReference::full(
+            &request.catalog_name,
+            &request.schema_name,
+            &request.table_name,
+        );
+        let table = self.get_table(&table_ref).await?;
+        let table_info = table.table_info();
+
+        let request = delete::TableToRegion::new(&table_info).convert(request)?;
+        let affected_rows = self
+            .region_request_handler
+            .handle(region_request::Body::Deletes(request), query_ctx)
+            .await
+            .context(RequestDatanodeSnafu)?;
+        Ok(affected_rows as _)
     }
 }
 
@@ -240,4 +346,23 @@ fn extract_timestamp(map: &HashMap<String, String>, key: &str) -> Result<Option<
                 .map_err(|_| error::InvalidCopyParameterSnafu { key, value: v }.build())
         })
         .transpose()
+}
+
+fn idents_to_full_database_name(
+    obj_name: &ObjectName,
+    query_ctx: &QueryContextRef,
+) -> Result<(String, String)> {
+    match &obj_name.0[..] {
+        [database] => Ok((
+            query_ctx.current_catalog().to_owned(),
+            database.value.clone(),
+        )),
+        [catalog, database] => Ok((catalog.value.clone(), database.value.clone())),
+        _ => InvalidSqlSnafu {
+            err_msg: format!(
+                "expect database name to be <catalog>.<database>, <database>, found: {obj_name}",
+            ),
+        }
+        .fail(),
+    }
 }

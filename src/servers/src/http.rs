@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod admin;
 pub mod authorize;
 pub mod handler;
 pub mod header;
@@ -22,18 +21,19 @@ pub mod opentsdb;
 pub mod otlp;
 mod pprof;
 pub mod prom_store;
+pub mod prometheus;
 pub mod script;
 
 #[cfg(feature = "dashboard")]
 mod dashboard;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aide::axum::{routing as apirouting, ApiRouter, IntoApiResponse};
 use aide::openapi::{Info, OpenApi, Server as OpenAPIServer};
 use async_trait::async_trait;
+use auth::UserProviderRef;
 use axum::body::BoxBody;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{DefaultBodyLimit, MatchedPath};
@@ -42,8 +42,6 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Json};
 use axum::{routing, BoxError, Extension, Router};
 use common_base::readable_size::ReadableSize;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_catalog::parse_catalog_and_schema_from_db_string;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_query::Output;
@@ -54,7 +52,6 @@ use futures::FutureExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use session::context::QueryContext;
 use snafu::{ensure, ResultExt};
 use tokio::sync::oneshot::{self, Sender};
 use tokio::sync::Mutex;
@@ -65,15 +62,17 @@ use tower_http::trace::TraceLayer;
 
 use self::authorize::HttpAuth;
 use self::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
-use crate::auth::UserProviderRef;
 use crate::configurator::ConfiguratorRef;
 use crate::error::{AlreadyStartedSnafu, Result, StartHttpSnafu};
-use crate::http::admin::{compact, flush};
+use crate::http::prometheus::{
+    instant_query, label_values_query, labels_query, range_query, series_query,
+};
 use crate::metrics::{
     METRIC_CODE_LABEL, METRIC_HTTP_REQUESTS_ELAPSED, METRIC_HTTP_REQUESTS_TOTAL,
     METRIC_METHOD_LABEL, METRIC_PATH_LABEL,
 };
 use crate::metrics_handler::MetricsHandler;
+use crate::prometheus_handler::PrometheusHandlerRef;
 use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
@@ -81,36 +80,6 @@ use crate::query_handler::{
     PromStoreProtocolHandlerRef, ScriptHandlerRef,
 };
 use crate::server::Server;
-
-/// create query context from database name information, catalog and schema are
-/// resolved from the name
-pub(crate) async fn query_context_from_db(
-    query_handler: ServerSqlQueryHandlerRef,
-    db: Option<String>,
-) -> std::result::Result<Arc<QueryContext>, JsonResponse> {
-    let (catalog, schema) = if let Some(db) = &db {
-        let (catalog, schema) = parse_catalog_and_schema_from_db_string(db);
-
-        match query_handler.is_valid_schema(catalog, schema).await {
-            Ok(true) => (catalog, schema),
-            Ok(false) => {
-                return Err(JsonResponse::with_error(
-                    format!("Database not found: {db}"),
-                    StatusCode::DatabaseNotFound,
-                ))
-            }
-            Err(e) => {
-                return Err(JsonResponse::with_error(
-                    format!("Error checking database: {db}, {e}"),
-                    StatusCode::Internal,
-                ))
-            }
-        }
-    } else {
-        (DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME)
-    };
-    Ok(QueryContext::with(catalog, schema))
-}
 
 pub const HTTP_API_VERSION: &str = "v1";
 pub const HTTP_API_PREFIX: &str = "/v1/";
@@ -128,6 +97,7 @@ pub struct HttpServer {
     influxdb_handler: Option<InfluxdbLineProtocolHandlerRef>,
     opentsdb_handler: Option<OpentsdbProtocolHandlerRef>,
     prom_handler: Option<PromStoreProtocolHandlerRef>,
+    prometheus_handler: Option<PrometheusHandlerRef>,
     otlp_handler: Option<OpenTelemetryProtocolHandlerRef>,
     script_handler: Option<ScriptHandlerRef>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
@@ -409,6 +379,7 @@ impl HttpServerBuilder {
                 opentsdb_handler: None,
                 influxdb_handler: None,
                 prom_handler: None,
+                prometheus_handler: None,
                 otlp_handler: None,
                 user_provider: None,
                 script_handler: None,
@@ -447,6 +418,11 @@ impl HttpServerBuilder {
 
     pub fn with_prom_handler(&mut self, handler: PromStoreProtocolHandlerRef) -> &mut Self {
         let _ = self.inner.prom_handler.get_or_insert(handler);
+        self
+    }
+
+    pub fn with_prometheus_handler(&mut self, handler: PrometheusHandlerRef) -> &mut Self {
+        let _ = self.inner.prometheus_handler.get_or_insert(handler);
         self
     }
 
@@ -509,13 +485,6 @@ impl HttpServer {
             router = router.nest(&format!("/{HTTP_API_VERSION}"), sql_router);
         }
 
-        if let Some(grpc_handler) = self.grpc_handler.clone() {
-            router = router.nest(
-                &format!("/{HTTP_API_VERSION}/admin"),
-                self.route_admin(grpc_handler.clone()),
-            );
-        }
-
         if let Some(opentsdb_handler) = self.opentsdb_handler.clone() {
             router = router.nest(
                 &format!("/{HTTP_API_VERSION}/opentsdb"),
@@ -534,6 +503,13 @@ impl HttpServer {
             router = router.nest(
                 &format!("/{HTTP_API_VERSION}/prometheus"),
                 self.route_prom(prom_handler),
+            );
+        }
+
+        if let Some(prometheus_handler) = self.prometheus_handler.clone() {
+            router = router.nest(
+                &format!("/{HTTP_API_VERSION}/prometheus/api/v1"),
+                self.route_prometheus(prometheus_handler),
             );
         }
 
@@ -648,6 +624,19 @@ impl HttpServer {
             .with_state(api_state)
     }
 
+    fn route_prometheus<S>(&self, prometheus_handler: PrometheusHandlerRef) -> Router<S> {
+        Router::new()
+            .route("/query", routing::post(instant_query).get(instant_query))
+            .route("/query_range", routing::post(range_query).get(range_query))
+            .route("/labels", routing::post(labels_query).get(labels_query))
+            .route("/series", routing::post(series_query).get(series_query))
+            .route(
+                "/label/:label_name/values",
+                routing::get(label_values_query),
+            )
+            .with_state(prometheus_handler)
+    }
+
     fn route_prom<S>(&self, prom_handler: PromStoreProtocolHandlerRef) -> Router<S> {
         Router::new()
             .route("/write", routing::post(prom_store::remote_write))
@@ -674,13 +663,6 @@ impl HttpServer {
         Router::new()
             .route("/v1/metrics", routing::post(otlp::metrics))
             .with_state(otlp_handler)
-    }
-
-    fn route_admin<S>(&self, grpc_handler: ServerGrpcQueryHandlerRef) -> Router<S> {
-        Router::new()
-            .route("/flush", routing::post(flush))
-            .route("/compact", routing::post(compact))
-            .with_state(grpc_handler)
     }
 
     fn route_config<S>(&self, state: GreptimeOptionsConfigState) -> ApiRouter<S> {

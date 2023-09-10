@@ -11,10 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::sync::Arc;
 
+use auth::user_provider_from_option;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use servers::auth::user_provider::StaticUserProvider;
 use sqlx::mysql::{MySqlDatabaseError, MySqlPoolOptions};
 use sqlx::postgres::{PgDatabaseError, PgPoolOptions};
 use sqlx::Row;
@@ -65,13 +64,13 @@ macro_rules! sql_tests {
 }
 
 pub async fn test_mysql_auth(store_type: StorageType) {
-    let user_provider = StaticUserProvider::try_from("cmd:greptime_user=greptime_pwd").unwrap();
-    let (addr, mut guard, fe_mysql_server) = setup_mysql_server_with_user_provider(
-        store_type,
-        "sql_crud",
-        Some(Arc::new(user_provider)),
+    let user_provider = user_provider_from_option(
+        &"static_user_provider:cmd:greptime_user=greptime_pwd".to_string(),
     )
-    .await;
+    .unwrap();
+
+    let (addr, mut guard, fe_mysql_server) =
+        setup_mysql_server_with_user_provider(store_type, "sql_crud", Some(user_provider)).await;
 
     // 1. no auth
     let conn_re = MySqlPoolOptions::new()
@@ -137,7 +136,10 @@ pub async fn test_mysql_crud(store_type: StorageType) {
     .await
     .is_ok());
     for i in 0..10 {
-        let dt = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp_opt(60, i).unwrap(), Utc);
+        let dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
+            NaiveDateTime::from_timestamp_opt(60, i).unwrap(),
+            Utc,
+        );
         let d = NaiveDate::from_yo_opt(2015, 100).unwrap();
         let hello = format!("hello{i}");
         let bytes = hello.as_bytes();
@@ -166,7 +168,7 @@ pub async fn test_mysql_crud(store_type: StorageType) {
         assert_eq!(ret, i as i64);
         let expected_d = NaiveDate::from_yo_opt(2015, 100).unwrap();
         assert_eq!(expected_d, d);
-        let expected_dt = DateTime::<Utc>::from_utc(
+        let expected_dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(
             NaiveDateTime::from_timestamp_opt(60, i as u32).unwrap(),
             Utc,
         );
@@ -204,10 +206,13 @@ pub async fn test_mysql_crud(store_type: StorageType) {
 }
 
 pub async fn test_postgres_auth(store_type: StorageType) {
-    let user_provider = StaticUserProvider::try_from("cmd:greptime_user=greptime_pwd").unwrap();
+    let user_provider = user_provider_from_option(
+        &"static_user_provider:cmd:greptime_user=greptime_pwd".to_string(),
+    )
+    .unwrap();
+
     let (addr, mut guard, fe_pg_server) =
-        setup_pg_server_with_user_provider(store_type, "sql_crud", Some(Arc::new(user_provider)))
-            .await;
+        setup_pg_server_with_user_provider(store_type, "sql_crud", Some(user_provider)).await;
 
     // 1. no auth
     let conn_re = PgPoolOptions::new()

@@ -19,7 +19,7 @@ use common_catalog::consts::DEFAULT_CATALOG_NAME;
 use common_query::Output;
 use common_recordbatch::util;
 use common_telemetry::logging;
-use datatypes::vectors::{Int64Vector, StringVector, UInt64Vector, VectorRef};
+use datatypes::vectors::{StringVector, TimestampMillisecondVector, UInt64Vector, VectorRef};
 use frontend::error::{Error, Result};
 use frontend::instance::Instance;
 use rstest::rstest;
@@ -46,7 +46,7 @@ async fn test_create_database_and_insert_query(instance: Arc<dyn MockInstance>) 
              host STRING,
              cpu DOUBLE,
              memory DOUBLE,
-             ts bigint,
+             ts timestamp,
              TIME INDEX(ts)
 )"#,
     )
@@ -69,7 +69,9 @@ async fn test_create_database_and_insert_query(instance: Arc<dyn MockInstance>) 
             let batches = util::collect(s).await.unwrap();
             assert_eq!(1, batches[0].num_columns());
             assert_eq!(
-                Arc::new(Int64Vector::from_vec(vec![1655276557000_i64])) as VectorRef,
+                Arc::new(TimestampMillisecondVector::from_vec(vec![
+                    1655276557000_i64
+                ])) as VectorRef,
                 *batches[0].column(0)
             );
         }
@@ -80,60 +82,163 @@ async fn test_create_database_and_insert_query(instance: Arc<dyn MockInstance>) 
 #[apply(both_instances_cases)]
 async fn test_show_create_table(instance: Arc<dyn MockInstance>) {
     let frontend = instance.frontend();
-
-    let output = execute_sql(
-        &frontend,
+    let sql = if instance.is_distributed_mode() {
         r#"create table demo(
-             host STRING,
-             cpu DOUBLE,
-             memory DOUBLE,
-             ts bigint,
-             TIME INDEX(ts)
-)"#,
-    )
-    .await;
+    host STRING,
+    cpu DOUBLE,
+    memory DOUBLE,
+    ts timestamp,
+    TIME INDEX(ts)
+)
+PARTITION BY RANGE COLUMNS (ts) (
+    PARTITION r0 VALUES LESS THAN (1),
+    PARTITION r1 VALUES LESS THAN (10),
+    PARTITION r2 VALUES LESS THAN (100),
+    PARTITION r3 VALUES LESS THAN (MAXVALUE),
+)"#
+    } else {
+        r#"create table demo(
+    host STRING,
+    cpu DOUBLE,
+    memory DOUBLE,
+    ts timestamp,
+    TIME INDEX(ts)
+)"#
+    };
+    let output = execute_sql(&frontend, sql).await;
     assert!(matches!(output, Output::AffectedRows(0)));
 
     let output = execute_sql(&frontend, "show create table demo").await;
 
     let expected = if instance.is_distributed_mode() {
-        "\
-+-------+--------------------------------------------+
-| Table | Create Table                               |
-+-------+--------------------------------------------+
-| demo  | CREATE TABLE IF NOT EXISTS demo (          |
-|       |   host STRING NULL,                        |
-|       |   cpu DOUBLE NULL,                         |
-|       |   memory DOUBLE NULL,                      |
-|       |   ts BIGINT NOT NULL,                      |
-|       |   TIME INDEX (ts)                          |
-|       | )                                          |
-|       | PARTITION BY RANGE COLUMNS () (            |
-|       |   PARTITION r0 VALUES LESS THAN (MAXVALUE) |
-|       | )                                          |
-|       | ENGINE=mito                                |
-|       |                                            |
-+-------+--------------------------------------------+"
+        r#"+-------+----------------------------------------------------------+
+| Table | Create Table                                             |
++-------+----------------------------------------------------------+
+| demo  | CREATE TABLE IF NOT EXISTS "demo" (                      |
+|       |   "host" STRING NULL,                                    |
+|       |   "cpu" DOUBLE NULL,                                     |
+|       |   "memory" DOUBLE NULL,                                  |
+|       |   "ts" TIMESTAMP(3) NOT NULL,                            |
+|       |   TIME INDEX ("ts")                                      |
+|       | )                                                        |
+|       | PARTITION BY RANGE COLUMNS ("ts") (                      |
+|       |                       PARTITION r0 VALUES LESS THAN (1), |
+|       |   PARTITION r1 VALUES LESS THAN (10),                    |
+|       |   PARTITION r2 VALUES LESS THAN (100),                   |
+|       |   PARTITION r3 VALUES LESS THAN (MAXVALUE)               |
+|       |                 )                                        |
+|       | ENGINE=mito                                              |
+|       | WITH(                                                    |
+|       |   regions = 4                                            |
+|       | )                                                        |
++-------+----------------------------------------------------------+"#
     } else {
-        "\
-+-------+-----------------------------------+
-| Table | Create Table                      |
-+-------+-----------------------------------+
-| demo  | CREATE TABLE IF NOT EXISTS demo ( |
-|       |   host STRING NULL,               |
-|       |   cpu DOUBLE NULL,                |
-|       |   memory DOUBLE NULL,             |
-|       |   ts BIGINT NOT NULL,             |
-|       |   TIME INDEX (ts)                 |
-|       | )                                 |
-|       | ENGINE=mito                       |
-|       | WITH(                             |
-|       |   regions = 1                     |
-|       | )                                 |
-+-------+-----------------------------------+"
+        r#"+-------+-------------------------------------+
+| Table | Create Table                        |
++-------+-------------------------------------+
+| demo  | CREATE TABLE IF NOT EXISTS "demo" ( |
+|       |   "host" STRING NULL,               |
+|       |   "cpu" DOUBLE NULL,                |
+|       |   "memory" DOUBLE NULL,             |
+|       |   "ts" TIMESTAMP(3) NOT NULL,       |
+|       |   TIME INDEX ("ts")                 |
+|       | )                                   |
+|       | ENGINE=mito                         |
+|       | WITH(                               |
+|       |   regions = 1                       |
+|       | )                                   |
++-------+-------------------------------------+"#
     };
 
     check_output_stream(output, expected).await;
+}
+
+#[apply(both_instances_cases)]
+async fn test_validate_external_table_options(instance: Arc<dyn MockInstance>) {
+    let frontend = instance.frontend();
+    let format = "json";
+    let location = find_testing_resource("/tests/data/json/various_type.json");
+    let table_name = "various_type_json_with_schema";
+    let sql = &format!(
+        r#"CREATE EXTERNAL TABLE {table_name} (
+            a BIGINT NULL,
+            b DOUBLE NULL,
+            c BOOLEAN NULL,
+            d STRING NULL,
+            e TIMESTAMP(0) NULL,
+            f DOUBLE NULL,
+            g TIMESTAMP(0) NULL,
+          ) WITH (foo='bar', location='{location}', format='{format}');"#,
+    );
+
+    let result = try_execute_sql(&frontend, sql).await;
+    assert!(matches!(result, Err(Error::ParseSql { .. })));
+}
+
+#[apply(both_instances_cases)]
+async fn test_show_create_external_table(instance: Arc<dyn MockInstance>) {
+    let fe_instance = instance.frontend();
+    let format = "csv";
+    let location = find_testing_resource("/tests/data/csv/various_type.csv");
+    let table_name = "various_type_csv";
+
+    let output = execute_sql(
+        &fe_instance,
+        &format!(
+            r#"create external table {table_name} with (location='{location}', format='{format}');"#,
+        ),
+    )
+    .await;
+    assert!(matches!(output, Output::AffectedRows(0)));
+
+    let output = execute_sql(&fe_instance, &format!("show create table {table_name};")).await;
+
+    let Output::RecordBatches(record_batches) = output else {
+        unreachable!()
+    };
+
+    // We can't directly test `show create table` by check_output_stream because the location name length depends on the current filesystem.
+    let record_batches = record_batches.iter().collect::<Vec<_>>();
+    let column = record_batches[0].column_by_name("Create Table").unwrap();
+    let actual = column.get(0);
+    let expect = if instance.is_distributed_mode() {
+        format!(
+            r#"CREATE EXTERNAL TABLE IF NOT EXISTS "various_type_csv" (
+  "c_int" BIGINT NULL,
+  "c_float" DOUBLE NULL,
+  "c_string" DOUBLE NULL,
+  "c_bool" BOOLEAN NULL,
+  "c_date" DATE NULL,
+  "c_datetime" TIMESTAMP(0) NULL,
+
+)
+
+ENGINE=file
+WITH(
+  format = 'csv',
+  location = '{location}',
+  regions = 1
+)"#
+        )
+    } else {
+        format!(
+            r#"CREATE EXTERNAL TABLE IF NOT EXISTS "various_type_csv" (
+  "c_int" BIGINT NULL,
+  "c_float" DOUBLE NULL,
+  "c_string" DOUBLE NULL,
+  "c_bool" BOOLEAN NULL,
+  "c_date" DATE NULL,
+  "c_datetime" TIMESTAMP(0) NULL,
+
+)
+ENGINE=file
+WITH(
+  format = 'csv',
+  location = '{location}'
+)"#
+        )
+    };
+    assert_eq!(actual.to_string(), expect);
 }
 
 #[apply(both_instances_cases)]
@@ -151,7 +256,7 @@ async fn test_issue477_same_table_name_in_different_databases(instance: Arc<dyn 
         &instance,
         r#"create table a.demo(
              host STRING,
-             ts bigint,
+             ts timestamp,
              TIME INDEX(ts)
 )"#,
     )
@@ -162,7 +267,7 @@ async fn test_issue477_same_table_name_in_different_databases(instance: Arc<dyn 
         &instance,
         r#"create table b.demo(
              host STRING,
-             ts bigint,
+             ts timestamp,
              TIME INDEX(ts)
 )"#,
     )
@@ -217,7 +322,7 @@ async fn assert_query_result(instance: &Arc<Instance>, sql: &str, ts: i64, host:
                 *batches[0].column(0)
             );
             assert_eq!(
-                Arc::new(Int64Vector::from_vec(vec![ts])) as VectorRef,
+                Arc::new(TimestampMillisecondVector::from_vec(vec![ts])) as VectorRef,
                 *batches[0].column(1)
             );
         }
@@ -314,53 +419,6 @@ async fn test_execute_insert_by_select(instance: Arc<dyn MockInstance>) {
 | host2 | 88.8 | 333.3  | 2022-06-15T07:02:38 |
 +-------+------+--------+---------------------+";
     check_output_stream(output, expected).await;
-}
-
-#[apply(both_instances_cases)]
-async fn test_execute_insert_query_with_i64_timestamp(instance: Arc<dyn MockInstance>) {
-    let instance = instance.frontend();
-
-    assert!(matches!(execute_sql(
-        &instance,
-        "create table demo(host string, cpu double, memory double, ts bigint time index, primary key (host));",
-    ).await, Output::AffectedRows(0)));
-
-    let output = execute_sql(
-        &instance,
-        r#"insert into demo(host, cpu, memory, ts) values
-                           ('host1', 66.6, 1024, 1655276557000),
-                           ('host2', 88.8,  333.3, 1655276558000)
-                           "#,
-    )
-    .await;
-    assert!(matches!(output, Output::AffectedRows(2)));
-
-    let query_output = execute_sql(&instance, "select ts from demo order by ts limit 1").await;
-    match query_output {
-        Output::Stream(s) => {
-            let batches = util::collect(s).await.unwrap();
-            assert_eq!(1, batches[0].num_columns());
-            assert_eq!(
-                Arc::new(Int64Vector::from_vec(vec![1655276557000_i64,])) as VectorRef,
-                *batches[0].column(0)
-            );
-        }
-        _ => unreachable!(),
-    }
-
-    let query_output =
-        execute_sql(&instance, "select ts as time from demo order by ts limit 1").await;
-    match query_output {
-        Output::Stream(s) => {
-            let batches = util::collect(s).await.unwrap();
-            assert_eq!(1, batches[0].num_columns());
-            assert_eq!(
-                Arc::new(Int64Vector::from_vec(vec![1655276557000_i64,])) as VectorRef,
-                *batches[0].column(0)
-            );
-        }
-        _ => unreachable!(),
-    }
 }
 
 #[apply(both_instances_cases)]
@@ -535,16 +593,16 @@ async fn test_execute_query_external_table_parquet(instance: Arc<dyn MockInstanc
 
     let output = execute_sql(&instance, &format!("desc table {table_name};")).await;
     let expect = "\
-+------------+-----------------+------+---------+---------------+
-| Field      | Type            | Null | Default | Semantic Type |
-+------------+-----------------+------+---------+---------------+
-| c_int      | Int64           | YES  |         | FIELD         |
-| c_float    | Float64         | YES  |         | FIELD         |
-| c_string   | Float64         | YES  |         | FIELD         |
-| c_bool     | Boolean         | YES  |         | FIELD         |
-| c_date     | Date            | YES  |         | FIELD         |
-| c_datetime | TimestampSecond | YES  |         | FIELD         |
-+------------+-----------------+------+---------+---------------+";
++------------+-----------------+-----+------+---------+---------------+
+| Column     | Type            | Key | Null | Default | Semantic Type |
++------------+-----------------+-----+------+---------+---------------+
+| c_int      | Int64           |     | YES  |         | FIELD         |
+| c_float    | Float64         |     | YES  |         | FIELD         |
+| c_string   | Float64         |     | YES  |         | FIELD         |
+| c_bool     | Boolean         |     | YES  |         | FIELD         |
+| c_date     | Date            |     | YES  |         | FIELD         |
+| c_datetime | TimestampSecond |     | YES  |         | FIELD         |
++------------+-----------------+-----+------+---------+---------------+";
     check_output_stream(output, expect).await;
 
     let output = execute_sql(&instance, &format!("select * from {table_name};")).await;
@@ -600,30 +658,30 @@ async fn test_execute_query_external_table_orc(instance: Arc<dyn MockInstance>) 
 
     let output = execute_sql(&instance, &format!("desc table {table_name};")).await;
     let expect = "\
-+------------------------+---------------------+------+---------+---------------+
-| Field                  | Type                | Null | Default | Semantic Type |
-+------------------------+---------------------+------+---------+---------------+
-| double_a               | Float64             | YES  |         | FIELD         |
-| a                      | Float32             | YES  |         | FIELD         |
-| b                      | Boolean             | YES  |         | FIELD         |
-| str_direct             | String              | YES  |         | FIELD         |
-| d                      | String              | YES  |         | FIELD         |
-| e                      | String              | YES  |         | FIELD         |
-| f                      | String              | YES  |         | FIELD         |
-| int_short_repeated     | Int32               | YES  |         | FIELD         |
-| int_neg_short_repeated | Int32               | YES  |         | FIELD         |
-| int_delta              | Int32               | YES  |         | FIELD         |
-| int_neg_delta          | Int32               | YES  |         | FIELD         |
-| int_direct             | Int32               | YES  |         | FIELD         |
-| int_neg_direct         | Int32               | YES  |         | FIELD         |
-| bigint_direct          | Int64               | YES  |         | FIELD         |
-| bigint_neg_direct      | Int64               | YES  |         | FIELD         |
-| bigint_other           | Int64               | YES  |         | FIELD         |
-| utf8_increase          | String              | YES  |         | FIELD         |
-| utf8_decrease          | String              | YES  |         | FIELD         |
-| timestamp_simple       | TimestampNanosecond | YES  |         | FIELD         |
-| date_simple            | Date                | YES  |         | FIELD         |
-+------------------------+---------------------+------+---------+---------------+";
++------------------------+---------------------+-----+------+---------+---------------+
+| Column                 | Type                | Key | Null | Default | Semantic Type |
++------------------------+---------------------+-----+------+---------+---------------+
+| double_a               | Float64             |     | YES  |         | FIELD         |
+| a                      | Float32             |     | YES  |         | FIELD         |
+| b                      | Boolean             |     | YES  |         | FIELD         |
+| str_direct             | String              |     | YES  |         | FIELD         |
+| d                      | String              |     | YES  |         | FIELD         |
+| e                      | String              |     | YES  |         | FIELD         |
+| f                      | String              |     | YES  |         | FIELD         |
+| int_short_repeated     | Int32               |     | YES  |         | FIELD         |
+| int_neg_short_repeated | Int32               |     | YES  |         | FIELD         |
+| int_delta              | Int32               |     | YES  |         | FIELD         |
+| int_neg_delta          | Int32               |     | YES  |         | FIELD         |
+| int_direct             | Int32               |     | YES  |         | FIELD         |
+| int_neg_direct         | Int32               |     | YES  |         | FIELD         |
+| bigint_direct          | Int64               |     | YES  |         | FIELD         |
+| bigint_neg_direct      | Int64               |     | YES  |         | FIELD         |
+| bigint_other           | Int64               |     | YES  |         | FIELD         |
+| utf8_increase          | String              |     | YES  |         | FIELD         |
+| utf8_decrease          | String              |     | YES  |         | FIELD         |
+| timestamp_simple       | TimestampNanosecond |     | YES  |         | FIELD         |
+| date_simple            | Date                |     | YES  |         | FIELD         |
++------------------------+---------------------+-----+------+---------+---------------+";
     check_output_stream(output, expect).await;
 
     let output = execute_sql(&instance, &format!("select * from {table_name};")).await;
@@ -675,16 +733,16 @@ async fn test_execute_query_external_table_csv(instance: Arc<dyn MockInstance>) 
 
     let output = execute_sql(&instance, &format!("desc table {table_name};")).await;
     let expect = "\
-+------------+-----------------+------+---------+---------------+
-| Field      | Type            | Null | Default | Semantic Type |
-+------------+-----------------+------+---------+---------------+
-| c_int      | Int64           | YES  |         | FIELD         |
-| c_float    | Float64         | YES  |         | FIELD         |
-| c_string   | Float64         | YES  |         | FIELD         |
-| c_bool     | Boolean         | YES  |         | FIELD         |
-| c_date     | Date            | YES  |         | FIELD         |
-| c_datetime | TimestampSecond | YES  |         | FIELD         |
-+------------+-----------------+------+---------+---------------+";
++------------+-----------------+-----+------+---------+---------------+
+| Column     | Type            | Key | Null | Default | Semantic Type |
++------------+-----------------+-----+------+---------+---------------+
+| c_int      | Int64           |     | YES  |         | FIELD         |
+| c_float    | Float64         |     | YES  |         | FIELD         |
+| c_string   | Float64         |     | YES  |         | FIELD         |
+| c_bool     | Boolean         |     | YES  |         | FIELD         |
+| c_date     | Date            |     | YES  |         | FIELD         |
+| c_datetime | TimestampSecond |     | YES  |         | FIELD         |
++------------+-----------------+-----+------+---------+---------------+";
     check_output_stream(output, expect).await;
 
     let output = execute_sql(&instance, &format!("select * from {table_name};")).await;
@@ -721,17 +779,17 @@ async fn test_execute_query_external_table_json(instance: Arc<dyn MockInstance>)
 
     let output = execute_sql(&instance, &format!("desc table {table_name};")).await;
     let expect = "\
-+-------+---------+------+---------+---------------+
-| Field | Type    | Null | Default | Semantic Type |
-+-------+---------+------+---------+---------------+
-| a     | Int64   | YES  |         | FIELD         |
-| b     | Float64 | YES  |         | FIELD         |
-| c     | Boolean | YES  |         | FIELD         |
-| d     | String  | YES  |         | FIELD         |
-| e     | Int64   | YES  |         | FIELD         |
-| f     | String  | YES  |         | FIELD         |
-| g     | String  | YES  |         | FIELD         |
-+-------+---------+------+---------+---------------+";
++--------+---------+-----+------+---------+---------------+
+| Column | Type    | Key | Null | Default | Semantic Type |
++--------+---------+-----+------+---------+---------------+
+| a      | Int64   |     | YES  |         | FIELD         |
+| b      | Float64 |     | YES  |         | FIELD         |
+| c      | Boolean |     | YES  |         | FIELD         |
+| d      | String  |     | YES  |         | FIELD         |
+| e      | Int64   |     | YES  |         | FIELD         |
+| f      | String  |     | YES  |         | FIELD         |
+| g      | String  |     | YES  |         | FIELD         |
++--------+---------+-----+------+---------+---------------+";
     check_output_stream(output, expect).await;
 
     let output = execute_sql(&instance, &format!("select * from {table_name};")).await;
@@ -781,17 +839,17 @@ async fn test_execute_query_external_table_json_with_schame(instance: Arc<dyn Mo
 
     let output = execute_sql(&instance, &format!("desc table {table_name};")).await;
     let expect = "\
-+-------+-----------------+------+---------+---------------+
-| Field | Type            | Null | Default | Semantic Type |
-+-------+-----------------+------+---------+---------------+
-| a     | Int64           | YES  |         | FIELD         |
-| b     | Float64         | YES  |         | FIELD         |
-| c     | Boolean         | YES  |         | FIELD         |
-| d     | String          | YES  |         | FIELD         |
-| e     | TimestampSecond | YES  |         | FIELD         |
-| f     | Float64         | YES  |         | FIELD         |
-| g     | TimestampSecond | YES  |         | FIELD         |
-+-------+-----------------+------+---------+---------------+";
++--------+-----------------+-----+------+---------+---------------+
+| Column | Type            | Key | Null | Default | Semantic Type |
++--------+-----------------+-----+------+---------+---------------+
+| a      | Int64           |     | YES  |         | FIELD         |
+| b      | Float64         |     | YES  |         | FIELD         |
+| c      | Boolean         |     | YES  |         | FIELD         |
+| d      | String          |     | YES  |         | FIELD         |
+| e      | TimestampSecond |     | YES  |         | FIELD         |
+| f      | Float64         |     | YES  |         | FIELD         |
+| g      | TimestampSecond |     | YES  |         | FIELD         |
++--------+-----------------+-----+------+---------+---------------+";
     check_output_stream(output, expect).await;
 
     let output = execute_sql(&instance, &format!("select * from {table_name};")).await;
@@ -1064,7 +1122,6 @@ async fn test_insert_with_default_value_for_type(instance: Arc<Instance>, type_n
 #[apply(standalone_instance_case)]
 async fn test_insert_with_default_value(instance: Arc<dyn MockInstance>) {
     test_insert_with_default_value_for_type(instance.frontend(), "timestamp").await;
-    test_insert_with_default_value_for_type(instance.frontend(), "bigint").await;
 }
 
 #[apply(both_instances_cases)]
@@ -1077,7 +1134,7 @@ async fn test_use_database(instance: Arc<dyn MockInstance>) {
     let query_ctx = QueryContext::with(DEFAULT_CATALOG_NAME, "db1");
     let output = execute_sql_with(
         &instance,
-        "create table tb1(col_i32 int, ts bigint, TIME INDEX(ts))",
+        "create table tb1(col_i32 int, ts timestamp, TIME INDEX(ts))",
         query_ctx.clone(),
     )
     .await;
@@ -1306,6 +1363,39 @@ async fn test_execute_copy_from_s3(instance: Arc<dyn MockInstance>) {
 }
 
 #[apply(both_instances_cases)]
+async fn test_execute_copy_from_orc_with_cast(instance: Arc<dyn MockInstance>) {
+    logging::init_default_ut_logging();
+    let instance = instance.frontend();
+
+    // setups
+    assert!(matches!(execute_sql(
+        &instance,
+        "create table demo(bigint_direct timestamp(9), bigint_neg_direct timestamp(6), bigint_other timestamp(3), timestamp_simple timestamp(9), time index (bigint_other));",
+    )
+    .await, Output::AffectedRows(0)));
+
+    let filepath = find_testing_resource("/src/common/datasource/tests/orc/test.orc");
+
+    let output = execute_sql(
+        &instance,
+        &format!("copy demo from '{}' WITH(FORMAT='orc');", &filepath),
+    )
+    .await;
+
+    assert!(matches!(output, Output::AffectedRows(5)));
+
+    let output = execute_sql(&instance, "select * from demo;").await;
+    let expected = r#"+-------------------------------+----------------------------+-------------------------+----------------------------+
+| bigint_direct                 | bigint_neg_direct          | bigint_other            | timestamp_simple           |
++-------------------------------+----------------------------+-------------------------+----------------------------+
+| 1970-01-01T00:00:00.000000006 | 1969-12-31T23:59:59.999994 | 1969-12-31T23:59:59.995 | 2021-08-22T07:26:44.525777 |
+|                               |                            | 1970-01-01T00:00:00.001 | 2023-01-01T00:00:00        |
+| 1970-01-01T00:00:00.000000002 | 1969-12-31T23:59:59.999998 | 1970-01-01T00:00:00.005 | 2023-03-01T00:00:00        |
++-------------------------------+----------------------------+-------------------------+----------------------------+"#;
+    check_output_stream(output, expected).await;
+}
+
+#[apply(both_instances_cases)]
 async fn test_execute_copy_from_orc(instance: Arc<dyn MockInstance>) {
     logging::init_default_ut_logging();
     let instance = instance.frontend();
@@ -1380,7 +1470,7 @@ async fn test_information_schema_dot_tables(instance: Arc<dyn MockInstance>) {
     let is_distributed_mode = instance.is_distributed_mode();
     let instance = instance.frontend();
 
-    let sql = "create table another_table(i bigint time index)";
+    let sql = "create table another_table(i timestamp time index)";
     let query_ctx = QueryContext::with("another_catalog", "another_schema");
     let output = execute_sql_with(&instance, sql, query_ctx.clone()).await;
     assert!(matches!(output, Output::AffectedRows(0)));
@@ -1447,7 +1537,7 @@ async fn test_information_schema_dot_tables(instance: Arc<dyn MockInstance>) {
 async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
     let instance = instance.frontend();
 
-    let sql = "create table another_table(i bigint time index)";
+    let sql = "create table another_table(i timestamp time index)";
     let query_ctx = QueryContext::with("another_catalog", "another_schema");
     let output = execute_sql_with(&instance, sql, query_ctx.clone()).await;
     assert!(matches!(output, Output::AffectedRows(0)));
@@ -1467,12 +1557,12 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 | greptime      | information_schema | columns    | column_name   | String               | FIELD         |
 | greptime      | information_schema | columns    | data_type     | String               | FIELD         |
 | greptime      | information_schema | columns    | semantic_type | String               | FIELD         |
-| greptime      | public             | numbers    | number        | UInt32               | PRIMARY KEY   |
-| greptime      | public             | scripts    | schema        | String               | PRIMARY KEY   |
-| greptime      | public             | scripts    | name          | String               | PRIMARY KEY   |
+| greptime      | public             | numbers    | number        | UInt32               | TAG           |
+| greptime      | public             | scripts    | schema        | String               | TAG           |
+| greptime      | public             | scripts    | name          | String               | TAG           |
 | greptime      | public             | scripts    | script        | String               | FIELD         |
 | greptime      | public             | scripts    | engine        | String               | FIELD         |
-| greptime      | public             | scripts    | timestamp     | TimestampMillisecond | TIME INDEX    |
+| greptime      | public             | scripts    | timestamp     | TimestampMillisecond | TIMESTAMP     |
 | greptime      | public             | scripts    | gmt_created   | TimestampMillisecond | FIELD         |
 | greptime      | public             | scripts    | gmt_modified  | TimestampMillisecond | FIELD         |
 | greptime      | information_schema | tables     | table_catalog | String               | FIELD         |
@@ -1487,23 +1577,23 @@ async fn test_information_schema_dot_columns(instance: Arc<dyn MockInstance>) {
 
     let output = execute_sql_with(&instance, sql, query_ctx).await;
     let expected = "\
-+-----------------+--------------------+---------------+---------------+-----------+---------------+
-| table_catalog   | table_schema       | table_name    | column_name   | data_type | semantic_type |
-+-----------------+--------------------+---------------+---------------+-----------+---------------+
-| another_catalog | another_schema     | another_table | i             | Int64     | TIME INDEX    |
-| another_catalog | information_schema | columns       | table_catalog | String    | FIELD         |
-| another_catalog | information_schema | columns       | table_schema  | String    | FIELD         |
-| another_catalog | information_schema | columns       | table_name    | String    | FIELD         |
-| another_catalog | information_schema | columns       | column_name   | String    | FIELD         |
-| another_catalog | information_schema | columns       | data_type     | String    | FIELD         |
-| another_catalog | information_schema | columns       | semantic_type | String    | FIELD         |
-| another_catalog | information_schema | tables        | table_catalog | String    | FIELD         |
-| another_catalog | information_schema | tables        | table_schema  | String    | FIELD         |
-| another_catalog | information_schema | tables        | table_name    | String    | FIELD         |
-| another_catalog | information_schema | tables        | table_type    | String    | FIELD         |
-| another_catalog | information_schema | tables        | table_id      | UInt32    | FIELD         |
-| another_catalog | information_schema | tables        | engine        | String    | FIELD         |
-+-----------------+--------------------+---------------+---------------+-----------+---------------+";
++-----------------+--------------------+---------------+---------------+----------------------+---------------+
+| table_catalog   | table_schema       | table_name    | column_name   | data_type            | semantic_type |
++-----------------+--------------------+---------------+---------------+----------------------+---------------+
+| another_catalog | another_schema     | another_table | i             | TimestampMillisecond | TIMESTAMP     |
+| another_catalog | information_schema | columns       | table_catalog | String               | FIELD         |
+| another_catalog | information_schema | columns       | table_schema  | String               | FIELD         |
+| another_catalog | information_schema | columns       | table_name    | String               | FIELD         |
+| another_catalog | information_schema | columns       | column_name   | String               | FIELD         |
+| another_catalog | information_schema | columns       | data_type     | String               | FIELD         |
+| another_catalog | information_schema | columns       | semantic_type | String               | FIELD         |
+| another_catalog | information_schema | tables        | table_catalog | String               | FIELD         |
+| another_catalog | information_schema | tables        | table_schema  | String               | FIELD         |
+| another_catalog | information_schema | tables        | table_name    | String               | FIELD         |
+| another_catalog | information_schema | tables        | table_type    | String               | FIELD         |
+| another_catalog | information_schema | tables        | table_id      | UInt32               | FIELD         |
+| another_catalog | information_schema | tables        | engine        | String               | FIELD         |
++-----------------+--------------------+---------------+---------------+----------------------+---------------+";
 
     check_output_stream(output, expected).await;
 }

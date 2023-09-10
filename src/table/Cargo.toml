@@ -13,6 +13,7 @@ async-trait = "0.1"
 chrono.workspace = true
 common-base = { workspace = true }
 common-catalog = { workspace = true }
+common-datasource = { workspace = true }
 common-error = { workspace = true }
 common-procedure = { workspace = true }
 common-query = { workspace = true }
@@ -27,7 +28,7 @@ datatypes = { workspace = true }
 derive_builder.workspace = true
 futures.workspace = true
 humantime = "2.1"
-humantime-serde = "1.1"
+humantime-serde.workspace = true
 paste.workspace = true
 serde.workspace = true
 snafu = { version = "0.7", features = ["backtraces"] }

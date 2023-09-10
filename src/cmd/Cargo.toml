@@ -17,13 +17,16 @@ metrics-process = ["servers/metrics-process"]
 [dependencies]
 anymap = "1.0.0-beta.2"
 async-trait.workspace = true
+auth.workspace = true
 catalog = { workspace = true }
 chrono.workspace = true
 clap = { version = "3.1", features = ["derive"] }
 client = { workspace = true }
 common-base = { workspace = true }
+common-config = { workspace = true }
 common-error = { workspace = true }
 common-meta = { workspace = true }
+common-procedure = { workspace = true }
 common-query = { workspace = true }
 common-recordbatch = { workspace = true }
 common-telemetry = { workspace = true, features = [
@@ -41,6 +44,7 @@ meta-srv = { workspace = true }
 metrics.workspace = true
 nu-ansi-term = "0.46"
 partition = { workspace = true }
+prost.workspace = true
 query = { workspace = true }
 rand.workspace = true
 rustyline = "10.1"

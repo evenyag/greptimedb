@@ -29,8 +29,8 @@ pub mod truncate;
 use std::str::FromStr;
 
 use api::helper::ColumnDataTypeWrapper;
-use api::v1::add_column::location::LocationType;
-use api::v1::add_column::Location;
+use api::v1::add_column_location::LocationType;
+use api::v1::{AddColumnLocation as Location, SemanticType};
 use common_base::bytes::Bytes;
 use common_query::AddColumnLocation;
 use common_time::Timestamp;
@@ -270,6 +270,17 @@ fn parse_column_default_constraint(
     }
 }
 
+/// Return true when the `ColumnDef` options contain primary key
+pub fn has_primary_key_option(column_def: &ColumnDef) -> bool {
+    column_def
+        .options
+        .iter()
+        .any(|options| match options.option {
+            ColumnOption::Unique { is_primary } => is_primary,
+            _ => false,
+        })
+}
+
 // TODO(yingwen): Make column nullable by default, and checks invalid case like
 // a column is not nullable but has a default value null.
 /// Create a `ColumnSchema` from `ColumnDef`.
@@ -327,9 +338,11 @@ pub fn sql_column_def_to_grpc_column_def(col: &ColumnDef) -> Result<api::v1::Col
         .datatype() as i32;
     Ok(api::v1::ColumnDef {
         name,
-        datatype: data_type,
+        data_type,
         is_nullable,
         default_constraint: default_constraint.unwrap_or_default(),
+        // TODO(#1308): support adding new primary key columns
+        semantic_type: SemanticType::Field as _,
     })
 }
 
@@ -411,15 +424,15 @@ pub fn concrete_data_type_to_sql_data_type(data_type: &ConcreteDataType) -> Resu
 
 pub fn sql_location_to_grpc_add_column_location(
     location: &Option<AddColumnLocation>,
-) -> Option<api::v1::add_column::Location> {
+) -> Option<Location> {
     match location {
         Some(AddColumnLocation::First) => Some(Location {
             location_type: LocationType::First.into(),
-            after_cloumn_name: "".to_string(),
+            after_column_name: "".to_string(),
         }),
         Some(AddColumnLocation::After { column_name }) => Some(Location {
             location_type: LocationType::After.into(),
-            after_cloumn_name: column_name.to_string(),
+            after_column_name: column_name.to_string(),
         }),
         None => None,
     }
@@ -730,7 +743,7 @@ mod tests {
 
         assert_eq!("col", grpc_column_def.name);
         assert!(grpc_column_def.is_nullable); // nullable when options are empty
-        assert_eq!(ColumnDataType::Float64 as i32, grpc_column_def.datatype);
+        assert_eq!(ColumnDataType::Float64 as i32, grpc_column_def.data_type);
         assert!(grpc_column_def.default_constraint.is_empty());
 
         // test not null
@@ -746,6 +759,28 @@ mod tests {
 
         let grpc_column_def = sql_column_def_to_grpc_column_def(&column_def).unwrap();
         assert!(!grpc_column_def.is_nullable);
+    }
+
+    #[test]
+    pub fn test_has_primary_key_option() {
+        let column_def = ColumnDef {
+            name: "col".into(),
+            data_type: SqlDataType::Double,
+            collation: None,
+            options: vec![],
+        };
+        assert!(!has_primary_key_option(&column_def));
+
+        let column_def = ColumnDef {
+            name: "col".into(),
+            data_type: SqlDataType::Double,
+            collation: None,
+            options: vec![ColumnOptionDef {
+                name: None,
+                option: ColumnOption::Unique { is_primary: true },
+            }],
+        };
+        assert!(has_primary_key_option(&column_def));
     }
 
     #[test]

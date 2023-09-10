@@ -13,9 +13,16 @@
 // limitations under the License.
 
 #![feature(btree_extract_if)]
+#![feature(async_closure)]
 
+pub mod cache_invalidator;
+pub mod datanode_manager;
+pub mod ddl;
+pub mod ddl_manager;
 pub mod error;
 pub mod heartbeat;
+// TODO(weny): Removes it
+#[allow(deprecated)]
 pub mod helper;
 pub mod ident;
 pub mod instruction;
@@ -25,6 +32,8 @@ pub mod metrics;
 pub mod peer;
 pub mod range_stream;
 pub mod rpc;
+pub mod sequence;
+pub mod state_store;
 pub mod table_name;
 pub mod util;
 

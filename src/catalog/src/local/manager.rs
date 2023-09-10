@@ -136,18 +136,17 @@ impl LocalCatalogManager {
             schema: INFORMATION_SCHEMA_NAME.to_string(),
             table_name: SYSTEM_CATALOG_TABLE_NAME.to_string(),
             table_id: SYSTEM_CATALOG_TABLE_ID,
-            table: self.system.information_schema.system.clone(),
+            table: self.system.information_schema.system.as_table_ref(),
         };
         self.catalogs.register_table(register_table_req).await?;
 
         // Add numbers table for test
-        let numbers_table = Arc::new(NumbersTable::default());
         let register_number_table_req = RegisterTableRequest {
             catalog: DEFAULT_CATALOG_NAME.to_string(),
             schema: DEFAULT_SCHEMA_NAME.to_string(),
             table_name: NUMBERS_TABLE_NAME.to_string(),
             table_id: NUMBERS_TABLE_ID,
-            table: numbers_table,
+            table: NumbersTable::table(NUMBERS_TABLE_ID),
         };
 
         self.catalogs
@@ -516,20 +515,6 @@ impl CatalogManager for LocalCatalogManager {
             operation: "deregister schema",
         }
         .fail()
-    }
-
-    async fn register_system_table(&self, request: RegisterSystemTableRequest) -> Result<()> {
-        let catalog_name = request.create_table_request.catalog_name.clone();
-        let schema_name = request.create_table_request.schema_name.clone();
-
-        let mut sys_table_requests = self.system_table_requests.lock().await;
-        sys_table_requests.push(request);
-        increment_gauge!(
-            crate::metrics::METRIC_CATALOG_MANAGER_TABLE_COUNT,
-            1.0,
-            &[crate::metrics::db_label(&catalog_name, &schema_name)],
-        );
-        Ok(())
     }
 
     async fn schema_exist(&self, catalog: &str, schema: &str) -> Result<bool> {

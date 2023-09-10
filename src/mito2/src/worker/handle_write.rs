@@ -15,29 +15,46 @@
 //! Handling write requests.
 
 use std::collections::{hash_map, HashMap};
-use std::mem;
 use std::sync::Arc;
 
-use greptime_proto::v1::mito::{Mutation, WalEntry};
-use snafu::ResultExt;
+use common_query::Output;
 use store_api::logstore::LogStore;
-use store_api::storage::{RegionId, SequenceNumber};
+use store_api::metadata::RegionMetadata;
+use store_api::storage::RegionId;
 use tokio::sync::oneshot::Sender;
 
-use crate::error::{Error, RegionNotFoundSnafu, Result, WriteGroupSnafu};
-use crate::memtable::KeyValues;
-use crate::metadata::RegionMetadata;
-use crate::proto_util::to_proto_op_type;
-use crate::region::version::{VersionControlData, VersionRef};
-use crate::region::MitoRegionRef;
+use crate::error::{RegionNotFoundSnafu, RejectWriteSnafu, Result};
+use crate::region_write_ctx::RegionWriteCtx;
 use crate::request::{SenderWriteRequest, WriteRequest};
-use crate::wal::{EntryId, WalWriter};
 use crate::worker::RegionWorkerLoop;
 
 impl<S: LogStore> RegionWorkerLoop<S> {
     /// Takes and handles all write requests.
-    pub(crate) async fn handle_write_requests(&mut self, write_requests: Vec<SenderWriteRequest>) {
+    pub(crate) async fn handle_write_requests(
+        &mut self,
+        mut write_requests: Vec<SenderWriteRequest>,
+        allow_stall: bool,
+    ) {
         if write_requests.is_empty() {
+            return;
+        }
+
+        // Flush this worker if the engine needs to flush.
+        self.maybe_flush_worker();
+
+        if self.should_reject_write() {
+            // The memory pressure is still too high, reject write requests.
+            reject_write_requests(write_requests);
+            // Also reject all stalled requests.
+            let stalled = std::mem::take(&mut self.stalled_requests);
+            reject_write_requests(stalled.requests);
+            return;
+        }
+
+        if self.write_buffer_manager.should_stall() && allow_stall {
+            // TODO(yingwen): stalled metrics.
+            self.stalled_requests.append(&mut write_requests);
+            self.listener.on_write_stall();
             return;
         }
 
@@ -68,13 +85,15 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 impl<S> RegionWorkerLoop<S> {
     /// Validates and groups requests by region.
     fn prepare_region_write_ctx(
-        &self,
+        &mut self,
         write_requests: Vec<SenderWriteRequest>,
     ) -> HashMap<RegionId, RegionWriteCtx> {
+        // Initialize region write context map.
         let mut region_ctxs = HashMap::new();
         for mut sender_req in write_requests {
             let region_id = sender_req.request.region_id;
-            // Checks whether the region exists.
+
+            // Checks whether the region exists and is it stalling.
             if let hash_map::Entry::Vacant(e) = region_ctxs.entry(region_id) {
                 let Some(region) = self.regions.get_region(region_id) else {
                     // No such region.
@@ -83,8 +102,9 @@ impl<S> RegionWorkerLoop<S> {
                     continue;
                 };
 
-                // Initialize the context.
-                e.insert(RegionWriteCtx::new(region));
+                let region_ctx = RegionWriteCtx::new(region.region_id, &region.version_control);
+
+                e.insert(region_ctx);
             }
 
             // Safety: Now we ensure the region exists.
@@ -92,7 +112,7 @@ impl<S> RegionWorkerLoop<S> {
 
             // Checks whether request schema is compatible with region schema.
             if let Err(e) =
-                maybe_fill_missing_columns(&mut sender_req.request, &region_ctx.version.metadata)
+                maybe_fill_missing_columns(&mut sender_req.request, &region_ctx.version().metadata)
             {
                 send_result(sender_req.sender, Err(e));
 
@@ -100,10 +120,35 @@ impl<S> RegionWorkerLoop<S> {
             }
 
             // Collect requests by region.
-            region_ctx.push_sender_request(sender_req);
+            region_ctx.push_mutation(
+                sender_req.request.op_type as i32,
+                Some(sender_req.request.rows),
+                sender_req.sender,
+            );
         }
 
         region_ctxs
+    }
+
+    /// Returns true if the engine needs to reject some write requests.
+    fn should_reject_write(&self) -> bool {
+        // If memory usage reaches high threshold (we should also consider stalled requests) returns true.
+        self.write_buffer_manager.memory_usage() + self.stalled_requests.estimated_size
+            >= self.config.global_write_buffer_reject_size.as_bytes() as usize
+    }
+}
+
+/// Send rejected error to all `write_requests`.
+fn reject_write_requests(write_requests: Vec<SenderWriteRequest>) {
+    for req in write_requests {
+        if let Some(sender) = req.sender {
+            let _ = sender.send(
+                RejectWriteSnafu {
+                    region_id: req.request.region_id,
+                }
+                .fail(),
+            );
+        }
     }
 }
 
@@ -112,7 +157,7 @@ fn maybe_fill_missing_columns(request: &mut WriteRequest, metadata: &RegionMetad
     if let Err(e) = request.check_schema(metadata) {
         if e.is_fill_default() {
             // TODO(yingwen): Add metrics for this case.
-            // We need to fill default value again. The write request may be a request
+            // We need to fill default value. The write request may be a request
             // sent before changing the schema.
             request.fill_missing_columns(metadata)?;
         } else {
@@ -124,133 +169,9 @@ fn maybe_fill_missing_columns(request: &mut WriteRequest, metadata: &RegionMetad
 }
 
 /// Send result to the request.
-fn send_result(sender: Option<Sender<Result<()>>>, res: Result<()>) {
+fn send_result(sender: Option<Sender<Result<Output>>>, res: Result<Output>) {
     if let Some(sender) = sender {
         // Ignore send result.
         let _ = sender.send(res);
-    }
-}
-
-/// Notifier to notify write result on drop.
-struct WriteNotify {
-    /// Error to send to the waiter.
-    err: Option<Arc<Error>>,
-    /// Sender to send write result to the waiter for this mutation.
-    sender: Option<Sender<Result<()>>>,
-}
-
-impl WriteNotify {
-    /// Creates a new notify from the `sender`.
-    fn new(sender: Option<Sender<Result<()>>>) -> WriteNotify {
-        WriteNotify { err: None, sender }
-    }
-
-    /// Send result to the waiter.
-    fn notify_result(&mut self) {
-        let Some(sender) = self.sender.take() else {
-            return;
-        };
-        if let Some(err) = &self.err {
-            // Try to send the error to waiters.
-            let _ = sender.send(Err(err.clone()).context(WriteGroupSnafu));
-        } else {
-            // Send success result.
-            let _ = sender.send(Ok(()));
-        }
-    }
-}
-
-impl Drop for WriteNotify {
-    fn drop(&mut self) {
-        self.notify_result();
-    }
-}
-
-/// Context to keep region metadata and buffer write requests.
-struct RegionWriteCtx {
-    /// Region to write.
-    region: MitoRegionRef,
-    /// Version of the region while creating the context.
-    version: VersionRef,
-    /// Next sequence number to write.
-    ///
-    /// The context assigns a unique sequence number for each row.
-    next_sequence: SequenceNumber,
-    /// Next entry id of WAL to write.
-    next_entry_id: EntryId,
-    /// Valid WAL entry to write.
-    ///
-    /// We keep [WalEntry] instead of mutations to avoid taking mutations
-    /// out of the context to construct the wal entry when we write to the wal.
-    wal_entry: WalEntry,
-    /// Notifiers to send write results to waiters.
-    ///
-    /// The i-th notify is for i-th mutation.
-    notifiers: Vec<WriteNotify>,
-}
-
-impl RegionWriteCtx {
-    /// Returns an empty context.
-    fn new(region: MitoRegionRef) -> RegionWriteCtx {
-        let VersionControlData {
-            version,
-            committed_sequence,
-            last_entry_id,
-        } = region.version_control.current();
-        RegionWriteCtx {
-            region,
-            version,
-            next_sequence: committed_sequence + 1,
-            next_entry_id: last_entry_id + 1,
-            wal_entry: WalEntry::default(),
-            notifiers: Vec::new(),
-        }
-    }
-
-    /// Push [SenderWriteRequest] to the context.
-    fn push_sender_request(&mut self, sender_req: SenderWriteRequest) {
-        let num_rows = sender_req.request.rows.rows.len() as u64;
-
-        self.wal_entry.mutations.push(Mutation {
-            op_type: to_proto_op_type(sender_req.request.op_type) as i32,
-            sequence: self.next_sequence,
-            rows: Some(sender_req.request.rows),
-        });
-        // Notifiers are 1:1 map to mutations.
-        self.notifiers.push(WriteNotify::new(sender_req.sender));
-
-        // Increase sequence number.
-        self.next_sequence += num_rows;
-    }
-
-    /// Encode and add WAL entry to the writer.
-    fn add_wal_entry<S: LogStore>(&self, wal_writer: &mut WalWriter<S>) -> Result<()> {
-        wal_writer.add_entry(self.region.region_id, self.next_entry_id, &self.wal_entry)
-    }
-
-    /// Sets error and marks all write operations are failed.
-    fn set_error(&mut self, err: Arc<Error>) {
-        // Set error for all notifiers
-        for notify in &mut self.notifiers {
-            notify.err = Some(err.clone());
-        }
-    }
-
-    /// Consumes mutations and writes them into mutable memtable.
-    fn write_memtable(&mut self) {
-        debug_assert_eq!(self.notifiers.len(), self.wal_entry.mutations.len());
-
-        let mutable = self.version.memtables.mutable();
-        // Takes mutations from the wal entry.
-        let mutations = mem::take(&mut self.wal_entry.mutations);
-        for (mutation, notify) in mutations.into_iter().zip(&mut self.notifiers) {
-            // Write mutation to the memtable.
-            let Some(kvs) = KeyValues::new(&self.version.metadata, mutation) else {
-                continue;
-            };
-            if let Err(e) = mutable.write(&kvs) {
-                notify.err = Some(Arc::new(e));
-            }
-        }
     }
 }

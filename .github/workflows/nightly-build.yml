@@ -151,6 +151,7 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_CN_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_CN_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_RELEASE_BUCKET_REGION }}
+          upload-latest-artifacts: false
 
   build-linux-arm64-artifacts:
     name: Build linux-arm64 artifacts
@@ -174,6 +175,7 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_CN_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_CN_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_RELEASE_BUCKET_REGION }}
+          upload-latest-artifacts: false
 
   release-images-to-dockerhub:
     name: Build and push images to DockerHub
@@ -299,11 +301,11 @@ jobs:
         if: ${{ needs.release-images-to-dockerhub.outputs.nightly-build-result == 'success' }}
         with:
           payload: |
-            {"text": "GreptimeDB nightly build successful"}
+            {"text": "GreptimeDB's ${{ env.NEXT_RELEASE_VERSION }} build has completed successfully."}
 
       - name: Notifiy nightly build failed result
         uses: slackapi/slack-github-action@v1.23.0
         if: ${{ needs.release-images-to-dockerhub.outputs.nightly-build-result != 'success' }}
         with:
           payload: |
-            {"text": "GreptimeDB nightly build failed, please check 'https://github.com/GreptimeTeam/greptimedb/actions/workflows/nightly-build.yml'"}
+            {"text": "GreptimeDB's ${{ env.NEXT_RELEASE_VERSION }} build has failed, please check 'https://github.com/GreptimeTeam/greptimedb/actions/workflows/${{ env.NEXT_RELEASE_VERSION }}-build.yml'."}

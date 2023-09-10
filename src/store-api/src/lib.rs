@@ -15,6 +15,12 @@
 
 //! Storage related APIs
 
+pub mod data_source;
+mod error;
 pub mod logstore;
 pub mod manifest;
+pub mod metadata;
+pub mod path_utils;
+pub mod region_engine;
+pub mod region_request;
 pub mod storage;

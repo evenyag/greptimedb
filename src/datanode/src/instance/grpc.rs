@@ -18,7 +18,7 @@ use std::sync::Arc;
 use api::v1::ddl_request::Expr as DdlExpr;
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
-use api::v1::{CreateDatabaseExpr, DdlRequest, DeleteRequest, InsertRequests};
+use api::v1::{CreateDatabaseExpr, DdlRequest, DeleteRequests, InsertRequests, RowInsertRequests};
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
 use common_grpc_expr::insert::to_table_insert_request;
@@ -42,7 +42,7 @@ use table::table::adapter::DfTableProviderAdapter;
 use crate::error::{
     self, CatalogSnafu, DecodeLogicalPlanSnafu, DeleteExprToRequestSnafu, DeleteSnafu,
     ExecuteLogicalPlanSnafu, ExecuteSqlSnafu, InsertDataSnafu, InsertSnafu, JoinTaskSnafu,
-    PlanStatementSnafu, Result, TableNotFoundSnafu,
+    PlanStatementSnafu, Result, TableNotFoundSnafu, UnsupportedGrpcRequestSnafu,
 };
 use crate::instance::Instance;
 
@@ -129,7 +129,7 @@ impl Instance {
     pub async fn handle_inserts(
         &self,
         requests: InsertRequests,
-        ctx: &QueryContextRef,
+        ctx: QueryContextRef,
     ) -> Result<Output> {
         let results = future::try_join_all(requests.inserts.into_iter().map(|insert| {
             let catalog_manager = self.catalog_manager.clone();
@@ -164,27 +164,46 @@ impl Instance {
         Ok(Output::AffectedRows(affected_rows))
     }
 
-    async fn handle_delete(&self, request: DeleteRequest, ctx: QueryContextRef) -> Result<Output> {
-        let catalog = ctx.current_catalog();
-        let schema = ctx.current_schema();
-        let table_name = &request.table_name.clone();
-        let table_ref = TableReference::full(catalog, schema, table_name);
+    pub async fn handle_row_inserts(
+        &self,
+        requests: RowInsertRequests,
+        ctx: QueryContextRef,
+    ) -> Result<Output> {
+        self.row_inserter.handle_inserts(requests, ctx).await
+    }
 
-        let table = self
-            .catalog_manager
-            .table(catalog, schema, table_name)
-            .await
-            .context(CatalogSnafu)?
-            .with_context(|| TableNotFoundSnafu {
-                table_name: table_ref.to_string(),
-            })?;
+    async fn handle_deletes(
+        &self,
+        request: DeleteRequests,
+        ctx: QueryContextRef,
+    ) -> Result<Output> {
+        let results = future::try_join_all(request.deletes.into_iter().map(|delete| {
+            let catalog_manager = self.catalog_manager.clone();
+            let catalog = ctx.current_catalog().to_string();
+            let schema = ctx.current_schema().to_string();
+            common_runtime::spawn_write(async move {
+                let table_name = delete.table_name.clone();
+                let table_ref = TableReference::full(&catalog, &schema, &table_name);
+                let table = catalog_manager
+                    .table(&catalog, &schema, &table_name)
+                    .await
+                    .context(CatalogSnafu)?
+                    .with_context(|| TableNotFoundSnafu {
+                        table_name: table_ref.to_string(),
+                    })?;
 
-        let request = common_grpc_expr::delete::to_table_delete_request(request)
-            .context(DeleteExprToRequestSnafu)?;
+                let request =
+                    common_grpc_expr::delete::to_table_delete_request(&catalog, &schema, delete)
+                        .context(DeleteExprToRequestSnafu)?;
 
-        let affected_rows = table.delete(request).await.with_context(|_| DeleteSnafu {
-            table_name: table_ref.to_string(),
-        })?;
+                table.delete(request).await.with_context(|_| DeleteSnafu {
+                    table_name: table_ref.to_string(),
+                })
+            })
+        }))
+        .await
+        .context(JoinTaskSnafu)?;
+        let affected_rows = results.into_iter().sum::<Result<usize>>()?;
         Ok(Output::AffectedRows(affected_rows))
     }
 
@@ -197,8 +216,6 @@ impl Instance {
             DdlExpr::Alter(expr) => self.handle_alter(expr, query_ctx).await,
             DdlExpr::CreateDatabase(expr) => self.handle_create_database(expr, query_ctx).await,
             DdlExpr::DropTable(expr) => self.handle_drop_table(expr, query_ctx).await,
-            DdlExpr::FlushTable(expr) => self.handle_flush_table(expr, query_ctx).await,
-            DdlExpr::CompactTable(expr) => self.handle_compact_table(expr, query_ctx).await,
             DdlExpr::TruncateTable(expr) => self.handle_truncate_table(expr, query_ctx).await,
         }
     }
@@ -210,8 +227,8 @@ impl GrpcQueryHandler for Instance {
 
     async fn do_query(&self, request: Request, ctx: QueryContextRef) -> Result<Output> {
         match request {
-            Request::Inserts(requests) => self.handle_inserts(requests, &ctx).await,
-            Request::Delete(request) => self.handle_delete(request, ctx).await,
+            Request::Inserts(requests) => self.handle_inserts(requests, ctx).await,
+            Request::Deletes(request) => self.handle_deletes(request, ctx).await,
             Request::Query(query_request) => {
                 let query = query_request
                     .query
@@ -221,6 +238,11 @@ impl GrpcQueryHandler for Instance {
                 self.handle_query(query, ctx).await
             }
             Request::Ddl(request) => self.handle_ddl(request, ctx).await,
+            Request::RowInserts(requests) => self.handle_row_inserts(requests, ctx).await,
+            Request::RowDeletes(_) => UnsupportedGrpcRequestSnafu {
+                kind: "row deletes",
+            }
+            .fail(),
         }
     }
 }
@@ -301,13 +323,13 @@ async fn new_dummy_catalog_list(
 
 #[cfg(test)]
 mod test {
-    use api::v1::add_column::location::LocationType;
-    use api::v1::add_column::Location;
+    use api::v1::add_column_location::LocationType;
     use api::v1::column::Values;
     use api::v1::{
-        alter_expr, AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDef,
-        CreateDatabaseExpr, CreateTableExpr, DropTableExpr, InsertRequest, InsertRequests,
-        QueryRequest, RenameTable, SemanticType, TableId, TruncateTableExpr,
+        alter_expr, AddColumn, AddColumnLocation as Location, AddColumns, AlterExpr, Column,
+        ColumnDataType, ColumnDef, CreateDatabaseExpr, CreateTableExpr, DeleteRequest,
+        DropTableExpr, InsertRequest, InsertRequests, QueryRequest, RenameTable, SemanticType,
+        TableId, TruncateTableExpr,
     };
     use common_catalog::consts::MITO_ENGINE;
     use common_error::ext::ErrorExt;
@@ -341,6 +363,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -355,15 +378,17 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as i32,
+                        data_type: ColumnDataType::String as i32,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Tag as i32,
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        data_type: ColumnDataType::TimestampMillisecond as i32,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -394,6 +419,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -408,15 +434,17 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as i32,
+                        data_type: ColumnDataType::String as i32,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Tag as i32,
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        data_type: ColumnDataType::TimestampMillisecond as i32,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -461,6 +489,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -475,15 +504,17 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as i32,
+                        data_type: ColumnDataType::String as i32,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Field as i32,
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        data_type: ColumnDataType::TimestampMillisecond as i32,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -506,22 +537,16 @@ mod test {
                     add_columns: vec![AddColumn {
                         column_def: Some(ColumnDef {
                             name: "b".to_string(),
-                            datatype: ColumnDataType::Int32 as i32,
+                            data_type: ColumnDataType::Int32 as i32,
                             is_nullable: true,
                             default_constraint: vec![],
+                            semantic_type: SemanticType::Tag as i32,
                         }),
-                        is_key: true,
                         location: None,
                     }],
                 })),
-                ..Default::default()
             })),
         });
-        let output = instance
-            .do_query(query.clone(), QueryContext::arc())
-            .await
-            .unwrap();
-        assert!(matches!(output, Output::AffectedRows(0)));
 
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
         assert!(matches!(output, Output::AffectedRows(0)));
@@ -536,16 +561,14 @@ mod test {
                     add_columns: vec![AddColumn {
                         column_def: Some(ColumnDef {
                             name: "b".to_string(),
-                            datatype: ColumnDataType::Int32 as i32,
+                            data_type: ColumnDataType::Int32 as i32,
                             is_nullable: true,
                             default_constraint: vec![],
+                            semantic_type: SemanticType::Tag as i32,
                         }),
-                        is_key: true,
                         location: None,
                     }],
                 })),
-                table_version: 1,
-                ..Default::default()
             })),
         });
         let err = instance
@@ -557,7 +580,6 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_rename_table_twice() {
-        common_telemetry::init_default_ut_logging();
         let instance = MockInstance::new("test_alter_table_twice").await;
         let instance = instance.inner();
 
@@ -565,6 +587,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -579,15 +602,17 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as i32,
+                        data_type: ColumnDataType::String as i32,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Field as i32,
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        data_type: ColumnDataType::TimestampMillisecond as i32,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -610,8 +635,6 @@ mod test {
                 kind: Some(alter_expr::Kind::RenameTable(RenameTable {
                     new_table_name: "new_my_table".to_string(),
                 })),
-                table_id: Some(TableId { id: 1025 }),
-                ..Default::default()
             })),
         });
         let output = instance
@@ -621,11 +644,8 @@ mod test {
         assert!(matches!(output, Output::AffectedRows(0)));
 
         // renames it again.
-        let output = instance
-            .do_query(query.clone(), QueryContext::arc())
-            .await
-            .unwrap();
-        assert!(matches!(output, Output::AffectedRows(0)));
+        let result = instance.do_query(query, QueryContext::arc()).await;
+        assert!(matches!(result, Err(error::Error::TableNotFound { .. })));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -637,6 +657,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "my_database".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -651,15 +672,17 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as i32,
+                        data_type: ColumnDataType::String as i32,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Tag as i32,
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as i32,
+                        data_type: ColumnDataType::TimestampMillisecond as i32,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -680,42 +703,41 @@ mod test {
                         AddColumn {
                             column_def: Some(ColumnDef {
                                 name: "b".to_string(),
-                                datatype: ColumnDataType::Int32 as i32,
+                                data_type: ColumnDataType::Int32 as i32,
                                 is_nullable: true,
                                 default_constraint: vec![],
+                                semantic_type: SemanticType::Tag as i32,
                             }),
-                            is_key: true,
                             location: None,
                         },
                         AddColumn {
                             column_def: Some(ColumnDef {
                                 name: "c".to_string(),
-                                datatype: ColumnDataType::Int32 as i32,
+                                data_type: ColumnDataType::Int32 as i32,
                                 is_nullable: true,
                                 default_constraint: vec![],
+                                semantic_type: SemanticType::Tag as i32,
                             }),
-                            is_key: true,
                             location: Some(Location {
                                 location_type: LocationType::First.into(),
-                                after_cloumn_name: "".to_string(),
+                                after_column_name: "".to_string(),
                             }),
                         },
                         AddColumn {
                             column_def: Some(ColumnDef {
                                 name: "d".to_string(),
-                                datatype: ColumnDataType::Int32 as i32,
+                                data_type: ColumnDataType::Int32 as i32,
                                 is_nullable: true,
                                 default_constraint: vec![],
+                                semantic_type: SemanticType::Tag as i32,
                             }),
-                            is_key: true,
                             location: Some(Location {
                                 location_type: LocationType::After.into(),
-                                after_cloumn_name: "a".to_string(),
+                                after_column_name: "a".to_string(),
                             }),
                         },
                     ],
                 })),
-                ..Default::default()
             })),
         });
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
@@ -899,7 +921,7 @@ mod test {
         let output = instance.do_query(query, QueryContext::arc()).await.unwrap();
         assert!(matches!(output, Output::AffectedRows(3)));
 
-        let request = DeleteRequest {
+        let request1 = DeleteRequest {
             table_name: "demo".to_string(),
             region_number: 0,
             key_columns: vec![
@@ -924,13 +946,39 @@ mod test {
             ],
             row_count: 1,
         };
-
-        let request = Request::Delete(request);
+        let request2 = DeleteRequest {
+            table_name: "demo".to_string(),
+            region_number: 0,
+            key_columns: vec![
+                Column {
+                    column_name: "host".to_string(),
+                    values: Some(Values {
+                        string_values: vec!["host3".to_string()],
+                        ..Default::default()
+                    }),
+                    datatype: ColumnDataType::String as i32,
+                    ..Default::default()
+                },
+                Column {
+                    column_name: "ts".to_string(),
+                    values: Some(Values {
+                        ts_millisecond_values: vec![1672201026000],
+                        ..Default::default()
+                    }),
+                    datatype: ColumnDataType::TimestampMillisecond as i32,
+                    ..Default::default()
+                },
+            ],
+            row_count: 1,
+        };
+        let request = Request::Deletes(DeleteRequests {
+            deletes: vec![request1, request2],
+        });
         let output = instance
             .do_query(request, QueryContext::arc())
             .await
             .unwrap();
-        assert!(matches!(output, Output::AffectedRows(1)));
+        assert!(matches!(output, Output::AffectedRows(2)));
 
         let output = exec_selection(instance, "SELECT ts, host, cpu FROM demo").await;
         let Output::Stream(stream) = output else {
@@ -942,7 +990,6 @@ mod test {
 | ts                  | host  | cpu  |
 +---------------------+-------+------+
 | 2022-12-28T04:17:05 | host1 | 66.6 |
-| 2022-12-28T04:17:06 | host3 | 88.8 |
 +---------------------+-------+------+";
         assert_eq!(recordbatches.pretty_print().unwrap(), expected);
     }

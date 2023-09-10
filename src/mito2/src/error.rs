@@ -18,12 +18,15 @@ use std::sync::Arc;
 use common_datasource::compression::CompressionType;
 use common_error::ext::{BoxedError, ErrorExt};
 use common_error::status_code::StatusCode;
+use common_runtime::JoinError;
 use datatypes::arrow::error::ArrowError;
+use datatypes::prelude::ConcreteDataType;
 use prost::{DecodeError, EncodeError};
 use snafu::{Location, Snafu};
 use store_api::manifest::ManifestVersion;
 use store_api::storage::RegionId;
 
+use crate::sst::file::FileId;
 use crate::worker::WorkerId;
 
 #[derive(Debug, Snafu)]
@@ -109,6 +112,12 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Invalid region metadata, source: {}, location: {}", source, location))]
+    InvalidMetadata {
+        source: store_api::metadata::MetadataError,
+        location: Location,
+    },
+
     #[snafu(display("Region {} already exists, location: {}", region_id, location))]
     RegionExists {
         region_id: RegionId,
@@ -177,7 +186,12 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Invalid request to region {}, reason: {}", region_id, reason))]
+    #[snafu(display(
+        "Invalid request to region {}, location: {}, reason: {}",
+        region_id,
+        location,
+        reason
+    ))]
     InvalidRequest {
         region_id: RegionId,
         reason: String,
@@ -260,9 +274,181 @@ pub enum Error {
     // Shared error for each writer in the write group.
     #[snafu(display("Failed to write region, source: {}", source))]
     WriteGroup { source: Arc<Error> },
+
+    #[snafu(display(
+        "Row length mismatch, expect: {}, actual: {}, location: {}",
+        expect,
+        actual,
+        location
+    ))]
+    RowLengthMismatch {
+        expect: usize,
+        actual: usize,
+        location: Location,
+    },
+
+    #[snafu(display("Row value mismatches field data type"))]
+    FieldTypeMismatch { source: datatypes::error::Error },
+
+    #[snafu(display("Failed to serialize field, location: {}", location))]
+    SerializeField {
+        source: memcomparable::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Data type: {} does not support serialization/deserialization, location: {}",
+        data_type,
+        location
+    ))]
+    NotSupportedField {
+        data_type: ConcreteDataType,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to deserialize field, source: {}, location: {}",
+        source,
+        location
+    ))]
+    DeserializeField {
+        source: memcomparable::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Invalid parquet SST file {}, location: {}, reason: {}",
+        file,
+        location,
+        reason
+    ))]
+    InvalidParquet {
+        file: String,
+        reason: String,
+        location: Location,
+    },
+
+    #[snafu(display("Invalid batch, {}, location: {}", reason, location))]
+    InvalidBatch { reason: String, location: Location },
+
+    #[snafu(display("Invalid arrow record batch, {}, location: {}", reason, location))]
+    InvalidRecordBatch { reason: String, location: Location },
+
+    #[snafu(display(
+        "Failed to convert array to vector, location: {}, source: {}",
+        location,
+        source
+    ))]
+    ConvertVector {
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display(
+        "Failed to compute arrow arrays, location: {}, source: {}",
+        location,
+        source
+    ))]
+    ComputeArrow {
+        location: Location,
+        source: datatypes::arrow::error::ArrowError,
+    },
+
+    #[snafu(display("Failed to compute vector, location: {}, source: {}", location, source))]
+    ComputeVector {
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display(
+        "Primary key length mismatch, expect: {}, actual: {}, location: {}",
+        expect,
+        actual,
+        location
+    ))]
+    PrimaryKeyLengthMismatch {
+        expect: usize,
+        actual: usize,
+        location: Location,
+    },
+
+    #[snafu(display("Invalid sender, location: {}", location,))]
+    InvalidSender { location: Location },
+
+    #[snafu(display("Invalid scheduler state, location: {}", location))]
+    InvalidSchedulerState { location: Location },
+
+    #[snafu(display("Failed to stop scheduler, location: {}, source: {}", location, source))]
+    StopScheduler {
+        source: JoinError,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to build scan predicate, location: {}, source: {}",
+        location,
+        source
+    ))]
+    BuildPredicate {
+        source: table::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to delete SST file, file id: {}, source: {}", file_id, source))]
+    DeleteSst {
+        file_id: FileId,
+        source: object_store::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to flush region {}, location: {}, source: {}",
+        region_id,
+        location,
+        source
+    ))]
+    FlushRegion {
+        region_id: RegionId,
+        source: Arc<Error>,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is dropped, location: {}", region_id, location))]
+    RegionDropped {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is closed, location: {}", region_id, location))]
+    RegionClosed {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Engine write buffer is full, rejecting write requests of region {}, location: {}",
+        region_id,
+        location
+    ))]
+    RejectWrite {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to compat readers for region {}, reason: {}, location: {}",
+        region_id,
+        reason,
+        location
+    ))]
+    CompatReader {
+        region_id: RegionId,
+        reason: String,
+        location: Location,
+    },
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     /// Returns true if we need to fill default value for a region.
@@ -286,16 +472,18 @@ impl ErrorExt for Error {
             | DecompressObject { .. }
             | SerdeJson { .. }
             | Utf8 { .. }
-            | RegionExists { .. }
             | NewRecordBatch { .. }
-            | RegionNotFound { .. }
             | RegionCorrupted { .. }
-            | CreateDefault { .. } => StatusCode::Unexpected,
+            | CreateDefault { .. }
+            | InvalidParquet { .. } => StatusCode::Unexpected,
+            RegionNotFound { .. } => StatusCode::RegionNotFound,
+            RegionExists { .. } => StatusCode::RegionAlreadyExists,
             InvalidScanIndex { .. }
             | InvalidMeta { .. }
             | InvalidSchema { .. }
             | InvalidRequest { .. }
-            | FillDefault { .. } => StatusCode::InvalidArguments,
+            | FillDefault { .. }
+            | InvalidMetadata { .. } => StatusCode::InvalidArguments,
             RegionMetadataNotFound { .. }
             | Join { .. }
             | WorkerStopped { .. }
@@ -304,6 +492,27 @@ impl ErrorExt for Error {
             | DecodeWal { .. } => StatusCode::Internal,
             WriteBuffer { source, .. } => source.status_code(),
             WriteGroup { source, .. } => source.status_code(),
+            RowLengthMismatch { .. } => StatusCode::InvalidArguments,
+            FieldTypeMismatch { source, .. } => source.status_code(),
+            SerializeField { .. } => StatusCode::Internal,
+            NotSupportedField { .. } => StatusCode::Unsupported,
+            DeserializeField { .. } => StatusCode::Unexpected,
+            InvalidBatch { .. } => StatusCode::InvalidArguments,
+            InvalidRecordBatch { .. } => StatusCode::InvalidArguments,
+            ConvertVector { source, .. } => source.status_code(),
+            ComputeArrow { .. } => StatusCode::Internal,
+            ComputeVector { .. } => StatusCode::Internal,
+            PrimaryKeyLengthMismatch { .. } => StatusCode::InvalidArguments,
+            InvalidSender { .. } => StatusCode::InvalidArguments,
+            InvalidSchedulerState { .. } => StatusCode::InvalidArguments,
+            StopScheduler { .. } => StatusCode::Internal,
+            BuildPredicate { source, .. } => source.status_code(),
+            DeleteSst { .. } => StatusCode::StorageUnavailable,
+            FlushRegion { source, .. } => source.status_code(),
+            RegionDropped { .. } => StatusCode::Cancelled,
+            RegionClosed { .. } => StatusCode::Cancelled,
+            RejectWrite { .. } => StatusCode::StorageUnavailable,
+            CompatReader { .. } => StatusCode::Unexpected,
         }
     }
 

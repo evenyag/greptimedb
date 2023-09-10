@@ -10,11 +10,14 @@ test = ["common-test-util"]
 
 [dependencies]
 anymap = "1.0.0-beta.2"
+api.workspace = true
 aquamarine = "0.3"
 arc-swap = "1.0"
+async-channel = "1.9"
 async-compat = "0.2"
 async-stream.workspace = true
 async-trait = "0.1"
+bytes = "1.4"
 chrono.workspace = true
 common-base = { workspace = true }
 common-catalog = { workspace = true }
@@ -32,21 +35,25 @@ datafusion-common.workspace = true
 datafusion.workspace = true
 datatypes = { workspace = true }
 futures.workspace = true
-# TODO(yingwen): Update and use api crate once https://github.com/GreptimeTeam/greptime-proto/pull/75 is merged.
-greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "10c349c033dded29097d0dc933fbc2f89f658032" }
+humantime-serde = { workspace = true }
 lazy_static = "1.4"
 log-store = { workspace = true }
+memcomparable = "0.2"
 metrics.workspace = true
 object-store = { workspace = true }
 parquet = { workspace = true, features = ["async"] }
+paste.workspace = true
 prost.workspace = true
 regex = "1.5"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
+smallvec.workspace = true
 snafu.workspace = true
 storage = { workspace = true }
 store-api = { workspace = true }
+strum.workspace = true
 table = { workspace = true }
+tokio-util.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
