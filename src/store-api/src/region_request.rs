@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use api::v1::region::region_request;
-use api::v1::Rows;
-use snafu::OptionExt;
+use api::v1::add_column_location::LocationType;
+use api::v1::region::{alter_request, region_request, AlterRequest};
+use api::v1::{self, Rows, SemanticType};
+use snafu::{ensure, OptionExt};
 
-use crate::metadata::{ColumnMetadata, InvalidRawRegionRequestSnafu, MetadataError};
+use crate::metadata::{
+    ColumnMetadata, InvalidRawRegionRequestSnafu, InvalidRegionRequestSnafu, MetadataError,
+    RegionMetadata, Result,
+};
 use crate::path_utils::region_dir;
-use crate::storage::{AlterRequest, ColumnId, RegionId, ScanRequest};
+use crate::storage::{ColumnId, RegionId, ScanRequest};
 
 #[derive(Debug)]
 pub enum RegionRequest {
@@ -39,11 +43,7 @@ pub enum RegionRequest {
 impl RegionRequest {
     /// Convert [Body](region_request::Body) to a group of [RegionRequest] with region id.
     /// Inserts/Deletes request might become multiple requests. Others are one-to-one.
-    // TODO: implement alter request
-    #[allow(unreachable_code)]
-    pub fn try_from_request_body(
-        body: region_request::Body,
-    ) -> Result<Vec<(RegionId, Self)>, MetadataError> {
+    pub fn try_from_request_body(body: region_request::Body) -> Result<Vec<(RegionId, Self)>> {
         match body {
             region_request::Body::Inserts(inserts) => Ok(inserts
                 .requests
@@ -68,7 +68,7 @@ impl RegionRequest {
                     .column_defs
                     .into_iter()
                     .map(ColumnMetadata::try_from_column_def)
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<_>>>()?;
                 let region_id = create.region_id.into();
                 let region_dir = region_dir(&create.catalog, &create.schema, region_id);
                 Ok(vec![(
@@ -103,25 +103,10 @@ impl RegionRequest {
                 close.region_id.into(),
                 Self::Close(RegionCloseRequest {}),
             )]),
-            region_request::Body::Alter(alter) => {
-                let kind = alter.kind.context(InvalidRawRegionRequestSnafu {
-                    err: "'kind' is absent",
-                })?;
-                Ok(vec![(
-                    alter.region_id.into(),
-                    Self::Alter(RegionAlterRequest {
-                        request: AlterRequest {
-                            operation: kind.try_into().map_err(|e| {
-                                InvalidRawRegionRequestSnafu {
-                                    err: format!("{e}"),
-                                }
-                                .build()
-                            })?,
-                            version: alter.schema_version as _,
-                        },
-                    }),
-                )])
-            }
+            region_request::Body::Alter(alter) => Ok(vec![(
+                alter.region_id.into(),
+                Self::Alter(RegionAlterRequest::try_from(alter)?),
+            )]),
             region_request::Body::Flush(flush) => Ok(vec![(
                 flush.region_id.into(),
                 Self::Flush(RegionFlushRequest {}),
@@ -189,9 +174,236 @@ pub struct RegionOpenRequest {
 #[derive(Debug)]
 pub struct RegionCloseRequest {}
 
+/// Alter metadata of a region.
 #[derive(Debug)]
 pub struct RegionAlterRequest {
-    pub request: AlterRequest,
+    /// The version of the schema before applying the alteration.
+    pub schema_version: u64,
+    /// Kind of alteration to do.
+    pub kind: AlterKind,
+}
+
+impl RegionAlterRequest {
+    /// Checks whether the request is valid, returns an error if it is invalid.
+    pub fn validate(&self, metadata: &RegionMetadata) -> Result<()> {
+        ensure!(
+            metadata.schema_version == self.schema_version,
+            InvalidRegionRequestSnafu {
+                region_id: metadata.region_id,
+                err: format!(
+                    "region schema version {} is not equal to request schema version {}",
+                    metadata.schema_version, self.schema_version
+                ),
+            }
+        );
+
+        self.kind.validate(metadata)?;
+
+        Ok(())
+    }
+}
+
+impl TryFrom<AlterRequest> for RegionAlterRequest {
+    type Error = MetadataError;
+
+    fn try_from(value: AlterRequest) -> Result<Self> {
+        let kind = value.kind.context(InvalidRawRegionRequestSnafu {
+            err: "missing kind in AlterRequest",
+        })?;
+
+        let kind = AlterKind::try_from(kind)?;
+        Ok(RegionAlterRequest {
+            schema_version: value.schema_version,
+            kind,
+        })
+    }
+}
+
+/// Kind of the alteration.
+#[derive(Debug)]
+pub enum AlterKind {
+    /// Add columns to the region.
+    AddColumns {
+        /// Columns to add.
+        columns: Vec<AddColumn>,
+    },
+    /// Drop columns from the region, only value columns are allowed to drop.
+    DropColumns {
+        /// Name of columns to drop.
+        names: Vec<String>,
+    },
+}
+
+impl AlterKind {
+    /// Returns an error if the the alter kind is invalid.
+    pub fn validate(&self, metadata: &RegionMetadata) -> Result<()> {
+        match self {
+            AlterKind::AddColumns { columns } => {
+                let mut names = HashSet::with_capacity(columns.len());
+                for col_to_add in columns {
+                    ensure!(
+                        !names.contains(&col_to_add.column_metadata.column_schema.name),
+                        InvalidRegionRequestSnafu {
+                            region_id: metadata.region_id,
+                            err: format!(
+                                "add column {} more than once",
+                                col_to_add.column_metadata.column_schema.name
+                            ),
+                        }
+                    );
+                    col_to_add.validate(metadata)?;
+                    names.insert(&col_to_add.column_metadata.column_schema.name);
+                }
+            }
+            AlterKind::DropColumns { names } => {
+                for name in names {
+                    Self::validate_column_to_drop(name, metadata)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns an error if the column to drop is invalid.
+    fn validate_column_to_drop(name: &str, metadata: &RegionMetadata) -> Result<()> {
+        let column = metadata
+            .column_by_name(name)
+            .with_context(|| InvalidRegionRequestSnafu {
+                region_id: metadata.region_id,
+                err: format!("column {} does not exist", name),
+            })?;
+        ensure!(
+            column.semantic_type == SemanticType::Field,
+            InvalidRegionRequestSnafu {
+                region_id: metadata.region_id,
+                err: format!("column {} is not a field and could not be dropped", name),
+            }
+        );
+        Ok(())
+    }
+}
+
+impl TryFrom<alter_request::Kind> for AlterKind {
+    type Error = MetadataError;
+
+    fn try_from(kind: alter_request::Kind) -> Result<Self> {
+        let alter_kind = match kind {
+            alter_request::Kind::AddColumns(x) => {
+                let columns = x
+                    .add_columns
+                    .into_iter()
+                    .map(|x| x.try_into())
+                    .collect::<Result<Vec<_>>>()?;
+                AlterKind::AddColumns { columns }
+            }
+            alter_request::Kind::DropColumns(x) => {
+                let names = x.drop_columns.into_iter().map(|x| x.name).collect();
+                AlterKind::DropColumns { names }
+            }
+        };
+
+        Ok(alter_kind)
+    }
+}
+
+/// Adds a column.
+#[derive(Debug)]
+pub struct AddColumn {
+    /// Metadata of the column to add.
+    pub column_metadata: ColumnMetadata,
+    /// Location to add the column. If location is None, the region adds
+    /// the column to the last.
+    pub location: Option<AddColumnLocation>,
+}
+
+impl AddColumn {
+    /// Returns an error if the column to add is invalid.
+    pub fn validate(&self, metadata: &RegionMetadata) -> Result<()> {
+        ensure!(
+            self.column_metadata.column_schema.is_nullable()
+                || self
+                    .column_metadata
+                    .column_schema
+                    .default_constraint()
+                    .is_some(),
+            InvalidRegionRequestSnafu {
+                region_id: metadata.region_id,
+                err: format!(
+                    "no default value for column {}",
+                    self.column_metadata.column_schema.name
+                ),
+            }
+        );
+        ensure!(
+            metadata
+                .column_by_name(&self.column_metadata.column_schema.name)
+                .is_none(),
+            InvalidRegionRequestSnafu {
+                region_id: metadata.region_id,
+                err: format!(
+                    "column {} already exists",
+                    self.column_metadata.column_schema.name
+                ),
+            }
+        );
+
+        Ok(())
+    }
+}
+
+impl TryFrom<v1::region::AddColumn> for AddColumn {
+    type Error = MetadataError;
+
+    fn try_from(add_column: v1::region::AddColumn) -> Result<Self> {
+        let column_def = add_column
+            .column_def
+            .context(InvalidRawRegionRequestSnafu {
+                err: "missing column_def in AddColumn",
+            })?;
+
+        let column_metadata = ColumnMetadata::try_from_column_def(column_def)?;
+        let location = add_column
+            .location
+            .map(AddColumnLocation::try_from)
+            .transpose()?;
+
+        Ok(AddColumn {
+            column_metadata,
+            location,
+        })
+    }
+}
+
+/// Location to add a column.
+#[derive(Debug)]
+pub enum AddColumnLocation {
+    /// Add the column to the first position of columns.
+    First,
+    /// Add the column after specific column.
+    After {
+        /// Add the column after this column.
+        column_name: String,
+    },
+}
+
+impl TryFrom<v1::AddColumnLocation> for AddColumnLocation {
+    type Error = MetadataError;
+
+    fn try_from(location: v1::AddColumnLocation) -> Result<Self> {
+        let location_type = LocationType::from_i32(location.location_type).context(
+            InvalidRawRegionRequestSnafu {
+                err: format!("unknown location type {}", location.location_type),
+            },
+        )?;
+        let add_column_location = match location_type {
+            LocationType::First => AddColumnLocation::First,
+            LocationType::After => AddColumnLocation::After {
+                column_name: location.after_column_name,
+            },
+        };
+
+        Ok(add_column_location)
+    }
 }
 
 #[derive(Debug)]
