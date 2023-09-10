@@ -430,7 +430,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 }
             }
 
+            info!("Start to handle {} requests", buffer.len());
+
             self.handle_requests(&mut buffer).await;
+
+            info!("Finished handling requests");
         }
 
         self.clean().await;

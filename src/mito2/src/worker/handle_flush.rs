@@ -82,6 +82,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Handle stalled requests.
         let stalled = std::mem::take(&mut self.stalled_requests);
+        if !stalled.requests.is_empty() {
+            info!(
+                "Flush is finished, handle stalled requests for region {}",
+                region_id
+            );
+        }
         // We already stalled these requests, don't stall them again.
         self.handle_write_requests(stalled.requests, false).await;
 

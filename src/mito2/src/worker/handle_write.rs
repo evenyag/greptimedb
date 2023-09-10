@@ -18,6 +18,7 @@ use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
 use common_query::Output;
+use common_telemetry::info;
 use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadata;
 use store_api::storage::RegionId;
@@ -53,6 +54,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         if self.write_buffer_manager.should_stall() && allow_stall {
             // TODO(yingwen): stalled metrics.
+            info!("Stall {} write request", write_requests.len());
             self.stalled_requests.append(&mut write_requests);
             self.listener.on_write_stall();
             return;
