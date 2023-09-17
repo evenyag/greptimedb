@@ -16,6 +16,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_compat::CompatExt;
 use async_trait::async_trait;
@@ -122,11 +123,17 @@ impl ParquetReaderBuilder {
             stream,
             read_format,
             batches: Vec::new(),
+            scan_record_batch: Duration::ZERO,
+            convert: Duration::ZERO,
+            num_rows: 0,
+            num_batches: 0,
+            num_record_batches: 0,
         })
     }
 
     /// Initializes the parquet stream, also creates a [ReadFormat] to decode record batches.
     async fn init_stream(&self, file_path: &str) -> Result<(BoxedRecordBatchStream, ReadFormat)> {
+        let start = Instant::now();
         // Creates parquet stream builder.
         let reader = self
             .object_store
@@ -186,6 +193,8 @@ impl ParquetReaderBuilder {
             builder = builder.with_projection(projection_mask);
         }
 
+        common_telemetry::info!("Parquet reader builder build cost: {:?}", start.elapsed());
+
         let stream = builder
             .build()
             .context(ReadParquetSnafu { path: file_path })?;
@@ -240,27 +249,39 @@ pub struct ParquetReader {
     read_format: ReadFormat,
     /// Buffered batches to return.
     batches: Vec<Batch>,
+    scan_record_batch: Duration,
+    convert: Duration,
+    num_rows: usize,
+    num_batches: usize,
+    num_record_batches: usize,
 }
 
 #[async_trait]
 impl BatchReader for ParquetReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
         if let Some(batch) = self.batches.pop() {
+            self.num_batches += 1;
             return Ok(Some(batch));
         }
 
         // We need to fetch next record batch and convert it to batches.
+        let start = Instant::now();
         let Some(record_batch) = self.stream.try_next().await.context(ReadParquetSnafu {
             path: &self.file_path,
         })?
         else {
             return Ok(None);
         };
+        self.num_record_batches += 1;
+        self.scan_record_batch += start.elapsed();
 
+        let start = Instant::now();
         self.read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
         // Reverse batches so we could pop it.
         self.batches.reverse();
+        self.convert += start.elapsed();
+        self.num_rows += record_batch.num_rows();
 
         Ok(self.batches.pop())
     }
@@ -270,6 +291,15 @@ impl ParquetReader {
     /// Returns the metadata of the SST.
     pub fn metadata(&self) -> &RegionMetadataRef {
         self.read_format.metadata()
+    }
+}
+
+impl Drop for ParquetReader {
+    fn drop(&mut self) {
+        common_telemetry::info!(
+            "Parquet reader metrics: num_rows: {}, num_batches: {}, num_record_batches: {}, scan_record_batch: {:?}, convert: {:?}",
+            self.num_rows, self.num_batches, self.num_record_batches, self.scan_record_batch, self.convert
+        );
     }
 }
 
