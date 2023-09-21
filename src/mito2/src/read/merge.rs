@@ -17,8 +17,10 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::mem;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use common_telemetry::info;
 
 use crate::error::Result;
 use crate::memtable::BoxedBatchIterator;
@@ -37,11 +39,29 @@ pub struct MergeReader {
     nodes: BinaryHeap<Node>,
     /// Batches for the next primary key.
     batch_merger: BatchMerger,
+    start: Instant,
+    take_batch_cost: Duration,
+    merge_batch_cost: Duration,
+    filter_cost: Duration,
+    new_cost: Duration,
+    next_batch_cost: Duration,
+    num_sorted: usize,
+    total_batch: usize,
+}
+
+impl Drop for MergeReader {
+    fn drop(&mut self) {
+        info!("MergeReader finish, total_cost: {:?}, take_batch_cost: {:?}, merge_batch_cost: {:?}, \
+            filter_cost: {:?}, new_cost: {:?}, next_batch_cost: {:?}, num_sorted: {}, total_batch: {}",
+            self.start.elapsed(), self.take_batch_cost, self.merge_batch_cost,
+            self.filter_cost, self.new_cost, self.next_batch_cost, self.num_sorted, self.total_batch);
+    }
 }
 
 #[async_trait]
 impl BatchReader for MergeReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
+        let next_start = Instant::now();
         // Collect batches from sources for the same primary key and return
         // the collected batch.
         while !self.nodes.is_empty() {
@@ -62,13 +82,22 @@ impl BatchReader for MergeReader {
         }
 
         // Merge collected batches.
-        self.batch_merger.merge_batches()
+        let start = Instant::now();
+        let ret = self.batch_merger.merge_batches(
+            &mut self.total_batch,
+            &mut self.num_sorted,
+            &mut self.filter_cost,
+        );
+        self.merge_batch_cost += start.elapsed();
+        self.next_batch_cost += next_start.elapsed();
+        ret
     }
 }
 
 impl MergeReader {
     /// Creates a new [MergeReader].
     pub async fn new(sources: Vec<Source>) -> Result<MergeReader> {
+        let start = Instant::now();
         let mut nodes = BinaryHeap::with_capacity(sources.len());
         for source in sources {
             let node = Node::new(source).await?;
@@ -81,11 +110,20 @@ impl MergeReader {
         Ok(MergeReader {
             nodes,
             batch_merger: BatchMerger::new(),
+            start,
+            take_batch_cost: Duration::ZERO,
+            merge_batch_cost: Duration::ZERO,
+            filter_cost: Duration::ZERO,
+            new_cost: start.elapsed(),
+            next_batch_cost: Duration::ZERO,
+            num_sorted: 0,
+            total_batch: 0,
         })
     }
 
     /// Takes batch from heap top and reheap.
     async fn take_batch_from_heap(&mut self) -> Result<()> {
+        let start = Instant::now();
         let mut next_node = self.nodes.pop().unwrap();
         let batch = next_node.fetch_batch().await?;
         self.batch_merger.push(batch);
@@ -93,10 +131,12 @@ impl MergeReader {
         // Insert the node back to the heap.
         // If the node reaches EOF, ignores it. This ensures nodes in the heap is always not EOF.
         if next_node.is_eof() {
+            self.take_batch_cost += start.elapsed();
             return Ok(());
         }
         self.nodes.push(next_node);
 
+        self.take_batch_cost += start.elapsed();
         Ok(())
     }
 }
@@ -201,10 +241,17 @@ impl BatchMerger {
 
     /// Merge all buffered batches and returns the merged batch. Then
     /// reset the buffer.
-    fn merge_batches(&mut self) -> Result<Option<Batch>> {
+    fn merge_batches(
+        &mut self,
+        total_batch: &mut usize,
+        num_sorted: &mut usize,
+        filter_cost: &mut Duration,
+    ) -> Result<Option<Batch>> {
         if self.batches.is_empty() {
             return Ok(None);
         }
+
+        *total_batch += 1;
 
         let batches = mem::take(&mut self.batches);
         // Concat all batches.
@@ -217,11 +264,15 @@ impl BatchMerger {
             batch.sort_and_dedup()?;
             // We don't need to remove duplications if timestamps of batches
             // are not overlapping.
+        } else {
+            *num_sorted += 1;
         }
 
         // Filter rows by op type. Currently, the reader only removes deleted rows but doesn't filter
         // rows by sequence for simplicity and performance reason.
+        let start = Instant::now();
         batch.filter_deleted()?;
+        *filter_cost += start.elapsed();
 
         // Reset merger.
         self.is_sorted = true;

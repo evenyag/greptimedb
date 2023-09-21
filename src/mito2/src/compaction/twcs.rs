@@ -90,6 +90,8 @@ impl TwcsPicker {
                         output_level: 1, // we only have two levels and always compact to l1 
                         inputs: files.clone(),
                     });
+                    let input_ids: Vec<_> = files.iter().map(|f| f.file_id()).collect();
+                    debug!("compact active window, input_ids: {:?}, output_file_id: {}", input_ids, output.last().unwrap().output_file_id);
                 } else {
                     debug!("Active window not present or no enough files in active window {:?}, window: {}", active_window, *window);
                 }
@@ -101,6 +103,8 @@ impl TwcsPicker {
                         output_level: 1,
                         inputs: files.clone(),
                     });
+                    let input_ids: Vec<_> = files.iter().map(|f| f.file_id()).collect();
+                    debug!("compact active window, input_ids: {:?}, output_file_id: {}", input_ids, output.last().unwrap().output_file_id);
                 } else {
                     debug!("No enough files, current: {}, max_inactive_window_files: {}", files.len(), self.max_inactive_window_files)
                 }
@@ -154,6 +158,10 @@ impl Picker for TwcsPicker {
         let outputs = self.build_output(&windows, active_window);
 
         if outputs.is_empty() && expired_ssts.is_empty() {
+            debug!(
+                "Region {} compaction output is empty, don't compact",
+                region_id
+            );
             // Nothing to compact, we are done. Notifies all waiters as we consume the compaction request.
             for waiter in waiters {
                 waiter.send(Ok(Output::AffectedRows(0)));
@@ -173,7 +181,11 @@ impl Picker for TwcsPicker {
             file_purger,
             start_at: Instant::now(),
         };
-        info!("compaction window infer cost: {:?}", start.elapsed());
+        debug!(
+            "region {} compaction window infer cost: {:?}",
+            region_id,
+            start.elapsed()
+        );
         Some(Box::new(task))
     }
 }
