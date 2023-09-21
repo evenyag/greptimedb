@@ -72,6 +72,13 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             return;
         }
 
+        info!(
+            "Compaction for region {} is finished, add {} files, remove {} files",
+            region_id,
+            request.compaction_outputs.len(),
+            request.compacted_files.len(),
+        );
+
         // Apply edit to region's version.
         region
             .version_control

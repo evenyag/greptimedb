@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use api::v1::add_column_location::LocationType;
 use api::v1::region::{alter_request, region_request, AlterRequest};
@@ -53,7 +54,7 @@ impl RegionRequest {
                 .filter_map(|r| {
                     let region_id = r.region_id.into();
                     r.rows
-                        .map(|rows| (region_id, Self::Put(RegionPutRequest { rows })))
+                        .map(|rows| (region_id, Self::Put(RegionPutRequest::new(rows))))
                 })
                 .collect()),
             region_request::Body::Deletes(deletes) => Ok(deletes
@@ -124,11 +125,24 @@ impl RegionRequest {
     }
 }
 
+static REQ_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Request to put data into a region.
 #[derive(Debug)]
 pub struct RegionPutRequest {
     /// Rows to put.
     pub rows: Rows,
+    /// Req id
+    pub req_id: u64,
+}
+
+impl RegionPutRequest {
+    pub fn new(rows: Rows) -> Self {
+        Self {
+            rows,
+            req_id: REQ_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug)]

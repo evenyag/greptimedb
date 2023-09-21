@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use common_query::Output;
 use common_telemetry::{error, info};
@@ -114,8 +115,8 @@ impl WriteBufferManager for WriteBufferManagerImpl {
         let mutable_memtable_memory_usage = self.memory_active.load(Ordering::Relaxed);
         if mutable_memtable_memory_usage > self.mutable_limit {
             info!(
-                "Engine should flush (over mutable limit), mutable_usage: {}, mutable_limit: {}.",
-                mutable_memtable_memory_usage, self.mutable_limit,
+                "Engine should flush (over mutable limit), mutable_usage: {}, memory_usage: {}, mutable_limit: {}, global_limit: {}",
+                mutable_memtable_memory_usage, self.memory_usage(), self.mutable_limit, self.global_write_buffer_size,
             );
             return true;
         }
@@ -141,7 +142,16 @@ impl WriteBufferManager for WriteBufferManagerImpl {
     }
 
     fn should_stall(&self) -> bool {
-        self.memory_usage() >= self.global_write_buffer_size
+        let stall = self.memory_usage() >= self.global_write_buffer_size;
+        if stall {
+            info!(
+                "Engine should stall memory_usage: {}, global_limit: {}, mutable_usage: {}",
+                self.memory_usage(),
+                self.global_write_buffer_size,
+                self.mutable_usage(),
+            );
+        }
+        stall
     }
 
     fn reserve_mem(&self, mem: usize) {
@@ -223,9 +233,17 @@ impl RegionFlushTask {
         // Get a version of this region before creating a job to get current
         // wal entry id, sequence and immutable memtables.
         let version_data = version_control.current();
+        let start = Instant::now();
 
         Box::pin(async move {
+            info!("flush job start");
+            let flush_start = Instant::now();
             self.do_flush(version_data).await;
+            info!(
+                "flush job is finished, cost: {:?}, flush_cost: {:?}",
+                start.elapsed(),
+                flush_start.elapsed()
+            );
         })
     }
 
@@ -361,6 +379,7 @@ impl FlushScheduler {
         task: RegionFlushTask,
     ) -> Result<()> {
         debug_assert_eq!(region_id, task.region_id);
+        info!("schedule flush for region {}", region_id);
 
         let version = version_control.current().version;
         if version.memtables.mutable.is_empty() && version.memtables.immutables().is_empty() {
@@ -379,6 +398,7 @@ impl FlushScheduler {
         if flush_status.flushing {
             // There is already a flush job running.
             flush_status.merge_task(task);
+            info!("region {} flushing, merge task", region_id);
             return Ok(());
         }
 
@@ -386,9 +406,11 @@ impl FlushScheduler {
         // If there are pending tasks, then we should push it to pending list.
         if flush_status.pending_task.is_some() {
             flush_status.merge_task(task);
+            info!("region {} has pending, merge task", region_id);
             return Ok(());
         }
 
+        info!("region {} start flush", region_id);
         // Now we can flush the region directly.
         version_control.freeze_mutable(&task.memtable_builder);
         // Submit a flush job.

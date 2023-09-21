@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
-use common_telemetry::logging;
+use common_telemetry::{info, logging};
 use snafu::{ensure, OptionExt, ResultExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -67,7 +67,7 @@ impl LocalScheduler {
 
         let mut handles = Vec::with_capacity(concurrency);
 
-        for _ in 0..concurrency {
+        for worker_id in 0..concurrency {
             let child = token.child_token();
             let receiver = rx.clone();
             let state_clone = state.clone();
@@ -77,10 +77,12 @@ impl LocalScheduler {
                         _ = child.cancelled() => {
                             break;
                         }
-                        req_opt = receiver.recv() =>{
+                        req_opt = receiver.recv() => {
+                            info!("worker {} handle job start", worker_id);
                             if let Ok(job) = req_opt {
                                 job.await;
                             }
+                            info!("worker {} handle job end", worker_id);
                         }
                     }
                 }

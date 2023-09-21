@@ -14,9 +14,11 @@
 
 use std::mem;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use api::v1::{Mutation, Rows, WalEntry};
 use common_query::Output;
+use common_telemetry::debug;
 use snafu::ResultExt;
 use store_api::logstore::LogStore;
 use store_api::storage::{RegionId, SequenceNumber};
@@ -37,6 +39,8 @@ struct WriteNotify {
     sender: OptionOutputTx,
     /// Number of rows to be written.
     num_rows: usize,
+    /// Create time.
+    create_at: Instant,
 }
 
 impl WriteNotify {
@@ -46,6 +50,7 @@ impl WriteNotify {
             err: None,
             sender,
             num_rows,
+            create_at: Instant::now(),
         }
     }
 
@@ -65,7 +70,16 @@ impl WriteNotify {
 
 impl Drop for WriteNotify {
     fn drop(&mut self) {
+        let write_cost = self.create_at.elapsed();
         self.notify_result();
+
+        let total_cost = self.create_at.elapsed();
+        if total_cost > Duration::from_millis(100) {
+            debug!(
+                "Write notify write cost: {:?}, total cost: {:?}",
+                write_cost, total_cost
+            );
+        }
     }
 }
 

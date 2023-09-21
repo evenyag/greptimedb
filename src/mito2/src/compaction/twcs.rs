@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common_base::readable_size::ReadableSize;
 use common_query::Output;
@@ -112,6 +112,7 @@ impl TwcsPicker {
 
 impl Picker for TwcsPicker {
     fn pick(&self, req: CompactionRequest) -> Option<Box<dyn CompactionTask>> {
+        let start = Instant::now();
         let CompactionRequest {
             current_version,
             access_layer,
@@ -170,7 +171,9 @@ impl Picker for TwcsPicker {
             request_sender,
             waiters,
             file_purger,
+            start_at: Instant::now(),
         };
+        info!("compaction window infer cost: {:?}", start.elapsed());
         Some(Box::new(task))
     }
 }
@@ -228,6 +231,7 @@ pub(crate) struct TwcsCompactionTask {
     pub(crate) request_sender: mpsc::Sender<WorkerRequest>,
     /// Senders that are used to notify waiters waiting for pending compaction tasks.
     pub waiters: Vec<OutputTx>,
+    start_at: Instant,
 }
 
 impl Debug for TwcsCompactionTask {
@@ -243,6 +247,10 @@ impl Debug for TwcsCompactionTask {
 
 impl Drop for TwcsCompactionTask {
     fn drop(&mut self) {
+        info!(
+            "Compaction task finished, cost: {:?}",
+            self.start_at.elapsed()
+        );
         self.mark_files_compacting(false)
     }
 }
@@ -341,6 +349,7 @@ impl TwcsCompactionTask {
 #[async_trait::async_trait]
 impl CompactionTask for TwcsCompactionTask {
     async fn run(&mut self) {
+        info!("compaction task start, region: {}", self.region_id);
         let notify = match self.handle_compaction().await {
             Ok((added, deleted)) => {
                 info!(

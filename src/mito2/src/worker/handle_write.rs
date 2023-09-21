@@ -17,6 +17,7 @@
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
 
+use common_telemetry::{info, warn};
 use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadata;
 use store_api::storage::RegionId;
@@ -37,10 +38,24 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             return;
         }
 
+        if !allow_stall {
+            let req_ids: Vec<_> = write_requests
+                .iter()
+                .map(|req| req.request.req_id)
+                .collect();
+            info!(
+                "Worker {} handle {} stalled requests, req_ids: {:?}",
+                self.id,
+                write_requests.len(),
+                req_ids
+            );
+        }
+
         // Flush this worker if the engine needs to flush.
         self.maybe_flush_worker();
 
         if self.should_reject_write() {
+            warn!("reject write");
             // The memory pressure is still too high, reject write requests.
             reject_write_requests(write_requests);
             // Also reject all stalled requests.
@@ -50,6 +65,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         if self.write_buffer_manager.should_stall() && allow_stall {
+            // TODO(yingwen): What if not flush is triggered?
+            let req_ids: Vec<_> = write_requests
+                .iter()
+                .map(|req| req.request.req_id)
+                .collect();
+            info!(
+                "Worker {} stalls {} write request, req_ids: {:?}",
+                self.id,
+                write_requests.len(),
+                req_ids
+            );
             // TODO(yingwen): stalled metrics.
             self.stalled_requests.append(&mut write_requests);
             self.listener.on_write_stall();
@@ -95,6 +121,11 @@ impl<S> RegionWorkerLoop<S> {
             if self.flush_scheduler.has_pending_ddls(region_id) {
                 // TODO(yingwen): consider adding some metrics for this.
                 // Safety: The region has pending ddls.
+                info!(
+                    "Worker {} add region {} requests to pending",
+                    self.id, region_id
+                );
+
                 self.flush_scheduler
                     .add_write_request_to_pending(sender_req);
                 continue;

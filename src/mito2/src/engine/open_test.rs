@@ -118,7 +118,7 @@ async fn test_engine_open_readonly() {
     let err = engine
         .handle_request(
             region_id,
-            RegionRequest::Put(RegionPutRequest { rows: rows.clone() }),
+            RegionRequest::Put(RegionPutRequest::new(rows.clone())),
         )
         .await
         .unwrap_err();

@@ -28,10 +28,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common_runtime::JoinHandle;
-use common_telemetry::{error, info, warn};
+use common_telemetry::{debug, error, info, warn};
 use futures::future::try_join_all;
 use object_store::ObjectStore;
 use snafu::{ensure, ResultExt};
@@ -451,6 +451,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let mut buffer = RequestBuffer::with_capacity(self.config.worker_request_batch_size);
 
         while self.running.load(Ordering::Relaxed) {
+            let start = Instant::now();
             // Clear the buffer before handling next batch of requests.
             buffer.clear();
 
@@ -458,6 +459,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 Some(request) => buffer.push(request),
                 None => break,
             }
+
+            let recv_wait = start.elapsed();
 
             // Try to recv more requests from the channel.
             for _ in 1..buffer.capacity() {
@@ -470,6 +473,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
 
             self.handle_requests(&mut buffer).await;
+
+            let cost = start.elapsed();
+            if cost > Duration::from_millis(200) {
+                warn!(
+                    "Worker {} cost too much time, cost: {:?}, recv_wait: {:?}",
+                    self.id, cost, recv_wait
+                );
+            }
         }
 
         self.clean().await;
@@ -481,6 +492,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     ///
     /// `buffer` should be empty.
     async fn handle_requests(&mut self, buffer: &mut RequestBuffer) {
+        let start = Instant::now();
         let mut write_requests = Vec::with_capacity(buffer.len());
         let mut ddl_requests = Vec::with_capacity(buffer.len());
         for worker_req in buffer.drain(..) {
@@ -504,11 +516,23 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
         }
 
+        let num_write = write_requests.len();
+        let num_ddl = ddl_requests.len();
+
         // Handles all write requests first. So we can alter regions without
         // considering existing write requests.
         self.handle_write_requests(write_requests, true).await;
 
+        let write_cost = start.elapsed();
+
         self.handle_ddl_requests(ddl_requests).await;
+
+        if num_ddl > 0
+            || write_cost > Duration::from_millis(10)
+            || start.elapsed() > Duration::from_millis(20)
+        {
+            debug!("Worker {} handle {} write requests, {} ddl requests, total cost: {:?}, write cost: {:?}", self.id, num_write, num_ddl, start.elapsed(), write_cost);
+        }
     }
 
     /// Takes and handles all ddl requests.
@@ -545,6 +569,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
     /// Handles region background request
     async fn handle_background_notify(&mut self, region_id: RegionId, notify: BackgroundNotify) {
+        let start = Instant::now();
         match notify {
             BackgroundNotify::FlushFinished(req) => {
                 self.handle_flush_finished(region_id, req).await
@@ -555,6 +580,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
             BackgroundNotify::CompactionFailed(req) => self.handle_compaction_failure(req).await,
         }
+
+        debug!(
+            "Worker {} handle background notify, cost: {:?}",
+            self.id,
+            start.elapsed()
+        );
     }
 }
 

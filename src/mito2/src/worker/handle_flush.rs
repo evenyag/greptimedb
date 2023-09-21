@@ -50,6 +50,7 @@ impl<S> RegionWorkerLoop<S> {
     /// On region flush job failed.
     pub(crate) async fn handle_flush_failed(&mut self, region_id: RegionId, request: FlushFailed) {
         self.flush_scheduler.on_flush_failed(region_id, request.err);
+        // TODO(yingwen): fail stalled requests.
     }
 
     /// Checks whether the engine reaches flush threshold. If so, finds regions in this
@@ -79,6 +80,7 @@ impl<S> RegionWorkerLoop<S> {
         for region in &regions {
             if self.flush_scheduler.is_flush_requested(region.region_id) {
                 // Already flushing.
+                info!("region {} already flushing", region.region_id);
                 continue;
             }
 
@@ -206,6 +208,16 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Handle stalled requests.
         let stalled = std::mem::take(&mut self.stalled_requests);
+        for req in &stalled.requests {
+            info!(
+                "req {} stalled time: {:?}",
+                req.request.req_id,
+                req.sender
+                    .0
+                    .as_ref()
+                    .map(|sender| sender.create_at.elapsed())
+            );
+        }
         // We already stalled these requests, don't stall them again.
         self.handle_write_requests(stalled.requests, false).await;
 

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::helper::{
     is_column_type_value_eq, is_semantic_type_eq, proto_value_type, to_column_data_type,
@@ -25,8 +25,7 @@ use api::helper::{
 use api::v1::{ColumnDataType, ColumnSchema, OpType, Rows, SemanticType, Value};
 use common_query::Output;
 use common_query::Output::AffectedRows;
-use common_telemetry::tracing::log::info;
-use common_telemetry::warn;
+use common_telemetry::{info, warn};
 use datatypes::prelude::DataType;
 use prost::Message;
 use smallvec::SmallVec;
@@ -61,6 +60,7 @@ pub struct WriteRequest {
     name_to_index: HashMap<String, usize>,
     /// Whether each column has null.
     has_null: Vec<bool>,
+    pub req_id: u64,
 }
 
 impl WriteRequest {
@@ -110,6 +110,7 @@ impl WriteRequest {
             rows,
             name_to_index,
             has_null,
+            req_id: 0,
         })
     }
 
@@ -369,24 +370,38 @@ pub(crate) fn validate_proto_value(
 
 /// Oneshot output result sender.
 #[derive(Debug)]
-pub(crate) struct OutputTx(Sender<Result<Output>>);
+pub(crate) struct OutputTx {
+    tx: Sender<Result<Output>>,
+    pub(crate) create_at: Instant,
+}
 
 impl OutputTx {
     /// Creates a new output sender.
     pub(crate) fn new(sender: Sender<Result<Output>>) -> OutputTx {
-        OutputTx(sender)
+        OutputTx {
+            tx: sender,
+            create_at: Instant::now(),
+        }
     }
 
     /// Sends the `result`.
     pub(crate) fn send(self, result: Result<Output>) {
+        let wait_cost = self.create_at.elapsed();
+        if wait_cost > Duration::from_millis(100) {
+            info!("output sender wait too long, cost: {:?}", wait_cost,);
+        }
         // Ignores send result.
-        let _ = self.0.send(result);
+        let _ = self.tx.send(result);
+        let total_cost = self.create_at.elapsed();
+        if total_cost > Duration::from_millis(200) {
+            info!("output sender total cost too long, cost: {:?}", total_cost,);
+        }
     }
 }
 
 /// Optional output result sender.
 #[derive(Debug)]
-pub(crate) struct OptionOutputTx(Option<OutputTx>);
+pub(crate) struct OptionOutputTx(pub(crate) Option<OutputTx>);
 
 impl OptionOutputTx {
     /// Creates a sender.
@@ -475,7 +490,8 @@ impl WorkerRequest {
         let (sender, receiver) = oneshot::channel();
         let worker_request = match value {
             RegionRequest::Put(v) => {
-                let write_request = WriteRequest::new(region_id, OpType::Put, v.rows)?;
+                let mut write_request = WriteRequest::new(region_id, OpType::Put, v.rows)?;
+                write_request.req_id = v.req_id;
                 WorkerRequest::Write(SenderWriteRequest {
                     sender: sender.into(),
                     request: write_request,
