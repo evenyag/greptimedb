@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use common_query::Output;
 use common_telemetry::{error, info};
@@ -236,11 +236,13 @@ impl RegionFlushTask {
         let start = Instant::now();
 
         Box::pin(async move {
-            info!("flush job start");
+            let region_id = version_data.version.metadata.region_id;
+            info!("flush job for region {} start", region_id);
             let flush_start = Instant::now();
             self.do_flush(version_data).await;
             info!(
-                "flush job is finished, cost: {:?}, flush_cost: {:?}",
+                "flush job for region {} is finished, cost: {:?}, flush_cost: {:?}",
+                region_id,
                 start.elapsed(),
                 flush_start.elapsed()
             );
@@ -293,13 +295,18 @@ impl RegionFlushTask {
         let write_opts = WriteOptions::default();
         let memtables = version.memtables.immutables();
         let mut file_metas = Vec::with_capacity(memtables.len());
+        let mut num_empty = 0;
+        let mut num_rows = 0;
+        let mut sst_cost = Duration::ZERO;
 
         for mem in memtables {
             if mem.is_empty() {
                 // Skip empty memtables.
+                num_empty += 1;
                 continue;
             }
 
+            let start = Instant::now();
             let file_id = FileId::random();
             let iter = mem.iter(None, &[]);
             let source = Source::Iter(iter);
@@ -308,8 +315,11 @@ impl RegionFlushTask {
                 .write_sst(file_id, version.metadata.clone(), source);
             let Some(sst_info) = writer.write_all(&write_opts).await? else {
                 // No data written.
+                num_empty += 1;
                 continue;
             };
+            num_rows += sst_info.num_rows;
+            sst_cost += start.elapsed();
 
             file_metas.push(FileMeta {
                 region_id: version.metadata.region_id,
@@ -322,10 +332,8 @@ impl RegionFlushTask {
 
         let file_ids: Vec<_> = file_metas.iter().map(|f| f.file_id).collect();
         info!(
-            "Successfully flush memtables, region: {}, reason: {}, files: {:?}",
-            version.metadata.region_id,
-            self.reason.as_ref(),
-            file_ids
+            "Successfully flush {} memtables, region: {}, reason: {}, files: {:?}, num_empty: {}, num_rows: {}, sst_cost: {:?}",
+            memtables.len(), version.metadata.region_id, self.reason.as_ref(), file_ids, num_empty, num_rows, sst_cost,
         );
 
         Ok(file_metas)

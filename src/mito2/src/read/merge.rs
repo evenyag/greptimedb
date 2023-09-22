@@ -538,7 +538,13 @@ mod tests {
     #[test]
     fn test_batch_merger_empty() {
         let mut merger = BatchMerger::new();
-        assert!(merger.merge_batches().unwrap().is_none());
+        let mut total_batch = 0;
+        let mut num_sorted = 0;
+        let mut filter_cost = Duration::ZERO;
+        assert!(merger
+            .merge_batches(&mut total_batch, &mut num_sorted, &mut filter_cost)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -560,7 +566,13 @@ mod tests {
             &[22, 24],
         ));
         assert!(!merger.is_sorted);
-        let batch = merger.merge_batches().unwrap().unwrap();
+        let mut total_batch = 0;
+        let mut num_sorted = 0;
+        let mut filter_cost = Duration::ZERO;
+        let batch = merger
+            .merge_batches(&mut total_batch, &mut num_sorted, &mut filter_cost)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             batch,
             new_batch(
