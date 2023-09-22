@@ -15,7 +15,7 @@
 //! Scans a region according to the scan request.
 
 use common_recordbatch::SendableRecordBatchStream;
-use common_telemetry::debug;
+use common_telemetry::info;
 use common_time::range::TimestampRange;
 use snafu::ResultExt;
 use store_api::storage::ScanRequest;
@@ -164,12 +164,13 @@ impl ScanRegion {
             .filter(|mem| !mem.is_empty())
             .collect();
 
-        debug!(
-            "Seq scan region {}, memtables: {}, ssts_to_read: {}, total_ssts: {}",
+        info!(
+            "Seq scan region {}, memtables: {}, ssts_to_read: {}, total_ssts: {}, request: {:?}",
             self.version.metadata.region_id,
             memtables.len(),
             files.len(),
-            total_ssts
+            total_ssts,
+            self.request,
         );
 
         let predicate = Predicate::try_new(
