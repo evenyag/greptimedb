@@ -17,9 +17,11 @@ use std::collections::{BTreeMap, Bound, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use api::v1::OpType;
 use common_query::logical_plan::Expr;
+use common_telemetry::info;
 use datatypes::arrow;
 use datatypes::arrow::array::ArrayRef;
 use datatypes::data_type::DataType;
@@ -291,6 +293,8 @@ impl SeriesSet {
             series: self.series.clone(),
             projection,
             last_key: None,
+            compact_cost: Duration::ZERO,
+            to_batch_cost: Duration::ZERO,
         }
     }
 }
@@ -300,6 +304,8 @@ struct Iter {
     series: Arc<SeriesRwLockMap>,
     projection: HashSet<ColumnId>,
     last_key: Option<Vec<u8>>,
+    compact_cost: Duration,
+    to_batch_cost: Duration,
 }
 
 impl Iterator for Iter {
@@ -316,11 +322,27 @@ impl Iterator for Iter {
 
         if let Some((primary_key, series)) = range.next() {
             self.last_key = Some(primary_key.clone());
+            let start = Instant::now();
             let values = series.write().unwrap().compact(&self.metadata);
-            Some(values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection)))
+            self.compact_cost += start.elapsed();
+            let start = Instant::now();
+            let ret = Some(
+                values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection)),
+            );
+            self.to_batch_cost += start.elapsed();
+            ret
         } else {
             None
         }
+    }
+}
+
+impl Drop for Iter {
+    fn drop(&mut self) {
+        info!(
+            "Region {} memtable iter, compact_cost: {:?}, to_batch_cost: {:?}",
+            self.metadata.region_id, self.compact_cost, self.to_batch_cost
+        );
     }
 }
 

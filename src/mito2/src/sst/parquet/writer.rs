@@ -14,7 +14,9 @@
 
 //! Parquet writer.
 
-use common_telemetry::debug;
+use std::time::{Duration, Instant};
+
+use common_telemetry::{debug, info};
 use common_time::Timestamp;
 use object_store::ObjectStore;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -97,11 +99,17 @@ impl ParquetWriter {
         .await?;
 
         let mut stats = SourceStats::default();
+        let mut next_cost = Duration::ZERO;
+        let mut next_start = Instant::now();
+        let mut num_batch = 0;
         while let Some(batch) = self.source.next_batch().await? {
+            next_cost += next_start.elapsed();
             stats.update(&batch);
             let arrow_batch = write_format.convert_batch(&batch)?;
 
             buffered_writer.write(&arrow_batch).await?;
+            next_start = Instant::now();
+            num_batch += 1;
         }
 
         if stats.num_rows == 0 {
@@ -117,6 +125,11 @@ impl ParquetWriter {
         let (_file_meta, file_size) = buffered_writer.close().await?;
         // Safety: num rows > 0 so we must have min/max.
         let time_range = stats.time_range.unwrap();
+
+        info!(
+            "SST writer for region {}, next_cost: {:?}, num_batch: {}",
+            self.metadata.region_id, next_cost, num_batch
+        );
 
         // object_store.write will make sure all bytes are written or an error is raised.
         Ok(Some(SstInfo {
