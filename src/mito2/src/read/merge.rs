@@ -70,38 +70,25 @@ impl Drop for MergeReader {
 impl BatchReader for MergeReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
         let next_start = Instant::now();
-        // Takes from sorted output.
-        if let Some(batch) = self.output.pop_front() {
-            self.next_batch_cost += next_start.elapsed();
-            return Ok(Some(batch));
-        }
-
-        // Collect batches from sources for the same primary key.
-        while !self.nodes.is_empty() {
-            // Peek current key.
-            let Some(current_key) = self.batch_merger.primary_key() else {
-                // The merger is empty, we could push it directly.
-                self.take_batch_from_heap().await?;
-                // Try next node.
-                continue;
-            };
-            // If next node has a different key, we have finish collecting current key.
-            // Safety: node is not empty.
-            if self.nodes.peek().unwrap().primary_key() != current_key {
-                break;
+        while !self.output.is_empty() || !self.nodes.is_empty() {
+            // Takes from sorted output if there are batches in it.
+            if let Some(batch) = self.output.pop_front() {
+                self.next_batch_cost += next_start.elapsed();
+                return Ok(Some(batch));
             }
-            // They have the same primary key, we could take it and try next node.
-            self.take_batch_from_heap().await?;
+
+            // Collects batches to the merger.
+            self.collect_batches_to_merge().await?;
+
+            // Merge collected batches to output.
+            let start = Instant::now();
+            self.output = self.batch_merger.merge_batches()?;
+            self.merge_batch_cost += start.elapsed();
+            self.total_batch += self.output.len();
         }
 
-        let start = Instant::now();
-        // Merge collected batches to output.
-        self.output = self.batch_merger.merge_batches()?;
-        self.merge_batch_cost += start.elapsed();
         self.next_batch_cost += next_start.elapsed();
-        self.total_batch += self.output.len();
-
-        Ok(self.output.pop_front())
+        Ok(None)
     }
 }
 
@@ -131,6 +118,28 @@ impl MergeReader {
             // num_sorted: 0,
             total_batch: 0,
         })
+    }
+
+    /// Collect batches from sources for the same primary key.
+    async fn collect_batches_to_merge(&mut self) -> Result<()> {
+        while !self.nodes.is_empty() {
+            // Peek current key.
+            let Some(current_key) = self.batch_merger.primary_key() else {
+                // The merger is empty, we could push it directly.
+                self.take_batch_from_heap().await?;
+                // Try next node.
+                continue;
+            };
+            // If next node has a different key, we have finish collecting current key.
+            // Safety: node is not empty.
+            if self.nodes.peek().unwrap().primary_key() != current_key {
+                break;
+            }
+            // They have the same primary key, we could take it and try next node.
+            self.take_batch_from_heap().await?;
+        }
+
+        Ok(())
     }
 
     /// Takes batch from heap top and reheap.
