@@ -267,25 +267,46 @@ impl BatchMerger {
             return Ok(VecDeque::new());
         }
 
-        let batches = mem::take(&mut self.batches);
-        let mut output = VecDeque::with_capacity(batches.len());
-        let mut heap = BinaryHeap::from_iter(batches.into_iter().map(CompareTimeSeq));
-        while !heap.is_empty() {
-            let top = heap.pop().unwrap().0;
-            let Some(next) = heap.pop() else {
-                output.push_back(top);
+        let mut output = VecDeque::with_capacity(self.batches.len());
+        if self.is_sorted {
+            // Fast path. We can output batches directly.
+            for batch in self.batches.drain(..) {
+                output_batch(&mut output, batch)?;
+            }
+
+            return Ok(output);
+        }
+
+        // Slow path. We need to merge overlapping batches.
+        // Contructs a heap from batches. Batches in the heap is not empty, we need to check
+        // this before pushing a batch into the heap.
+        let mut heap = BinaryHeap::from_iter(self.batches.drain(..).map(CompareTimeSeq));
+        // Reset merger as sorted as we have cleared batches.
+        self.is_sorted = true;
+
+        // Sorts batches.
+        while let Some(top) = heap.pop() {
+            let top = top.0;
+            let Some(next) = heap.peek() else {
+                // If there is no remaining batch, we can output the top-most batch.
+                output_batch(&mut output, top)?;
                 break;
             };
-            let next = next.0;
+            let next = &next.0;
 
             if top.last_timestamp() < next.first_timestamp() {
-                output.push_back(top);
-                heap.push(CompareTimeSeq(next));
+                // If the top-most batch doesn't overlaps with the next batch, we can output it.
+                output_batch(&mut output, top)?;
                 continue;
             }
 
+            // Safety: Batches (top, next) in the heap is not empty, so we can use unwrap here.
+            // Min timestamp in the next batch.
             let next_min_ts = next.first_timestamp().unwrap();
             let timestamps = top.timestamps_native().unwrap();
+            // Binary searches the timestamp in the top batch.
+            // Safety: Batches should have the same timestamp resolution so we can compare the native
+            // value directly.
             match timestamps.binary_search(&next_min_ts.value()) {
                 Ok(pos) => {
                     // They have duplicate timestamps. Outputs non overlapping timestamps.
@@ -319,9 +340,6 @@ impl BatchMerger {
                 }
             }
         }
-
-        // Reset merger.
-        self.is_sorted = true;
 
         Ok(output)
     }
