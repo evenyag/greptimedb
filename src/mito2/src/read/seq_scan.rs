@@ -112,14 +112,21 @@ impl SeqScan {
 
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
+        let cache_manager = self.cache_manager.clone();
         let stream = try_stream! {
             let mut convert_cost = Duration::ZERO;
             let mut next_cost = Duration::ZERO;
             let mut next_start = Instant::now();
-            while let Some(batch) = reader.next_batch().await.map_err(BoxedError::new).context(ExternalSnafu)? {
+            let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
+            while let Some(batch) = reader
+                .next_batch()
+                .await
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+            {
                 next_cost += next_start.elapsed();
                 let start = Instant::now();
-                let rb = mapper.convert(&batch)?;
+                let rb = mapper.convert(&batch, cache)?;
                 convert_cost += start.elapsed();
                 next_start = Instant::now();
                 yield rb;
