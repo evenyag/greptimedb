@@ -295,6 +295,7 @@ impl SeriesSet {
             last_key: None,
             compact_cost: Duration::ZERO,
             to_batch_cost: Duration::ZERO,
+            num_rows: 0,
         }
     }
 }
@@ -306,6 +307,7 @@ struct Iter {
     last_key: Option<Vec<u8>>,
     compact_cost: Duration,
     to_batch_cost: Duration,
+    num_rows: usize,
 }
 
 impl Iterator for Iter {
@@ -327,7 +329,12 @@ impl Iterator for Iter {
             self.compact_cost += start.elapsed();
             let start = Instant::now();
             let ret = Some(
-                values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection)),
+                values
+                    .and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection))
+                    .map(|batch| {
+                        self.num_rows += batch.num_rows();
+                        batch
+                    }),
             );
             self.to_batch_cost += start.elapsed();
             ret
@@ -340,8 +347,8 @@ impl Iterator for Iter {
 impl Drop for Iter {
     fn drop(&mut self) {
         info!(
-            "Region {} memtable iter, compact_cost: {:?}, to_batch_cost: {:?}",
-            self.metadata.region_id, self.compact_cost, self.to_batch_cost
+            "Region {} memtable iter, compact_cost: {:?}, to_batch_cost: {:?}, num_rows: {}",
+            self.metadata.region_id, self.compact_cost, self.to_batch_cost, self.num_rows
         );
     }
 }
