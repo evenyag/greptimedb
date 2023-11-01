@@ -182,6 +182,14 @@ mod tests {
         check_bytes_deref(hello, &bytes);
     }
 
+    // This is a false positive of clippy.
+    //
+    // See <https://rust-lang.github.io/rust-clippy/master/index.html#/mutable_key_type>
+    //
+    // > It’s correct to use a struct that contains interior mutability as a key, when its implementation
+    // > of Hash or Ord doesn’t access any of the interior mutable types. However, this lint is unable to
+    // > recognize this, so it will often cause false positives in theses cases. The bytes crate is a great example of this.
+    #[allow(clippy::mutable_key_type)]
     #[test]
     fn test_bytes_borrow() {
         let hello = b"hello";
