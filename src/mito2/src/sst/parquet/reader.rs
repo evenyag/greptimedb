@@ -172,15 +172,16 @@ impl ParquetReaderBuilder {
                 .context(ReadParquetSnafu { path: &file_path })?;
 
         let reader_builder = RowGroupReaderBuilder {
+            file_handle: self.file_handle.clone(),
             file_path,
             parquet_meta,
             file_reader: reader,
             projection: projection_mask,
             field_levels,
+            cache_manager: self.cache_manager.clone(),
         };
 
         Ok(ParquetReader {
-            _file_handle: self.file_handle.clone(),
             row_groups,
             read_format,
             reader_builder,
@@ -249,6 +250,10 @@ impl ParquetReaderBuilder {
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
 struct RowGroupReaderBuilder {
+    /// SST file to read.
+    ///
+    /// Holds the file handle to avoid the file purge purge it.
+    file_handle: FileHandle,
     /// Path of the file.
     file_path: String,
     /// Metadata of the parquet file.
@@ -259,6 +264,8 @@ struct RowGroupReaderBuilder {
     projection: ProjectionMask,
     /// Field levels to read.
     field_levels: FieldLevels,
+    /// Cache.
+    cache_manager: Option<CacheManagerRef>,
 }
 
 impl RowGroupReaderBuilder {
@@ -269,7 +276,13 @@ impl RowGroupReaderBuilder {
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
     async fn build(&mut self, row_group_idx: usize) -> Result<ParquetRecordBatchReader> {
-        let mut row_group = InMemoryRowGroup::create(&self.parquet_meta, row_group_idx);
+        let mut row_group = InMemoryRowGroup::create(
+            self.file_handle.region_id(),
+            self.file_handle.file_id(),
+            &self.parquet_meta,
+            row_group_idx,
+            self.cache_manager.clone(),
+        );
         // Fetches data into memory.
         row_group
             .fetch(&mut self.file_reader, &self.projection, None)
@@ -294,10 +307,6 @@ impl RowGroupReaderBuilder {
 
 /// Parquet batch reader to read our SST format.
 pub struct ParquetReader {
-    /// SST file to read.
-    ///
-    /// Holds the file handle to avoid the file purge purge it.
-    _file_handle: FileHandle,
     /// Indices of row groups to read.
     row_groups: VecDeque<usize>,
     /// Helper to read record batches.
@@ -305,6 +314,9 @@ pub struct ParquetReader {
     /// Not `None` if [ParquetReader::stream] is not `None`.
     read_format: ReadFormat,
     /// Builder to build row group readers.
+    ///
+    /// The builder contains the file handle so don't drop the builder while using
+    /// the [ParquetReader].
     reader_builder: RowGroupReaderBuilder,
     /// Reader of current row group.
     current_reader: Option<ParquetRecordBatchReader>,
