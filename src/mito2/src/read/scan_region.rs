@@ -161,18 +161,17 @@ impl ScanRegion {
         let memtables: Vec<_> = memtables
             .into_iter()
             .filter(|mem| {
-                !mem.is_empty()
-                // if mem.is_empty() {
-                //     return false;
-                // }
-                // let stats = mem.stats();
-                // let Some((start, end)) = stats.time_range() else {
-                //     return true;
-                // };
+                if mem.is_empty() {
+                    return false;
+                }
+                let stats = mem.stats();
+                let Some((start, end)) = stats.time_range() else {
+                    return true;
+                };
 
-                // // The time range of the memtable is inclusive.
-                // let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
-                // memtable_range.intersects(&time_range)
+                // The time range of the memtable is inclusive.
+                let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
+                memtable_range.intersects(&time_range)
             })
             .collect();
 
