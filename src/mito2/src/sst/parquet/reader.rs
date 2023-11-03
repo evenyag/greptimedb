@@ -16,9 +16,11 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
+use common_telemetry::info;
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -112,6 +114,8 @@ impl ParquetReaderBuilder {
     ///
     /// This needs to perform IO operation.
     pub async fn build(&self) -> Result<ParquetReader> {
+        let start = Instant::now();
+
         let file_path = self.file_handle.file_path(&self.file_dir);
         // Now we create a reader to read the whole file.
         let reader = self
@@ -181,12 +185,19 @@ impl ParquetReaderBuilder {
             cache_manager: self.cache_manager.clone(),
         };
 
+        let metrics = Metrics {
+            num_row_groups: row_groups.len(),
+            build_reader_cost: start.elapsed(),
+            ..Default::default()
+        };
+
         Ok(ParquetReader {
             row_groups,
             read_format,
             reader_builder,
             current_reader: None,
             batches: VecDeque::new(),
+            metrics,
         })
     }
 
@@ -246,6 +257,14 @@ impl ParquetReaderBuilder {
 
         Ok(metadata)
     }
+}
+
+#[derive(Default, Debug)]
+#[allow(unused)]
+struct Metrics {
+    num_row_groups: usize,
+    build_reader_cost: Duration,
+    scan_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -322,24 +341,41 @@ pub struct ParquetReader {
     current_reader: Option<ParquetRecordBatchReader>,
     /// Buffered batches to return.
     batches: VecDeque<Batch>,
+    metrics: Metrics,
 }
 
 #[async_trait]
 impl BatchReader for ParquetReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
+        let start = Instant::now();
         if let Some(batch) = self.batches.pop_front() {
+            self.metrics.scan_cost += start.elapsed();
             return Ok(Some(batch));
         }
 
         // We need to fetch next record batch and convert it to batches.
         let Some(record_batch) = self.fetch_next_record_batch().await? else {
+            self.metrics.scan_cost += start.elapsed();
             return Ok(None);
         };
 
         self.read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
 
-        Ok(self.batches.pop_front())
+        let batch = self.batches.pop_front();
+        self.metrics.scan_cost += start.elapsed();
+        Ok(batch)
+    }
+}
+
+impl Drop for ParquetReader {
+    fn drop(&mut self) {
+        info!(
+            "Read parquet {} {}, metrics: {:?}",
+            self.reader_builder.file_handle.region_id(),
+            self.reader_builder.file_handle.file_id(),
+            self.metrics
+        );
     }
 }
 
