@@ -115,6 +115,7 @@ impl SeqScan {
         let cache_manager = self.cache_manager.clone();
         let mut convert_cost = Duration::ZERO;
         let mut num_rows = 0;
+        let mut num_rb = 0;
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
             while let Some(batch) = reader
@@ -127,10 +128,11 @@ impl SeqScan {
                 let rb = mapper.convert(&batch, cache)?;
                 convert_cost += start.elapsed();
                 num_rows += rb.num_rows();
+                num_rb += 1;
                 yield rb;
             }
 
-            info!("Scan stream, num_rows: {}, convert cost {:?}", num_rows, convert_cost);
+            info!("Scan stream, num_rb: {}, num_rows: {}, convert cost {:?}", num_rb, num_rows, convert_cost);
         };
         let stream = Box::pin(RecordBatchStreamAdaptor::new(
             self.mapper.output_schema(),
