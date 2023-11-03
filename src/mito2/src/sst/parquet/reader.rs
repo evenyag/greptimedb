@@ -371,9 +371,10 @@ impl BatchReader for ParquetReader {
 impl Drop for ParquetReader {
     fn drop(&mut self) {
         info!(
-            "Read parquet {} {}, metrics: {:?}",
+            "Read parquet {} {}, range: {:?}, metrics: {:?}",
             self.reader_builder.file_handle.region_id(),
             self.reader_builder.file_handle.file_id(),
+            self.reader_builder.file_handle.time_range(),
             self.metrics
         );
     }
