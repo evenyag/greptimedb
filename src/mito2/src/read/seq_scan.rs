@@ -128,6 +128,7 @@ impl SeqScan {
                 yield rb;
                 start = Instant::now();
             }
+            scan_cost += start.elapsed();
 
             info!("Scan stream cost {:?}", scan_cost);
         };
