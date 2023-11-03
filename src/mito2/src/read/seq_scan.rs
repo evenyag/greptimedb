@@ -15,11 +15,13 @@
 //! Sequential scan.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use common_error::ext::BoxedError;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{RecordBatchStreamAdaptor, SendableRecordBatchStream};
+use common_telemetry::info;
 use common_time::range::TimestampRange;
 use snafu::ResultExt;
 use table::predicate::Predicate;
@@ -111,16 +113,23 @@ impl SeqScan {
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
         let cache_manager = self.cache_manager.clone();
+        let mut scan_cost = Duration::ZERO;
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
+            let mut start = Instant::now();
             while let Some(batch) = reader
                 .next_batch()
                 .await
                 .map_err(BoxedError::new)
                 .context(ExternalSnafu)?
             {
-                yield mapper.convert(&batch, cache)?;
+                let rb = mapper.convert(&batch, cache)?;
+                scan_cost += start.elapsed();
+                yield rb;
+                start = Instant::now();
             }
+
+            info!("Scan stream cost {:?}", scan_cost);
         };
         let stream = Box::pin(RecordBatchStreamAdaptor::new(
             self.mapper.output_schema(),
