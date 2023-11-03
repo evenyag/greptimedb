@@ -355,6 +355,7 @@ struct Metrics {
     range_cost: Duration,
     filter_cost: Duration,
     scan_cost: Duration,
+    num_pruned_series: usize,
 }
 
 struct Iter {
@@ -406,14 +407,14 @@ impl Iterator for Iter {
             {
                 // read next series
                 self.metrics.filter_cost += start.elapsed();
+                self.metrics.num_pruned_series += 1;
                 continue;
             }
             self.metrics.filter_cost += start.elapsed();
             self.last_key = Some(primary_key.clone());
 
             let values = series.compact(&self.metadata);
-            let batch =
-                values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection));
+            let batch = values.and_then(|v| v.to_batch(primary_key, &self.metadata, &self.projection));
             self.metrics.num_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
             self.metrics.scan_cost += next_start.elapsed();
             return Some(batch);
