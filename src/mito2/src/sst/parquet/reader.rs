@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::info;
+use common_telemetry::debug;
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -40,6 +40,7 @@ use crate::error::{
     ArrowReaderSnafu, InvalidMetadataSnafu, InvalidParquetSnafu, OpenDalSnafu, ReadParquetSnafu,
     Result,
 };
+use crate::metrics::{SST_READ_ELAPSED_TOTAL, SST_READ_ROWS_TOTAL};
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::format::ReadFormat;
@@ -186,8 +187,8 @@ impl ParquetReaderBuilder {
         };
 
         let metrics = Metrics {
-            row_groups: row_groups.iter().copied().collect(),
-            build_reader_cost: start.elapsed(),
+            read_row_groups: row_groups.len(),
+            build_cost: start.elapsed(),
             ..Default::default()
         };
 
@@ -259,13 +260,21 @@ impl ParquetReaderBuilder {
     }
 }
 
+/// Parquet reader metrics.
 #[derive(Default, Debug)]
-#[allow(unused)]
 struct Metrics {
-    row_groups: Vec<usize>,
-    build_reader_cost: Duration,
+    /// Number of row groups to read.
+    read_row_groups: usize,
+    /// Duration to build the parquet reader.
+    build_cost: Duration,
+    /// Duration to scan the reader.
     scan_cost: Duration,
-    fetch_cost: Duration,
+    /// Number of record batches read.
+    num_record_batches: usize,
+    /// Number of batches decoded.
+    num_batches: usize,
+    /// Number of rows read.
+    num_rows: usize,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -351,37 +360,48 @@ impl BatchReader for ParquetReader {
         let start = Instant::now();
         if let Some(batch) = self.batches.pop_front() {
             self.metrics.scan_cost += start.elapsed();
+            self.metrics.num_rows += batch.num_rows();
             return Ok(Some(batch));
         }
 
         // We need to fetch next record batch and convert it to batches.
-        let fetch_start = Instant::now();
         let Some(record_batch) = self.fetch_next_record_batch().await? else {
             self.metrics.scan_cost += start.elapsed();
-            self.metrics.fetch_cost += fetch_start.elapsed();
             return Ok(None);
         };
-        self.metrics.fetch_cost += fetch_start.elapsed();
+        self.metrics.num_record_batches += 1;
 
         self.read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
+        self.metrics.num_batches += self.batches.len();
 
         let batch = self.batches.pop_front();
         self.metrics.scan_cost += start.elapsed();
+        self.metrics.num_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
         Ok(batch)
     }
 }
 
 impl Drop for ParquetReader {
     fn drop(&mut self) {
-        info!(
-            "Read parquet {} {}, range: {:?}, num_row_groups: {}, metrics: {:?}",
+        debug!(
+            "Read parquet {} {}, range: {:?}, {}/{} row groups, metrics: {:?}",
             self.reader_builder.file_handle.region_id(),
             self.reader_builder.file_handle.file_id(),
             self.reader_builder.file_handle.time_range(),
-            self.metrics.row_groups.len(),
+            self.metrics.read_row_groups,
+            self.reader_builder.parquet_meta.num_row_groups(),
             self.metrics
         );
+
+        // Report metrics.
+        SST_READ_ELAPSED_TOTAL
+            .with_label_values(&["build"])
+            .observe(self.metrics.build_cost.as_secs_f64());
+        SST_READ_ELAPSED_TOTAL
+            .with_label_values(&["next_batch"])
+            .observe(self.metrics.scan_cost.as_secs_f64());
+        SST_READ_ROWS_TOTAL.inc_by(self.metrics.num_rows as u64);
     }
 }
 
