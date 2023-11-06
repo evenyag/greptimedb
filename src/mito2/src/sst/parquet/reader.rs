@@ -351,6 +351,7 @@ pub struct ParquetReader {
     current_reader: Option<ParquetRecordBatchReader>,
     /// Buffered batches to return.
     batches: VecDeque<Batch>,
+    /// Local metrics.
     metrics: Metrics,
 }
 
