@@ -361,6 +361,7 @@ impl BatchReader for ParquetReader {
             self.metrics.fetch_cost += fetch_start.elapsed();
             return Ok(None);
         };
+        self.metrics.fetch_cost += fetch_start.elapsed();
 
         self.read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
