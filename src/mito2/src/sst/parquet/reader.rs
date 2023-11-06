@@ -186,7 +186,7 @@ impl ParquetReaderBuilder {
         };
 
         let metrics = Metrics {
-            num_row_groups: row_groups.len(),
+            row_groups: row_groups.iter().copied().collect(),
             build_reader_cost: start.elapsed(),
             ..Default::default()
         };
@@ -262,7 +262,7 @@ impl ParquetReaderBuilder {
 #[derive(Default, Debug)]
 #[allow(unused)]
 struct Metrics {
-    num_row_groups: usize,
+    row_groups: Vec<usize>,
     build_reader_cost: Duration,
     scan_cost: Duration,
     fetch_cost: Duration,
@@ -375,10 +375,11 @@ impl BatchReader for ParquetReader {
 impl Drop for ParquetReader {
     fn drop(&mut self) {
         info!(
-            "Read parquet {} {}, range: {:?}, metrics: {:?}",
+            "Read parquet {} {}, range: {:?}, num_row_groups: {}, metrics: {:?}",
             self.reader_builder.file_handle.region_id(),
             self.reader_builder.file_handle.file_id(),
             self.reader_builder.file_handle.time_range(),
+            self.metrics.row_groups.len(),
             self.metrics
         );
     }
