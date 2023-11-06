@@ -265,6 +265,7 @@ struct Metrics {
     num_row_groups: usize,
     build_reader_cost: Duration,
     scan_cost: Duration,
+    fetch_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -354,8 +355,10 @@ impl BatchReader for ParquetReader {
         }
 
         // We need to fetch next record batch and convert it to batches.
+        let fetch_start = Instant::now();
         let Some(record_batch) = self.fetch_next_record_batch().await? else {
             self.metrics.scan_cost += start.elapsed();
+            self.metrics.fetch_cost += fetch_start.elapsed();
             return Ok(None);
         };
 
