@@ -514,7 +514,10 @@ impl ParquetReader {
 
         // No more items in current row group, reads next row group.
         while let Some(row_group_idx) = self.row_groups.pop_front() {
-            let mut row_group_reader = self.reader_builder.build(row_group_idx).await?;
+            let mut row_group_reader = self
+                .reader_builder
+                .build(row_group_idx, &mut self.metrics)
+                .await?;
             let Some(record_batch) =
                 row_group_reader
                     .next()
