@@ -126,18 +126,8 @@ impl ParquetReaderBuilder {
             .context(OpenDalSnafu)?
             .compat();
         let mut reader = BufReader::new(reader);
-        debug!(
-            "parquet read file {}, open reader cost: {:?}",
-            file_path,
-            start.elapsed()
-        );
         // Loads parquet metadata of the file.
         let parquet_meta = self.read_parquet_metadata(&mut reader, &file_path).await?;
-        debug!(
-            "parquet read file {}, read metadata cost: {:?}",
-            file_path,
-            start.elapsed()
-        );
         // Decodes region metadata.
         let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
         let region_meta = Self::get_region_metadata(&file_path, key_value_meta)?;
@@ -154,11 +144,6 @@ impl ParquetReaderBuilder {
                     .collect()
             });
         let read_format = ReadFormat::new(Arc::new(region_meta));
-        debug!(
-            "parquet read file {}, read format cost: {:?}",
-            file_path,
-            start.elapsed()
-        );
 
         // Prunes row groups by metadata.
         let row_groups: VecDeque<_> = if let Some(predicate) = &self.predicate {
@@ -174,11 +159,6 @@ impl ParquetReaderBuilder {
         } else {
             (0..parquet_meta.num_row_groups()).collect()
         };
-        debug!(
-            "parquet read file {}, prune row groups cost: {:?}",
-            file_path,
-            start.elapsed()
-        );
 
         // Computes the projection mask.
         let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
@@ -195,11 +175,6 @@ impl ParquetReaderBuilder {
         let field_levels =
             parquet_to_arrow_field_levels(parquet_schema_desc, projection_mask.clone(), hint)
                 .context(ReadParquetSnafu { path: &file_path })?;
-        debug!(
-            "parquet read file {}, field levels cost: {:?}",
-            file_path,
-            start.elapsed()
-        );
 
         let reader_builder = RowGroupReaderBuilder {
             file_handle: self.file_handle.clone(),
