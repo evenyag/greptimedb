@@ -276,6 +276,8 @@ struct Metrics {
     num_batches: usize,
     /// Number of rows read.
     num_rows: usize,
+    /// Cost to prune primary key.
+    prune_pk_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -309,10 +311,14 @@ impl RowGroupReaderBuilder {
     }
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
-    async fn build(&mut self, row_group_idx: usize) -> Result<ParquetRecordBatchReader> {
+    async fn build(
+        &mut self,
+        row_group_idx: usize,
+        metrics: &mut Metrics,
+    ) -> Result<ParquetRecordBatchReader> {
         // First try to filter some primary keys.
         let row_selection = self
-            .prune_by_pk(row_group_idx)
+            .prune_by_pk(row_group_idx, metrics)
             .await
             .map_err(|e| {
                 error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
@@ -350,7 +356,12 @@ impl RowGroupReaderBuilder {
     }
 
     /// Prunes by primary key.
-    async fn prune_by_pk(&mut self, row_group_idx: usize) -> Result<Option<RowSelection>> {
+    async fn prune_by_pk(
+        &mut self,
+        row_group_idx: usize,
+        metrics: &mut Metrics,
+    ) -> Result<Option<RowSelection>> {
+        let start = Instant::now();
         // Only read primary keys.
         let projection = ProjectionMask::roots(
             self.parquet_meta.file_metadata().schema_descr(),
@@ -394,11 +405,16 @@ impl RowGroupReaderBuilder {
             .read_format
             .build_physical_exprs(self.predicate.as_ref());
         if exprs.is_empty() {
+            metrics.prune_pk_cost += start.elapsed();
             return Ok(None);
         }
 
-        self.read_format
-            .prune_by_primary_keys(&self.file_path, &exprs, pk_schema, &mut reader)
+        let ret =
+            self.read_format
+                .prune_by_primary_keys(&self.file_path, &exprs, pk_schema, &mut reader);
+        metrics.prune_pk_cost += start.elapsed();
+
+        ret
     }
 }
 
