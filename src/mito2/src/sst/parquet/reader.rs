@@ -371,8 +371,17 @@ impl RowGroupReaderBuilder {
                 path: &self.file_path,
             })?;
 
+        let hint = Some(self.read_format.arrow_schema().fields());
+        let field_levels = parquet_to_arrow_field_levels(
+            self.parquet_meta.file_metadata().schema_descr(),
+            projection.clone(),
+            hint,
+        )
+        .context(ReadParquetSnafu {
+            path: &self.file_path,
+        })?;
         let mut reader = ParquetRecordBatchReader::try_new_with_row_groups(
-            &self.field_levels,
+            &field_levels,
             &row_group,
             DEFAULT_READ_BATCH_SIZE,
             None,
