@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use api::v1::SemanticType;
 use common_telemetry::error;
@@ -529,8 +530,8 @@ impl ReadFormat {
         predicates: &[Arc<dyn PhysicalExpr>],
         schema: SchemaRef,
         reader: &mut ParquetRecordBatchReader,
-        evaluate_cost: &mut std::time::Duration,
-    ) -> Result<Option<RowSelection>> {
+    ) -> Result<(PruneMetrics, Option<RowSelection>)> {
+        let mut metrics = PruneMetrics::default();
         let mut builders: Vec<_> = self
             .metadata
             .primary_key_columns()
@@ -554,6 +555,7 @@ impl ReadFormat {
             let record_batch = record_batch.context(ArrowReaderSnafu { path })?;
             assert_eq!(1, record_batch.num_columns());
 
+            let start = Instant::now();
             let pk_array = record_batch.column(0);
             let pk_dict_array = pk_array
                 .as_any()
@@ -598,6 +600,8 @@ impl ReadFormat {
             let tags_record_batch = RecordBatch::try_new(schema.clone(), tag_dict_arrays)
                 .context(NewRecordBatchSnafu)?;
 
+            metrics.build_tags_batch_cost += start.elapsed();
+
             for (i, expr) in predicates.iter().enumerate() {
                 let Some(filters) = &mut predicate_filters[i] else {
                     // Unable to evaluate this expr so we skip it.
@@ -608,14 +612,14 @@ impl ReadFormat {
                 let start = std::time::Instant::now();
                 match evaluate_record_batch(&**expr, &tags_record_batch) {
                     Ok(filter) => {
-                        *evaluate_cost += start.elapsed();
+                        metrics.evaluate_cost += start.elapsed();
                         match filter.null_count() {
                             0 => filters.push(filter),
                             _ => filters.push(prep_null_mask_filter(&filter)),
                         }
                     }
                     Err(e) => {
-                        *evaluate_cost += start.elapsed();
+                        metrics.evaluate_cost += start.elapsed();
                         error!(e; "Failed to evaluate expr {:?}", expr);
                         // Set filters to None.
                         predicate_filters[i] = None;
@@ -624,6 +628,7 @@ impl ReadFormat {
             }
         }
 
+        let start = Instant::now();
         let mut output_selection: Option<RowSelection> = None;
         for filters in predicate_filters.iter().filter_map(|v| v.as_ref()) {
             let raw = RowSelection::from_filters(filters);
@@ -632,9 +637,17 @@ impl ReadFormat {
                 None => Some(raw),
             };
         }
+        metrics.build_selection_cost += start.elapsed();
 
-        Ok(output_selection)
+        Ok((metrics, output_selection))
     }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PruneMetrics {
+    pub(crate) evaluate_cost: std::time::Duration,
+    pub(crate) build_selection_cost: std::time::Duration,
+    pub(crate) build_tags_batch_cost: std::time::Duration,
 }
 
 fn evaluate_record_batch(

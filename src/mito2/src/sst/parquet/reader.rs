@@ -278,8 +278,9 @@ struct Metrics {
     num_rows: usize,
     /// Cost to prune primary key.
     prune_pk_cost: Duration,
-    /// Cost to filter pk.
-    filter_pk_cost: Duration,
+    evaluate_cost: std::time::Duration,
+    build_selection_cost: std::time::Duration,
+    build_tags_batch_cost: std::time::Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -412,16 +413,18 @@ impl RowGroupReaderBuilder {
         }
 
         // TODO(yingwen): Apply filter to primary keys.
-        let ret = self.read_format.prune_by_primary_keys(
+        let (prune_metrics, ret) = self.read_format.prune_by_primary_keys(
             &self.file_path,
             &exprs,
             pk_schema,
             &mut reader,
-            &mut metrics.filter_pk_cost,
-        );
+        )?;
         metrics.prune_pk_cost += start.elapsed();
+        metrics.evaluate_cost += prune_metrics.evaluate_cost;
+        metrics.build_selection_cost += prune_metrics.build_selection_cost;
+        metrics.build_tags_batch_cost += prune_metrics.build_tags_batch_cost;
 
-        ret
+        Ok(ret)
     }
 }
 
