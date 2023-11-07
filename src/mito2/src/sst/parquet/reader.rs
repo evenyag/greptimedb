@@ -278,8 +278,8 @@ struct Metrics {
     num_rows: usize,
     /// Cost to prune primary key.
     prune_pk_cost: Duration,
-    /// Cost to fetch pk.
-    fetch_pk_cost: Duration,
+    /// Cost to filter pk.
+    filter_pk_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -417,7 +417,7 @@ impl RowGroupReaderBuilder {
             &exprs,
             pk_schema,
             &mut reader,
-            &mut metrics.fetch_pk_cost,
+            &mut metrics.filter_pk_cost,
         );
         metrics.prune_pk_cost += start.elapsed();
 

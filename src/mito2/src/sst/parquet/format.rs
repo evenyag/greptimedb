@@ -529,7 +529,7 @@ impl ReadFormat {
         predicates: &[Arc<dyn PhysicalExpr>],
         schema: SchemaRef,
         reader: &mut ParquetRecordBatchReader,
-        read_cost: &mut std::time::Duration,
+        evaluate_cost: &mut std::time::Duration,
     ) -> Result<Option<RowSelection>> {
         let mut builders: Vec<_> = self
             .metadata
@@ -550,11 +550,8 @@ impl ReadFormat {
         // Filters for each predicate.
         let mut predicate_filters = vec![Some(vec![]); predicates.len()];
 
-        let mut start = std::time::Instant::now();
         for record_batch in reader {
             let record_batch = record_batch.context(ArrowReaderSnafu { path })?;
-            *read_cost += start.elapsed();
-
             assert_eq!(1, record_batch.num_columns());
 
             let pk_array = record_batch.column(0);
@@ -608,19 +605,23 @@ impl ReadFormat {
                 };
 
                 // Evaluates this predicate.
+                let start = std::time::Instant::now();
                 match evaluate_record_batch(&**expr, &tags_record_batch) {
-                    Ok(filter) => match filter.null_count() {
-                        0 => filters.push(filter),
-                        _ => filters.push(prep_null_mask_filter(&filter)),
-                    },
+                    Ok(filter) => {
+                        *evaluate_cost += start.elapsed();
+                        match filter.null_count() {
+                            0 => filters.push(filter),
+                            _ => filters.push(prep_null_mask_filter(&filter)),
+                        }
+                    }
                     Err(e) => {
+                        *evaluate_cost += start.elapsed();
                         error!(e; "Failed to evaluate expr {:?}", expr);
                         // Set filters to None.
                         predicate_filters[i] = None;
                     }
                 }
             }
-            start = std::time::Instant::now();
         }
 
         let mut output_selection: Option<RowSelection> = None;
