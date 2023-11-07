@@ -117,18 +117,12 @@ impl SeqScan {
 
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
-        debug!(
-            "Seq scan build reader, region_id: {:?}, metrics: {:?}",
-            mapper.metadata().region_id,
-            metrics
-        );
         let cache_manager = self.cache_manager.clone();
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
             while let Some(batch) =
                 Self::fetch_record_batch(&mut reader, &mapper, cache, &mut metrics).await?
             {
-                debug!("Seq scan yield batch, region_id: {:?}, metrics: {:?}", mapper.metadata().region_id, metrics);
                 yield batch;
             }
 
@@ -197,13 +191,6 @@ impl SeqScan {
 
         let record_batch = mapper.convert(&batch, cache)?;
         metrics.scan_cost += start.elapsed();
-
-        debug!(
-            "Seq scan fetch batch, region_id: {:?}, metrics: {:?}, elapsed: {:?}",
-            mapper.metadata().region_id,
-            metrics,
-            start.elapsed()
-        );
 
         Ok(Some(record_batch))
     }
