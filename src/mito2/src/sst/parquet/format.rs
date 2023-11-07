@@ -529,6 +529,7 @@ impl ReadFormat {
         predicates: &[Arc<dyn PhysicalExpr>],
         schema: SchemaRef,
         reader: &mut ParquetRecordBatchReader,
+        read_cost: &mut std::time::Duration,
     ) -> Result<Option<RowSelection>> {
         let mut builders: Vec<_> = self
             .metadata
@@ -549,8 +550,11 @@ impl ReadFormat {
         // Filters for each predicate.
         let mut predicate_filters = vec![Some(vec![]); predicates.len()];
 
+        let mut start = std::time::Instant::now();
         for record_batch in reader {
             let record_batch = record_batch.context(ArrowReaderSnafu { path })?;
+            *read_cost += start.elapsed();
+            start = std::time::Instant::now();
 
             assert_eq!(1, record_batch.num_columns());
 

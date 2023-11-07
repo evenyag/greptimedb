@@ -278,6 +278,8 @@ struct Metrics {
     num_rows: usize,
     /// Cost to prune primary key.
     prune_pk_cost: Duration,
+    /// Cost to fetch pk.
+    fetch_pk_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -409,9 +411,13 @@ impl RowGroupReaderBuilder {
             return Ok(None);
         }
 
-        let ret =
-            self.read_format
-                .prune_by_primary_keys(&self.file_path, &exprs, pk_schema, &mut reader);
+        let ret = self.read_format.prune_by_primary_keys(
+            &self.file_path,
+            &exprs,
+            pk_schema,
+            &mut reader,
+            &mut metrics.fetch_pk_cost,
+        );
         metrics.prune_pk_cost += start.elapsed();
 
         ret
