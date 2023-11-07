@@ -120,6 +120,7 @@ impl SeqScan {
             while let Some(batch) =
                 Self::fetch_record_batch(&mut reader, &mapper, cache, &mut metrics).await?
             {
+                debug!("Seq scan yield batch, region_id: {:?}, metrics: {:?}", mapper.metadata().region_id, metrics);
                 yield batch;
             }
 
@@ -188,6 +189,13 @@ impl SeqScan {
 
         let record_batch = mapper.convert(&batch, cache)?;
         metrics.scan_cost += start.elapsed();
+
+        debug!(
+            "Seq scan fetch batch, region_id: {:?}, metrics: {:?}, elapsed: {:?}",
+            mapper.metadata().region_id,
+            metrics,
+            start.elapsed()
+        );
 
         Ok(Some(record_batch))
     }
