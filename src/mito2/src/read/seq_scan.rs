@@ -114,6 +114,11 @@ impl SeqScan {
 
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
+        debug!(
+            "Seq scan build reader, region_id: {:?}, metrics: {:?}",
+            mapper.metadata().region_id,
+            metrics
+        );
         let cache_manager = self.cache_manager.clone();
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
