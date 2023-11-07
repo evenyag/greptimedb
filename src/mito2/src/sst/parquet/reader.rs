@@ -411,6 +411,7 @@ impl RowGroupReaderBuilder {
             return Ok(None);
         }
 
+        // TODO(yingwen): Apply filter to primary keys.
         let ret = self.read_format.prune_by_primary_keys(
             &self.file_path,
             &exprs,

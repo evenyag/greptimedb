@@ -554,7 +554,6 @@ impl ReadFormat {
         for record_batch in reader {
             let record_batch = record_batch.context(ArrowReaderSnafu { path })?;
             *read_cost += start.elapsed();
-            start = std::time::Instant::now();
 
             assert_eq!(1, record_batch.num_columns());
 
@@ -621,6 +620,7 @@ impl ReadFormat {
                     }
                 }
             }
+            start = std::time::Instant::now();
         }
 
         let mut output_selection: Option<RowSelection> = None;
