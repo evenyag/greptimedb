@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::debug;
+use common_telemetry::{debug, error};
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{parquet_to_arrow_field_levels, FieldLevels, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
@@ -184,6 +184,8 @@ impl ParquetReaderBuilder {
             projection: projection_mask,
             field_levels,
             cache_manager: self.cache_manager.clone(),
+            read_format,
+            predicate: self.predicate.clone(),
         };
 
         let metrics = Metrics {
@@ -194,7 +196,6 @@ impl ParquetReaderBuilder {
 
         Ok(ParquetReader {
             row_groups,
-            read_format,
             reader_builder,
             current_reader: None,
             batches: VecDeque::new(),
@@ -295,6 +296,10 @@ struct RowGroupReaderBuilder {
     field_levels: FieldLevels,
     /// Cache.
     cache_manager: Option<CacheManagerRef>,
+    /// Helper to read this SST format.
+    read_format: ReadFormat,
+    /// Predicate to evaluate.
+    predicate: Option<Predicate>,
 }
 
 impl RowGroupReaderBuilder {
@@ -305,6 +310,17 @@ impl RowGroupReaderBuilder {
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
     async fn build(&mut self, row_group_idx: usize) -> Result<ParquetRecordBatchReader> {
+        // First try to filter some primary keys.
+        let row_selection = self
+            .prune_by_pk(row_group_idx)
+            .await
+            .map_err(|e| {
+                error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
+                e
+            })
+            .ok()
+            .flatten();
+
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
             self.file_handle.file_id(),
@@ -326,11 +342,54 @@ impl RowGroupReaderBuilder {
             &self.field_levels,
             &row_group,
             DEFAULT_READ_BATCH_SIZE,
-            None,
+            row_selection,
         )
         .context(ReadParquetSnafu {
             path: &self.file_path,
         })
+    }
+
+    /// Prunes by primary key.
+    async fn prune_by_pk(&mut self, row_group_idx: usize) -> Result<Option<RowSelection>> {
+        // Only read primary keys.
+        let projection = ProjectionMask::roots(
+            self.parquet_meta.file_metadata().schema_descr(),
+            [self.read_format.primary_key_position()],
+        );
+        let mut row_group = InMemoryRowGroup::create(
+            self.file_handle.region_id(),
+            self.file_handle.file_id(),
+            &self.parquet_meta,
+            row_group_idx,
+            self.cache_manager.clone(),
+        );
+        // Fetches data into memory.
+        row_group
+            .fetch(&mut self.file_reader, &projection, None)
+            .await
+            .context(ReadParquetSnafu {
+                path: &self.file_path,
+            })?;
+
+        let mut reader = ParquetRecordBatchReader::try_new_with_row_groups(
+            &self.field_levels,
+            &row_group,
+            DEFAULT_READ_BATCH_SIZE,
+            None,
+        )
+        .context(ReadParquetSnafu {
+            path: &self.file_path,
+        })?;
+
+        let (pk_schema, exprs) = self
+            .read_format
+            .build_physical_exprs(self.predicate.as_ref());
+        if exprs.is_empty() {
+            return Ok(None);
+        }
+
+        self.read_format
+            .prune_by_primary_keys(&self.file_path, &exprs, pk_schema, &mut reader)
     }
 }
 
@@ -338,10 +397,6 @@ impl RowGroupReaderBuilder {
 pub struct ParquetReader {
     /// Indices of row groups to read.
     row_groups: VecDeque<usize>,
-    /// Helper to read record batches.
-    ///
-    /// Not `None` if [ParquetReader::stream] is not `None`.
-    read_format: ReadFormat,
     /// Builder to build row group readers.
     ///
     /// The builder contains the file handle so don't drop the builder while using
@@ -372,7 +427,8 @@ impl BatchReader for ParquetReader {
         };
         self.metrics.num_record_batches += 1;
 
-        self.read_format
+        self.reader_builder
+            .read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
         self.metrics.num_batches += self.batches.len();
 
@@ -411,7 +467,7 @@ impl Drop for ParquetReader {
 impl ParquetReader {
     /// Returns the metadata of the SST.
     pub fn metadata(&self) -> &RegionMetadataRef {
-        self.read_format.metadata()
+        self.reader_builder.read_format.metadata()
     }
 
     /// Tries to fetch next [RecordBatch] from the reader.

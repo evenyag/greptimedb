@@ -30,14 +30,21 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use api::v1::SemanticType;
+use common_telemetry::error;
+use datafusion::physical_plan::PhysicalExpr;
+use datafusion_common::arrow::compute::prep_null_mask_filter;
 use datafusion_common::ScalarValue;
-use datatypes::arrow::array::{ArrayRef, BinaryArray, DictionaryArray, UInt16Array, UInt64Array};
+use datatypes::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, UInt16Array, UInt64Array,
+};
 use datatypes::arrow::datatypes::{
     DataType as ArrowDataType, Field, FieldRef, Fields, Schema, SchemaRef, UInt16Type,
 };
+use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::DataType;
 use datatypes::vectors::{Helper, Vector};
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
 use snafu::{ensure, OptionExt, ResultExt};
@@ -46,12 +53,15 @@ use store_api::storage::consts::{
     OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
 };
 use store_api::storage::ColumnId;
+use table::predicate::Predicate;
 
 use crate::error::{
-    ConvertVectorSnafu, InvalidBatchSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result,
+    ArrowReaderSnafu, ConvertVectorSnafu, InvalidBatchSnafu, InvalidRecordBatchSnafu,
+    NewRecordBatchSnafu, Result,
 };
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 /// Number of columns that have fixed positions.
 ///
@@ -475,13 +485,174 @@ impl ReadFormat {
     }
 
     /// Field index of the primary key.
-    fn primary_key_position(&self) -> usize {
+    pub(crate) fn primary_key_position(&self) -> usize {
         self.arrow_schema.fields.len() - 3
     }
 
     /// Field index of the time index.
     fn time_index_position(&self) -> usize {
         self.arrow_schema.fields.len() - FIXED_POS_COLUMN_NUM
+    }
+
+    /// Builds the physical expressions for the predicates.
+    ///
+    /// Returns an empty vector if failed to build expressions.
+    pub(crate) fn build_physical_exprs(
+        &self,
+        predicate: Option<&Predicate>,
+    ) -> (SchemaRef, Vec<Arc<dyn PhysicalExpr>>) {
+        // Creates a primary key schema.
+        let fields: Vec<_> = self
+            .metadata()
+            .primary_key_columns()
+            .map(|column| {
+                Field::new_dictionary(
+                    column.column_schema.name.clone(),
+                    ArrowDataType::UInt16,
+                    column.column_schema.data_type.as_arrow_type(),
+                    column.column_schema.is_nullable(),
+                )
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let exprs = predicate
+            .and_then(|p| p.to_physical_exprs(&schema).ok())
+            .unwrap_or_default();
+
+        (schema, exprs)
+    }
+
+    /// Prune rows by primary keys.
+    pub(crate) fn prune_by_primary_keys(
+        &self,
+        path: &str,
+        predicates: &[Arc<dyn PhysicalExpr>],
+        schema: SchemaRef,
+        reader: &mut ParquetRecordBatchReader,
+    ) -> Result<Option<RowSelection>> {
+        let mut builders: Vec<_> = self
+            .metadata
+            .primary_key_columns()
+            .map(|column| {
+                column
+                    .column_schema
+                    .data_type
+                    .create_mutable_vector(DEFAULT_READ_BATCH_SIZE)
+            })
+            .collect();
+        let sort_fields = self
+            .metadata
+            .primary_key_columns()
+            .map(|column| SortField::new(column.column_schema.data_type.clone()))
+            .collect();
+        let codec = McmpRowCodec::new(sort_fields);
+        // Filters for each predicate.
+        let mut predicate_filters = vec![Some(vec![]); predicates.len()];
+
+        for record_batch in reader {
+            let record_batch = record_batch.context(ArrowReaderSnafu { path })?;
+
+            assert_eq!(1, record_batch.num_columns());
+
+            let pk_array = record_batch.column(0);
+            let pk_dict_array = pk_array
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt16Type>>()
+                .with_context(|| InvalidRecordBatchSnafu {
+                    reason: format!("primary key array should not be {:?}", pk_array.data_type()),
+                })?;
+            let keys = pk_dict_array.keys();
+            let pk_values = pk_dict_array
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .with_context(|| InvalidRecordBatchSnafu {
+                    reason: format!(
+                        "values of primary key array should not be {:?}",
+                        pk_dict_array.values().data_type()
+                    ),
+                })?;
+
+            // Decode primary keys.
+            for primary_key in pk_values.iter() {
+                // The dictionary array we create should be not null.
+                let primary_key = primary_key.unwrap();
+                let pk_values = codec.decode(primary_key)?;
+                debug_assert_eq!(builders.len(), pk_values.len());
+
+                for (builder, value) in builders.iter_mut().zip(&pk_values) {
+                    // If the value type doesn't match the codec should return error. So we use `push_value_ref()`.
+                    builder.push_value_ref(value.as_value_ref());
+                }
+            }
+
+            // Create tags record batch.
+            let tag_dict_arrays: Vec<_> = builders
+                .iter_mut()
+                .map(|builder| {
+                    // Reuse the key array to build the tag array.
+                    let values = builder.to_vector().to_arrow_array();
+                    Arc::new(DictionaryArray::new(keys.clone(), values)) as ArrayRef
+                })
+                .collect();
+            let tags_record_batch = RecordBatch::try_new(schema.clone(), tag_dict_arrays)
+                .context(NewRecordBatchSnafu)?;
+
+            for (i, expr) in predicates.iter().enumerate() {
+                let Some(filters) = &mut predicate_filters[i] else {
+                    // Unable to evaluate this expr so we skip it.
+                    continue;
+                };
+
+                // Evaluates this predicate.
+                match evaluate_record_batch(&**expr, &tags_record_batch) {
+                    Ok(filter) => match filter.null_count() {
+                        0 => filters.push(filter),
+                        _ => filters.push(prep_null_mask_filter(&filter)),
+                    },
+                    Err(e) => {
+                        error!(e; "Failed to evaluate expr {:?}", expr);
+                        // Set filters to None.
+                        predicate_filters[i] = None;
+                    }
+                }
+            }
+        }
+
+        let mut output_selection: Option<RowSelection> = None;
+        for filters in predicate_filters.iter().filter_map(|v| v.as_ref()) {
+            let raw = RowSelection::from_filters(filters);
+            output_selection = match output_selection {
+                Some(selection) => Some(selection.and_then(&raw)),
+                None => Some(raw),
+            };
+        }
+
+        Ok(output_selection)
+    }
+}
+
+fn evaluate_record_batch(
+    expr: &dyn PhysicalExpr,
+    batch: &RecordBatch,
+) -> Result<BooleanArray, ArrowError> {
+    match expr.evaluate(batch) {
+        Ok(v) => {
+            let array = v.into_array(batch.num_rows());
+            let bool_arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    ArrowError::CastError(
+                        "Physical expr evaluated res is not a boolean array".to_string(),
+                    )
+                })?
+                .clone();
+            Ok(bool_arr)
+        }
+        Err(e) => Err(ArrowError::ComputeError(format!(
+            "Error evaluating filter predicate: {e:?}"
+        ))),
     }
 }
 

@@ -67,13 +67,14 @@ impl Predicate {
         // registering variables.
         let execution_props = &ExecutionProps::new();
 
-        self.exprs
+        Ok(self
+            .exprs
             .iter()
-            .map(|expr| {
+            .filter_map(|expr| {
                 create_physical_expr(expr.df_expr(), df_schema.as_ref(), schema, execution_props)
+                    .ok()
             })
-            .collect::<Result<_, _>>()
-            .context(error::DatafusionSnafu)
+            .collect::<Vec<_>>())
     }
 
     /// Builds an empty predicate from given schema.
