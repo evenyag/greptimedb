@@ -108,6 +108,7 @@ impl SeqScan {
 
     /// Builds a stream for the query.
     pub async fn build_stream(&self) -> Result<SendableRecordBatchStream> {
+        let mut metrics = Metrics::default();
         // Scans all memtables and SSTs. Builds a merge reader to merge results.
         let mut reader = self.build_reader().await?;
 
@@ -116,7 +117,6 @@ impl SeqScan {
         let cache_manager = self.cache_manager.clone();
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
-            let mut metrics = Metrics::default();
             while let Some(batch) =
                 Self::fetch_record_batch(&mut reader, &mapper, cache, &mut metrics).await?
             {
