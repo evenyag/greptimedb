@@ -108,9 +108,12 @@ impl SeqScan {
 
     /// Builds a stream for the query.
     pub async fn build_stream(&self) -> Result<SendableRecordBatchStream> {
-        let mut metrics = Metrics::default();
+        let start = Instant::now();
         // Scans all memtables and SSTs. Builds a merge reader to merge results.
         let mut reader = self.build_reader().await?;
+        let mut metrics = Metrics {
+            scan_cost: start.elapsed(),
+        };
 
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
