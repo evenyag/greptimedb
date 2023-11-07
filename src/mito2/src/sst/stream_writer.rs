@@ -103,3 +103,95 @@ impl BufferedWriter {
             .context(error::WriteBufferSnafu)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+    use std::sync::Arc;
+
+    use datatypes::arrow::array::{BinaryArray, UInt64Array};
+    use datatypes::arrow::datatypes::{DataType, Field, Schema};
+    use object_store::layers::LoggingLayer;
+    use object_store::services::S3;
+
+    use super::*;
+
+    fn new_s3_store(bucket: &str) -> ObjectStore {
+        let mut builder = S3::default();
+        builder
+            .root("/mito2-test")
+            .access_key_id(&env::var("GT_S3_ACCESS_KEY_ID").unwrap())
+            .secret_access_key(&env::var("GT_S3_ACCESS_KEY").unwrap())
+            .region(&env::var("GT_S3_REGION").unwrap())
+            .bucket(&bucket);
+
+        ObjectStore::new(builder).unwrap().finish().layer(
+            LoggingLayer::default()
+                .with_error_level(Some("debug"))
+                .unwrap(),
+        )
+    }
+
+    fn new_kv_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("value", DataType::Binary, false),
+        ]))
+    }
+
+    fn new_test_record_batch(
+        schema: SchemaRef,
+        start: u64,
+        num_rows: u64,
+        value_size: usize,
+    ) -> RecordBatch {
+        let keys = Arc::new(UInt64Array::from_iter_values(
+            (start..start + num_rows).map(|v| v),
+        ));
+        let value = vec![b'g'; value_size];
+        let values = Arc::new(BinaryArray::from_iter_values(
+            (start..start + num_rows).map(|_i| &value),
+        ));
+
+        RecordBatch::try_new(schema, vec![keys, values]).unwrap()
+    }
+
+    async fn write_to_s3(bucket: &str) {
+        let object_store = new_s3_store(bucket);
+        let writer_props = WriterProperties::builder()
+            // Use a small row group size for test.
+            .set_max_row_group_size(50)
+            // Disable dictionary.
+            .set_dictionary_enabled(false)
+            .build();
+
+        let path = "write_s3_test.parquet".to_string();
+        let schema = new_kv_schema();
+        let buffer_threshold = 1024 * 1024 * 8;
+        let mut writer = BufferedWriter::try_new(
+            path,
+            object_store,
+            schema.clone(),
+            Some(writer_props),
+            buffer_threshold,
+        )
+        .await
+        .unwrap();
+
+        for i in 0..7 {
+            let batch = new_test_record_batch(schema.clone(), i * 1024, i * 1024 + 1024, 1024);
+            writer.write(&batch).await.unwrap();
+        }
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_to_s3() {
+        if let Ok(bucket) = env::var("GT_S3_BUCKET") {
+            if !bucket.is_empty() {
+                write_to_s3(&bucket).await;
+            }
+        }
+    }
+}

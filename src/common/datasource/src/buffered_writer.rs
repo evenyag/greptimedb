@@ -129,6 +129,8 @@ impl<
             };
             let size = chunk.len();
 
+            common_telemetry::info!("write {size} buffer to inner writer");
+
             self.maybe_init_writer()
                 .await?
                 .write_all(&chunk)
@@ -157,6 +159,9 @@ impl<
     async fn try_flush_all(&mut self) -> Result<u64> {
         let remain = self.buffer.buffer.lock().unwrap().split();
         let size = remain.len();
+
+        common_telemetry::info!("write remaining {size} buffer to inner writer");
+
         self.maybe_init_writer()
             .await?
             .write_all(&remain)
