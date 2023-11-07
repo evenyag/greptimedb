@@ -1661,6 +1661,7 @@ dependencies = [
  "common-error",
  "common-macro",
  "common-runtime",
+ "common-telemetry",
  "common-test-util",
  "datafusion",
  "derive_builder 0.12.0",
