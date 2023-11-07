@@ -129,7 +129,7 @@ impl<
             };
             let size = chunk.len();
 
-            common_telemetry::info!("write {size} buffer to inner writer");
+            common_telemetry::info!("write {size} buffer to inner writer, path: {}", self.path);
 
             self.maybe_init_writer()
                 .await?
@@ -160,7 +160,10 @@ impl<
         let remain = self.buffer.buffer.lock().unwrap().split();
         let size = remain.len();
 
-        common_telemetry::info!("write remaining {size} buffer to inner writer");
+        common_telemetry::info!(
+            "write remaining {size} buffer to inner writer, path: {}",
+            self.path
+        );
 
         self.maybe_init_writer()
             .await?
