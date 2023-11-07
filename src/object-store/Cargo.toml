@@ -15,7 +15,7 @@ futures.workspace = true
 lazy_static.workspace = true
 md5 = "0.7"
 moka = { workspace = true, features = ["future"] }
-opendal = { version = "0.40", features = [
+opendal = { git = "https://github.com/evenyag/incubator-opendal", branch = "debug/multipart-upload-0.40", features = [
     "layers-tracing",
     "layers-prometheus",
 ] }
