@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::{debug, error};
+use common_telemetry::debug;
+// use common_telemetry::{debug, error};
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -317,18 +318,19 @@ impl RowGroupReaderBuilder {
     async fn build(
         &mut self,
         row_group_idx: usize,
-        metrics: &mut Metrics,
+        _metrics: &mut Metrics,
     ) -> Result<ParquetRecordBatchReader> {
         // First try to filter some primary keys.
-        let row_selection = self
-            .prune_by_pk(row_group_idx, metrics)
-            .await
-            .map_err(|e| {
-                error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
-                e
-            })
-            .ok()
-            .flatten();
+        // let row_selection = self
+        //     .prune_by_pk(row_group_idx, metrics)
+        //     .await
+        //     .map_err(|e| {
+        //         error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
+        //         e
+        //     })
+        //     .ok()
+        //     .flatten();
+        let row_selection = None;
 
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
@@ -359,6 +361,7 @@ impl RowGroupReaderBuilder {
     }
 
     /// Prunes by primary key.
+    #[allow(unused)]
     async fn prune_by_pk(
         &mut self,
         row_group_idx: usize,
