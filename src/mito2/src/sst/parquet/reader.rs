@@ -283,6 +283,7 @@ struct Metrics {
     decode_pk_cost: std::time::Duration,
     push_value_cost: std::time::Duration,
     decode_pk_count: usize,
+    decode_cache_hit: usize,
     build_tags_batch_cost: std::time::Duration,
 }
 
@@ -430,6 +431,7 @@ impl RowGroupReaderBuilder {
         metrics.decode_pk_cost += prune_metrics.decode_pk_cost;
         metrics.push_value_cost += prune_metrics.push_value_cost;
         metrics.decode_pk_count += prune_metrics.decode_pk_count;
+        metrics.decode_cache_hit += prune_metrics.decode_cache_hit;
         metrics.build_tags_batch_cost += prune_metrics.build_tags_batch_cost;
 
         Ok(ret)

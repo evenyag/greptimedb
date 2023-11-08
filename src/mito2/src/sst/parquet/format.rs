@@ -583,6 +583,7 @@ impl ReadFormat {
                 // The dictionary array we create should be not null.
                 let primary_key = primary_key.unwrap();
                 let pk_values = if let Some(values) = pk_values_cache.get(primary_key) {
+                    metrics.decode_cache_hit += 1;
                     values.clone()
                 } else {
                     let pk_values = codec.decode(primary_key)?;
@@ -663,6 +664,7 @@ pub(crate) struct PruneMetrics {
     pub(crate) decode_pk_cost: std::time::Duration,
     pub(crate) push_value_cost: std::time::Duration,
     pub(crate) decode_pk_count: usize,
+    pub(crate) decode_cache_hit: usize,
     pub(crate) build_tags_batch_cost: std::time::Duration,
 }
 
