@@ -92,6 +92,15 @@ impl TestEnv {
         }
     }
 
+    /// Returns a new env with empty prefix for test.
+    pub fn with_object_store_manager(manager: ObjectStoreManagerRef) -> TestEnv {
+        TestEnv {
+            data_home: create_temp_dir(""),
+            logstore: None,
+            object_store_manager: Some(manager),
+        }
+    }
+
     /// Returns a new env with specific `prefix` for test.
     pub fn with_prefix(prefix: &str) -> TestEnv {
         TestEnv {
@@ -132,11 +141,13 @@ impl TestEnv {
     pub async fn create_engine(&mut self, config: MitoConfig) -> MitoEngine {
         let (log_store, object_store_manager) = self.create_log_and_object_store_manager().await;
 
+        let object_store_manager = self
+            .object_store_manager
+            .get_or_insert(Arc::new(object_store_manager));
+
         let logstore = Arc::new(log_store);
-        let object_store_manager = Arc::new(object_store_manager);
         self.logstore = Some(logstore.clone());
-        self.object_store_manager = Some(object_store_manager.clone());
-        MitoEngine::new(config, logstore, object_store_manager)
+        MitoEngine::new(config, logstore, object_store_manager.clone())
     }
 
     /// Creates a new engine with specific config and manager/listener under this env.

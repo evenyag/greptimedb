@@ -69,7 +69,7 @@ impl ParquetWriter {
         // TODO(yingwen): Find and set proper column encoding for internal columns: op type and tsid.
         let props_builder = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![key_value_meta]))
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            // .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_encoding(Encoding::PLAIN)
             .set_max_row_group_size(opts.row_group_size)
             .set_column_encoding(
