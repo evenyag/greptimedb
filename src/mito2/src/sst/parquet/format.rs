@@ -577,15 +577,20 @@ impl ReadFormat {
 
             // Decode primary keys.
             for primary_key in pk_values.iter() {
+                let start = Instant::now();
                 // The dictionary array we create should be not null.
                 let primary_key = primary_key.unwrap();
                 let pk_values = codec.decode(primary_key)?;
                 debug_assert_eq!(builders.len(), pk_values.len());
+                metrics.decode_pk_cost += start.elapsed();
+                metrics.decode_pk_count += 1;
 
+                let start = Instant::now();
                 for (builder, value) in builders.iter_mut().zip(&pk_values) {
                     // If the value type doesn't match the codec should return error. So we use `push_value_ref()`.
                     builder.push_value_ref(value.as_value_ref());
                 }
+                metrics.push_value_cost += start.elapsed();
             }
 
             // Create tags record batch.
@@ -647,6 +652,9 @@ impl ReadFormat {
 pub(crate) struct PruneMetrics {
     pub(crate) evaluate_cost: std::time::Duration,
     pub(crate) build_selection_cost: std::time::Duration,
+    pub(crate) decode_pk_cost: std::time::Duration,
+    pub(crate) push_value_cost: std::time::Duration,
+    pub(crate) decode_pk_count: usize,
     pub(crate) build_tags_batch_cost: std::time::Duration,
 }
 

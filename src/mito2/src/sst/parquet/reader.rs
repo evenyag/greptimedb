@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::debug;
-// use common_telemetry::{debug, error};
+use common_telemetry::{debug, error};
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -281,6 +280,9 @@ struct Metrics {
     prune_pk_cost: Duration,
     evaluate_cost: std::time::Duration,
     build_selection_cost: std::time::Duration,
+    decode_pk_cost: std::time::Duration,
+    push_value_cost: std::time::Duration,
+    decode_pk_count: usize,
     build_tags_batch_cost: std::time::Duration,
 }
 
@@ -318,19 +320,18 @@ impl RowGroupReaderBuilder {
     async fn build(
         &mut self,
         row_group_idx: usize,
-        _metrics: &mut Metrics,
+        metrics: &mut Metrics,
     ) -> Result<ParquetRecordBatchReader> {
         // First try to filter some primary keys.
-        // let row_selection = self
-        //     .prune_by_pk(row_group_idx, metrics)
-        //     .await
-        //     .map_err(|e| {
-        //         error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
-        //         e
-        //     })
-        //     .ok()
-        //     .flatten();
-        let row_selection = None;
+        let row_selection = self
+            .prune_by_pk(row_group_idx, metrics)
+            .await
+            .map_err(|e| {
+                error!(e; "Failed to prune pk, region_id: {}, file: {}", self.file_handle.region_id(), self.file_path);
+                e
+            })
+            .ok()
+            .flatten();
 
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
@@ -361,7 +362,6 @@ impl RowGroupReaderBuilder {
     }
 
     /// Prunes by primary key.
-    #[allow(unused)]
     async fn prune_by_pk(
         &mut self,
         row_group_idx: usize,
@@ -425,6 +425,9 @@ impl RowGroupReaderBuilder {
         metrics.prune_pk_cost += start.elapsed();
         metrics.evaluate_cost += prune_metrics.evaluate_cost;
         metrics.build_selection_cost += prune_metrics.build_selection_cost;
+        metrics.decode_pk_cost += prune_metrics.decode_pk_cost;
+        metrics.push_value_cost += prune_metrics.push_value_cost;
+        metrics.decode_pk_count += prune_metrics.decode_pk_count;
         metrics.build_tags_batch_cost += prune_metrics.build_tags_batch_cost;
 
         Ok(ret)
