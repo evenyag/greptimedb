@@ -44,6 +44,7 @@ use datatypes::arrow::datatypes::{
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::DataType;
+use datatypes::value::Value;
 use datatypes::vectors::{Helper, Vector};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
 use parquet::file::metadata::RowGroupMetaData;
@@ -530,6 +531,7 @@ impl ReadFormat {
         predicates: &[Arc<dyn PhysicalExpr>],
         schema: SchemaRef,
         reader: &mut ParquetRecordBatchReader,
+        pk_values_cache: &mut HashMap<Vec<u8>, Vec<Value>>,
     ) -> Result<(PruneMetrics, Option<RowSelection>)> {
         let mut metrics = PruneMetrics::default();
         let mut builders: Vec<_> = self
@@ -580,7 +582,13 @@ impl ReadFormat {
                 let start = Instant::now();
                 // The dictionary array we create should be not null.
                 let primary_key = primary_key.unwrap();
-                let pk_values = codec.decode(primary_key)?;
+                let pk_values = if let Some(values) = pk_values_cache.get(primary_key) {
+                    values.clone()
+                } else {
+                    let pk_values = codec.decode(primary_key)?;
+                    pk_values_cache.insert(primary_key.to_vec(), pk_values.clone());
+                    pk_values
+                };
                 debug_assert_eq!(builders.len(), pk_values.len());
                 metrics.decode_pk_cost += start.elapsed();
                 metrics.decode_pk_count += 1;

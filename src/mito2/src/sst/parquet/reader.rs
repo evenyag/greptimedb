@@ -14,7 +14,7 @@
 
 //! Parquet reader.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -416,11 +416,13 @@ impl RowGroupReaderBuilder {
         }
 
         // TODO(yingwen): Apply filter to primary keys.
+        let mut pk_values_cache = HashMap::new();
         let (prune_metrics, ret) = self.read_format.prune_by_primary_keys(
             &self.file_path,
             &exprs,
             pk_schema,
             &mut reader,
+            &mut pk_values_cache,
         )?;
         metrics.prune_pk_cost += start.elapsed();
         metrics.evaluate_cost += prune_metrics.evaluate_cost;
