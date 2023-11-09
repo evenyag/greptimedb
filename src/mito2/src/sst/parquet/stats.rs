@@ -176,12 +176,12 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
             .len()
             .min((self.row_group_idx + 1) * num_index_in_group)
             - self.row_group_idx * num_index_in_group;
-        common_telemetry::info!(
-            "container is {}, row_group_idx: {}, values.len(): {}",
-            num,
-            self.row_group_idx,
-            values.len()
-        );
+        // common_telemetry::info!(
+        //     "container is {}, row_group_idx: {}, values.len(): {}",
+        //     num,
+        //     self.row_group_idx,
+        //     values.len()
+        // );
         num
     }
 
