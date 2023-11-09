@@ -345,8 +345,6 @@ impl VersionBuilder {
         ssts.add_files(file_purger, files);
         self.ssts = Arc::new(ssts);
 
-        common_telemetry::info!("sst is {:?}", self.ssts);
-
         self
     }
 

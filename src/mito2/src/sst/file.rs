@@ -103,6 +103,7 @@ impl fmt::Debug for FileMeta {
             .field("time_range", &self.time_range)
             .field("size", &self.file_size)
             .field("level", &self.level)
+            .field("stats", &self.stats[0].min_values.len())
             .finish()
     }
 }
