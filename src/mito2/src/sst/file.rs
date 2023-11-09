@@ -78,7 +78,7 @@ impl FromStr for FileId {
 pub type FileTimeRange = (Timestamp, Timestamp);
 
 /// Metadata of a SST file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FileMeta {
     /// Region of file.
@@ -93,6 +93,18 @@ pub struct FileMeta {
     pub file_size: u64,
     /// Column statistics
     pub stats: Arc<Vec<ColumnStats>>,
+}
+
+impl fmt::Debug for FileMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileMeta")
+            .field("region_id", &self.region_id)
+            .field("file_id", &self.file_id)
+            .field("time_range", &self.time_range)
+            .field("size", &self.file_size)
+            .field("level", &self.level)
+            .finish()
+    }
 }
 
 /// Handle to a SST file.
