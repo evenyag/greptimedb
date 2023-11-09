@@ -22,6 +22,7 @@ pub mod writer;
 
 use common_base::readable_size::ReadableSize;
 use datatypes::value::Value;
+use serde::{Deserialize, Serialize};
 
 use crate::sst::file::FileTimeRange;
 
@@ -55,7 +56,7 @@ impl Default for WriteOptions {
 }
 
 /// Column statistics.
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ColumnStats {
     /// Min values statistics.
     pub min_values: Vec<Value>,

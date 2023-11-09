@@ -27,6 +27,7 @@ use store_api::storage::RegionId;
 use uuid::Uuid;
 
 use crate::sst::file_purger::{FilePurgerRef, PurgeRequest};
+use crate::sst::parquet::ColumnStats;
 
 /// Type to store SST level.
 pub type Level = u8;
@@ -77,7 +78,7 @@ impl FromStr for FileId {
 pub type FileTimeRange = (Timestamp, Timestamp);
 
 /// Metadata of a SST file.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FileMeta {
     /// Region of file.
@@ -90,6 +91,8 @@ pub struct FileMeta {
     pub level: Level,
     /// Size of the file.
     pub file_size: u64,
+    /// Column statistics
+    pub stats: Vec<ColumnStats>,
 }
 
 /// Handle to a SST file.
@@ -231,6 +234,7 @@ mod tests {
             time_range: FileTimeRange::default(),
             level,
             file_size: 0,
+            stats: vec![],
         }
     }
 

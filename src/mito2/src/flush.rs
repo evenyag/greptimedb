@@ -322,6 +322,7 @@ impl RegionFlushTask {
                 time_range: sst_info.time_range,
                 level: 0,
                 file_size: sst_info.file_size,
+                stats: sst_info.stats,
             });
         }
 

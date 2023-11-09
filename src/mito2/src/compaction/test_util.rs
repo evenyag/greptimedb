@@ -35,6 +35,7 @@ pub fn new_file_handle(
             ),
             level,
             file_size: 0,
+            stats: vec![],
         },
         file_purger,
     )

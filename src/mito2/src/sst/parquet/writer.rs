@@ -30,7 +30,9 @@ use crate::error::{InvalidMetadataSnafu, Result};
 use crate::read::{Batch, Source};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::parquet::format::WriteFormat;
-use crate::sst::parquet::{ColumnStats, SstInfo, WriteOptions, PARQUET_METADATA_KEY};
+use crate::sst::parquet::{
+    ColumnStats, SstInfo, WriteOptions, DEFAULT_INDEX_ROWS, PARQUET_METADATA_KEY,
+};
 use crate::sst::stream_writer::BufferedWriter;
 
 /// Parquet SST writer.
@@ -148,26 +150,26 @@ struct ColumnStatsCollector {
 
 impl ColumnStatsCollector {
     fn update_stats(&mut self, value: &Value) {
-        self.last_value = Some(value.clone());
-        if let Some(last_min) = self.min_values.last_mut() {
-            if value < last_min {
-                *last_min = value.clone();
-            }
-        } else {
+        if self.last_value.is_none() {
             self.min_values.push(value.clone());
-        }
-        if let Some(last_max) = self.max_values.last_mut() {
-            if value > last_max {
-                *last_max = value.clone();
-            }
-        } else {
             self.max_values.push(value.clone());
+            self.last_value = Some(value.clone());
+            return;
+        }
+
+        self.last_value = Some(value.clone());
+        let last_min = self.min_values.last_mut().unwrap();
+        if value < last_min {
+            *last_min = value.clone();
+        }
+        let last_max = self.max_values.last_mut().unwrap();
+        if value > last_max {
+            *last_max = value.clone();
         }
     }
 
-    fn push_stats(&mut self, value: &Value) {
-        self.min_values.push(value.clone());
-        self.max_values.push(value.clone());
+    fn finish_one_group(&mut self) {
+        self.last_value = None;
     }
 
     fn finish(&mut self) -> ColumnStats {
@@ -204,6 +206,12 @@ impl PrimaryKeyStats {
         }
     }
 
+    fn finish_one_group(&mut self) {
+        for column in &mut self.columns {
+            column.finish_one_group();
+        }
+    }
+
     fn finish(&mut self) -> Vec<ColumnStats> {
         self.columns
             .iter_mut()
@@ -228,10 +236,9 @@ impl SourceStats {
             return;
         }
 
-        let pk_values = codec.decode(batch.primary_key()).unwrap();
-        self.pk_stats.update_stats(&pk_values);
-
+        let num_rows_before = self.num_rows;
         self.num_rows += batch.num_rows();
+
         // Safety: batch is not empty.
         let (min_in_batch, max_in_batch) = (
             batch.first_timestamp().unwrap(),
@@ -242,6 +249,21 @@ impl SourceStats {
             time_range.1 = time_range.1.max(max_in_batch);
         } else {
             self.time_range = Some((min_in_batch, max_in_batch));
+        }
+
+        let pk_values = codec.decode(batch.primary_key()).unwrap();
+        let mut rows_to_fill_group =
+            (num_rows_before + DEFAULT_INDEX_ROWS - 1) / DEFAULT_INDEX_ROWS * DEFAULT_INDEX_ROWS
+                - num_rows_before;
+        let mut batch_rows = batch.num_rows();
+        while batch_rows > 0 {
+            self.pk_stats.update_stats(&pk_values);
+            if batch_rows < rows_to_fill_group {
+                break;
+            }
+            self.pk_stats.finish_one_group();
+            batch_rows -= rows_to_fill_group;
+            rows_to_fill_group = DEFAULT_INDEX_ROWS;
         }
     }
 }

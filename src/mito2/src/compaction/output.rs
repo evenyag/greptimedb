@@ -55,6 +55,7 @@ impl CompactionOutput {
             |SstInfo {
                  time_range,
                  file_size,
+                 stats,
                  ..
              }| {
                 FileMeta {
@@ -63,6 +64,7 @@ impl CompactionOutput {
                     time_range,
                     level: self.output_level,
                     file_size,
+                    stats,
                 }
             },
         );
