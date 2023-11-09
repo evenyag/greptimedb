@@ -312,11 +312,11 @@ impl RowGroupReaderBuilder {
             // Primary key schema.
             let pk_schema = self.read_format.pk_schema();
             let meta = self.file_handle.meta();
-            common_telemetry::info!("file {} meta is {:?}", self.file_path, meta);
+            // common_telemetry::info!("file {} meta is {:?}", self.file_path, meta);
             let stats = PrimaryKeyPruningStats::new(&meta.stats, &self.read_format, row_group_idx);
 
             let res = predicate.prune_with_stats(&stats, &pk_schema);
-            common_telemetry::info!("file {} prune res is {:?}", self.file_path, res);
+            // common_telemetry::info!("file {} prune res is {:?}", self.file_path, res);
             let selectors: Vec<_> = res
                 .into_iter()
                 .map(|valid| {

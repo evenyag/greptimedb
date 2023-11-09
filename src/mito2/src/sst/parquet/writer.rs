@@ -174,7 +174,7 @@ impl ColumnStatsCollector {
             self.min_values.push(last_min);
         }
         if let Some(last_max) = self.last_max.take() {
-            self.min_values.push(last_max);
+            self.max_values.push(last_max);
         }
     }
 
