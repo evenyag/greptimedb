@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::debug;
+use common_telemetry::{debug, info};
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -315,6 +315,7 @@ impl RowGroupReaderBuilder {
             let pk_schema = self.read_format.pk_schema();
             let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
             let meta = self.file_handle.meta();
+            info!("row_group_idx {}, stats len {}", row_group_idx, meta.stats.len());
             let index = &meta.stats[row_group_idx * num_index_in_group
                 ..(row_group_idx * num_index_in_group + num_index_in_group).min(meta.stats.len())];
             let stats = PrimaryKeyPruningStats::new(index, &self.read_format);
