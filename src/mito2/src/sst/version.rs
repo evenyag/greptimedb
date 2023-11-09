@@ -54,6 +54,7 @@ impl SstVersion {
         files_to_add: impl Iterator<Item = FileMeta>,
     ) {
         for file in files_to_add {
+            common_telemetry::info!("sst add {}, stats len: {}", file.file_id, file.stats[0].max_values.len());
             let level = file.level;
             let handle = FileHandle::new(file, file_purger.clone());
             let file_id = handle.file_id();
