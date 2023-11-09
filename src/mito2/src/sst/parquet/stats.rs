@@ -24,7 +24,7 @@ use parquet::file::metadata::RowGroupMetaData;
 use store_api::storage::ColumnId;
 
 use crate::sst::parquet::format::ReadFormat;
-use crate::sst::parquet::ColumnStats;
+use crate::sst::parquet::{ColumnStats, DEFAULT_INDEX_ROWS, DEFAULT_ROW_GROUP_SIZE};
 
 /// Statistics for pruning row groups.
 pub(crate) struct RowGroupPruningStats<'a> {
@@ -88,10 +88,15 @@ pub(crate) struct PrimaryKeyPruningStats<'a> {
     stats: &'a [ColumnStats],
     read_format: &'a ReadFormat,
     pk_name_to_idx: HashMap<String, usize>,
+    row_group_idx: usize,
 }
 
 impl<'a> PrimaryKeyPruningStats<'a> {
-    pub(crate) fn new(stats: &'a [ColumnStats], read_format: &'a ReadFormat) -> Self {
+    pub(crate) fn new(
+        stats: &'a [ColumnStats],
+        read_format: &'a ReadFormat,
+        row_group_idx: usize,
+    ) -> Self {
         let pk_name_to_idx = read_format
             .metadata()
             .primary_key_columns()
@@ -103,15 +108,21 @@ impl<'a> PrimaryKeyPruningStats<'a> {
             stats,
             read_format,
             pk_name_to_idx,
+            row_group_idx,
         }
     }
 }
 
 impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
         let idx = self.pk_name_to_idx.get(&column.name)?;
         let column = self.read_format.metadata().column_by_name(&column.name)?;
         let values = &self.stats[*idx].min_values;
+        let values = &values[self.row_group_idx * num_index_in_group
+            ..values
+                .len()
+                .min((self.row_group_idx + 1) * num_index_in_group)];
         let mut builder = column
             .column_schema
             .data_type
@@ -123,9 +134,14 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
         let idx = self.pk_name_to_idx.get(&column.name)?;
         let column = self.read_format.metadata().column_by_name(&column.name)?;
         let values = &self.stats[*idx].max_values;
+        let values = &values[self.row_group_idx * num_index_in_group
+            ..values
+                .len()
+                .min((self.row_group_idx + 1) * num_index_in_group)];
         let mut builder = column
             .column_schema
             .data_type

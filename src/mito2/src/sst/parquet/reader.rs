@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_compat::{Compat, CompatExt};
 use async_trait::async_trait;
-use common_telemetry::{debug, info};
+use common_telemetry::debug;
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
@@ -46,9 +46,7 @@ use crate::sst::file::FileHandle;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::row_group::InMemoryRowGroup;
 use crate::sst::parquet::stats::{PrimaryKeyPruningStats, RowGroupPruningStats};
-use crate::sst::parquet::{
-    DEFAULT_INDEX_ROWS, DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, PARQUET_METADATA_KEY,
-};
+use crate::sst::parquet::{DEFAULT_INDEX_ROWS, DEFAULT_READ_BATCH_SIZE, PARQUET_METADATA_KEY};
 
 /// Parquet SST reader builder.
 pub struct ParquetReaderBuilder {
@@ -313,12 +311,8 @@ impl RowGroupReaderBuilder {
         let row_selection = if let Some(predicate) = &self.predicate {
             // Primary key schema.
             let pk_schema = self.read_format.pk_schema();
-            let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
             let meta = self.file_handle.meta();
-            info!("row_group_idx {}, stats len {}", row_group_idx, meta.stats.len());
-            let index = &meta.stats[row_group_idx * num_index_in_group
-                ..(row_group_idx * num_index_in_group + num_index_in_group).min(meta.stats.len())];
-            let stats = PrimaryKeyPruningStats::new(index, &self.read_format);
+            let stats = PrimaryKeyPruningStats::new(&meta.stats, &self.read_format, row_group_idx);
 
             let selectors: Vec<_> = predicate
                 .prune_with_stats(&stats, &pk_schema)
