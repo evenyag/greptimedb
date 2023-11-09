@@ -145,40 +145,41 @@ impl ParquetWriter {
 struct ColumnStatsCollector {
     min_values: Vec<Value>,
     max_values: Vec<Value>,
-    last_value: Option<Value>,
+    // Last min in current group.
+    last_min: Option<Value>,
+    // Last max in current group.
+    last_max: Option<Value>,
 }
 
 impl ColumnStatsCollector {
     fn update_stats(&mut self, value: &Value) {
-        if self.last_value.is_none() {
-            self.min_values.push(value.clone());
-            self.max_values.push(value.clone());
-            self.last_value = Some(value.clone());
+        if self.last_min.is_none() {
+            self.last_min = Some(value.clone());
+            self.last_max = Some(value.clone());
             return;
         }
 
-        self.last_value = Some(value.clone());
-        let last_min = self.min_values.last_mut().unwrap();
+        let last_min = self.last_min.as_mut().unwrap();
         if value < last_min {
             *last_min = value.clone();
         }
-        let last_max = self.max_values.last_mut().unwrap();
+        let last_max = self.last_max.as_mut().unwrap();
         if value > last_max {
             *last_max = value.clone();
         }
     }
 
     fn finish_one_group(&mut self) {
-        self.last_value = None;
+        if let Some(last_min) = self.last_min.take() {
+            self.min_values.push(last_min);
+        }
+        if let Some(last_max) = self.last_max.take() {
+            self.min_values.push(last_max);
+        }
     }
 
     fn finish(&mut self) -> ColumnStats {
-        let Some(last_value) = self.last_value.take() else {
-            return ColumnStats::default();
-        };
-
-        self.min_values.push(last_value.clone());
-        self.max_values.push(last_value.clone());
+        self.finish_one_group();
 
         ColumnStats {
             min_values: std::mem::take(&mut self.min_values),
@@ -261,7 +262,9 @@ impl SourceStats {
             if batch_rows < rows_to_fill_group {
                 break;
             }
-            self.pk_stats.finish_one_group();
+            if rows_to_fill_group != 0 {
+                self.pk_stats.finish_one_group();
+            }
             batch_rows -= rows_to_fill_group;
             rows_to_fill_group = DEFAULT_INDEX_ROWS;
         }
