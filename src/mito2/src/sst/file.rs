@@ -92,7 +92,7 @@ pub struct FileMeta {
     /// Size of the file.
     pub file_size: u64,
     /// Column statistics
-    pub stats: Vec<ColumnStats>,
+    pub stats: Arc<Vec<ColumnStats>>,
 }
 
 /// Handle to a SST file.
@@ -234,7 +234,7 @@ mod tests {
             time_range: FileTimeRange::default(),
             level,
             file_size: 0,
-            stats: vec![],
+            stats: vec![].into(),
         }
     }
 

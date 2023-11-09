@@ -64,7 +64,7 @@ impl CompactionOutput {
                     time_range,
                     level: self.output_level,
                     file_size,
-                    stats,
+                    stats: stats.into(),
                 }
             },
         );

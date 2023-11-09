@@ -96,7 +96,7 @@ impl VersionControlBuilder {
                 ),
                 level: 0,
                 file_size: 0, // We don't care file size.
-                stats: vec![],
+                stats: vec![].into(),
             },
         );
         self
@@ -137,7 +137,7 @@ pub(crate) fn apply_edit(
                 ),
                 level: 0,
                 file_size: 0, // We don't care file size.
-                stats: vec![],
+                stats: vec![].into(),
             }
         })
         .collect();

@@ -14,15 +14,17 @@
 
 //! Statistics of parquet SSTs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::physical_optimizer::pruning::PruningStatistics;
 use datafusion_common::Column;
 use datatypes::arrow::array::ArrayRef;
+use datatypes::prelude::DataType;
 use parquet::file::metadata::RowGroupMetaData;
 use store_api::storage::ColumnId;
 
 use crate::sst::parquet::format::ReadFormat;
+use crate::sst::parquet::ColumnStats;
 
 /// Statistics for pruning row groups.
 pub(crate) struct RowGroupPruningStats<'a> {
@@ -79,5 +81,66 @@ impl<'a> PruningStatistics for RowGroupPruningStats<'a> {
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.column_id_to_prune(&column.name)?;
         self.read_format.null_counts(self.row_groups, column_id)
+    }
+}
+
+pub(crate) struct PrimaryKeyPruningStats<'a> {
+    stats: &'a [ColumnStats],
+    read_format: &'a ReadFormat,
+    pk_name_to_idx: HashMap<String, usize>,
+}
+
+impl<'a> PrimaryKeyPruningStats<'a> {
+    pub(crate) fn new(stats: &'a [ColumnStats], read_format: &'a ReadFormat) -> Self {
+        let pk_name_to_idx = read_format
+            .metadata()
+            .primary_key_columns()
+            .enumerate()
+            .map(|(i, column)| (column.column_schema.name.to_string(), i))
+            .collect();
+
+        Self {
+            stats,
+            read_format,
+            pk_name_to_idx,
+        }
+    }
+}
+
+impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        let idx = self.pk_name_to_idx.get(&column.name)?;
+        let column = self.read_format.metadata().column_by_name(&column.name)?;
+        let values = &self.stats[*idx].min_values;
+        let mut builder = column
+            .column_schema
+            .data_type
+            .create_mutable_vector(values.len());
+        for value in values {
+            builder.push_value_ref(value.as_value_ref());
+        }
+        Some(builder.to_vector().to_arrow_array())
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        let idx = self.pk_name_to_idx.get(&column.name)?;
+        let column = self.read_format.metadata().column_by_name(&column.name)?;
+        let values = &self.stats[*idx].max_values;
+        let mut builder = column
+            .column_schema
+            .data_type
+            .create_mutable_vector(values.len());
+        for value in values {
+            builder.push_value_ref(value.as_value_ref());
+        }
+        Some(builder.to_vector().to_arrow_array())
+    }
+
+    fn num_containers(&self) -> usize {
+        self.stats.len()
+    }
+
+    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
     }
 }

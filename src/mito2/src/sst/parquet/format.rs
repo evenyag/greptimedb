@@ -151,6 +151,21 @@ impl ReadFormat {
         &self.metadata
     }
 
+    pub(crate) fn pk_schema(&self) -> SchemaRef {
+        let fields: Vec<_> = self
+            .metadata
+            .primary_key_columns()
+            .map(|column| {
+                Field::new(
+                    column.column_schema.name.clone(),
+                    column.column_schema.data_type.as_arrow_type(),
+                    column.column_schema.is_nullable(),
+                )
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
     /// Gets sorted projection indices to read `columns` from parquet files.
     ///
     /// This function ignores columns not in `metadata` to for compatibility between

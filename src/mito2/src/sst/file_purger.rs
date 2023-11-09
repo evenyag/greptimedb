@@ -136,7 +136,7 @@ mod tests {
                     time_range: FileTimeRange::default(),
                     level: 0,
                     file_size: 4096,
-                    stats: vec![],
+                    stats: vec![].into(),
                 },
                 file_purger,
             );

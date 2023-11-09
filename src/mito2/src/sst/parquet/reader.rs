@@ -24,7 +24,7 @@ use common_telemetry::debug;
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{ObjectStore, Reader};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection, RowSelector};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{parquet_to_arrow_field_levels, FieldLevels, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
@@ -45,8 +45,10 @@ use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::row_group::InMemoryRowGroup;
-use crate::sst::parquet::stats::RowGroupPruningStats;
-use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, PARQUET_METADATA_KEY};
+use crate::sst::parquet::stats::{PrimaryKeyPruningStats, RowGroupPruningStats};
+use crate::sst::parquet::{
+    DEFAULT_INDEX_ROWS, DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, PARQUET_METADATA_KEY,
+};
 
 /// Parquet SST reader builder.
 pub struct ParquetReaderBuilder {
@@ -183,6 +185,8 @@ impl ParquetReaderBuilder {
             file_reader: reader,
             projection: projection_mask,
             field_levels,
+            read_format,
+            predicate: self.predicate.clone(),
         };
 
         let metrics = Metrics {
@@ -193,7 +197,6 @@ impl ParquetReaderBuilder {
 
         Ok(ParquetReader {
             row_groups,
-            read_format,
             reader_builder,
             current_reader: None,
             batches: VecDeque::new(),
@@ -292,6 +295,11 @@ struct RowGroupReaderBuilder {
     projection: ProjectionMask,
     /// Field levels to read.
     field_levels: FieldLevels,
+    /// Helper to read record batches.
+    ///
+    /// Not `None` if [ParquetReader::stream] is not `None`.
+    read_format: ReadFormat,
+    predicate: Option<Predicate>,
 }
 
 impl RowGroupReaderBuilder {
@@ -302,6 +310,31 @@ impl RowGroupReaderBuilder {
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
     async fn build(&mut self, row_group_idx: usize) -> Result<ParquetRecordBatchReader> {
+        let row_selection = if let Some(predicate) = &self.predicate {
+            // Primary key schema.
+            let pk_schema = self.read_format.pk_schema();
+            let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
+            let meta = self.file_handle.meta();
+            let index = &meta.stats[row_group_idx * num_index_in_group
+                ..(row_group_idx * num_index_in_group + num_index_in_group).min(meta.stats.len())];
+            let stats = PrimaryKeyPruningStats::new(index, &self.read_format);
+
+            let selectors: Vec<_> = predicate
+                .prune_with_stats(&stats, &pk_schema)
+                .into_iter()
+                .map(|valid| {
+                    if valid {
+                        RowSelector::select(DEFAULT_INDEX_ROWS)
+                    } else {
+                        RowSelector::skip(DEFAULT_INDEX_ROWS)
+                    }
+                })
+                .collect();
+            Some(RowSelection::from(selectors))
+        } else {
+            None
+        };
+
         let mut row_group = InMemoryRowGroup::create(&self.parquet_meta, row_group_idx);
         // Fetches data into memory.
         row_group
@@ -317,7 +350,7 @@ impl RowGroupReaderBuilder {
             &self.field_levels,
             &row_group,
             DEFAULT_READ_BATCH_SIZE,
-            None,
+            row_selection,
         )
         .context(ReadParquetSnafu {
             path: &self.file_path,
@@ -329,10 +362,6 @@ impl RowGroupReaderBuilder {
 pub struct ParquetReader {
     /// Indices of row groups to read.
     row_groups: VecDeque<usize>,
-    /// Helper to read record batches.
-    ///
-    /// Not `None` if [ParquetReader::stream] is not `None`.
-    read_format: ReadFormat,
     /// Builder to build row group readers.
     reader_builder: RowGroupReaderBuilder,
     /// Reader of current row group.
@@ -360,7 +389,8 @@ impl BatchReader for ParquetReader {
         };
         self.metrics.num_record_batches += 1;
 
-        self.read_format
+        self.reader_builder
+            .read_format
             .convert_record_batch(&record_batch, &mut self.batches)?;
         self.metrics.num_batches += self.batches.len();
 
@@ -399,7 +429,7 @@ impl Drop for ParquetReader {
 impl ParquetReader {
     /// Returns the metadata of the SST.
     pub fn metadata(&self) -> &RegionMetadataRef {
-        self.read_format.metadata()
+        self.reader_builder.read_format.metadata()
     }
 
     /// Tries to fetch next [RecordBatch] from the reader.
