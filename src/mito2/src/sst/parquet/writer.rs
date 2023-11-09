@@ -16,6 +16,7 @@
 
 use common_telemetry::debug;
 use common_time::Timestamp;
+use datatypes::value::Value;
 use object_store::ObjectStore;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
@@ -27,8 +28,9 @@ use store_api::storage::consts::SEQUENCE_COLUMN_NAME;
 
 use crate::error::{InvalidMetadataSnafu, Result};
 use crate::read::{Batch, Source};
+use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::parquet::format::WriteFormat;
-use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
+use crate::sst::parquet::{ColumnStats, SstInfo, WriteOptions, PARQUET_METADATA_KEY};
 use crate::sst::stream_writer::BufferedWriter;
 
 /// Parquet SST writer.
@@ -96,9 +98,17 @@ impl ParquetWriter {
         )
         .await?;
 
+        // Creates a new decoder.
+        let codec = McmpRowCodec::new(
+            self.metadata
+                .primary_key_columns()
+                .map(|column| SortField::new(column.column_schema.data_type.clone()))
+                .collect(),
+        );
+
         let mut stats = SourceStats::default();
         while let Some(batch) = self.source.next_batch().await? {
-            stats.update(&batch);
+            stats.update(&batch, &codec);
             let arrow_batch = write_format.convert_batch(&batch)?;
 
             buffered_writer.write(&arrow_batch).await?;
@@ -123,7 +133,82 @@ impl ParquetWriter {
             time_range,
             file_size,
             num_rows: stats.num_rows,
+            stats: stats.pk_stats.finish(),
         }))
+    }
+}
+
+/// Column stats collector.
+#[derive(Debug, Default, Clone)]
+struct ColumnStatsCollector {
+    min_values: Vec<Value>,
+    max_values: Vec<Value>,
+    last_value: Option<Value>,
+}
+
+impl ColumnStatsCollector {
+    fn update_stats(&mut self, value: &Value) {
+        self.last_value = Some(value.clone());
+        if let Some(last_min) = self.min_values.last_mut() {
+            if value < last_min {
+                *last_min = value.clone();
+            }
+        } else {
+            self.min_values.push(value.clone());
+        }
+        if let Some(last_max) = self.max_values.last_mut() {
+            if value > last_max {
+                *last_max = value.clone();
+            }
+        } else {
+            self.max_values.push(value.clone());
+        }
+    }
+
+    fn push_stats(&mut self, value: &Value) {
+        self.min_values.push(value.clone());
+        self.max_values.push(value.clone());
+    }
+
+    fn finish(&mut self) -> ColumnStats {
+        let Some(last_value) = self.last_value.take() else {
+            return ColumnStats::default();
+        };
+
+        self.min_values.push(last_value.clone());
+        self.max_values.push(last_value.clone());
+
+        ColumnStats {
+            min_values: std::mem::take(&mut self.min_values),
+            max_values: std::mem::take(&mut self.max_values),
+        }
+    }
+}
+
+/// Stats for all primary key.
+#[derive(Debug, Default, Clone)]
+struct PrimaryKeyStats {
+    /// Stats builder for all primary columns.
+    columns: Vec<ColumnStatsCollector>,
+}
+
+impl PrimaryKeyStats {
+    // Updates last stats for each column.
+    fn update_stats(&mut self, values: &[Value]) {
+        if self.columns.is_empty() {
+            self.columns = vec![ColumnStatsCollector::default(); values.len()];
+        }
+
+        for (column, value) in self.columns.iter_mut().zip(values) {
+            column.update_stats(value);
+        }
+    }
+
+    fn finish(&mut self) -> Vec<ColumnStats> {
+        self.columns
+            .iter_mut()
+            .map(|collector| collector.finish())
+            .collect()
     }
 }
 
@@ -133,13 +218,18 @@ struct SourceStats {
     num_rows: usize,
     /// Time range of fetched batches.
     time_range: Option<(Timestamp, Timestamp)>,
+    /// Stats of primary keys.
+    pk_stats: PrimaryKeyStats,
 }
 
 impl SourceStats {
-    fn update(&mut self, batch: &Batch) {
+    fn update(&mut self, batch: &Batch, codec: &McmpRowCodec) {
         if batch.is_empty() {
             return;
         }
+
+        let pk_values = codec.decode(batch.primary_key()).unwrap();
+        self.pk_stats.update_stats(&pk_values);
 
         self.num_rows += batch.num_rows();
         // Safety: batch is not empty.

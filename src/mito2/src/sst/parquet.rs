@@ -21,6 +21,7 @@ mod stats;
 pub mod writer;
 
 use common_base::readable_size::ReadableSize;
+use datatypes::value::Value;
 
 use crate::sst::file::FileTimeRange;
 
@@ -31,6 +32,9 @@ const DEFAULT_WRITE_BUFFER_SIZE: ReadableSize = ReadableSize::mb(8);
 pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 /// Default row group size for parquet files.
 const DEFAULT_ROW_GROUP_SIZE: usize = 100 * DEFAULT_READ_BATCH_SIZE;
+/// Default number of rows to build an index.
+// So each row group has 25 indices.
+pub(crate) const DEFAULT_INDEX_ROWS: usize = 4 * DEFAULT_READ_BATCH_SIZE;
 
 /// Parquet write options.
 #[derive(Debug)]
@@ -50,6 +54,15 @@ impl Default for WriteOptions {
     }
 }
 
+/// Column statistics.
+#[derive(Default)]
+pub struct ColumnStats {
+    /// Min values statistics.
+    pub min_values: Vec<Value>,
+    /// Max values statistics.
+    pub max_values: Vec<Value>,
+}
+
 /// Parquet SST info returned by the writer.
 pub struct SstInfo {
     /// Time range of the SST.
@@ -58,4 +71,6 @@ pub struct SstInfo {
     pub file_size: u64,
     /// Number of rows.
     pub num_rows: usize,
+    /// Statistics.
+    pub stats: Vec<ColumnStats>,
 }
