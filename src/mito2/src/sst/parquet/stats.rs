@@ -119,6 +119,10 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
         let idx = self.pk_name_to_idx.get(&column.name)?;
         let column = self.read_format.metadata().column_by_name(&column.name)?;
         let values = &self.stats[*idx].min_values;
+        if values.is_empty() {
+            common_telemetry::warn!("empty values of stats");
+            return None;
+        }
         let values = &values[self.row_group_idx * num_index_in_group
             ..values
                 .len()
@@ -138,6 +142,10 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
         let idx = self.pk_name_to_idx.get(&column.name)?;
         let column = self.read_format.metadata().column_by_name(&column.name)?;
         let values = &self.stats[*idx].max_values;
+        if values.is_empty() {
+            common_telemetry::warn!("empty values of stats");
+            return None;
+        }
         let values = &values[self.row_group_idx * num_index_in_group
             ..values
                 .len()
@@ -160,6 +168,10 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
 
         let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
         let values = &self.stats[0].max_values;
+        if values.is_empty() {
+            common_telemetry::warn!("empty values of stats");
+            return 0;
+        }
         let num = values
             .len()
             .min((self.row_group_idx + 1) * num_index_in_group)
