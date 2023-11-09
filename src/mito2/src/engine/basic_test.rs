@@ -506,5 +506,5 @@ async fn test_region_usage() {
     assert_eq!(region_stat.sst_usage, 2827);
 
     // region total usage
-    assert_eq!(region_stat.disk_usage(), 3833);
+    assert_eq!(region_stat.disk_usage(), 3965);
 }
