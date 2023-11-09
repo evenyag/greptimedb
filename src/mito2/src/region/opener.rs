@@ -224,6 +224,7 @@ impl RegionOpener {
             self.cache_manager.clone(),
         ));
         let mutable = self.memtable_builder.build(&metadata);
+        common_telemetry::info!("may be open manifest is {:?}", manifest);
         let version = VersionBuilder::new(metadata, mutable)
             .add_files(file_purger.clone(), manifest.files.values().cloned())
             .flushed_entry_id(manifest.flushed_entry_id)
