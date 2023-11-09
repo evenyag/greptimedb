@@ -154,15 +154,18 @@ impl<'a> PruningStatistics for PrimaryKeyPruningStats<'a> {
 
     fn num_containers(&self) -> usize {
         if self.stats.is_empty() {
+            common_telemetry::info!("container is 0");
             return 0;
         }
 
         let num_index_in_group = DEFAULT_ROW_GROUP_SIZE / DEFAULT_INDEX_ROWS;
         let values = &self.stats[0].max_values;
-        values
+        let num = values
             .len()
             .min((self.row_group_idx + 1) * num_index_in_group)
-            - self.row_group_idx * num_index_in_group
+            - self.row_group_idx * num_index_in_group;
+        common_telemetry::info!("container is {num}");
+        num
     }
 
     fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
