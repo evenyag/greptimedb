@@ -275,6 +275,10 @@ struct Metrics {
     num_batches: usize,
     /// Number of rows read.
     num_rows: usize,
+    /// Duration to build a row group reader.
+    row_group_build_cost: Duration,
+    /// Duration to prune pages.
+    prune_page_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -307,7 +311,8 @@ impl RowGroupReaderBuilder {
     }
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
-    async fn build(&mut self, row_group_idx: usize) -> Result<ParquetRecordBatchReader> {
+    async fn build(&mut self, row_group_idx: usize, metrics: &mut Metrics) -> Result<ParquetRecordBatchReader> {
+        let start = Instant::now();
         let row_selection = if let Some(predicate) = &self.predicate {
             // Primary key schema.
             let pk_schema = self.read_format.pk_schema();
@@ -331,6 +336,7 @@ impl RowGroupReaderBuilder {
         } else {
             None
         };
+        metrics.prune_page_cost += start.elapsed();
 
         let mut row_group = InMemoryRowGroup::create(&self.parquet_meta, row_group_idx);
         // Fetches data into memory.
@@ -448,7 +454,9 @@ impl ParquetReader {
 
         // No more items in current row group, reads next row group.
         while let Some(row_group_idx) = self.row_groups.pop_front() {
-            let mut row_group_reader = self.reader_builder.build(row_group_idx).await?;
+            let start = Instant::now();
+            let mut row_group_reader = self.reader_builder.build(row_group_idx, &mut self.metrics).await?;
+            self.metrics.row_group_build_cost += start.elapsed();
             let Some(record_batch) =
                 row_group_reader
                     .next()
