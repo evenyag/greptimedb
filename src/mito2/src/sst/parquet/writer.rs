@@ -18,7 +18,8 @@ use common_telemetry::debug;
 use common_time::Timestamp;
 use datatypes::value::Value;
 use object_store::ObjectStore;
-use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::basic::{Compression, Encoding};
+// use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
@@ -73,7 +74,8 @@ impl ParquetWriter {
         // TODO(yingwen): Find and set proper column encoding for internal columns: op type and tsid.
         let props_builder = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![key_value_meta]))
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_compression(Compression::LZ4)
+            // .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_data_page_size_limit(1024 * 128)
             .set_encoding(Encoding::PLAIN)
             .set_max_row_group_size(opts.row_group_size)

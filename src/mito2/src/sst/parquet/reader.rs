@@ -311,7 +311,11 @@ impl RowGroupReaderBuilder {
     }
 
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
-    async fn build(&mut self, row_group_idx: usize, metrics: &mut Metrics) -> Result<ParquetRecordBatchReader> {
+    async fn build(
+        &mut self,
+        row_group_idx: usize,
+        metrics: &mut Metrics,
+    ) -> Result<ParquetRecordBatchReader> {
         let start = Instant::now();
         let row_selection = if let Some(predicate) = &self.predicate {
             // Primary key schema.
@@ -455,7 +459,10 @@ impl ParquetReader {
         // No more items in current row group, reads next row group.
         while let Some(row_group_idx) = self.row_groups.pop_front() {
             let start = Instant::now();
-            let mut row_group_reader = self.reader_builder.build(row_group_idx, &mut self.metrics).await?;
+            let mut row_group_reader = self
+                .reader_builder
+                .build(row_group_idx, &mut self.metrics)
+                .await?;
             self.metrics.row_group_build_cost += start.elapsed();
             let Some(record_batch) =
                 row_group_reader
