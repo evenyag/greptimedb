@@ -75,6 +75,7 @@ impl ParquetWriter {
         let props_builder = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![key_value_meta]))
             .set_compression(Compression::LZ4)
+            .set_data_page_row_count_limit(DEFAULT_INDEX_ROWS)
             // .set_compression(Compression::ZSTD(ZstdLevel::default()))
             // .set_data_page_size_limit(1024 * 128)
             .set_encoding(Encoding::PLAIN)
