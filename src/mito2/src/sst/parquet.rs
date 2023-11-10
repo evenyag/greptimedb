@@ -32,7 +32,7 @@ const DEFAULT_WRITE_BUFFER_SIZE: ReadableSize = ReadableSize::mb(8);
 /// Default batch size to read parquet files.
 pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 /// Default row group size for parquet files.
-const DEFAULT_ROW_GROUP_SIZE: usize = 100 * DEFAULT_READ_BATCH_SIZE;
+const DEFAULT_ROW_GROUP_SIZE: usize = 512 * DEFAULT_READ_BATCH_SIZE;
 /// Default number of rows to build an index.
 // So each row group has 25 indices.
 pub(crate) const DEFAULT_INDEX_ROWS: usize = 4 * DEFAULT_READ_BATCH_SIZE;
