@@ -280,6 +280,8 @@ struct Metrics {
     row_group_build_cost: Duration,
     /// Duration to prune pages.
     prune_page_cost: Duration,
+    /// Duration to prune pages.
+    fetch_page_cost: Duration,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
@@ -345,6 +347,7 @@ impl RowGroupReaderBuilder {
         };
         metrics.prune_page_cost += start.elapsed();
 
+        let start = Instant::now();
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
             self.file_handle.file_id(),
@@ -359,6 +362,7 @@ impl RowGroupReaderBuilder {
             .context(ReadParquetSnafu {
                 path: &self.file_path,
             })?;
+        metrics.fetch_page_cost += start.elapsed();
 
         // Builds the parquet reader.
         // Now the row selection is None.
