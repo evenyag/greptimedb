@@ -341,6 +341,17 @@ pub async fn test_prom_http_api(store_type: StorageType) {
     let (app, mut guard) = setup_test_prom_app_with_frontend(store_type, "promql_api").await;
     let client = TestClient::new(app);
 
+    // format_query
+    let res = client
+        .get("/v1/prometheus/api/v1/format_query?query=foo/bar")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.text().await.as_str(),
+        r#"{"status":"success","data":"foo / bar"}"#
+    );
+
     // instant query
     let res = client
         .get("/v1/prometheus/api/v1/query?query=up&time=1")
@@ -732,6 +743,7 @@ global_write_buffer_size = "1GiB"
 global_write_buffer_reject_size = "2GiB"
 sst_meta_cache_size = "128MiB"
 vector_cache_size = "512MiB"
+page_cache_size = "2GiB"
 sst_write_buffer_size = "8MiB"
 
 [[datanode.region_engine]]

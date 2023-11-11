@@ -185,6 +185,7 @@ impl ParquetReaderBuilder {
             field_levels,
             read_format,
             predicate: self.predicate.clone(),
+            cache_manager: self.cache_manager.clone(),
         };
 
         let metrics = Metrics {
@@ -302,6 +303,8 @@ struct RowGroupReaderBuilder {
     /// Not `None` if [ParquetReader::stream] is not `None`.
     read_format: ReadFormat,
     predicate: Option<Predicate>,
+    /// Cache.
+    cache_manager: Option<CacheManagerRef>,
 }
 
 impl RowGroupReaderBuilder {
@@ -342,7 +345,13 @@ impl RowGroupReaderBuilder {
         };
         metrics.prune_page_cost += start.elapsed();
 
-        let mut row_group = InMemoryRowGroup::create(&self.parquet_meta, row_group_idx);
+        let mut row_group = InMemoryRowGroup::create(
+            self.file_handle.region_id(),
+            self.file_handle.file_id(),
+            &self.parquet_meta,
+            row_group_idx,
+            self.cache_manager.clone(),
+        );
         // Fetches data into memory.
         row_group
             .fetch(&mut self.file_reader, &self.projection, None)
@@ -370,6 +379,9 @@ pub struct ParquetReader {
     /// Indices of row groups to read.
     row_groups: VecDeque<usize>,
     /// Builder to build row group readers.
+    ///
+    /// The builder contains the file handle so don't drop the builder while using
+    /// the [ParquetReader].
     reader_builder: RowGroupReaderBuilder,
     /// Reader of current row group.
     current_reader: Option<ParquetRecordBatchReader>,
