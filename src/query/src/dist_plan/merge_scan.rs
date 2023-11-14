@@ -166,6 +166,7 @@ impl MergeScanExec {
         let trace_id = trace_id().unwrap_or_default();
 
         let stream = Box::pin(stream!({
+            let start = Instant::now();
             METRIC_MERGE_SCAN_REGIONS.observe(regions.len() as f64);
             let _finish_timer = metric.finish_time().timer();
             let mut ready_timer = metric.ready_time().timer();
@@ -213,6 +214,8 @@ impl MergeScanExec {
                 }
                 METRIC_MERGE_SCAN_POLL_ELAPSED.observe(poll_duration.as_secs_f64());
             }
+
+            info!("Merge scan cost: {:?}", start.elapsed());
         }));
 
         Ok(Box::pin(RecordBatchStreamAdaptor {
