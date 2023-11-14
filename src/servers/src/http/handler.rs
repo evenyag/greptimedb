@@ -21,6 +21,7 @@ use axum::extract::{Json, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Form};
 use common_error::status_code::StatusCode;
+use common_telemetry::info;
 use query::parser::PromQuery;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,17 @@ pub async fn sql(
             return Json(resp);
         }
 
-        JsonResponse::from_output(sql_handler.do_query(sql, query_ctx).await).await
+        let output = sql_handler.do_query(sql, query_ctx).await;
+        let convert_start = Instant::now();
+        let resp = JsonResponse::from_output(output).await;
+
+        info!(
+            "Handle sql, query_cost: {:?}, convert_cost: {:?}",
+            start.elapsed(),
+            convert_start.elapsed()
+        );
+
+        resp
     } else {
         JsonResponse::with_error(
             "sql parameter is required.".to_string(),
