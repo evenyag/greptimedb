@@ -60,12 +60,13 @@ pub async fn sql(
         }
 
         let output = sql_handler.do_query(sql, query_ctx).await;
+        let query_cost = start.elapsed();
         let convert_start = Instant::now();
         let resp = JsonResponse::from_output(output).await;
 
         info!(
             "Handle sql, query_cost: {:?}, convert_cost: {:?}",
-            start.elapsed(),
+            query_cost,
             convert_start.elapsed()
         );
 
