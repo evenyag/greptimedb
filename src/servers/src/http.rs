@@ -280,6 +280,7 @@ impl JsonResponse {
         // TODO(sunng87): this api response structure cannot represent error
         // well. It hides successful execution results from error response
         let mut results = Vec::with_capacity(outputs.len());
+        let mut convert_cost = Duration::ZERO;
         for out in outputs {
             match out {
                 Ok(Output::AffectedRows(rows)) => {
@@ -288,14 +289,18 @@ impl JsonResponse {
                 Ok(Output::Stream(stream)) => {
                     // TODO(sunng87): streaming response
                     match util::collect(stream).await {
-                        Ok(rows) => match HttpRecordsOutput::try_from(rows) {
-                            Ok(rows) => {
-                                results.push(JsonOutput::Records(rows));
+                        Ok(rows) => {
+                            let start = Instant::now();
+                            match HttpRecordsOutput::try_from(rows) {
+                                Ok(rows) => {
+                                    results.push(JsonOutput::Records(rows));
+                                }
+                                Err(err) => {
+                                    return Self::with_error(err, StatusCode::Internal);
+                                }
                             }
-                            Err(err) => {
-                                return Self::with_error(err, StatusCode::Internal);
-                            }
-                        },
+                            convert_cost += start.elapsed();
+                        }
 
                         Err(e) => {
                             return Self::with_error(
@@ -305,19 +310,24 @@ impl JsonResponse {
                         }
                     }
                 }
-                Ok(Output::RecordBatches(rbs)) => match HttpRecordsOutput::try_from(rbs.take()) {
-                    Ok(rows) => {
-                        results.push(JsonOutput::Records(rows));
+                Ok(Output::RecordBatches(rbs)) => {
+                    let start = Instant::now();
+                    match HttpRecordsOutput::try_from(rbs.take()) {
+                        Ok(rows) => {
+                            results.push(JsonOutput::Records(rows));
+                        }
+                        Err(err) => {
+                            return Self::with_error(err, StatusCode::Internal);
+                        }
                     }
-                    Err(err) => {
-                        return Self::with_error(err, StatusCode::Internal);
-                    }
-                },
+                    convert_cost += start.elapsed();
+                }
                 Err(e) => {
                     return Self::with_error(e.output_msg(), e.status_code());
                 }
             }
         }
+        info!("from output convert cost: {:?}", convert_cost);
         Self::with_output(Some(results))
     }
 
