@@ -58,6 +58,7 @@ pub async fn sql(
         if let Some(resp) = validate_schema(sql_handler.clone(), query_ctx.clone()).await {
             return Json(resp);
         }
+        info!("Handle sql validate schema, cost: {:?}", start.elapsed());
 
         let output = sql_handler.do_query(sql, query_ctx).await;
         let resp = JsonResponse::from_output(output).await;
