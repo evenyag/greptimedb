@@ -27,7 +27,7 @@ use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{
     DfSendableRecordBatchStream, RecordBatch, RecordBatchStreamAdaptor, SendableRecordBatchStream,
 };
-use common_telemetry::trace_id;
+use common_telemetry::{trace_id, info};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
