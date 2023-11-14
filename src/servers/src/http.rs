@@ -281,6 +281,7 @@ impl JsonResponse {
         // well. It hides successful execution results from error response
         let mut results = Vec::with_capacity(outputs.len());
         let mut convert_cost = Duration::ZERO;
+        let mut collect_cost = Duration::ZERO;
         for out in outputs {
             match out {
                 Ok(Output::AffectedRows(rows)) => {
@@ -288,8 +289,10 @@ impl JsonResponse {
                 }
                 Ok(Output::Stream(stream)) => {
                     // TODO(sunng87): streaming response
+                    let collect_start = Instant::now();
                     match util::collect(stream).await {
                         Ok(rows) => {
+                            collect_cost += collect_start.elapsed();
                             let start = Instant::now();
                             match HttpRecordsOutput::try_from(rows) {
                                 Ok(rows) => {
@@ -327,7 +330,10 @@ impl JsonResponse {
                 }
             }
         }
-        info!("from output convert cost: {:?}", convert_cost);
+        info!(
+            "from output convert cost: {:?}, collect_cost: {:?}",
+            convert_cost, collect_cost
+        );
         Self::with_output(Some(results))
     }
 
