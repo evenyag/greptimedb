@@ -14,6 +14,8 @@
 
 //! Scans a region according to the scan request.
 
+use std::time::Instant;
+
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::debug;
 use common_time::range::TimestampRange;
@@ -140,6 +142,7 @@ impl ScanRegion {
 
     /// Scan sequentially.
     pub(crate) fn seq_scan(self) -> Result<SeqScan> {
+        let start = Instant::now();
         let time_range = self.build_time_range_predicate();
 
         let ssts = &self.version.ssts;
@@ -197,6 +200,8 @@ impl ScanRegion {
             .with_memtables(memtables)
             .with_files(files)
             .with_cache(self.cache_manager);
+
+        debug!("Build seq scan cost: {:?}", start.elapsed());
 
         Ok(seq_scan)
     }
