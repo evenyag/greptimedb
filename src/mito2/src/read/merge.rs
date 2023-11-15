@@ -483,9 +483,11 @@ impl Node {
     ///
     /// It tries to fetch one batch from the `source`.
     async fn new(mut source: Source, metrics: &mut Metrics) -> Result<Node> {
+        let start = Instant::now();
         // Ensures batch is not empty.
         let current_batch = source.next_batch().await?.map(CompareFirst);
         metrics.num_input_rows += current_batch.as_ref().map(|b| b.0.num_rows()).unwrap_or(0);
+        metrics.fetch_cost += start.elapsed();
 
         Ok(Node {
             source,
