@@ -34,6 +34,7 @@ use common_recordbatch::adapter::RecordBatchStreamAdapter;
 use common_recordbatch::{
     EmptyRecordBatchStream, RecordBatch, RecordBatches, SendableRecordBatchStream,
 };
+use common_telemetry::info;
 use datafusion::common::Column;
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -84,6 +85,8 @@ impl DatafusionQueryEngine {
     ) -> Result<Output> {
         let mut ctx = QueryEngineContext::new(self.state.session_state(), query_ctx.clone());
 
+        info!("exec query plan start");
+
         // `create_physical_plan` will optimize logical plan internally
         let physical_plan = self.create_physical_plan(&mut ctx, &plan).await?;
         let optimized_physical_plan = self.optimize_physical_plan(&mut ctx, physical_plan)?;
@@ -93,6 +96,8 @@ impl DatafusionQueryEngine {
         } else {
             optimized_physical_plan
         };
+
+        info!("exec query plan end");
 
         Ok(Output::Stream(self.execute_stream(&ctx, &physical_plan)?))
     }

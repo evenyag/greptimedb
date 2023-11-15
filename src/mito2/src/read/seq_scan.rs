@@ -118,6 +118,7 @@ impl SeqScan {
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
         let cache_manager = self.cache_manager.clone();
+        info!("Try to create stream");
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
             let mut first = true;
@@ -149,6 +150,8 @@ impl SeqScan {
 
     /// Builds a [BoxedBatchReader] from sequential scan.
     pub async fn build_reader(&self) -> Result<BoxedBatchReader> {
+        info!("Try to build reader");
+
         // Scans all memtables and SSTs. Builds a merge reader to merge results.
         let mut builder = MergeReaderBuilder::new();
         for mem in &self.memtables {
