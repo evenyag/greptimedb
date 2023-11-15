@@ -87,9 +87,12 @@ impl BatchReader for MergeReader {
             self.metrics.scan_cost += start.elapsed();
             // Update deleted rows num.
             self.metrics.num_deleted_rows = self.batch_merger.num_deleted_rows();
+            self.metrics.filter_deleted_cost = self.batch_merger.filter_deleted_cost;
             Ok(None)
         } else {
+            let concat_start = Instant::now();
             let batch = self.batch_merger.merge_batches()?;
+            self.metrics.concat_cost += concat_start.elapsed();
             self.metrics.scan_cost += start.elapsed();
             self.metrics.num_output_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
             Ok(batch)
@@ -369,6 +372,12 @@ struct Metrics {
     num_output_rows: usize,
     /// Number of deleted rows.
     num_deleted_rows: usize,
+    /// Fetch cost
+    fetch_cost: Duration,
+    /// Concat cost
+    concat_cost: Duration,
+    /// Filter deleted cost.
+    filter_deleted_cost: Duration,
 }
 
 /// Helper to collect and merge small batches for same primary key.
@@ -379,6 +388,8 @@ struct BatchMerger {
     num_rows: usize,
     /// Number of rows deleted.
     num_deleted_rows: usize,
+    /// Filter deleted cost.
+    filter_deleted_cost: Duration,
 }
 
 impl BatchMerger {
@@ -388,6 +399,7 @@ impl BatchMerger {
             batches: Vec::new(),
             num_rows: 0,
             num_deleted_rows: 0,
+            filter_deleted_cost: Duration::ZERO,
         }
     }
 
@@ -425,7 +437,9 @@ impl BatchMerger {
             .unwrap_or(true));
 
         let num_rows = batch.num_rows();
+        let start = Instant::now();
         batch.filter_deleted()?;
+        self.filter_deleted_cost += start.elapsed();
         self.num_deleted_rows += num_rows - batch.num_rows();
         if batch.is_empty() {
             return Ok(());
@@ -506,6 +520,7 @@ impl Node {
     /// # Panics
     /// Panics if the node has reached EOF.
     async fn fetch_batch(&mut self, metrics: &mut Metrics) -> Result<Batch> {
+        let start = Instant::now();
         let current = self.current_batch.take().unwrap();
         // Ensures batch is not empty.
         self.current_batch = self.source.next_batch().await?.map(CompareFirst);
@@ -514,6 +529,7 @@ impl Node {
             .as_ref()
             .map(|b| b.0.num_rows())
             .unwrap_or(0);
+        metrics.fetch_cost += start.elapsed();
         Ok(current.0)
     }
 
