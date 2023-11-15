@@ -183,8 +183,6 @@ impl MergeScanExec {
                     plan: substrait_plan.clone(),
                 };
 
-                info!("Before do get");
-
                 let mut stream = region_query_handler
                     .do_get(request)
                     .await
@@ -193,8 +191,6 @@ impl MergeScanExec {
                         BoxedError::new(e)
                     })
                     .context(ExternalSnafu)?;
-
-                info!("After do get");
 
                 ready_timer.stop();
 
