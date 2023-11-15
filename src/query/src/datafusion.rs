@@ -89,7 +89,9 @@ impl DatafusionQueryEngine {
 
         // `create_physical_plan` will optimize logical plan internally
         let physical_plan = self.create_physical_plan(&mut ctx, &plan).await?;
+        info!("create physical finish 91 - 92");
         let optimized_physical_plan = self.optimize_physical_plan(&mut ctx, physical_plan)?;
+        info!("optimize physical finish 94 - 95");
 
         let physical_plan = if let Some(wrapper) = self.plugins.get::<PhysicalPlanWrapperRef>() {
             wrapper.wrap(optimized_physical_plan, query_ctx)
@@ -326,6 +328,8 @@ impl PhysicalPlanner for DatafusionQueryEngine {
                     .map_err(BoxedError::new)
                     .context(QueryExecutionSnafu)?;
 
+                info!("After create physical plan");
+
                 Ok(Arc::new(PhysicalPlanAdapter::new(
                     Arc::new(
                         physical_plan
@@ -379,6 +383,7 @@ impl PhysicalOptimizer for DatafusionQueryEngine {
                         .optimize(new_plan, config)
                         .context(DataFusionSnafu)?;
                 }
+                info!("plan after physical optimizers");
                 new_plan
             };
 
