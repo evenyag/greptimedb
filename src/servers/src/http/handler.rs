@@ -61,9 +61,12 @@ pub async fn sql(
         info!("Handle sql validate schema, cost: {:?}", start.elapsed());
 
         let output = sql_handler.do_query(sql, query_ctx).await;
+
+        info!("Handle sql generate stream, cost: {:?}", start.elapsed());
+
         let resp = JsonResponse::from_output(output).await;
 
-        info!("Handle sql, cost: {:?}", start.elapsed());
+        info!("Handle sql finish, cost: {:?}", start.elapsed());
 
         resp
     } else {
