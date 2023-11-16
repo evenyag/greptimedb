@@ -98,6 +98,7 @@ impl<R: ChunkReader> PageReader for CachedPageReader<R> {
             .get_one_page(self.page_key.clone(), self.page_idx)
         {
             self.page_idx += 1;
+            self.inner_reader.skip_next_page()?;
             return Ok(Some(page));
         }
 
