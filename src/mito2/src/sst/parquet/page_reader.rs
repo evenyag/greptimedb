@@ -14,48 +14,121 @@
 
 //! Parquet page reader.
 
-use std::collections::VecDeque;
+// use std::collections::VecDeque;
 
 use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::errors::Result;
+use parquet::file::reader::ChunkReader;
+use parquet::file::serialized_reader::SerializedPageReader;
+
+use crate::cache::{CacheManagerRef, PageKey};
+
+// /// A reader that reads from cached pages.
+// pub(crate) struct CachedPageReader {
+//     /// Cached pages.
+//     pages: VecDeque<Page>,
+// }
+
+// impl CachedPageReader {
+//     /// Returns a new reader from existing pages.
+//     pub(crate) fn new(pages: &[Page]) -> Self {
+//         Self {
+//             pages: pages.iter().cloned().collect(),
+//         }
+//     }
+// }
+
+// impl PageReader for CachedPageReader {
+//     fn get_next_page(&mut self) -> Result<Option<Page>> {
+//         Ok(self.pages.pop_front())
+//     }
+
+//     fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
+//         Ok(self.pages.front().map(page_to_page_meta))
+//     }
+
+//     fn skip_next_page(&mut self) -> Result<()> {
+//         // When the `SerializedPageReader` is in `SerializedPageReaderState::Pages` state, it never pops
+//         // the dictionary page. So it always return the dictionary page as the first page. See:
+//         // https://github.com/apache/arrow-rs/blob/1d6feeacebb8d0d659d493b783ba381940973745/parquet/src/file/serialized_reader.rs#L766-L770
+//         // But the `GenericColumnReader` will read the dictionary page before skipping records so it won't skip dictionary page.
+//         // So we don't need to handle the dictionary page specifically in this method.
+//         // https://github.com/apache/arrow-rs/blob/65f7be856099d389b0d0eafa9be47fad25215ee6/parquet/src/column/reader.rs#L322-L331
+//         self.pages.pop_front();
+//         Ok(())
+//     }
+// }
+
+// impl Iterator for CachedPageReader {
+//     type Item = Result<Page>;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.get_next_page().transpose()
+//     }
+// }
 
 /// A reader that reads from cached pages.
-pub(crate) struct CachedPageReader {
-    /// Cached pages.
-    pages: VecDeque<Page>,
+pub(crate) struct CachedPageReader<R: ChunkReader> {
+    page_key: PageKey,
+    cache: CacheManagerRef,
+    page_idx: usize,
+    inner_reader: SerializedPageReader<R>,
 }
 
-impl CachedPageReader {
-    /// Returns a new reader from existing pages.
-    pub(crate) fn new(pages: &[Page]) -> Self {
+impl<R: ChunkReader> CachedPageReader<R> {
+    /// Returns a new reader from cache.
+    pub(crate) fn new(
+        page_key: PageKey,
+        cache: CacheManagerRef,
+        inner_reader: SerializedPageReader<R>,
+    ) -> Self {
         Self {
-            pages: pages.iter().cloned().collect(),
+            page_key,
+            cache,
+            page_idx: 0,
+            inner_reader,
         }
     }
 }
 
-impl PageReader for CachedPageReader {
+impl<R: ChunkReader> PageReader for CachedPageReader<R> {
     fn get_next_page(&mut self) -> Result<Option<Page>> {
-        Ok(self.pages.pop_front())
+        if let Some(page) = self
+            .cache
+            .get_one_page(self.page_key.clone(), self.page_idx)
+        {
+            self.page_idx += 1;
+            return Ok(Some(page));
+        }
+
+        if let Some(page) = self.inner_reader.get_next_page()? {
+            self.cache
+                .put_one_page(self.page_key.clone(), self.page_idx, page.clone());
+            self.page_idx += 1;
+            return Ok(Some(page));
+        }
+
+        Ok(None)
     }
 
     fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
-        Ok(self.pages.front().map(page_to_page_meta))
+        if let Some(page) = self
+            .cache
+            .get_one_page(self.page_key.clone(), self.page_idx)
+        {
+            return Ok(Some(page_to_page_meta(&page)));
+        }
+
+        self.inner_reader.peek_next_page()
     }
 
     fn skip_next_page(&mut self) -> Result<()> {
-        // When the `SerializedPageReader` is in `SerializedPageReaderState::Pages` state, it never pops
-        // the dictionary page. So it always return the dictionary page as the first page. See:
-        // https://github.com/apache/arrow-rs/blob/1d6feeacebb8d0d659d493b783ba381940973745/parquet/src/file/serialized_reader.rs#L766-L770
-        // But the `GenericColumnReader` will read the dictionary page before skipping records so it won't skip dictionary page.
-        // So we don't need to handle the dictionary page specifically in this method.
-        // https://github.com/apache/arrow-rs/blob/65f7be856099d389b0d0eafa9be47fad25215ee6/parquet/src/column/reader.rs#L322-L331
-        self.pages.pop_front();
-        Ok(())
+        self.page_idx += 1;
+        self.inner_reader.skip_next_page()
     }
 }
 
-impl Iterator for CachedPageReader {
+impl<R: ChunkReader> Iterator for CachedPageReader<R> {
     type Item = Result<Page>;
 
     fn next(&mut self) -> Option<Self::Item> {

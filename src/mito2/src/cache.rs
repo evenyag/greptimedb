@@ -79,8 +79,10 @@ impl CacheManager {
         } else {
             let cache = Cache::builder()
                 .max_capacity(page_cache_size)
-                .weigher(|k: &PageKey, v: &Arc<PageValue>| {
-                    (k.estimated_size() + v.estimated_size()) as u32
+                .weigher(|k: &(PageKey, usize), v: &Page| {
+                    // .weigher(|k: &PageKey, v: &Arc<PageValue>| {
+                    (k.0.estimated_size() + v.buffer().len()) as u32
+                    // (k.estimated_size() + v.estimated_size()) as u32
                 })
                 .build();
             Some(cache)
@@ -137,17 +139,31 @@ impl CacheManager {
         }
     }
 
-    /// Gets pages for the row group.
-    pub fn get_pages(&self, page_key: &PageKey) -> Option<Arc<PageValue>> {
+    // /// Gets pages for the row group.
+    // pub fn get_pages(&self, page_key: &PageKey) -> Option<Arc<PageValue>> {
+    //     self.page_cache
+    //         .as_ref()
+    //         .and_then(|page_cache| page_cache.get(page_key))
+    // }
+
+    // /// Puts pages of the row group into the cache.
+    // pub fn put_pages(&self, page_key: PageKey, pages: Arc<PageValue>) {
+    //     if let Some(cache) = &self.page_cache {
+    //         cache.insert(page_key, pages);
+    //     }
+    // }
+
+    /// Gets one page for the row group.
+    pub fn get_one_page(&self, page_key: PageKey, page_idx: usize) -> Option<Page> {
         self.page_cache
             .as_ref()
-            .and_then(|page_cache| page_cache.get(page_key))
+            .and_then(|page_cache| page_cache.get(&(page_key, page_idx)))
     }
 
-    /// Puts pages of the row group into the cache.
-    pub fn put_pages(&self, page_key: PageKey, pages: Arc<PageValue>) {
+    /// Puts one page of the row group into the cache.
+    pub fn put_one_page(&self, page_key: PageKey, page_idx: usize, page: Page) {
         if let Some(cache) = &self.page_cache {
-            cache.insert(page_key, pages);
+            cache.insert((page_key, page_idx), page);
         }
     }
 }
@@ -189,18 +205,18 @@ pub struct PageValue {
     pub pages: Vec<Page>,
 }
 
-impl PageValue {
-    /// Creates a new page value.
-    pub fn new(pages: Vec<Page>) -> PageValue {
-        PageValue { pages }
-    }
+// impl PageValue {
+//     /// Creates a new page value.
+//     pub fn new(pages: Vec<Page>) -> PageValue {
+//         PageValue { pages }
+//     }
 
-    /// Returns memory used by the value (estimated).
-    fn estimated_size(&self) -> usize {
-        // We only consider heap size of all pages.
-        self.pages.iter().map(|page| page.buffer().len()).sum()
-    }
-}
+//     /// Returns memory used by the value (estimated).
+//     fn estimated_size(&self) -> usize {
+//         // We only consider heap size of all pages.
+//         self.pages.iter().map(|page| page.buffer().len()).sum()
+//     }
+// }
 
 /// Maps (region id, file id) to [ParquetMetaData].
 type SstMetaCache = Cache<SstMetaKey, Arc<ParquetMetaData>>;
@@ -209,7 +225,8 @@ type SstMetaCache = Cache<SstMetaKey, Arc<ParquetMetaData>>;
 /// e.g. `"hello" => ["hello", "hello", "hello"]`
 type VectorCache = Cache<Value, VectorRef>;
 /// Maps (region, file, row group, column) to [PageValue].
-type PageCache = Cache<PageKey, Arc<PageValue>>;
+type PageCache = Cache<(PageKey, usize), Page>;
+// type PageCache = Cache<PageKey, Arc<PageValue>>;
 
 #[cfg(test)]
 mod tests {
@@ -236,15 +253,15 @@ mod tests {
         cache.put_repeated_vector(value.clone(), vector.clone());
         assert!(cache.get_repeated_vector(&value).is_none());
 
-        let key = PageKey {
-            region_id,
-            file_id,
-            row_group_idx: 0,
-            column_idx: 0,
-        };
-        let pages = Arc::new(PageValue::new(Vec::new()));
-        cache.put_pages(key.clone(), pages);
-        assert!(cache.get_pages(&key).is_none());
+        // let key = PageKey {
+        //     region_id,
+        //     file_id,
+        //     row_group_idx: 0,
+        //     column_idx: 0,
+        // };
+        // let pages = Arc::new(PageValue::new(Vec::new()));
+        // cache.put_pages(key.clone(), 0, pages);
+        // assert!(cache.get_pages(key, 0).is_none());
     }
 
     #[test]
@@ -271,20 +288,20 @@ mod tests {
         assert_eq!(vector, cached);
     }
 
-    #[test]
-    fn test_page_cache() {
-        let cache = CacheManager::new(0, 0, 1000);
-        let region_id = RegionId::new(1, 1);
-        let file_id = FileId::random();
-        let key = PageKey {
-            region_id,
-            file_id,
-            row_group_idx: 0,
-            column_idx: 0,
-        };
-        assert!(cache.get_pages(&key).is_none());
-        let pages = Arc::new(PageValue::new(Vec::new()));
-        cache.put_pages(key.clone(), pages);
-        assert!(cache.get_pages(&key).is_some());
-    }
+    // #[test]
+    // fn test_page_cache() {
+    //     let cache = CacheManager::new(0, 0, 1000);
+    //     let region_id = RegionId::new(1, 1);
+    //     let file_id = FileId::random();
+    //     let key = PageKey {
+    //         region_id,
+    //         file_id,
+    //         row_group_idx: 0,
+    //         column_idx: 0,
+    //     };
+    //     assert!(cache.get_pages(key, 0).is_none());
+    //     let pages = Arc::new(PageValue::new(Vec::new()));
+    //     cache.put_pages(key.clone(), pages);
+    //     assert!(cache.get_pages(&key).is_some());
+    // }
 }

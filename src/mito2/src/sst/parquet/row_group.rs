@@ -142,7 +142,7 @@ impl<'a> InMemoryRowGroup<'a> {
             }
         } else {
             // Now we only use cache in dense chunk data.
-            self.fetch_pages_from_cache(projection);
+            // self.fetch_pages_from_cache(projection);
 
             let fetch_ranges: Vec<_> = self
                 .column_chunks
@@ -189,31 +189,31 @@ impl<'a> InMemoryRowGroup<'a> {
         Ok(())
     }
 
-    /// Fetches pages for columns if cache is enabled.
-    fn fetch_pages_from_cache(&mut self, projection: &ProjectionMask) {
-        self.column_chunks
-            .iter()
-            .enumerate()
-            .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
-            .for_each(|(idx, _chunk)| {
-                if let Some(cache) = &self.cache_manager {
-                    let page_key = PageKey {
-                        region_id: self.region_id,
-                        file_id: self.file_id,
-                        row_group_idx: self.row_group_idx,
-                        column_idx: idx,
-                    };
-                    self.column_cached_pages[idx] = cache.get_pages(&page_key);
-                }
-            });
-    }
+    // /// Fetches pages for columns if cache is enabled.
+    // fn fetch_pages_from_cache(&mut self, projection: &ProjectionMask) {
+    //     self.column_chunks
+    //         .iter()
+    //         .enumerate()
+    //         .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
+    //         .for_each(|(idx, _chunk)| {
+    //             if let Some(cache) = &self.cache_manager {
+    //                 let page_key = PageKey {
+    //                     region_id: self.region_id,
+    //                     file_id: self.file_id,
+    //                     row_group_idx: self.row_group_idx,
+    //                     column_idx: idx,
+    //                 };
+    //                 self.column_cached_pages[idx] = cache.get_pages(&page_key);
+    //             }
+    //         });
+    // }
 
     /// Creates a page reader to read column at `i`.
     fn column_page_reader(&self, i: usize) -> Result<Box<dyn PageReader>> {
-        if let Some(cached_pages) = &self.column_cached_pages[i] {
-            // Already in cache.
-            return Ok(Box::new(CachedPageReader::new(&cached_pages.pages)));
-        }
+        // if let Some(cached_pages) = &self.column_cached_pages[i] {
+        //     // Already in cache.
+        //     return Ok(Box::new(CachedPageReader::new(&cached_pages.pages)));
+        // }
 
         // Cache miss.
         let page_reader = match &self.column_chunks[i] {
@@ -238,18 +238,21 @@ impl<'a> InMemoryRowGroup<'a> {
             return Ok(Box::new(page_reader));
         };
 
-        // We collect all pages and put them into the cache.
-        let pages = page_reader.collect::<Result<Vec<_>>>()?;
-        let page_value = Arc::new(PageValue::new(pages));
+        // // We collect all pages and put them into the cache.
+        // let pages = page_reader.collect::<Result<Vec<_>>>()?;
+        // let page_value = Arc::new(PageValue::new(pages));
         let page_key = PageKey {
             region_id: self.region_id,
             file_id: self.file_id,
             row_group_idx: self.row_group_idx,
             column_idx: i,
         };
-        cache.put_pages(page_key, page_value.clone());
+        // cache.put_pages(page_key, page_value.clone());
 
-        Ok(Box::new(CachedPageReader::new(&page_value.pages)))
+        // Ok(Box::new(CachedPageReader::new(&page_value.pages)))
+
+        let reader = CachedPageReader::new(page_key, cache.clone(), page_reader);
+        Ok(Box::new(reader))
     }
 }
 
