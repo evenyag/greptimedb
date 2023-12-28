@@ -58,8 +58,6 @@ pub struct CacheManager {
     /// Cache for SST pages.
     page_cache: Option<PageCache>,
     /// A Cache for writing files to object stores.
-    // TODO(yingwen): Remove this once the cache is ready.
-    #[allow(unused)]
     write_cache: Option<WriteCacheRef>,
 }
 
@@ -193,6 +191,11 @@ impl CacheManager {
                 .add(page_cache_weight(&page_key, &pages).into());
             cache.insert(page_key, pages);
         }
+    }
+
+    /// Gets the the write cache.
+    pub(crate) fn write_cache(&self) -> Option<&WriteCacheRef> {
+        self.write_cache.as_ref()
     }
 }
 

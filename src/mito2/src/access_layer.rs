@@ -74,15 +74,18 @@ impl AccessLayer {
         ParquetReaderBuilder::new(self.region_dir.clone(), file, self.object_store.clone())
     }
 
-    // Returns a [UploadPartWriter] to upload.
+    /// Returns a [UploadPartWriter] to upload.
+    ///
+    /// If write cache is enabled, it writes to the local store.
     pub(crate) fn upload_part_writer(
         &self,
         metadata: RegionMetadataRef,
-        _cache_manager: &CacheManagerRef,
+        cache_manager: &CacheManagerRef,
     ) -> UploadPartWriter {
-        // TODO(yingwen): Use local store in the cache manager once the cache is ready.
+        let file_cache = cache_manager.write_cache().map(|cache| cache.file_cache());
         UploadPartWriter::new(self.object_store.clone(), metadata)
             .with_region_dir(self.region_dir.clone())
+            .with_file_cache(file_cache)
     }
 }
 

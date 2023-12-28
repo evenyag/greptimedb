@@ -14,6 +14,7 @@
 
 //! A cache for files.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use common_base::readable_size::ReadableSize;
@@ -47,6 +48,8 @@ pub(crate) struct FileCache {
     /// File id is enough to identity a file uniquely.
     memory_index: Cache<IndexKey, IndexValue>,
 }
+
+pub type FileCacheRef = Arc<FileCache>;
 
 impl FileCache {
     /// Creates a new file cache.
@@ -113,7 +116,7 @@ impl FileCache {
             return None;
         }
 
-        let file_path = cache_file_path(&self.file_dir, key);
+        let file_path = self.cache_file_path(key);
         match self.local_store.reader(&file_path).await {
             Ok(reader) => {
                 CACHE_HIT.with_label_values(&[FILE_TYPE]).inc();
@@ -133,7 +136,7 @@ impl FileCache {
 
     /// Removes a file from the cache explicitly.
     pub(crate) async fn remove(&self, key: IndexKey) {
-        let file_path = cache_file_path(&self.file_dir, key);
+        let file_path = self.cache_file_path(key);
         if let Err(e) = self.local_store.delete(&file_path).await {
             warn!(e; "Failed to delete a cached file {}", file_path);
         }
@@ -178,6 +181,16 @@ impl FileCache {
         );
 
         Ok(())
+    }
+
+    /// Returns the cache file path for the key.
+    pub(crate) fn cache_file_path(&self, key: IndexKey) -> String {
+        cache_file_path(&self.file_dir, key)
+    }
+
+    /// Returns the local store of the file cache.
+    pub(crate) fn local_store(&self) -> ObjectStore {
+        self.local_store.clone()
     }
 }
 

@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use common_base::readable_size::ReadableSize;
 use object_store::manager::ObjectStoreManagerRef;
 use object_store::ObjectStore;
 use store_api::metadata::RegionMetadataRef;
@@ -23,6 +24,7 @@ use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::mpsc::Sender;
 
 use crate::access_layer::sst_file_path;
+use crate::cache::file_cache::{FileCache, FileCacheRef};
 use crate::error::Result;
 use crate::read::Source;
 use crate::request::WorkerRequest;
@@ -35,8 +37,8 @@ use crate::wal::EntryId;
 ///
 /// It keeps files in local disk and then sends files to object stores.
 pub(crate) struct WriteCache {
-    /// Local object storage to store files to upload.
-    local_store: ObjectStore,
+    /// Local file cache.
+    file_cache: FileCacheRef,
     /// Object store manager.
     object_store_manager: ObjectStoreManagerRef,
 }
@@ -51,9 +53,13 @@ impl WriteCache {
         local_store: ObjectStore,
         object_store_manager: ObjectStoreManagerRef,
     ) -> Self {
-        // TODO(yingwen): Cache capacity.
+        // TODO(yingwen): Expose cache capacity and cache path config.
         Self {
-            local_store,
+            file_cache: Arc::new(FileCache::new(
+                local_store,
+                "cache".to_string(),
+                ReadableSize::mb(512),
+            )),
             object_store_manager,
         }
     }
@@ -62,6 +68,11 @@ impl WriteCache {
     pub(crate) async fn upload(&self, upload: Upload) -> Result<()> {
         // Add the upload metadata to the manifest.
         unimplemented!()
+    }
+
+    /// Returns the file cache of the write cache.
+    pub(crate) fn file_cache(&self) -> FileCacheRef {
+        self.file_cache.clone()
     }
 }
 
@@ -85,8 +96,8 @@ pub(crate) struct UploadPart {
 
 /// Writer to build a upload part.
 pub(crate) struct UploadPartWriter {
-    /// Local object store to cache SSTs.
-    local_store: ObjectStore,
+    /// Remote object store to write.
+    remote_store: ObjectStore,
     /// Metadata of the region.
     metadata: RegionMetadataRef,
     /// Directory of the region.
@@ -95,17 +106,20 @@ pub(crate) struct UploadPartWriter {
     file_metas: Vec<FileMeta>,
     /// Target storage of SSTs.
     storage: Option<String>,
+    /// Local file cache.
+    file_cache: Option<FileCacheRef>,
 }
 
 impl UploadPartWriter {
     /// Creates a new writer.
-    pub(crate) fn new(local_store: ObjectStore, metadata: RegionMetadataRef) -> Self {
+    pub(crate) fn new(remote_store: ObjectStore, metadata: RegionMetadataRef) -> Self {
         Self {
-            local_store,
+            remote_store,
             metadata,
             region_dir: String::new(),
             file_metas: Vec::new(),
             storage: None,
+            file_cache: None,
         }
     }
 
@@ -123,15 +137,36 @@ impl UploadPartWriter {
         self
     }
 
+    /// Sets the file cache for the part.
+    #[must_use]
+    pub(crate) fn with_file_cache(mut self, cache: Option<FileCacheRef>) -> Self {
+        self.file_cache = cache;
+        self
+    }
+
     /// Reserve capacity for `additional` files.
     pub(crate) fn reserve_capacity(&mut self, additional: usize) {
         self.file_metas.reserve(additional);
     }
 
     /// Builds a new parquet writer to write to this part.
+    ///
+    /// If the file cache is enabled, it writes to the local store of the file cache.
+    /// It doesn't add the file to the index of the cache to avoid the cache removing
+    /// it before we uploading the file.
     pub(crate) fn new_sst_writer(&self, file_id: FileId) -> ParquetWriter {
-        let path = sst_file_path(&self.region_dir, file_id);
-        ParquetWriter::new(path, self.metadata.clone(), self.local_store.clone())
+        match self.file_cache.as_ref() {
+            Some(cache) => {
+                // File cache is enabled, write to the local store.
+                let path = cache.cache_file_path((self.metadata.region_id, file_id));
+                ParquetWriter::new(path, self.metadata.clone(), cache.local_store())
+            }
+            None => {
+                // File cache is disabled, write to the remote store.
+                let path = sst_file_path(&self.region_dir, file_id);
+                ParquetWriter::new(path, self.metadata.clone(), self.remote_store.clone())
+            }
+        }
     }
 
     /// Adds a SST to this part.
@@ -156,6 +191,14 @@ impl UploadPartWriter {
             region_dir: self.region_dir,
             file_metas: self.file_metas,
             storage: self.storage,
+        }
+    }
+
+    /// Returns the path to store the file.
+    fn file_path(&self, file_id: FileId) -> String {
+        match self.file_cache.as_ref() {
+            Some(cache) => cache.cache_file_path((self.metadata.region_id, file_id)),
+            None => sst_file_path(&self.region_dir, file_id),
         }
     }
 }
