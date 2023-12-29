@@ -19,13 +19,14 @@ use std::sync::Arc;
 use common_base::readable_size::ReadableSize;
 use object_store::manager::ObjectStoreManagerRef;
 use object_store::ObjectStore;
+use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::mpsc::Sender;
 
 use crate::access_layer::sst_file_path;
-use crate::cache::file_cache::{FileCache, FileCacheRef};
-use crate::error::Result;
+use crate::cache::file_cache::{FileCache, FileCacheRef, IndexValue};
+use crate::error::{CopySstSnafu, ObjectStoreNotFoundSnafu, OpenDalSnafu, Result};
 use crate::read::Source;
 use crate::request::WorkerRequest;
 use crate::sst::file::{FileId, FileMeta, Level};
@@ -66,13 +67,71 @@ impl WriteCache {
 
     /// Adds files to the cache.
     pub(crate) async fn upload(&self, upload: Upload) -> Result<()> {
-        // Add the upload metadata to the manifest.
-        unimplemented!()
+        // Uploads each parts.
+        for part in &upload.parts {
+            self.upload_part(part).await?;
+        }
+
+        // Add files to the file cache.
+        for part in &upload.parts {
+            for meta in &part.file_metas {
+                self.file_cache
+                    .put(
+                        (part.region_id, meta.file_id),
+                        IndexValue {
+                            file_size: meta.file_size as u32,
+                        },
+                    )
+                    .await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the file cache of the write cache.
     pub(crate) fn file_cache(&self) -> FileCacheRef {
         self.file_cache.clone()
+    }
+
+    /// Uploads a part to remote.
+    async fn upload_part(&self, part: &UploadPart) -> Result<()> {
+        for meta in &part.file_metas {
+            let remote = self.remote_store(part.storage.as_ref())?;
+            let local = self.file_cache.local_store();
+
+            let path = self
+                .file_cache
+                .cache_file_path((part.region_id, meta.file_id));
+            let reader = local.reader(&path).await.context(OpenDalSnafu)?;
+
+            // TODO(yingwen): Reuse DEFAULT_WRITE_BUFFER_SIZE.
+            let mut writer = remote
+                .writer_with(&sst_file_path(&part.region_dir, meta.file_id))
+                .buffer(5 * 1024 * 1024)
+                .await
+                .context(OpenDalSnafu)?;
+
+            futures::io::copy(reader, &mut writer)
+                .await
+                .context(CopySstSnafu {
+                    region_id: meta.region_id,
+                    file_id: meta.file_id,
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn remote_store(&self, storage: Option<&String>) -> Result<ObjectStore> {
+        match storage {
+            Some(name) => self
+                .object_store_manager
+                .find(name)
+                .cloned()
+                .context(ObjectStoreNotFoundSnafu { object_store: name }),
+            None => Ok(self.object_store_manager.default_object_store().clone()),
+        }
     }
 }
 
@@ -80,6 +139,13 @@ impl WriteCache {
 pub(crate) struct Upload {
     /// Parts to upload.
     pub(crate) parts: Vec<UploadPart>,
+}
+
+impl Upload {
+    /// Creates a new upload from parts.
+    pub(crate) fn new(parts: Vec<UploadPart>) -> Upload {
+        Upload { parts }
+    }
 }
 
 /// Metadata of SSTs to upload together.

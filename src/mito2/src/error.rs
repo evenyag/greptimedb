@@ -423,6 +423,15 @@ pub enum Error {
         #[snafu(source)]
         error: parquet::errors::ParquetError,
     },
+
+    #[snafu(display("Failed to copy SST, region_id: {}, file_id: {}", region_id, file_id))]
+    CopySst {
+        region_id: RegionId,
+        file_id: FileId,
+        location: Location,
+        #[snafu(source)]
+        error: std::io::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -504,6 +513,7 @@ impl ErrorExt for Error {
             JsonOptions { .. } => StatusCode::InvalidArguments,
             EmptyRegionDir { .. } | EmptyManifestDir { .. } => StatusCode::RegionNotFound,
             ArrowReader { .. } => StatusCode::StorageUnavailable,
+            CopySst { .. } => StatusCode::StorageUnavailable,
         }
     }
 
