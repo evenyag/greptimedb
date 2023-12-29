@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use common_telemetry::debug;
 use common_time::range::TimestampRange;
 use datatypes::arrow::record_batch::RecordBatch;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, Reader};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{parquet_to_arrow_field_levels, FieldLevels, ProjectionMask};
@@ -118,11 +118,7 @@ impl ParquetReaderBuilder {
 
         let file_path = self.file_handle.file_path(&self.file_dir);
         // Now we create a reader to read the whole file.
-        let reader = self
-            .object_store
-            .reader(&file_path)
-            .await
-            .context(OpenDalSnafu)?;
+        let reader = self.new_reader(&file_path).await?;
         let mut reader = BufReader::new(reader);
         // Loads parquet metadata of the file.
         let parquet_meta = self.read_parquet_metadata(&mut reader, &file_path).await?;
@@ -225,6 +221,28 @@ impl ParquetReaderBuilder {
             })?;
 
         RegionMetadata::from_json(json).context(InvalidMetadataSnafu)
+    }
+
+    /// Returns a reader to read the file.
+    async fn new_reader(&self, file_path: &str) -> Result<Reader> {
+        if let Some(write_cache) = self
+            .cache_manager
+            .as_ref()
+            .and_then(|manager| manager.write_cache())
+        {
+            if let Some(reader) = write_cache
+                .file_cache()
+                .reader((self.file_handle.region_id(), self.file_handle.file_id()))
+                .await
+            {
+                return Ok(reader);
+            }
+        }
+
+        self.object_store
+            .reader(&file_path)
+            .await
+            .context(OpenDalSnafu)
     }
 
     /// Reads parquet metadata of specific file.
