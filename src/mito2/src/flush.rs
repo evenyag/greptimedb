@@ -25,7 +25,7 @@ use strum::IntoStaticStr;
 use tokio::sync::mpsc;
 
 use crate::access_layer::AccessLayerRef;
-use crate::cache::write_cache::UploadPartWriter;
+use crate::cache::write_cache::{Upload, UploadPartWriter};
 use crate::cache::CacheManagerRef;
 use crate::config::MitoConfig;
 use crate::error::{
@@ -249,16 +249,13 @@ impl RegionFlushTask {
 
         let version = &version_data.version;
         // Prepare a upload part.
-        let mut writer = self
+        let writer = self
             .access_layer
             .upload_part_writer(version.metadata.clone(), &self.cache_manager)
             .with_storage(version.options.storage.clone());
 
-        let worker_request = match self
-            .flush_memtables(&version_data.version, &mut writer)
-            .await
-        {
-            Ok(()) => {
+        let worker_request = match self.flush_memtables(&version_data.version, writer).await {
+            Ok(file_metas) => {
                 let memtables_to_remove = version_data
                     .version
                     .memtables
@@ -266,11 +263,10 @@ impl RegionFlushTask {
                     .iter()
                     .map(|m| m.id())
                     .collect();
-                let upload_part = writer.finish();
 
                 let flush_finished = FlushFinished {
                     region_id: self.region_id,
-                    file_metas: upload_part.file_metas,
+                    file_metas: file_metas,
                     // The last entry has been flushed.
                     flushed_entry_id: version_data.last_entry_id,
                     flushed_sequence: version_data.committed_sequence,
@@ -304,8 +300,8 @@ impl RegionFlushTask {
     async fn flush_memtables(
         &self,
         version: &VersionRef,
-        part_writer: &mut UploadPartWriter,
-    ) -> Result<()> {
+        mut part_writer: UploadPartWriter,
+    ) -> Result<Vec<FileMeta>> {
         let timer = FLUSH_ELAPSED
             .with_label_values(&["flush_memtables"])
             .start_timer();
@@ -360,6 +356,14 @@ impl RegionFlushTask {
             .iter()
             .map(|f| f.file_id)
             .collect();
+        let upload_part = part_writer.finish();
+        let file_metas = upload_part.file_metas.clone();
+        // We submit the upload part directly. In the future we can collect multiple upload
+        // part together.
+        if let Some(write_cache) = self.cache_manager.write_cache() {
+            // Uploads to the remote.
+            write_cache.upload(Upload::new(vec![upload_part])).await?
+        }
         info!(
             "Successfully flush memtables, region: {}, reason: {}, files: {:?}, cost: {:?}s",
             self.region_id,
@@ -368,7 +372,7 @@ impl RegionFlushTask {
             timer.stop_and_record(),
         );
 
-        Ok(())
+        Ok(file_metas)
     }
 
     /// Notify flush job status.

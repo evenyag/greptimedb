@@ -28,7 +28,7 @@ use store_api::storage::RegionId;
 use tokio::sync::mpsc;
 
 use crate::access_layer::AccessLayerRef;
-use crate::cache::write_cache::UploadPart;
+use crate::cache::write_cache::{Upload, UploadPart};
 use crate::cache::CacheManagerRef;
 use crate::compaction::picker::{CompactionTask, Picker};
 use crate::compaction::CompactionRequest;
@@ -359,8 +359,15 @@ impl TwcsCompactionTask {
             merge_timer.stop_and_discard();
             e
         })?;
+        let file_metas = part.file_metas.clone();
+
+        // Upload the file.
+        if let Some(write_cache) = self.cache_manager.write_cache() {
+            write_cache.upload(Upload::new(vec![part])).await?;
+        }
+
         compacted.extend(self.expired_ssts.iter().map(FileHandle::meta));
-        Ok((part.file_metas, compacted))
+        Ok((file_metas, compacted))
     }
 
     /// Handles compaction failure, notifies all waiters.
