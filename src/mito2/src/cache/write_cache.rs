@@ -120,6 +120,9 @@ impl WriteCache {
                     file_id: meta.file_id,
                 })?;
 
+            // Flushes the object.
+            writer.close().await.context(OpenDalSnafu)?;
+
             common_telemetry::info!(
                 "Upload file to remote, file: {}, upload_path: {}",
                 path,
