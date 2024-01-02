@@ -29,6 +29,8 @@ use parquet::file::serialized_reader::SerializedPageReader;
 use parquet::format::PageLocation;
 use store_api::storage::RegionId;
 
+use crate::cache::file_cache::IndexKey;
+use crate::cache::write_cache::WriteCacheRef;
 use crate::cache::{CacheManagerRef, PageKey, PageValue};
 use crate::sst::file::FileId;
 use crate::sst::parquet::page_reader::CachedPageReader;
@@ -126,10 +128,17 @@ impl<'a> InMemoryRowGroup<'a> {
                     ranges
                 })
                 .collect();
-            let mut chunk_data =
-                fetch_byte_ranges(self.file_path, self.object_store.clone(), fetch_ranges)
-                    .await?
-                    .into_iter();
+            let mut chunk_data = fetch_byte_ranges(
+                self.file_path,
+                self.object_store.clone(),
+                fetch_ranges,
+                (self.region_id, self.file_id),
+                self.cache_manager
+                    .as_ref()
+                    .and_then(|manager| manager.write_cache()),
+            )
+            .await?
+            .into_iter();
 
             let mut page_start_offsets = page_start_offsets.into_iter();
 
@@ -175,10 +184,17 @@ impl<'a> InMemoryRowGroup<'a> {
                 return Ok(());
             }
 
-            let mut chunk_data =
-                fetch_byte_ranges(self.file_path, self.object_store.clone(), fetch_ranges)
-                    .await?
-                    .into_iter();
+            let mut chunk_data = fetch_byte_ranges(
+                self.file_path,
+                self.object_store.clone(),
+                fetch_ranges,
+                (self.region_id, self.file_id),
+                self.cache_manager
+                    .as_ref()
+                    .and_then(|manager| manager.write_cache()),
+            )
+            .await?
+            .into_iter();
 
             for (idx, (chunk, cached_pages)) in self
                 .column_chunks
@@ -357,16 +373,46 @@ async fn fetch_byte_ranges(
     file_path: &str,
     object_store: ObjectStore,
     ranges: Vec<Range<usize>>,
+    key: IndexKey,
+    write_cache: Option<&WriteCacheRef>,
 ) -> Result<Vec<Bytes>> {
     let ranges: Vec<_> = ranges
         .iter()
         .map(|range| range.start as u64..range.end as u64)
         .collect();
+    if let Some(pages) = fetch_from_write_cache(key, write_cache, &ranges).await {
+        return Ok(pages);
+    }
+
     if object_store.info().full_capability().blocking {
         fetch_ranges_seq(file_path, object_store, ranges).await
     } else {
         fetch_ranges_concurrent(file_path, object_store, ranges).await
     }
+}
+
+async fn fetch_from_write_cache(
+    key: IndexKey,
+    write_cache: Option<&WriteCacheRef>,
+    ranges: &[Range<u64>],
+) -> Option<Vec<Bytes>> {
+    if let Some(write_cache) = write_cache {
+        let mut pages = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let Some(page) = write_cache
+                .file_cache()
+                .read_range(key, range.clone())
+                .await
+            else {
+                return None;
+            };
+
+            pages.push(page.into());
+        }
+
+        return Some(pages);
+    }
+    None
 }
 
 /// Fetches data from object store sequentially

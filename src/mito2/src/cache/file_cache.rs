@@ -14,6 +14,7 @@
 
 //! A cache for files.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -121,6 +122,35 @@ impl FileCache {
             Ok(reader) => {
                 CACHE_HIT.with_label_values(&[FILE_TYPE]).inc();
                 Some(reader)
+            }
+            Err(e) => {
+                if e.kind() != ErrorKind::NotFound {
+                    warn!("Failed to get file for key {:?}, err: {}", key, e);
+                }
+                // We removes the file from the index.
+                self.memory_index.remove(&key).await;
+                CACHE_MISS.with_label_values(&[FILE_TYPE]).inc();
+                None
+            }
+        }
+    }
+
+    /// Reads a range from the cache.
+    pub(crate) async fn read_range(
+        &self,
+        key: IndexKey,
+        range: impl RangeBounds<u64>,
+    ) -> Option<Vec<u8>> {
+        if !self.memory_index.contains_key(&key) {
+            CACHE_MISS.with_label_values(&[FILE_TYPE]).inc();
+            return None;
+        }
+
+        let file_path = self.cache_file_path(key);
+        match self.local_store.read_with(&file_path).range(range).await {
+            Ok(bytes) => {
+                CACHE_HIT.with_label_values(&[FILE_TYPE]).inc();
+                Some(bytes)
             }
             Err(e) => {
                 if e.kind() != ErrorKind::NotFound {
