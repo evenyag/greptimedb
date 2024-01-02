@@ -21,48 +21,45 @@ use object_store::manager::ObjectStoreManagerRef;
 use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{RegionId, SequenceNumber};
-use tokio::sync::mpsc::Sender;
+use store_api::storage::{RegionId};
 
 use crate::access_layer::sst_file_path;
 use crate::cache::file_cache::{FileCache, FileCacheRef, IndexValue};
 use crate::error::{CopySstSnafu, ObjectStoreNotFoundSnafu, OpenDalSnafu, Result};
-use crate::read::Source;
-use crate::request::WorkerRequest;
-use crate::sst::file::{FileId, FileMeta, Level};
+use crate::sst::file::{FileId, FileMeta};
 use crate::sst::parquet::writer::ParquetWriter;
-use crate::sst::parquet::WriteOptions;
-use crate::wal::EntryId;
 
 /// A cache for uploading files to remote object stores.
 ///
 /// It keeps files in local disk and then sends files to object stores.
-pub(crate) struct WriteCache {
+pub struct WriteCache {
     /// Local file cache.
     file_cache: FileCacheRef,
     /// Object store manager.
     object_store_manager: ObjectStoreManagerRef,
 }
 
-pub(crate) type WriteCacheRef = Arc<WriteCache>;
+pub type WriteCacheRef = Arc<WriteCache>;
 
 impl WriteCache {
     // TODO(yingwen): Maybe pass cache path instead of local store.
     /// Create the cache with a `local_store` to cache files and a
     /// `object_store_manager` for all object stores.
-    pub(crate) fn new(
-        local_store: ObjectStore,
-        object_store_manager: ObjectStoreManagerRef,
-    ) -> Self {
+    pub fn new(local_store: ObjectStore, object_store_manager: ObjectStoreManagerRef) -> Self {
         // TODO(yingwen): Expose cache capacity and cache path config.
         Self {
             file_cache: Arc::new(FileCache::new(
                 local_store,
                 "cache".to_string(),
-                ReadableSize::mb(512),
+                ReadableSize::gb(4),
             )),
             object_store_manager,
         }
+    }
+
+    /// Recovers the write cache.
+    pub async fn recover(&self) -> Result<()> {
+        self.file_cache.recover().await
     }
 
     /// Adds files to the cache.
@@ -257,14 +254,6 @@ impl UploadPartWriter {
             region_dir: self.region_dir,
             file_metas: self.file_metas,
             storage: self.storage,
-        }
-    }
-
-    /// Returns the path to store the file.
-    fn file_path(&self, file_id: FileId) -> String {
-        match self.file_cache.as_ref() {
-            Some(cache) => cache.cache_file_path((self.metadata.region_id, file_id)),
-            None => sst_file_path(&self.region_dir, file_id),
         }
     }
 }

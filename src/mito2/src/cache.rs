@@ -16,12 +16,10 @@
 
 mod cache_size;
 // TODO(yingwen): Remove this after the write cache is ready.
-#[allow(unused)]
 pub(crate) mod file_cache;
 #[cfg(test)]
 pub(crate) mod test_util;
-#[allow(unused)]
-pub(crate) mod write_cache;
+pub mod write_cache;
 
 use std::mem;
 use std::sync::Arc;
@@ -122,6 +120,12 @@ impl CacheManager {
         }
     }
 
+    /// Attaches the write cache.
+    pub fn with_write_cache(mut self, write_cache: Option<WriteCacheRef>) -> CacheManager {
+        self.write_cache = write_cache;
+        self
+    }
+
     /// Gets cached [ParquetMetaData].
     pub fn get_parquet_meta_data(
         &self,
@@ -152,6 +156,7 @@ impl CacheManager {
 
     /// Removes [ParquetMetaData] from the cache.
     pub fn remove_parquet_meta_data(&self, region_id: RegionId, file_id: FileId) {
+        // TODO(yingwen): Remove from write cache.
         if let Some(cache) = &self.sst_meta_cache {
             cache.remove(&SstMetaKey(region_id, file_id));
         }

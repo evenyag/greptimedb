@@ -35,6 +35,8 @@ use common_runtime::JoinHandle;
 use common_telemetry::{error, info, warn};
 use futures::future::try_join_all;
 use object_store::manager::ObjectStoreManagerRef;
+use object_store::services::Fs;
+use object_store::ObjectStore;
 use snafu::{ensure, ResultExt};
 use store_api::logstore::LogStore;
 use store_api::region_engine::SetReadonlyResponse;
@@ -42,6 +44,7 @@ use store_api::storage::RegionId;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::cache::write_cache::WriteCache;
 use crate::cache::{CacheManager, CacheManagerRef};
 use crate::compaction::CompactionScheduler;
 use crate::config::MitoConfig;
@@ -119,12 +122,29 @@ impl WorkerGroup {
         let write_buffer_manager = Arc::new(WriteBufferManagerImpl::new(
             config.global_write_buffer_size.as_bytes() as usize,
         ));
+        let write_cache = if config.write_cache_path.is_empty() {
+            // FIXME(yingwen): No unwrap.
+            // FIXME(yingwen): recover the write cache.
+            let mut fs = Fs::default();
+            fs.root(&config.write_cache_path);
+            let local_store = ObjectStore::new(fs).unwrap().finish();
+            let write_cache = WriteCache::new(
+                local_store,
+                object_store_manager.clone(),
+            );
+            Some(Arc::new(write_cache))
+        } else {
+            None
+        };
         let scheduler = Arc::new(LocalScheduler::new(config.max_background_jobs));
-        let cache_manager = Arc::new(CacheManager::new(
-            config.sst_meta_cache_size.as_bytes(),
-            config.vector_cache_size.as_bytes(),
-            config.page_cache_size.as_bytes(),
-        ));
+        let cache_manager = Arc::new(
+            CacheManager::new(
+                config.sst_meta_cache_size.as_bytes(),
+                config.vector_cache_size.as_bytes(),
+                config.page_cache_size.as_bytes(),
+            )
+            .with_write_cache(write_cache),
+        );
 
         let workers = (0..config.num_workers)
             .map(|id| {

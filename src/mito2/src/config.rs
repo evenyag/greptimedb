@@ -78,6 +78,8 @@ pub struct MitoConfig {
     pub scan_parallelism: usize,
     /// Capacity of the channel to send data from parallel scan tasks to the main task (default 32).
     pub parallel_scan_channel_size: usize,
+
+    pub write_cache_path: String,
 }
 
 impl Default for MitoConfig {
@@ -98,6 +100,7 @@ impl Default for MitoConfig {
             sst_write_buffer_size: ReadableSize::mb(8),
             scan_parallelism: divide_num_cpus(4),
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
+            write_cache_path: String::new(),
         }
     }
 }
