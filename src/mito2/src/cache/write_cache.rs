@@ -21,11 +21,12 @@ use object_store::manager::ObjectStoreManagerRef;
 use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{RegionId};
+use store_api::storage::RegionId;
 
 use crate::access_layer::sst_file_path;
 use crate::cache::file_cache::{FileCache, FileCacheRef, IndexValue};
 use crate::error::{CopySstSnafu, ObjectStoreNotFoundSnafu, OpenDalSnafu, Result};
+use crate::metrics::UPLOAD_ELAPSED_TOTAL;
 use crate::sst::file::{FileId, FileMeta};
 use crate::sst::parquet::writer::ParquetWriter;
 
@@ -64,6 +65,8 @@ impl WriteCache {
 
     /// Adds files to the cache.
     pub(crate) async fn upload(&self, upload: Upload) -> Result<()> {
+        let _timer = UPLOAD_ELAPSED_TOTAL.start_timer();
+
         // Uploads each parts.
         for part in &upload.parts {
             self.upload_part(part).await?;

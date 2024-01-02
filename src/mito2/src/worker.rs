@@ -128,10 +128,7 @@ impl WorkerGroup {
             let mut fs = Fs::default();
             fs.root(&config.write_cache_path);
             let local_store = ObjectStore::new(fs).unwrap().finish();
-            let write_cache = WriteCache::new(
-                local_store,
-                object_store_manager.clone(),
-            );
+            let write_cache = WriteCache::new(local_store, object_store_manager.clone());
             Some(Arc::new(write_cache))
         } else {
             None

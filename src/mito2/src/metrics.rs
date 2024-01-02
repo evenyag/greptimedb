@@ -143,4 +143,7 @@ lazy_static! {
         &[TYPE_LABEL]
     )
     .unwrap();
+    /// Timer of upload.
+    pub static ref UPLOAD_ELAPSED_TOTAL: Histogram =
+        register_histogram!("mito_upload_total_elapsed", "mito upload total elapsed").unwrap();
 }
