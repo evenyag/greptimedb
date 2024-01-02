@@ -106,8 +106,9 @@ impl WriteCache {
             let reader = local.reader(&path).await.context(OpenDalSnafu)?;
 
             // TODO(yingwen): Reuse DEFAULT_WRITE_BUFFER_SIZE.
+            let upload_path = sst_file_path(&part.region_dir, meta.file_id);
             let mut writer = remote
-                .writer_with(&sst_file_path(&part.region_dir, meta.file_id))
+                .writer_with(&upload_path)
                 .buffer(5 * 1024 * 1024)
                 .await
                 .context(OpenDalSnafu)?;
@@ -118,6 +119,12 @@ impl WriteCache {
                     region_id: meta.region_id,
                     file_id: meta.file_id,
                 })?;
+
+            common_telemetry::info!(
+                "Upload file to remote, file: {}, upload_path: {}",
+                path,
+                upload_path
+            );
         }
 
         Ok(())
