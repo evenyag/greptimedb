@@ -122,7 +122,7 @@ impl WorkerGroup {
         let write_buffer_manager = Arc::new(WriteBufferManagerImpl::new(
             config.global_write_buffer_size.as_bytes() as usize,
         ));
-        let write_cache = if config.write_cache_path.is_empty() {
+        let write_cache = if !config.write_cache_path.is_empty() {
             // FIXME(yingwen): No unwrap.
             // FIXME(yingwen): recover the write cache.
             let mut fs = Fs::default();
