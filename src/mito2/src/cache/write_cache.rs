@@ -51,7 +51,7 @@ impl WriteCache {
         Self {
             file_cache: Arc::new(FileCache::new(
                 local_store,
-                "cache".to_string(),
+                "".to_string(),
                 ReadableSize::gb(4),
             )),
             object_store_manager,
