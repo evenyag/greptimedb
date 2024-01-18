@@ -53,7 +53,7 @@ pub struct MergeTreeConfig {
 impl Default for MergeTreeConfig {
     fn default() -> Self {
         Self {
-            enable_dict: true,
+            enable_dict: false,
             dict_key_num: 50_000,
             dict_key_bytes: ReadableSize::kb(32),
             max_dict_num: 16,
@@ -80,7 +80,7 @@ impl fmt::Debug for MergeTreeMemtable {
 
 impl Memtable for MergeTreeMemtable {
     fn id(&self) -> MemtableId {
-        todo!()
+        self.id
     }
 
     fn write(&self, kvs: &KeyValues) -> Result<()> {
@@ -96,10 +96,10 @@ impl Memtable for MergeTreeMemtable {
 
     fn iter(
         &self,
-        _projection: Option<&[ColumnId]>,
-        _predicate: Option<Predicate>,
-    ) -> BoxedBatchIterator {
-        todo!()
+        projection: Option<&[ColumnId]>,
+        predicate: Option<Predicate>,
+    ) -> Result<BoxedBatchIterator> {
+        self.tree.scan(projection, predicate)
     }
 
     fn is_empty(&self) -> bool {
@@ -231,5 +231,122 @@ impl MemtableBuilder for MergeTreeMemtableBuilder {
             self.write_buffer_manager.clone(),
             &self.config,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use common_time::Timestamp;
+    use datatypes::scalars::ScalarVector;
+    use datatypes::vectors::TimestampMillisecondVector;
+
+    use super::*;
+    use crate::test_util::memtable_util;
+
+    #[test]
+    fn test_memtable_sorted_input() {
+        common_telemetry::init_default_ut_logging();
+        let metadata = memtable_util::schema_for_test();
+        let kvs = memtable_util::build_key_values(&metadata, "hello".to_string(), 42, 100);
+        let memtable = MergeTreeMemtable::new(1, metadata, None, &MergeTreeConfig::default());
+        memtable.write(&kvs).unwrap();
+
+        let expected_ts = kvs
+            .iter()
+            .map(|kv| kv.timestamp().as_timestamp().unwrap().unwrap().value())
+            .collect::<HashSet<_>>();
+
+        let iter = memtable.iter(None, None).unwrap();
+        let read = iter
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .timestamps()
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondVector>()
+                    .unwrap()
+                    .iter_data()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .map(|v| v.unwrap().0.value())
+            .collect::<HashSet<_>>();
+        assert_eq!(expected_ts, read);
+
+        let stats = memtable.stats();
+        assert!(stats.bytes_allocated() > 0);
+        assert_eq!(
+            Some((
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(99)
+            )),
+            stats.time_range()
+        );
+    }
+
+    #[test]
+    fn test_memtable_unsorted_input() {
+        common_telemetry::init_default_ut_logging();
+        let metadata = memtable_util::schema_for_test();
+        let memtable =
+            MergeTreeMemtable::new(1, metadata.clone(), None, &MergeTreeConfig::default());
+
+        let kvs = memtable_util::build_key_values_with_ts_seq(
+            &metadata,
+            "hello".to_string(),
+            0,
+            [1, 3, 7, 5, 6].into_iter(),
+            0, // sequence 0, 1, 2, 3, 4
+        );
+        memtable.write(&kvs).unwrap();
+
+        let kvs = memtable_util::build_key_values_with_ts_seq(
+            &metadata,
+            "hello".to_string(),
+            0,
+            [5, 2, 4, 0, 7].into_iter(),
+            5, // sequence 5, 6, 7, 8, 9
+        );
+        memtable.write(&kvs).unwrap();
+
+        let iter = memtable.iter(None, None).unwrap();
+        let read = iter
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .timestamps()
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondVector>()
+                    .unwrap()
+                    .iter_data()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .map(|v| v.unwrap().0.value())
+            .collect::<Vec<_>>();
+        assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], read);
+
+        let iter = memtable.iter(None, None).unwrap();
+        let read = iter
+            .flat_map(|batch| {
+                batch
+                    .unwrap()
+                    .sequences()
+                    .iter_data()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .map(|v| v.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(vec![8, 0, 6, 1, 7, 5, 4, 9], read);
+
+        let stats = memtable.stats();
+        assert!(stats.bytes_allocated() > 0);
+        assert_eq!(
+            Some((Timestamp::new_millisecond(0), Timestamp::new_millisecond(7))),
+            stats.time_range()
+        );
     }
 }
