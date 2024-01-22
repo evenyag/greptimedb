@@ -67,11 +67,13 @@ impl OrderHintRule {
                     .as_any()
                     .downcast_ref::<DefaultTableSource>()
                 {
+                    common_telemetry::info!("is default table source");
                     if let Some(adapter) = source
                         .table_provider
                         .as_any()
                         .downcast_ref::<DfTableProviderAdapter>()
                     {
+                        common_telemetry::info!("is DfTableProviderAdapter");
                         let mut opts = Vec::with_capacity(order_expr.len());
                         for sort in order_expr {
                             let name = match sort.expr.try_into_col() {
@@ -111,6 +113,26 @@ impl TreeNodeVisitor for OrderHintVisitor {
     type N = LogicalPlan;
 
     fn pre_visit(&mut self, node: &Self::N) -> DataFusionResult<VisitRecursion> {
+        match node {
+            LogicalPlan::TableScan(table_scan) => {
+                if let Some(source) = table_scan
+                    .source
+                    .as_any()
+                    .downcast_ref::<DefaultTableSource>()
+                {
+                    common_telemetry::info!("is default table source");
+                    if let Some(adapter) = source
+                        .table_provider
+                        .as_any()
+                        .downcast_ref::<DfTableProviderAdapter>()
+                    {
+                        common_telemetry::info!("is DfTableProviderAdapter");
+                    }
+                }
+            },
+            _ => (),
+        }
+
         if let LogicalPlan::Sort(sort) = node {
             let mut exprs = vec![];
             for expr in &sort.expr {

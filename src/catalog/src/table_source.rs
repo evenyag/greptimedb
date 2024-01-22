@@ -78,6 +78,8 @@ impl DfTableSourceProvider {
         &mut self,
         table_ref: TableReference<'_>,
     ) -> Result<Arc<dyn TableSource>> {
+        common_telemetry::info!("resolve table");
+
         let table_ref = self.resolve_table_ref(table_ref)?;
 
         let resolved_name = table_ref.to_string();

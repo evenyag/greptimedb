@@ -784,6 +784,8 @@ struct DummyTableProvider {
 #[async_trait]
 impl TableProvider for DummyTableProvider {
     fn as_any(&self) -> &dyn Any {
+        common_telemetry::info!("DummyTableProvider as any");
+
         self
     }
 
@@ -802,6 +804,7 @@ impl TableProvider for DummyTableProvider {
         filters: &[DfExpr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn DfPhysicalPlan>> {
+        common_telemetry::info!("DummyTableProvider scan");
         let mut request = self.scan_request.lock().unwrap().clone();
         request.projection = projection.cloned();
         request.filters = filters.iter().map(|e| Expr::from(e.clone())).collect();

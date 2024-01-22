@@ -40,6 +40,7 @@ pub struct DfTableProviderAdapter {
 
 impl DfTableProviderAdapter {
     pub fn new(table: TableRef) -> Self {
+        common_telemetry::info!("DfTableProviderAdapter");
         Self {
             table,
             scan_req: Arc::default(),
