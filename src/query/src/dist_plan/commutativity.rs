@@ -40,11 +40,13 @@ pub struct Categorizer {}
 impl Categorizer {
     pub fn check_plan(plan: &LogicalPlan, partition_cols: Option<Vec<String>>) -> Commutativity {
         let partition_cols = partition_cols.unwrap_or_default();
+        common_telemetry::info!("Categorizer check plan: {:?}", plan);
 
         match plan {
             LogicalPlan::Projection(proj) => {
                 for expr in &proj.expr {
                     let commutativity = Self::check_expr(expr);
+                    common_telemetry::info!("Categorizer check projection, expr: {:?}, is_commutative: {:?}", expr, matches!(commutativity, Commutativity::Commutative));
                     if !matches!(commutativity, Commutativity::Commutative) {
                         return commutativity;
                     }

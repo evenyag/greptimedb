@@ -85,6 +85,8 @@ impl TableProvider for DfTableProviderAdapter {
         filters: &[DfExpr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn DfPhysicalPlan>> {
+        common_telemetry::info!("scan adapter");
+
         let filters: Vec<Expr> = filters.iter().map(Clone::clone).map(Into::into).collect();
         let request = {
             let mut request = self.scan_req.lock().unwrap();

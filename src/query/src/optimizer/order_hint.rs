@@ -42,6 +42,8 @@ impl OptimizerRule for OrderHintRule {
 
 impl OrderHintRule {
     fn optimize(plan: &LogicalPlan) -> DataFusionResult<LogicalPlan> {
+        common_telemetry::info!("optimize OrderHintRule");
+
         let mut visitor = OrderHintVisitor::default();
         let _ = plan.visit(&mut visitor)?;
 

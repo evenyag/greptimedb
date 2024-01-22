@@ -625,6 +625,7 @@ impl RegionServerInner {
             .decode(Bytes::from(plan), catalog_list, "", "")
             .await
             .context(DecodeLogicalPlanSnafu)?;
+        common_telemetry::info!("datanode logical plan: {:?}", logical_plan);
         let result = self
             .query_engine
             .execute(logical_plan.into(), ctx)

@@ -150,13 +150,17 @@ impl PlanRewriter {
         }
 
         match Categorizer::check_plan(plan, self.partition_cols.clone()) {
-            Commutativity::Commutative => {}
+            Commutativity::Commutative => {
+                common_telemetry::info!("check plan Commutative");
+            }
             Commutativity::PartialCommutative => {
+                common_telemetry::info!("check plan PartialCommutative");
                 if let Some(plan) = partial_commutative_transformer(plan) {
                     self.stage.push(plan)
                 }
             }
             Commutativity::ConditionalCommutative(transformer) => {
+                common_telemetry::info!("check plan ConditionalCommutative");
                 if let Some(transformer) = transformer
                     && let Some(plan) = transformer(plan)
                 {
@@ -164,6 +168,7 @@ impl PlanRewriter {
                 }
             }
             Commutativity::TransformedCommutative(transformer) => {
+                common_telemetry::info!("check plan TransformedCommutative");
                 if let Some(transformer) = transformer
                     && let Some(plan) = transformer(plan)
                 {
@@ -173,6 +178,7 @@ impl PlanRewriter {
             Commutativity::NonCommutative
             | Commutativity::Unimplemented
             | Commutativity::Unsupported => {
+                common_telemetry::info!("check plan NotCommutative");
                 return true;
             }
         }
