@@ -45,6 +45,9 @@ use datatypes::arrow::datatypes::SchemaRef;
 use futures_util::future::try_join_all;
 use metric_engine::engine::MetricEngine;
 use prost::Message;
+pub use query::dummy_catalog::{
+    DummyCatalogList, DummyTableProviderFactory, TableProviderFactoryRef,
+};
 use query::QueryEngineRef;
 use servers::error::{self as servers_error, ExecuteGrpcRequestSnafu, Result as ServerResult};
 use servers::grpc::flight::{FlightCraft, FlightRecordBatchStream, TonicStream};
@@ -616,7 +619,8 @@ impl RegionServerInner {
         let table_provider = self
             .table_provider_factory
             .create(region_id, region_status.into_engine())
-            .await?;
+            .await
+            .context(ExecuteLogicalPlanSnafu)?;
 
         let catalog_list = Arc::new(DummyCatalogList::with_table_provider(table_provider));
 
@@ -683,187 +687,6 @@ enum RegionChange {
     Register(String, bool),
     Deregisters,
 }
-
-/// Resolve to the given region (specified by [RegionId]) unconditionally.
-#[derive(Clone)]
-struct DummyCatalogList {
-    catalog: DummyCatalogProvider,
-}
-
-impl DummyCatalogList {
-    fn with_table_provider(table_provider: Arc<dyn TableProvider>) -> Self {
-        let schema_provider = DummySchemaProvider {
-            table: table_provider,
-        };
-        let catalog_provider = DummyCatalogProvider {
-            schema: schema_provider,
-        };
-        Self {
-            catalog: catalog_provider,
-        }
-    }
-}
-
-impl CatalogList for DummyCatalogList {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn register_catalog(
-        &self,
-        _name: String,
-        _catalog: Arc<dyn CatalogProvider>,
-    ) -> Option<Arc<dyn CatalogProvider>> {
-        None
-    }
-
-    fn catalog_names(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn catalog(&self, _name: &str) -> Option<Arc<dyn CatalogProvider>> {
-        Some(Arc::new(self.catalog.clone()))
-    }
-}
-
-/// For [DummyCatalogList].
-#[derive(Clone)]
-struct DummyCatalogProvider {
-    schema: DummySchemaProvider,
-}
-
-impl CatalogProvider for DummyCatalogProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema_names(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn schema(&self, _name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        Some(Arc::new(self.schema.clone()))
-    }
-}
-
-/// For [DummyCatalogList].
-#[derive(Clone)]
-struct DummySchemaProvider {
-    table: Arc<dyn TableProvider>,
-}
-
-#[async_trait]
-impl SchemaProvider for DummySchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn table_names(&self) -> Vec<String> {
-        vec![]
-    }
-
-    async fn table(&self, _name: &str) -> Option<Arc<dyn TableProvider>> {
-        Some(self.table.clone())
-    }
-
-    fn table_exist(&self, _name: &str) -> bool {
-        true
-    }
-}
-
-/// For [TableProvider](TableProvider) and [DummyCatalogList]
-#[derive(Clone)]
-struct DummyTableProvider {
-    region_id: RegionId,
-    engine: RegionEngineRef,
-    metadata: RegionMetadataRef,
-    /// Keeping a mutable request makes it possible to change in the optimize phase.
-    scan_request: Arc<Mutex<ScanRequest>>,
-}
-
-#[async_trait]
-impl TableProvider for DummyTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        common_telemetry::info!("DummyTableProvider as any");
-
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.metadata.schema.arrow_schema().clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        _state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[DfExpr],
-        limit: Option<usize>,
-    ) -> DfResult<Arc<dyn DfPhysicalPlan>> {
-        common_telemetry::info!("DummyTableProvider scan");
-        let mut request = self.scan_request.lock().unwrap().clone();
-        request.projection = projection.cloned();
-        request.filters = filters.iter().map(|e| Expr::from(e.clone())).collect();
-        request.limit = limit;
-
-        let stream = self
-            .engine
-            .handle_query(self.region_id, request)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(DfPhysicalPlanAdapter(Arc::new(
-            StreamScanAdapter::new(stream),
-        ))))
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&DfExpr],
-    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
-    }
-}
-
-pub struct DummyTableProviderFactory;
-
-#[async_trait]
-impl TableProviderFactory for DummyTableProviderFactory {
-    async fn create(
-        &self,
-        region_id: RegionId,
-        engine: RegionEngineRef,
-    ) -> Result<Arc<dyn TableProvider>> {
-        let metadata =
-            engine
-                .get_metadata(region_id)
-                .await
-                .with_context(|_| GetRegionMetadataSnafu {
-                    engine: engine.name(),
-                    region_id,
-                })?;
-        Ok(Arc::new(DummyTableProvider {
-            region_id,
-            engine,
-            metadata,
-            scan_request: Default::default(),
-        }))
-    }
-}
-
-#[async_trait]
-pub trait TableProviderFactory: Send + Sync {
-    async fn create(
-        &self,
-        region_id: RegionId,
-        engine: RegionEngineRef,
-    ) -> Result<Arc<dyn TableProvider>>;
-}
-
-pub type TableProviderFactoryRef = Arc<dyn TableProviderFactory>;
 
 #[cfg(test)]
 mod tests {
