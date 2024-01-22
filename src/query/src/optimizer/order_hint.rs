@@ -129,7 +129,7 @@ impl TreeNodeVisitor for OrderHintVisitor {
                         common_telemetry::info!("is DfTableProviderAdapter");
                     }
                 }
-            },
+            }
             _ => (),
         }
 

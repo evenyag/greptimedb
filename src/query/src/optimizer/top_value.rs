@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use datafusion_common::tree_node::{TreeNodeVisitor, VisitRecursion};
-use datafusion_expr::LogicalPlan;
-use datafusion_optimizer::{OptimizerRule, OptimizerConfig};
 use datafusion_common::Result;
+use datafusion_expr::LogicalPlan;
+use datafusion_optimizer::{OptimizerConfig, OptimizerRule};
 
 /// This rule pushes down `last_value`/`first_value` aggregator as a hint to the
 /// leaf table scan node.
@@ -41,8 +41,7 @@ impl TopValuePushDownRule {
 
 /// Find the most closest top value aggregator to the leaf node.
 #[derive(Default)]
-struct TopValueVisitor {
-}
+struct TopValueVisitor {}
 
 impl TreeNodeVisitor for TopValueVisitor {
     type N = LogicalPlan;

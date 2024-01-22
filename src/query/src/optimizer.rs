@@ -14,5 +14,5 @@
 
 pub mod order_hint;
 pub mod string_normalization;
-pub mod type_conversion;
 pub mod top_value;
+pub mod type_conversion;

@@ -46,7 +46,11 @@ impl Categorizer {
             LogicalPlan::Projection(proj) => {
                 for expr in &proj.expr {
                     let commutativity = Self::check_expr(expr);
-                    common_telemetry::info!("Categorizer check projection, expr: {:?}, is_commutative: {:?}", expr, matches!(commutativity, Commutativity::Commutative));
+                    common_telemetry::info!(
+                        "Categorizer check projection, expr: {:?}, is_commutative: {:?}",
+                        expr,
+                        matches!(commutativity, Commutativity::Commutative)
+                    );
                     if !matches!(commutativity, Commutativity::Commutative) {
                         return commutativity;
                     }
