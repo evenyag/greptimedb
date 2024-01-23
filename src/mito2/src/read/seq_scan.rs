@@ -175,8 +175,9 @@ impl SeqScan {
         let last = self.last.clone();
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
+            let mut last_key = None;
             while let Some(batch) =
-                Self::fetch_record_batch(&mut reader, &mapper, cache, last, &mut metrics).await?
+                Self::fetch_record_batch(&mut reader, &mapper, cache, last, &mut last_key, &mut metrics).await?
             {
                 yield batch;
             }
@@ -304,32 +305,46 @@ impl SeqScan {
         mapper: &ProjectionMapper,
         cache: Option<&CacheManager>,
         last: Option<bool>,
+        last_key: &mut Option<Vec<u8>>,
         metrics: &mut Metrics,
     ) -> common_recordbatch::error::Result<Option<RecordBatch>> {
         let start = Instant::now();
+        let last = last.unwrap_or(false);
 
-        let Some(mut batch) = reader
-            .next_batch()
-            .await
-            .map_err(BoxedError::new)
-            .context(ExternalSnafu)?
-        else {
+        loop {
+            let Some(mut batch) = reader
+                .next_batch()
+                .await
+                .map_err(BoxedError::new)
+                .context(ExternalSnafu)?
+            else {
+                metrics.scan_cost += start.elapsed();
+
+                return Ok(None);
+            };
+
+            if last {
+                if let Some(lk) = last_key {
+                    if lk == batch.primary_key() {
+                        continue;
+                    }
+                }
+                *last_key = Some(batch.primary_key().to_vec());
+            }
+
+            if last {
+                // Use last row.
+                batch = batch.slice(batch.num_rows() - 1, 1);
+            }
+
+            let convert_start = Instant::now();
+            let record_batch = mapper.convert(&batch, cache)?;
+            metrics.convert_cost += convert_start.elapsed();
             metrics.scan_cost += start.elapsed();
+            metrics.num_batches += 1;
 
-            return Ok(None);
-        };
-
-        if last.unwrap_or(false) {
-            // Use last row.
-            batch = batch.slice(batch.num_rows() - 1, 1);
+            return Ok(Some(record_batch));
         }
-
-        let convert_start = Instant::now();
-        let record_batch = mapper.convert(&batch, cache)?;
-        metrics.convert_cost += convert_start.elapsed();
-        metrics.scan_cost += start.elapsed();
-
-        Ok(Some(record_batch))
     }
 }
 
@@ -342,6 +357,8 @@ struct Metrics {
     scan_cost: Duration,
     /// Duration to convert batches.
     convert_cost: Duration,
+    /// Number of batches.
+    num_batches: usize,
 }
 
 #[cfg(test)]
