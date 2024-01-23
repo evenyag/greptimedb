@@ -29,4 +29,22 @@ pub struct ScanRequest {
     /// If set, it contains the amount of rows needed by the caller,
     /// The data source should return *at least* this number of rows if available.
     pub limit: Option<usize>,
+    /// Optional top hint for the scan.
+    pub top: Option<TopHint>,
+}
+
+/// Type of the [TopOptions].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopType {
+    /// Last value of each group.
+    LastValue,
+}
+
+/// Hint to query top values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopHint {
+    /// Type of the top query.
+    pub top_type: TopType,
+    /// Column names to group by.
+    pub group_columns: Vec<String>,
 }

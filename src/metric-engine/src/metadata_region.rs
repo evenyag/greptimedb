@@ -351,6 +351,7 @@ impl MetadataRegion {
             filters: vec![],
             output_ordering: None,
             limit: None,
+            top: None,
         };
         let record_batch_stream = self
             .mito
@@ -408,6 +409,7 @@ impl MetadataRegion {
             filters: vec![filter_expr.into()],
             output_ordering: None,
             limit: None,
+            top: None,
         }
     }
 
@@ -568,6 +570,7 @@ mod test {
             filters: vec![expected_filter_expr.into()],
             output_ordering: None,
             limit: None,
+            top: None,
         };
         let actual_scan_request = MetadataRegion::build_read_request(key);
         assert_eq!(actual_scan_request, expected_scan_request);
