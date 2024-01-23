@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use api::v1::region::{region_request, QueryRequest, RegionResponse};
 use api::v1::{ResponseHeader, Status};
@@ -25,23 +24,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use common_error::ext::BoxedError;
 use common_error::status_code::StatusCode;
-use common_query::logical_plan::Expr;
-use common_query::physical_plan::DfPhysicalPlanAdapter;
-use common_query::{DfPhysicalPlan, Output};
+use common_query::Output;
 use common_recordbatch::SendableRecordBatchStream;
 use common_runtime::Runtime;
 use common_telemetry::tracing::{self, info_span};
 use common_telemetry::tracing_context::{FutureExt, TracingContext};
 use common_telemetry::{info, warn};
 use dashmap::DashMap;
-use datafusion::catalog::schema::SchemaProvider;
-use datafusion::catalog::{CatalogList, CatalogProvider};
-use datafusion::datasource::TableProvider;
-use datafusion::error::Result as DfResult;
-use datafusion::execution::context::SessionState;
-use datafusion_common::DataFusionError;
-use datafusion_expr::{Expr as DfExpr, TableProviderFilterPushDown, TableType};
-use datatypes::arrow::datatypes::SchemaRef;
 use futures_util::future::try_join_all;
 use metric_engine::engine::MetricEngine;
 use prost::Message;
@@ -54,20 +43,17 @@ use servers::grpc::flight::{FlightCraft, FlightRecordBatchStream, TonicStream};
 use servers::grpc::region_server::RegionServerHandler;
 use session::context::{QueryContextBuilder, QueryContextRef};
 use snafu::{OptionExt, ResultExt};
-use store_api::metadata::RegionMetadataRef;
 use store_api::metric_engine_consts::{METRIC_ENGINE_NAME, PHYSICAL_TABLE_METADATA_KEY};
 use store_api::region_engine::{RegionEngineRef, RegionRole, SetReadonlyResponse};
 use store_api::region_request::{AffectedRows, RegionCloseRequest, RegionRequest};
-use store_api::storage::{RegionId, ScanRequest};
+use store_api::storage::RegionId;
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
-use table::table::scan::StreamScanAdapter;
 use tonic::{Request, Response, Result as TonicResult};
 
 use crate::error::{
     self, BuildRegionRequestsSnafu, DecodeLogicalPlanSnafu, ExecuteLogicalPlanSnafu,
-    FindLogicalRegionsSnafu, GetRegionMetadataSnafu, HandleRegionRequestSnafu,
-    RegionEngineNotFoundSnafu, RegionNotFoundSnafu, Result, StopRegionEngineSnafu, UnexpectedSnafu,
-    UnsupportedOutputSnafu,
+    FindLogicalRegionsSnafu, HandleRegionRequestSnafu, RegionEngineNotFoundSnafu,
+    RegionNotFoundSnafu, Result, StopRegionEngineSnafu, UnexpectedSnafu, UnsupportedOutputSnafu,
 };
 use crate::event_listener::RegionServerEventListenerRef;
 

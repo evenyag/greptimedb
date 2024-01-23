@@ -22,8 +22,6 @@ use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_optimizer::{OptimizerConfig, OptimizerRule};
 use table::table::adapter::DfTableProviderAdapter;
 
-use crate::dummy_catalog::DummyTableProvider;
-
 /// This rule will pass the nearest order requirement to the leaf table
 /// scan node as ordering hint.
 pub struct OrderHintRule;
@@ -115,26 +113,6 @@ impl TreeNodeVisitor for OrderHintVisitor {
     type N = LogicalPlan;
 
     fn pre_visit(&mut self, node: &Self::N) -> DataFusionResult<VisitRecursion> {
-        match node {
-            LogicalPlan::TableScan(table_scan) => {
-                if let Some(source) = table_scan
-                    .source
-                    .as_any()
-                    .downcast_ref::<DefaultTableSource>()
-                {
-                    common_telemetry::info!("is default table source");
-                    if let Some(adapter) = source
-                        .table_provider
-                        .as_any()
-                        .downcast_ref::<DummyTableProvider>()
-                    {
-                        common_telemetry::info!("is DummyTableProvider");
-                    }
-                }
-            }
-            _ => (),
-        }
-
         if let LogicalPlan::Sort(sort) = node {
             let mut exprs = vec![];
             for expr in &sort.expr {

@@ -55,7 +55,7 @@ impl OptimizerRule for TopValuePushDownRule {
 impl TopValuePushDownRule {
     fn set_top_value_hint(
         plan: LogicalPlan,
-        group_expr: &[Expr],
+        _group_expr: &[Expr],
         is_last: bool,
     ) -> Result<Transformed<LogicalPlan>> {
         let LogicalPlan::TableScan(table_scan) = &plan else {
