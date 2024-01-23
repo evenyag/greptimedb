@@ -65,6 +65,8 @@ pub struct SeqScan {
     parallelism: ScanParallism,
     /// Index applier.
     index_applier: Option<SstIndexApplierRef>,
+    /// Get last value.
+    last: Option<bool>,
 }
 
 impl SeqScan {
@@ -82,6 +84,7 @@ impl SeqScan {
             ignore_file_not_found: false,
             parallelism: ScanParallism::default(),
             index_applier: None,
+            last: None,
         }
     }
 
@@ -141,6 +144,13 @@ impl SeqScan {
         self
     }
 
+    /// Sets last hint.
+    #[must_use]
+    pub(crate) fn with_last_hint(mut self, last: Option<bool>) -> Self {
+        self.last = last;
+        self
+    }
+
     /// Builds a stream for the query.
     pub async fn build_stream(&self) -> Result<SendableRecordBatchStream> {
         let start = Instant::now();
@@ -160,10 +170,11 @@ impl SeqScan {
         let mapper = self.mapper.clone();
         let cache_manager = self.cache_manager.clone();
         let parallelism = self.parallelism.parallelism;
+        let last = self.last.clone();
         let stream = try_stream! {
             let cache = cache_manager.as_ref().map(|cache| cache.as_ref());
             while let Some(batch) =
-                Self::fetch_record_batch(&mut reader, &mapper, cache, &mut metrics).await?
+                Self::fetch_record_batch(&mut reader, &mapper, cache, last, &mut metrics).await?
             {
                 yield batch;
             }
@@ -290,11 +301,12 @@ impl SeqScan {
         reader: &mut dyn BatchReader,
         mapper: &ProjectionMapper,
         cache: Option<&CacheManager>,
+        last: Option<bool>,
         metrics: &mut Metrics,
     ) -> common_recordbatch::error::Result<Option<RecordBatch>> {
         let start = Instant::now();
 
-        let Some(batch) = reader
+        let Some(mut batch) = reader
             .next_batch()
             .await
             .map_err(BoxedError::new)
@@ -304,6 +316,11 @@ impl SeqScan {
 
             return Ok(None);
         };
+
+        if last.unwrap_or(false) {
+            // Use last row.
+            batch = batch.slice(batch.num_rows() - 1, 1);
+        }
 
         let convert_start = Instant::now();
         let record_batch = mapper.convert(&batch, cache)?;

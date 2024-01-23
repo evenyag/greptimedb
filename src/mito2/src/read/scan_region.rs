@@ -164,7 +164,7 @@ impl ScanRegion {
 
     /// Scan sequentially.
     pub(crate) fn seq_scan(self) -> Result<SeqScan> {
-        common_telemetry::info!("scan region");
+        common_telemetry::info!("scan region, request: {:?}", self.request);
 
         let time_range = self.build_time_range_predicate();
 
