@@ -166,6 +166,8 @@ impl SeqScan {
         metrics.build_reader_cost = elapsed;
         metrics.scan_cost = elapsed;
 
+        common_telemetry::info!("seq scan build stream, last: {:?}", self.last);
+
         // Creates a stream to poll the batch reader and convert batch into record batch.
         let mapper = self.mapper.clone();
         let cache_manager = self.cache_manager.clone();

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use common_recordbatch::SendableRecordBatchStream;
 use common_telemetry::{debug, warn};
 use common_time::range::TimestampRange;
-use store_api::storage::ScanRequest;
+use store_api::storage::{ScanRequest, TopType};
 use table::predicate::{Predicate, TimeRangePredicateBuilder};
 
 use crate::access_layer::AccessLayerRef;
@@ -217,6 +217,10 @@ impl ScanRegion {
             Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied())?,
             None => ProjectionMapper::all(&self.version.metadata)?,
         };
+        let last = self
+            .request
+            .top
+            .map(|top| top.top_type == TopType::LastValue);
 
         let seq_scan = SeqScan::new(self.access_layer.clone(), mapper)
             .with_time_range(Some(time_range))
@@ -225,7 +229,8 @@ impl ScanRegion {
             .with_files(files)
             .with_cache(self.cache_manager)
             .with_index_applier(index_applier)
-            .with_parallelism(self.parallelism);
+            .with_parallelism(self.parallelism)
+            .with_last_hint(last);
 
         Ok(seq_scan)
     }
