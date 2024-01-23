@@ -22,6 +22,8 @@ use datafusion_expr::{Expr, LogicalPlan};
 use datafusion_optimizer::{OptimizerConfig, OptimizerRule};
 use table::table::adapter::DfTableProviderAdapter;
 
+use crate::dummy_catalog::DummyTableProvider;
+
 /// This rule will pass the nearest order requirement to the leaf table
 /// scan node as ordering hint.
 pub struct OrderHintRule;
@@ -124,9 +126,9 @@ impl TreeNodeVisitor for OrderHintVisitor {
                     if let Some(adapter) = source
                         .table_provider
                         .as_any()
-                        .downcast_ref::<DfTableProviderAdapter>()
+                        .downcast_ref::<DummyTableProvider>()
                     {
-                        common_telemetry::info!("is DfTableProviderAdapter");
+                        common_telemetry::info!("is DummyTableProvider");
                     }
                 }
             }

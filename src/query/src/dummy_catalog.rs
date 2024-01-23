@@ -124,7 +124,7 @@ impl SchemaProvider for DummySchemaProvider {
 
 /// For [TableProvider](TableProvider) and [DummyCatalogList]
 #[derive(Clone)]
-struct DummyTableProvider {
+pub struct DummyTableProvider {
     region_id: RegionId,
     engine: RegionEngineRef,
     metadata: RegionMetadataRef,

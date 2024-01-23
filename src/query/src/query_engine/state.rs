@@ -41,6 +41,7 @@ use table::TableRef;
 use crate::dist_plan::{DistExtensionPlanner, DistPlannerAnalyzer};
 use crate::optimizer::order_hint::OrderHintRule;
 use crate::optimizer::string_normalization::StringNormalizationRule;
+use crate::optimizer::top_value::TopValuePushDownRule;
 use crate::optimizer::type_conversion::TypeConversionRule;
 use crate::query_engine::options::QueryOptions;
 use crate::range_select::planner::RangeSelectPlanner;
@@ -89,6 +90,7 @@ impl QueryEngineState {
         }
         let mut optimizer = Optimizer::new();
         optimizer.rules.push(Arc::new(OrderHintRule));
+        optimizer.rules.push(Arc::new(TopValuePushDownRule));
 
         let session_state = SessionState::new_with_config_rt_and_catalog_list(
             session_config,
