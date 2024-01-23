@@ -18,6 +18,7 @@ use datafusion_common::Result;
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::{aggregate_function, Expr, LogicalPlan};
 use datafusion_optimizer::{OptimizerConfig, OptimizerRule};
+use store_api::storage::{TopHint, TopType};
 
 use crate::dummy_catalog::DummyTableProvider;
 
@@ -61,15 +62,34 @@ impl TopValuePushDownRule {
             return Ok(Transformed::No(plan));
         };
 
-        let Some(source) = table_scan.source.as_any().downcast_ref::<DefaultTableSource>() else {
+        let Some(source) = table_scan
+            .source
+            .as_any()
+            .downcast_ref::<DefaultTableSource>()
+        else {
             return Ok(Transformed::No(plan));
         };
 
-        let Some(adapter) = source.table_provider.as_any().downcast_ref::<DummyTableProvider>() else {
+        let Some(adapter) = source
+            .table_provider
+            .as_any()
+            .downcast_ref::<DummyTableProvider>()
+        else {
             return Ok(Transformed::No(plan));
         };
 
-        todo!()
+        // TODO(yingwen): Get group column names.
+
+        if is_last {
+            adapter.with_top_hint(TopHint {
+                top_type: TopType::LastValue,
+                group_columns: Vec::new(),
+            });
+
+            Ok(Transformed::Yes(plan))
+        } else {
+            Ok(Transformed::No(plan))
+        }
     }
 }
 

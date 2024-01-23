@@ -30,7 +30,7 @@ use datatypes::arrow::datatypes::SchemaRef;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::RegionEngineRef;
-use store_api::storage::{RegionId, ScanRequest};
+use store_api::storage::{RegionId, ScanRequest, TopHint};
 use table::table::scan::StreamScanAdapter;
 
 use crate::error::{GetRegionMetadataSnafu, Result};
@@ -130,6 +130,13 @@ pub struct DummyTableProvider {
     metadata: RegionMetadataRef,
     /// Keeping a mutable request makes it possible to change in the optimize phase.
     scan_request: Arc<Mutex<ScanRequest>>,
+}
+
+impl DummyTableProvider {
+    /// Attaches the top hint to the scan request.
+    pub fn with_top_hint(&self, top: TopHint) {
+        self.scan_request.lock().unwrap().top = Some(top);
+    }
 }
 
 #[async_trait]
