@@ -14,12 +14,11 @@
 
 //! Mutable part of the merge tree.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::v1::OpType;
-use bytes::Bytes;
 use common_telemetry::{debug, warn};
 use common_time::Timestamp;
 use datafusion::physical_plan::PhysicalExpr;
@@ -34,9 +33,9 @@ use datatypes::scalars::{ScalarVector, ScalarVectorBuilder};
 use datatypes::types::TimestampType;
 use datatypes::vectors::{
     BinaryVector, BinaryVectorBuilder, BooleanVector, MutableVector, TimestampMicrosecondVector,
-    TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector,
-    UInt16VectorBuilder, UInt32Vector, UInt64Vector, UInt64VectorBuilder, UInt8Vector,
-    UInt8VectorBuilder, Vector, VectorOp, VectorRef,
+    TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, UInt32Vector,
+    UInt64Vector, UInt64VectorBuilder, UInt8Vector, UInt8VectorBuilder, Vector, VectorOp,
+    VectorRef,
 };
 use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
@@ -57,47 +56,14 @@ const INITIAL_BUILDER_CAPACITY: usize = 8;
 
 /// Mutable part that buffers input data.
 pub(crate) struct MutablePart {
-    active_dict: KeyDict,
-    immutable_dicts: Vec<Arc<KeyDict>>,
-    interned_blocks: HashMap<DictIdType, InternedBlock>,
-    /// Stores rows without interning primary keys. If the region doesn't have primary key,
-    /// it also stores rows in this block.
+    /// Stores rows without interning primary keys.
     plain_block: Option<PlainBlock>,
-    /// Next id of the dictionary.
-    next_dict_id: DictIdType,
-    /// Number of keys in a dictionary.
-    dict_key_num: KeyIdType,
-    /// Maximum bytes of keys in a dictionary.
-    dict_key_bytes: usize,
-    /// Maximum number of dictionaries in the part.
-    max_dict_num: usize,
 }
 
 impl MutablePart {
     /// Creates a new mutable part.
-    pub(crate) fn new(config: &MergeTreeConfig) -> MutablePart {
-        let dict_key_num = config
-            .enable_dict
-            .then(|| {
-                config
-                    .dict_key_num
-                    .try_into()
-                    .inspect_err(|_| warn!("Sanitize dict key num to {}", KeyIdType::MAX))
-                    .unwrap_or(KeyIdType::MAX)
-            })
-            .unwrap_or(0);
-
-        MutablePart {
-            active_dict: KeyDict::new(0),
-            immutable_dicts: Vec::new(),
-            interned_blocks: HashMap::new(),
-            plain_block: None,
-            // 0 is allocated by the first active dict.
-            next_dict_id: 1,
-            dict_key_num,
-            dict_key_bytes: config.dict_key_bytes.as_bytes() as usize,
-            max_dict_num: config.max_dict_num,
-        }
+    pub(crate) fn new(_config: &MergeTreeConfig) -> MutablePart {
+        MutablePart { plain_block: None }
     }
 
     /// Write key-values into the part.
@@ -125,7 +91,7 @@ impl MutablePart {
             metrics.value_bytes += kv.fields().map(|v| v.data_size()).sum::<usize>();
 
             if metadata.primary_key.is_empty() {
-                // No primary key, write to the plain block.
+                // No primary key.
                 self.write_plain(metadata, &kv, None);
                 continue;
             }
@@ -134,12 +100,9 @@ impl MutablePart {
             primary_key.clear();
             row_codec.encode_to_vec(kv.primary_keys(), &mut primary_key)?;
 
-            // TODO(yingwen): Freeze a block/dict if it is large enough (in bytes).
-            if self.is_dictionary_enabled() {
-                self.write_intern(metadata, &kv, &mut primary_key, metrics);
-            } else {
-                self.write_plain(metadata, &kv, Some(&primary_key));
-            }
+            // TODO(yingwen): Freeze a block if it is large enough (in bytes).
+            // Write rows with primary keys.
+            self.write_plain(metadata, &kv, Some(&primary_key));
         }
 
         metrics.value_bytes +=
@@ -157,12 +120,6 @@ impl MutablePart {
         predicate: Option<&Predicate>,
         dedup: bool,
     ) -> Result<BoxedBatchIterator> {
-        // TODO(yingwen): Support dictionary mode or remove dictionary mode.
-        assert!(
-            !self.is_dictionary_enabled(),
-            "Dictionary mode does not support scan"
-        );
-
         let mut metrics = ReadMetrics::default();
         let now = Instant::now();
 
@@ -198,35 +155,6 @@ impl MutablePart {
         Ok(Box::new(iter))
     }
 
-    /// Returns true if the dictionary is enabled.
-    fn is_dictionary_enabled(&self) -> bool {
-        self.dict_key_num > 0
-    }
-
-    /// Writes to the intern block and falls back to the plain block if it can't intern the key.
-    ///
-    /// The region must have a primary key.
-    fn write_intern(
-        &mut self,
-        metadata: &RegionMetadataRef,
-        key_value: &KeyValue,
-        primary_key: &mut Vec<u8>,
-        metrics: &mut WriteMetrics,
-    ) {
-        assert!(!metadata.primary_key.is_empty());
-
-        let Some((dict_id, key_id)) = self.maybe_intern(primary_key, metrics) else {
-            // Unable to intern the key, write to the plain block.
-            return self.write_plain(metadata, key_value, Some(primary_key));
-        };
-
-        let block = self
-            .interned_blocks
-            .entry(dict_id)
-            .or_insert_with(|| InternedBlock::new(metadata, INITIAL_BUILDER_CAPACITY));
-        block.insert_by_id(key_id, key_value);
-    }
-
     /// Writes the `key_value` and the `primary_key` to the plain block.
     fn write_plain(
         &mut self,
@@ -239,52 +167,6 @@ impl MutablePart {
             .get_or_insert_with(|| PlainBlock::new(metadata, INITIAL_BUILDER_CAPACITY));
 
         block.insert_by_key(primary_key, key_value);
-    }
-
-    /// Tries to intern the primary key, returns the id of the dictionary and the key.
-    fn maybe_intern(
-        &mut self,
-        primary_key: &mut Vec<u8>,
-        metrics: &mut WriteMetrics,
-    ) -> Option<(DictIdType, KeyIdType)> {
-        if let Some(key_id) = self.active_dict.get_key_id(primary_key) {
-            return Some((self.active_dict.id, key_id));
-        }
-
-        for dict in &self.immutable_dicts {
-            if let Some(key_id) = dict.get_key_id(primary_key) {
-                return Some((dict.id, key_id));
-            }
-        }
-
-        // A new key.
-        if self
-            .active_dict
-            .is_full(self.dict_key_num, self.dict_key_bytes)
-        {
-            // Allocates a new dictionary.
-            let key_dict = self.allocate_dict()?;
-            let prev_dict = std::mem::replace(&mut self.active_dict, key_dict);
-            self.immutable_dicts.push(Arc::new(prev_dict));
-        }
-
-        // Intern the primary key.
-        let key = std::mem::take(primary_key);
-        metrics.key_bytes += key.len();
-        let key_id = self.active_dict.must_intern(key);
-        Some((self.active_dict.id, key_id))
-    }
-
-    /// Allocates a new dictionary if possible.
-    fn allocate_dict(&mut self) -> Option<KeyDict> {
-        if self.immutable_dicts.len() + 1 >= self.max_dict_num {
-            return None;
-        }
-
-        let dict_id = self.next_dict_id;
-        self.next_dict_id = self.next_dict_id.checked_add(1)?;
-
-        Some(KeyDict::new(dict_id))
     }
 }
 
@@ -345,85 +227,6 @@ impl Iterator for Iter {
                 Ok(batch)
             });
         Some(batch)
-    }
-}
-
-/// Id of the primary key.
-type KeyIdType = u16;
-/// Id of a [KeyDict].
-type DictIdType = u32;
-
-/// Sorted dictionary for primary keys.
-struct KeyDict {
-    /// Id of the dictionary.
-    id: DictIdType,
-    /// The dictionary.
-    dict: BTreeMap<Bytes, KeyIdType>,
-    /// Interned keys.
-    keys: Vec<Bytes>,
-    /// Total bytes of keys in the dict.
-    key_bytes: usize,
-}
-
-impl KeyDict {
-    /// Creates a new dictionary.
-    fn new(id: DictIdType) -> Self {
-        Self {
-            id,
-            dict: BTreeMap::new(),
-            keys: Vec::new(),
-            key_bytes: 0,
-        }
-    }
-
-    /// Gets the id of the key if the dictionary contains the key.
-    fn get_key_id(&self, key: &[u8]) -> Option<KeyIdType> {
-        self.dict.get(key).copied()
-    }
-
-    /// Returns true if the dictionary is full.
-    fn is_full(&self, dict_key_num: KeyIdType, max_key_bytes: usize) -> bool {
-        self.keys.len() >= dict_key_num.into() || self.key_bytes >= max_key_bytes
-    }
-
-    /// Adds the key into the dictionary and returns the
-    /// id of the key.
-    ///
-    /// # Panics
-    /// Panics if the dictionary is full.
-    fn must_intern(&mut self, key: Vec<u8>) -> KeyIdType {
-        let key = Bytes::from(key);
-        let key_id = self.keys.len().try_into().unwrap();
-        let old = self.dict.insert(key.clone(), key_id);
-        debug_assert!(old.is_none());
-        self.key_bytes += key.len();
-        self.keys.push(key);
-
-        key_id
-    }
-}
-
-/// A block that keys are interned in the [KeyDict].
-struct InternedBlock {
-    /// Ids of keys.
-    key: UInt16VectorBuilder,
-    /// Values of rows.
-    value: ValueBuilder,
-}
-
-impl InternedBlock {
-    /// Returns a new block.
-    fn new(metadata: &RegionMetadataRef, capacity: usize) -> InternedBlock {
-        InternedBlock {
-            key: UInt16VectorBuilder::with_capacity(capacity),
-            value: ValueBuilder::new(metadata, capacity),
-        }
-    }
-
-    /// Inserts the row by id.
-    fn insert_by_id(&mut self, key_id: KeyIdType, key_value: &KeyValue) {
-        self.key.push(Some(key_id));
-        self.value.push(key_value);
     }
 }
 
