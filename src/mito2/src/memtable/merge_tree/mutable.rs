@@ -226,6 +226,8 @@ pub(crate) struct ReadMetrics {
     num_rows_returned: usize,
     /// Failures during evaluating expressions.
     eval_failure_total: u32,
+    decode_cost: Duration,
+    push_pk_cost: Duration,
 }
 
 impl ReadMetrics {
@@ -465,17 +467,18 @@ impl PlainBlockVectors {
         if self.value.is_empty() {
             return Ok(());
         }
+
+        // TODO(yingwen): Build schema first, then we don't need to build record batch
+        // if nothing need to prune.
+        let batch = self.record_batch_to_prune(metadata, codec, metrics)?;
+        metrics.num_rows_before_prune += batch.num_rows();
+
         let Some(predicate) = predicate else {
             return Ok(());
         };
         if predicate.exprs().is_empty() {
             return Ok(());
         }
-
-        // TODO(yingwen): Build schema first, then we don't need to build record batch
-        // if nothing need to prune.
-        let batch = self.record_batch_to_prune(metadata, codec)?;
-        metrics.num_rows_before_prune += batch.num_rows();
 
         let physical_exprs: Vec<_> = predicate
             .to_physical_exprs(&batch.schema())
@@ -597,6 +600,7 @@ impl PlainBlockVectors {
         &self,
         metadata: &RegionMetadataRef,
         codec: &Arc<McmpRowCodec>,
+        metrics: &mut ReadMetrics,
     ) -> Result<RecordBatch> {
         debug_assert!(!self.value.is_empty());
 
@@ -622,7 +626,7 @@ impl PlainBlockVectors {
                 ));
             }
 
-            self.decode_primary_keys_to(codec, &mut pk_builders);
+            self.decode_primary_keys_to(codec, &mut pk_builders, metrics);
             for mut pk_builder in pk_builders {
                 arrays.push(pk_builder.to_vector().to_arrow_array());
             }
@@ -692,6 +696,7 @@ impl PlainBlockVectors {
         &self,
         codec: &Arc<McmpRowCodec>,
         pk_builders: &mut [Box<dyn MutableVector>],
+        metrics: &mut ReadMetrics,
     ) {
         // Safety: `record_batch_to_prune()` ensures key is not None.
         let pk_vector = self.key.as_ref().unwrap();
@@ -699,11 +704,15 @@ impl PlainBlockVectors {
             // Safety: key is not null.
             let pk = pk.unwrap();
             // Safety: Pk is encoded from values. If decode returns an error, it should be a bug.
+            let now = Instant::now();
             let pk_values = codec.decode(pk).unwrap();
+            metrics.decode_cost += now.elapsed();
 
+            let now = Instant::now();
             for (builder, pk_value) in pk_builders.iter_mut().zip(&pk_values) {
                 builder.push_value_ref(pk_value.as_value_ref());
             }
+            metrics.push_pk_cost += now.elapsed();
         }
     }
 
