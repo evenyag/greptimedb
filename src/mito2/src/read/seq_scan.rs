@@ -323,6 +323,9 @@ impl SeqScan {
                 return Ok(None);
             };
 
+            // FIXME(yingwen): Note that this is incorrect, it returns the last
+            // row of the first batch for each series. We might need to implement
+            // a LastReader to correctly return the last row.
             if last {
                 if let Some(lk) = last_key {
                     if lk == batch.primary_key() {
