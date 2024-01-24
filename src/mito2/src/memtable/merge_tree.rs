@@ -215,19 +215,27 @@ impl MemtableBuilder for MergeTreeMemtableBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
 
     use common_time::Timestamp;
     use datatypes::scalars::ScalarVector;
-    use datatypes::vectors::TimestampMillisecondVector;
+    use datatypes::vectors::{Int64Vector, TimestampMillisecondVector};
 
     use super::*;
     use crate::test_util::memtable_util;
 
     #[test]
     fn test_memtable_sorted_input() {
-        common_telemetry::init_default_ut_logging();
-        let metadata = memtable_util::metadata_for_test();
+        write_iter_sorted_input(true);
+        write_iter_sorted_input(false);
+    }
+
+    fn write_iter_sorted_input(has_pk: bool) {
+        let metadata = if has_pk {
+            memtable_util::metadata_for_test()
+        } else {
+            memtable_util::metadata_with_primary_key(vec![])
+        };
         let kvs = memtable_util::build_key_values(&metadata, "hello".to_string(), 42, 100);
         let memtable = MergeTreeMemtable::new(1, metadata, None, &MergeTreeConfig::default());
         memtable.write(&kvs).unwrap();
@@ -235,7 +243,7 @@ mod tests {
         let expected_ts = kvs
             .iter()
             .map(|kv| kv.timestamp().as_timestamp().unwrap().unwrap().value())
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
 
         let iter = memtable.iter(None, None).unwrap();
         let read = iter
@@ -251,7 +259,7 @@ mod tests {
                     .into_iter()
             })
             .map(|v| v.unwrap().0.value())
-            .collect::<HashSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert_eq!(expected_ts, read);
 
         let stats = memtable.stats();
@@ -267,8 +275,16 @@ mod tests {
 
     #[test]
     fn test_memtable_unsorted_input() {
-        common_telemetry::init_default_ut_logging();
-        let metadata = memtable_util::metadata_for_test();
+        write_iter_unsorted_input(true);
+        write_iter_unsorted_input(false);
+    }
+
+    fn write_iter_unsorted_input(has_pk: bool) {
+        let metadata = if has_pk {
+            memtable_util::metadata_for_test()
+        } else {
+            memtable_util::metadata_with_primary_key(vec![])
+        };
         let memtable =
             MergeTreeMemtable::new(1, metadata.clone(), None, &MergeTreeConfig::default());
 
@@ -327,5 +343,40 @@ mod tests {
             Some((Timestamp::new_millisecond(0), Timestamp::new_millisecond(7))),
             stats.time_range()
         );
+    }
+
+    #[test]
+    fn test_memtable_projection() {
+        write_iter_projection(true);
+        write_iter_projection(false);
+    }
+
+    fn write_iter_projection(has_pk: bool) {
+        let metadata = if has_pk {
+            memtable_util::metadata_for_test()
+        } else {
+            memtable_util::metadata_with_primary_key(vec![])
+        };
+        let memtable = MergeTreeMemtableBuilder::new(None).build(&metadata);
+
+        let kvs = memtable_util::build_key_values(&metadata, "hello".to_string(), 10, 100);
+        memtable.write(&kvs).unwrap();
+        let iter = memtable.iter(Some(&[3]), None).unwrap();
+
+        let mut v0_all = vec![];
+        for res in iter {
+            let batch = res.unwrap();
+            assert_eq!(1, batch.fields().len());
+            let v0 = batch
+                .fields()
+                .first()
+                .unwrap()
+                .data
+                .as_any()
+                .downcast_ref::<Int64Vector>()
+                .unwrap();
+            v0_all.extend(v0.iter_data().map(|v| v.unwrap()));
+        }
+        assert_eq!((0..100i64).collect::<Vec<_>>(), v0_all);
     }
 }

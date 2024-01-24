@@ -52,6 +52,7 @@ use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{McmpRowCodec, RowCodec};
 
 /// Initial capacity for builders.
+// TODO(yingwen): maybe use 0 to avoid allocating spaces for empty columns.
 const INITIAL_BUILDER_CAPACITY: usize = 8;
 
 /// Mutable part that buffers input data.
@@ -138,10 +139,7 @@ impl MutablePart {
             }
             None => None,
         };
-        let offsets = plain_vectors
-            .as_ref()
-            .map(|v| v.primary_key_offsets())
-            .unwrap_or_default();
+        let offsets = plain_vectors.as_ref().and_then(|v| v.primary_key_offsets());
 
         // TODO(yingwen): prune cost.
         metrics.init_cost = now.elapsed();
@@ -214,7 +212,7 @@ pub(crate) struct ReadMetrics {
 /// Iterator of the mutable part.
 struct Iter {
     plain_vectors: Option<PlainBlockVectors>,
-    offsets: VecDeque<usize>,
+    offsets: Option<VecDeque<usize>>,
     // TODO(yingwen): scan metrics.
     #[allow(unused)]
     metrics: ReadMetrics,
@@ -225,16 +223,36 @@ impl Iterator for Iter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let plain_vectors = self.plain_vectors.as_ref()?;
-        let start = self.offsets.pop_front()?;
-        let end = self.offsets.front().copied()?;
 
-        let batch = plain_vectors
-            .slice_to_batch(start, end)
-            .and_then(|mut batch| {
-                batch.filter_deleted()?;
-                Ok(batch)
-            });
-        Some(batch)
+        if let Some(offsets) = &mut self.offsets {
+            let start = offsets.pop_front()?;
+            let end = offsets.front().copied()?;
+
+            let batch = Self::next_by_offset(plain_vectors, start, end);
+            Some(batch)
+        } else {
+            let batch = Self::next_without_offset(plain_vectors);
+            self.plain_vectors = None;
+            Some(batch)
+        }
+    }
+}
+
+impl Iter {
+    fn next_by_offset(
+        plain_vectors: &PlainBlockVectors,
+        start: usize,
+        end: usize,
+    ) -> Result<Batch> {
+        let mut batch = plain_vectors.slice_to_batch(start, end)?;
+        batch.filter_deleted()?;
+        Ok(batch)
+    }
+
+    fn next_without_offset(plain_vectors: &PlainBlockVectors) -> Result<Batch> {
+        let mut batch = plain_vectors.slice_to_batch(0, plain_vectors.len())?;
+        batch.filter_deleted()?;
+        Ok(batch)
     }
 }
 
@@ -385,6 +403,11 @@ struct PlainBlockVectors {
 }
 
 impl PlainBlockVectors {
+    /// Returns number of rows in vectors.
+    fn len(&self) -> usize {
+        self.value.timestamp.len()
+    }
+
     /// Prune vectors by the predicate.
     ///
     /// It tolerates errors during evaluating expressions but still returns an error on other cases.
@@ -399,6 +422,8 @@ impl PlainBlockVectors {
             return Ok(());
         }
 
+        // TODO(yingwen): Build schema first, then we don't need to build record batch
+        // if nothing need to prune.
         let batch = self.record_batch_to_prune(metadata, codec)?;
         let physical_exprs: Vec<_> = predicate
             .and_then(|p| p.to_physical_exprs(&batch.schema()).ok())
@@ -483,7 +508,8 @@ impl PlainBlockVectors {
         });
 
         if dedup {
-            index_and_key.dedup_by_key(|x| x.1);
+            // Dedup by timestamp
+            index_and_key.dedup_by_key(|x| x.1 .0);
         }
 
         UInt32Vector::from_iter_values(index_and_key.iter().map(|(idx, _)| *idx as u32))
@@ -696,12 +722,10 @@ impl PlainBlockVectors {
     }
 
     /// Compute offsets of different primary keys in the array.
-    fn primary_key_offsets(&self) -> VecDeque<usize> {
-        let Some(pk_vector) = &self.key else {
-            return VecDeque::new();
-        };
+    fn primary_key_offsets(&self) -> Option<VecDeque<usize>> {
+        let pk_vector = self.key.as_ref()?;
         if pk_vector.is_empty() {
-            return VecDeque::new();
+            return Some(VecDeque::new());
         }
 
         // Init offsets.
@@ -723,7 +747,7 @@ impl PlainBlockVectors {
         // The last end offset.
         offsets.push_back(pk_vector.len());
 
-        offsets
+        Some(offsets)
     }
 }
 

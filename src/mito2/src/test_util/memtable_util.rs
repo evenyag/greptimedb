@@ -89,20 +89,27 @@ impl MemtableBuilder for EmptyMemtableBuilder {
     }
 }
 
-/// Creates a region metadata to test memtable.
+/// Creates a region metadata to test memtable with default pk.
+///
+/// The schema is `k0, k1, ts, v0, v1` and pk is `k0, k1`.
+pub(crate) fn metadata_for_test() -> RegionMetadataRef {
+    metadata_with_primary_key(vec![0, 1])
+}
+
+/// Creates a region metadata to test memtable and specific primary key.
 ///
 /// The schema is `k0, k1, ts, v0, v1`.
-pub(crate) fn metadata_for_test() -> RegionMetadataRef {
+pub(crate) fn metadata_with_primary_key(primary_key: Vec<ColumnId>) -> RegionMetadataRef {
     let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
     builder
         .push_column_metadata(ColumnMetadata {
             column_schema: ColumnSchema::new("k0", ConcreteDataType::string_datatype(), false),
-            semantic_type: SemanticType::Tag,
+            semantic_type: semantic_type_of_column(0, &primary_key),
             column_id: 0,
         })
         .push_column_metadata(ColumnMetadata {
             column_schema: ColumnSchema::new("k1", ConcreteDataType::int64_datatype(), false),
-            semantic_type: SemanticType::Tag,
+            semantic_type: semantic_type_of_column(1, &primary_key),
             column_id: 1,
         })
         .push_column_metadata(ColumnMetadata {
@@ -116,17 +123,25 @@ pub(crate) fn metadata_for_test() -> RegionMetadataRef {
         })
         .push_column_metadata(ColumnMetadata {
             column_schema: ColumnSchema::new("v0", ConcreteDataType::int64_datatype(), true),
-            semantic_type: SemanticType::Field,
+            semantic_type: semantic_type_of_column(3, &primary_key),
             column_id: 3,
         })
         .push_column_metadata(ColumnMetadata {
             column_schema: ColumnSchema::new("v1", ConcreteDataType::float64_datatype(), true),
-            semantic_type: SemanticType::Field,
+            semantic_type: semantic_type_of_column(4, &primary_key),
             column_id: 4,
         })
-        .primary_key(vec![0, 1]);
+        .primary_key(primary_key);
     let region_metadata = builder.build().unwrap();
     Arc::new(region_metadata)
+}
+
+fn semantic_type_of_column(column_id: ColumnId, primary_key: &[ColumnId]) -> SemanticType {
+    if primary_key.contains(&column_id) {
+        SemanticType::Tag
+    } else {
+        SemanticType::Field
+    }
 }
 
 /// Builds key values with `len` rows for test.
