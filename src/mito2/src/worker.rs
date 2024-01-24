@@ -49,6 +49,7 @@ use crate::config::MitoConfig;
 use crate::error::{InvalidRequestSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::manifest::action::RegionEdit;
+use crate::memtable::merge_tree::MergeTreeMemtableBuilder;
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::memtable::MemtableBuilderRef;
 use crate::region::{MitoRegionRef, RegionMap, RegionMapRef};
@@ -323,6 +324,7 @@ impl<S: LogStore> WorkerStarter<S> {
         let (sender, receiver) = mpsc::channel(self.config.worker_channel_size);
 
         let running = Arc::new(AtomicBool::new(true));
+        let use_merge_tree = self.config.use_merge_tree;
         let mut worker_thread = RegionWorkerLoop {
             id: self.id,
             config: self.config,
@@ -333,9 +335,15 @@ impl<S: LogStore> WorkerStarter<S> {
             wal: Wal::new(self.log_store),
             object_store_manager: self.object_store_manager.clone(),
             running: running.clone(),
-            memtable_builder: Arc::new(TimeSeriesMemtableBuilder::new(Some(
-                self.write_buffer_manager.clone(),
-            ))),
+            memtable_builder: if use_merge_tree {
+                Arc::new(MergeTreeMemtableBuilder::new(Some(
+                    self.write_buffer_manager.clone(),
+                )))
+            } else {
+                Arc::new(TimeSeriesMemtableBuilder::new(Some(
+                    self.write_buffer_manager.clone(),
+                )))
+            },
             scheduler: self.scheduler.clone(),
             write_buffer_manager: self.write_buffer_manager,
             flush_scheduler: FlushScheduler::new(self.scheduler.clone()),

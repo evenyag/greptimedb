@@ -100,6 +100,10 @@ pub struct MitoConfig {
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
 
+    // Test config:
+    /// Use the new merge tree memtable.
+    pub use_merge_tree: bool,
+
     /// Inverted index configs.
     pub inverted_index: InvertedIndexConfig,
 }
@@ -126,6 +130,7 @@ impl Default for MitoConfig {
             scan_parallelism: divide_num_cpus(4),
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
             allow_stale_entries: false,
+            use_merge_tree: true,
             inverted_index: InvertedIndexConfig::default(),
         };
 
