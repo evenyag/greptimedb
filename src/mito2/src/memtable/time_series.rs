@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_series_with_nulls() {
-        let region_metadata = schema_for_test();
+        let region_metadata = memtable_util::schema_for_test();
         let mut series = Series::new(&region_metadata);
         // col1: NULL 1 2 3
         // col2: NULL NULL 10.2 NULL
