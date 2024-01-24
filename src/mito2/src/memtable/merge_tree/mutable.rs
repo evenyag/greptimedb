@@ -222,8 +222,8 @@ pub(crate) struct ReadMetrics {
     num_batches: usize,
     /// Number of rows before prunning.
     num_rows_before_prune: usize,
-    /// Number of rows after prunning.
-    num_rows_after_prune: usize,
+    /// Number of rows returned.
+    num_rows_returned: usize,
     /// Failures during evaluating expressions.
     eval_failure_total: u32,
 }
@@ -263,7 +263,7 @@ impl Drop for Iter {
 
         READ_ROWS_TOTAL
             .with_label_values(&["merge_tree_memtable"])
-            .inc_by(self.metrics.num_rows_after_prune as u64);
+            .inc_by(self.metrics.num_rows_returned as u64);
         READ_STAGE_ELAPSED
             .with_label_values(&["init_scan_memtable"])
             .observe(self.metrics.init_cost.as_secs_f64());
@@ -286,12 +286,14 @@ impl Iter {
 
             let batch = plain_vectors.slice_to_batch(start, end);
             self.metrics.num_batches += 1;
+            self.metrics.num_rows_returned += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
 
             Some(batch)
         } else {
             let batch = plain_vectors.slice_to_batch(0, plain_vectors.len());
             self.plain_vectors = None;
             self.metrics.num_batches += 1;
+            self.metrics.num_rows_returned += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
 
             Some(batch)
         }
@@ -486,7 +488,6 @@ impl PlainBlockVectors {
         let mask = BooleanVector::from(mask);
 
         let pruned = self.filter(&mask)?;
-        metrics.num_rows_after_prune += pruned.len();
         *self = pruned;
 
         Ok(())
