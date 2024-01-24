@@ -82,7 +82,7 @@ impl Memtable for MergeTreeMemtable {
     }
 
     fn is_empty(&self) -> bool {
-        todo!()
+        self.tree.is_empty()
     }
 
     fn mark_immutable(&self) {

@@ -76,4 +76,10 @@ impl MergeTree {
             true,
         )
     }
+
+    /// Returns true if the tree is empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        let mutable = self.mutable.write().unwrap();
+        mutable.is_empty()
+    }
 }

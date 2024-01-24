@@ -155,6 +155,14 @@ impl MutablePart {
         Ok(Box::new(iter))
     }
 
+    /// Returns true if the part is empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.plain_block
+            .as_ref()
+            .map(|block| block.is_empty())
+            .unwrap_or(true)
+    }
+
     /// Writes the `key_value` and the `primary_key` to the plain block.
     fn write_plain(
         &mut self,
@@ -266,6 +274,11 @@ impl PlainBlock {
 
         PlainBlockVectors { key, value }
     }
+
+    /// Returns true if the block is empty.
+    fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
 }
 
 /// Vector builder for a field.
@@ -278,6 +291,8 @@ struct FieldBuilder {
 }
 
 /// Mutable buffer for values.
+///
+/// Now timestamp, sequence, op_type is not null.
 struct ValueBuilder {
     timestamp: Box<dyn MutableVector>,
     sequence: UInt64VectorBuilder,
@@ -309,6 +324,11 @@ impl ValueBuilder {
             op_type,
             fields,
         }
+    }
+
+    /// Returns true if the builder is empty.
+    fn is_empty(&self) -> bool {
+        self.timestamp.is_empty()
     }
 
     /// Pushes the value of a row into the builder.
