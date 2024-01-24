@@ -35,6 +35,7 @@ use crate::memtable::{
     AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
     MemtableRef, MemtableStats,
 };
+use crate::metrics::WRITE_STAGE_ELAPSED;
 
 /// Config for the merge tree memtable.
 #[derive(Debug, Default, Clone)]
@@ -69,6 +70,10 @@ impl Memtable for MergeTreeMemtable {
         let res = self.tree.write(kvs, &mut metrics);
 
         self.update_stats(&metrics);
+
+        WRITE_STAGE_ELAPSED
+            .with_label_values(&["encode_pk"])
+            .observe(metrics.encode_cost.as_secs_f64());
 
         res
     }

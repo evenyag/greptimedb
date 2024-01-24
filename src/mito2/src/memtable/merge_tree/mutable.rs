@@ -100,7 +100,9 @@ impl MutablePart {
 
             // Encode primary key.
             primary_key.clear();
+            let now = Instant::now();
             row_codec.encode_to_vec(kv.primary_keys(), &mut primary_key)?;
+            metrics.encode_cost += now.elapsed();
 
             // TODO(yingwen): Freeze a block if it is large enough (in bytes).
             // Write rows with primary keys.
@@ -194,6 +196,9 @@ pub(crate) struct WriteMetrics {
     pub(crate) min_ts: i64,
     /// Maximum timestamp
     pub(crate) max_ts: i64,
+
+    /// Cost to encode primary keys.
+    pub(crate) encode_cost: Duration,
 }
 
 impl Default for WriteMetrics {
@@ -203,6 +208,7 @@ impl Default for WriteMetrics {
             value_bytes: 0,
             min_ts: i64::MAX,
             max_ts: i64::MIN,
+            encode_cost: Default::default(),
         }
     }
 }
