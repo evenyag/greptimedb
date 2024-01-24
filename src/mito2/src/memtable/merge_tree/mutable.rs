@@ -228,31 +228,13 @@ impl Iterator for Iter {
             let start = offsets.pop_front()?;
             let end = offsets.front().copied()?;
 
-            let batch = Self::next_by_offset(plain_vectors, start, end);
+            let batch = plain_vectors.slice_to_batch(start, end);
             Some(batch)
         } else {
-            let batch = Self::next_without_offset(plain_vectors);
+            let batch = plain_vectors.slice_to_batch(0, plain_vectors.len());
             self.plain_vectors = None;
             Some(batch)
         }
-    }
-}
-
-impl Iter {
-    fn next_by_offset(
-        plain_vectors: &PlainBlockVectors,
-        start: usize,
-        end: usize,
-    ) -> Result<Batch> {
-        let mut batch = plain_vectors.slice_to_batch(start, end)?;
-        batch.filter_deleted()?;
-        Ok(batch)
-    }
-
-    fn next_without_offset(plain_vectors: &PlainBlockVectors) -> Result<Batch> {
-        let mut batch = plain_vectors.slice_to_batch(0, plain_vectors.len())?;
-        batch.filter_deleted()?;
-        Ok(batch)
     }
 }
 
