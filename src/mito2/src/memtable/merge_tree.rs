@@ -86,7 +86,7 @@ impl Memtable for MergeTreeMemtable {
     }
 
     fn mark_immutable(&self) {
-        todo!()
+        self.alloc_tracker.done_allocating();
     }
 
     fn stats(&self) -> MemtableStats {
