@@ -39,7 +39,7 @@ use datatypes::vectors::{
 };
 use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::ColumnId;
+use store_api::storage::{ColumnId, RegionId};
 use table::predicate::Predicate;
 
 use crate::error::{
@@ -48,6 +48,7 @@ use crate::error::{
 use crate::memtable::key_values::KeyValue;
 use crate::memtable::merge_tree::MergeTreeConfig;
 use crate::memtable::{BoxedBatchIterator, KeyValues};
+use crate::metrics::{READ_ROWS_TOTAL, READ_STAGE_ELAPSED};
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{McmpRowCodec, RowCodec};
 
@@ -132,8 +133,14 @@ impl MutablePart {
         let plain_vectors = match &self.plain_block {
             Some(block) => {
                 let mut vectors = block.to_vectors(&projection);
+
+                let prune_start = Instant::now();
                 vectors.prune(metadata, &row_codec, predicate, &mut metrics)?;
+                metrics.prune_cost = prune_start.elapsed();
+
+                let sort_start = Instant::now();
                 vectors.sort_and_dedup(dedup)?;
+                metrics.sort_dedup_cost = sort_start.elapsed();
 
                 Some(vectors)
             }
@@ -145,6 +152,7 @@ impl MutablePart {
         metrics.init_cost = now.elapsed();
 
         let iter = Iter {
+            region_id: metadata.region_id,
             plain_vectors,
             offsets,
             metrics,
@@ -200,21 +208,38 @@ impl Default for WriteMetrics {
 }
 
 /// Metrics of scanning the mutable part.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ReadMetrics {
     /// Time used to initialize the iter.
     init_cost: Duration,
-
+    /// Time used to prune rows.
+    prune_cost: Duration,
+    /// Time used to sort and dedup rows.
+    sort_dedup_cost: Duration,
+    /// Time used to invoke next.
+    next_cost: Duration,
+    /// Number of batches returned by the iter.
+    num_batches: usize,
+    /// Number of rows before prunning.
+    num_rows_before_prune: usize,
+    /// Number of rows after prunning.
+    num_rows_after_prune: usize,
     /// Failures during evaluating expressions.
     eval_failure_total: u32,
 }
 
+impl ReadMetrics {
+    /// Returns the total duration to read the memtable.
+    fn total_scan_cost(&self) -> Duration {
+        self.init_cost + self.next_cost
+    }
+}
+
 /// Iterator of the mutable part.
 struct Iter {
+    region_id: RegionId,
     plain_vectors: Option<PlainBlockVectors>,
     offsets: Option<VecDeque<usize>>,
-    // TODO(yingwen): scan metrics.
-    #[allow(unused)]
     metrics: ReadMetrics,
 }
 
@@ -222,6 +247,37 @@ impl Iterator for Iter {
     type Item = Result<Batch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let now = Instant::now();
+        let res = self.next_batch();
+        self.metrics.next_cost += now.elapsed();
+        res
+    }
+}
+
+impl Drop for Iter {
+    fn drop(&mut self) {
+        debug!(
+            "Iter region {} memtable, metrics: {:?}",
+            self.region_id, self.metrics
+        );
+
+        READ_ROWS_TOTAL
+            .with_label_values(&["merge_tree_memtable"])
+            .inc_by(self.metrics.num_rows_after_prune as u64);
+        READ_STAGE_ELAPSED
+            .with_label_values(&["init_scan_memtable"])
+            .observe(self.metrics.init_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["prune_memtable"])
+            .observe(self.metrics.prune_cost.as_secs_f64());
+        READ_STAGE_ELAPSED
+            .with_label_values(&["scan_memtable"])
+            .observe(self.metrics.total_scan_cost().as_secs_f64());
+    }
+}
+
+impl Iter {
+    fn next_batch(&mut self) -> Option<Result<Batch>> {
         let plain_vectors = self.plain_vectors.as_ref()?;
 
         if let Some(offsets) = &mut self.offsets {
@@ -229,10 +285,14 @@ impl Iterator for Iter {
             let end = offsets.front().copied()?;
 
             let batch = plain_vectors.slice_to_batch(start, end);
+            self.metrics.num_batches += 1;
+
             Some(batch)
         } else {
             let batch = plain_vectors.slice_to_batch(0, plain_vectors.len());
             self.plain_vectors = None;
+            self.metrics.num_batches += 1;
+
             Some(batch)
         }
     }
@@ -407,6 +467,8 @@ impl PlainBlockVectors {
         // TODO(yingwen): Build schema first, then we don't need to build record batch
         // if nothing need to prune.
         let batch = self.record_batch_to_prune(metadata, codec)?;
+        metrics.num_rows_before_prune += batch.num_rows();
+
         let physical_exprs: Vec<_> = predicate
             .and_then(|p| p.to_physical_exprs(&batch.schema()).ok())
             .unwrap_or_default();
@@ -424,6 +486,7 @@ impl PlainBlockVectors {
         let mask = BooleanVector::from(mask);
 
         let pruned = self.filter(&mask)?;
+        metrics.num_rows_after_prune += pruned.len();
         *self = pruned;
 
         Ok(())
