@@ -92,7 +92,7 @@ impl MemtableBuilder for EmptyMemtableBuilder {
 /// Creates a region metadata to test memtable.
 ///
 /// The schema is `k0, k1, ts, v0, v1`.
-pub(crate) fn schema_for_test() -> RegionMetadataRef {
+pub(crate) fn metadata_for_test() -> RegionMetadataRef {
     let mut builder = RegionMetadataBuilder::new(RegionId::new(123, 456));
     builder
         .push_column_metadata(ColumnMetadata {

@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_memtable_sorted_input() {
         common_telemetry::init_default_ut_logging();
-        let metadata = memtable_util::schema_for_test();
+        let metadata = memtable_util::metadata_for_test();
         let kvs = memtable_util::build_key_values(&metadata, "hello".to_string(), 42, 100);
         let memtable = MergeTreeMemtable::new(1, metadata, None, &MergeTreeConfig::default());
         memtable.write(&kvs).unwrap();
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn test_memtable_unsorted_input() {
         common_telemetry::init_default_ut_logging();
-        let metadata = memtable_util::schema_for_test();
+        let metadata = memtable_util::metadata_for_test();
         let memtable =
             MergeTreeMemtable::new(1, metadata.clone(), None, &MergeTreeConfig::default());
 

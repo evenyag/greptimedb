@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_series() {
-        let region_metadata = memtable_util::schema_for_test();
+        let region_metadata = memtable_util::metadata_for_test();
         let mut series = Series::new(&region_metadata);
         series.push(ts_value_ref(1), 0, OpType::Put, field_value_ref(1, 10.1));
         series.push(ts_value_ref(2), 0, OpType::Put, field_value_ref(2, 10.2));
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_series_with_nulls() {
-        let region_metadata = memtable_util::schema_for_test();
+        let region_metadata = memtable_util::metadata_for_test();
         let mut series = Series::new(&region_metadata);
         // col1: NULL 1 2 3
         // col2: NULL NULL 10.2 NULL
@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn test_values_sort() {
-        let schema = memtable_util::schema_for_test();
+        let schema = memtable_util::metadata_for_test();
         let timestamp = Arc::new(TimestampMillisecondVector::from_vec(vec![1, 2, 3, 4, 3]));
         let sequence = Arc::new(UInt64Vector::from_vec(vec![1, 1, 1, 1, 2]));
         let op_type = Arc::new(UInt8Vector::from_vec(vec![1, 1, 1, 1, 0]));
@@ -963,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_series_set_concurrency() {
-        let schema = memtable_util::schema_for_test();
+        let schema = memtable_util::metadata_for_test();
         let row_codec = Arc::new(McmpRowCodec::new(
             schema
                 .primary_key_columns()
@@ -1042,7 +1042,7 @@ mod tests {
     #[test]
     fn test_memtable() {
         common_telemetry::init_default_ut_logging();
-        let schema = memtable_util::schema_for_test();
+        let schema = memtable_util::metadata_for_test();
         let kvs = memtable_util::build_key_values(&schema, "hello".to_string(), 42, 100);
         let memtable = TimeSeriesMemtable::new(schema, 42, None);
         memtable.write(&kvs).unwrap();
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn test_memtable_projection() {
         common_telemetry::init_default_ut_logging();
-        let schema = memtable_util::schema_for_test();
+        let schema = memtable_util::metadata_for_test();
         let kvs = memtable_util::build_key_values(&schema, "hello".to_string(), 42, 100);
         let memtable = TimeSeriesMemtable::new(schema, 42, None);
         memtable.write(&kvs).unwrap();
