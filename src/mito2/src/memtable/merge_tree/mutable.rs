@@ -465,6 +465,12 @@ impl PlainBlockVectors {
         if self.value.is_empty() {
             return Ok(());
         }
+        let Some(predicate) = predicate else {
+            return Ok(());
+        };
+        if predicate.exprs().is_empty() {
+            return Ok(());
+        }
 
         // TODO(yingwen): Build schema first, then we don't need to build record batch
         // if nothing need to prune.
@@ -472,7 +478,7 @@ impl PlainBlockVectors {
         metrics.num_rows_before_prune += batch.num_rows();
 
         let physical_exprs: Vec<_> = predicate
-            .and_then(|p| p.to_physical_exprs(&batch.schema()).ok())
+            .to_physical_exprs(&batch.schema())
             .unwrap_or_default();
         if physical_exprs.is_empty() {
             return Ok(());
@@ -687,7 +693,7 @@ impl PlainBlockVectors {
         codec: &Arc<McmpRowCodec>,
         pk_builders: &mut [Box<dyn MutableVector>],
     ) {
-        // Safety: `record_batch_to_prune()` ensures key is not None..
+        // Safety: `record_batch_to_prune()` ensures key is not None.
         let pk_vector = self.key.as_ref().unwrap();
         for pk in pk_vector.iter_data() {
             // Safety: key is not null.
