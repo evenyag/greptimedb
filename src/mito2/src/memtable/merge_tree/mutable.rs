@@ -144,7 +144,7 @@ impl MutablePart {
                 metrics.prune_cost = prune_start.elapsed();
 
                 let sort_start = Instant::now();
-                vectors.sort_and_dedup(dedup)?;
+                vectors.sort_and_dedup(dedup, &mut metrics)?;
                 metrics.sort_dedup_cost = sort_start.elapsed();
 
                 Some(vectors)
@@ -225,6 +225,9 @@ pub(crate) struct ReadMetrics {
     prune_cost: Duration,
     /// Time used to sort and dedup rows.
     sort_dedup_cost: Duration,
+    sort_cost: Duration,
+    dedup_cost: Duration,
+    sort_dedup_index_cost: Duration,
     /// Time used to invoke next.
     next_cost: Duration,
     /// Number of batches returned by the iter.
@@ -512,20 +515,22 @@ impl PlainBlockVectors {
     }
 
     /// Sort vectors by key, timestamp, seq desc.
-    fn sort_and_dedup(&mut self, dedup: bool) -> Result<()> {
+    fn sort_and_dedup(&mut self, dedup: bool, metrics: &mut ReadMetrics) -> Result<()> {
         // TODO(yingwen): Don't sort if vectors are already sorted.
         // Creates entries to sort.
+        let now = Instant::now();
         let indices = if self.key.is_none() {
             self.sort_and_dedup_without_key(dedup)
         } else {
-            self.sort_and_dedup_with_key(dedup)
+            self.sort_and_dedup_with_key(dedup, metrics)
         };
+        metrics.sort_dedup_index_cost += now.elapsed();
 
         self.take_in_place(&indices)
     }
 
     /// Returns indices to sort vectors by pk, timestamp, seq desc.
-    fn sort_and_dedup_with_key(&self, dedup: bool) -> UInt32Vector {
+    fn sort_and_dedup_with_key(&self, dedup: bool, metrics: &mut ReadMetrics) -> UInt32Vector {
         // Safety: `sort_and_dedup()` ensures key exists.
         let pk_vector = self.key.as_ref().unwrap();
         // Safety: primary key is not null.
@@ -535,6 +540,7 @@ impl PlainBlockVectors {
         debug_assert_eq!(pk_vector.len(), seq_values.len());
         debug_assert_eq!(ts_values.len(), seq_values.len());
 
+        let now = Instant::now();
         let mut index_and_key: Vec<_> = pk_values
             .zip(ts_values.iter())
             .zip(seq_values.iter())
@@ -546,10 +552,14 @@ impl PlainBlockVectors {
                 .then_with(|| a.1.cmp(&b.1)) // compare timestamp
                 .then_with(|| b.2.cmp(&a.2)) // then compare seq desc
         });
+        metrics.sort_cost += now.elapsed();
 
         if dedup {
+            let now = Instant::now();
+
             // Dedup by primary key, timestamp
             index_and_key.dedup_by_key(|x| (x.1 .0, x.1 .1));
+            metrics.dedup_cost += now.elapsed();
         }
 
         UInt32Vector::from_iter_values(index_and_key.iter().map(|(idx, _)| *idx as u32))
