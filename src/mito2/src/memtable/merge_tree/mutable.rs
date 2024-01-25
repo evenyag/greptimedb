@@ -477,17 +477,17 @@ impl PlainBlockVectors {
             return Ok(());
         }
 
-        // TODO(yingwen): Build schema first, then we don't need to build record batch
-        // if nothing need to prune.
-        let batch = self.record_batch_to_prune(metadata, codec, metrics)?;
-        metrics.num_rows_before_prune += batch.num_rows();
-
         let Some(predicate) = predicate else {
             return Ok(());
         };
         if predicate.exprs().is_empty() {
             return Ok(());
         }
+
+        // TODO(yingwen): Build schema first, then we don't need to build record batch
+        // if nothing need to prune.
+        let batch = self.record_batch_to_prune(metadata, codec, metrics)?;
+        metrics.num_rows_before_prune += batch.num_rows();
 
         let physical_exprs: Vec<_> = predicate
             .to_physical_exprs(&batch.schema())
