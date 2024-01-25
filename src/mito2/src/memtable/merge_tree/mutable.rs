@@ -104,6 +104,9 @@ impl MutablePart {
             row_codec.encode_to_vec(kv.primary_keys(), &mut primary_key)?;
             metrics.encode_cost += now.elapsed();
 
+            // Add bytes used by the primary key.
+            metrics.key_bytes += primary_key.len();
+
             // TODO(yingwen): Freeze a block if it is large enough (in bytes).
             // Write rows with primary keys.
             self.write_plain(metadata, &kv, Some(&primary_key));
