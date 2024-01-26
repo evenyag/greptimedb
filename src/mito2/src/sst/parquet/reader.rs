@@ -276,11 +276,6 @@ impl ParquetReaderBuilder {
         metrics: &mut Metrics,
     ) -> BTreeSet<usize> {
         let mut row_group_ids: BTreeSet<_> = (0..parquet_meta.num_row_groups()).collect();
-        common_telemetry::info!(
-            "parquet meta: {:?}, row group ids: {:?}",
-            parquet_meta,
-            row_group_ids
-        );
         metrics.num_row_groups_unfiltered += row_group_ids.len();
 
         // Applies index to prune row groups.
