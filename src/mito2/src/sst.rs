@@ -21,6 +21,7 @@ pub mod file_purger;
 pub mod index;
 pub mod location;
 pub mod parquet;
+pub mod split_kv;
 pub(crate) mod version;
 
 /// Default write buffer size, it should be greater than the default minimum upload part of S3 (5mb).
