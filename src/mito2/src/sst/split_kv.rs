@@ -24,8 +24,11 @@ use datatypes::arrow::array::{BinaryArray, UInt64Array};
 use datatypes::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use object_store::ObjectStore;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use snafu::ResultExt;
+use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 
 use crate::error::{InvalidParquetSnafu, Result, WriteBufferSnafu};
 use crate::read::BatchReader;
@@ -36,6 +39,7 @@ use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 const PK_ROW_GROUP_SIZE: usize = 8192;
+const PKID_COLUMN_NAME: &str = "__pkid";
 
 type PkId = u64;
 
@@ -103,7 +107,8 @@ impl PrimaryKeyFileWriter {
                 .await
                 .context(WriteBufferSnafu)?;
         }
-        writer.close().await.context(WriteBufferSnafu)?;
+        let (_, file_size) = writer.close().await.context(WriteBufferSnafu)?;
+        metrics.file_size = file_size as usize;
 
         Ok(metrics)
     }
@@ -122,15 +127,21 @@ impl PrimaryKeyFileWriter {
     }
 
     fn new_writer_props(&self) -> WriterProperties {
+        let pk_column = ColumnPath::new(vec![PRIMARY_KEY_COLUMN_NAME.to_string()]);
+        let pkid_column = ColumnPath::new(vec![PKID_COLUMN_NAME.to_string()]);
+
         WriterProperties::builder()
             .set_max_row_group_size(self.row_group_size)
+            .set_column_dictionary_enabled(pk_column, false)
+            .set_column_dictionary_enabled(pkid_column, false)
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .build()
     }
 
     fn new_schema() -> SchemaRef {
         let fields = Fields::from(vec![
-            Field::new("__primary_key", DataType::Binary, false),
-            Field::new("__pkid", DataType::UInt64, false),
+            Field::new(PRIMARY_KEY_COLUMN_NAME, DataType::Binary, false),
+            Field::new(PKID_COLUMN_NAME, DataType::UInt64, false),
         ]);
         Arc::new(Schema::new(fields))
     }
@@ -151,6 +162,8 @@ pub struct WriterMetrics {
     pub num_pk: usize,
     /// Total bytes of primary keys.
     pub pk_bytes: usize,
+    /// Output file size.
+    pub file_size: usize,
 }
 
 #[derive(Debug)]
