@@ -450,12 +450,18 @@ impl MarkFileWriter {
 
     fn new_writer_props() -> WriterProperties {
         let pkid_column = ColumnPath::new(vec![PKID_COLUMN_NAME.to_string()]);
+        let row_offset_column = ColumnPath::new(vec![ROW_OFFSET_COLUMN_NAME.to_string()]);
+        let num_rows_column = ColumnPath::new(vec![NUM_ROWS_COLUMN_NAME.to_string()]);
 
         WriterProperties::builder()
             .set_max_row_group_size(MARK_ROW_GROUP_SIZE)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_column_dictionary_enabled(pkid_column.clone(), false)
             .set_column_encoding(pkid_column, Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(row_offset_column.clone(), false)
+            .set_column_encoding(row_offset_column, Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(num_rows_column.clone(), false)
+            .set_column_encoding(num_rows_column, Encoding::DELTA_BINARY_PACKED)
             .build()
     }
 
