@@ -144,7 +144,9 @@ impl PrimaryKeyFileWriter {
         );
         let schema_with_tags = self.new_schema_with_tags(metadata);
 
-        let mut writer = self.new_buffered_writer(store).await?;
+        let mut writer = self
+            .new_buffered_writer_with_schema(store, schema_with_tags.clone())
+            .await?;
 
         let key_values: Vec<_> = self.primary_keys.iter().collect();
         for kv_batch in key_values.chunks(self.batch_size) {
@@ -172,10 +174,19 @@ impl PrimaryKeyFileWriter {
     }
 
     async fn new_buffered_writer(&self, store: &ObjectStore) -> Result<BufferedWriter> {
+        self.new_buffered_writer_with_schema(store, self.schema.clone())
+            .await
+    }
+
+    async fn new_buffered_writer_with_schema(
+        &self,
+        store: &ObjectStore,
+        schema: SchemaRef,
+    ) -> Result<BufferedWriter> {
         BufferedWriter::try_new(
             self.path.clone(),
             store.clone(),
-            self.schema.clone(),
+            schema,
             Some(self.new_writer_props()),
             DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize,
             DEFAULT_WRITE_CONCURRENCY,
