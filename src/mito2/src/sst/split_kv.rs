@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_datasource::file_format::parquet::BufferedWriter;
@@ -53,6 +54,7 @@ const DATA_ROW_GROUP_SIZE: usize = 102400;
 const PKID_COLUMN_NAME: &str = "__pkid";
 const ROW_OFFSET_COLUMN_NAME: &str = "__row_offset";
 const NUM_ROWS_COLUMN_NAME: &str = "__num_rows";
+const TSID_COLUMN_NAME: &str = "__tsid";
 
 type PkId = u64;
 
@@ -154,7 +156,14 @@ impl PrimaryKeyFileWriter {
             metrics.pk_bytes += key_bytes;
 
             let mut columns = Self::kv_batch_to_columns(kv_batch);
+            let convert_start = Instant::now();
             let mut tags = Self::kv_batch_to_tags(kv_batch, &codec, metadata);
+            metrics.build_tags_cost += convert_start.elapsed();
+            let tsid_index = metadata
+                .primary_key_columns()
+                .position(|meta| meta.column_schema.name == TSID_COLUMN_NAME)
+                .unwrap();
+            tags.remove(tsid_index);
             metrics.tag_bytes += tags
                 .iter()
                 .map(|array| array.get_buffer_memory_size())
@@ -211,6 +220,10 @@ impl PrimaryKeyFileWriter {
     fn new_schema_with_tags(&self, metadata: &RegionMetadataRef) -> SchemaRef {
         let mut fields = Self::internal_fields();
         for column_metadata in metadata.primary_key_columns() {
+            if column_metadata.column_schema.name == TSID_COLUMN_NAME {
+                continue;
+            }
+
             fields.push(
                 metadata
                     .schema
@@ -289,6 +302,8 @@ pub struct PkWriterMetrics {
     pub file_size: usize,
     /// Total bytes of tag arrays.
     pub tag_bytes: usize,
+    /// Duration to build tag arrays.
+    pub build_tags_cost: Duration,
 }
 
 /// Metrics for writing the data file.
