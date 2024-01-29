@@ -22,8 +22,11 @@ use api::v1::SemanticType;
 use common_datasource::file_format::parquet::BufferedWriter;
 use common_time::Timestamp;
 use datatypes::arrow::array::{ArrayBuilder, ArrayRef, BinaryArray, UInt64Array, UInt64Builder};
-use datatypes::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use datatypes::arrow::datatypes::{
+    DataType as ArrowDataType, Field, FieldRef, Fields, Schema, SchemaRef,
+};
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::data_type::DataType;
 use datatypes::vectors::Vector;
 use object_store::ObjectStore;
 use parquet::basic::{Compression, ZstdLevel};
@@ -37,6 +40,7 @@ use store_api::storage::consts::{
 
 use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result, WriteBufferSnafu};
 use crate::read::{Batch, BatchReader};
+use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::file::{FileHandle, FileId, FileMeta};
 use crate::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
 use crate::sst::parquet::reader::ParquetReaderBuilder;
@@ -122,6 +126,51 @@ impl PrimaryKeyFileWriter {
         Ok(metrics)
     }
 
+    async fn write_to_store_with_tags(
+        &self,
+        store: &ObjectStore,
+        metadata: &RegionMetadataRef,
+    ) -> Result<PkWriterMetrics> {
+        let mut metrics = PkWriterMetrics {
+            num_pk: self.primary_keys.len(),
+            ..Default::default()
+        };
+
+        let codec = McmpRowCodec::new(
+            metadata
+                .primary_key_columns()
+                .map(|c| SortField::new(c.column_schema.data_type.clone()))
+                .collect(),
+        );
+        let schema_with_tags = self.new_schema_with_tags(metadata);
+
+        let mut writer = self.new_buffered_writer(store).await?;
+
+        let key_values: Vec<_> = self.primary_keys.iter().collect();
+        for kv_batch in key_values.chunks(self.batch_size) {
+            let key_bytes: usize = kv_batch.iter().map(|kv| kv.0.len()).sum();
+            metrics.pk_bytes += key_bytes;
+
+            let mut columns = Self::kv_batch_to_columns(kv_batch);
+            let mut tags = Self::kv_batch_to_tags(kv_batch, &codec, metadata);
+            metrics.tag_bytes += tags
+                .iter()
+                .map(|array| array.get_buffer_memory_size())
+                .sum::<usize>();
+            columns.append(&mut tags);
+            let record_batch = RecordBatch::try_new(schema_with_tags.clone(), columns)
+                .context(NewRecordBatchSnafu)?;
+            writer
+                .write(&record_batch)
+                .await
+                .context(WriteBufferSnafu)?;
+        }
+        let (_, file_size) = writer.close().await.context(WriteBufferSnafu)?;
+        metrics.file_size = file_size as usize;
+
+        Ok(metrics)
+    }
+
     async fn new_buffered_writer(&self, store: &ObjectStore) -> Result<BufferedWriter> {
         BufferedWriter::try_new(
             self.path.clone(),
@@ -148,12 +197,39 @@ impl PrimaryKeyFileWriter {
             .build()
     }
 
-    fn new_schema() -> SchemaRef {
-        let fields = Fields::from(vec![
-            Field::new(PRIMARY_KEY_COLUMN_NAME, DataType::Binary, false),
-            Field::new(PKID_COLUMN_NAME, DataType::UInt64, false),
-        ]);
+    fn new_schema_with_tags(&self, metadata: &RegionMetadataRef) -> SchemaRef {
+        let mut fields = Self::internal_fields();
+        for column_metadata in metadata.primary_key_columns() {
+            fields.push(
+                metadata
+                    .schema
+                    .arrow_schema()
+                    .field_with_name(&column_metadata.column_schema.name)
+                    .unwrap()
+                    .clone(),
+            );
+        }
+
+        let fields = Fields::from(fields);
         Arc::new(Schema::new(fields))
+    }
+
+    fn new_schema() -> SchemaRef {
+        let fields = Fields::from(Self::internal_fields());
+        Arc::new(Schema::new(fields))
+    }
+
+    fn internal_fields() -> Vec<Field> {
+        vec![
+            Field::new(PRIMARY_KEY_COLUMN_NAME, ArrowDataType::Binary, false),
+            Field::new(PKID_COLUMN_NAME, ArrowDataType::UInt64, false),
+        ]
+    }
+
+    fn kv_batch_to_columns(kv_batch: &[(&Vec<u8>, &PkFileRowValue)]) -> Vec<ArrayRef> {
+        let pk_array = BinaryArray::from_iter_values(kv_batch.iter().map(|kv| kv.0.as_slice()));
+        let pkid_array = UInt64Array::from_iter_values(kv_batch.iter().map(|kv| kv.1.pkid));
+        vec![Arc::new(pk_array), Arc::new(pkid_array)]
     }
 
     fn kv_batch_to_record_batch(&self, kv_batch: &[(&Vec<u8>, &PkFileRowValue)]) -> RecordBatch {
@@ -162,6 +238,32 @@ impl PrimaryKeyFileWriter {
         let columns = vec![Arc::new(pk_array) as _, Arc::new(pkid_array) as _];
 
         RecordBatch::try_new(self.schema.clone(), columns).unwrap()
+    }
+
+    fn kv_batch_to_tags(
+        kv_batch: &[(&Vec<u8>, &PkFileRowValue)],
+        codec: &McmpRowCodec,
+        metadata: &RegionMetadataRef,
+    ) -> Vec<ArrayRef> {
+        let mut builders: Vec<_> = metadata
+            .primary_key_columns()
+            .map(|meta| {
+                meta.column_schema
+                    .data_type
+                    .create_mutable_vector(kv_batch.len())
+            })
+            .collect();
+        for (key, _) in kv_batch {
+            let values = codec.decode(key.as_slice()).unwrap();
+            for (value, builder) in values.into_iter().zip(&mut builders) {
+                builder.push_value_ref(value.as_value_ref());
+            }
+        }
+
+        builders
+            .into_iter()
+            .map(|mut builder| builder.to_vector().to_arrow_array())
+            .collect()
     }
 }
 
@@ -174,6 +276,8 @@ pub struct PkWriterMetrics {
     pub pk_bytes: usize,
     /// Output file size.
     pub file_size: usize,
+    /// Total bytes of tag arrays.
+    pub tag_bytes: usize,
 }
 
 /// Metrics for writing the data file.
@@ -314,9 +418,13 @@ impl DataFileWriter {
     fn internal_fields() -> [FieldRef; 3] {
         // Internal columns are always not null.
         [
-            Arc::new(Field::new(PKID_COLUMN_NAME, DataType::UInt64, false)),
-            Arc::new(Field::new(SEQUENCE_COLUMN_NAME, DataType::UInt64, false)),
-            Arc::new(Field::new(OP_TYPE_COLUMN_NAME, DataType::UInt8, false)),
+            Arc::new(Field::new(PKID_COLUMN_NAME, ArrowDataType::UInt64, false)),
+            Arc::new(Field::new(
+                SEQUENCE_COLUMN_NAME,
+                ArrowDataType::UInt64,
+                false,
+            )),
+            Arc::new(Field::new(OP_TYPE_COLUMN_NAME, ArrowDataType::UInt8, false)),
         ]
     }
 
@@ -503,9 +611,9 @@ impl MarkFileWriter {
 
     fn new_schema() -> SchemaRef {
         let fields = Fields::from(vec![
-            Field::new(PKID_COLUMN_NAME, DataType::UInt64, false),
-            Field::new(ROW_OFFSET_COLUMN_NAME, DataType::UInt64, false),
-            Field::new(NUM_ROWS_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(PKID_COLUMN_NAME, ArrowDataType::UInt64, false),
+            Field::new(ROW_OFFSET_COLUMN_NAME, ArrowDataType::UInt64, false),
+            Field::new(NUM_ROWS_COLUMN_NAME, ArrowDataType::UInt64, false),
         ]);
         Arc::new(Schema::new(fields))
     }
@@ -556,6 +664,7 @@ pub async fn create_pk_file(
     file_id: &str,
     output_path: &str,
     object_store: &ObjectStore,
+    with_tags: bool,
 ) -> Result<PkWriterMetrics> {
     let mut writer = PrimaryKeyFileWriter::new(output_path);
 
@@ -568,7 +677,13 @@ pub async fn create_pk_file(
         writer.add_primary_key(batch.primary_key());
     }
 
-    writer.write_to_store(object_store).await
+    if with_tags {
+        writer
+            .write_to_store_with_tags(object_store, reader.metadata())
+            .await
+    } else {
+        writer.write_to_store(object_store).await
+    }
 }
 
 /// Creates a data file under `input_dir` to `output_path`.

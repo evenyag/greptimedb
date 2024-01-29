@@ -67,7 +67,15 @@ async fn run_create_pk(args: CreateArgs) {
     }
 
     let store = new_fs_store();
-    match create_pk_file(&args.input_dir, &args.file_id, &args.output_path, &store).await {
+    match create_pk_file(
+        &args.input_dir,
+        &args.file_id,
+        &args.output_path,
+        &store,
+        false,
+    )
+    .await
+    {
         Ok(metrics) => {
             println!("Created pk file, metrics: {:?}", metrics);
         }
