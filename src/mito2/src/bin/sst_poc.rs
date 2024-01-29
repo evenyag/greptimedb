@@ -15,7 +15,7 @@
 //! POC of the SST format.
 
 use clap::Parser;
-use mito2::sst::split_kv::{create_data_file, create_pk_file};
+use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file};
 use object_store::services::Fs;
 use object_store::ObjectStore;
 
@@ -24,25 +24,16 @@ use object_store::ObjectStore;
 #[command(bin_name = "sst-poc")]
 enum PocCli {
     /// Creates a primary key file.
-    CreatePk(CreatePkArgs),
+    CreatePk(CreateArgs),
     /// Creates a data file.
-    CreateData(CreateDataArgs),
+    CreateData(CreateArgs),
+    /// Creates a mark file.
+    CreateMark(CreateArgs),
 }
 
 #[derive(Debug, clap::Args)]
 #[command(author, version, about, long_about = None)]
-struct CreatePkArgs {
-    #[arg(short, long)]
-    input_dir: String,
-    #[arg(long)]
-    file_id: String,
-    #[arg(short, long)]
-    output_path: String,
-}
-
-#[derive(Debug, clap::Args)]
-#[command(author, version, about, long_about = None)]
-struct CreateDataArgs {
+struct CreateArgs {
     #[arg(short, long)]
     input_dir: String,
     #[arg(long)]
@@ -63,10 +54,11 @@ async fn main() {
     match cli {
         PocCli::CreatePk(args) => run_create_pk(args).await,
         PocCli::CreateData(args) => run_create_data(args).await,
+        PocCli::CreateMark(args) => run_create_mark(args).await,
     }
 }
 
-async fn run_create_pk(args: CreatePkArgs) {
+async fn run_create_pk(args: CreateArgs) {
     println!("Create pk, args: {args:?}");
 
     if args.file_id.is_empty() {
@@ -85,8 +77,8 @@ async fn run_create_pk(args: CreatePkArgs) {
     }
 }
 
-async fn run_create_data(args: CreateDataArgs) {
-    println!("Create pk, args: {args:?}");
+async fn run_create_data(args: CreateArgs) {
+    println!("Create mark, args: {args:?}");
 
     if args.file_id.is_empty() {
         println!("File id is empty");
@@ -100,6 +92,25 @@ async fn run_create_data(args: CreateDataArgs) {
         }
         Err(e) => {
             println!("Failed to create data file, {e:?}");
+        }
+    }
+}
+
+async fn run_create_mark(args: CreateArgs) {
+    println!("Create mark, args: {args:?}");
+
+    if args.file_id.is_empty() {
+        println!("File id is empty");
+        return;
+    }
+
+    let store = new_fs_store();
+    match create_mark_file(&args.input_dir, &args.file_id, &args.output_path, &store).await {
+        Ok(metrics) => {
+            println!("Created mark file, metrics: {:?}", metrics);
+        }
+        Err(e) => {
+            println!("Failed to create mark file, {e:?}");
         }
     }
 }
