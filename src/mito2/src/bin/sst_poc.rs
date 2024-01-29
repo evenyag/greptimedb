@@ -24,7 +24,7 @@ use object_store::ObjectStore;
 #[command(bin_name = "sst-poc")]
 enum PocCli {
     /// Creates a primary key file.
-    CreatePk(CreateArgs),
+    CreatePk(CreatePkArgs),
     /// Creates a data file.
     CreateData(CreateArgs),
     /// Creates a mark file.
@@ -33,11 +33,31 @@ enum PocCli {
 
 #[derive(Debug, clap::Args)]
 #[command(author, version, about, long_about = None)]
-struct CreateArgs {
+struct CreatePkArgs {
+    /// Input directory.
     #[arg(short, long)]
     input_dir: String,
+    /// File id of the file under input directory.
     #[arg(long)]
     file_id: String,
+    /// Output file path.
+    #[arg(short, long)]
+    output_path: String,
+    /// Add tags to the primary key file.
+    #[arg(long, default_value_t = false)]
+    with_tags: bool,
+}
+
+#[derive(Debug, clap::Args)]
+#[command(author, version, about, long_about = None)]
+struct CreateArgs {
+    /// Input directory.
+    #[arg(short, long)]
+    input_dir: String,
+    /// File id of the file under input directory.
+    #[arg(long)]
+    file_id: String,
+    /// Output file path.
     #[arg(short, long)]
     output_path: String,
 }
@@ -58,7 +78,7 @@ async fn main() {
     }
 }
 
-async fn run_create_pk(args: CreateArgs) {
+async fn run_create_pk(args: CreatePkArgs) {
     println!("Create pk, args: {args:?}");
 
     if args.file_id.is_empty() {
@@ -72,7 +92,7 @@ async fn run_create_pk(args: CreateArgs) {
         &args.file_id,
         &args.output_path,
         &store,
-        false,
+        args.with_tags,
     )
     .await
     {
