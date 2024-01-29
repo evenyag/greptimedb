@@ -186,7 +186,6 @@ pub struct DataWriterMetrics {
 
 /// A writer to write a data file from batches.
 struct DataFileWriter {
-    metadata: RegionMetadataRef,
     sst_schema: SchemaRef,
     writer: BufferedWriter,
     last_primary_key: Option<Vec<u8>>,
@@ -198,7 +197,7 @@ struct DataFileWriter {
 impl DataFileWriter {
     async fn new(
         path: &str,
-        metadata: RegionMetadataRef,
+        metadata: &RegionMetadataRef,
         object_store: &ObjectStore,
         props: Option<WriterProperties>,
     ) -> Result<DataFileWriter> {
@@ -215,7 +214,6 @@ impl DataFileWriter {
         .context(WriteBufferSnafu)?;
 
         Ok(DataFileWriter {
-            metadata,
             sst_schema,
             writer,
             last_primary_key: None,
@@ -414,7 +412,7 @@ pub async fn create_data_file(
             .await?;
     let props = Some(DataFileWriter::new_writer_props(reader.metadata()));
     let mut writer =
-        DataFileWriter::new(output_path, reader.metadata().clone(), object_store, props).await?;
+        DataFileWriter::new(output_path, reader.metadata(), object_store, props).await?;
 
     while let Some(batch) = reader.next_batch().await? {
         writer.write_data(&batch).await?;
