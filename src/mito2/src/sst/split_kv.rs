@@ -133,7 +133,8 @@ impl PrimaryKeyFileWriter {
         WriterProperties::builder()
             .set_max_row_group_size(self.row_group_size)
             .set_column_dictionary_enabled(pk_column, false)
-            .set_column_dictionary_enabled(pkid_column, false)
+            .set_column_dictionary_enabled(pkid_column.clone(), false)
+            .set_column_encoding(pkid_column, Encoding::DELTA_BINARY_PACKED)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .build()
     }
