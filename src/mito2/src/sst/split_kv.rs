@@ -21,7 +21,7 @@ use std::sync::Arc;
 use api::v1::SemanticType;
 use common_datasource::file_format::parquet::BufferedWriter;
 use common_time::Timestamp;
-use datatypes::arrow::array::{ArrayRef, BinaryArray, UInt64Array};
+use datatypes::arrow::array::{ArrayBuilder, ArrayRef, BinaryArray, UInt64Array, UInt64Builder};
 use datatypes::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::vectors::Vector;
@@ -44,8 +44,11 @@ use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 const PK_ROW_GROUP_SIZE: usize = 8192;
+const MARK_ROW_GROUP_SIZE: usize = 8192;
 const DATA_ROW_GROUP_SIZE: usize = 102400;
 const PKID_COLUMN_NAME: &str = "__pkid";
+const ROW_OFFSET_COLUMN_NAME: &str = "__row_offset";
+const NUM_ROWS_COLUMN_NAME: &str = "__num_rows";
 
 type PkId = u64;
 
@@ -180,6 +183,13 @@ pub struct DataWriterMetrics {
     pub num_pk: usize,
     /// Number of rows.
     pub num_rows: usize,
+    /// Output file size.
+    pub file_size: usize,
+}
+
+/// Metrics for writing the mark file.
+#[derive(Debug, Default)]
+pub struct MarkWriterMetrics {
     /// Output file size.
     pub file_size: usize,
 }
@@ -338,6 +348,163 @@ impl DataFileWriter {
     }
 }
 
+/// Builder for columns in the mark file.
+struct MarkFileColumnsBuilder {
+    /// Id of the pk.
+    pkid: UInt64Builder,
+    /// Row offset of the pk in the file.
+    row_offset: UInt64Builder,
+    /// Number of rows of the pk.
+    num_rows: UInt64Builder,
+}
+
+impl MarkFileColumnsBuilder {
+    fn with_capacity(capacity: usize) -> MarkFileColumnsBuilder {
+        MarkFileColumnsBuilder {
+            pkid: UInt64Builder::with_capacity(capacity),
+            row_offset: UInt64Builder::with_capacity(capacity),
+            num_rows: UInt64Builder::with_capacity(capacity),
+        }
+    }
+}
+
+struct MarkFileWriter {
+    file_schema: SchemaRef,
+    writer: BufferedWriter,
+    last_primary_key: Option<Vec<u8>>,
+    current_pkid: PkId,
+    current_offset: usize,
+    num_rows: usize,
+    builder: MarkFileColumnsBuilder,
+
+    batch_size: usize,
+}
+
+impl MarkFileWriter {
+    async fn new(path: &str, object_store: &ObjectStore) -> Result<MarkFileWriter> {
+        let file_schema = Self::new_schema();
+        let writer = BufferedWriter::try_new(
+            path.to_string(),
+            object_store.clone(),
+            file_schema.clone(),
+            Some(Self::new_writer_props()),
+            DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await
+        .context(WriteBufferSnafu)?;
+
+        Ok(MarkFileWriter {
+            file_schema,
+            writer,
+            last_primary_key: None,
+            current_pkid: 0,
+            current_offset: 0,
+            num_rows: 0,
+            builder: MarkFileColumnsBuilder::with_capacity(DEFAULT_READ_BATCH_SIZE),
+            batch_size: DEFAULT_READ_BATCH_SIZE,
+        })
+    }
+
+    async fn write_mark(&mut self, batch: &Batch) -> Result<()> {
+        let Some(current_key) = &self.last_primary_key else {
+            self.last_primary_key = Some(batch.primary_key().to_vec());
+            // The first key.
+            self.num_rows += batch.num_rows();
+
+            return self.maybe_write_batch().await;
+        };
+
+        if current_key == batch.primary_key() {
+            // The same pk.
+            self.num_rows += batch.num_rows();
+
+            return self.maybe_write_batch().await;
+        }
+
+        assert!(batch.primary_key() > current_key.as_slice());
+        // A new key.
+        self.builder.pkid.append_value(self.current_pkid as u64);
+        self.builder
+            .row_offset
+            .append_value(self.current_offset as u64);
+        self.builder.num_rows.append_value(self.num_rows as u64);
+
+        self.last_primary_key = Some(batch.primary_key().to_vec());
+        self.current_pkid += 1;
+        self.current_offset = self.num_rows;
+        self.num_rows += batch.num_rows();
+
+        self.maybe_write_batch().await
+    }
+
+    async fn finish(mut self) -> Result<MarkWriterMetrics> {
+        self.write_one_batch().await?;
+
+        let (_, file_size) = self.writer.close().await.context(WriteBufferSnafu)?;
+
+        Ok(MarkWriterMetrics {
+            file_size: file_size as usize,
+        })
+    }
+
+    fn new_writer_props() -> WriterProperties {
+        let pkid_column = ColumnPath::new(vec![PKID_COLUMN_NAME.to_string()]);
+
+        WriterProperties::builder()
+            .set_max_row_group_size(MARK_ROW_GROUP_SIZE)
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_column_dictionary_enabled(pkid_column.clone(), false)
+            .set_column_encoding(pkid_column, Encoding::DELTA_BINARY_PACKED)
+            .build()
+    }
+
+    async fn maybe_write_batch(&mut self) -> Result<()> {
+        if self.builder.pkid.len() < self.batch_size {
+            return Ok(());
+        }
+
+        let pkid = Arc::new(self.builder.pkid.finish());
+        let row_offset = Arc::new(self.builder.row_offset.finish());
+        let num_rows = Arc::new(self.builder.num_rows.finish());
+
+        let columns: Vec<ArrayRef> = vec![pkid, row_offset, num_rows];
+        let record_batch = RecordBatch::try_new(self.file_schema.clone(), columns).unwrap();
+
+        self.writer
+            .write(&record_batch)
+            .await
+            .context(WriteBufferSnafu)
+    }
+
+    async fn write_one_batch(&mut self) -> Result<()> {
+        if self.builder.pkid.is_empty() {
+            return Ok(());
+        }
+
+        let pkid = Arc::new(self.builder.pkid.finish());
+        let row_offset = Arc::new(self.builder.row_offset.finish());
+        let num_rows = Arc::new(self.builder.num_rows.finish());
+
+        let columns: Vec<ArrayRef> = vec![pkid, row_offset, num_rows];
+        let record_batch = RecordBatch::try_new(self.file_schema.clone(), columns).unwrap();
+
+        self.writer
+            .write(&record_batch)
+            .await
+            .context(WriteBufferSnafu)
+    }
+
+    fn new_schema() -> SchemaRef {
+        let fields = Fields::from(vec![
+            Field::new(PKID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(ROW_OFFSET_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(NUM_ROWS_COLUMN_NAME, DataType::UInt64, false),
+        ]);
+        Arc::new(Schema::new(fields))
+    }
+}
+
 #[derive(Debug)]
 struct NoopFilePurger;
 
@@ -416,6 +583,27 @@ pub async fn create_data_file(
 
     while let Some(batch) = reader.next_batch().await? {
         writer.write_data(&batch).await?;
+    }
+
+    writer.finish().await
+}
+
+/// Creates a mark file under `input_dir` to `output_path`.
+pub async fn create_mark_file(
+    input_dir: &str,
+    file_id: &str,
+    output_path: &str,
+    object_store: &ObjectStore,
+) -> Result<MarkWriterMetrics> {
+    let file_handle = new_file_handle(file_id)?;
+    let mut reader =
+        ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
+            .build()
+            .await?;
+    let mut writer = MarkFileWriter::new(output_path, object_store).await?;
+
+    while let Some(batch) = reader.next_batch().await? {
+        writer.write_mark(&batch).await?;
     }
 
     writer.finish().await
