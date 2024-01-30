@@ -29,6 +29,7 @@ type PkId = u64;
 struct IndexConfig {
     /// Max keys in a dictionary block.
     max_keys_per_dict: usize,
+    // TODO(yingwen): Also consider byte size.
 }
 
 // TODO(yingwen): Support partition index (partition by a column, e.g. table_id) to
@@ -76,22 +77,17 @@ impl DictBlockBuilder {
     fn finish(&mut self) -> Result<DictBlock> {
         // TODO(yingwen): We can check whether keys are already sorted first. But
         // we might need some benchmarks.
-        let pk_array = self.primary_key.finish();
-        let pkid_array = self.pkid.finish();
+        let primary_key = self.primary_key.finish();
+        let pkid = self.pkid.finish();
 
-        let indices = compute::sort_to_indices(&pk_array, None, None).context(ComputeArrowSnafu)?;
-        let primary_key = compute::take(&pk_array, &indices, None).context(ComputeArrowSnafu)?;
-        let pkid = compute::take(&pkid_array, &indices, None).context(ComputeArrowSnafu)?;
+        DictBlock::try_new(primary_key, pkid)
+    }
 
-        let dict = DictBlock {
-            primary_key: primary_key
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap()
-                .clone(),
-            pkid: pkid.as_any().downcast_ref::<UInt64Array>().unwrap().clone(),
-        };
-        Ok(dict)
+    fn finish_cloned(&self) -> Result<DictBlock> {
+        let primary_key = self.primary_key.finish_cloned();
+        let pkid = self.pkid.finish_cloned();
+
+        DictBlock::try_new(primary_key, pkid)
     }
 
     fn len(&self) -> usize {
@@ -124,4 +120,24 @@ impl WriteBuffer {
 struct DictBlock {
     primary_key: BinaryArray,
     pkid: UInt64Array,
+}
+
+impl DictBlock {
+    fn try_new(primary_key: BinaryArray, pkid: UInt64Array) -> Result<Self> {
+        // Sort by primary key.
+        let indices =
+            compute::sort_to_indices(&primary_key, None, None).context(ComputeArrowSnafu)?;
+        let primary_key = compute::take(&primary_key, &indices, None).context(ComputeArrowSnafu)?;
+        let pkid = compute::take(&pkid, &indices, None).context(ComputeArrowSnafu)?;
+
+        let dict = DictBlock {
+            primary_key: primary_key
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .clone(),
+            pkid: pkid.as_any().downcast_ref::<UInt64Array>().unwrap().clone(),
+        };
+        Ok(dict)
+    }
 }
