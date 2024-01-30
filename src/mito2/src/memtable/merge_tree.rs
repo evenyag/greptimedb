@@ -16,6 +16,7 @@
 //! - Flushes mutable parts to immutable parts
 //! - Merges small immutable parts into a big immutable part
 
+mod index;
 mod mutable;
 mod tree;
 
