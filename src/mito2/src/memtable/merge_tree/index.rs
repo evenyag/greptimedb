@@ -66,6 +66,7 @@ impl MutableShard {
 
         // Safety: we check the buffer length.
         let pk_index = self.key_buffer.push_key(key);
+        self.num_keys += 1;
 
         Ok(Some(PkId {
             shard_id: self.shard_id,
