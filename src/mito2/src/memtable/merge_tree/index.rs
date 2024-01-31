@@ -21,30 +21,25 @@ use datatypes::arrow::compute;
 use snafu::ResultExt;
 
 use crate::error::{ComputeArrowSnafu, Result};
+use crate::memtable::merge_tree::{PkId, PkIndex, ShardId};
 
 // TODO(yingwen): Consider using byte size to manage block.
 /// Maximum keys in a block. Should be power of 2.
 const MAX_KEYS_PER_BLOCK: usize = 256;
 
-/// Id of a shard.
-type ShardId = u32;
-/// Index of a primary key in a shard.
-type PkIndex = u16;
-/// Id of a primary key.
-struct PkId {
-    shard_id: ShardId,
-    pk_index: PkIndex,
-}
-
 /// Config for the index.
-struct IndexConfig {
+pub(crate) struct IndexConfig {
     /// Max keys in an index shard.
-    max_keys_per_shard: usize,
+    pub(crate) max_keys_per_shard: usize,
 }
 
 /// Primary key index.
-struct KeyIndex {
-    //
+pub(crate) struct KeyIndex {}
+
+impl KeyIndex {
+    pub(crate) fn add_primary_key(&mut self, config: &IndexConfig, key: &[u8]) -> Result<PkId> {
+        unimplemented!()
+    }
 }
 
 // TODO(yingwen): Support partition index (partition by a column, e.g. table_id) to
