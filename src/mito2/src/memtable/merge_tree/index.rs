@@ -15,46 +15,68 @@
 //! Primary key index of the merge tree.
 
 use datatypes::arrow::array::{
-    ArrayBuilder, BinaryArray, BinaryBuilder, UInt64Array, UInt64Builder,
+    ArrayBuilder, BinaryArray, BinaryBuilder, UInt16Array, UInt16Builder,
 };
 use datatypes::arrow::compute;
 use snafu::ResultExt;
 
 use crate::error::{ComputeArrowSnafu, Result};
 
+// TODO(yingwen): Consider using byte size to manage block.
+/// Maximum keys in a block. Should be power of 2.
+const MAX_KEYS_PER_BLOCK: usize = 256;
+
+/// Id of a shard.
+type ShardId = u32;
+/// Index of a primary key in a shard.
+type PkIndex = u16;
 /// Id of a primary key.
-type PkId = u64;
+struct PkId {
+    shard_id: ShardId,
+    pk_index: PkIndex,
+}
 
 /// Config for the index.
 struct IndexConfig {
-    /// Max keys in a dictionary block.
-    max_keys_per_dict: usize,
-    // TODO(yingwen): Also consider byte size.
+    /// Max keys in an index shard.
+    max_keys_per_shard: usize,
+}
+
+/// Primary key index.
+struct KeyIndex {
+    //
 }
 
 // TODO(yingwen): Support partition index (partition by a column, e.g. table_id) to
 // reduce null columns and eliminate lock contention. We only need to partition the
 // write buffer but modify dicts with partition lock held.
-/// Index for primary keys.
-struct KeyIndex {
+/// Mutable shard for the index.
+struct MutableShard {
+    shard_id: ShardId,
     write_buffer: WriteBuffer,
-    dicts: Vec<DictBlock>,
+    dict_blocks: Vec<DictBlock>,
+    num_keys: usize,
 }
 
-impl KeyIndex {
-    fn add_primary_key(&mut self, config: &IndexConfig, key: &[u8]) -> Result<PkId> {
-        let pkid = self.write_buffer.push_key(key);
-
-        if self.write_buffer.len() < config.max_keys_per_dict {
-            return Ok(pkid);
+impl MutableShard {
+    fn try_add_primary_key(&mut self, config: &IndexConfig, key: &[u8]) -> Result<Option<PkId>> {
+        // The shard is full.
+        if self.num_keys >= config.max_keys_per_shard {
+            return Ok(None);
         }
 
-        // TODO(yingwen): Freeze buffer to dicts.
-        // The write buffer is full.
-        let dict_block = self.write_buffer.finish_dict_block()?;
-        self.dicts.push(dict_block);
+        if self.write_buffer.len() >= MAX_KEYS_PER_BLOCK {
+            // The write buffer is full.
+            let dict_block = self.write_buffer.finish_dict_block()?;
+            self.dict_blocks.push(dict_block);
+        }
 
-        Ok(pkid)
+        let pk_index = self.write_buffer.push_key(key);
+
+        Ok(Some(PkId {
+            shard_id: self.shard_id,
+            pk_index,
+        }))
     }
 }
 
@@ -64,13 +86,15 @@ struct DictBlockBuilder {
     // We use arrow's binary builder as out default binary builder
     // is LargeBinaryBuilder
     primary_key: BinaryBuilder,
-    pkid: UInt64Builder,
+    // TODO(yingwen): We don't need to store index in the builder, we only need
+    // to store start index.
+    pk_index: UInt16Builder,
 }
 
 impl DictBlockBuilder {
-    fn push_key(&mut self, key: &[u8], pkid: PkId) {
+    fn push_key(&mut self, key: &[u8], index: PkIndex) {
         self.primary_key.append_value(key);
-        self.pkid.append_value(pkid);
+        self.pk_index.append_value(index);
     }
 
     /// Builds and sorts the key dict.
@@ -78,16 +102,16 @@ impl DictBlockBuilder {
         // TODO(yingwen): We can check whether keys are already sorted first. But
         // we might need some benchmarks.
         let primary_key = self.primary_key.finish();
-        let pkid = self.pkid.finish();
+        let pk_index = self.pk_index.finish();
 
-        DictBlock::try_new(primary_key, pkid)
+        DictBlock::try_new(primary_key, pk_index)
     }
 
     fn finish_cloned(&self) -> Result<DictBlock> {
         let primary_key = self.primary_key.finish_cloned();
-        let pkid = self.pkid.finish_cloned();
+        let pk_index = self.pk_index.finish_cloned();
 
-        DictBlock::try_new(primary_key, pkid)
+        DictBlock::try_new(primary_key, pk_index)
     }
 
     fn len(&self) -> usize {
@@ -97,15 +121,20 @@ impl DictBlockBuilder {
 
 struct WriteBuffer {
     builder: DictBlockBuilder,
-    next_pkid: PkId,
+    next_index: usize,
 }
 
 impl WriteBuffer {
-    fn push_key(&mut self, key: &[u8]) -> PkId {
-        let pkid = self.next_pkid;
-        self.next_pkid += 1;
-        self.builder.push_key(key, pkid);
-        pkid
+    /// Push a new key.
+    ///
+    /// # Panics
+    /// Panics if the index will overflow.
+    fn push_key(&mut self, key: &[u8]) -> PkIndex {
+        let pk_index = self.next_index.try_into().unwrap();
+        self.next_index += 1;
+        self.builder.push_key(key, pk_index);
+
+        pk_index
     }
 
     fn len(&self) -> usize {
@@ -119,16 +148,16 @@ impl WriteBuffer {
 
 struct DictBlock {
     primary_key: BinaryArray,
-    pkid: UInt64Array,
+    pk_index: UInt16Array,
 }
 
 impl DictBlock {
-    fn try_new(primary_key: BinaryArray, pkid: UInt64Array) -> Result<Self> {
+    fn try_new(primary_key: BinaryArray, pk_index: UInt16Array) -> Result<Self> {
         // Sort by primary key.
         let indices =
             compute::sort_to_indices(&primary_key, None, None).context(ComputeArrowSnafu)?;
         let primary_key = compute::take(&primary_key, &indices, None).context(ComputeArrowSnafu)?;
-        let pkid = compute::take(&pkid, &indices, None).context(ComputeArrowSnafu)?;
+        let pk_index = compute::take(&pk_index, &indices, None).context(ComputeArrowSnafu)?;
 
         let dict = DictBlock {
             primary_key: primary_key
@@ -136,7 +165,11 @@ impl DictBlock {
                 .downcast_ref::<BinaryArray>()
                 .unwrap()
                 .clone(),
-            pkid: pkid.as_any().downcast_ref::<UInt64Array>().unwrap().clone(),
+            pk_index: pk_index
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .clone(),
         };
         Ok(dict)
     }
