@@ -35,7 +35,7 @@ pub(crate) struct IndexConfig {
 pub(crate) struct KeyIndex {}
 
 impl KeyIndex {
-    pub(crate) fn add_primary_key(&mut self, config: &IndexConfig, key: &[u8]) -> Result<PkId> {
+    pub(crate) fn add_primary_key(&mut self, key: &[u8]) -> Result<PkId> {
         unimplemented!()
     }
 }
@@ -46,7 +46,7 @@ impl KeyIndex {
 /// Mutable shard for the index.
 struct MutableShard {
     shard_id: ShardId,
-    write_buffer: WriteBuffer,
+    key_buffer: KeyBuffer,
     dict_blocks: Vec<DictBlock>,
     num_keys: usize,
 }
@@ -58,14 +58,14 @@ impl MutableShard {
             return Ok(None);
         }
 
-        if self.write_buffer.len() >= MAX_KEYS_PER_BLOCK.into() {
+        if self.key_buffer.len() >= MAX_KEYS_PER_BLOCK.into() {
             // The write buffer is full.
-            let dict_block = self.write_buffer.finish()?;
+            let dict_block = self.key_buffer.finish()?;
             self.dict_blocks.push(dict_block);
         }
 
         // Safety: we check the buffer length.
-        let pk_index = self.write_buffer.push_key(key);
+        let pk_index = self.key_buffer.push_key(key);
 
         Ok(Some(PkId {
             shard_id: self.shard_id,
@@ -80,14 +80,14 @@ impl MutableShard {
 ///
 /// Now it doesn't support searching index by key. The memtable should use another
 /// cache to map primary key to its index.
-struct WriteBuffer {
+struct KeyBuffer {
     // We use arrow's binary builder as out default binary builder
     // is LargeBinaryBuilder
     primary_key_builder: BinaryBuilder,
     next_pk_index: usize,
 }
 
-impl WriteBuffer {
+impl KeyBuffer {
     /// Pushes a new key and returns its pk index.
     ///
     /// # Panics
@@ -124,6 +124,8 @@ impl WriteBuffer {
         // TODO(yingwen): We can check whether keys are already sorted first. But
         // we might need some benchmarks.
         let primary_key = self.primary_key_builder.finish();
+        // Also resets the pk index for the next block.
+        self.next_pk_index = 0;
 
         DictBlock::try_from_unsorted(primary_key)
     }
