@@ -14,6 +14,8 @@
 
 //! Primary key index of the merge tree.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use datatypes::arrow::array::{Array, ArrayBuilder, BinaryArray, BinaryBuilder};
@@ -225,17 +227,99 @@ impl DictBlockReader {
         self.current < self.block.len()
     }
 
+    /// Returns current key.
+    ///
+    /// # Panics
+    /// Panics if the reader is invalid.
     fn current_key(&self) -> &[u8] {
-        assert!(self.is_valid());
-
         self.block.key_at(self.current)
     }
 
+    /// Returns current pk index.
+    ///
+    /// # Panics
+    /// Panics if the reader is invalid.
     fn current_pk_index(&self) -> PkIndex {
         self.block.pk_index_at(self.current)
     }
 
+    /// Advance the reader.
+    ///
+    /// # Panics
+    /// Panics if the reader is invalid.
     fn next(&mut self) {
+        assert!(self.is_valid());
         self.current += 1;
+    }
+}
+
+/// Wrapper for heap merge.
+///
+/// Reader inside the wrapper must be valid.
+struct HeapWrapper(DictBlockReader);
+
+impl PartialEq for HeapWrapper {
+    fn eq(&self, other: &HeapWrapper) -> bool {
+        self.0.current_key() == other.0.current_key()
+    }
+}
+
+impl Eq for HeapWrapper {}
+
+impl PartialOrd for HeapWrapper {
+    fn partial_cmp(&self, other: &HeapWrapper) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapWrapper {
+    fn cmp(&self, other: &HeapWrapper) -> Ordering {
+        // The std binary heap is a max heap, but we want the nodes are ordered in
+        // ascend order, so we compare the nodes in reverse order.
+        other.0.current_key().cmp(self.0.current_key())
+    }
+}
+
+struct ReaderMerger {
+    heap: BinaryHeap<HeapWrapper>,
+}
+
+impl ReaderMerger {
+    fn from_readers(readers: Vec<DictBlockReader>) -> ReaderMerger {
+        let heap = readers
+            .into_iter()
+            .filter_map(|reader| {
+                if reader.is_valid() {
+                    Some(HeapWrapper(reader))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        ReaderMerger { heap }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.heap.is_empty()
+    }
+
+    fn current_key(&self) -> &[u8] {
+        self.heap.peek().unwrap().0.current_key()
+    }
+
+    fn current_pk_index(&self) -> PkIndex {
+        self.heap.peek().unwrap().0.current_pk_index()
+    }
+
+    fn next(&mut self) {
+        while let Some(mut top) = self.heap.pop() {
+            top.0.next();
+            if top.0.is_valid() {
+                self.heap.push(top);
+                break;
+            }
+            // Top is exhausted, try next node.
+        }
     }
 }
