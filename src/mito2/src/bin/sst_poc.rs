@@ -14,8 +14,10 @@
 
 //! POC of the SST format.
 
+use std::time::Instant;
+
 use clap::Parser;
-use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file};
+use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
 use object_store::services::Fs;
 use object_store::ObjectStore;
 
@@ -29,6 +31,8 @@ enum PocCli {
     CreateData(CreateArgs),
     /// Creates a mark file.
     CreateMark(CreateArgs),
+    /// Scans a file.
+    Scan(ScanArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -62,6 +66,20 @@ struct CreateArgs {
     output_path: String,
 }
 
+#[derive(Debug, clap::Args)]
+#[command(author, version, about, long_about = None)]
+struct ScanArgs {
+    /// Input directory.
+    #[arg(short, long)]
+    input_dir: String,
+    /// File id of the file under input directory.
+    #[arg(long)]
+    file_id: String,
+    /// Scan times.
+    #[arg(short, long)]
+    times: usize,
+}
+
 fn new_fs_store() -> ObjectStore {
     let mut builder = Fs::default();
     builder.root("/");
@@ -75,6 +93,7 @@ async fn main() {
         PocCli::CreatePk(args) => run_create_pk(args).await,
         PocCli::CreateData(args) => run_create_data(args).await,
         PocCli::CreateMark(args) => run_create_mark(args).await,
+        PocCli::Scan(args) => run_scan(args).await,
     }
 }
 
@@ -139,6 +158,29 @@ async fn run_create_mark(args: CreateArgs) {
         }
         Err(e) => {
             println!("Failed to create mark file, {e:?}");
+        }
+    }
+}
+
+async fn run_scan(args: ScanArgs) {
+    println!("Scan, args: {args:?}");
+
+    if args.file_id.is_empty() {
+        println!("File id is empty");
+        return;
+    }
+
+    let store = new_fs_store();
+    for _ in 0..args.times {
+        let now = Instant::now();
+        match scan_file(&args.input_dir, &args.file_id, &store).await {
+            Ok(()) => {
+                println!("Scan cost: {:?}", now.elapsed());
+            }
+            Err(e) => {
+                println!("Failed to scan file, {e:?}");
+                return;
+            }
         }
     }
 }
