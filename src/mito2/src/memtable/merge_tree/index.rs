@@ -14,6 +14,8 @@
 
 //! Primary key index of the merge tree.
 
+use std::sync::Arc;
+
 use datatypes::arrow::array::{Array, ArrayBuilder, BinaryArray, BinaryBuilder};
 use datatypes::arrow::compute;
 use snafu::ResultExt;
@@ -154,6 +156,8 @@ struct DictBlock {
     index_weight: Vec<u16>,
 }
 
+type DictBlockRef = Arc<DictBlock>;
+
 impl DictBlock {
     fn try_from_unsorted(primary_key: BinaryArray) -> Result<Self> {
         assert!(primary_key.len() <= PkIndex::MAX.into());
@@ -185,9 +189,53 @@ impl DictBlock {
         Ok(dict)
     }
 
-    fn get_key(&self, index: PkIndex) -> &[u8] {
+    fn len(&self) -> usize {
+        self.primary_key.len()
+    }
+
+    /// Get key by [PkIndex].
+    fn key_by_pk_index(&self, index: PkIndex) -> &[u8] {
         // Casting index to usize is safe.
         let pos = self.index_weight[index as usize];
-        self.primary_key.value(pos as usize)
+        self.key_at(pos as usize)
+    }
+
+    /// Get key at position.
+    fn key_at(&self, pos: usize) -> &[u8] {
+        self.primary_key.value(pos)
+    }
+
+    /// Get [PkIndex] at position.
+    fn pk_index_at(&self, pos: usize) -> PkIndex {
+        self.ordered_pk_index[pos]
+    }
+}
+
+struct DictBlockReader {
+    block: DictBlockRef,
+    current: usize,
+}
+
+impl DictBlockReader {
+    fn new(block: DictBlockRef) -> Self {
+        Self { block, current: 0 }
+    }
+
+    fn is_valid(&self) -> bool {
+        self.current < self.block.len()
+    }
+
+    fn current_key(&self) -> &[u8] {
+        assert!(self.is_valid());
+
+        self.block.key_at(self.current)
+    }
+
+    fn current_pk_index(&self) -> PkIndex {
+        self.block.pk_index_at(self.current)
+    }
+
+    fn next(&mut self) {
+        self.current += 1;
     }
 }
