@@ -32,11 +32,17 @@ pub(crate) struct IndexConfig {
 }
 
 /// Primary key index.
-pub(crate) struct KeyIndex {}
+pub(crate) struct KeyIndex {
+    config: IndexConfig,
+    // TODO(yingwen): 1. Support multiple shard. 2. Lock
+    shard: Shard,
+}
 
 impl KeyIndex {
     pub(crate) fn add_primary_key(&mut self, key: &[u8]) -> Result<PkId> {
-        unimplemented!()
+        let pkid = self.shard.try_add_primary_key(&self.config, key)?;
+        // TODO(yingwen): Switch shard if current shard is full.
+        Ok(pkid.unwrap())
     }
 }
 
@@ -44,14 +50,14 @@ impl KeyIndex {
 // reduce null columns and eliminate lock contention. We only need to partition the
 // write buffer but modify dicts with partition lock held.
 /// Mutable shard for the index.
-struct MutableShard {
+struct Shard {
     shard_id: ShardId,
     key_buffer: KeyBuffer,
     dict_blocks: Vec<DictBlock>,
     num_keys: usize,
 }
 
-impl MutableShard {
+impl Shard {
     fn try_add_primary_key(&mut self, config: &IndexConfig, key: &[u8]) -> Result<Option<PkId>> {
         // The shard is full.
         if self.num_keys >= config.max_keys_per_shard {
