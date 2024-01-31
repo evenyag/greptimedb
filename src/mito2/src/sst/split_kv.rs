@@ -755,3 +755,17 @@ pub async fn create_mark_file(
 
     writer.finish().await
 }
+
+/// Scans the file.
+pub async fn scan_file(input_dir: &str, file_id: &str, object_store: &ObjectStore) -> Result<()> {
+    let file_handle = new_file_handle(file_id)?;
+    let mut reader = ParquetReaderBuilder::new(
+        input_dir.to_string(),
+        file_handle.clone(),
+        object_store.clone(),
+    )
+    .build()
+    .await?;
+    while let Some(_batch) = reader.next_batch().await? {}
+    Ok(())
+}
