@@ -324,6 +324,17 @@ pub struct MarkWriterMetrics {
     pub file_size: usize,
 }
 
+/// Metrics for scanning the file.
+#[derive(Debug, Default)]
+pub struct ScanMetrics {
+    /// Scan cost.
+    pub scan_cost: Duration,
+    /// Number of batches.
+    pub num_batches: usize,
+    /// Number of rows.
+    pub num_rows: usize,
+}
+
 /// A writer to write a data file from batches.
 struct DataFileWriter {
     sst_schema: SchemaRef,
@@ -757,7 +768,14 @@ pub async fn create_mark_file(
 }
 
 /// Scans the file.
-pub async fn scan_file(input_dir: &str, file_id: &str, object_store: &ObjectStore) -> Result<()> {
+pub async fn scan_file(
+    input_dir: &str,
+    file_id: &str,
+    object_store: &ObjectStore,
+) -> Result<ScanMetrics> {
+    let now = Instant::now();
+    let mut metrics = ScanMetrics::default();
+
     let file_handle = new_file_handle(file_id)?;
     let mut reader = ParquetReaderBuilder::new(
         input_dir.to_string(),
@@ -766,6 +784,11 @@ pub async fn scan_file(input_dir: &str, file_id: &str, object_store: &ObjectStor
     )
     .build()
     .await?;
-    while let Some(_batch) = reader.next_batch().await? {}
-    Ok(())
+    while let Some(batch) = reader.next_batch().await? {
+        metrics.num_batches += 1;
+        metrics.num_rows += batch.num_rows();
+    }
+    metrics.scan_cost = now.elapsed();
+
+    Ok(metrics)
 }

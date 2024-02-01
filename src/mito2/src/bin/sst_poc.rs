@@ -14,8 +14,6 @@
 
 //! POC of the SST format.
 
-use std::time::Instant;
-
 use clap::Parser;
 use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
 use object_store::services::Fs;
@@ -172,10 +170,9 @@ async fn run_scan(args: ScanArgs) {
 
     let store = new_fs_store();
     for _ in 0..args.times {
-        let now = Instant::now();
         match scan_file(&args.input_dir, &args.file_id, &store).await {
-            Ok(()) => {
-                println!("Scan cost: {:?}", now.elapsed());
+            Ok(metrics) => {
+                println!("Scan metrics: {:?}", metrics);
             }
             Err(e) => {
                 println!("Failed to scan file, {e:?}");
