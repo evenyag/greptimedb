@@ -38,7 +38,8 @@ pub(crate) struct IndexConfig {
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
-            max_keys_per_shard: 4096,
+            // TODO(yingwen): Use 4096 or find a proper value.
+            max_keys_per_shard: 8192,
         }
     }
 }
@@ -47,18 +48,18 @@ impl Default for IndexConfig {
 pub(crate) struct KeyIndex {
     config: IndexConfig,
     // TODO(yingwen): 1. Support multiple shard.
-    shard: RwLock<Shard>,
+    shard: RwLock<MutableShard>,
 }
 
 impl KeyIndex {
     pub(crate) fn new(config: IndexConfig) -> KeyIndex {
         KeyIndex {
             config,
-            shard: RwLock::new(Shard::new(0)),
+            shard: RwLock::new(MutableShard::new(0)),
         }
     }
 
-    pub(crate) fn add_primary_key(&mut self, key: &[u8]) -> Result<PkId> {
+    pub(crate) fn add_primary_key(&self, key: &[u8]) -> Result<PkId> {
         let mut shard = self.shard.write().unwrap();
         let pkid = shard.try_add_primary_key(&self.config, key)?;
         // TODO(yingwen): Switch shard if current shard is full.
@@ -77,16 +78,16 @@ impl KeyIndex {
 // reduce null columns and eliminate lock contention. We only need to partition the
 // write buffer but modify dicts with partition lock held.
 /// Mutable shard for the index.
-struct Shard {
+struct MutableShard {
     shard_id: ShardId,
     key_buffer: KeyBuffer,
     dict_blocks: Vec<DictBlockRef>,
     num_keys: usize,
 }
 
-impl Shard {
-    fn new(shard_id: ShardId) -> Shard {
-        Shard {
+impl MutableShard {
+    fn new(shard_id: ShardId) -> MutableShard {
+        MutableShard {
             shard_id,
             key_buffer: KeyBuffer::new(MAX_KEYS_PER_BLOCK.into()),
             dict_blocks: Vec::new(),
