@@ -111,6 +111,7 @@ impl MutableShard {
                 pk_index,
             }));
         }
+        // A new key.
 
         if self.key_buffer.len() >= MAX_KEYS_PER_BLOCK.into() {
             // The write buffer is full.
@@ -120,6 +121,7 @@ impl MutableShard {
 
         // Safety: we check the buffer length.
         let pk_index = self.key_buffer.push_key(key);
+        self.pk_to_index.insert(key.to_vec(), pk_index);
         self.num_keys += 1;
 
         Ok(Some(PkId {
@@ -339,5 +341,20 @@ mod tests {
             },
             last_pk_id.unwrap()
         );
+
+        let mut expect: Vec<_> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| (key, i as PkIndex))
+            .collect();
+        expect.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut result = Vec::with_capacity(expect.len());
+        let mut reader = index.scan_index().unwrap();
+        while reader.is_valid() {
+            result.push((reader.current_key().to_vec(), reader.current_pk_index()));
+            reader.next();
+        }
+        assert_eq!(expect, result);
     }
 }
