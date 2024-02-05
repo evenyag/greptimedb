@@ -311,7 +311,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let mut keys = Vec::with_capacity(num_keys);
         for i in 0..num_keys {
-            let prefix_idx = rng.gen_range((0..prefix.len()));
+            let prefix_idx = rng.gen_range(0..prefix.len());
             // We don't need to decode the priamry key in index's test so we format the string
             // into the key.
             let key = format!("{}{}", prefix[prefix_idx], i);
@@ -331,7 +331,7 @@ mod tests {
         });
         let mut last_pk_id = None;
         for key in &keys {
-            let pk_id = index.write_primary_key(&key).unwrap();
+            let pk_id = index.write_primary_key(key).unwrap();
             last_pk_id = Some(pk_id);
         }
         assert_eq!(
