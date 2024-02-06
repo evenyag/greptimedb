@@ -35,7 +35,7 @@ use crate::memtable::merge_tree::index::{
 use crate::memtable::merge_tree::mutable::WriteMetrics;
 use crate::memtable::merge_tree::{MergeTreeConfig, PkId, PkIndex};
 use crate::memtable::{BoxedBatchIterator, KeyValues};
-use crate::read::{Batch, BatchBuilder};
+use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 
 /// Initial capacity for the data buffer.
@@ -163,7 +163,7 @@ impl MergeTree {
             data_reader: DataReader {},
         };
 
-        todo!()
+        Ok(Box::new(iter))
     }
 
     /// Returns true if the tree is empty.
@@ -333,27 +333,46 @@ impl ShardIter {
         primary_key: &[u8],
         record_batch: &RecordBatch,
     ) -> Result<Batch> {
-        let mut builder = BatchBuilder::new(primary_key.to_vec())
+        let mut builder = BatchBuilder::new(primary_key.to_vec());
+        builder
             .timestamps_array(Self::record_batch_timestamps(record_batch).clone())?
             .sequences_array(Self::record_batch_sequences(record_batch).clone())?
             .op_types_array(Self::record_batch_op_types(record_batch).clone())?;
 
         // TODO(yingwen): Pushdown projection to data parts.
-        //
+        if record_batch.num_columns() <= 4 {
+            // No fields.
+            return builder.build();
+        }
 
-        unimplemented!()
+        // Iterate all field columns.
+        for (array, field) in record_batch
+            .columns()
+            .iter()
+            .zip(record_batch.schema().fields().iter())
+            .skip(4)
+        {
+            // Safety: metadata should contains all fields.
+            let column_id = metadata.column_by_name(field.name()).unwrap().column_id;
+            if !projection.contains(&column_id) {
+                continue;
+            }
+            builder.push_field_array(column_id, array.clone())?;
+        }
+
+        builder.build()
     }
 
     fn record_batch_timestamps(record_batch: &RecordBatch) -> &ArrayRef {
-        unimplemented!()
+        record_batch.column(1)
     }
 
     fn record_batch_sequences(record_batch: &RecordBatch) -> &ArrayRef {
-        unimplemented!()
+        record_batch.column(2)
     }
 
     fn record_batch_op_types(record_batch: &RecordBatch) -> &ArrayRef {
-        unimplemented!()
+        record_batch.column(3)
     }
 }
 
