@@ -15,7 +15,6 @@
 //! The value part of key-value separated merge-tree structure.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -46,10 +45,12 @@ pub const PK_INDEX_COLUMN_NAME: &str = "pk_index";
 
 /// Data part batches returns by `DataParts::read`.
 pub struct DataBatch {
+    /// Primary key index of this batch.
+    pk_index: PkIndex,
     /// Record batch of data.
     rb: RecordBatch,
-    /// The ranges of all primary key offsets inside batch.
-    pk_index_ranges: HashMap<PkIndex, Range<usize>>,
+    /// Range of current primary key inside record batch
+    range: Range<usize>,
 }
 
 /// Data parts including an active writing part and several frozen parts.
@@ -65,13 +66,11 @@ impl DataParts {
     }
 
     /// Reads data from all parts including active and frozen parts.
-    pub fn read(&mut self, pk_weights: &[u16]) -> Result<Vec<DataBatch>> {
-        let mut batches = Vec::with_capacity(1 + self.frozen.len());
-        batches.push(self.active.read(pk_weights)?);
-        for p in &self.frozen {
-            batches.push(p.read(pk_weights)?);
-        }
-        Ok(batches)
+    /// The returned iterator yields a record batch of one primary key at a time.
+    /// The order of yielding primary keys is determined by provided weights.
+    pub fn iter(&mut self, _pk_weights: &[u16]) -> Result<impl Iterator<Item = DataBatch>> {
+        todo!();
+        Ok(std::iter::empty())
     }
 }
 
