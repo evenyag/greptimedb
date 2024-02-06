@@ -59,6 +59,19 @@ pub struct DataParts {
     frozen: Vec<DataPart>, // todo(hl): merge all frozen parts into one parquet-encoded bytes.
 }
 
+/// Iterator for iterating data in `DataParts`
+pub struct Iter {
+    // todo
+}
+
+impl Iterator for Iter {
+    type Item = Result<DataBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
 impl DataParts {
     /// Writes one row into active part.
     pub fn write_row(&mut self, pk_id: PkId, kv: KeyValue) {
@@ -68,9 +81,9 @@ impl DataParts {
     /// Reads data from all parts including active and frozen parts.
     /// The returned iterator yields a record batch of one primary key at a time.
     /// The order of yielding primary keys is determined by provided weights.
-    pub fn iter(&mut self, _pk_weights: &[u16]) -> Result<impl Iterator<Item = DataBatch>> {
-        todo!();
-        Ok(std::iter::empty())
+    pub fn iter(&mut self, _pk_weights: &[u16]) -> Result<Iter> {
+        let iter = todo!();
+        Ok(iter)
     }
 }
 
