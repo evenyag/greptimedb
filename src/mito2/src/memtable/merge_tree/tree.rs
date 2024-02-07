@@ -28,7 +28,7 @@ use table::predicate::Predicate;
 
 use crate::error::{PrimaryKeyLengthMismatchSnafu, Result};
 use crate::memtable::key_values::KeyValue;
-use crate::memtable::merge_tree::data::{self, DataBatch, DataBuffer};
+use crate::memtable::merge_tree::data::{self, DataBatch, DataBuffer, DataParts};
 use crate::memtable::merge_tree::index::{
     IndexConfig, IndexReader, KeyIndex, KeyIndexRef, ShardReader,
 };
@@ -69,11 +69,10 @@ impl MergeTree {
                 max_keys_per_shard: config.index_max_keys_per_shard,
             }))
         });
-        let data_buffer = DataBuffer::with_capacity(metadata.clone(), DATA_INIT_CAP);
         let parts = TreeParts {
             immutable: false,
             index,
-            data_buffer,
+            data: DataParts::new(metadata.clone(), DATA_INIT_CAP),
         };
 
         MergeTree {
@@ -165,16 +164,16 @@ impl MergeTree {
             pk_weights.push(0);
         }
 
-        let data_reader = {
-            let parts = self.parts.read().unwrap();
-            parts.data_buffer.read(&pk_weights)?
+        let data_iter = {
+            let mut parts = self.parts.write().unwrap();
+            parts.data.iter(&pk_weights)?
         };
 
         let iter = ShardIter {
             metadata: self.metadata.clone(),
             projection,
             index_reader,
-            data_reader: DataReader {},
+            data_reader: DataReader::new(data_iter)?,
         };
 
         Ok(Box::new(iter))
@@ -184,7 +183,7 @@ impl MergeTree {
     pub(crate) fn is_empty(&self) -> bool {
         let parts = self.parts.read().unwrap();
         // Gets whether the memtable is empty from the data part.
-        parts.data_buffer.is_empty()
+        parts.data.is_empty()
         // TODO(yingwen): Also consider other parts if we freeze the data buffer.
     }
 
@@ -219,7 +218,7 @@ impl MergeTree {
         let parts = TreeParts {
             immutable: false,
             index,
-            data_buffer: DataBuffer::with_capacity(metadata.clone(), DATA_INIT_CAP),
+            data: DataParts::new(metadata.clone(), DATA_INIT_CAP),
         };
 
         MergeTree {
@@ -258,7 +257,7 @@ impl MergeTree {
     fn write_with_id(&self, pk_id: PkId, kv: KeyValue) {
         let mut parts = self.parts.write().unwrap();
         assert!(!parts.immutable);
-        parts.data_buffer.write_row(pk_id, kv)
+        parts.data.write_row(pk_id, kv)
     }
 
     fn write_primary_key(&self, key: &[u8], metrics: &mut WriteMetrics) -> Result<PkId> {
@@ -279,8 +278,8 @@ struct TreeParts {
     /// Index part of the tree. If the region doesn't have a primary key, this field
     /// is `None`.
     index: Option<KeyIndexRef>,
-    /// Data buffer of the tree.
-    data_buffer: DataBuffer,
+    /// Data part of the tree.
+    data: DataParts,
 }
 
 struct ShardIter {

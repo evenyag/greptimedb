@@ -87,6 +87,13 @@ impl Iterator for Iter {
 }
 
 impl DataParts {
+    pub(crate) fn new(metadata: RegionMetadataRef, capacity: usize) -> Self {
+        Self {
+            active: DataBuffer::with_capacity(metadata, capacity),
+            frozen: Vec::new(),
+        }
+    }
+
     /// Writes one row into active part.
     pub fn write_row(&mut self, pk_id: PkId, kv: KeyValue) {
         self.active.write_row(pk_id, kv);
@@ -98,6 +105,10 @@ impl DataParts {
     pub fn iter(&mut self, _pk_weights: &[u16]) -> Result<Iter> {
         let iter = todo!();
         Ok(iter)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        unimplemented!()
     }
 }
 
