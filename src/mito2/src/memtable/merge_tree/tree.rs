@@ -155,6 +155,20 @@ impl MergeTree {
             .as_ref()
             .map(|index| index.scan_shard(0))
             .transpose()?;
+        // Compute pk weights.
+        let mut pk_weights = Vec::new();
+        if let Some(reader) = &index_reader {
+            reader.compute_pk_weights(&mut pk_weights);
+        } else {
+            // Push weight for the only key.
+            // TODO(yingwen): Allow passing empty weights if there is no primary key.
+            pk_weights.push(0);
+        }
+
+        let data_reader = {
+            let parts = self.parts.read().unwrap();
+            parts.data_buffer.read(&pk_weights)?
+        };
 
         let iter = ShardIter {
             metadata: self.metadata.clone(),
