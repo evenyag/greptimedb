@@ -53,6 +53,20 @@ pub struct DataBatch {
     range: Range<usize>,
 }
 
+impl DataBatch {
+    pub(crate) fn pk_index(&self) -> PkIndex {
+        self.pk_index
+    }
+
+    pub(crate) fn record_batch(&self) -> &RecordBatch {
+        &self.rb
+    }
+
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+}
+
 /// Data parts including an active writing part and several frozen parts.
 pub struct DataParts {
     active: DataBuffer,

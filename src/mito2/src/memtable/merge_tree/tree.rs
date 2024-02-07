@@ -28,7 +28,7 @@ use table::predicate::Predicate;
 
 use crate::error::{PrimaryKeyLengthMismatchSnafu, Result};
 use crate::memtable::key_values::KeyValue;
-use crate::memtable::merge_tree::data::DataBuffer;
+use crate::memtable::merge_tree::data::{self, DataBatch, DataBuffer};
 use crate::memtable::merge_tree::index::{
     IndexConfig, IndexReader, KeyIndex, KeyIndexRef, ShardReader,
 };
@@ -294,9 +294,11 @@ impl ShardIter {
         let Some(index_reader) = &mut self.index_reader else {
             // No primary key to read.
             // Safety: `next()` ensures the data reader is valid.
-            let record_batch = self.data_reader.current_record_batch();
-            let batch =
-                Self::convert_record_batch(&self.metadata, &self.projection, &[], record_batch)?;
+            let batch = self.data_reader.convert_current_record_batch(
+                &self.metadata,
+                &self.projection,
+                &[],
+            )?;
             // Advances the data reader.
             self.data_reader.next()?;
             return Ok(Some(batch));
@@ -314,30 +316,54 @@ impl ShardIter {
             self.data_reader.current_pk_index()
         );
 
-        let record_batch = self.data_reader.current_record_batch();
-        let batch = Self::convert_record_batch(
+        let batch = self.data_reader.convert_current_record_batch(
             &self.metadata,
             &self.projection,
             index_reader.current_key(),
-            record_batch,
         )?;
         // Advances the data reader.
         self.data_reader.next()?;
         Ok(Some(batch))
     }
+}
 
-    /// Converts [RecordBatch] to [Batch].
-    fn convert_record_batch(
+struct DataReader {
+    current: Option<DataBatch>,
+    iter: data::Iter,
+}
+
+impl DataReader {
+    fn new(mut iter: data::Iter) -> Result<Self> {
+        let current = iter.next().transpose()?;
+
+        Ok(Self { current, iter })
+    }
+
+    fn is_valid(&self) -> bool {
+        self.current.is_some()
+    }
+
+    fn current_pk_index(&self) -> PkIndex {
+        self.current.as_ref().unwrap().pk_index()
+    }
+
+    /// Converts current [RecordBatch] to [Batch].
+    fn convert_current_record_batch(
+        &self,
         metadata: &RegionMetadataRef,
         projection: &HashSet<ColumnId>,
         primary_key: &[u8],
-        record_batch: &RecordBatch,
     ) -> Result<Batch> {
+        let data_batch = self.current.as_ref().unwrap();
+        let offset = data_batch.range().start;
+        let length = data_batch.range().end - offset;
+        let record_batch = data_batch.record_batch();
+
         let mut builder = BatchBuilder::new(primary_key.to_vec());
         builder
-            .timestamps_array(Self::record_batch_timestamps(record_batch).clone())?
-            .sequences_array(Self::record_batch_sequences(record_batch).clone())?
-            .op_types_array(Self::record_batch_op_types(record_batch).clone())?;
+            .timestamps_array(record_batch.column(1).slice(offset, length))?
+            .sequences_array(record_batch.column(2).slice(offset, length))?
+            .op_types_array(record_batch.column(3).slice(offset, length))?;
 
         // TODO(yingwen): Pushdown projection to data parts.
         if record_batch.num_columns() <= 4 {
@@ -357,41 +383,14 @@ impl ShardIter {
             if !projection.contains(&column_id) {
                 continue;
             }
-            builder.push_field_array(column_id, array.clone())?;
+            builder.push_field_array(column_id, array.slice(offset, length))?;
         }
 
         builder.build()
     }
 
-    fn record_batch_timestamps(record_batch: &RecordBatch) -> &ArrayRef {
-        record_batch.column(1)
-    }
-
-    fn record_batch_sequences(record_batch: &RecordBatch) -> &ArrayRef {
-        record_batch.column(2)
-    }
-
-    fn record_batch_op_types(record_batch: &RecordBatch) -> &ArrayRef {
-        record_batch.column(3)
-    }
-}
-
-struct DataReader {}
-
-impl DataReader {
-    fn is_valid(&self) -> bool {
-        unimplemented!()
-    }
-
-    fn current_pk_index(&self) -> PkIndex {
-        unimplemented!()
-    }
-
-    fn current_record_batch(&self) -> &RecordBatch {
-        unimplemented!()
-    }
-
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.current = self.iter.next().transpose()?;
+        Ok(())
     }
 }
