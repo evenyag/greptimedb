@@ -369,7 +369,7 @@ impl DataReader {
     ) -> Result<Batch> {
         let data_batch = self.current.as_ref().unwrap();
         let offset = data_batch.range().start;
-        let length = data_batch.range().end - offset;
+        let length = data_batch.range().len();
         let record_batch = data_batch.record_batch();
 
         let mut builder = BatchBuilder::new(primary_key.to_vec());
