@@ -266,7 +266,7 @@ impl MergeTreeMemtableBuilder {
 impl MemtableBuilder for MergeTreeMemtableBuilder {
     fn build(&self, metadata: &RegionMetadataRef) -> MemtableRef {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
-        if metadata.region_id.region_group() != 0 {
+        if metadata.region_id.region_group() != 0 || metadata.region_id.region_number() == 1024 {
             return Arc::new(TimeSeriesMemtable::new(
                 metadata.clone(),
                 id,
