@@ -67,6 +67,10 @@ impl KeyIndex {
         Ok(pk_id)
     }
 
+    pub(crate) fn is_full(&self) -> bool {
+        self.shard.read().unwrap().is_full(&self.config)
+    }
+
     pub(crate) fn scan_shard(&self, shard_id: ShardId) -> Result<ShardReader> {
         let shard = self.shard.read().unwrap();
         assert_eq!(shard.shard_id, shard_id);
@@ -129,6 +133,10 @@ impl Shard {
             key_bytes_in_index: 0,
             shared_index: None,
         }
+    }
+
+    fn is_full(&self, config: &IndexConfig) -> bool {
+        self.num_keys >= config.max_keys_per_shard
     }
 
     fn try_add_primary_key(

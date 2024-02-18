@@ -156,8 +156,16 @@ impl MergeTree {
         metrics.num_partitions_before_prune = partition_keys.len();
         let mut partitions = VecDeque::with_capacity(partition_keys.len());
         for partition in partition_keys {
-            let iter = self.scan_part(partition)?;
-            partitions.push_back(iter);
+            let num_shards = {
+                let parts = self.parts.read().unwrap();
+                let parts_vec = parts.parts.get(&partition).unwrap();
+                parts_vec.len()
+            };
+
+            for i in 0..num_shards {
+                let iter = self.scan_part_shard(partition, i)?;
+                partitions.push_back(iter);
+            }
         }
 
         let pk_schema = primary_key_schema(&self.metadata);
@@ -221,11 +229,11 @@ impl MergeTree {
         parts.parts.keys().copied().collect()
     }
 
-    /// Scans the tree.
-    fn scan_part(&self, partition: PartitionKey) -> Result<ShardIter> {
+    fn scan_part_shard(&self, partition: PartitionKey, shard_index: usize) -> Result<ShardIter> {
         let index = {
             let parts = self.parts.read().unwrap();
-            parts.parts.get(&partition).unwrap().index.clone()
+            let parts_vec = parts.parts.get(&partition).unwrap();
+            parts_vec[shard_index].index.clone()
         };
         let index_reader = index
             .as_ref()
@@ -243,10 +251,7 @@ impl MergeTree {
 
         let data_iter = {
             let mut parts = self.parts.write().unwrap();
-            parts
-                .parts
-                .get_mut(&partition)
-                .unwrap()
+            parts.parts.get_mut(&partition).unwrap()[shard_index]
                 .data
                 .iter(pk_weights)?
         };
@@ -320,7 +325,7 @@ impl MergeTree {
     fn write_with_id(&self, partition: PartitionKey, pk_id: PkId, kv: KeyValue) -> Result<()> {
         let mut parts = self.parts.write().unwrap();
         let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
-        tree_parts.write_with_id(pk_id, kv)?;
+        tree_parts.last_mut().unwrap().write_with_id(pk_id, kv)?;
         parts.num_rows += 1;
         Ok(())
     }
@@ -334,9 +339,12 @@ impl MergeTree {
         let index = {
             let mut parts = self.parts.write().unwrap();
             let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
-            assert!(!tree_parts.immutable);
+            assert!(!tree_parts.last().unwrap().immutable);
             // Safety: The region has primary keys.
-            tree_parts.index.clone().unwrap()
+            if tree_parts.last().unwrap().index.as_ref().unwrap().is_full() {
+                tree_parts.push(TreeParts::new(&self.metadata, &self.config));
+            }
+            tree_parts.last().unwrap().index.clone().unwrap()
         };
 
         let pk_opt = index.write_primary_key(key, metrics)?;
@@ -359,7 +367,8 @@ fn compute_partition_key(value: ValueRef) -> PartitionKey {
 
 #[derive(Default)]
 struct PartitionTreeParts {
-    parts: BTreeMap<PartitionKey, TreeParts>,
+    // FIXME(yingwen): We should merge parts under the same partition.
+    parts: BTreeMap<PartitionKey, Vec<TreeParts>>,
     num_rows: usize,
 }
 
@@ -369,10 +378,10 @@ impl PartitionTreeParts {
         partition: PartitionKey,
         metadata: &RegionMetadataRef,
         config: &MergeTreeConfig,
-    ) -> &mut TreeParts {
+    ) -> &mut Vec<TreeParts> {
         self.parts
             .entry(partition)
-            .or_insert_with(|| TreeParts::new(metadata, config))
+            .or_insert_with(|| vec![TreeParts::new(metadata, config)])
     }
 
     fn is_empty(&self) -> bool {
@@ -380,8 +389,10 @@ impl PartitionTreeParts {
     }
 
     fn freeze(&mut self) -> Result<()> {
-        for parts in self.parts.values_mut() {
-            parts.freeze()?;
+        for parts_vec in self.parts.values_mut() {
+            for p in parts_vec {
+                p.freeze()?;
+            }
         }
 
         Ok(())
@@ -389,8 +400,12 @@ impl PartitionTreeParts {
 
     fn fork(&self, metadata: &RegionMetadataRef, config: &MergeTreeConfig) -> PartitionTreeParts {
         let mut parts = BTreeMap::new();
-        for (k, v) in &self.parts {
-            parts.insert(*k, v.fork(metadata.clone(), config));
+        for (k, parts_vec) in &self.parts {
+            let new_parts_vec = parts_vec
+                .iter()
+                .map(|v| v.fork(metadata.clone(), config))
+                .collect();
+            parts.insert(*k, new_parts_vec);
         }
 
         PartitionTreeParts { parts, num_rows: 0 }
@@ -399,7 +414,12 @@ impl PartitionTreeParts {
     fn shared_memory_size(&self) -> usize {
         self.parts
             .values()
-            .map(|parts| parts.shared_memory_size())
+            .map(|parts_vec| {
+                parts_vec
+                    .iter()
+                    .map(|parts| parts.shared_memory_size())
+                    .sum::<usize>()
+            })
             .sum()
     }
 }
