@@ -209,17 +209,15 @@ impl Iterator for Iter {
     type Item = Result<DataBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(mut top) = self.heap.pop() {
-            let top_batch = top.source.current_batch();
-            if let Err(e) = top.source.next() {
-                return Some(Err(e));
-            }
-            if top.source.is_valid() {
-                self.heap.push(top);
-            }
-            return Some(Ok(top_batch));
+        let mut top = self.heap.pop()?;
+        let top_batch = top.source.current_batch();
+        if let Err(e) = top.source.next() {
+            return Some(Err(e));
         }
-        None
+        if top.source.is_valid() {
+            self.heap.push(top);
+        }
+        Some(Ok(top_batch))
     }
 }
 
