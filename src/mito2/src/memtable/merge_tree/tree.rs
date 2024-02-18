@@ -342,6 +342,12 @@ impl MergeTree {
             assert!(!tree_parts.last().unwrap().immutable);
             // Safety: The region has primary keys.
             if tree_parts.last().unwrap().index.as_ref().unwrap().is_full() {
+                common_telemetry::info!(
+                    "Adds a new shard {} to region {} partition {}",
+                    tree_parts.len(),
+                    self.metadata.region_id,
+                    partition
+                );
                 tree_parts.push(TreeParts::new(&self.metadata, &self.config));
             }
             tree_parts.last().unwrap().index.clone().unwrap()
