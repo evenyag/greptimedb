@@ -56,11 +56,15 @@ impl KeyIndex {
         shard.sorted_pk_indices()
     }
 
-    pub(crate) fn write_primary_key(&self, key: &[u8], metrics: &mut WriteMetrics) -> Result<PkId> {
+    pub(crate) fn write_primary_key(
+        &self,
+        key: &[u8],
+        metrics: &mut WriteMetrics,
+    ) -> Result<Option<PkId>> {
         let mut shard = self.shard.write().unwrap();
         let pk_id = shard.try_add_primary_key(&self.config, key, metrics)?;
         // TODO(yingwen): Switch shard if current shard is full.
-        Ok(pk_id.expect("shard is full"))
+        Ok(pk_id)
     }
 
     pub(crate) fn scan_shard(&self, shard_id: ShardId) -> Result<ShardReader> {
@@ -467,7 +471,7 @@ mod tests {
                 shard_id: 0,
                 pk_index: num_keys - 1,
             },
-            last_pk_id.unwrap()
+            last_pk_id.unwrap().unwrap()
         );
         let key_bytes: usize = keys.iter().map(|key| key.len() * 2).sum();
         assert_eq!(key_bytes, metrics.key_bytes);

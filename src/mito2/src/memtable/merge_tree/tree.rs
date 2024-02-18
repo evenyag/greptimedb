@@ -339,7 +339,13 @@ impl MergeTree {
             tree_parts.index.clone().unwrap()
         };
 
-        index.write_primary_key(key, metrics)
+        let pk_opt = index.write_primary_key(key, metrics)?;
+        match pk_opt {
+            Some(v) => Ok(v),
+            None => {
+                panic!("region {} shard is full", self.metadata.region_id);
+            }
+        }
     }
 }
 
