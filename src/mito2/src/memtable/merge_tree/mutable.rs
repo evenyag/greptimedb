@@ -229,6 +229,8 @@ pub(crate) struct ReadMetrics {
     pub(crate) num_rows_before_prune: usize,
     /// Number of rows returned.
     pub(crate) num_rows_returned: usize,
+    /// Number of partitions before prunning.
+    pub(crate) num_partitions_before_prune: usize,
     /// Number of partitions.
     pub(crate) num_partitions: usize,
     /// Failures during evaluating expressions.

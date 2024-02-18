@@ -157,6 +157,7 @@ impl MergeTree {
             .unwrap_or_default();
 
         let partition_keys = self.partition_keys(&simple_filters);
+        metrics.num_partitions_before_prune = partition_keys.len();
         let mut partitions = VecDeque::with_capacity(partition_keys.len());
         for partition in partition_keys {
             let iter = self.scan_part(partition)?;
