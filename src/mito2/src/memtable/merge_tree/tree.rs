@@ -151,6 +151,7 @@ impl MergeTree {
         }
 
         metrics.init_cost = init_start.elapsed();
+        metrics.num_partitions = partitions.len();
         let iter = PartitionIter {
             metadata: self.metadata.clone(),
             projection,
