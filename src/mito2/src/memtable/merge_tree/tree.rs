@@ -288,7 +288,7 @@ fn compute_partition_key(value: ValueRef) -> PartitionKey {
     match value {
         ValueRef::UInt32(v) => v.into(),
         ValueRef::UInt64(v) => v,
-        _ => todo!(),
+        _ => 0,
     }
 }
 
