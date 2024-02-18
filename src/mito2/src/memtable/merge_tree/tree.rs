@@ -19,7 +19,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use api::v1::OpType;
+use common_recordbatch::filter::{ScalarValue, SimpleFilterEvaluator};
 use common_time::Timestamp;
+use datatypes::arrow;
+use datatypes::data_type::ConcreteDataType;
 use datatypes::value::ValueRef;
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
@@ -34,6 +37,7 @@ use crate::memtable::merge_tree::index::{
 };
 use crate::memtable::merge_tree::mutable::{ReadMetrics, WriteMetrics};
 use crate::memtable::merge_tree::{MergeTreeConfig, PkId, PkIndex};
+use crate::memtable::time_series::primary_key_schema;
 use crate::memtable::{BoxedBatchIterator, KeyValues};
 use crate::read::{Batch, BatchBuilder};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
@@ -132,7 +136,10 @@ impl MergeTree {
         let mut metrics = ReadMetrics::default();
         let init_start = Instant::now();
 
-        assert!(predicate.is_none(), "Predicate is unsupported");
+        assert!(
+            predicate.is_none() || predicate.as_ref().unwrap().exprs().is_empty(),
+            "Predicate is unsupported"
+        );
         // Creates the projection set.
         let projection: HashSet<_> = if let Some(projection) = projection {
             projection.iter().copied().collect()
@@ -140,26 +147,81 @@ impl MergeTree {
             self.metadata.field_columns().map(|c| c.column_id).collect()
         };
 
-        let partition_keys: Vec<_> = {
-            let parts = self.parts.read().unwrap();
-            parts.parts.keys().copied().collect()
-        };
+        let simple_filters = predicate
+            .map(|p| {
+                p.exprs()
+                    .iter()
+                    .filter_map(|f| SimpleFilterEvaluator::try_new(f.df_expr()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let partition_keys = self.partition_keys(&simple_filters);
         let mut partitions = VecDeque::with_capacity(partition_keys.len());
         for partition in partition_keys {
             let iter = self.scan_part(partition)?;
             partitions.push_back(iter);
         }
 
+        let pk_schema = primary_key_schema(&self.metadata);
+        let pk_datatypes = self
+            .metadata
+            .primary_key_columns()
+            .map(|pk| pk.column_schema.data_type.clone())
+            .collect();
+
         metrics.init_cost = init_start.elapsed();
         metrics.num_partitions = partitions.len();
         let iter = PartitionIter {
             metadata: self.metadata.clone(),
+            pk_schema,
+            pk_datatypes,
+            simple_filters,
             projection,
+            row_codec: self.row_codec.clone(),
             partitions,
             metrics,
         };
 
         Ok(Box::new(iter))
+    }
+
+    fn partition_keys(&self, filters: &[SimpleFilterEvaluator]) -> Vec<PartitionKey> {
+        let parts = self.parts.read().unwrap();
+        // Prune partition keys.
+        if let Some(partition_col) = self.metadata.primary_key_columns().next() {
+            for filter in filters {
+                // Only the first filter takes effect.
+                if filter.column_name() == partition_col.column_schema.name {
+                    let mut partition_keys = Vec::new();
+                    for key in parts.parts.keys() {
+                        match partition_col.column_schema.data_type {
+                            ConcreteDataType::UInt32(_) => {
+                                if filter
+                                    .evaluate_scalar(&ScalarValue::UInt32(Some(*key as u32)))
+                                    .unwrap_or(true)
+                                {
+                                    partition_keys.push(*key);
+                                }
+                            }
+                            ConcreteDataType::UInt64(_) => {
+                                if filter
+                                    .evaluate_scalar(&ScalarValue::UInt64(Some(*key)))
+                                    .unwrap_or(true)
+                                {
+                                    partition_keys.push(*key);
+                                }
+                            }
+                            _ => partition_keys.push(*key),
+                        }
+                    }
+
+                    return partition_keys;
+                }
+            }
+        }
+
+        parts.parts.keys().copied().collect()
     }
 
     /// Scans the tree.
@@ -413,7 +475,11 @@ impl TreeParts {
 
 struct PartitionIter {
     metadata: RegionMetadataRef,
+    pk_schema: arrow::datatypes::SchemaRef,
+    pk_datatypes: Vec<ConcreteDataType>,
+    simple_filters: Vec<SimpleFilterEvaluator>,
     projection: HashSet<ColumnId>,
+    row_codec: Arc<McmpRowCodec>,
     partitions: VecDeque<ShardIter>,
     metrics: ReadMetrics,
 }
@@ -432,7 +498,21 @@ impl Iterator for PartitionIter {
 impl PartitionIter {
     fn next_batch(&mut self) -> Result<Option<Batch>> {
         while let Some(iter) = self.partitions.front_mut() {
-            if let Some(batch) = iter.next_batch(&self.projection)? {
+            while let Some(batch) = iter.next_batch(&self.projection)? {
+                self.metrics.num_batches_before_prune += 1;
+                self.metrics.num_rows_before_prune += batch.num_rows();
+
+                // Prune primary key.
+                if !prune_primary_key(
+                    &self.row_codec,
+                    batch.primary_key(),
+                    &self.pk_datatypes,
+                    &self.pk_schema,
+                    &self.simple_filters,
+                ) {
+                    continue;
+                }
+
                 self.metrics.num_batches += 1;
                 self.metrics.num_rows_returned += batch.num_rows();
                 return Ok(Some(batch));
@@ -448,6 +528,42 @@ impl Drop for PartitionIter {
     fn drop(&mut self) {
         common_telemetry::info!("PartitionIter drop, metrics: {:?}", self.metrics);
     }
+}
+
+fn prune_primary_key(
+    codec: &Arc<McmpRowCodec>,
+    pk: &[u8],
+    datatypes: &[ConcreteDataType],
+    pk_schema: &arrow::datatypes::SchemaRef,
+    predicates: &[SimpleFilterEvaluator],
+) -> bool {
+    // no primary key, we simply return true.
+    if pk_schema.fields().is_empty() {
+        return true;
+    }
+
+    let pk_values = codec.decode(pk);
+    if let Err(e) = pk_values {
+        common_telemetry::error!(e; "Failed to decode primary key");
+        return true;
+    }
+    let pk_values = pk_values.unwrap();
+
+    // evaluate predicates against primary key values
+    let mut result = true;
+    for predicate in predicates {
+        // ignore predicates that are not referencing primary key columns
+        let Ok(index) = pk_schema.index_of(predicate.column_name()) else {
+            continue;
+        };
+        // Safety: arrow schema and datatypes are constructed from the same source.
+        let scalar_value = pk_values[index]
+            .try_to_scalar_value(&datatypes[index])
+            .unwrap();
+        result &= predicate.evaluate_scalar(&scalar_value).unwrap_or(true);
+    }
+
+    result
 }
 
 struct ShardIter {

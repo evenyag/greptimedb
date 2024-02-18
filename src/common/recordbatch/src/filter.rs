@@ -18,7 +18,7 @@ use datafusion::logical_expr::{Expr, Operator};
 use datafusion_common::arrow::array::{ArrayRef, Datum, Scalar};
 use datafusion_common::arrow::buffer::BooleanBuffer;
 use datafusion_common::arrow::compute::kernels::cmp;
-use datafusion_common::ScalarValue;
+pub use datafusion_common::ScalarValue;
 use datatypes::vectors::VectorRef;
 use snafu::ResultExt;
 

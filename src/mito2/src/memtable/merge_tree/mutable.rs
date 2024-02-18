@@ -221,10 +221,12 @@ pub(crate) struct ReadMetrics {
     sort_dedup_cost: Duration,
     /// Time used to invoke next.
     pub(crate) next_cost: Duration,
+    /// Number of batches before prunning.
+    pub(crate) num_batches_before_prune: usize,
     /// Number of batches returned by the iter.
     pub(crate) num_batches: usize,
     /// Number of rows before prunning.
-    num_rows_before_prune: usize,
+    pub(crate) num_rows_before_prune: usize,
     /// Number of rows returned.
     pub(crate) num_rows_returned: usize,
     /// Number of partitions.
