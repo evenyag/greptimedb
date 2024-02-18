@@ -515,7 +515,7 @@ fn data_buffer_to_record_batches(
     pk_weights: &[u16],
     keep_data: bool,
 ) -> Result<RecordBatch> {
-    let start = std::time::Instant::now();
+    // let start = std::time::Instant::now();
 
     let num_rows = buffer.ts_builder.len();
 
@@ -586,7 +586,7 @@ fn data_buffer_to_record_batches(
         );
     }
 
-    common_telemetry::info!("data buffer to rb cost: {:?}", start.elapsed());
+    // common_telemetry::info!("data buffer to rb cost: {:?}", start.elapsed());
 
     RecordBatch::try_new(schema, columns).context(error::NewRecordBatchSnafu)
 }

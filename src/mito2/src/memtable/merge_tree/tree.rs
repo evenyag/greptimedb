@@ -351,7 +351,10 @@ impl MergeTree {
         match pk_opt {
             Some(v) => Ok(v),
             None => {
-                panic!("region {} shard is full", self.metadata.region_id);
+                panic!(
+                    "region {} partition {} shard is full",
+                    self.metadata.region_id, partition
+                );
             }
         }
     }
