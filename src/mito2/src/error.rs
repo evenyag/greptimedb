@@ -561,6 +561,12 @@ pub enum Error {
     ReadDataPart {
         #[snafu(source)]
         error: parquet::errors::ParquetError,
+    },
+
+    #[snafu(display("BiError, first: {first}, second: {second}"))]
+    BiError {
+        first: Box<Error>,
+        second: Box<Error>,
         location: Location,
     },
 }
@@ -665,6 +671,7 @@ impl ErrorExt for Error {
             FilterRecordBatch { source, .. } => source.status_code(),
             Upload { .. } => StatusCode::StorageUnavailable,
             ReadDataPart { .. } | EncodeMemtable { .. } => StatusCode::Internal,
+            BiError { .. } => StatusCode::Internal,
         }
     }
 
