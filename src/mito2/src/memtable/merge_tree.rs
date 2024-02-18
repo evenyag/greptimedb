@@ -34,6 +34,7 @@ use crate::error::Result;
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::merge_tree::mutable::WriteMetrics;
 use crate::memtable::merge_tree::tree::{MergeTree, MergeTreeRef};
+use crate::memtable::time_series::TimeSeriesMemtable;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
     MemtableRef, MemtableStats,
@@ -265,6 +266,14 @@ impl MergeTreeMemtableBuilder {
 impl MemtableBuilder for MergeTreeMemtableBuilder {
     fn build(&self, metadata: &RegionMetadataRef) -> MemtableRef {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
+        if metadata.region_id.region_group() != 0 {
+            return Arc::new(TimeSeriesMemtable::new(
+                metadata.clone(),
+                id,
+                self.write_buffer_manager.clone(),
+            ));
+        }
+
         Arc::new(MergeTreeMemtable::new(
             id,
             metadata.clone(),
