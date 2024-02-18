@@ -14,13 +14,14 @@
 
 //! Implementation of the memtable merge tree.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use api::v1::OpType;
 use common_time::Timestamp;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::value::ValueRef;
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
@@ -41,6 +42,8 @@ use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 /// Initial capacity for the data buffer.
 const DATA_INIT_CAP: usize = 8;
 
+type PartitionKey = u64;
+
 /// The merge tree.
 pub(crate) struct MergeTree {
     /// Config of the tree.
@@ -49,7 +52,7 @@ pub(crate) struct MergeTree {
     pub(crate) metadata: RegionMetadataRef,
     /// Primary key codec.
     row_codec: Arc<McmpRowCodec>,
-    pub(crate) parts: RwLock<TreeParts>,
+    parts: RwLock<PartitionTreeParts>,
 }
 
 pub(crate) type MergeTreeRef = Arc<MergeTree>;
@@ -64,24 +67,11 @@ impl MergeTree {
                 .collect(),
         );
 
-        let index = (!metadata.primary_key.is_empty()).then(|| {
-            Arc::new(KeyIndex::new(IndexConfig {
-                max_keys_per_shard: config.index_max_keys_per_shard,
-            }))
-        });
-        let data =
-            DataParts::with_capacity(metadata.clone(), DATA_INIT_CAP, config.freeze_threshold);
-        let parts = TreeParts {
-            immutable: false,
-            index,
-            data,
-        };
-
         MergeTree {
             config: config.clone(),
             metadata,
             row_codec: Arc::new(row_codec),
-            parts: RwLock::new(parts),
+            parts: RwLock::new(PartitionTreeParts::default()),
         }
     }
 
@@ -115,7 +105,7 @@ impl MergeTree {
                     shard_id: 0,
                     pk_index: 0,
                 };
-                self.write_with_id(pk_id, kv)?;
+                self.write_with_id(0, pk_id, kv)?;
                 continue;
             }
 
@@ -151,9 +141,32 @@ impl MergeTree {
             self.metadata.field_columns().map(|c| c.column_id).collect()
         };
 
+        let partition_keys: Vec<_> = {
+            let parts = self.parts.read().unwrap();
+            parts.parts.keys().copied().collect()
+        };
+        let mut partitions = VecDeque::with_capacity(partition_keys.len());
+        for partition in partition_keys {
+            let iter = self.scan_part(partition)?;
+            partitions.push_back(iter);
+        }
+
+        metrics.init_cost = init_start.elapsed();
+        let iter = PartitionIter {
+            metadata: self.metadata.clone(),
+            projection,
+            partitions,
+            metrics,
+        };
+
+        Ok(Box::new(iter))
+    }
+
+    /// Scans the tree.
+    fn scan_part(&self, partition: PartitionKey) -> Result<ShardIter> {
         let index = {
             let parts = self.parts.read().unwrap();
-            parts.index.clone()
+            parts.parts.get(&partition).unwrap().index.clone()
         };
         let index_reader = index
             .as_ref()
@@ -171,26 +184,28 @@ impl MergeTree {
 
         let data_iter = {
             let mut parts = self.parts.write().unwrap();
-            parts.data.iter(pk_weights)?
+            parts
+                .parts
+                .get_mut(&partition)
+                .unwrap()
+                .data
+                .iter(pk_weights)?
         };
 
-        metrics.init_cost = init_start.elapsed();
         let iter = ShardIter {
             metadata: self.metadata.clone(),
-            projection,
             index_reader,
             data_reader: DataReader::new(data_iter)?,
-            metrics,
         };
 
-        Ok(Box::new(iter))
+        Ok(iter)
     }
 
     /// Returns true if the tree is empty.
     pub(crate) fn is_empty(&self) -> bool {
         let parts = self.parts.read().unwrap();
         // Gets whether the memtable is empty from the data part.
-        parts.data.is_empty()
+        parts.is_empty()
         // TODO(yingwen): Also consider other parts if we freeze the data buffer.
     }
 
@@ -199,11 +214,7 @@ impl MergeTree {
     /// Once the tree becomes immutable, callers should not write to it again.
     pub(crate) fn freeze(&self) -> Result<()> {
         let mut parts = self.parts.write().unwrap();
-        parts.immutable = true;
-        // Freezes the index.
-        if let Some(index) = &parts.index {
-            index.freeze()?;
-        }
+        parts.freeze()?;
 
         Ok(())
     }
@@ -217,20 +228,7 @@ impl MergeTree {
         }
 
         let current_parts = self.parts.read().unwrap();
-        let index = current_parts
-            .index
-            .as_ref()
-            .map(|index| Arc::new(index.fork()));
-        // New parts.
-        let parts = TreeParts {
-            immutable: false,
-            index,
-            data: DataParts::new(
-                metadata.clone(),
-                DATA_INIT_CAP,
-                self.config.freeze_threshold,
-            ),
-        };
+        let parts = current_parts.fork(&metadata, &self.config);
 
         MergeTree {
             config: self.config.clone(),
@@ -244,11 +242,7 @@ impl MergeTree {
     /// Returns the memory size of shared parts.
     pub(crate) fn shared_memory_size(&self) -> usize {
         let parts = self.parts.read().unwrap();
-        parts
-            .index
-            .as_ref()
-            .map(|index| index.memory_size())
-            .unwrap_or(0)
+        parts.shared_memory_size()
     }
 
     fn write_with_key(
@@ -257,40 +251,91 @@ impl MergeTree {
         kv: KeyValue,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
+        let partition = compute_partition_key(kv.primary_keys().next().unwrap());
         // Write the pk to the index.
-        let pk_id = self.write_primary_key(primary_key, metrics)?;
+        let pk_id = self.write_primary_key(partition, primary_key, metrics)?;
         // Writes data.
-        self.write_with_id(pk_id, kv)
+        self.write_with_id(partition, pk_id, kv)
     }
 
-    fn write_with_id(&self, pk_id: PkId, kv: KeyValue) -> Result<()> {
+    fn write_with_id(&self, partition: PartitionKey, pk_id: PkId, kv: KeyValue) -> Result<()> {
         let mut parts = self.parts.write().unwrap();
-        assert!(!parts.immutable);
-        if parts.data.write_row(pk_id, kv) {
-            // should trigger freeze
-            let weights = if let Some(index) = parts.index.as_ref() {
-                let pk_indices = index.sorted_pk_indices();
-                let mut weights = Vec::with_capacity(pk_indices.len());
-                compute_pk_weights(&pk_indices, &mut weights);
-                weights
-            } else {
-                vec![0]
-            };
-            parts.data.freeze(&weights)
-        } else {
-            Ok(())
-        }
+        let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
+        tree_parts.write_with_id(pk_id, kv)?;
+        parts.num_rows += 1;
+        Ok(())
     }
 
-    fn write_primary_key(&self, key: &[u8], metrics: &mut WriteMetrics) -> Result<PkId> {
+    fn write_primary_key(
+        &self,
+        partition: PartitionKey,
+        key: &[u8],
+        metrics: &mut WriteMetrics,
+    ) -> Result<PkId> {
         let index = {
-            let parts = self.parts.read().unwrap();
-            assert!(!parts.immutable);
+            let mut parts = self.parts.write().unwrap();
+            let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
+            assert!(!tree_parts.immutable);
             // Safety: The region has primary keys.
-            parts.index.clone().unwrap()
+            tree_parts.index.clone().unwrap()
         };
 
         index.write_primary_key(key, metrics)
+    }
+}
+
+fn compute_partition_key(value: ValueRef) -> PartitionKey {
+    match value {
+        ValueRef::UInt32(v) => v.into(),
+        ValueRef::UInt64(v) => v,
+        _ => todo!(),
+    }
+}
+
+#[derive(Default)]
+struct PartitionTreeParts {
+    parts: BTreeMap<PartitionKey, TreeParts>,
+    num_rows: usize,
+}
+
+impl PartitionTreeParts {
+    fn get_or_create_parts(
+        &mut self,
+        partition: PartitionKey,
+        metadata: &RegionMetadataRef,
+        config: &MergeTreeConfig,
+    ) -> &mut TreeParts {
+        self.parts
+            .entry(partition)
+            .or_insert_with(|| TreeParts::new(metadata, config))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.num_rows == 0
+    }
+
+    fn freeze(&mut self) -> Result<()> {
+        for parts in self.parts.values_mut() {
+            parts.freeze()?;
+        }
+
+        Ok(())
+    }
+
+    fn fork(&self, metadata: &RegionMetadataRef, config: &MergeTreeConfig) -> PartitionTreeParts {
+        let mut parts = BTreeMap::new();
+        for (k, v) in &self.parts {
+            parts.insert(*k, v.fork(metadata.clone(), config));
+        }
+
+        PartitionTreeParts { parts, num_rows: 0 }
+    }
+
+    fn shared_memory_size(&self) -> usize {
+        self.parts
+            .values()
+            .map(|parts| parts.shared_memory_size())
+            .sum()
     }
 }
 
@@ -304,45 +349,128 @@ pub(crate) struct TreeParts {
     pub(crate) data: DataParts,
 }
 
-struct ShardIter {
+impl TreeParts {
+    fn new(metadata: &RegionMetadataRef, config: &MergeTreeConfig) -> Self {
+        let index = (!metadata.primary_key.is_empty()).then(|| {
+            Arc::new(KeyIndex::new(IndexConfig {
+                max_keys_per_shard: config.index_max_keys_per_shard,
+            }))
+        });
+        let data =
+            DataParts::with_capacity(metadata.clone(), DATA_INIT_CAP, config.freeze_threshold);
+        TreeParts {
+            immutable: false,
+            index,
+            data,
+        }
+    }
+
+    fn write_with_id(&mut self, pk_id: PkId, kv: KeyValue) -> Result<()> {
+        assert!(!self.immutable);
+        if self.data.write_row(pk_id, kv) {
+            // should trigger freeze
+            let weights = if let Some(index) = self.index.as_ref() {
+                let pk_indices = index.sorted_pk_indices();
+                let mut weights = Vec::with_capacity(pk_indices.len());
+                compute_pk_weights(&pk_indices, &mut weights);
+                weights
+            } else {
+                vec![0]
+            };
+            self.data.freeze(&weights)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn freeze(&mut self) -> Result<()> {
+        self.immutable = true;
+        // Freezes the index.
+        if let Some(index) = &self.index {
+            index.freeze()?;
+        }
+
+        Ok(())
+    }
+
+    fn fork(&self, metadata: RegionMetadataRef, config: &MergeTreeConfig) -> TreeParts {
+        let index = self.index.as_ref().map(|index| Arc::new(index.fork()));
+        // New parts.
+        TreeParts {
+            immutable: false,
+            index,
+            data: DataParts::new(metadata, DATA_INIT_CAP, config.freeze_threshold),
+        }
+    }
+
+    fn shared_memory_size(&self) -> usize {
+        self.index
+            .as_ref()
+            .map(|index| index.memory_size())
+            .unwrap_or(0)
+    }
+}
+
+struct PartitionIter {
     metadata: RegionMetadataRef,
     projection: HashSet<ColumnId>,
-    index_reader: Option<ShardReader>,
-    data_reader: DataReader,
+    partitions: VecDeque<ShardIter>,
     metrics: ReadMetrics,
 }
 
-impl Iterator for ShardIter {
+impl Iterator for PartitionIter {
     type Item = Result<Batch>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let start = Instant::now();
-        if !self.data_reader.is_valid() {
-            self.metrics.next_cost += start.elapsed();
-            return None;
-        }
-
         let ret = self.next_batch().transpose();
         self.metrics.next_cost += start.elapsed();
         ret
     }
 }
 
+impl PartitionIter {
+    fn next_batch(&mut self) -> Result<Option<Batch>> {
+        while let Some(iter) = self.partitions.front_mut() {
+            if let Some(batch) = iter.next_batch(&self.projection)? {
+                self.metrics.num_batches += 1;
+                self.metrics.num_rows_returned += batch.num_rows();
+                return Ok(Some(batch));
+            }
+            self.partitions.pop_front();
+        }
+
+        Ok(None)
+    }
+}
+
+impl Drop for PartitionIter {
+    fn drop(&mut self) {
+        common_telemetry::info!("PartitionIter drop, metrics: {:?}", self.metrics);
+    }
+}
+
+struct ShardIter {
+    metadata: RegionMetadataRef,
+    index_reader: Option<ShardReader>,
+    data_reader: DataReader,
+}
+
 impl ShardIter {
     /// Fetches next batch and advances the iter.
-    fn next_batch(&mut self) -> Result<Option<Batch>> {
+    fn next_batch(&mut self, projection: &HashSet<ColumnId>) -> Result<Option<Batch>> {
+        if !self.data_reader.is_valid() {
+            return Ok(None);
+        }
+
         let Some(index_reader) = &mut self.index_reader else {
             // No primary key to read.
             // Safety: `next()` ensures the data reader is valid.
-            let batch = self.data_reader.convert_current_record_batch(
-                &self.metadata,
-                &self.projection,
-                &[],
-            )?;
+            let batch =
+                self.data_reader
+                    .convert_current_record_batch(&self.metadata, projection, &[])?;
             // Advances the data reader.
             self.data_reader.next()?;
-            self.metrics.num_batches += 1;
-            self.metrics.num_rows_returned += batch.num_rows();
             return Ok(Some(batch));
         };
 
@@ -360,20 +488,12 @@ impl ShardIter {
 
         let batch = self.data_reader.convert_current_record_batch(
             &self.metadata,
-            &self.projection,
+            projection,
             index_reader.current_key(),
         )?;
         // Advances the data reader.
         self.data_reader.next()?;
-        self.metrics.num_batches += 1;
-        self.metrics.num_rows_returned += batch.num_rows();
         Ok(Some(batch))
-    }
-}
-
-impl Drop for ShardIter {
-    fn drop(&mut self) {
-        common_telemetry::info!("Shard iter drop, metrics: {:?}", self.metrics);
     }
 }
 
