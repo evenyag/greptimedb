@@ -136,10 +136,6 @@ impl MergeTree {
         let mut metrics = ReadMetrics::default();
         let init_start = Instant::now();
 
-        assert!(
-            predicate.is_none() || predicate.as_ref().unwrap().exprs().is_empty(),
-            "Predicate is unsupported"
-        );
         // Creates the projection set.
         let projection: HashSet<_> = if let Some(projection) = projection {
             projection.iter().copied().collect()
