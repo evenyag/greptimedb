@@ -252,6 +252,7 @@ impl StatementExecutor {
 
         for (i, table_info) in raw_tables_info.iter_mut().enumerate() {
             table_info.ident.table_id = table_ids[i];
+            info!("Successfully created logical table: {:?}", table_info);
         }
         let tables_info = raw_tables_info
             .into_iter()
