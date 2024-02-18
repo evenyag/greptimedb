@@ -64,7 +64,7 @@ impl Default for MergeTreeConfig {
     fn default() -> Self {
         Self {
             // TODO(yingwen): Use 4096 or find a proper value.
-            index_max_keys_per_shard: 8192,
+            index_max_keys_per_shard: 8192 * 2,
             freeze_threshold: 102400,
         }
     }
@@ -266,7 +266,7 @@ impl MergeTreeMemtableBuilder {
 impl MemtableBuilder for MergeTreeMemtableBuilder {
     fn build(&self, metadata: &RegionMetadataRef) -> MemtableRef {
         let id = self.id.fetch_add(1, Ordering::Relaxed);
-        if metadata.region_id.region_group() != 0 || metadata.region_id.table_id() == 1024 {
+        if metadata.region_id.region_group() != 0 {
             return Arc::new(TimeSeriesMemtable::new(
                 metadata.clone(),
                 id,
