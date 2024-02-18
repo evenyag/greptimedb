@@ -44,16 +44,21 @@ pub(crate) struct KeyIndex {
 pub(crate) type KeyIndexRef = Arc<KeyIndex>;
 
 impl KeyIndex {
-    pub(crate) fn new(config: IndexConfig) -> KeyIndex {
+    pub(crate) fn new(config: IndexConfig, shard_id: ShardId) -> KeyIndex {
         KeyIndex {
             config,
-            shard: RwLock::new(Shard::new(0)),
+            shard: RwLock::new(Shard::new(shard_id)),
         }
     }
 
     pub(crate) fn sorted_pk_indices(&self) -> Vec<u16> {
         let shard = self.shard.read().unwrap();
         shard.sorted_pk_indices()
+    }
+
+    pub(crate) fn get_pk_id(&self, key: &[u8]) -> Option<PkId> {
+        let shard = self.shard.read().unwrap();
+        shard.get_pk_id(key)
     }
 
     pub(crate) fn write_primary_key(
@@ -137,6 +142,22 @@ impl Shard {
 
     fn is_full(&self, config: &IndexConfig) -> bool {
         self.num_keys >= config.max_keys_per_shard
+    }
+
+    fn get_pk_id(&self, key: &[u8]) -> Option<PkId> {
+        // The shard is immutable, find in the shared index.
+        if let Some(shared_index) = &self.shared_index {
+            let pk_id = shared_index.get(key).map(|pk_index| PkId {
+                shard_id: self.shard_id,
+                pk_index: *pk_index,
+            });
+            return pk_id;
+        }
+
+        self.pk_to_index.get(key).map(|pk_index| PkId {
+            shard_id: self.shard_id,
+            pk_index: *pk_index,
+        })
     }
 
     fn try_add_primary_key(
@@ -465,9 +486,12 @@ mod tests {
         let num_keys = MAX_KEYS_PER_BLOCK * 2 + MAX_KEYS_PER_BLOCK / 2;
         let keys = prepare_input_keys(num_keys.into());
 
-        let index = KeyIndex::new(IndexConfig {
-            max_keys_per_shard: (MAX_KEYS_PER_BLOCK * 3).into(),
-        });
+        let index = KeyIndex::new(
+            IndexConfig {
+                max_keys_per_shard: (MAX_KEYS_PER_BLOCK * 3).into(),
+            },
+            0,
+        );
         let mut last_pk_id = None;
         let mut metrics = WriteMetrics::default();
         for key in &keys {
@@ -502,9 +526,12 @@ mod tests {
 
     #[test]
     fn test_index_memory_size() {
-        let index = KeyIndex::new(IndexConfig {
-            max_keys_per_shard: (MAX_KEYS_PER_BLOCK * 3).into(),
-        });
+        let index = KeyIndex::new(
+            IndexConfig {
+                max_keys_per_shard: (MAX_KEYS_PER_BLOCK * 3).into(),
+            },
+            0,
+        );
         let mut metrics = WriteMetrics::default();
         // 513 keys
         let num_keys = MAX_KEYS_PER_BLOCK * 2 + 1;

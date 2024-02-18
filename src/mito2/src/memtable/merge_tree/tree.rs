@@ -36,7 +36,7 @@ use crate::memtable::merge_tree::index::{
     compute_pk_weights, IndexConfig, IndexReader, KeyIndex, KeyIndexRef, ShardReader,
 };
 use crate::memtable::merge_tree::mutable::{ReadMetrics, WriteMetrics};
-use crate::memtable::merge_tree::{MergeTreeConfig, PkId, PkIndex};
+use crate::memtable::merge_tree::{MergeTreeConfig, PkId, PkIndex, ShardId};
 use crate::memtable::time_series::primary_key_schema;
 use crate::memtable::{BoxedBatchIterator, KeyValues};
 use crate::read::{Batch, BatchBuilder};
@@ -336,20 +336,23 @@ impl MergeTree {
         key: &[u8],
         metrics: &mut WriteMetrics,
     ) -> Result<PkId> {
+        {
+            let parts = self.parts.read().unwrap();
+            if let Some(parts_vec) = parts.parts.get(&partition) {
+                for parts in parts_vec {
+                    // Safety: The region has primary key.
+                    if let Some(pk_id) = parts.index.as_ref().unwrap().get_pk_id(key) {
+                        return Ok(pk_id);
+                    }
+                }
+            }
+        }
+
         let index = {
             let mut parts = self.parts.write().unwrap();
             let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
-            assert!(!tree_parts.last().unwrap().immutable);
-            // Safety: The region has primary keys.
-            if tree_parts.last().unwrap().index.as_ref().unwrap().is_full() {
-                common_telemetry::info!(
-                    "Adds a new shard {} to region {} partition {}",
-                    tree_parts.len(),
-                    self.metadata.region_id,
-                    partition
-                );
-                tree_parts.push(TreeParts::new(&self.metadata, &self.config));
-            }
+            // We don't check whether the key is already added in previous shards now. It is possible
+            // to write a key into multiple shards.
             tree_parts.last().unwrap().index.clone().unwrap()
         };
 
@@ -379,6 +382,7 @@ struct PartitionTreeParts {
     // FIXME(yingwen): We should merge parts under the same partition.
     parts: BTreeMap<PartitionKey, Vec<TreeParts>>,
     num_rows: usize,
+    next_shard_id: ShardId,
 }
 
 impl PartitionTreeParts {
@@ -388,9 +392,24 @@ impl PartitionTreeParts {
         metadata: &RegionMetadataRef,
         config: &MergeTreeConfig,
     ) -> &mut Vec<TreeParts> {
-        self.parts
-            .entry(partition)
-            .or_insert_with(|| vec![TreeParts::new(metadata, config)])
+        let parts_vec = self.parts.entry(partition).or_insert_with(|| {
+            let shard_id = self.next_shard_id;
+            self.next_shard_id += 1;
+            vec![TreeParts::new(metadata, config, shard_id)]
+        });
+        assert!(!parts_vec.last().unwrap().immutable);
+        // Safety: The region has primary keys.
+        if parts_vec.last().unwrap().index.as_ref().unwrap().is_full() {
+            common_telemetry::info!(
+                "Adds a new shard {} to region {} partition {}",
+                parts_vec.len(),
+                metadata.region_id,
+                partition
+            );
+            parts_vec.push(TreeParts::new(metadata, config, self.next_shard_id));
+            self.next_shard_id += 1;
+        }
+        parts_vec
     }
 
     fn is_empty(&self) -> bool {
@@ -417,7 +436,11 @@ impl PartitionTreeParts {
             parts.insert(*k, new_parts_vec);
         }
 
-        PartitionTreeParts { parts, num_rows: 0 }
+        PartitionTreeParts {
+            parts,
+            num_rows: 0,
+            next_shard_id: self.next_shard_id,
+        }
     }
 
     fn shared_memory_size(&self) -> usize {
@@ -444,11 +467,14 @@ pub(crate) struct TreeParts {
 }
 
 impl TreeParts {
-    fn new(metadata: &RegionMetadataRef, config: &MergeTreeConfig) -> Self {
+    fn new(metadata: &RegionMetadataRef, config: &MergeTreeConfig, shard_id: ShardId) -> Self {
         let index = (!metadata.primary_key.is_empty()).then(|| {
-            Arc::new(KeyIndex::new(IndexConfig {
-                max_keys_per_shard: config.index_max_keys_per_shard,
-            }))
+            Arc::new(KeyIndex::new(
+                IndexConfig {
+                    max_keys_per_shard: config.index_max_keys_per_shard,
+                },
+                shard_id,
+            ))
         });
         let data =
             DataParts::with_capacity(metadata.clone(), DATA_INIT_CAP, config.freeze_threshold);
