@@ -631,6 +631,10 @@ fn prune_primary_key(
     pk_schema: &arrow::datatypes::SchemaRef,
     predicates: &[SimpleFilterEvaluator],
 ) -> bool {
+    if predicates.is_empty() {
+        return true;
+    }
+
     // no primary key, we simply return true.
     if pk_schema.fields().is_empty() {
         return true;
