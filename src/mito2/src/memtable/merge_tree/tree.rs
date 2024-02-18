@@ -103,12 +103,7 @@ impl MergeTree {
 
             if !has_pk {
                 // No primary key.
-                // Now we always assign the first shard and the first pk index to the id.
-                let pk_id = PkId {
-                    shard_id: 0,
-                    pk_index: 0,
-                };
-                self.write_with_id(0, pk_id, kv)?;
+                self.write_no_key(0, kv)?;
                 continue;
             }
 
@@ -322,10 +317,23 @@ impl MergeTree {
         self.write_with_id(partition, pk_id, kv)
     }
 
-    fn write_with_id(&self, partition: PartitionKey, pk_id: PkId, kv: KeyValue) -> Result<()> {
+    fn write_no_key(&self, partition: PartitionKey, kv: KeyValue) -> Result<()> {
         let mut parts = self.parts.write().unwrap();
         let tree_parts = parts.get_or_create_parts(partition, &self.metadata, &self.config);
+        // Now we always assign the first shard and the first pk index to the id.
+        let pk_id = PkId {
+            shard_id: 0,
+            pk_index: 0,
+        };
         tree_parts.last_mut().unwrap().write_with_id(pk_id, kv)?;
+        parts.num_rows += 1;
+        Ok(())
+    }
+
+    fn write_with_id(&self, partition: PartitionKey, pk_id: PkId, kv: KeyValue) -> Result<()> {
+        let mut parts = self.parts.write().unwrap();
+        let tree_parts = parts.get_parts_by_pkid(partition, pk_id);
+        tree_parts.write_with_id(pk_id, kv)?;
         parts.num_rows += 1;
         Ok(())
     }
@@ -412,6 +420,21 @@ impl PartitionTreeParts {
         parts_vec
     }
 
+    fn get_parts_by_pkid(&mut self, partition: PartitionKey, pk_id: PkId) -> &mut TreeParts {
+        let parts_vec = self.parts.get_mut(&partition).unwrap();
+        assert!(!parts_vec.last().unwrap().immutable);
+        for parts in parts_vec {
+            if parts.shard_id == pk_id.shard_id {
+                return parts;
+            }
+        }
+
+        panic!(
+            "partition {} shard for pk id {:?} not found",
+            partition, pk_id
+        )
+    }
+
     fn is_empty(&self) -> bool {
         self.num_rows == 0
     }
@@ -457,6 +480,7 @@ impl PartitionTreeParts {
 }
 
 pub(crate) struct TreeParts {
+    shard_id: ShardId,
     /// Whether the tree is immutable.
     immutable: bool,
     /// Index part of the tree. If the region doesn't have a primary key, this field
@@ -479,6 +503,7 @@ impl TreeParts {
         let data =
             DataParts::with_capacity(metadata.clone(), DATA_INIT_CAP, config.freeze_threshold);
         TreeParts {
+            shard_id,
             immutable: false,
             index,
             data,
@@ -517,6 +542,7 @@ impl TreeParts {
         let index = self.index.as_ref().map(|index| Arc::new(index.fork()));
         // New parts.
         TreeParts {
+            shard_id: self.shard_id,
             immutable: false,
             index,
             data: DataParts::new(metadata, DATA_INIT_CAP, config.freeze_threshold),
