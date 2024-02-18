@@ -68,12 +68,14 @@ impl KeyIndex {
     ) -> Result<Option<PkId>> {
         let mut shard = self.shard.write().unwrap();
         let pk_id = shard.try_add_primary_key(&self.config, key, metrics)?;
-        // TODO(yingwen): Switch shard if current shard is full.
         Ok(pk_id)
     }
 
-    pub(crate) fn is_full(&self) -> bool {
-        self.shard.read().unwrap().is_full(&self.config)
+    pub(crate) fn is_full_or_immutable(&self) -> bool {
+        self.shard
+            .read()
+            .unwrap()
+            .is_full_or_immutable(&self.config)
     }
 
     pub(crate) fn scan_shard(&self, shard_id: ShardId) -> Result<ShardReader> {
@@ -140,8 +142,8 @@ impl Shard {
         }
     }
 
-    fn is_full(&self, config: &IndexConfig) -> bool {
-        self.num_keys >= config.max_keys_per_shard
+    fn is_full_or_immutable(&self, config: &IndexConfig) -> bool {
+        self.num_keys >= config.max_keys_per_shard || self.shared_index.is_some()
     }
 
     fn get_pk_id(&self, key: &[u8]) -> Option<PkId> {

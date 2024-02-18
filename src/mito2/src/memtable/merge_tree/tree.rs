@@ -225,14 +225,17 @@ impl MergeTree {
     }
 
     fn scan_part_shard(&self, partition: PartitionKey, shard_index: usize) -> Result<ShardIter> {
-        let index = {
+        let (index, shard_id) = {
             let parts = self.parts.read().unwrap();
             let parts_vec = parts.parts.get(&partition).unwrap();
-            parts_vec[shard_index].index.clone()
+            (
+                parts_vec[shard_index].index.clone(),
+                parts_vec[shard_index].shard_id,
+            )
         };
         let index_reader = index
             .as_ref()
-            .map(|index| index.scan_shard(0))
+            .map(|index| index.scan_shard(shard_id))
             .transpose()?;
         // Compute pk weights.
         let mut pk_weights = Vec::new();
@@ -407,7 +410,14 @@ impl PartitionTreeParts {
         });
         assert!(!parts_vec.last().unwrap().immutable);
         // Safety: The region has primary keys.
-        if parts_vec.last().unwrap().index.as_ref().unwrap().is_full() {
+        if parts_vec
+            .last()
+            .unwrap()
+            .index
+            .as_ref()
+            .unwrap()
+            .is_full_or_immutable()
+        {
             common_telemetry::info!(
                 "Adds a new shard {} to region {} partition {}",
                 parts_vec.len(),
