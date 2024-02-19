@@ -16,10 +16,10 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use api::v1::OpType;
 use common_time::Timestamp;
-use datatypes::arrow::record_batch::RecordBatch;
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
@@ -31,7 +31,7 @@ use crate::memtable::merge_tree::data::{self, DataBatch, DataParts};
 use crate::memtable::merge_tree::index::{
     compute_pk_weights, IndexConfig, IndexReader, KeyIndex, KeyIndexRef, ShardReader,
 };
-use crate::memtable::merge_tree::mutable::WriteMetrics;
+use crate::memtable::merge_tree::mutable::{ReadMetrics, WriteMetrics};
 use crate::memtable::merge_tree::{MergeTreeConfig, PkId, PkIndex};
 use crate::memtable::{BoxedBatchIterator, KeyValues};
 use crate::read::{Batch, BatchBuilder};
@@ -50,8 +50,6 @@ pub(crate) struct MergeTree {
     row_codec: Arc<McmpRowCodec>,
     pub(crate) parts: RwLock<TreeParts>,
 }
-
-pub(crate) type MergeTreeRef = Arc<MergeTree>;
 
 impl MergeTree {
     /// Creates a new merge tree.
@@ -139,6 +137,9 @@ impl MergeTree {
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
     ) -> Result<BoxedBatchIterator> {
+        let mut metrics = ReadMetrics::default();
+        let init_start = Instant::now();
+
         assert!(predicate.is_none(), "Predicate is unsupported");
         // Creates the projection set.
         let projection: HashSet<_> = if let Some(projection) = projection {
@@ -170,11 +171,13 @@ impl MergeTree {
             parts.data.iter(pk_weights)?
         };
 
+        metrics.init_cost = init_start.elapsed();
         let iter = ShardIter {
             metadata: self.metadata.clone(),
             projection,
             index_reader,
             data_reader: DataReader::new(data_iter)?,
+            metrics,
         };
 
         Ok(Box::new(iter))
@@ -303,17 +306,22 @@ struct ShardIter {
     projection: HashSet<ColumnId>,
     index_reader: Option<ShardReader>,
     data_reader: DataReader,
+    metrics: ReadMetrics,
 }
 
 impl Iterator for ShardIter {
     type Item = Result<Batch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let start = Instant::now();
         if !self.data_reader.is_valid() {
+            self.metrics.next_cost += start.elapsed();
             return None;
         }
 
-        self.next_batch().transpose()
+        let ret = self.next_batch().transpose();
+        self.metrics.next_cost += start.elapsed();
+        ret
     }
 }
 
@@ -330,6 +338,8 @@ impl ShardIter {
             )?;
             // Advances the data reader.
             self.data_reader.next()?;
+            self.metrics.num_batches += 1;
+            self.metrics.num_rows_returned += batch.num_rows();
             return Ok(Some(batch));
         };
 
@@ -352,7 +362,15 @@ impl ShardIter {
         )?;
         // Advances the data reader.
         self.data_reader.next()?;
+        self.metrics.num_batches += 1;
+        self.metrics.num_rows_returned += batch.num_rows();
         Ok(Some(batch))
+    }
+}
+
+impl Drop for ShardIter {
+    fn drop(&mut self) {
+        common_telemetry::info!("Shard iter drop, metrics: {:?}", self.metrics);
     }
 }
 

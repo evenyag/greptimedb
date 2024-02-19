@@ -26,7 +26,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use common_base::readable_size::ReadableSize;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
@@ -34,7 +33,7 @@ use table::predicate::Predicate;
 use crate::error::Result;
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::merge_tree::mutable::WriteMetrics;
-use crate::memtable::merge_tree::tree::{MergeTree, MergeTreeRef};
+use crate::memtable::merge_tree::tree::MergeTree;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, KeyValues, Memtable, MemtableBuilder, MemtableId,
     MemtableRef, MemtableStats,
@@ -65,7 +64,7 @@ impl Default for MergeTreeConfig {
         Self {
             // TODO(yingwen): Use 4096 or find a proper value.
             index_max_keys_per_shard: 8192,
-            freeze_threshold: 4096,
+            freeze_threshold: 409600,
         }
     }
 }
@@ -73,7 +72,7 @@ impl Default for MergeTreeConfig {
 /// Memtable based on a merge tree.
 pub struct MergeTreeMemtable {
     id: MemtableId,
-    tree: MergeTreeRef,
+    tree: MergeTree,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
     min_timestamp: AtomicI64,
@@ -190,7 +189,7 @@ impl MergeTreeMemtable {
 
         Self {
             id,
-            tree: Arc::new(tree),
+            tree,
             alloc_tracker,
             max_timestamp: AtomicI64::new(i64::MIN),
             min_timestamp: AtomicI64::new(i64::MAX),
