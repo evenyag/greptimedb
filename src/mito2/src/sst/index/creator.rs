@@ -75,6 +75,11 @@ pub struct SstIndexCreator {
 
     /// Ignore column IDs for index creation.
     ignore_column_ids: HashSet<ColumnId>,
+
+    /// Stores the key of the previous [Batch] that updates the index.
+    prev_index_key: Vec<u8>,
+    /// Stores row number of the previous index key.
+    prev_key_rows_num: usize,
 }
 
 impl SstIndexCreator {
@@ -115,6 +120,9 @@ impl SstIndexCreator {
             aborted: false,
 
             ignore_column_ids: HashSet::default(),
+
+            prev_index_key: Vec::new(),
+            prev_key_rows_num: 0,
         }
     }
 
@@ -139,7 +147,22 @@ impl SstIndexCreator {
             return Ok(());
         }
 
-        if let Err(update_err) = self.do_update(batch).await {
+        if batch.primary_key() == self.prev_index_key {
+            // The key is the same as previous key, update rows number.
+            self.prev_key_rows_num += batch.num_rows();
+            return Ok(());
+        }
+
+        if self.prev_key_rows_num == 0 {
+            // This is the first key we need to index.
+            debug_assert!(self.prev_index_key.is_empty());
+            self.prev_index_key.extend_from_slice(batch.primary_key());
+            self.prev_key_rows_num = batch.num_rows();
+            return Ok(());
+        }
+
+        // We meet a different key, index previous key.
+        if let Err(update_err) = self.do_update().await {
             // clean up garbage if failed to update
             if let Err(err) = self.do_cleanup().await {
                 if cfg!(any(test, feature = "test")) {
@@ -153,6 +176,11 @@ impl SstIndexCreator {
             }
             return Err(update_err);
         }
+
+        // Updates previous index key.
+        self.prev_index_key.clear();
+        self.prev_index_key.extend_from_slice(batch.primary_key());
+        self.prev_key_rows_num = batch.num_rows();
 
         Ok(())
     }
@@ -193,13 +221,13 @@ impl SstIndexCreator {
         self.do_cleanup().await
     }
 
-    async fn do_update(&mut self, batch: &Batch) -> Result<()> {
+    async fn do_update(&mut self) -> Result<()> {
         let mut guard = self.stats.record_update();
 
-        let n = batch.num_rows();
+        let n = self.prev_key_rows_num;
         guard.inc_row_count(n);
 
-        for (column_id, field, value) in self.codec.decode(batch.primary_key())? {
+        for (column_id, field, value) in self.codec.decode(&self.prev_index_key)? {
             if self.ignore_column_ids.contains(column_id) {
                 continue;
             }
@@ -243,6 +271,14 @@ impl SstIndexCreator {
     ///                                    └──────┘
     /// ```
     async fn do_finish(&mut self) -> Result<()> {
+        if self.prev_key_rows_num > 0 {
+            // Index previous key.
+            self.do_update().await?;
+            // Clean previous key and rows count.
+            self.prev_index_key.clear();
+            self.prev_key_rows_num = 0;
+        }
+
         let mut guard = self.stats.record_finish();
 
         let file_writer = self
