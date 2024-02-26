@@ -14,7 +14,7 @@
 
 //! Key dictionary of a shard.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datatypes::arrow::array::{Array, ArrayBuilder, BinaryArray, BinaryBuilder};
@@ -25,7 +25,7 @@ use crate::memtable::merge_tree::PkIndex;
 /// Maximum keys in a [DictBlock].
 const MAX_KEYS_PER_BLOCK: u16 = 256;
 
-type PkIndexMap = BTreeMap<Vec<u8>, PkIndex>;
+type PkIndexMap = HashMap<Vec<u8>, PkIndex>;
 
 /// Builder to build a key dictionary.
 pub struct KeyDictBuilder {
@@ -49,7 +49,7 @@ impl KeyDictBuilder {
         Self {
             capacity,
             num_keys: 0,
-            pk_to_index: BTreeMap::new(),
+            pk_to_index: HashMap::new(),
             key_buffer: KeyBuffer::new(MAX_KEYS_PER_BLOCK.into()),
             dict_blocks: Vec::with_capacity(capacity / MAX_KEYS_PER_BLOCK as usize + 1),
             key_bytes_in_index: 0,
@@ -113,14 +113,17 @@ impl KeyDictBuilder {
         let dict_block = self.key_buffer.finish(true);
         self.dict_blocks.push(dict_block);
         // Takes the pk to index map.
-        let mut pk_to_index = std::mem::take(&mut self.pk_to_index);
+        let pk_to_index = std::mem::take(&mut self.pk_to_index);
         // Computes key position and then alter pk index.
         let mut key_positions = vec![0; pk_to_index.len()];
-        for (i, pk_index) in pk_to_index.values_mut().enumerate() {
+        let mut key_pk_indices = pk_to_index.into_iter().collect::<Vec<_>>();
+        key_pk_indices.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut pk_to_index = HashMap::with_capacity(key_pk_indices.len());
+        for (i, (key, pk_index)) in key_pk_indices.into_iter().enumerate() {
             // The position of the i-th key is the old pk index.
-            key_positions[i] = *pk_index;
+            key_positions[i] = pk_index;
             // Overwrites the pk index.
-            *pk_index = i as PkIndex;
+            pk_to_index.insert(key, i as PkIndex);
         }
         self.num_keys = 0;
 
@@ -134,7 +137,16 @@ impl KeyDictBuilder {
 
     /// Reads the builder.
     pub fn read(&self) -> DictBuilderReader {
-        let sorted_pk_indices = self.pk_to_index.values().copied().collect();
+        let mut key_pk_indices = self
+            .pk_to_index
+            .iter()
+            .map(|(k, v)| (k, *v))
+            .collect::<Vec<_>>();
+        key_pk_indices.sort_unstable_by_key(|kv| kv.0);
+        let sorted_pk_indices = key_pk_indices
+            .iter()
+            .map(|(_key, pk_index)| *pk_index)
+            .collect();
         let block = self.key_buffer.finish_cloned();
         let mut blocks = Vec::with_capacity(self.dict_blocks.len() + 1);
         blocks.extend_from_slice(&self.dict_blocks);
