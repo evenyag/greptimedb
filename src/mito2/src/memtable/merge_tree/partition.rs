@@ -34,6 +34,7 @@ use crate::memtable::merge_tree::shard::{
     BoxedDataBatchSource, Shard, ShardMerger, ShardNode, ShardSource,
 };
 use crate::memtable::merge_tree::shard_builder::ShardBuilder;
+use crate::memtable::merge_tree::tree::PkCache;
 use crate::memtable::merge_tree::{MergeTreeConfig, PkId};
 use crate::read::{Batch, BatchBuilder};
 use crate::row_converter::{McmpRowCodec, RowCodec};
@@ -65,12 +66,20 @@ impl Partition {
         primary_key: &[u8],
         key_value: KeyValue,
         metrics: &mut WriteMetrics,
+        cache: &PkCache,
     ) -> Result<()> {
         let mut inner = self.inner.write().unwrap();
+        if let Some(pk_id) = cache.get(primary_key) {
+            // Key already in shards.
+            inner.write_to_shard(pk_id, key_value);
+            return Ok(());
+        }
+
         // Now we ensure one key only exists in one shard.
         if let Some(pk_id) = inner.find_key_in_shards(primary_key) {
             // Key already in shards.
             inner.write_to_shard(pk_id, key_value);
+            cache.insert(primary_key.to_vec(), pk_id);
             return Ok(());
         }
 
@@ -79,10 +88,11 @@ impl Partition {
         }
 
         // Write to the shard builder.
-        inner
+        let pk_id = inner
             .shard_builder
             .write_with_key(primary_key, key_value, metrics);
         inner.num_rows += 1;
+        cache.insert(primary_key.to_vec(), pk_id);
 
         Ok(())
     }

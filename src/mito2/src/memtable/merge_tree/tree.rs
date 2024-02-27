@@ -18,9 +18,11 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use api::v1::OpType;
+use common_base::readable_size::ReadableSize;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
+use moka::sync::Cache;
 use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
@@ -32,10 +34,12 @@ use crate::memtable::merge_tree::metrics::WriteMetrics;
 use crate::memtable::merge_tree::partition::{
     Partition, PartitionKey, PartitionReader, PartitionRef, ReadPartitionContext,
 };
-use crate::memtable::merge_tree::MergeTreeConfig;
+use crate::memtable::merge_tree::{MergeTreeConfig, PkId};
 use crate::memtable::{BoxedBatchIterator, KeyValues};
 use crate::read::Batch;
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+
+pub type PkCache = Cache<Vec<u8>, PkId>;
 
 /// The merge tree.
 pub struct MergeTree {
@@ -49,6 +53,7 @@ pub struct MergeTree {
     partitions: RwLock<BTreeMap<PartitionKey, PartitionRef>>,
     /// Whether the tree has multiple partitions.
     is_partitioned: bool,
+    cache: Arc<PkCache>,
 }
 
 impl MergeTree {
@@ -68,6 +73,12 @@ impl MergeTree {
             row_codec: Arc::new(row_codec),
             partitions: Default::default(),
             is_partitioned,
+            cache: Arc::new(
+                PkCache::builder()
+                    .weigher(|k, _v| k.len() as u32)
+                    .max_capacity(ReadableSize::mb(512).as_bytes())
+                    .build(),
+            ),
         }
     }
 
@@ -204,6 +215,7 @@ impl MergeTree {
             row_codec: self.row_codec.clone(),
             partitions: RwLock::new(forked),
             is_partitioned: self.is_partitioned,
+            cache: self.cache.clone(),
         }
     }
 
@@ -225,7 +237,7 @@ impl MergeTree {
         let partition_key = Partition::get_partition_key(&key_value, self.is_partitioned);
         let partition = self.get_or_create_partition(partition_key);
 
-        partition.write_with_key(primary_key, key_value, metrics)
+        partition.write_with_key(primary_key, key_value, metrics, &self.cache)
     }
 
     fn write_no_key(&self, key_value: KeyValue) {
