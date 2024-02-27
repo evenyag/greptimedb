@@ -21,12 +21,15 @@ use api::v1::OpType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
-use snafu::ensure;
+use datatypes::value::ValueRef;
+use memcomparable::Serializer;
+use serde::Serialize;
+use snafu::{ensure, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
-use crate::error::{PrimaryKeyLengthMismatchSnafu, Result};
+use crate::error::{PrimaryKeyLengthMismatchSnafu, Result, SerializeFieldSnafu};
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::key_values::KeyValue;
 use crate::memtable::merge_tree::metrics::WriteMetrics;
@@ -37,6 +40,34 @@ use crate::memtable::merge_tree::MergeTreeConfig;
 use crate::memtable::{BoxedBatchIterator, KeyValues};
 use crate::read::Batch;
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
+
+struct FieldWithId {
+    field: SortField,
+    column_id: ColumnId,
+}
+
+struct ShortEncoder {
+    fields: Vec<FieldWithId>,
+}
+
+impl ShortEncoder {
+    fn encode_to_vec<'a, I>(&self, row: I, buffer: &mut Vec<u8>) -> Result<()>
+    where
+        I: Iterator<Item = ValueRef<'a>>,
+    {
+        let mut serializer = Serializer::new(buffer);
+        for (value, field) in row.zip(self.fields.iter()) {
+            if !value.is_null() {
+                field
+                    .column_id
+                    .serialize(&mut serializer)
+                    .context(SerializeFieldSnafu)?;
+                field.field.serialize(&mut serializer, &value)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The merge tree.
 pub struct MergeTree {
@@ -52,6 +83,7 @@ pub struct MergeTree {
     is_partitioned: bool,
     /// Manager to report size of the tree.
     write_buffer_manager: Option<WriteBufferManagerRef>,
+    short_encoder: Arc<ShortEncoder>,
 }
 
 impl MergeTree {
@@ -67,6 +99,15 @@ impl MergeTree {
                 .map(|c| SortField::new(c.column_schema.data_type.clone()))
                 .collect(),
         );
+        let short_encoder = ShortEncoder {
+            fields: metadata
+                .primary_key_columns()
+                .map(|c| FieldWithId {
+                    field: SortField::new(c.column_schema.data_type.clone()),
+                    column_id: c.column_id,
+                })
+                .collect(),
+        };
         let is_partitioned = Partition::has_multi_partitions(&metadata);
 
         MergeTree {
@@ -76,6 +117,7 @@ impl MergeTree {
             partitions: Default::default(),
             is_partitioned,
             write_buffer_manager,
+            short_encoder: Arc::new(short_encoder),
         }
     }
 
@@ -114,7 +156,9 @@ impl MergeTree {
 
             // Encode primary key.
             pk_buffer.clear();
-            self.row_codec.encode_to_vec(kv.primary_keys(), pk_buffer)?;
+            // self.row_codec.encode_to_vec(kv.primary_keys(), pk_buffer)?;
+            self.short_encoder
+                .encode_to_vec(kv.primary_keys(), pk_buffer)?;
 
             // Write rows with primary keys.
             self.write_with_key(pk_buffer, kv, metrics)?;
@@ -246,6 +290,7 @@ impl MergeTree {
             partitions: RwLock::new(forked),
             is_partitioned: self.is_partitioned,
             write_buffer_manager: self.write_buffer_manager.clone(),
+            short_encoder: self.short_encoder.clone(),
         }
     }
 
@@ -256,14 +301,14 @@ impl MergeTree {
 
     fn write_with_key(
         &self,
-        primary_key: &[u8],
+        primary_key: &mut Vec<u8>,
         key_value: KeyValue,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
         let partition_key = Partition::get_partition_key(&key_value, self.is_partitioned);
         let partition = self.get_or_create_partition(partition_key);
 
-        partition.write_with_key(primary_key, key_value, metrics)
+        partition.write_with_key(primary_key, &self.row_codec, key_value, metrics)
     }
 
     fn write_no_key(&self, key_value: KeyValue) {

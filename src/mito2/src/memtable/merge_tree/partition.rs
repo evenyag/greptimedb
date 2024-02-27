@@ -62,7 +62,8 @@ impl Partition {
     /// Writes to the partition with a primary key.
     pub fn write_with_key(
         &self,
-        primary_key: &[u8],
+        primary_key: &mut Vec<u8>,
+        row_codec: &McmpRowCodec,
         key_value: KeyValue,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
@@ -78,12 +79,21 @@ impl Partition {
             inner.freeze_active_shard()?;
         }
 
+        // Short key for the map.
+        let short_key = primary_key.to_vec();
+
+        // Encode full primary key.
+        primary_key.clear();
+        row_codec.encode_to_vec(key_value.primary_keys(), primary_key)?;
+
         // Write to the shard builder.
         let pk_id = inner
             .shard_builder
             .write_with_key(primary_key, key_value, metrics);
         inner.num_rows += 1;
-        inner.pk_to_pk_id.insert(primary_key.to_vec(), pk_id);
+
+        // Insert into the map.
+        inner.pk_to_pk_id.insert(short_key, pk_id);
 
         Ok(())
     }
