@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bloomfilter::Bloom;
 use datatypes::arrow::array::{Array, ArrayBuilder, BinaryArray, BinaryBuilder};
 
 use crate::memtable::merge_tree::metrics::WriteMetrics;
@@ -42,6 +43,8 @@ pub struct KeyDictBuilder {
     dict_blocks: Vec<DictBlock>,
     /// Bytes allocated by keys in the index.
     key_bytes_in_index: usize,
+    /// Bloom filters
+    bloom: Bloom<[u8]>,
 }
 
 impl KeyDictBuilder {
@@ -54,6 +57,7 @@ impl KeyDictBuilder {
             key_buffer: KeyBuffer::new(MAX_KEYS_PER_BLOCK.into()),
             dict_blocks: Vec::with_capacity(capacity / MAX_KEYS_PER_BLOCK as usize + 1),
             key_bytes_in_index: 0,
+            bloom: Bloom::new_for_fp_rate(capacity, 0.001),
         }
     }
 
@@ -83,6 +87,7 @@ impl KeyDictBuilder {
         // Safety: we have checked the buffer length.
         let pk_index = self.key_buffer.push_key(key);
         self.pk_to_index.insert(key.to_vec(), pk_index);
+        self.bloom.set(key);
         self.num_keys += 1;
 
         // Since we store the key twice so the bytes usage doubled.
@@ -129,12 +134,17 @@ impl KeyDictBuilder {
         self.num_keys = 0;
         let key_bytes_in_index = self.key_bytes_in_index;
         self.key_bytes_in_index = 0;
+        let bloom = std::mem::replace(
+            &mut self.bloom,
+            Bloom::new_for_fp_rate(self.capacity, 0.001),
+        );
 
         Some(KeyDict {
             pk_to_index,
             dict_blocks: std::mem::take(&mut self.dict_blocks),
             key_positions,
             key_bytes_in_index,
+            bloom,
         })
     }
 
@@ -211,7 +221,6 @@ fn compute_pk_weights(sorted_pk_indices: &[PkIndex], pk_weights: &mut Vec<u16>) 
 }
 
 /// A key dictionary.
-#[derive(Default)]
 pub struct KeyDict {
     // TODO(yingwen): We can use key_positions to do a binary search.
     /// Key map to find a key in the dict.
@@ -222,6 +231,7 @@ pub struct KeyDict {
     key_positions: Vec<PkIndex>,
     /// Bytes of keys in the index.
     key_bytes_in_index: usize,
+    bloom: Bloom<[u8]>,
 }
 
 pub type KeyDictRef = Arc<KeyDict>;
@@ -239,6 +249,10 @@ impl KeyDict {
 
     /// Gets the pk index by the key.
     pub fn get_pk_index(&self, key: &[u8]) -> Option<PkIndex> {
+        if !self.bloom.check(key) {
+            return None;
+        }
+
         self.pk_to_index.get(key).copied()
     }
 
