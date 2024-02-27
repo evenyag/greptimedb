@@ -190,7 +190,7 @@ impl SstIndexCreator {
     pub async fn finish(&mut self) -> Result<(RowCount, ByteCount)> {
         ensure!(!self.aborted, OperateAbortedIndexSnafu);
 
-        if self.stats.row_count() == 0 {
+        if self.stats.row_count() == 0 && self.prev_key_rows_num == 0 {
             // no IO is performed, no garbage to clean up, just return
             return Ok((0, 0));
         }
