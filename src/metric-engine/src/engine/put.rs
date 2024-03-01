@@ -38,26 +38,28 @@ impl MetricEngineInner {
     /// Dispatch region put request
     pub async fn put_region(
         &self,
-        region_id: RegionId,
-        request: RegionPutRequest,
+        _region_id: RegionId,
+        _request: RegionPutRequest,
     ) -> Result<AffectedRows> {
-        let is_putting_physical_region = self
-            .state
-            .read()
-            .unwrap()
-            .physical_regions()
-            .contains_key(&region_id);
+        Ok(0)
 
-        if is_putting_physical_region {
-            info!(
-                "Metric region received put request {request:?} on physical region {region_id:?}"
-            );
-            FORBIDDEN_OPERATION_COUNT.inc();
+        // let is_putting_physical_region = self
+        //     .state
+        //     .read()
+        //     .unwrap()
+        //     .physical_regions()
+        //     .contains_key(&region_id);
 
-            ForbiddenPhysicalAlterSnafu.fail()
-        } else {
-            self.put_logical_region(region_id, request).await
-        }
+        // if is_putting_physical_region {
+        //     info!(
+        //         "Metric region received put request {request:?} on physical region {region_id:?}"
+        //     );
+        //     FORBIDDEN_OPERATION_COUNT.inc();
+
+        //     ForbiddenPhysicalAlterSnafu.fail()
+        // } else {
+        //     self.put_logical_region(region_id, request).await
+        // }
     }
 
     async fn put_logical_region(
