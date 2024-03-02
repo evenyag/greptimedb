@@ -181,14 +181,14 @@ pub fn write_tag(
 
 pub fn write_f64(
     table_data: &mut TableData,
-    name: impl ToString,
+    name: impl Into<String>,
     value: f64,
     one_row: &mut Vec<Value>,
 ) -> Result<()> {
     write_fields(
         table_data,
         std::iter::once((
-            name.to_string(),
+            name.into(),
             ColumnDataType::Float64,
             ValueData::F64Value(value),
         )),

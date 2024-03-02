@@ -338,6 +338,13 @@ pub fn to_grpc_row_insert_requests(request: WriteRequest) -> Result<(RowInsertRe
             row_writer::write_tags(table_data, kvs, &mut one_row)?;
             // value
             row_writer::write_f64(table_data, GREPTIME_VALUE, *value, &mut one_row)?;
+            // More fields for test purpose.
+            row_writer::write_f64(
+                table_data,
+                format!("{GREPTIME_VALUE}1"),
+                *value,
+                &mut one_row,
+            )?;
             // timestamp
             row_writer::write_ts_millis(
                 table_data,
