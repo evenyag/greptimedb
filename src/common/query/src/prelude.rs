@@ -20,9 +20,9 @@ pub use crate::logical_plan::{create_udf, AggregateFunction, Expr, ScalarUdf};
 pub use crate::signature::{Signature, TypeSignature, Volatility};
 
 /// Default timestamp column name for Prometheus metrics.
-pub const GREPTIME_TIMESTAMP: &str = "greptime_timestamp";
+pub const GREPTIME_TIMESTAMP: &str = "ts";
 /// Default value column name for Prometheus metrics.
-pub const GREPTIME_VALUE: &str = "greptime_value";
+pub const GREPTIME_VALUE: &str = "val";
 /// Default counter column name for OTLP metrics.
 pub const GREPTIME_COUNT: &str = "greptime_count";
 /// Default physical table name
