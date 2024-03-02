@@ -27,6 +27,7 @@ use common_time::timestamp::TimeUnit;
 use datafusion::prelude::{col, lit, regexp_match, Expr};
 use datafusion_common::ScalarValue;
 use datatypes::prelude::{ConcreteDataType, Value};
+use once_cell::sync::Lazy;
 use openmetrics_parser::{MetricsExposition, PrometheusType, PrometheusValue};
 use query::dataframe::DataFrame;
 use query::plan::LogicalPlan;
@@ -37,6 +38,11 @@ use crate::error::{self, Result};
 use crate::row_writer::{self, MultiTableData};
 
 pub const METRIC_NAME_LABEL: &str = "__name__";
+static TOTAL_FIELDS: Lazy<usize> = Lazy::new(|| {
+    std::env::var("GT_PROM_FIELDS_NUM")
+        .map(|s| s.parse::<usize>().unwrap_or(1))
+        .unwrap_or(1)
+});
 
 /// Metrics for push gateway protocol
 pub struct Metrics {
@@ -300,7 +306,7 @@ fn recordbatch_to_timeseries(table: &str, recordbatch: RecordBatch) -> Result<Ve
 
 pub fn to_grpc_row_insert_requests(request: WriteRequest) -> Result<(RowInsertRequests, usize)> {
     let mut multi_table_data = MultiTableData::new();
-    let total_fields = 2;
+    let total_fields = *TOTAL_FIELDS;
 
     for series in &request.timeseries {
         let table_name = &series
