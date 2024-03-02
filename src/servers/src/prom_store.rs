@@ -300,6 +300,7 @@ fn recordbatch_to_timeseries(table: &str, recordbatch: RecordBatch) -> Result<Ve
 
 pub fn to_grpc_row_insert_requests(request: WriteRequest) -> Result<(RowInsertRequests, usize)> {
     let mut multi_table_data = MultiTableData::new();
+    let total_fields = 2;
 
     for series in &request.timeseries {
         let table_name = &series
@@ -339,12 +340,14 @@ pub fn to_grpc_row_insert_requests(request: WriteRequest) -> Result<(RowInsertRe
             // value
             row_writer::write_f64(table_data, GREPTIME_VALUE, *value, &mut one_row)?;
             // More fields for test purpose.
-            row_writer::write_f64(
-                table_data,
-                format!("{GREPTIME_VALUE}1"),
-                *value,
-                &mut one_row,
-            )?;
+            for i in 1..total_fields {
+                row_writer::write_f64(
+                    table_data,
+                    format!("{GREPTIME_VALUE}_{i}"),
+                    *value,
+                    &mut one_row,
+                )?;
+            }
             // timestamp
             row_writer::write_ts_millis(
                 table_data,
@@ -357,7 +360,9 @@ pub fn to_grpc_row_insert_requests(request: WriteRequest) -> Result<(RowInsertRe
         }
     }
 
-    Ok(multi_table_data.into_row_insert_requests())
+    let (requests, num_rows) = multi_table_data.into_row_insert_requests();
+
+    Ok((requests, num_rows * total_fields))
 }
 
 #[inline]
