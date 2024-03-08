@@ -123,6 +123,7 @@ impl Partition {
 
     /// Scans data in the partition.
     pub fn read(&self, mut context: ReadPartitionContext) -> Result<PartitionReader> {
+        let start = Instant::now();
         let (builder_source, shard_reader_builders) = {
             let inner = self.inner.read().unwrap();
             let mut shard_source = Vec::with_capacity(inner.shards.len() + 1);
@@ -141,10 +142,14 @@ impl Partition {
             (builder_reader, shard_source)
         };
 
+        common_telemetry::info!("create builder elapsed: {:?}", start.elapsed());
+
         let mut nodes = shard_reader_builders
             .into_iter()
             .map(|builder| Ok(ShardNode::new(ShardSource::Shard(builder.build()?))))
             .collect::<Result<Vec<_>>>()?;
+
+        common_telemetry::info!("build shard sources elapsed: {:?}", start.elapsed());
 
         if let Some(builder) = builder_source {
             // Move the initialization of ShardBuilderReader out of read lock.
@@ -152,14 +157,20 @@ impl Partition {
             nodes.push(ShardNode::new(ShardSource::Builder(shard_builder_reader)));
         }
 
+        common_telemetry::info!("build shard builder elapsed: {:?}", start.elapsed());
+
         // Creating a shard merger will invoke next so we do it outside the lock.
         let merger = ShardMerger::try_new(nodes)?;
-        if self.dedup {
+        let reader = if self.dedup {
             let source = DedupReader::try_new(merger)?;
             PartitionReader::new(context, Box::new(source))
         } else {
             PartitionReader::new(context, Box::new(merger))
-        }
+        };
+
+        common_telemetry::info!("build partition reader elapsed: {:?}", start.elapsed());
+
+        reader
     }
 
     /// Freezes the partition.
