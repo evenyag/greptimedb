@@ -142,7 +142,7 @@ impl Partition {
             (builder_reader, shard_source)
         };
 
-        common_telemetry::info!("create builder elapsed: {:?}", start.elapsed());
+        common_telemetry::info!("create builder elapsed: {:?}, shard_num: {}", start.elapsed(), shard_reader_builders.len());
 
         let mut nodes = shard_reader_builders
             .into_iter()

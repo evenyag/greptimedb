@@ -475,6 +475,7 @@ pub(crate) struct DataBufferReaderBuilder {
 
 impl DataBufferReaderBuilder {
     fn build_record_batch(self, pk_weights: Option<&[u16]>) -> Result<RecordBatch> {
+        let now = Instant::now();
         let num_rows = self.timestamp.len();
         let (indices_to_take, mut columns) = build_row_sort_indices_and_columns(
             pk_weights,
@@ -490,6 +491,8 @@ impl DataBufferReaderBuilder {
             self.fields.len() + 4,
         )?;
 
+        common_telemetry::info!("build_row_sort_indices_and_columns rows: {}, elapsed: {:?}", num_rows, now.elapsed());
+
         for b in self.fields.iter() {
             let array = match b {
                 LazyFieldVector::Type(ty) => {
@@ -504,6 +507,8 @@ impl DataBufferReaderBuilder {
                     .context(error::ComputeArrowSnafu)?,
             );
         }
+
+        common_telemetry::info!("take, elapsed: {:?}", now.elapsed());
         RecordBatch::try_new(self.schema, columns).context(error::NewRecordBatchSnafu)
     }
 
@@ -965,11 +970,14 @@ impl DataParts {
             .with_label_values(&["build_data_parts_reader"])
             .start_timer();
 
+        let now = Instant::now();
         let buffer = self.active.read()?;
+        common_telemetry::info!("read active buffer elapsed: {:?}", now.elapsed());
         let mut parts = Vec::with_capacity(self.frozen.len());
         for p in &self.frozen {
             parts.push(p.read()?);
         }
+        common_telemetry::info!("read parts elapsed: {:?}, num: {}", now.elapsed(), self.frozen.len());
         Ok(DataPartsReaderBuilder { buffer, parts })
     }
 
@@ -985,16 +993,19 @@ pub struct DataPartsReaderBuilder {
 
 impl DataPartsReaderBuilder {
     pub(crate) fn build(self) -> Result<DataPartsReader> {
+        let now = Instant::now();
         let mut nodes = Vec::with_capacity(self.parts.len() + 1);
         nodes.push(DataNode::new(DataSource::Buffer(
             // `DataPars::read` ensures that all pk_index inside `DataBuffer` are replaced by weights.
             // then we pass None to sort rows directly according to pk_index.
             self.buffer.build(None)?,
         )));
+        common_telemetry::info!("build buffer data node elapsed {:?}, parts num: {}", now.elapsed(), self.parts.len());
         for p in self.parts {
             nodes.push(DataNode::new(DataSource::Part(p)));
         }
         let merger = Merger::try_new(nodes)?;
+        common_telemetry::info!("build merger elapsed: {:?}", now.elapsed());
         Ok(DataPartsReader {
             merger,
             elapsed: Default::default(),
