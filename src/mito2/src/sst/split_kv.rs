@@ -668,7 +668,7 @@ fn new_noop_file_purger() -> FilePurgerRef {
 }
 
 /// Creates a mock file handle to converting files.
-fn new_file_handle(file_id: &str) -> Result<FileHandle> {
+pub(crate) fn new_file_handle(file_id: &str) -> Result<FileHandle> {
     let file_purger = new_noop_file_purger();
     let file_id = FileId::from_str(file_id).map_err(|e| {
         InvalidParquetSnafu {

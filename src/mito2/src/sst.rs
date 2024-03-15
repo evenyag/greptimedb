@@ -21,6 +21,7 @@ pub mod file_purger;
 pub mod index;
 pub mod location;
 pub mod parquet;
+pub mod rewrite;
 pub mod split_kv;
 pub(crate) mod version;
 
