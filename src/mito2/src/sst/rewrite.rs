@@ -200,7 +200,9 @@ impl SplitPkWriter {
     ) -> Vec<ArrayRef> {
         let tags = codec.decode(batch.primary_key()).unwrap();
         for (value, builder) in tags.into_iter().zip(builders.iter_mut()) {
-            builder.push_value_ref(value.as_value_ref());
+            for _ in 0..batch.num_rows() {
+                builder.push_value_ref(value.as_value_ref());
+            }
         }
 
         let mut arrays = Vec::with_capacity(metadata.column_metadatas.len() + 2);
