@@ -15,7 +15,7 @@
 //! POC of the SST format.
 
 use clap::Parser;
-use mito2::sst::rewrite::rewrite_file;
+use mito2::sst::rewrite::split_key;
 use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
 use object_store::services::Fs;
 use object_store::ObjectStore;
@@ -32,8 +32,8 @@ enum PocCli {
     CreateMark(CreateArgs),
     /// Scans a file.
     Scan(ScanArgs),
-    /// Rewrites a SST file.
-    Rewrite(CreateArgs),
+    /// Splits primary key in a SST file.
+    SplitKey(CreateArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -95,7 +95,7 @@ async fn main() {
         PocCli::CreateData(args) => run_create_data(args).await,
         PocCli::CreateMark(args) => run_create_mark(args).await,
         PocCli::Scan(args) => run_scan(args).await,
-        PocCli::Rewrite(args) => run_rewrite(args).await,
+        PocCli::SplitKey(args) => run_split_key(args).await,
     }
 }
 
@@ -186,8 +186,8 @@ async fn run_scan(args: ScanArgs) {
     }
 }
 
-async fn run_rewrite(args: CreateArgs) {
-    println!("Rewrite, args: {args:?}");
+async fn run_split_key(args: CreateArgs) {
+    println!("Split key, args: {args:?}");
 
     if args.file_id.is_empty() {
         println!("File id is empty");
@@ -195,12 +195,12 @@ async fn run_rewrite(args: CreateArgs) {
     }
 
     let store = new_fs_store();
-    match rewrite_file(&args.input_dir, &args.file_id, &args.output_path, &store).await {
+    match split_key(&args.input_dir, &args.file_id, &args.output_path, &store).await {
         Ok(metrics) => {
-            println!("Rewrite file, metrics: {:?}", metrics);
+            println!("Split key, metrics: {:?}", metrics);
         }
         Err(e) => {
-            println!("Failed to rewrite file, {e:?}");
+            println!("Failed to split key, {e:?}");
         }
     }
 }

@@ -238,8 +238,8 @@ pub struct SplitWriterMetrics {
     pub write_cost: Duration,
 }
 
-/// Rewrites a file.
-pub async fn rewrite_file(
+/// Split primary keys in a file.
+pub async fn split_key(
     input_dir: &str,
     file_id: &str,
     output_path: &str,
