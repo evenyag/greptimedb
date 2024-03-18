@@ -14,16 +14,18 @@
 
 //! Rewrite SST files.
 
+use std::fs::File;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_datasource::file_format::parquet::BufferedWriter;
 use datatypes::arrow::array::{ArrayRef, DictionaryArray, UInt32Array};
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema, SchemaRef};
-use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::arrow::record_batch::{RecordBatch, RecordBatchReader};
 use datatypes::data_type::DataType;
 use datatypes::vectors::{MutableVector, Vector};
 use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{WriterProperties, DEFAULT_MAX_ROW_GROUP_SIZE};
 use parquet::schema::types::ColumnPath;
@@ -31,7 +33,7 @@ use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::{OP_TYPE_COLUMN_NAME, SEQUENCE_COLUMN_NAME};
 
-use crate::error::{Result, WriteBufferSnafu};
+use crate::error::{ReadParquetSnafu, Result, WriteBufferSnafu};
 use crate::read::{Batch, BatchReader};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::parquet::reader::{ParquetReader, ParquetReaderBuilder};
@@ -258,7 +260,7 @@ impl SplitPkWriter {
     }
 }
 
-/// Metrics for splitting a SST file.
+/// Metrics for writing a SST file.
 #[derive(Debug, Default)]
 pub struct SplitWriterMetrics {
     /// Number of batches.
@@ -286,6 +288,158 @@ pub async fn split_key(
             .build()
             .await?;
     let writer = SplitPkWriter::new(output_path);
+
+    writer.write_to_store(reader, object_store).await
+}
+
+/// A writer that rewrites a parquet file.
+pub struct ParquetRewriter {
+    path: String,
+
+    row_group_size: usize,
+    tag_use_dictionary: bool,
+}
+
+impl ParquetRewriter {
+    pub fn new(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            tag_use_dictionary: false,
+        }
+    }
+
+    pub fn with_tag_use_dictionary(mut self, tag_use_dictionary: bool) -> Self {
+        self.tag_use_dictionary = tag_use_dictionary;
+        self
+    }
+
+    pub async fn write_to_store(
+        &self,
+        mut reader: ParquetRecordBatchReader,
+        store: &ObjectStore,
+    ) -> Result<SplitWriterMetrics> {
+        let mut metrics = SplitWriterMetrics::default();
+
+        let schema = reader.schema();
+        let schema_with_tags = self.new_schema_with_tags(&schema);
+
+        let mut writer = self
+            .new_buffered_writer_with_schema(store, &schema_with_tags)
+            .await?;
+        while let Some(batch) = reader.next() {
+            let batch = batch.unwrap();
+            metrics.num_batches += 1;
+            metrics.num_rows += batch.num_rows();
+            let convert_start = Instant::now();
+            let record_batch = Self::convert_record_batch(&batch, self.tag_use_dictionary);
+            metrics.convert_cost += convert_start.elapsed();
+            let write_start = Instant::now();
+            writer
+                .write(&record_batch)
+                .await
+                .context(WriteBufferSnafu)?;
+            metrics.write_cost += write_start.elapsed();
+        }
+        let write_start = Instant::now();
+        let (_, file_size) = writer.close().await.context(WriteBufferSnafu)?;
+        metrics.file_size = file_size as usize;
+        metrics.write_cost += write_start.elapsed();
+
+        Ok(metrics)
+    }
+
+    async fn new_buffered_writer_with_schema(
+        &self,
+        store: &ObjectStore,
+        schema: &SchemaRef,
+    ) -> Result<BufferedWriter> {
+        BufferedWriter::try_new(
+            self.path.clone(),
+            store.clone(),
+            schema.clone(),
+            Some(self.new_writer_props(&schema)),
+            DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize,
+            DEFAULT_WRITE_CONCURRENCY,
+        )
+        .await
+        .context(WriteBufferSnafu)
+    }
+
+    fn new_writer_props(&self, schema: &SchemaRef) -> WriterProperties {
+        let ts_column = schema
+            .fields
+            .iter()
+            .find(|field| matches!(field.data_type(), ArrowDataType::Timestamp(_, _)))
+            .unwrap();
+        let ts_col = ColumnPath::new(vec![ts_column.name().to_string()]);
+        let seq_col = ColumnPath::new(vec![SEQUENCE_COLUMN_NAME.to_string()]);
+
+        WriterProperties::builder()
+            .set_max_row_group_size(self.row_group_size)
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_column_encoding(seq_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(seq_col, false)
+            .set_column_encoding(ts_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(ts_col, false)
+            .build()
+    }
+
+    fn new_schema_with_tags(&self, schema: &SchemaRef) -> SchemaRef {
+        let mut fields = Vec::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            if self.tag_use_dictionary
+                && (*field.data_type() == ArrowDataType::Utf8
+                    || *field.data_type() == ArrowDataType::LargeUtf8)
+            {
+                fields.push(Arc::new(Field::new_dictionary(
+                    field.name(),
+                    ArrowDataType::UInt32,
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )));
+            } else {
+                fields.push(field.clone());
+            }
+        }
+
+        let fields = Fields::from(fields);
+        Arc::new(Schema::new(fields))
+    }
+
+    fn convert_record_batch(batch: &RecordBatch, tag_use_dictionary: bool) -> RecordBatch {
+        let mut columns = Vec::with_capacity(batch.num_columns());
+        for column in batch.columns() {
+            if tag_use_dictionary
+                && (*column.data_type() == ArrowDataType::Utf8
+                    || *column.data_type() == ArrowDataType::LargeUtf8)
+            {
+                let key_array = UInt32Array::from_iter_values(0..column.len() as u32);
+                let dictionary_array: ArrayRef =
+                    Arc::new(DictionaryArray::new(key_array, column.clone()));
+                columns.push(dictionary_array);
+            } else {
+                columns.push(column.clone());
+            }
+        }
+
+        RecordBatch::try_new(batch.schema(), columns).unwrap()
+    }
+}
+
+/// Rewrites a file.
+pub async fn rewrite_file(
+    input_path: &str,
+    output_path: &str,
+    tag_use_dictionary: bool,
+    object_store: &ObjectStore,
+) -> Result<SplitWriterMetrics> {
+    let file = File::open(input_path).unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .context(ReadParquetSnafu { path: input_path })?;
+    let writer = ParquetRewriter::new(output_path).with_tag_use_dictionary(tag_use_dictionary);
 
     writer.write_to_store(reader, object_store).await
 }
