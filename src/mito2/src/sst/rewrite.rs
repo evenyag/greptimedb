@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_datasource::file_format::parquet::BufferedWriter;
-use datatypes::arrow::array::ArrayRef;
+use datatypes::arrow::array::{ArrayRef, DictionaryArray, UInt32Array};
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::DataType;
@@ -45,6 +45,7 @@ pub struct SplitPkWriter {
 
     batch_size: usize,
     row_group_size: usize,
+    tag_use_dictionary: bool,
 }
 
 impl SplitPkWriter {
@@ -53,6 +54,7 @@ impl SplitPkWriter {
             path: path.to_string(),
             batch_size: DEFAULT_READ_BATCH_SIZE,
             row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            tag_use_dictionary: false,
         }
     }
 
@@ -94,6 +96,7 @@ impl SplitPkWriter {
                 &metadata,
                 &mut builders,
                 schema_with_tags.clone(),
+                self.tag_use_dictionary,
             );
             metrics.convert_cost += convert_start.elapsed();
             let write_start = Instant::now();
@@ -151,14 +154,23 @@ impl SplitPkWriter {
         let mut fields = Vec::with_capacity(metadata.column_metadatas.len() + 2);
         // Primary keys.
         for column_metadata in metadata.primary_key_columns() {
-            fields.push(
-                metadata
-                    .schema
-                    .arrow_schema()
-                    .field_with_name(&column_metadata.column_schema.name)
-                    .unwrap()
-                    .clone(),
-            );
+            if self.tag_use_dictionary && column_metadata.column_schema.data_type.is_string() {
+                fields.push(Field::new_dictionary(
+                    &column_metadata.column_schema.name,
+                    ArrowDataType::UInt32,
+                    column_metadata.column_schema.data_type.as_arrow_type(),
+                    column_metadata.column_schema.is_nullable(),
+                ));
+            } else {
+                fields.push(
+                    metadata
+                        .schema
+                        .arrow_schema()
+                        .field_with_name(&column_metadata.column_schema.name)
+                        .unwrap()
+                        .clone(),
+                );
+            }
         }
         // Fields.
         for column_metadata in metadata.field_columns() {
@@ -199,8 +211,9 @@ impl SplitPkWriter {
         metadata: &RegionMetadataRef,
         builders: &mut [Box<dyn MutableVector>],
         schema: SchemaRef,
+        tag_use_dictionary: bool,
     ) -> RecordBatch {
-        let columns = Self::batch_to_arrays(batch, codec, metadata, builders);
+        let columns = Self::batch_to_arrays(batch, codec, metadata, builders, tag_use_dictionary);
 
         RecordBatch::try_new(schema.clone(), columns).unwrap()
     }
@@ -210,6 +223,7 @@ impl SplitPkWriter {
         codec: &McmpRowCodec,
         metadata: &RegionMetadataRef,
         builders: &mut [Box<dyn MutableVector>],
+        tag_use_dictionary: bool,
     ) -> Vec<ArrayRef> {
         let tags = codec.decode(batch.primary_key()).unwrap();
         for (value, builder) in tags.into_iter().zip(builders.iter_mut()) {
@@ -221,7 +235,15 @@ impl SplitPkWriter {
         let mut arrays = Vec::with_capacity(metadata.column_metadatas.len() + 2);
         // tags
         for builder in builders {
-            arrays.push(builder.to_vector().to_arrow_array());
+            let tag_array = builder.to_vector().to_arrow_array();
+            if tag_use_dictionary {
+                let key_array = UInt32Array::from_iter_values(0..tag_array.len() as u32);
+                let dictionary_array: ArrayRef =
+                    Arc::new(DictionaryArray::new(key_array, tag_array));
+                arrays.push(dictionary_array);
+            } else {
+                arrays.push(tag_array);
+            }
         }
         // fields
         for column in batch.fields() {
