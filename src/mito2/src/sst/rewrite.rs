@@ -332,7 +332,8 @@ impl ParquetRewriter {
             metrics.num_batches += 1;
             metrics.num_rows += batch.num_rows();
             let convert_start = Instant::now();
-            let record_batch = Self::convert_record_batch(&batch, self.tag_use_dictionary);
+            let record_batch =
+                Self::convert_record_batch(&schema_with_tags, &batch, self.tag_use_dictionary);
             metrics.convert_cost += convert_start.elapsed();
             let write_start = Instant::now();
             writer
@@ -407,7 +408,11 @@ impl ParquetRewriter {
         Arc::new(Schema::new(fields))
     }
 
-    fn convert_record_batch(batch: &RecordBatch, tag_use_dictionary: bool) -> RecordBatch {
+    fn convert_record_batch(
+        schema: &SchemaRef,
+        batch: &RecordBatch,
+        tag_use_dictionary: bool,
+    ) -> RecordBatch {
         let mut columns = Vec::with_capacity(batch.num_columns());
         for column in batch.columns() {
             if tag_use_dictionary
@@ -423,7 +428,7 @@ impl ParquetRewriter {
             }
         }
 
-        RecordBatch::try_new(batch.schema(), columns).unwrap()
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
     }
 }
 
