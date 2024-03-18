@@ -64,8 +64,8 @@ impl SplitPkWriter {
         &self,
         mut reader: ParquetReader,
         store: &ObjectStore,
-    ) -> Result<SplitWriterMetrics> {
-        let mut metrics = SplitWriterMetrics::default();
+    ) -> Result<WriterMetrics> {
+        let mut metrics = WriterMetrics::default();
 
         let metadata = reader.metadata().clone();
         let codec = McmpRowCodec::new(
@@ -262,7 +262,7 @@ impl SplitPkWriter {
 
 /// Metrics for writing a SST file.
 #[derive(Debug, Default)]
-pub struct SplitWriterMetrics {
+pub struct WriterMetrics {
     /// Number of batches.
     pub num_batches: usize,
     /// Number of rows.
@@ -281,7 +281,7 @@ pub async fn split_key(
     file_id: &str,
     output_path: &str,
     object_store: &ObjectStore,
-) -> Result<SplitWriterMetrics> {
+) -> Result<WriterMetrics> {
     let file_handle = new_file_handle(file_id)?;
     let reader =
         ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
@@ -318,8 +318,8 @@ impl ParquetRewriter {
         &self,
         mut reader: ParquetRecordBatchReader,
         store: &ObjectStore,
-    ) -> Result<SplitWriterMetrics> {
-        let mut metrics = SplitWriterMetrics::default();
+    ) -> Result<WriterMetrics> {
+        let mut metrics = WriterMetrics::default();
 
         let schema = reader.schema();
         let schema_with_tags = self.new_schema_with_tags(&schema);
@@ -433,7 +433,7 @@ pub async fn rewrite_file(
     output_path: &str,
     tag_use_dictionary: bool,
     object_store: &ObjectStore,
-) -> Result<SplitWriterMetrics> {
+) -> Result<WriterMetrics> {
     let file = File::open(input_path).unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
