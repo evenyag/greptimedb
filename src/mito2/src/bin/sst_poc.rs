@@ -15,7 +15,7 @@
 //! POC of the SST format.
 
 use clap::Parser;
-use mito2::sst::rewrite::split_key;
+use mito2::sst::rewrite::{rewrite_file, split_key};
 use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
 use object_store::services::Fs;
 use object_store::ObjectStore;
@@ -34,6 +34,8 @@ enum PocCli {
     Scan(ScanArgs),
     /// Splits primary key in a SST file.
     SplitKey(CreateArgs),
+    /// Rewrites a SST file.
+    Rewrite(RewriteArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -81,6 +83,20 @@ struct ScanArgs {
     times: usize,
 }
 
+#[derive(Debug, clap::Args)]
+#[command(author, version, about, long_about = None)]
+struct RewriteArgs {
+    /// Input path.
+    #[arg(short, long)]
+    input_path: String,
+    /// Output file path.
+    #[arg(short, long)]
+    output_path: String,
+    /// Use dictionary type to store tags.
+    #[arg(long, default_value_t = false)]
+    tag_use_dictionary: bool,
+}
+
 fn new_fs_store() -> ObjectStore {
     let mut builder = Fs::default();
     builder.root("/");
@@ -96,6 +112,7 @@ async fn main() {
         PocCli::CreateMark(args) => run_create_mark(args).await,
         PocCli::Scan(args) => run_scan(args).await,
         PocCli::SplitKey(args) => run_split_key(args).await,
+        PocCli::Rewrite(args) => run_rewrite(args).await,
     }
 }
 
@@ -201,6 +218,27 @@ async fn run_split_key(args: CreateArgs) {
         }
         Err(e) => {
             println!("Failed to split key, {e:?}");
+        }
+    }
+}
+
+async fn run_rewrite(args: RewriteArgs) {
+    println!("Rewrite file, args: {args:?}");
+
+    let store = new_fs_store();
+    match rewrite_file(
+        &args.input_path,
+        &args.output_path,
+        args.tag_use_dictionary,
+        &store,
+    )
+    .await
+    {
+        Ok(metrics) => {
+            println!("Rewrite file, metrics: {:?}", metrics);
+        }
+        Err(e) => {
+            println!("Failed to write file, {e:?}");
         }
     }
 }
