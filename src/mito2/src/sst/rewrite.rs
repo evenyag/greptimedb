@@ -24,8 +24,9 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::DataType;
 use datatypes::vectors::{MutableVector, Vector};
 use object_store::ObjectStore;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{WriterProperties, DEFAULT_MAX_ROW_GROUP_SIZE};
+use parquet::schema::types::ColumnPath;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::{OP_TYPE_COLUMN_NAME, SEQUENCE_COLUMN_NAME};
@@ -72,7 +73,7 @@ impl SplitPkWriter {
         let schema_with_tags = self.new_schema_with_tags(&metadata);
 
         let mut writer = self
-            .new_buffered_writer_with_schema(store, schema_with_tags.clone())
+            .new_buffered_writer_with_schema(store, schema_with_tags.clone(), &metadata)
             .await?;
         let mut builders: Vec<_> = metadata
             .primary_key_columns()
@@ -114,12 +115,13 @@ impl SplitPkWriter {
         &self,
         store: &ObjectStore,
         schema: SchemaRef,
+        metadata: &RegionMetadataRef,
     ) -> Result<BufferedWriter> {
         BufferedWriter::try_new(
             self.path.clone(),
             store.clone(),
             schema,
-            Some(self.new_writer_props()),
+            Some(self.new_writer_props(metadata)),
             DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize,
             DEFAULT_WRITE_CONCURRENCY,
         )
@@ -127,10 +129,21 @@ impl SplitPkWriter {
         .context(WriteBufferSnafu)
     }
 
-    fn new_writer_props(&self) -> WriterProperties {
+    fn new_writer_props(&self, metadata: &RegionMetadataRef) -> WriterProperties {
+        let ts_col = ColumnPath::new(vec![metadata
+            .time_index_column()
+            .column_schema
+            .name
+            .clone()]);
+        let seq_col = ColumnPath::new(vec![SEQUENCE_COLUMN_NAME.to_string()]);
+
         WriterProperties::builder()
             .set_max_row_group_size(self.row_group_size)
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_column_encoding(seq_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(seq_col, false)
+            .set_column_encoding(ts_col.clone(), Encoding::DELTA_BINARY_PACKED)
+            .set_column_dictionary_enabled(ts_col, false)
             .build()
     }
 
