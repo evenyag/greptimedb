@@ -30,7 +30,7 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::DataType;
 use datatypes::vectors::Vector;
 use object_store::ObjectStore;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, ZstdLevel, Encoding};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use snafu::ResultExt;
