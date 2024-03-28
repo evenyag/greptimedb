@@ -27,7 +27,7 @@ use datatypes::vectors::{MutableVector, Vector};
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::basic::{Compression, Encoding, ZstdLevel};
-use parquet::file::properties::{WriterProperties, DEFAULT_MAX_ROW_GROUP_SIZE};
+use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
@@ -37,7 +37,7 @@ use crate::error::{ReadParquetSnafu, Result, WriteBufferSnafu};
 use crate::read::{Batch, BatchReader};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::parquet::reader::{ParquetReader, ParquetReaderBuilder};
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 use crate::sst::split_kv::new_file_handle;
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
@@ -55,7 +55,7 @@ impl SplitPkWriter {
         Self {
             path: path.to_string(),
             batch_size: DEFAULT_READ_BATCH_SIZE,
-            row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
             tag_use_dictionary: false,
         }
     }
@@ -304,7 +304,7 @@ impl ParquetRewriter {
     pub fn new(path: &str) -> Self {
         Self {
             path: path.to_string(),
-            row_group_size: DEFAULT_MAX_ROW_GROUP_SIZE,
+            row_group_size: DEFAULT_ROW_GROUP_SIZE,
             tag_use_dictionary: false,
         }
     }
