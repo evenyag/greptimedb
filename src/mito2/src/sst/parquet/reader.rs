@@ -51,11 +51,11 @@ use crate::read::{Batch, BatchReader};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::file::FileHandle;
 use crate::sst::index::applier::SstIndexApplierRef;
-use crate::sst::parquet::format::{ReadFormat, AppendReadFormat};
+use crate::sst::parquet::format::{AppendReadFormat, ReadFormat};
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::row_group::InMemoryRowGroup;
 use crate::sst::parquet::row_selection::row_selection_from_row_ranges;
-use crate::sst::parquet::stats::RowGroupPruningStats;
+use crate::sst::parquet::stats::{AppendModePruningStats, RowGroupPruningStats};
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, PARQUET_METADATA_KEY};
 
 /// Parquet SST reader builder.
@@ -77,6 +77,10 @@ pub(crate) struct ParquetReaderBuilder {
     cache_manager: Option<CacheManagerRef>,
     /// Index applier.
     index_applier: Option<SstIndexApplierRef>,
+    /// Latest region metadata.
+    ///
+    /// We can use it to identify whether a column still exists in the latest schema.
+    latest_metadata: Option<RegionMetadataRef>,
 }
 
 impl ParquetReaderBuilder {
@@ -95,6 +99,7 @@ impl ParquetReaderBuilder {
             projection: None,
             cache_manager: None,
             index_applier: None,
+            latest_metadata: None,
         }
     }
 
@@ -128,6 +133,12 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn index_applier(mut self, index_applier: Option<SstIndexApplierRef>) -> Self {
         self.index_applier = index_applier;
+        self
+    }
+
+    /// Attaches the latest region metadata.
+    fn latest_metadata(mut self, metadata: Option<RegionMetadataRef>) -> Self {
+        self.latest_metadata = metadata;
         self
     }
 
@@ -226,8 +237,8 @@ impl ParquetReaderBuilder {
 
         // Computes the projection mask.
         let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
-        let projection_mask = if let Some(column_ids) = self.projection.as_ref() {
-            let indices = read_format.projection_indices(column_ids.iter().copied());
+        let projection_mask = if self.projection.is_some() {
+            let indices = read_format.projection_indices();
             // Now we assumes we don't have nested schemas.
             ProjectionMask::roots(parquet_schema_desc, indices)
         } else {
@@ -242,9 +253,9 @@ impl ParquetReaderBuilder {
 
         let mut metrics = Metrics::default();
 
-        // let row_groups = self
-        //     .row_groups_to_read(&read_format, &parquet_meta, &mut metrics)
-        //     .await;
+        let row_groups = self
+            .append_mode_row_groups_to_read(&read_format, &parquet_meta, &mut metrics)
+            .await;
 
         let reader_builder = RowGroupReaderBuilder {
             file_handle: self.file_handle.clone(),
@@ -267,26 +278,21 @@ impl ParquetReaderBuilder {
             vec![]
         };
 
-        // let codec = McmpRowCodec::new(
-        //     read_format
-        //         .metadata()
-        //         .primary_key_columns()
-        //         .map(|c| SortField::new(c.column_schema.data_type.clone()))
-        //         .collect(),
-        // );
+        let partition_ctx = Arc::new(PartitionContext {
+            reader_builder,
+            predicate,
+            format: read_format,
+        });
+        let mut partitions = Vec::with_capacity(row_groups.len());
+        for (idx, row_selection) in row_groups {
+            partitions.push(ParquetPartition {
+                context: partition_ctx.clone(),
+                row_group_idx: idx,
+                row_selection,
+            });
+        }
 
-        // Ok(ParquetReader {
-        //     row_groups,
-        //     read_format,
-        //     reader_builder,
-        //     predicate,
-        //     current_reader: None,
-        //     batches: VecDeque::new(),
-        //     codec,
-        //     metrics,
-        // })
-
-        todo!()
+        Ok(partitions)
     }
 
     /// Decodes region metadata from key value.
@@ -363,6 +369,23 @@ impl ParquetReaderBuilder {
         self.prune_row_groups_by_inverted_index(parquet_meta, metrics)
             .await
             .or_else(|| self.prune_row_groups_by_minmax(read_format, parquet_meta, metrics))
+            .unwrap_or_else(|| (0..num_row_groups).map(|i| (i, None)).collect())
+    }
+
+    /// Computes row groups to read, along with their respective row selections.
+    async fn append_mode_row_groups_to_read(
+        &self,
+        read_format: &AppendReadFormat,
+        parquet_meta: &ParquetMetaData,
+        metrics: &mut Metrics,
+    ) -> BTreeMap<usize, Option<RowSelection>> {
+        let num_row_groups = parquet_meta.num_row_groups();
+        if num_row_groups == 0 {
+            return BTreeMap::default();
+        }
+        metrics.num_row_groups_before_filtering += num_row_groups;
+
+        self.append_mode_prune_row_groups_by_minmax(read_format, parquet_meta, metrics)
             .unwrap_or_else(|| (0..num_row_groups).map(|i| (i, None)).collect())
     }
 
@@ -486,6 +509,36 @@ impl ParquetReaderBuilder {
 
         Some(row_groups)
     }
+
+    /// Prunes row groups by min-max index for append mode.
+    fn append_mode_prune_row_groups_by_minmax(
+        &self,
+        read_format: &AppendReadFormat,
+        parquet_meta: &ParquetMetaData,
+        metrics: &mut Metrics,
+    ) -> Option<BTreeMap<usize, Option<RowSelection>>> {
+        let Some(predicate) = &self.predicate else {
+            return None;
+        };
+
+        let num_row_groups = parquet_meta.num_row_groups();
+        let row_groups = parquet_meta.row_groups();
+        let stats =
+            AppendModePruningStats::new(row_groups, read_format, self.latest_metadata.clone());
+        // Here we need to create physical expressions so we use the schema of the SST.
+        let row_groups = predicate
+            .prune_with_stats(&stats, read_format.arrow_schema())
+            .iter()
+            .zip(0..num_row_groups)
+            .filter(|&(mask, _)| *mask)
+            .map(|(_, id)| (id, None))
+            .collect::<BTreeMap<_, _>>();
+
+        let filtered = num_row_groups - row_groups.len();
+        metrics.num_row_groups_min_max_filtered += filtered;
+
+        Some(row_groups)
+    }
 }
 
 /// Parquet reader metrics.
@@ -517,10 +570,22 @@ struct Metrics {
 
 /// Range of a parquet file to read, usually a row group.
 pub struct ParquetPartition {
-    /// Reader builder.
-    builder: Arc<RowGroupReaderBuilder>,
+    /// Common structs for reading a row group.
+    context: Arc<PartitionContext>,
     /// Index of the row group to read.
     row_group_idx: usize,
+    /// Row selection of this row group. None indicates all rows are selected.
+    row_selection: Option<RowSelection>,
+}
+
+/// Context for partitions of the same parquet file.
+struct PartitionContext {
+    /// Row group reader builder.
+    reader_builder: RowGroupReaderBuilder,
+    /// Pushed down filters.
+    predicate: Vec<SimpleFilterEvaluator>,
+    /// Helper to read the file.
+    format: AppendReadFormat,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.

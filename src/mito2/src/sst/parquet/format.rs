@@ -27,7 +27,7 @@
 //! We stores fields in the same order as [RegionMetadata::field_columns()](store_api::metadata::RegionMetadata::field_columns()).
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use api::v1::SemanticType;
@@ -37,6 +37,7 @@ use datatypes::arrow::datatypes::{
     DataType as ArrowDataType, Field, FieldRef, Fields, Schema, SchemaRef, UInt16Type,
 };
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::DataType;
 use datatypes::vectors::{Helper, Vector};
 use parquet::file::metadata::RowGroupMetaData;
@@ -120,30 +121,35 @@ pub(crate) struct AppendReadFormat {
 }
 
 impl AppendReadFormat {
-    pub(crate) fn new(metadata: RegionMetadataRef, columns: Option<&[ColumnId]>) -> AppendReadFormat {
+    pub(crate) fn new(
+        metadata: RegionMetadataRef,
+        columns: Option<&[ColumnId]>,
+    ) -> AppendReadFormat {
         let projection = match columns {
             Some(column_ids) => column_ids.iter().copied().collect(),
-            None => metadata.column_metadatas.iter().map(|column| column.column_id).collect(),
+            None => metadata
+                .column_metadatas
+                .iter()
+                .map(|column| column.column_id)
+                .collect(),
         };
-        AppendReadFormat { metadata, projection }
+        AppendReadFormat {
+            metadata,
+            projection,
+        }
     }
 
     /// Gets sorted projection indices to read `columns` from parquet files.
     ///
     /// This function ignores columns not in `metadata` to for compatibility between
     /// different schemas.
-    pub(crate) fn projection_indices(
-        &self,
-        columns: impl IntoIterator<Item = ColumnId>,
-    ) -> Vec<usize> {
-        let mut indices: Vec<_> = columns
-            .into_iter()
-            .filter_map(|column_id| {
-                self.metadata.column_index_by_id(column_id)
-            })
-            .collect();
-        indices.sort_unstable();
-        indices
+    ///
+    /// The output ordering of column indices are unspecific.
+    pub(crate) fn projection_indices(&self) -> Vec<usize> {
+        self.projection
+            .iter()
+            .filter_map(|column_id| self.metadata.column_index_by_id(*column_id))
+            .collect()
     }
 
     /// Gets the arrow schema of the SST file.
@@ -152,6 +158,43 @@ impl AppendReadFormat {
     /// as the arrow schema decoded from the file metadata.
     pub(crate) fn arrow_schema(&self) -> &SchemaRef {
         self.metadata.schema.arrow_schema()
+    }
+
+    /// Gets the metadata of the SST.
+    pub(crate) fn sst_metadata(&self) -> &RegionMetadataRef {
+        &self.metadata
+    }
+
+    /// Returns min values of specific column in row groups.
+    pub(crate) fn min_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> Option<ArrayRef> {
+        let index = self.metadata.column_index_by_id(column_id)?;
+        let column = &self.metadata.column_metadatas[index];
+        column_values(row_groups, &column.column_schema.data_type, index, true)
+    }
+
+    /// Returns max values of specific column in row groups.
+    pub(crate) fn max_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> Option<ArrayRef> {
+        let index = self.metadata.column_index_by_id(column_id)?;
+        let column = &self.metadata.column_metadatas[index];
+        column_values(row_groups, &column.column_schema.data_type, index, false)
+    }
+
+    /// Returns null counts of specific column in row groups.
+    pub(crate) fn null_counts(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> Option<ArrayRef> {
+        let index = self.metadata.column_index_by_id(column_id)?;
+        column_null_counts(row_groups, index)
     }
 }
 
@@ -468,6 +511,7 @@ impl ReadFormat {
         Some(vector.to_arrow_array())
     }
 
+    // TODO(yingwen): Reuse global function.
     /// Returns min/max values of specific non-tag columns.
     fn column_values(
         row_groups: &[impl Borrow<RowGroupMetaData>],
@@ -531,6 +575,7 @@ impl ReadFormat {
         ScalarValue::iter_to_array(scalar_values).ok()
     }
 
+    // TODO(yingwen): Reuse global function.
     /// Returns null counts of specific non-tag columns.
     fn column_null_counts(
         row_groups: &[impl Borrow<RowGroupMetaData>],
@@ -563,6 +608,77 @@ impl ReadFormat {
             .as_ref()
             .and_then(|m| m.get(&column_id).copied())
     }
+}
+
+/// Returns min/max values of specific non-tag columns.
+fn column_values(
+    row_groups: &[impl Borrow<RowGroupMetaData>],
+    column_data_type: &ConcreteDataType,
+    column_index: usize,
+    is_min: bool,
+) -> Option<ArrayRef> {
+    let null_scalar: ScalarValue = column_data_type.as_arrow_type().try_into().ok()?;
+    let scalar_values = row_groups
+        .iter()
+        .map(|meta| {
+            let stats = meta.borrow().column(column_index).statistics()?;
+            if !stats.has_min_max_set() {
+                return None;
+            }
+            match stats {
+                Statistics::Boolean(s) => Some(ScalarValue::Boolean(Some(if is_min {
+                    *s.min()
+                } else {
+                    *s.max()
+                }))),
+                Statistics::Int32(s) => Some(ScalarValue::Int32(Some(if is_min {
+                    *s.min()
+                } else {
+                    *s.max()
+                }))),
+                Statistics::Int64(s) => Some(ScalarValue::Int64(Some(if is_min {
+                    *s.min()
+                } else {
+                    *s.max()
+                }))),
+
+                Statistics::Int96(_) => None,
+                Statistics::Float(s) => Some(ScalarValue::Float32(Some(if is_min {
+                    *s.min()
+                } else {
+                    *s.max()
+                }))),
+                Statistics::Double(s) => Some(ScalarValue::Float64(Some(if is_min {
+                    *s.min()
+                } else {
+                    *s.max()
+                }))),
+                Statistics::ByteArray(s) => {
+                    let bytes = if is_min { s.min_bytes() } else { s.max_bytes() };
+                    let s = String::from_utf8(bytes.to_vec()).ok();
+                    Some(ScalarValue::Utf8(s))
+                }
+
+                Statistics::FixedLenByteArray(_) => None,
+            }
+        })
+        .map(|maybe_scalar| maybe_scalar.unwrap_or_else(|| null_scalar.clone()))
+        .collect::<Vec<ScalarValue>>();
+    debug_assert_eq!(scalar_values.len(), row_groups.len());
+    ScalarValue::iter_to_array(scalar_values).ok()
+}
+
+/// Returns null counts of specific non-tag columns.
+fn column_null_counts(
+    row_groups: &[impl Borrow<RowGroupMetaData>],
+    column_index: usize,
+) -> Option<ArrayRef> {
+    let values = row_groups.iter().map(|meta| {
+        let col = meta.borrow().column(column_index);
+        let stat = col.statistics()?;
+        Some(stat.null_count())
+    });
+    Some(Arc::new(UInt64Array::from_iter(values)))
 }
 
 /// Gets the arrow schema to store in parquet.

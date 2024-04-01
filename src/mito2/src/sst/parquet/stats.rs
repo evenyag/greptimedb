@@ -21,9 +21,10 @@ use datafusion::physical_optimizer::pruning::PruningStatistics;
 use datafusion_common::Column;
 use datatypes::arrow::array::ArrayRef;
 use parquet::file::metadata::RowGroupMetaData;
+use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 
-use crate::sst::parquet::format::ReadFormat;
+use crate::sst::parquet::format::{AppendReadFormat, ReadFormat};
 
 /// Statistics for pruning row groups.
 pub(crate) struct RowGroupPruningStats<'a, T> {
@@ -63,6 +64,68 @@ impl<'a, T> RowGroupPruningStats<'a, T> {
 }
 
 impl<'a, T: Borrow<RowGroupMetaData>> PruningStatistics for RowGroupPruningStats<'a, T> {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        let column_id = self.column_id_to_prune(&column.name)?;
+        self.read_format.min_values(self.row_groups, column_id)
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        let column_id = self.column_id_to_prune(&column.name)?;
+        self.read_format.max_values(self.row_groups, column_id)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.row_groups.len()
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        let column_id = self.column_id_to_prune(&column.name)?;
+        self.read_format.null_counts(self.row_groups, column_id)
+    }
+}
+
+/// Statistics for pruning row groups under append mode.
+pub(crate) struct AppendModePruningStats<'a, T> {
+    /// Metadata of SST row groups.
+    row_groups: &'a [T],
+    /// Helper to read the SST.
+    read_format: &'a AppendReadFormat,
+    /// Latest region metadata, we use it to find the column id of a column.
+    ///
+    /// Use the SST's metadata if it is None.
+    latest_metadata: Option<RegionMetadataRef>,
+}
+
+impl<'a, T> AppendModePruningStats<'a, T> {
+    /// Creates a new statistics to prune specific `row_groups`.
+    pub(crate) fn new(
+        row_groups: &'a [T],
+        read_format: &'a AppendReadFormat,
+        latest_metadata: Option<RegionMetadataRef>,
+    ) -> Self {
+        Self {
+            row_groups,
+            read_format,
+            latest_metadata,
+        }
+    }
+
+    /// Returns the column id of specific column name in latest metadata.
+    ///
+    /// Use the column id in the latest schema instead of the SST so we support dropping
+    /// and adding a column with the same name.
+    fn column_id_to_prune(&self, name: &str) -> Option<ColumnId> {
+        let latest_metadata = self
+            .latest_metadata
+            .as_ref()
+            .unwrap_or_else(|| self.read_format.sst_metadata());
+        latest_metadata
+            .column_by_name(name)
+            .map(|col| col.column_id)
+    }
+}
+
+impl<'a, T: Borrow<RowGroupMetaData>> PruningStatistics for AppendModePruningStats<'a, T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.column_id_to_prune(&column.name)?;
         self.read_format.min_values(self.row_groups, column_id)
