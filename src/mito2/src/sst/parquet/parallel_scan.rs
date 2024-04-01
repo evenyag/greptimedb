@@ -17,16 +17,18 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use async_stream::stream;
 use common_recordbatch::DfSendableRecordBatchStream;
 use common_telemetry::error;
 use common_time::range::TimestampRange;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datatypes::arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheManagerRef;
@@ -76,7 +78,7 @@ impl RowGroupScan {
                 .latest_metadata(Some(self.metadata.clone()))
                 .build_partitions()
                 .await;
-            let mut file_parts = match maybe_parts {
+            let file_parts = match maybe_parts {
                 Ok(file_parts) => file_parts,
                 Err(e) => {
                     if e.is_object_not_found() && self.ignore_file_not_found {
@@ -112,12 +114,24 @@ impl RowGroupScan {
             self.spawn_scan_task(partitions.clone(), sender.clone());
         }
 
-        // TODO(yingwen): projection schema.
-        // let stream = stream! {
-        //     //
-        // };
+        // TODO(yingwen): Error handling: id not exists, duplicate ids.
+        let mut project_indices: Vec<_> = self
+            .projection
+            .iter()
+            .map(|column_id| self.metadata.column_index_by_id(*column_id).unwrap())
+            .collect();
+        project_indices.sort_unstable();
+        let record_batch_schema = self
+            .metadata
+            .schema
+            .arrow_schema()
+            .project(&project_indices)
+            .unwrap();
+        let stream = ReceiverStream::new(receiver)
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
+        let stream = RecordBatchStreamAdapter::new(Arc::new(record_batch_schema), stream);
 
-        todo!()
+        Ok(Box::pin(stream))
     }
 
     fn spawn_scan_task(
