@@ -578,14 +578,29 @@ pub struct ParquetPartition {
     row_selection: Option<RowSelection>,
 }
 
+impl ParquetPartition {
+    /// Returns a reader for this partition.
+    pub(crate) async fn reader(&self) -> Result<ParquetRecordBatchReader> {
+        self.context
+            .reader_builder
+            .build(self.row_group_idx, self.row_selection.clone())
+            .await
+    }
+
+    /// Returns the context of the partition.
+    pub(crate) fn context(&self) -> &Arc<PartitionContext> {
+        &self.context
+    }
+}
+
 /// Context for partitions of the same parquet file.
-struct PartitionContext {
+pub(crate) struct PartitionContext {
     /// Row group reader builder.
     reader_builder: RowGroupReaderBuilder,
     /// Pushed down filters.
-    predicate: Vec<SimpleFilterEvaluator>,
+    pub(crate) predicate: Vec<SimpleFilterEvaluator>,
     /// Helper to read the file.
-    format: AppendReadFormat,
+    pub(crate) format: AppendReadFormat,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
