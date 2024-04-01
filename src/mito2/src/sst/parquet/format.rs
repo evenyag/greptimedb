@@ -27,7 +27,7 @@
 //! We stores fields in the same order as [RegionMetadata::field_columns()](store_api::metadata::RegionMetadata::field_columns()).
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::sync::Arc;
 
 use api::v1::SemanticType;
@@ -110,6 +110,48 @@ impl WriteFormat {
         columns.push(batch.op_types().to_arrow_array());
 
         RecordBatch::try_new(self.arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
+    }
+}
+
+/// Helper for reading the SST format in append mode.
+pub(crate) struct AppendReadFormat {
+    metadata: RegionMetadataRef,
+    projection: HashSet<ColumnId>,
+}
+
+impl AppendReadFormat {
+    pub(crate) fn new(metadata: RegionMetadataRef, columns: Option<&[ColumnId]>) -> AppendReadFormat {
+        let projection = match columns {
+            Some(column_ids) => column_ids.iter().copied().collect(),
+            None => metadata.column_metadatas.iter().map(|column| column.column_id).collect(),
+        };
+        AppendReadFormat { metadata, projection }
+    }
+
+    /// Gets sorted projection indices to read `columns` from parquet files.
+    ///
+    /// This function ignores columns not in `metadata` to for compatibility between
+    /// different schemas.
+    pub(crate) fn projection_indices(
+        &self,
+        columns: impl IntoIterator<Item = ColumnId>,
+    ) -> Vec<usize> {
+        let mut indices: Vec<_> = columns
+            .into_iter()
+            .filter_map(|column_id| {
+                self.metadata.column_index_by_id(column_id)
+            })
+            .collect();
+        indices.sort_unstable();
+        indices
+    }
+
+    /// Gets the arrow schema of the SST file.
+    ///
+    /// This schema is computed from the region metadata but should be the same
+    /// as the arrow schema decoded from the file metadata.
+    pub(crate) fn arrow_schema(&self) -> &SchemaRef {
+        self.metadata.schema.arrow_schema()
     }
 }
 

@@ -51,7 +51,7 @@ use crate::read::{Batch, BatchReader};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::file::FileHandle;
 use crate::sst::index::applier::SstIndexApplierRef;
-use crate::sst::parquet::format::ReadFormat;
+use crate::sst::parquet::format::{ReadFormat, AppendReadFormat};
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::row_group::InMemoryRowGroup;
 use crate::sst::parquet::row_selection::row_selection_from_row_ranges;
@@ -207,6 +207,86 @@ impl ParquetReaderBuilder {
             codec,
             metrics,
         })
+    }
+
+    /// Builds and initializes a list of [ParquetPartition] to read.
+    ///
+    /// This needs to perform IO operation.
+    pub async fn build_partitions(&self) -> Result<Vec<ParquetPartition>> {
+        let start = Instant::now();
+
+        let file_path = self.file_handle.file_path(&self.file_dir);
+        let file_size = self.file_handle.meta().file_size;
+        // Loads parquet metadata of the file.
+        let parquet_meta = self.read_parquet_metadata(&file_path, file_size).await?;
+        // Decodes region metadata.
+        let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
+        let region_meta = Self::get_region_metadata(&file_path, key_value_meta)?;
+        let read_format = AppendReadFormat::new(Arc::new(region_meta), self.projection.as_deref());
+
+        // Computes the projection mask.
+        let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
+        let projection_mask = if let Some(column_ids) = self.projection.as_ref() {
+            let indices = read_format.projection_indices(column_ids.iter().copied());
+            // Now we assumes we don't have nested schemas.
+            ProjectionMask::roots(parquet_schema_desc, indices)
+        } else {
+            ProjectionMask::all()
+        };
+
+        // Computes the field levels.
+        let hint = Some(read_format.arrow_schema().fields());
+        let field_levels =
+            parquet_to_arrow_field_levels(parquet_schema_desc, projection_mask.clone(), hint)
+                .context(ReadParquetSnafu { path: &file_path })?;
+
+        let mut metrics = Metrics::default();
+
+        // let row_groups = self
+        //     .row_groups_to_read(&read_format, &parquet_meta, &mut metrics)
+        //     .await;
+
+        let reader_builder = RowGroupReaderBuilder {
+            file_handle: self.file_handle.clone(),
+            file_path,
+            parquet_meta,
+            object_store: self.object_store.clone(),
+            projection: projection_mask,
+            field_levels,
+            cache_manager: self.cache_manager.clone(),
+        };
+
+        metrics.build_cost = start.elapsed();
+
+        let predicate = if let Some(p) = &self.predicate {
+            p.exprs()
+                .iter()
+                .filter_map(|expr| SimpleFilterEvaluator::try_new(expr.df_expr()))
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // let codec = McmpRowCodec::new(
+        //     read_format
+        //         .metadata()
+        //         .primary_key_columns()
+        //         .map(|c| SortField::new(c.column_schema.data_type.clone()))
+        //         .collect(),
+        // );
+
+        // Ok(ParquetReader {
+        //     row_groups,
+        //     read_format,
+        //     reader_builder,
+        //     predicate,
+        //     current_reader: None,
+        //     batches: VecDeque::new(),
+        //     codec,
+        //     metrics,
+        // })
+
+        todo!()
     }
 
     /// Decodes region metadata from key value.
@@ -433,6 +513,14 @@ struct Metrics {
     num_batches: usize,
     /// Number of rows read.
     num_rows: usize,
+}
+
+/// Range of a parquet file to read, usually a row group.
+pub struct ParquetPartition {
+    /// Reader builder.
+    builder: Arc<RowGroupReaderBuilder>,
+    /// Index of the row group to read.
+    row_group_idx: usize,
 }
 
 /// Builder to build a [ParquetRecordBatchReader] for a row group.
