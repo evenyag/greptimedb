@@ -18,6 +18,7 @@ mod format;
 pub(crate) mod helper;
 pub(crate) mod metadata;
 mod page_reader;
+pub mod parallel_scan;
 pub mod reader;
 pub mod row_group;
 mod row_selection;

@@ -137,7 +137,7 @@ impl ParquetReaderBuilder {
     }
 
     /// Attaches the latest region metadata.
-    fn latest_metadata(mut self, metadata: Option<RegionMetadataRef>) -> Self {
+    pub fn latest_metadata(mut self, metadata: Option<RegionMetadataRef>) -> Self {
         self.latest_metadata = metadata;
         self
     }
@@ -246,7 +246,7 @@ impl ParquetReaderBuilder {
         };
 
         // Computes the field levels.
-        let hint = Some(read_format.arrow_schema().fields());
+        let hint = Some(read_format.sst_arrow_schema().fields());
         let field_levels =
             parquet_to_arrow_field_levels(parquet_schema_desc, projection_mask.clone(), hint)
                 .context(ReadParquetSnafu { path: &file_path })?;
@@ -527,7 +527,7 @@ impl ParquetReaderBuilder {
             AppendModePruningStats::new(row_groups, read_format, self.latest_metadata.clone());
         // Here we need to create physical expressions so we use the schema of the SST.
         let row_groups = predicate
-            .prune_with_stats(&stats, read_format.arrow_schema())
+            .prune_with_stats(&stats, read_format.sst_arrow_schema())
             .iter()
             .zip(0..num_row_groups)
             .filter(|&(mask, _)| *mask)
@@ -579,6 +579,11 @@ pub struct ParquetPartition {
 }
 
 impl ParquetPartition {
+    /// Returns the path of the parquet file.
+    pub(crate) fn file_path(&self) -> &str {
+        self.context.reader_builder.file_path()
+    }
+
     /// Returns a reader for this partition.
     pub(crate) async fn reader(&self) -> Result<ParquetRecordBatchReader> {
         self.context

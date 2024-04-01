@@ -156,7 +156,7 @@ impl AppendReadFormat {
     ///
     /// This schema is computed from the region metadata but should be the same
     /// as the arrow schema decoded from the file metadata.
-    pub(crate) fn arrow_schema(&self) -> &SchemaRef {
+    pub(crate) fn sst_arrow_schema(&self) -> &SchemaRef {
         self.metadata.schema.arrow_schema()
     }
 
