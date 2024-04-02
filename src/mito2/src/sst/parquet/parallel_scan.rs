@@ -284,6 +284,8 @@ pub struct ScanMetrics {
     pub num_batches: usize,
     /// Number of rows.
     pub num_rows: usize,
+    /// Number of columns.
+    pub num_columns: usize,
 }
 
 fn infer_region_metadata(file: File, region_id: RegionId) -> RegionMetadataRef {
@@ -400,6 +402,7 @@ pub async fn parallel_scan_file(
     while let Some(batch) = stream.try_next().await.unwrap() {
         metrics.num_batches += 1;
         metrics.num_rows += batch.num_rows();
+        metrics.num_columns = batch.num_columns();
     }
     metrics.scan_cost = now.elapsed();
 
