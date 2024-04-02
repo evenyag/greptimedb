@@ -88,6 +88,9 @@ struct ScanArgs {
     /// is true.
     #[arg(short, long, default_value_t = 0)]
     jobs: usize,
+    /// Channel size.
+    #[arg(long, default_value_t = None)]
+    channel_size: Option<usize>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -199,7 +202,14 @@ async fn run_scan(args: ScanArgs) {
     let store = new_fs_store();
     if args.row_group_parallel {
         for _ in 0..args.times {
-            match parallel_scan::parallel_scan_file(&args.input_path, &store, args.jobs).await {
+            match parallel_scan::parallel_scan_file(
+                &args.input_path,
+                &store,
+                args.jobs,
+                args.channel_size,
+            )
+            .await
+            {
                 Ok(metrics) => {
                     println!("Scan metrics: {:?}", metrics);
                 }
