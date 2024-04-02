@@ -144,8 +144,6 @@ impl RowGroupScan {
     // For simplicity and performance, we use datafusion's stream.
     /// Builds a stream for the query.
     pub async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
-        let partitions = self.build_parquet_partitions().await?;
-        let partitions = Arc::new(PartitionQueue::new(partitions));
         let num_tasks = if self.parallelism.parallelism == 0 {
             1
         } else {
@@ -157,6 +155,8 @@ impl RowGroupScan {
         } else {
             AppendReadFormat::new(self.metadata.clone(), Some(&self.projection))
         };
+        let partitions = self.build_parquet_partitions().await?;
+        let partitions = Arc::new(PartitionQueue::new(partitions));
         // TODO(yingwen): projection result.
         let record_batch_schema = if !self.projection.is_empty() {
             let project_indices = read_format.projection_indices();
@@ -227,6 +227,11 @@ impl RowGroupScan {
 
     /// Builds and returns partitions to read.
     async fn build_parquet_partitions(&self) -> Result<VecDeque<ParquetPartition>> {
+        let projection = if self.projection.is_empty() {
+            None
+        } else {
+            Some(self.projection.clone())
+        };
         let mut partitions = VecDeque::with_capacity(self.files.len());
         for file in &self.files {
             // TODO(yingwen); Read and prune in parallel.
@@ -238,7 +243,7 @@ impl RowGroupScan {
             )
             .predicate(self.predicate.clone())
             .time_range(self.time_range)
-            .projection(Some(self.projection.clone()))
+            .projection(projection.clone())
             .cache(self.cache_manager.clone())
             // TODO(yingwen): Index applier.
             .latest_metadata(Some(self.metadata.clone()))

@@ -167,6 +167,10 @@ impl AppendReadFormat {
         self.projection
             .iter()
             .filter_map(|column_id| self.metadata.column_index_by_id(*column_id))
+            .chain([
+                self.sst_schema.fields.len() - 2,
+                self.sst_schema.fields.len() - 1,
+            ])
             .collect()
     }
 
