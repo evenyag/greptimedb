@@ -230,10 +230,18 @@ impl ParquetReaderBuilder {
         let file_size = self.file_handle.meta().file_size;
         // Loads parquet metadata of the file.
         let parquet_meta = self.read_parquet_metadata(&file_path, file_size).await?;
-        // Decodes region metadata.
-        let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
-        let region_meta = Self::get_region_metadata(&file_path, key_value_meta)?;
-        let read_format = AppendReadFormat::new(Arc::new(region_meta), self.projection.as_deref());
+        // TODO(yingwen): For test purpose, we use latest metadata if it exists since our test
+        // inputs don't have this metadata. Remove this later.
+        let regon_meta = match &self.latest_metadata {
+            Some(meta) => meta.clone(),
+            None => {
+                // Decodes region metadata.
+                let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
+                let region_meta = Self::get_region_metadata(&file_path, key_value_meta)?;
+                Arc::new(region_meta)
+            }
+        };
+        let read_format = AppendReadFormat::new(regon_meta, self.projection.as_deref());
 
         // Computes the projection mask.
         let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();

@@ -40,7 +40,7 @@ use crate::sst::parquet::reader::ParquetPartition;
 
 // TODO(yingwen): Read memtables.
 /// Parallel row group scanner.
-pub(crate) struct RowGroupScan {
+pub struct RowGroupScan {
     /// Region SST access layer.
     access_layer: AccessLayerRef,
     /// Latest region metadata.
@@ -62,6 +62,107 @@ pub(crate) struct RowGroupScan {
 }
 
 impl RowGroupScan {
+    /// Creates a new row group scan.
+    pub fn new(access_layer: AccessLayerRef, metadata: RegionMetadataRef) -> Self {
+        Self {
+            access_layer,
+            metadata,
+            projection: vec![],
+            time_range: None,
+            predicate: None,
+            files: vec![],
+            cache_manager: None,
+            ignore_file_not_found: false,
+            parallelism: ScanParallism::default(),
+        }
+    }
+
+    /// Attaches the projection.
+    pub fn with_projection(mut self, projection: Vec<ColumnId>) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Attaches the time range filter.
+    pub fn with_time_range(mut self, range: Option<TimestampRange>) -> Self {
+        self.time_range = range;
+        self
+    }
+
+    /// Attaches the predicate.
+    pub fn with_predicate(mut self, predicate: Option<Predicate>) -> Self {
+        self.predicate = predicate;
+        self
+    }
+
+    /// Attaches files to scan.
+    pub fn with_files(mut self, files: Vec<FileHandle>) -> Self {
+        self.files = files;
+        self
+    }
+
+    /// Attaches the cache.
+    pub fn with_cache(mut self, cache: Option<CacheManagerRef>) -> Self {
+        self.cache_manager = cache;
+        self
+    }
+
+    /// Ignores file not found error.
+    pub fn with_ignore_file_not_found(mut self, ignore: bool) -> Self {
+        self.ignore_file_not_found = ignore;
+        self
+    }
+
+    /// Attaches scan parallelism.
+    pub fn with_parallelism(mut self, parallelism: usize) -> Self {
+        self.parallelism.parallelism = parallelism;
+        self
+    }
+
+    /// Attaches scan channel size.
+    pub fn with_parallelism_channel_size(mut self, channel_size: usize) -> Self {
+        self.parallelism.channel_size = channel_size;
+        self
+    }
+
+    // For simplicity and performance, we use datafusion's stream.
+    /// Builds a stream for the query.
+    pub async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
+        let partitions = self.build_parquet_partitions().await?;
+        let partitions = Arc::new(PartitionQueue::new(partitions));
+        let (sender, receiver) = mpsc::channel(self.parallelism.channel_size);
+        let num_tasks = if self.parallelism.parallelism == 0 {
+            1
+        } else {
+            self.parallelism.parallelism
+        };
+        for _ in 0..num_tasks {
+            self.spawn_scan_task(partitions.clone(), sender.clone());
+        }
+
+        // TODO(yingwen): Error handling: id not exists, duplicate ids.
+        let mut project_indices: Vec<_> = if !self.projection.is_empty() {
+            self.projection
+                .iter()
+                .map(|column_id| self.metadata.column_index_by_id(*column_id).unwrap())
+                .collect()
+        } else {
+            (0..self.metadata.column_metadatas.len()).collect()
+        };
+        project_indices.sort_unstable();
+        let record_batch_schema = self
+            .metadata
+            .schema
+            .arrow_schema()
+            .project(&project_indices)
+            .unwrap();
+        let stream = ReceiverStream::new(receiver)
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
+        let stream = RecordBatchStreamAdapter::new(Arc::new(record_batch_schema), stream);
+
+        Ok(Box::pin(stream))
+    }
+
     /// Builds and returns partitions to read.
     async fn build_parquet_partitions(&self) -> Result<VecDeque<ParquetPartition>> {
         let mut partitions = VecDeque::with_capacity(self.files.len());
@@ -97,41 +198,6 @@ impl RowGroupScan {
         READ_SST_COUNT.observe(self.files.len() as f64);
 
         Ok(partitions)
-    }
-
-    // For simplicity and performance, we use datafusion's stream.
-    /// Builds a stream for the query.
-    async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
-        let partitions = self.build_parquet_partitions().await?;
-        let partitions = Arc::new(PartitionQueue::new(partitions));
-        let (sender, receiver) = mpsc::channel(self.parallelism.channel_size);
-        let num_tasks = if self.parallelism.parallelism == 0 {
-            1
-        } else {
-            self.parallelism.parallelism
-        };
-        for _ in 0..num_tasks {
-            self.spawn_scan_task(partitions.clone(), sender.clone());
-        }
-
-        // TODO(yingwen): Error handling: id not exists, duplicate ids.
-        let mut project_indices: Vec<_> = self
-            .projection
-            .iter()
-            .map(|column_id| self.metadata.column_index_by_id(*column_id).unwrap())
-            .collect();
-        project_indices.sort_unstable();
-        let record_batch_schema = self
-            .metadata
-            .schema
-            .arrow_schema()
-            .project(&project_indices)
-            .unwrap();
-        let stream = ReceiverStream::new(receiver)
-            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
-        let stream = RecordBatchStreamAdapter::new(Arc::new(record_batch_schema), stream);
-
-        Ok(Box::pin(stream))
     }
 
     fn spawn_scan_task(
