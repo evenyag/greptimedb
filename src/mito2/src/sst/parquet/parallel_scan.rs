@@ -23,6 +23,7 @@ use common_time::range::TimestampRange;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
+use object_store::ObjectStore;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
@@ -30,19 +31,20 @@ use table::predicate::Predicate;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheManagerRef;
 use crate::error::{ArrowReaderSnafu, Result};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::scan_region::ScanParallism;
 use crate::sst::file::FileHandle;
-use crate::sst::parquet::reader::ParquetPartition;
+use crate::sst::parquet::reader::{ParquetPartition, ParquetReaderBuilder};
 
 // TODO(yingwen): Read memtables.
 /// Parallel row group scanner.
 pub struct RowGroupScan {
-    /// Region SST access layer.
-    access_layer: AccessLayerRef,
+    /// Directory of the file.
+    file_dir: String,
+    /// Object store.
+    object_store: ObjectStore,
     /// Latest region metadata.
     metadata: RegionMetadataRef,
     /// Column ids to read.
@@ -63,9 +65,10 @@ pub struct RowGroupScan {
 
 impl RowGroupScan {
     /// Creates a new row group scan.
-    pub fn new(access_layer: AccessLayerRef, metadata: RegionMetadataRef) -> Self {
+    pub fn new(file_dir: String, object_store: ObjectStore, metadata: RegionMetadataRef) -> Self {
         Self {
-            access_layer,
+            file_dir,
+            object_store,
             metadata,
             projection: vec![],
             time_range: None,
@@ -168,17 +171,20 @@ impl RowGroupScan {
         let mut partitions = VecDeque::with_capacity(self.files.len());
         for file in &self.files {
             // TODO(yingwen); Read and prune in parallel.
-            let maybe_parts = self
-                .access_layer
-                .read_sst(file.clone())
-                .predicate(self.predicate.clone())
-                .time_range(self.time_range)
-                .projection(Some(self.projection.clone()))
-                .cache(self.cache_manager.clone())
-                // TODO(yingwen): Index applier.
-                .latest_metadata(Some(self.metadata.clone()))
-                .build_partitions()
-                .await;
+
+            let maybe_parts = ParquetReaderBuilder::new(
+                self.file_dir.clone(),
+                file.clone(),
+                self.object_store.clone(),
+            )
+            .predicate(self.predicate.clone())
+            .time_range(self.time_range)
+            .projection(Some(self.projection.clone()))
+            .cache(self.cache_manager.clone())
+            // TODO(yingwen): Index applier.
+            .latest_metadata(Some(self.metadata.clone()))
+            .build_partitions()
+            .await;
             let file_parts = match maybe_parts {
                 Ok(file_parts) => file_parts,
                 Err(e) => {
