@@ -47,6 +47,8 @@ use crate::sst::file::{FileHandle, FileId};
 use crate::sst::parquet::format::AppendReadFormat;
 use crate::sst::parquet::reader::{ParquetPartition, ParquetReaderBuilder};
 
+const DEFAULT_CHANNEL_SIZE: usize = 32;
+
 // TODO(yingwen): Read memtables.
 /// Parallel row group scanner.
 pub struct RowGroupScan {
@@ -142,7 +144,12 @@ impl RowGroupScan {
     pub async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
         let partitions = self.build_parquet_partitions().await?;
         let partitions = Arc::new(PartitionQueue::new(partitions));
-        let (sender, receiver) = mpsc::channel(self.parallelism.channel_size);
+        let channel_size = if self.parallelism.channel_size == 0 {
+            DEFAULT_CHANNEL_SIZE
+        } else {
+            self.parallelism.channel_size
+        };
+        let (sender, receiver) = mpsc::channel(channel_size);
         let num_tasks = if self.parallelism.parallelism == 0 {
             1
         } else {
