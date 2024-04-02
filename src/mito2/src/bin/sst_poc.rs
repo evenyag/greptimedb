@@ -14,7 +14,10 @@
 
 //! POC of the SST format.
 
+use std::path::Path;
+
 use clap::Parser;
+use mito2::sst::parquet::parallel_scan;
 use mito2::sst::rewrite::{rewrite_file, split_key};
 use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
 use object_store::services::Fs;
@@ -72,15 +75,19 @@ struct CreateArgs {
 #[derive(Debug, clap::Args)]
 #[command(author, version, about, long_about = None)]
 struct ScanArgs {
-    /// Input directory.
+    /// Input file path.
     #[arg(short, long)]
-    input_dir: String,
-    /// File id of the file under input directory.
-    #[arg(long)]
-    file_id: String,
+    input_path: String,
     /// Scan times.
     #[arg(short, long)]
     times: usize,
+    /// Use row group level scan.
+    #[arg(long, default_value_t = false)]
+    row_group_parallel: bool,
+    /// Parallelism to scan the file. Only takes effect when row_group_parallel
+    /// is true.
+    #[arg(short, long, default_value_t = 0)]
+    jobs: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -184,14 +191,44 @@ async fn run_create_mark(args: CreateArgs) {
 async fn run_scan(args: ScanArgs) {
     println!("Scan, args: {args:?}");
 
-    if args.file_id.is_empty() {
-        println!("File id is empty");
+    if args.input_path.is_empty() {
+        println!("File path is empty");
         return;
     }
 
     let store = new_fs_store();
+    if args.row_group_parallel {
+        for _ in 0..args.times {
+            match parallel_scan::parallel_scan_file(&args.input_path, &store, args.jobs).await {
+                Ok(metrics) => {
+                    println!("Scan metrics: {:?}", metrics);
+                }
+                Err(e) => {
+                    println!("Failed to scan file, {e:?}");
+                    return;
+                }
+            }
+        }
+
+        return;
+    }
+
+    let path = Path::new(&args.input_path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        println!("File name is empty");
+        return;
+    };
+    let Some(file_id) = file_name.split('.').next() else {
+        println!("File id is empty");
+        return;
+    };
+    let Some(input_dir) = path.to_str().and_then(|path| path.strip_suffix(file_name)) else {
+        println!("Path is empty");
+        return;
+    };
+
     for _ in 0..args.times {
-        match scan_file(&args.input_dir, &args.file_id, &store).await {
+        match scan_file(input_dir, file_id, &store).await {
             Ok(metrics) => {
                 println!("Scan metrics: {:?}", metrics);
             }
