@@ -384,6 +384,7 @@ pub async fn parallel_scan_file(
     file_path: &str,
     object_store: &ObjectStore,
     parallelism: usize,
+    channel_size: Option<usize>,
 ) -> Result<ScanMetrics> {
     // Infer metadata and file size.
     let file = File::open(file_path).unwrap();
@@ -397,7 +398,8 @@ pub async fn parallel_scan_file(
     let file_handle = new_file_handle(region_id, file_size);
     let scan = RowGroupScan::new(file_path.to_string(), object_store.clone(), metadata)
         .with_files(vec![file_handle])
-        .with_parallelism(parallelism);
+        .with_parallelism(parallelism)
+        .with_parallelism_channel_size(channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE));
     let mut stream = scan.build_stream().await?;
     while let Some(batch) = stream.try_next().await.unwrap() {
         metrics.num_batches += 1;
