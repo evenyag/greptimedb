@@ -226,7 +226,8 @@ impl ParquetReaderBuilder {
     pub async fn build_partitions(&self) -> Result<Vec<ParquetPartition>> {
         let start = Instant::now();
 
-        let file_path = self.file_handle.file_path(&self.file_dir);
+        // TODO(yingwen): For test, we use file dir as file path. Change to getting path from file handle later.
+        let file_path = self.file_dir.to_string();
         let file_size = self.file_handle.meta().file_size;
         // Loads parquet metadata of the file.
         let parquet_meta = self.read_parquet_metadata(&file_path, file_size).await?;

@@ -15,18 +15,25 @@
 //! Scans row groups in parallel.
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use api::v1::SemanticType;
 use common_recordbatch::DfSendableRecordBatchStream;
 use common_telemetry::error;
 use common_time::range::TimestampRange;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field};
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::data_type::ConcreteDataType;
+use datatypes::schema::ColumnSchema;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use snafu::ResultExt;
-use store_api::metadata::RegionMetadataRef;
-use store_api::storage::ColumnId;
+use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
+use store_api::storage::{ColumnId, RegionId};
 use table::predicate::Predicate;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,7 +42,7 @@ use crate::cache::CacheManagerRef;
 use crate::error::{ArrowReaderSnafu, Result};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::scan_region::ScanParallism;
-use crate::sst::file::FileHandle;
+use crate::sst::file::{FileHandle, FileId};
 use crate::sst::parquet::reader::{ParquetPartition, ParquetReaderBuilder};
 
 // TODO(yingwen): Read memtables.
@@ -253,4 +260,133 @@ impl PartitionQueue {
     fn pop(&self) -> Option<ParquetPartition> {
         self.partitions.lock().unwrap().pop_front()
     }
+}
+
+// ---------------- Functions for benchmark. -----------------------------
+
+/// Metrics for scanning the file.
+#[derive(Debug, Default)]
+pub struct ScanMetrics {
+    /// Scan cost.
+    pub scan_cost: Duration,
+    /// Number of batches.
+    pub num_batches: usize,
+    /// Number of rows.
+    pub num_rows: usize,
+}
+
+fn infer_region_metadata(file: File, region_id: RegionId) -> RegionMetadataRef {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let schema = reader.schema();
+
+    let mut builder = RegionMetadataBuilder::new(region_id);
+    let mut column_id = 0;
+    let mut primary_key = Vec::new();
+    for field in schema.fields() {
+        let semantic_type = infer_semantic_type(field);
+        if semantic_type == SemanticType::Tag {
+            primary_key.push(column_id);
+        }
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                field.name(),
+                infer_data_type(field),
+                field.is_nullable(),
+            ),
+            semantic_type,
+            column_id,
+        });
+        column_id += 1;
+    }
+    builder.primary_key(primary_key);
+
+    let metadata = builder.build().unwrap();
+    Arc::new(metadata)
+}
+
+fn infer_file_size(file: &File) -> u64 {
+    let meta = file.metadata().unwrap();
+    meta.len()
+}
+
+fn infer_data_type(field: &Field) -> ConcreteDataType {
+    ConcreteDataType::try_from(field.data_type()).unwrap()
+}
+
+fn infer_semantic_type(field: &Field) -> SemanticType {
+    if matches!(field.data_type(), ArrowDataType::Timestamp(_, _)) {
+        return SemanticType::Timestamp;
+    }
+
+    if matches!(
+        field.data_type(),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8
+    ) {
+        return SemanticType::Tag;
+    }
+
+    SemanticType::Field
+}
+
+/// Creates a mock file handle to converting files.
+fn new_file_handle(region_id: RegionId, file_size: u64) -> FileHandle {
+    use common_time::Timestamp;
+
+    use crate::sst::file::FileMeta;
+    use crate::sst::file_purger::{FilePurger, PurgeRequest};
+
+    #[derive(Debug)]
+    struct NoopFilePurger;
+
+    impl FilePurger for NoopFilePurger {
+        fn send_request(&self, _request: PurgeRequest) {}
+    }
+
+    let file_purger = Arc::new(NoopFilePurger {});
+    let file_id = FileId::random();
+
+    FileHandle::new(
+        FileMeta {
+            region_id,
+            file_id,
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(3600000),
+            ),
+            level: 0,
+            file_size,
+            available_indexes: Default::default(),
+            index_file_size: 0,
+        },
+        file_purger,
+    )
+}
+
+/// Scans the file in parallel.
+pub async fn parallel_scan_file(
+    file_path: &str,
+    object_store: &ObjectStore,
+    parallelism: usize,
+) -> Result<ScanMetrics> {
+    // Infer metadata and file size.
+    let file = File::open(file_path).unwrap();
+    let region_id = RegionId::new(1, 1);
+    let file_size = infer_file_size(&file);
+    let metadata = infer_region_metadata(file, region_id);
+
+    let now = Instant::now();
+    let mut metrics = ScanMetrics::default();
+
+    let file_handle = new_file_handle(region_id, file_size);
+    let scan = RowGroupScan::new(file_path.to_string(), object_store.clone(), metadata)
+        .with_files(vec![file_handle])
+        .with_parallelism(parallelism);
+    let mut stream = scan.build_stream().await?;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        metrics.num_batches += 1;
+        metrics.num_rows += batch.num_rows();
+    }
+    metrics.scan_cost = now.elapsed();
+
+    Ok(metrics)
 }
