@@ -20,10 +20,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
+use async_stream::stream;
 use common_recordbatch::DfSendableRecordBatchStream;
 use common_telemetry::error;
 use common_time::range::TimestampRange;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datatypes::arrow;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
@@ -40,7 +42,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cache::CacheManagerRef;
-use crate::error::{ArrowReaderSnafu, Result};
+use crate::error::{ArrowReaderSnafu, Error, Result};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::scan_region::ScanParallism;
 use crate::sst::file::{FileHandle, FileId};
@@ -144,21 +146,11 @@ impl RowGroupScan {
     pub async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
         let partitions = self.build_parquet_partitions().await?;
         let partitions = Arc::new(PartitionQueue::new(partitions));
-        let channel_size = if self.parallelism.channel_size == 0 {
-            DEFAULT_CHANNEL_SIZE
-        } else {
-            self.parallelism.channel_size
-        };
-        let (sender, receiver) = mpsc::channel(channel_size);
         let num_tasks = if self.parallelism.parallelism == 0 {
             1
         } else {
             self.parallelism.parallelism
         };
-        for _ in 0..num_tasks {
-            self.spawn_scan_task(partitions.clone(), sender.clone());
-        }
-
         // TODO(yingwen): For test we create a read format here.
         let read_format = if self.projection.is_empty() {
             AppendReadFormat::new(self.metadata.clone(), None)
@@ -177,11 +169,60 @@ impl RowGroupScan {
         } else {
             read_format.sst_arrow_schema().clone()
         };
+        if num_tasks > 0 {
+            let stream = self.build_parallel_stream(partitions, record_batch_schema, num_tasks);
+            Ok(stream)
+        } else {
+            let stream = self.build_single_thread_stream(partitions, record_batch_schema);
+            Ok(stream)
+        }
+    }
+
+    /// Builds a stream for parallel scan.
+    fn build_parallel_stream(
+        &self,
+        partitions: Arc<PartitionQueue>,
+        record_batch_schema: arrow::datatypes::SchemaRef,
+        num_tasks: usize,
+    ) -> DfSendableRecordBatchStream {
+        let channel_size = if self.parallelism.channel_size == 0 {
+            DEFAULT_CHANNEL_SIZE
+        } else {
+            self.parallelism.channel_size
+        };
+        let (sender, receiver) = mpsc::channel(channel_size);
+        for _ in 0..num_tasks {
+            self.spawn_scan_task(partitions.clone(), sender.clone());
+        }
         let stream = ReceiverStream::new(receiver)
             .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
         let stream = RecordBatchStreamAdapter::new(record_batch_schema, stream);
+        Box::pin(stream)
+    }
 
-        Ok(Box::pin(stream))
+    /// Builds a stream to read in single thread.
+    fn build_single_thread_stream(
+        &self,
+        partitions: Arc<PartitionQueue>,
+        record_batch_schema: arrow::datatypes::SchemaRef,
+    ) -> DfSendableRecordBatchStream {
+        let stream = stream! {
+            while let Some(partition) = partitions.pop() {
+                let reader = partition.reader().await?;
+                for batch in reader {
+                    let batch = batch.context(ArrowReaderSnafu {
+                        path: partition.file_path(),
+                    })?;
+
+                    yield Ok(batch);
+                }
+            }
+        };
+
+        let stream =
+            stream.map_err(|e: Error| datafusion_common::DataFusionError::External(Box::new(e)));
+        let stream = RecordBatchStreamAdapter::new(record_batch_schema, stream);
+        Box::pin(stream)
     }
 
     /// Builds and returns partitions to read.
