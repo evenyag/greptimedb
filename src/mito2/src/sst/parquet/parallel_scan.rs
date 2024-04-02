@@ -33,6 +33,7 @@ use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use snafu::ResultExt;
 use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
+use store_api::storage::consts::is_internal_column;
 use store_api::storage::{ColumnId, RegionId};
 use table::predicate::Predicate;
 use tokio::sync::mpsc;
@@ -283,6 +284,10 @@ fn infer_region_metadata(file: File, region_id: RegionId) -> RegionMetadataRef {
     let mut column_id = 0;
     let mut primary_key = Vec::new();
     for field in schema.fields() {
+        if is_internal_column(field.name()) {
+            continue;
+        }
+
         let semantic_type = infer_semantic_type(field);
         if semantic_type == SemanticType::Tag {
             primary_key.push(column_id);
