@@ -44,6 +44,7 @@ use crate::error::{ArrowReaderSnafu, Result};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::scan_region::ScanParallism;
 use crate::sst::file::{FileHandle, FileId};
+use crate::sst::parquet::format::AppendReadFormat;
 use crate::sst::parquet::reader::{ParquetPartition, ParquetReaderBuilder};
 
 // TODO(yingwen): Read memtables.
@@ -151,25 +152,27 @@ impl RowGroupScan {
             self.spawn_scan_task(partitions.clone(), sender.clone());
         }
 
-        // TODO(yingwen): Error handling: id not exists, duplicate ids.
-        let mut project_indices: Vec<_> = if !self.projection.is_empty() {
-            self.projection
-                .iter()
-                .map(|column_id| self.metadata.column_index_by_id(*column_id).unwrap())
-                .collect()
+        // TODO(yingwen): For test we create a read format here.
+        let read_format = if self.projection.is_empty() {
+            AppendReadFormat::new(self.metadata.clone(), None)
         } else {
-            (0..self.metadata.column_metadatas.len()).collect()
+            AppendReadFormat::new(self.metadata.clone(), Some(&self.projection))
         };
-        project_indices.sort_unstable();
-        let record_batch_schema = self
-            .metadata
-            .schema
-            .arrow_schema()
-            .project(&project_indices)
-            .unwrap();
+        // TODO(yingwen): projection result.
+        let record_batch_schema = if !self.projection.is_empty() {
+            let project_indices = read_format.projection_indices();
+            Arc::new(
+                read_format
+                    .sst_arrow_schema()
+                    .project(&project_indices)
+                    .unwrap(),
+            )
+        } else {
+            read_format.sst_arrow_schema().clone()
+        };
         let stream = ReceiverStream::new(receiver)
             .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
-        let stream = RecordBatchStreamAdapter::new(Arc::new(record_batch_schema), stream);
+        let stream = RecordBatchStreamAdapter::new(record_batch_schema, stream);
 
         Ok(Box::pin(stream))
     }

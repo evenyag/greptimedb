@@ -118,6 +118,7 @@ impl WriteFormat {
 pub(crate) struct AppendReadFormat {
     metadata: RegionMetadataRef,
     projection: HashSet<ColumnId>,
+    sst_schema: SchemaRef,
 }
 
 impl AppendReadFormat {
@@ -133,9 +134,26 @@ impl AppendReadFormat {
                 .map(|column| column.column_id)
                 .collect(),
         };
+        let fields: Vec<_> = metadata
+            .schema
+            .arrow_schema()
+            .fields()
+            .iter()
+            .map(|field| field.clone())
+            .chain([
+                Arc::new(Field::new(
+                    SEQUENCE_COLUMN_NAME,
+                    ArrowDataType::UInt64,
+                    false,
+                )),
+                Arc::new(Field::new(OP_TYPE_COLUMN_NAME, ArrowDataType::UInt8, false)),
+            ])
+            .collect();
+
         AppendReadFormat {
             metadata,
             projection,
+            sst_schema: Arc::new(Schema::new(fields)),
         }
     }
 
@@ -157,7 +175,7 @@ impl AppendReadFormat {
     /// This schema is computed from the region metadata but should be the same
     /// as the arrow schema decoded from the file metadata.
     pub(crate) fn sst_arrow_schema(&self) -> &SchemaRef {
-        self.metadata.schema.arrow_schema()
+        &self.sst_schema
     }
 
     /// Gets the metadata of the SST.
