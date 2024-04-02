@@ -79,7 +79,7 @@ struct ScanArgs {
     #[arg(short, long)]
     input_path: String,
     /// Scan times.
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = 1)]
     times: usize,
     /// Use row group level scan.
     #[arg(long, default_value_t = false)]
