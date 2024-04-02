@@ -30,6 +30,7 @@ use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
+use futures::future::try_join_all;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -143,7 +144,7 @@ impl RowGroupScan {
 
     // For simplicity and performance, we use datafusion's stream.
     /// Builds a stream for the query.
-    pub async fn build_stream(&self) -> Result<DfSendableRecordBatchStream> {
+    pub async fn build_streams(&self) -> Result<Vec<DfSendableRecordBatchStream>> {
         let num_tasks = if self.parallelism.parallelism == 0 {
             1
         } else {
@@ -157,7 +158,6 @@ impl RowGroupScan {
         };
         let partitions = self.build_parquet_partitions().await?;
         let partitions = Arc::new(PartitionQueue::new(partitions));
-        // TODO(yingwen): projection result.
         let record_batch_schema = if !self.projection.is_empty() {
             let project_indices = read_format.projection_indices();
             Arc::new(
@@ -170,34 +170,16 @@ impl RowGroupScan {
             read_format.sst_arrow_schema().clone()
         };
         if num_tasks > 0 {
-            let stream = self.build_parallel_stream(partitions, record_batch_schema, num_tasks);
-            Ok(stream)
+            let streams: Vec<_> = (0..num_tasks)
+                .map(|_| {
+                    self.build_single_thread_stream(partitions.clone(), record_batch_schema.clone())
+                })
+                .collect();
+            Ok(streams)
         } else {
             let stream = self.build_single_thread_stream(partitions, record_batch_schema);
-            Ok(stream)
+            Ok(vec![stream])
         }
-    }
-
-    /// Builds a stream for parallel scan.
-    fn build_parallel_stream(
-        &self,
-        partitions: Arc<PartitionQueue>,
-        record_batch_schema: arrow::datatypes::SchemaRef,
-        num_tasks: usize,
-    ) -> DfSendableRecordBatchStream {
-        let channel_size = if self.parallelism.channel_size == 0 {
-            DEFAULT_CHANNEL_SIZE
-        } else {
-            self.parallelism.channel_size
-        };
-        let (sender, receiver) = mpsc::channel(channel_size);
-        for _ in 0..num_tasks {
-            self.spawn_scan_task(partitions.clone(), sender.clone());
-        }
-        let stream = ReceiverStream::new(receiver)
-            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)));
-        let stream = RecordBatchStreamAdapter::new(record_batch_schema, stream);
-        Box::pin(stream)
     }
 
     /// Builds a stream to read in single thread.
@@ -439,20 +421,35 @@ pub async fn parallel_scan_file(
     let metadata = infer_region_metadata(file, region_id);
 
     let now = Instant::now();
-    let mut metrics = ScanMetrics::default();
+    let mut final_metrics = ScanMetrics::default();
 
     let file_handle = new_file_handle(region_id, file_size);
     let scan = RowGroupScan::new(file_path.to_string(), object_store.clone(), metadata)
         .with_files(vec![file_handle])
         .with_parallelism(parallelism)
         .with_parallelism_channel_size(channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE));
-    let mut stream = scan.build_stream().await?;
-    while let Some(batch) = stream.try_next().await.unwrap() {
-        metrics.num_batches += 1;
-        metrics.num_rows += batch.num_rows();
-        metrics.num_columns = batch.num_columns();
-    }
-    metrics.scan_cost = now.elapsed();
+    let streams = scan.build_streams().await?;
+    let mut futures = Vec::with_capacity(streams.len());
+    for mut stream in streams {
+        let future = tokio::spawn(async move {
+            let mut metrics = ScanMetrics::default();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                metrics.num_batches += 1;
+                metrics.num_rows += batch.num_rows();
+                metrics.num_columns = batch.num_columns();
+            }
 
-    Ok(metrics)
+            metrics
+        });
+        futures.push(future);
+    }
+    let task_metrics = try_join_all(futures).await.unwrap();
+    for metrics in task_metrics {
+        final_metrics.num_batches += metrics.num_batches;
+        final_metrics.num_rows += metrics.num_rows;
+        final_metrics.num_columns = metrics.num_columns;
+    }
+    final_metrics.scan_cost = now.elapsed();
+
+    Ok(final_metrics)
 }
