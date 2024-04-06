@@ -15,7 +15,7 @@
 //! Scans row groups in parallel.
 
 use std::collections::VecDeque;
-use std::fs::File;
+use std::fs::{self, File};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,6 @@ use store_api::storage::consts::is_internal_column;
 use store_api::storage::{ColumnId, RegionId};
 use table::predicate::Predicate;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cache::CacheManagerRef;
 use crate::error::{ArrowReaderSnafu, Error, Result};
@@ -252,6 +251,7 @@ impl RowGroupScan {
         Ok(partitions)
     }
 
+    #[allow(dead_code)]
     fn spawn_scan_task(
         &self,
         partitions: Arc<PartitionQueue>,
@@ -421,14 +421,40 @@ pub async fn parallel_scan_file(
     let metadata = infer_region_metadata(file, region_id);
 
     let now = Instant::now();
-    let mut final_metrics = ScanMetrics::default();
-
     let file_handle = new_file_handle(region_id, file_size);
     let scan = RowGroupScan::new(file_path.to_string(), object_store.clone(), metadata)
         .with_files(vec![file_handle])
         .with_parallelism(parallelism)
         .with_parallelism_channel_size(channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE));
     let streams = scan.build_streams().await?;
+    let final_metrics = scan_streams(streams, now).await;
+
+    Ok(final_metrics)
+}
+
+/// Scans directory in parallel.
+pub async fn parallel_scan_dir(
+    file_dir: &str,
+    object_store: &ObjectStore,
+    parallelism: usize,
+) -> Result<ScanMetrics> {
+    let (metadata, file_handles) =
+        create_file_handles_and_infer_metadata(file_dir, RegionId::new(1, 1));
+    let Some(metadata) = metadata else {
+        return Ok(ScanMetrics::default());
+    };
+
+    let now = Instant::now();
+    let scan = RowGroupScan::new(file_dir.to_string(), object_store.clone(), metadata)
+        .with_files(file_handles)
+        .with_parallelism(parallelism);
+    let streams = scan.build_streams().await?;
+    let final_metrics = scan_streams(streams, now).await;
+
+    Ok(final_metrics)
+}
+
+async fn scan_streams(streams: Vec<DfSendableRecordBatchStream>, now: Instant) -> ScanMetrics {
     let mut futures = Vec::with_capacity(streams.len());
     for mut stream in streams {
         let future = tokio::spawn(async move {
@@ -443,6 +469,7 @@ pub async fn parallel_scan_file(
         });
         futures.push(future);
     }
+    let mut final_metrics = ScanMetrics::default();
     let task_metrics = try_join_all(futures).await.unwrap();
     for metrics in task_metrics {
         final_metrics.num_batches += metrics.num_batches;
@@ -451,5 +478,35 @@ pub async fn parallel_scan_file(
     }
     final_metrics.scan_cost = now.elapsed();
 
-    Ok(final_metrics)
+    final_metrics
+}
+
+/// Iterates files under the directory, infer the metadata of the first file
+/// and files sizes for all files. Creates file handles for all files based
+/// on their file sizes.
+/// Returns the file handles and the inferred metadata.
+pub fn create_file_handles_and_infer_metadata(
+    file_dir: &str,
+    region_id: RegionId,
+) -> (Option<RegionMetadataRef>, Vec<FileHandle>) {
+    // Gets file metadata and file sizes from the file directory.
+    let file_paths = fs::read_dir(file_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+
+    let mut file_handles = Vec::with_capacity(file_paths.len());
+    let mut metadata = None;
+    for file_path in file_paths {
+        let file = File::open(file_path).unwrap();
+        let file_size = infer_file_size(&file);
+        let file_handle = new_file_handle(region_id, file_size);
+        file_handles.push(file_handle);
+
+        if metadata.is_none() {
+            metadata = Some(infer_region_metadata(file, region_id));
+        }
+    }
+
+    (metadata, file_handles)
 }
