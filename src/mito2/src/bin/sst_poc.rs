@@ -14,12 +14,12 @@
 
 //! POC of the SST format.
 
-use std::path::Path;
-
 use clap::Parser;
 use mito2::sst::parquet::parallel_scan;
 use mito2::sst::rewrite::{rewrite_file, split_key};
-use mito2::sst::split_kv::{create_data_file, create_mark_file, create_pk_file, scan_file};
+use mito2::sst::split_kv::{
+    create_data_file, create_mark_file, create_pk_file, scan_dir, scan_file,
+};
 use object_store::services::Fs;
 use object_store::ObjectStore;
 
@@ -78,6 +78,12 @@ struct ScanArgs {
     /// Input file path.
     #[arg(short, long)]
     input_path: String,
+    /// Path to the input file.
+    #[arg(short, long)]
+    file: String,
+    /// Path to the input directory.
+    #[arg(short, long)]
+    directory: String,
     /// Scan times.
     #[arg(short, long, default_value_t = 1)]
     times: usize,
@@ -194,27 +200,56 @@ async fn run_create_mark(args: CreateArgs) {
 async fn run_scan(args: ScanArgs) {
     println!("Scan, args: {args:?}");
 
-    if args.input_path.is_empty() {
+    if args.file.is_empty() && args.directory.is_empty() {
         println!("File path is empty");
         return;
     }
+    if !args.file.is_empty() && !args.directory.is_empty() {
+        println!("Only specify one of file and directory");
+        return;
+    }
+    let channel_size = if args.channel_size == 0 {
+        None
+    } else {
+        Some(args.channel_size)
+    };
 
     let store = new_fs_store();
     if args.row_group_parallel {
-        let channel_size = if args.channel_size == 0 {
-            None
+        if !args.file.is_empty() {
+            for _ in 0..args.times {
+                match parallel_scan::parallel_scan_file(&args.file, &store, args.jobs, channel_size)
+                    .await
+                {
+                    Ok(metrics) => {
+                        println!("Scan metrics: {:?}", metrics);
+                    }
+                    Err(e) => {
+                        println!("Failed to scan file, {e:?}");
+                        return;
+                    }
+                }
+            }
         } else {
-            Some(args.channel_size)
-        };
+            for _ in 0..args.times {
+                match parallel_scan::parallel_scan_dir(&args.directory, &store, args.jobs).await {
+                    Ok(metrics) => {
+                        println!("Scan metrics: {:?}", metrics);
+                    }
+                    Err(e) => {
+                        println!("Failed to scan directory, {e:?}");
+                        return;
+                    }
+                }
+            }
+        }
+
+        return;
+    }
+
+    if !args.file.is_empty() {
         for _ in 0..args.times {
-            match parallel_scan::parallel_scan_file(
-                &args.input_path,
-                &store,
-                args.jobs,
-                channel_size,
-            )
-            .await
-            {
+            match scan_file(&args.file, &store).await {
                 Ok(metrics) => {
                     println!("Scan metrics: {:?}", metrics);
                 }
@@ -224,32 +259,16 @@ async fn run_scan(args: ScanArgs) {
                 }
             }
         }
-
-        return;
-    }
-
-    let path = Path::new(&args.input_path);
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        println!("File name is empty");
-        return;
-    };
-    let Some(file_id) = file_name.split('.').next() else {
-        println!("File id is empty");
-        return;
-    };
-    let Some(input_dir) = path.to_str().and_then(|path| path.strip_suffix(file_name)) else {
-        println!("Path is empty");
-        return;
-    };
-
-    for _ in 0..args.times {
-        match scan_file(input_dir, file_id, &store).await {
-            Ok(metrics) => {
-                println!("Scan metrics: {:?}", metrics);
-            }
-            Err(e) => {
-                println!("Failed to scan file, {e:?}");
-                return;
+    } else {
+        for _ in 0..args.times {
+            match scan_dir(&args.directory, &store, args.jobs, channel_size).await {
+                Ok(metrics) => {
+                    println!("Scan metrics: {:?}", metrics);
+                }
+                Err(e) => {
+                    println!("Failed to scan directory, {e:?}");
+                    return;
+                }
             }
         }
     }

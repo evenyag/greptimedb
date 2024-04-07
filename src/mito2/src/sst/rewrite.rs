@@ -32,6 +32,7 @@ use parquet::schema::types::ColumnPath;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::{OP_TYPE_COLUMN_NAME, SEQUENCE_COLUMN_NAME};
+use store_api::storage::RegionId;
 
 use crate::error::{ReadParquetSnafu, Result, WriteBufferSnafu};
 use crate::read::{Batch, BatchReader};
@@ -282,7 +283,7 @@ pub async fn split_key(
     output_path: &str,
     object_store: &ObjectStore,
 ) -> Result<WriterMetrics> {
-    let file_handle = new_file_handle(file_id)?;
+    let file_handle = new_file_handle(file_id, RegionId::new(1, 1))?;
     let reader =
         ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
             .build()

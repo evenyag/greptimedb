@@ -15,12 +15,14 @@
 //! Split key values.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_datasource::file_format::parquet::BufferedWriter;
+use common_test_util::temp_dir::create_temp_dir;
 use common_time::Timestamp;
 use datatypes::arrow::array::{ArrayBuilder, ArrayRef, BinaryArray, UInt64Array, UInt64Builder};
 use datatypes::arrow::datatypes::{
@@ -38,12 +40,20 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::{
     OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
 };
+use store_api::storage::RegionId;
+use tokio_stream::StreamExt;
 
+use super::parquet::parallel_scan::infer_region_metadata;
+use crate::access_layer::AccessLayer;
 use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result, WriteBufferSnafu};
+use crate::read::projection::ProjectionMapper;
+use crate::read::scan_region::{ScanInput, ScanParallism};
+use crate::read::seq_scan::SeqScan;
 use crate::read::{Batch, BatchReader};
 use crate::row_converter::{McmpRowCodec, RowCodec, SortField};
 use crate::sst::file::{FileHandle, FileId, FileMeta};
 use crate::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
+use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::parquet::reader::ParquetReaderBuilder;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
@@ -668,7 +678,7 @@ fn new_noop_file_purger() -> FilePurgerRef {
 }
 
 /// Creates a mock file handle to converting files.
-pub(crate) fn new_file_handle(file_id: &str) -> Result<FileHandle> {
+pub(crate) fn new_file_handle(file_id: &str, region_id: RegionId) -> Result<FileHandle> {
     let file_purger = new_noop_file_purger();
     let file_id = FileId::from_str(file_id).map_err(|e| {
         InvalidParquetSnafu {
@@ -680,7 +690,7 @@ pub(crate) fn new_file_handle(file_id: &str) -> Result<FileHandle> {
 
     Ok(FileHandle::new(
         FileMeta {
-            region_id: 0.into(),
+            region_id,
             file_id,
             time_range: (
                 Timestamp::new_millisecond(0),
@@ -705,7 +715,7 @@ pub async fn create_pk_file(
 ) -> Result<PkWriterMetrics> {
     let mut writer = PrimaryKeyFileWriter::new(output_path);
 
-    let file_handle = new_file_handle(file_id)?;
+    let file_handle = new_file_handle(file_id, RegionId::new(1, 1))?;
     let mut reader =
         ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
             .build()
@@ -730,7 +740,7 @@ pub async fn create_data_file(
     output_path: &str,
     object_store: &ObjectStore,
 ) -> Result<DataWriterMetrics> {
-    let file_handle = new_file_handle(file_id)?;
+    let file_handle = new_file_handle(file_id, RegionId::new(1, 1))?;
     let mut reader =
         ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
             .build()
@@ -753,7 +763,7 @@ pub async fn create_mark_file(
     output_path: &str,
     object_store: &ObjectStore,
 ) -> Result<MarkWriterMetrics> {
-    let file_handle = new_file_handle(file_id)?;
+    let file_handle = new_file_handle(file_id, RegionId::new(1, 1))?;
     let mut reader =
         ParquetReaderBuilder::new(input_dir.to_string(), file_handle, object_store.clone())
             .build()
@@ -768,15 +778,22 @@ pub async fn create_mark_file(
 }
 
 /// Scans the file.
-pub async fn scan_file(
-    input_dir: &str,
-    file_id: &str,
-    object_store: &ObjectStore,
-) -> Result<ScanMetrics> {
+pub async fn scan_file(input_path: &str, object_store: &ObjectStore) -> Result<ScanMetrics> {
+    let path = Path::new(&input_path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(ScanMetrics::default());
+    };
+    let Some(file_id) = file_name.split('.').next() else {
+        return Ok(ScanMetrics::default());
+    };
+    let Some(input_dir) = path.to_str().and_then(|path| path.strip_suffix(file_name)) else {
+        return Ok(ScanMetrics::default());
+    };
+
     let now = Instant::now();
     let mut metrics = ScanMetrics::default();
 
-    let file_handle = new_file_handle(file_id)?;
+    let file_handle = new_file_handle(file_id, RegionId::new(1, 1))?;
     let mut reader = ParquetReaderBuilder::new(
         input_dir.to_string(),
         file_handle.clone(),
@@ -791,4 +808,80 @@ pub async fn scan_file(
     metrics.scan_cost = now.elapsed();
 
     Ok(metrics)
+}
+
+/// Scans the directory and merge inputs.
+pub async fn scan_dir(
+    input_dir: &str,
+    object_store: &ObjectStore,
+    parallelism: usize,
+    channel_size: Option<usize>,
+) -> Result<ScanMetrics> {
+    let temp_dir = create_temp_dir("scan");
+    let file_ids = collect_file_ids(input_dir);
+    let region_id = RegionId::new(1, 1);
+    let metadata = infer_metadata_from_dir(input_dir, region_id).unwrap();
+    let files = file_ids
+        .iter()
+        .map(|file_id| new_file_handle(&file_id, region_id))
+        .collect::<Result<Vec<_>>>()?;
+
+    let now = Instant::now();
+    let mut metrics = ScanMetrics::default();
+    let intermediate_manager =
+        IntermediateManager::init_fs(temp_dir.path().to_str().unwrap()).await?;
+    let access_layer = Arc::new(AccessLayer::new(
+        input_dir,
+        object_store.clone(),
+        intermediate_manager,
+    ));
+    let input = ScanInput::new(access_layer, ProjectionMapper::all(&metadata)?)
+        .with_files(files)
+        .with_parallelism(ScanParallism {
+            parallelism,
+            channel_size: channel_size.unwrap_or(64),
+        });
+    let mut stream = SeqScan::new(input).build_stream().await?;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        metrics.num_batches += 1;
+        metrics.num_rows += batch.num_rows();
+    }
+    metrics.scan_cost = now.elapsed();
+    Ok(metrics)
+}
+
+/// Collects file ids from the directory.
+/// Returns a list of file ids.
+fn collect_file_ids(path: &str) -> Vec<String> {
+    let mut file_ids = vec![];
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(file_id) = parse_file_name(&path) {
+            file_ids.push(file_id);
+        }
+    }
+    file_ids
+}
+
+/// Infers metadata from the directory.
+fn infer_metadata_from_dir(path: &str, region_id: RegionId) -> Option<RegionMetadataRef> {
+    let mut entries = std::fs::read_dir(path).unwrap();
+    entries.next().map(|entry| {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let file = std::fs::File::open(path).unwrap();
+        infer_region_metadata(file, region_id)
+    })
+}
+
+/// Parses the file path to get the file id string.
+/// Returns the file id or None if the file name is invalid.
+fn parse_file_name(path: &PathBuf) -> Option<String> {
+    let file_name = path.file_name().unwrap().to_str().unwrap();
+    let file_id_str = file_name.split('.').next()?;
+    Some(file_id_str.to_string())
 }
