@@ -75,9 +75,6 @@ struct CreateArgs {
 #[derive(Debug, clap::Args)]
 #[command(author, version, about, long_about = None)]
 struct ScanArgs {
-    /// Input file path.
-    #[arg(short, long)]
-    input_path: String,
     /// Path to the input file.
     #[arg(short, long)]
     file: String,
