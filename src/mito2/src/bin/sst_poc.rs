@@ -76,10 +76,10 @@ struct CreateArgs {
 #[command(author, version, about, long_about = None)]
 struct ScanArgs {
     /// Path to the input file.
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = String::new())]
     file: String,
     /// Path to the input directory.
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = String::new())]
     directory: String,
     /// Scan times.
     #[arg(short, long, default_value_t = 1)]
