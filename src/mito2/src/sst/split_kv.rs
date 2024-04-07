@@ -43,7 +43,6 @@ use store_api::storage::consts::{
 use store_api::storage::RegionId;
 use tokio_stream::StreamExt;
 
-use super::parquet::parallel_scan::infer_region_metadata;
 use crate::access_layer::AccessLayer;
 use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result, WriteBufferSnafu};
 use crate::read::projection::ProjectionMapper;
@@ -819,8 +818,18 @@ pub async fn scan_dir(
 ) -> Result<ScanMetrics> {
     let temp_dir = create_temp_dir("scan");
     let file_ids = collect_file_ids(input_dir);
+    if file_ids.is_empty() {
+        return Ok(ScanMetrics::default());
+    }
+
     let region_id = RegionId::new(1, 1);
-    let metadata = infer_metadata_from_dir(input_dir, region_id).unwrap();
+    let metadata = infer_metadata_from_dir(
+        input_dir,
+        file_ids.first().unwrap(),
+        object_store,
+        region_id,
+    )
+    .await?;
     let files = file_ids
         .iter()
         .map(|file_id| new_file_handle(&file_id, region_id))
@@ -867,15 +876,19 @@ fn collect_file_ids(path: &str) -> Vec<String> {
     file_ids
 }
 
-/// Infers metadata from the directory.
-fn infer_metadata_from_dir(path: &str, region_id: RegionId) -> Option<RegionMetadataRef> {
-    let mut entries = std::fs::read_dir(path).unwrap();
-    entries.next().map(|entry| {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let file = std::fs::File::open(path).unwrap();
-        infer_region_metadata(file, region_id)
-    })
+/// Infers region metadata from the directory.
+/// It creates a parquet reader for the file id and gets the metadata from the reader.
+async fn infer_metadata_from_dir(
+    path: &str,
+    file_id: &str,
+    object_store: &ObjectStore,
+    region_id: RegionId,
+) -> Result<RegionMetadataRef> {
+    let file_handle = new_file_handle(file_id, region_id)?;
+    let reader = ParquetReaderBuilder::new(path.to_string(), file_handle, object_store.clone())
+        .build()
+        .await?;
+    Ok(reader.metadata().clone())
 }
 
 /// Parses the file path to get the file id string.
