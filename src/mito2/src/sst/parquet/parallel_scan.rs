@@ -316,7 +316,8 @@ pub struct ScanMetrics {
     pub num_columns: usize,
 }
 
-fn infer_region_metadata(file: File, region_id: RegionId) -> RegionMetadataRef {
+/// Infers the metadata of the region from a file.
+pub(crate) fn infer_region_metadata(file: File, region_id: RegionId) -> RegionMetadataRef {
     let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
     let schema = reader.schema();
 
