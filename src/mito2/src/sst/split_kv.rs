@@ -344,6 +344,8 @@ pub struct ScanMetrics {
     pub num_rows: usize,
     /// Number of files.
     pub num_files: usize,
+    /// Number of bytes of batches read.
+    pub batch_bytes: usize,
 }
 
 /// A writer to write a data file from batches.
@@ -858,6 +860,7 @@ pub async fn scan_dir(
     while let Some(batch) = stream.try_next().await.unwrap() {
         metrics.num_batches += 1;
         metrics.num_rows += batch.num_rows();
+        metrics.batch_bytes += batch.df_record_batch().get_array_memory_size();
     }
     metrics.scan_cost = now.elapsed();
     Ok(metrics)
