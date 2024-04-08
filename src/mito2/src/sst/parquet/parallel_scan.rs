@@ -314,6 +314,8 @@ pub struct ScanMetrics {
     pub num_rows: usize,
     /// Number of columns.
     pub num_columns: usize,
+    /// Number of files.
+    pub num_files: usize,
 }
 
 /// Infers the metadata of the region from a file.
@@ -428,7 +430,8 @@ pub async fn parallel_scan_file(
         .with_parallelism(parallelism)
         .with_parallelism_channel_size(channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE));
     let streams = scan.build_streams().await?;
-    let final_metrics = scan_streams(streams, now).await;
+    let mut final_metrics = scan_streams(streams, now).await;
+    final_metrics.num_files = 1;
 
     Ok(final_metrics)
 }
@@ -446,11 +449,13 @@ pub async fn parallel_scan_dir(
     };
 
     let now = Instant::now();
+    let num_files = file_handles.len();
     let scan = RowGroupScan::new(file_dir.to_string(), object_store.clone(), metadata)
         .with_files(file_handles)
         .with_parallelism(parallelism);
     let streams = scan.build_streams().await?;
-    let final_metrics = scan_streams(streams, now).await;
+    let mut final_metrics = scan_streams(streams, now).await;
+    final_metrics.num_files = num_files;
 
     Ok(final_metrics)
 }
