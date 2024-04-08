@@ -807,6 +807,12 @@ pub async fn scan_file(input_path: &str, object_store: &ObjectStore) -> Result<S
     while let Some(batch) = reader.next_batch().await? {
         metrics.num_batches += 1;
         metrics.num_rows += batch.num_rows();
+        metrics.batch_bytes += batch.primary_key().len()
+            + batch
+                .fields()
+                .iter()
+                .map(|col| col.data.memory_size())
+                .sum::<usize>();
     }
     metrics.num_files = 1;
     metrics.scan_cost = now.elapsed();
