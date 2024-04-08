@@ -41,7 +41,6 @@ use store_api::storage::consts::{
     OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
 };
 use store_api::storage::RegionId;
-use tokio_stream::StreamExt;
 
 use crate::access_layer::AccessLayer;
 use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result, WriteBufferSnafu};
@@ -862,11 +861,16 @@ pub async fn scan_dir(
             parallelism,
             channel_size: channel_size.unwrap_or(64),
         });
-    let mut stream = SeqScan::new(input).build_stream().await?;
-    while let Some(batch) = stream.try_next().await.unwrap() {
+    let mut reader = SeqScan::new(input).build_reader().await?;
+    while let Some(batch) = reader.next_batch().await? {
         metrics.num_batches += 1;
         metrics.num_rows += batch.num_rows();
-        metrics.batch_bytes += batch.df_record_batch().get_array_memory_size();
+        metrics.batch_bytes += batch.primary_key().len()
+            + batch
+                .fields()
+                .iter()
+                .map(|col| col.data.memory_size())
+                .sum::<usize>();
     }
     metrics.scan_cost = now.elapsed();
     Ok(metrics)
