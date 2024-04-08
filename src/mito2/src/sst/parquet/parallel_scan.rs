@@ -316,6 +316,8 @@ pub struct ScanMetrics {
     pub num_columns: usize,
     /// Number of files.
     pub num_files: usize,
+    /// Total bytes of batches read.
+    pub batch_bytes: usize,
 }
 
 /// Infers the metadata of the region from a file.
@@ -469,6 +471,7 @@ async fn scan_streams(streams: Vec<DfSendableRecordBatchStream>, now: Instant) -
                 metrics.num_batches += 1;
                 metrics.num_rows += batch.num_rows();
                 metrics.num_columns = batch.num_columns();
+                metrics.batch_bytes += batch.get_array_memory_size();
             }
 
             metrics
@@ -481,6 +484,7 @@ async fn scan_streams(streams: Vec<DfSendableRecordBatchStream>, now: Instant) -
         final_metrics.num_batches += metrics.num_batches;
         final_metrics.num_rows += metrics.num_rows;
         final_metrics.num_columns = metrics.num_columns;
+        final_metrics.batch_bytes += metrics.batch_bytes;
     }
     final_metrics.scan_cost = now.elapsed();
 
