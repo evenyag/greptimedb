@@ -342,6 +342,8 @@ pub struct ScanMetrics {
     pub num_batches: usize,
     /// Number of rows.
     pub num_rows: usize,
+    /// Number of files.
+    pub num_files: usize,
 }
 
 /// A writer to write a data file from batches.
@@ -804,6 +806,7 @@ pub async fn scan_file(input_path: &str, object_store: &ObjectStore) -> Result<S
         metrics.num_batches += 1;
         metrics.num_rows += batch.num_rows();
     }
+    metrics.num_files = 1;
     metrics.scan_cost = now.elapsed();
 
     Ok(metrics)
@@ -837,6 +840,7 @@ pub async fn scan_dir(
 
     let now = Instant::now();
     let mut metrics = ScanMetrics::default();
+    metrics.num_files = files.len();
     let intermediate_manager =
         IntermediateManager::init_fs(temp_dir.path().to_str().unwrap()).await?;
     let access_layer = Arc::new(AccessLayer::new(
