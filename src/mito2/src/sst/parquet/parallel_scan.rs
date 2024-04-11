@@ -444,7 +444,7 @@ pub async fn parallel_scan_dir(
     object_store: &ObjectStore,
     parallelism: usize,
 ) -> Result<ScanMetrics> {
-    let (metadata, file_handles) =
+    let (metadata, file_handles, file_paths) =
         create_file_handles_and_infer_metadata(file_dir, RegionId::new(1, 1));
     let Some(metadata) = metadata else {
         return Ok(ScanMetrics::default());
@@ -494,20 +494,20 @@ async fn scan_streams(streams: Vec<DfSendableRecordBatchStream>, now: Instant) -
 /// Iterates files under the directory, infer the metadata of the first file
 /// and files sizes for all files. Creates file handles for all files based
 /// on their file sizes.
-/// Returns the file handles and the inferred metadata.
+/// Returns the file handles, file paths and the inferred metadata.
 pub fn create_file_handles_and_infer_metadata(
     file_dir: &str,
     region_id: RegionId,
-) -> (Option<RegionMetadataRef>, Vec<FileHandle>) {
+) -> (Option<RegionMetadataRef>, Vec<FileHandle>, Vec<String>) {
     // Gets file metadata and file sizes from the file directory.
     let file_paths = fs::read_dir(file_dir)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
+        .map(|entry| entry.unwrap().path().to_str().unwrap().to_string())
         .collect::<Vec<_>>();
 
     let mut file_handles = Vec::with_capacity(file_paths.len());
     let mut metadata = None;
-    for file_path in file_paths {
+    for file_path in &file_paths {
         let file = File::open(file_path).unwrap();
         let file_size = infer_file_size(&file);
         let file_handle = new_file_handle(region_id, file_size);
@@ -518,5 +518,5 @@ pub fn create_file_handles_and_infer_metadata(
         }
     }
 
-    (metadata, file_handles)
+    (metadata, file_handles, file_paths)
 }
