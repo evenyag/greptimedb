@@ -54,8 +54,8 @@ const DEFAULT_CHANNEL_SIZE: usize = 32;
 // TODO(yingwen): Read memtables.
 /// Parallel row group scanner.
 pub struct RowGroupScan {
-    /// Directory of the file.
-    file_dir: String,
+    /// Paths of files.
+    file_paths: Vec<String>,
     /// Object store.
     object_store: ObjectStore,
     /// Latest region metadata.
@@ -78,9 +78,13 @@ pub struct RowGroupScan {
 
 impl RowGroupScan {
     /// Creates a new row group scan.
-    pub fn new(file_dir: String, object_store: ObjectStore, metadata: RegionMetadataRef) -> Self {
+    pub fn new(
+        file_paths: Vec<String>,
+        object_store: ObjectStore,
+        metadata: RegionMetadataRef,
+    ) -> Self {
         Self {
-            file_dir,
+            file_paths,
             object_store,
             metadata,
             projection: vec![],
@@ -214,11 +218,11 @@ impl RowGroupScan {
             Some(self.projection.clone())
         };
         let mut partitions = VecDeque::with_capacity(self.files.len());
-        for file in &self.files {
+        for (file, file_path) in self.files.iter().zip(&self.file_paths) {
             // TODO(yingwen); Read and prune in parallel.
 
             let maybe_parts = ParquetReaderBuilder::new(
-                self.file_dir.clone(),
+                file_path.clone(),
                 file.clone(),
                 self.object_store.clone(),
             )
@@ -427,7 +431,7 @@ pub async fn parallel_scan_file(
 
     let now = Instant::now();
     let file_handle = new_file_handle(region_id, file_size);
-    let scan = RowGroupScan::new(file_path.to_string(), object_store.clone(), metadata)
+    let scan = RowGroupScan::new(vec![file_path.to_string()], object_store.clone(), metadata)
         .with_files(vec![file_handle])
         .with_parallelism(parallelism)
         .with_parallelism_channel_size(channel_size.unwrap_or(DEFAULT_CHANNEL_SIZE));
@@ -452,7 +456,7 @@ pub async fn parallel_scan_dir(
 
     let now = Instant::now();
     let num_files = file_handles.len();
-    let scan = RowGroupScan::new(file_dir.to_string(), object_store.clone(), metadata)
+    let scan = RowGroupScan::new(file_paths, object_store.clone(), metadata)
         .with_files(file_handles)
         .with_parallelism(parallelism);
     let streams = scan.build_streams().await?;
