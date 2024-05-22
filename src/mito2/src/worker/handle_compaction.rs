@@ -65,6 +65,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         // compaction finished.
         request.on_success();
 
+        info!(
+            "Handle compaction finished, region: {}, worker: {}",
+            region_id, self.id
+        );
+
         // Schedule next compaction if necessary.
         self.compaction_scheduler
             .on_compaction_finished(region_id, &region.manifest_ctx);

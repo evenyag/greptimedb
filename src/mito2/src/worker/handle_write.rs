@@ -61,8 +61,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             self.stalled_requests.append(&mut write_requests);
             common_telemetry::info!(
                 "Worker {} stall {} write requests, total: {}",
-                request_num,
                 self.id,
+                request_num,
                 self.stalled_requests.requests.len(),
             );
             self.listener.on_write_stall();

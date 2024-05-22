@@ -69,7 +69,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         .create_or_open(&self.config, &self.wal)
         .await?;
 
-        info!("A new region created, region: {:?}", region.metadata());
+        info!(
+            "A new region created, region: {:?}, worker: {}",
+            region.metadata(),
+            self.id
+        );
 
         REGION_COUNT.inc();
 

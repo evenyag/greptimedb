@@ -262,6 +262,10 @@ impl RegionFlushTask {
 
         let worker_request = match self.flush_memtables(&version_data, version_control).await {
             Ok(()) => {
+                info!(
+                    "Flush region {} finished, tries to send notify",
+                    self.region_id
+                );
                 let flush_finished = FlushFinished {
                     region_id: self.region_id,
                     // The last entry has been flushed.

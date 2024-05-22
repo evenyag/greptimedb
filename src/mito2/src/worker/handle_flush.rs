@@ -203,8 +203,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Delete wal.
         info!(
-            "Region {} flush finished, tries to bump wal to {}",
-            region_id, request.flushed_entry_id
+            "Region {} flush finished, tries to bump wal to {}, worker: {}",
+            region_id, request.flushed_entry_id, self.id
         );
         if let Err(e) = self
             .wal
