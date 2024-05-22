@@ -56,8 +56,15 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         if self.write_buffer_manager.should_stall() && allow_stall {
-            self.stalled_requests.append(&mut write_requests);
+            let request_num = write_requests.len();
             WRITE_STALL_TOTAL.add(write_requests.len() as i64);
+            self.stalled_requests.append(&mut write_requests);
+            common_telemetry::info!(
+                "Worker {} stall {} write requests, total: {}",
+                request_num,
+                self.id,
+                self.stalled_requests.requests.len(),
+            );
             self.listener.on_write_stall();
             return;
         }
@@ -78,6 +85,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let mut wal_writer = self.wal.writer();
             for region_ctx in region_ctxs.values_mut() {
                 if let Err(e) = region_ctx.add_wal_entry(&mut wal_writer).map_err(Arc::new) {
+                    common_telemetry::error!(e; "Failed to add wal entry");
                     region_ctx.set_error(e);
                 }
             }
@@ -92,6 +100,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     }
                 }
                 Err(e) => {
+                    common_telemetry::error!(e; "Failed to write to entry");
                     // Failed to write wal.
                     for mut region_ctx in region_ctxs.into_values() {
                         region_ctx.set_error(e.clone());

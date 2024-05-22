@@ -500,6 +500,9 @@ impl FlushScheduler {
             self.region_status.remove(&region_id);
             return Err(e);
         }
+
+        info!("Submit a flush job for region {}", region_id);
+
         // Submit a flush job.
         let job = task.into_flush_job(version_control);
         if let Err(e) = self.scheduler.schedule(job) {

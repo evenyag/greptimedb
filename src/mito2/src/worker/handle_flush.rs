@@ -223,6 +223,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         if let Some((ddl_requests, write_requests)) =
             self.flush_scheduler.on_flush_success(region_id)
         {
+            info!(
+                "Try to handle {} ddl_requests and {} write requests after flush {}",
+                ddl_requests.len(),
+                write_requests.len(),
+                region_id,
+            );
             // Perform DDLs first because they require empty memtables.
             self.handle_ddl_requests(ddl_requests).await;
             // Handle pending write requests, we don't stall these requests.
@@ -230,6 +236,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Handle stalled requests.
+        common_telemetry::info!(
+            "Worker {} tries to write {} stalled requests",
+            self.id,
+            self.stalled_requests.requests.len(),
+        );
         let stalled = std::mem::take(&mut self.stalled_requests);
         WRITE_STALL_TOTAL.sub(stalled.requests.len() as i64);
         // We already stalled these requests, don't stall them again.

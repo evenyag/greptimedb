@@ -249,7 +249,12 @@ impl EngineInner {
         let (request, receiver) = WorkerRequest::try_from_region_request(region_id, request)?;
         self.workers.submit_to_worker(region_id, request).await?;
 
-        receiver.await.context(RecvSnafu)?
+        receiver
+            .await
+            .inspect_err(|_| {
+                common_telemetry::error!("Failed to handle request for region {}", region_id)
+            })
+            .context(RecvSnafu)?
     }
 
     /// Handles the scan `request` and returns a [ScanRegion].
