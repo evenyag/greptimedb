@@ -71,8 +71,8 @@ lazy_static! {
 
     // ------ Write related metrics
     /// Counter of stalled write requests.
-    pub static ref WRITE_STALL_TOTAL: IntCounter =
-        register_int_counter!("greptime_mito_write_stall_total", "mito write stall total").unwrap();
+    pub static ref WRITE_STALL_TOTAL: IntGauge =
+        register_int_gauge!("greptime_mito_write_stall_total", "mito write stall requests number").unwrap();
     /// Counter of rejected write requests.
     pub static ref WRITE_REJECT_TOTAL: IntCounter =
         register_int_counter!("greptime_mito_write_reject_total", "mito write reject total").unwrap();

@@ -24,6 +24,7 @@ use store_api::storage::RegionId;
 use crate::config::MitoConfig;
 use crate::error::Result;
 use crate::flush::{FlushReason, RegionFlushTask};
+use crate::metrics::WRITE_STALL_TOTAL;
 use crate::region::MitoRegionRef;
 use crate::request::{FlushFailed, FlushFinished, OnFailure, OptionOutputTx};
 use crate::worker::RegionWorkerLoop;
@@ -230,6 +231,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Handle stalled requests.
         let stalled = std::mem::take(&mut self.stalled_requests);
+        WRITE_STALL_TOTAL.sub(stalled.requests.len() as i64);
         // We already stalled these requests, don't stall them again.
         self.handle_write_requests(stalled.requests, false).await;
 

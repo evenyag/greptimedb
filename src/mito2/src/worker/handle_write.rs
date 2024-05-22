@@ -50,14 +50,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             reject_write_requests(write_requests);
             // Also reject all stalled requests.
             let stalled = std::mem::take(&mut self.stalled_requests);
+            WRITE_STALL_TOTAL.sub(stalled.requests.len() as i64);
             reject_write_requests(stalled.requests);
             return;
         }
 
         if self.write_buffer_manager.should_stall() && allow_stall {
-            WRITE_STALL_TOTAL.inc_by(write_requests.len() as u64);
-
             self.stalled_requests.append(&mut write_requests);
+            WRITE_STALL_TOTAL.add(write_requests.len() as i64);
             self.listener.on_write_stall();
             return;
         }
