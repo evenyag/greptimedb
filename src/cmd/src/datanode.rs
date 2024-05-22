@@ -21,6 +21,7 @@ use clap::Parser;
 use common_config::Configurable;
 use common_telemetry::info;
 use common_telemetry::logging::TracingOptions;
+use common_version::{short_version, version};
 use common_wal::config::DatanodeWalConfig;
 use datanode::config::DatanodeOptions;
 use datanode::datanode::{Datanode, DatanodeBuilder};
@@ -28,22 +29,29 @@ use datanode::service::DatanodeServiceBuilder;
 use meta_client::MetaClientOptions;
 use servers::Mode;
 use snafu::{OptionExt, ResultExt};
+use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{
     LoadLayeredConfigSnafu, MissingConfigSnafu, Result, ShutdownDatanodeSnafu, StartDatanodeSnafu,
 };
 use crate::options::GlobalOptions;
-use crate::App;
+use crate::{log_versions, App};
 
 pub const APP_NAME: &str = "greptime-datanode";
 
 pub struct Instance {
     datanode: Datanode,
+
+    // Keep the logging guard to prevent the worker from being dropped.
+    _guard: Vec<WorkerGuard>,
 }
 
 impl Instance {
-    pub fn new(datanode: Datanode) -> Self {
-        Self { datanode }
+    pub fn new(datanode: Datanode, guard: Vec<WorkerGuard>) -> Self {
+        Self {
+            datanode,
+            _guard: guard,
+        }
     }
 
     pub fn datanode_mut(&mut self) -> &mut Datanode {
@@ -227,12 +235,13 @@ impl StartCommand {
     }
 
     async fn build(&self, mut opts: DatanodeOptions) -> Result<Instance> {
-        let _guard = common_telemetry::init_global_logging(
+        let guard = common_telemetry::init_global_logging(
             APP_NAME,
             &opts.logging,
             &opts.tracing,
             opts.node_id.map(|x| x.to_string()),
         );
+        log_versions(version!(), short_version!());
 
         let plugins = plugins::setup_datanode_plugins(&mut opts)
             .await
@@ -272,7 +281,7 @@ impl StartCommand {
             .context(StartDatanodeSnafu)?;
         datanode.setup_services(services);
 
-        Ok(Instance::new(datanode))
+        Ok(Instance::new(datanode, guard))
     }
 }
 

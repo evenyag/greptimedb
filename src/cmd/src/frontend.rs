@@ -31,6 +31,7 @@ use common_meta::heartbeat::handler::HandlerGroupExecutor;
 use common_telemetry::info;
 use common_telemetry::logging::TracingOptions;
 use common_time::timezone::set_default_timezone;
+use common_version::{short_version, version};
 use frontend::frontend::FrontendOptions;
 use frontend::heartbeat::handler::invalidate_table_cache::InvalidateTableCacheHandler;
 use frontend::heartbeat::HeartbeatTask;
@@ -41,22 +42,29 @@ use meta_client::MetaClientOptions;
 use servers::tls::{TlsMode, TlsOption};
 use servers::Mode;
 use snafu::{OptionExt, ResultExt};
+use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{
     self, InitTimezoneSnafu, LoadLayeredConfigSnafu, MissingConfigSnafu, Result, StartFrontendSnafu,
 };
 use crate::options::GlobalOptions;
-use crate::App;
+use crate::{log_versions, App};
 
 pub struct Instance {
     frontend: FeInstance,
+
+    // Keep the logging guard to prevent the worker from being dropped.
+    _guard: Vec<WorkerGuard>,
 }
 
 pub const APP_NAME: &str = "greptime-frontend";
 
 impl Instance {
-    pub fn new(frontend: FeInstance) -> Self {
-        Self { frontend }
+    pub fn new(frontend: FeInstance, guard: Vec<WorkerGuard>) -> Self {
+        Self {
+            frontend,
+            _guard: guard,
+        }
     }
 
     pub fn mut_inner(&mut self) -> &mut FeInstance {
@@ -240,12 +248,13 @@ impl StartCommand {
     }
 
     async fn build(&self, mut opts: FrontendOptions) -> Result<Instance> {
-        let _guard = common_telemetry::init_global_logging(
+        let guard = common_telemetry::init_global_logging(
             APP_NAME,
             &opts.logging,
             &opts.tracing,
             opts.node_id.clone(),
         );
+        log_versions(version!(), short_version!());
 
         #[allow(clippy::unnecessary_mut_passed)]
         let plugins = plugins::setup_frontend_plugins(&mut opts)
@@ -356,7 +365,7 @@ impl StartCommand {
             .build_servers(opts, servers)
             .context(StartFrontendSnafu)?;
 
-        Ok(Instance::new(instance))
+        Ok(Instance::new(instance, guard))
     }
 }
 
