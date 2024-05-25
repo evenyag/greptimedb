@@ -54,10 +54,10 @@ enum SubCommand {
     Cli(cli::Command),
 }
 
-// #[cfg(not(any(feature = "jemalloc", feature = "scudo")))]
-// #[global_allocator]
-// static ALLOC: alloc_metrics::MetricAlloc<std::alloc::System> =
-//     alloc_metrics::MetricAlloc::new(std::alloc::System);
+#[cfg(not(any(feature = "jemalloc", feature = "scudo")))]
+#[global_allocator]
+static ALLOC: alloc_metrics::MetricAlloc<std::alloc::System> =
+    alloc_metrics::MetricAlloc::new(std::alloc::System);
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
