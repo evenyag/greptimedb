@@ -10,10 +10,8 @@ name = "greptime"
 path = "src/bin/greptime.rs"
 
 [features]
-default = ["system-alloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 scudo = ["dep:scudo"]
-system-alloc = []
 tokio-console = ["common-telemetry/tokio-console"]
 
 [lints]
