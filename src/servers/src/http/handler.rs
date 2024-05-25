@@ -277,6 +277,9 @@ pub async fn metrics(
     ALLOCATED_BYTES.set(metrics.allocated_bytes as i64);
     ALLOCATION_COUNT.set(metrics.allocations as i64);
 
+    #[cfg(feature = "scudo")]
+    scudo::GlobalScudoAllocator::print_stats();
+
     #[cfg(feature = "jemalloc")]
     if let Some(c) = crate::metrics::jemalloc::JEMALLOC_COLLECTOR.as_ref() {
         if let Err(e) = c.update() {
