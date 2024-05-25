@@ -9635,7 +9635,6 @@ dependencies = [
  "rustls-pki-types",
  "schemars",
  "script",
- "scudo",
  "serde",
  "serde_json",
  "session",
