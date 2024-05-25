@@ -65,6 +65,7 @@ static ALLOC: alloc_metrics::MetricAlloc<tikv_jemallocator::Jemalloc> =
     alloc_metrics::MetricAlloc::new(tikv_jemallocator::Jemalloc);
 
 #[cfg(feature = "scudo")]
+#[global_allocator]
 static ALLOC: alloc_metrics::MetricAlloc<scudo::GlobalScudoAllocator> =
     alloc_metrics::MetricAlloc::new(scudo::GlobalScudoAllocator);
 
