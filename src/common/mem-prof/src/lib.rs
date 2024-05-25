@@ -14,12 +14,12 @@
 
 pub mod error;
 
-#[cfg(not(windows))]
+#[cfg(feature = "jemalloc")]
 mod jemalloc;
-#[cfg(not(windows))]
+#[cfg(feature = "jemalloc")]
 pub use jemalloc::dump_profile;
 
-#[cfg(windows)]
+#[cfg(not(feature = "jemalloc"))]
 pub async fn dump_profile() -> error::Result<Vec<u8>> {
     error::ProfilingNotSupportedSnafu.fail()
 }

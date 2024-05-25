@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(windows))]
+#[cfg(feature = "jemalloc")]
 pub(crate) mod jemalloc;
 
 use std::task::{Context, Poll};

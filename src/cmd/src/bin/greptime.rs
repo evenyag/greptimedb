@@ -54,10 +54,15 @@ enum SubCommand {
     Cli(cli::Command),
 }
 
-#[cfg(not(windows))]
+#[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
 static ALLOC: alloc_metrics::MetricAlloc<std::alloc::System> =
     alloc_metrics::MetricAlloc::new(std::alloc::System);
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static ALLOC: alloc_metrics::MetricAlloc<tikv_jemallocator::Jemalloc> =
+    alloc_metrics::MetricAlloc::new(tikv_jemallocator::Jemalloc);
 
 #[tokio::main]
 async fn main() -> Result<()> {

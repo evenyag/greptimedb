@@ -470,7 +470,7 @@ pub enum Error {
         source: crate::http::pprof::nix::Error,
     },
 
-    #[cfg(not(windows))]
+    #[cfg(feature = "jemalloc")]
     #[snafu(display("Failed to update jemalloc metrics"))]
     UpdateJemallocMetrics {
         #[snafu(source)]
@@ -601,7 +601,7 @@ impl ErrorExt for Error {
 
             UnsupportedDataType { .. } => StatusCode::Unsupported,
 
-            #[cfg(not(windows))]
+            #[cfg(feature = "jemalloc")]
             UpdateJemallocMetrics { .. } => StatusCode::Internal,
 
             CollectRecordbatch { .. } => StatusCode::EngineExecuteQuery,

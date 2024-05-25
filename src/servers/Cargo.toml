@@ -6,7 +6,8 @@ license.workspace = true
 
 [features]
 dashboard = []
-mem-prof = ["dep:common-mem-prof"]
+mem-prof = ["dep:common-mem-prof", "jemalloc"]
+jemalloc = ["dep:tikv-jemalloc-ctl"]
 pprof = ["dep:pprof"]
 testing = []
 
@@ -15,6 +16,7 @@ workspace = true
 
 [dependencies]
 aide = { version = "0.9", features = ["axum"] }
+alloc-metrics = "0.1"
 api.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
@@ -104,10 +106,7 @@ tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.4", features = ["full"] }
 urlencoding = "2.1"
 zstd.workspace = true
-
-[target.'cfg(not(windows))'.dependencies]
-tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
-alloc-metrics = "0.1"
+tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"], optional = true }
 
 [dev-dependencies]
 auth = { workspace = true, features = ["testing"] }

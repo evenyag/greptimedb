@@ -277,7 +277,7 @@ pub async fn metrics(
     ALLOCATED_BYTES.set(metrics.allocated_bytes as i64);
     ALLOCATION_COUNT.set(metrics.allocations as i64);
 
-    #[cfg(not(windows))]
+    #[cfg(feature = "jemalloc")]
     if let Some(c) = crate::metrics::jemalloc::JEMALLOC_COLLECTOR.as_ref() {
         if let Err(e) = c.update() {
             common_telemetry::error!(e; "Failed to update jemalloc metrics");
