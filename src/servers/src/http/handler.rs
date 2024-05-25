@@ -43,6 +43,7 @@ use crate::http::{
     ApiState, Epoch, GreptimeOptionsConfigState, GreptimeQueryOutput, HttpRecordsOutput,
     HttpResponse, ResponseFormat,
 };
+use crate::metrics::{ALLOCATED_BYTES, ALLOCATION_COUNT};
 use crate::metrics_handler::MetricsHandler;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 
@@ -271,6 +272,10 @@ pub async fn metrics(
     // A default ProcessCollector is registered automatically in prometheus.
     // We do not need to explicitly collect process-related data.
     // But ProcessCollector only support on linux.
+
+    let metrics = alloc_metrics::global_metrics();
+    ALLOCATED_BYTES.set(metrics.allocated_bytes as i64);
+    ALLOCATION_COUNT.set(metrics.allocations as i64);
 
     #[cfg(not(windows))]
     if let Some(c) = crate::metrics::jemalloc::JEMALLOC_COLLECTOR.as_ref() {

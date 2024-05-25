@@ -56,7 +56,8 @@ enum SubCommand {
 
 #[cfg(not(windows))]
 #[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOC: alloc_metrics::MetricAlloc<tikv_jemallocator::Jemalloc> =
+    alloc_metrics::MetricAlloc::new(tikv_jemallocator::Jemalloc);
 
 #[tokio::main]
 async fn main() -> Result<()> {

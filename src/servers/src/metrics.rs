@@ -201,6 +201,17 @@ lazy_static! {
         vec![0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0, 300.0]
     )
     .unwrap();
+
+    pub static ref ALLOCATED_BYTES: IntGauge = register_int_gauge!(
+        "greptime_global_allocated_bytes",
+        "global allocated bytes from alloc-metrics"
+    )
+    .unwrap();
+    pub static ref ALLOCATION_COUNT: IntGauge = register_int_gauge!(
+        "greptime_global_allocation_count",
+        "global allocation count from alloc-metrics"
+    )
+    .unwrap();
 }
 
 // Based on https://github.com/hyperium/tonic/blob/master/examples/src/tower/server.rs

@@ -95,6 +95,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-metrics"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662c4b124f24704a2979dd8bb6a2971639bfc0c71f1cd87699fd79ca040cff8a"
+dependencies = [
+ "derive_more",
+ "spin 0.9.8",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1601,6 +1611,7 @@ dependencies = [
 name = "cmd"
 version = "0.8.0"
 dependencies = [
+ "alloc-metrics",
  "async-trait",
  "auth",
  "base64 0.21.7",
@@ -3368,6 +3379,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebcda35c7a396850a55ffeac740804b40ffec779b98fffbb1738f4033f0ee79e"
 dependencies = [
  "derive_builder_core 0.12.0",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "derive_more"
+version = "0.99.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fb810d30a7c1953f91334de7244731fc3f3c10d7fe163338a35b9f640960321"
+dependencies = [
+ "proc-macro2",
+ "quote",
  "syn 1.0.109",
 ]
 
@@ -9505,6 +9527,7 @@ name = "servers"
 version = "0.8.0"
 dependencies = [
  "aide",
+ "alloc-metrics",
  "api",
  "arrow",
  "arrow-flight",

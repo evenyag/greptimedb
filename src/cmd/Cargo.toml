@@ -78,6 +78,7 @@ tracing-appender = "0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.5"
+alloc-metrics = "0.1"
 
 [dev-dependencies]
 common-test-util.workspace = true

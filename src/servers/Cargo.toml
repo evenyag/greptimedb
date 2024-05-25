@@ -107,6 +107,7 @@ zstd.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemalloc-ctl = { version = "0.5", features = ["use_std"] }
+alloc-metrics = "0.1"
 
 [dev-dependencies]
 auth = { workspace = true, features = ["testing"] }
