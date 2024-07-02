@@ -27,7 +27,6 @@ use std::sync::Arc;
 use datatypes::value::Value;
 use datatypes::vectors::VectorRef;
 use moka::sync::Cache;
-use parquet::arrow::arrow_reader::RowSelection;
 use parquet::column::page::Page;
 use parquet::file::metadata::ParquetMetaData;
 use store_api::storage::{ConcreteDataType, RegionId};
@@ -36,6 +35,7 @@ use crate::cache::cache_size::parquet_meta_size;
 use crate::cache::file_cache::{FileType, IndexKey};
 use crate::cache::write_cache::WriteCacheRef;
 use crate::metrics::{CACHE_BYTES, CACHE_HIT, CACHE_MISS};
+use crate::read::Batch;
 use crate::sst::file::FileId;
 
 // Metrics type key for sst meta.
@@ -346,8 +346,8 @@ type TopKey = (FileId, usize);
 pub struct TopRows {
     /// Is last.
     pub last: bool,
-    /// Row selection.
-    pub selection: RowSelection,
+    /// Batches with last rows.
+    pub batches: Vec<Batch>,
 }
 
 /// Maps (region id, file id) to [ParquetMetaData].
