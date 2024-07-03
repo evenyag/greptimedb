@@ -39,7 +39,9 @@ use crate::read::{Batch, Source};
 use crate::sst::index::Indexer;
 use crate::sst::parquet::format::WriteFormat;
 use crate::sst::parquet::helper::parse_parquet_metadata;
-use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
+use crate::sst::parquet::{
+    SstInfo, WriteOptions, DEFAULT_DATA_PAGE_ROW_LIMIT, PARQUET_METADATA_KEY,
+};
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 /// Parquet SST writer.
@@ -224,7 +226,8 @@ where
                 .set_key_value_metadata(Some(vec![key_value_meta]))
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .set_encoding(Encoding::PLAIN)
-                .set_max_row_group_size(opts.row_group_size);
+                .set_max_row_group_size(opts.row_group_size)
+                .set_data_page_row_count_limit(DEFAULT_DATA_PAGE_ROW_LIMIT);
 
             let props_builder = Self::customize_column_config(props_builder, &self.metadata);
             let writer_props = props_builder.build();
