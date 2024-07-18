@@ -198,6 +198,8 @@ impl MergeScanExec {
         let extensions = self.query_ctx.extensions();
         let target_partition = self.target_partition;
 
+        common_telemetry::info!("Merge scan to stream, partition: {partition}");
+
         let sub_sgate_metrics_moved = self.sub_stage_metrics.clone();
         let plan = self.plan.clone();
         let stream = Box::pin(stream!({
@@ -226,6 +228,9 @@ impl MergeScanExec {
                     region_id,
                     plan: plan.clone(),
                 };
+                common_telemetry::info!(
+                    "Merge scan do get, partition: {partition}, region_id: {region_id}"
+                );
                 let mut stream = region_query_handler
                     .do_get(request)
                     .await
@@ -240,6 +245,9 @@ impl MergeScanExec {
                 let mut poll_duration = Duration::new(0, 0);
 
                 let mut poll_timer = Instant::now();
+                common_telemetry::info!(
+                    "Merge scan start poll stream, partition: {partition}, region_id: {region_id}"
+                );
                 while let Some(batch) = stream.next().await {
                     let poll_elapsed = poll_timer.elapsed();
                     poll_duration += poll_elapsed;
@@ -256,6 +264,7 @@ impl MergeScanExec {
                     // reset poll timer
                     poll_timer = Instant::now();
                 }
+                common_telemetry::info!("Merge scan stop poll stream, partition: {partition}, region_id: {region_id}, poll_duration: {poll_duration:?}");
 
                 // process metrics after all data is drained.
                 if let Some(metrics) = stream.metrics() {
