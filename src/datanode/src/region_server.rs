@@ -834,6 +834,11 @@ impl RegionServerInner {
     pub async fn handle_read(&self, request: QueryRequest) -> Result<SendableRecordBatchStream> {
         // TODO(ruihang): add metrics and set trace id
 
+        common_telemetry::info!(
+            "Region server inner handle read, region_id: {}",
+            request.region_id
+        );
+
         // Build query context from gRPC header
         let query_ctx: QueryContextRef = request
             .header

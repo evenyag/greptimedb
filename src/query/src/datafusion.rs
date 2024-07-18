@@ -475,6 +475,7 @@ impl QueryExecutor for DatafusionQueryEngine {
                 Ok(Box::pin(EmptyRecordBatchStream::new(schema)))
             }
             1 => {
+                common_telemetry::info!("One output partition");
                 let df_stream = plan
                     .execute(0, task_ctx)
                     .context(error::DatafusionSnafu)
@@ -486,11 +487,16 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
                 let stream = OnDone::new(Box::pin(stream), move || {
-                    exec_timer.observe_duration();
+                    common_telemetry::info!(
+                        "One output partition finished, elapsed: {}",
+                        exec_timer.stop_and_record()
+                    );
+                    // exec_timer.observe_duration();
                 });
                 Ok(Box::pin(stream))
             }
-            _ => {
+            cnt => {
+                common_telemetry::info!("Output partition {cnt}");
                 // merge into a single partition
                 let merged_plan = CoalescePartitionsExec::new(plan.clone());
                 // CoalescePartitionsExec must produce a single partition
@@ -512,7 +518,12 @@ impl QueryExecutor for DatafusionQueryEngine {
                     .context(QueryExecutionSnafu)?;
                 stream.set_metrics2(plan.clone());
                 let stream = OnDone::new(Box::pin(stream), move || {
-                    exec_timer.observe_duration();
+                    common_telemetry::info!(
+                        "All {}, output partition finished, elapsed: {}",
+                        cnt,
+                        exec_timer.stop_and_record()
+                    );
+                    // exec_timer.observe_duration();
                 });
                 Ok(Box::pin(stream))
             }
