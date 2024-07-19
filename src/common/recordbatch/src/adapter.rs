@@ -253,11 +253,12 @@ impl Stream for RecordBatchStreamAdapter {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let create_time = self.create_time.unwrap();
-        common_telemetry::info!(
-            "RecordBatchStreamAdapter first poll elapsed: {}",
-            create_time.elapsed().as_secs_f64()
-        );
+        if let Some(create_time) = self.create_time.take() {
+            common_telemetry::info!(
+                "RecordBatchStreamAdapter first poll elapsed: {}",
+                create_time.elapsed().as_secs_f64()
+            );
+        }
         let timer = self
             .metrics
             .as_ref()
