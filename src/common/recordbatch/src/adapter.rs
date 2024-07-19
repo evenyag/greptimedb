@@ -182,6 +182,7 @@ pub struct RecordBatchStreamAdapter {
     /// Aggregated plan-level metrics. Resolved after an [ExecutionPlan] is finished.
     metrics_2: Metrics,
     poll_cost: Duration,
+    create_time: Option<Instant>,
 }
 
 /// Json encoded metrics. Contains metric from a whole plan tree.
@@ -201,6 +202,7 @@ impl RecordBatchStreamAdapter {
             metrics: None,
             metrics_2: Metrics::Unavailable,
             poll_cost: Duration::ZERO,
+            create_time: Some(Instant::now()),
         })
     }
 
@@ -217,6 +219,7 @@ impl RecordBatchStreamAdapter {
             metrics: Some(metrics),
             metrics_2: Metrics::Unresolved(df_plan),
             poll_cost: Duration::ZERO,
+            create_time: Some(Instant::now()),
         })
     }
 
@@ -250,6 +253,11 @@ impl Stream for RecordBatchStreamAdapter {
     type Item = Result<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let create_time = self.create_time.unwrap();
+        common_telemetry::info!(
+            "RecordBatchStreamAdapter first poll elapsed: {}",
+            create_time.elapsed().as_secs_f64()
+        );
         let timer = self
             .metrics
             .as_ref()
