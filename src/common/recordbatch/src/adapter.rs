@@ -275,7 +275,7 @@ impl Stream for RecordBatchStreamAdapter {
                 Poll::Ready(None)
             }
         };
-        self.poll_cost = now.elapsed();
+        self.poll_cost += now.elapsed();
         if let Poll::Ready(None) = &poll {
             common_telemetry::info!(
                 "RecordBatchStreamAdapter poll cost: {}",
