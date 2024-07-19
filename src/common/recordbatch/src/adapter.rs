@@ -18,6 +18,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef as DfSchemaRef;
@@ -180,6 +181,7 @@ pub struct RecordBatchStreamAdapter {
     metrics: Option<BaselineMetrics>,
     /// Aggregated plan-level metrics. Resolved after an [ExecutionPlan] is finished.
     metrics_2: Metrics,
+    poll_cost: Duration,
 }
 
 /// Json encoded metrics. Contains metric from a whole plan tree.
@@ -198,6 +200,7 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: None,
             metrics_2: Metrics::Unavailable,
+            poll_cost: Duration::ZERO,
         })
     }
 
@@ -213,6 +216,7 @@ impl RecordBatchStreamAdapter {
             stream,
             metrics: Some(metrics),
             metrics_2: Metrics::Unresolved(df_plan),
+            poll_cost: Duration::ZERO,
         })
     }
 
@@ -252,7 +256,8 @@ impl Stream for RecordBatchStreamAdapter {
             .map(|m| m.elapsed_compute().clone())
             .unwrap_or_default();
         let _guard = timer.timer();
-        match Pin::new(&mut self.stream).poll_next(cx) {
+        let now = Instant::now();
+        let poll = match Pin::new(&mut self.stream).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(df_record_batch)) => {
                 let df_record_batch = df_record_batch.context(error::PollStreamSnafu)?;
@@ -269,7 +274,9 @@ impl Stream for RecordBatchStreamAdapter {
                 }
                 Poll::Ready(None)
             }
-        }
+        };
+        self.poll_cost = now.elapsed();
+        poll
     }
 
     #[inline]
