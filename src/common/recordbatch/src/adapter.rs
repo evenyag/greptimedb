@@ -276,6 +276,12 @@ impl Stream for RecordBatchStreamAdapter {
             }
         };
         self.poll_cost = now.elapsed();
+        if let Poll::Ready(None) = &poll {
+            common_telemetry::info!(
+                "RecordBatchStreamAdapter poll cost: {}",
+                self.poll_cost.as_secs_f64(),
+            );
+        }
         poll
     }
 
