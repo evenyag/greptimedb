@@ -452,7 +452,11 @@ impl RegionScanner for SeqScan {
 
 impl DisplayAs for SeqScan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SeqScan: ")?;
+        write!(
+            f,
+            "SeqScan: region_id={}, ",
+            self.stream_ctx.input.mapper.metadata().region_id
+        )?;
         self.stream_ctx.format_for_explain(t, f)
     }
 }
