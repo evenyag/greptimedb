@@ -259,7 +259,7 @@ impl MergeScanExec {
                     // to remove metadata and correct column name
                     let batch = RecordBatch::new(schema.clone(), batch.columns().iter().cloned())?;
                     metric.record_output_batch_rows(batch.num_rows());
-                    if let Some(first_consume_timer) = first_consume_timer.as_mut().take() {
+                    if let Some(mut first_consume_timer) = first_consume_timer.take() {
                         first_consume_timer.stop();
                         first_consume_du = first_consume_start.elapsed();
                         common_telemetry::info!(
