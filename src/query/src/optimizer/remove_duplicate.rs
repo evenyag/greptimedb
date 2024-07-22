@@ -57,11 +57,12 @@ impl RemoveDuplicate {
                 {
                     // check child
                     let child = plan.children()[0].clone();
-                    common_telemetry::info!(
-                        "RemoveDuplicateRule: removed CoalesceBatchesExec or RepartitionExec"
-                    );
-                    return Ok(Transformed::yes(child));
-
+                    if child.as_any().downcast_ref::<RegionScanExec>().is_some() {
+                        common_telemetry::info!(
+                            "RemoveDuplicateRule: removed CoalesceBatchesExec or RepartitionExec"
+                        );
+                        return Ok(Transformed::yes(child));
+                    }
                     // if child.as_any().type_id() == plan.as_any().type_id() {
                     //     // remove child
                     //     let grand_child = child.children()[0].clone();
