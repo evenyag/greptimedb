@@ -425,6 +425,7 @@ impl SeqScan {
             part_list.set_parts(distributor.build_parts(input.parallelism.parallelism));
 
             metrics.observe_init_part(now.elapsed());
+            common_telemetry::info!("Seq scan maybe init parts done, cost: {:?}", now.elapsed());
         }
         Ok(())
     }
