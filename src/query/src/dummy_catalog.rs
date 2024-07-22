@@ -165,6 +165,8 @@ impl TableProvider for DummyTableProvider {
         request.filters = filters.to_vec();
         request.limit = limit;
 
+        common_telemetry::info!("DummyTableProvider scan, request: {:?}", request);
+
         let scanner = self
             .engine
             .handle_query(self.region_id, request)
