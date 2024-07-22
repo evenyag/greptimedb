@@ -263,7 +263,7 @@ impl MergeScanExec {
                         first_consume_timer.stop();
                         first_consume_du = first_consume_start.elapsed();
                         common_telemetry::info!(
-                            "Merge scan first consume, partition: {partition}, region_id: {region_id}"
+                            "Merge scan first consume, partition: {partition}, region_id: {region_id}, first_consume: {first_consume_du:?}"
                         );
                     }
                     yield Ok(batch);
