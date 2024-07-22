@@ -607,7 +607,9 @@ impl ScanInput {
         &self,
         collector: &mut impl FileRangeCollector,
     ) -> Result<()> {
+        let mut file_prune_costs = Vec::with_capacity(self.files.len());
         for file in &self.files {
+            let prune_start = Instant::now();
             let res = self
                 .access_layer
                 .read_sst(file.clone())
@@ -620,6 +622,7 @@ impl ScanInput {
                 .expected_metadata(Some(self.mapper.metadata().clone()))
                 .build_reader_input()
                 .await;
+            file_prune_costs.push((file.file_id(), prune_start.elapsed()));
             let (mut file_range_ctx, row_groups) = match res {
                 Ok(x) => x,
                 Err(e) => {
@@ -654,6 +657,12 @@ impl ScanInput {
         }
 
         READ_SST_COUNT.observe(self.files.len() as f64);
+
+        common_telemetry::info!(
+            "File prune cost for region {} is {:?}",
+            self.mapper.metadata().region_id,
+            file_prune_costs
+        );
 
         Ok(())
     }
