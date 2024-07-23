@@ -207,7 +207,7 @@ impl MergeScanExec {
             let _finish_timer = metric.finish_time().timer();
             let mut ready_timer = metric.ready_time().timer();
             let mut first_consume_timer = Some(metric.first_consume_time().timer());
-            let first_consume_start = Instant::now();
+            let mut first_consume_start = Some(Instant::now());
 
             for region_id in regions
                 .iter()
@@ -259,9 +259,11 @@ impl MergeScanExec {
                     // to remove metadata and correct column name
                     let batch = RecordBatch::new(schema.clone(), batch.columns().iter().cloned())?;
                     metric.record_output_batch_rows(batch.num_rows());
-                    if let Some(mut first_consume_timer) = first_consume_timer.take() {
+                    if let Some(first_consume_timer) = first_consume_timer.as_mut().take() {
                         first_consume_timer.stop();
-                        first_consume_du = first_consume_start.elapsed();
+                    }
+                    if let Some(start) = first_consume_start.take() {
+                        first_consume_du = start.elapsed();
                         common_telemetry::info!(
                             "Merge scan first consume, partition: {partition}, region_id: {region_id}, first_consume: {first_consume_du:?}"
                         );
@@ -270,7 +272,7 @@ impl MergeScanExec {
                     // reset poll timer
                     poll_timer = Instant::now();
                 }
-                common_telemetry::info!("Merge scan stop poll stream, partition: {partition}, region_id: {region_id}, poll_duration: {poll_duration:?}, first_consume: {first_consume_du:?}");
+                common_telemetry::info!("Merge scan stop poll stream, partition: {partition}, region_id: {region_id}, poll_duration: {poll_duration:?}, first_consume: {first_consume_du:?}, metric_first_consume: {}", metric.first_consume_time());
 
                 // process metrics after all data is drained.
                 if let Some(metrics) = stream.metrics() {
