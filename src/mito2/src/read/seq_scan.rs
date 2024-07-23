@@ -206,6 +206,7 @@ impl SeqScan {
             range_id,
             start.elapsed()
         );
+        drop(parts);
 
         let start = Instant::now();
         let ret = Self::build_reader_from_sources(stream_ctx, sources, semaphore).await;
