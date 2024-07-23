@@ -368,6 +368,7 @@ impl SeqScan {
                 };
                 let cache = stream_ctx.input.cache_manager.as_deref();
                 let mut fetch_start = Instant::now();
+                let mut yield_cost = Duration::ZERO;
                 while let Some(batch) = reader
                     .next_batch()
                     .await
@@ -381,7 +382,9 @@ impl SeqScan {
                     let convert_start = Instant::now();
                     let record_batch = stream_ctx.input.mapper.convert(&batch, cache)?;
                     metrics.convert_cost += convert_start.elapsed();
+                    let yield_start = Instant::now();
                     yield record_batch;
+                    yield_cost += yield_start.elapsed();
 
                     fetch_start = Instant::now();
                 }
@@ -390,11 +393,12 @@ impl SeqScan {
                 metrics.observe_metrics_on_finish();
 
                 common_telemetry::info!(
-                    "Seq scan finished, region_id: {:?}, partition: {}, metrics: {:?}, first_poll: {:?}",
+                    "Seq scan finished, region_id: {:?}, partition: {}, metrics: {:?}, first_poll: {:?}, yield_cost: {:?}",
                     stream_ctx.input.mapper.metadata().region_id,
                     partition,
                     metrics,
-                    first_poll
+                    first_poll,
+                    yield_cost,
                 );
             }
         };
