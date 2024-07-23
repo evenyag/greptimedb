@@ -190,16 +190,31 @@ impl SeqScan {
 
         let mut sources = Vec::new();
         let Some(part) = parts.get_part(range_id) else {
+            common_telemetry::info!(
+                "Build region: {}, range {} out of bound",
+                stream_ctx.input.mapper.metadata().region_id,
+                range_id,
+            );
             return Ok(None);
         };
 
         let start = Instant::now();
         Self::build_part_sources(part, &mut sources, stream_ctx.input.series_row_selector)?;
-        common_telemetry::info!("Build part sources cost: {:?}", start.elapsed());
+        common_telemetry::info!(
+            "Build region: {}, range_id: {}, part sources cost: {:?}",
+            stream_ctx.input.mapper.metadata().region_id,
+            range_id,
+            start.elapsed()
+        );
 
         let start = Instant::now();
         let ret = Self::build_reader_from_sources(stream_ctx, sources, semaphore).await;
-        common_telemetry::info!("Build reader from sources cost: {:?}", start.elapsed());
+        common_telemetry::info!(
+            "Build reader region: {}, range_id: {}, from sources cost: {:?}",
+            stream_ctx.input.mapper.metadata().region_id,
+            range_id,
+            start.elapsed()
+        );
 
         ret
     }
@@ -360,6 +375,13 @@ impl SeqScan {
             };
 
             for id in (0..parts_len).skip(partition).step_by(num_partitions) {
+                common_telemetry::info!(
+                    "Seq scan build reader begin, region_id: {:?}, partition: {}, id: {}, num_partitions: {}",
+                    stream_ctx.input.mapper.metadata().region_id,
+                    partition,
+                    id,
+                    num_partition,
+                );
                 let init_reader_start = Instant::now();
                 let maybe_reader = Self::build_merge_reader(
                     &stream_ctx,
@@ -375,9 +397,10 @@ impl SeqScan {
                 };
                 let init_reader_cost = init_reader_start.elapsed();
                 common_telemetry::info!(
-                    "Seq scan init reader, region_id: {:?}, partition: {}, init_reader_cost: {:?}",
+                    "Seq scan init reader, region_id: {:?}, partition: {}, id: {}, init_reader_cost: {:?}",
                     stream_ctx.input.mapper.metadata().region_id,
                     partition,
+                    id,
                     init_reader_cost,
                 );
                 let cache = stream_ctx.input.cache_manager.as_deref();
@@ -407,9 +430,10 @@ impl SeqScan {
                 metrics.observe_metrics_on_finish();
 
                 common_telemetry::info!(
-                    "Seq scan finished, region_id: {:?}, partition: {}, metrics: {:?}, first_poll: {:?}, yield_cost: {:?}, init_reader_cost: {:?}",
+                    "Seq scan finished, region_id: {:?}, partition: {}, id: {}, metrics: {:?}, first_poll: {:?}, yield_cost: {:?}, init_reader_cost: {:?}",
                     stream_ctx.input.mapper.metadata().region_id,
                     partition,
+                    id,
                     metrics,
                     first_poll,
                     yield_cost,
