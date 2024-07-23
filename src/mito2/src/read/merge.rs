@@ -20,7 +20,6 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use common_telemetry::debug;
 
 use crate::error::Result;
 use crate::memtable::BoxedBatchIterator;
@@ -84,7 +83,7 @@ impl BatchReader for MergeReader {
 
 impl Drop for MergeReader {
     fn drop(&mut self) {
-        debug!("Merge reader finished, metrics: {:?}", self.metrics);
+        common_telemetry::info!("Merge reader finished, metrics: {:?}", self.metrics);
 
         READ_STAGE_ELAPSED
             .with_label_values(&["merge"])

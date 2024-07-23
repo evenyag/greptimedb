@@ -216,6 +216,8 @@ impl SeqScan {
             start.elapsed()
         );
 
+        metrics.scan_cost += start.elapsed();
+
         ret
     }
 
