@@ -368,6 +368,12 @@ impl SeqScan {
                     return;
                 };
                 let init_reader_cost = init_reader_start.elapsed();
+                common_telemetry::info!(
+                    "Seq scan init reader, region_id: {:?}, partition: {}, init_reader_cost: {:?}",
+                    stream_ctx.input.mapper.metadata().region_id,
+                    partition,
+                    init_reader_cost,
+                );
                 let cache = stream_ctx.input.cache_manager.as_deref();
                 let mut fetch_start = Instant::now();
                 let mut yield_cost = Duration::ZERO;
