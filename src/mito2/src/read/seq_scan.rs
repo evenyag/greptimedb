@@ -354,6 +354,7 @@ impl SeqScan {
             };
 
             for id in (0..parts_len).skip(partition).step_by(num_partitions) {
+                let init_reader_start = Instant::now();
                 let maybe_reader = Self::build_merge_reader(
                     &stream_ctx,
                     id,
@@ -366,6 +367,7 @@ impl SeqScan {
                 let Some(mut reader) = maybe_reader else {
                     return;
                 };
+                let init_reader_cost = init_reader_start.elapsed();
                 let cache = stream_ctx.input.cache_manager.as_deref();
                 let mut fetch_start = Instant::now();
                 let mut yield_cost = Duration::ZERO;
@@ -393,12 +395,13 @@ impl SeqScan {
                 metrics.observe_metrics_on_finish();
 
                 common_telemetry::info!(
-                    "Seq scan finished, region_id: {:?}, partition: {}, metrics: {:?}, first_poll: {:?}, yield_cost: {:?}",
+                    "Seq scan finished, region_id: {:?}, partition: {}, metrics: {:?}, first_poll: {:?}, yield_cost: {:?}, init_reader_cost: {:?}",
                     stream_ctx.input.mapper.metadata().region_id,
                     partition,
                     metrics,
                     first_poll,
                     yield_cost,
+                    init_reader_cost,
                 );
             }
         };
