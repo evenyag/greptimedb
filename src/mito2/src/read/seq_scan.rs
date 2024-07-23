@@ -16,7 +16,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use common_error::ext::BoxedError;
