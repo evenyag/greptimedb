@@ -200,24 +200,15 @@ impl SeqScan {
 
         let start = Instant::now();
         Self::build_part_sources(part, &mut sources, stream_ctx.input.series_row_selector)?;
-        common_telemetry::info!(
-            "Build region: {}, range_id: {}, part sources cost: {:?}",
-            stream_ctx.input.mapper.metadata().region_id,
-            range_id,
-            start.elapsed()
-        );
         drop(parts);
 
-        let start = Instant::now();
         let ret = Self::build_reader_from_sources(stream_ctx, sources, semaphore).await;
         common_telemetry::info!(
-            "Build reader region: {}, range_id: {}, from sources cost: {:?}",
+            "Build reader region: {}, range_id: {}, from sources, build_reader_cost: {:?}",
             stream_ctx.input.mapper.metadata().region_id,
             range_id,
             start.elapsed()
         );
-
-        metrics.scan_cost += start.elapsed();
 
         ret
     }
