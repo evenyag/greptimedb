@@ -21,7 +21,6 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::Result as DfResult;
-use table::table::scan::RegionScanExec;
 
 /// This is [PhysicalOptimizerRule] to remove duplicate physical plans such as two
 /// adjoining [CoalesceBatchesExec] or [RepartitionExec]. They won't have any effect
@@ -57,12 +56,12 @@ impl RemoveDuplicate {
                 {
                     // check child
                     let child = plan.children()[0].clone();
-                    if child.as_any().downcast_ref::<RegionScanExec>().is_some() {
-                        common_telemetry::info!(
-                            "RemoveDuplicateRule: removed CoalesceBatchesExec or RepartitionExec"
-                        );
-                        return Ok(Transformed::yes(child));
-                    }
+                    // if child.as_any().downcast_ref::<RegionScanExec>().is_some() {
+                    //     common_telemetry::info!(
+                    //         "RemoveDuplicateRule: removed CoalesceBatchesExec or RepartitionExec"
+                    //     );
+                    //     return Ok(Transformed::yes(child));
+                    // }
                     if child.as_any().type_id() == plan.as_any().type_id() {
                         // remove child
                         let grand_child = child.children()[0].clone();
