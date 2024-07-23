@@ -380,7 +380,7 @@ impl SeqScan {
                     stream_ctx.input.mapper.metadata().region_id,
                     partition,
                     id,
-                    num_partition,
+                    num_partitions,
                 );
                 let init_reader_start = Instant::now();
                 let maybe_reader = Self::build_merge_reader(
