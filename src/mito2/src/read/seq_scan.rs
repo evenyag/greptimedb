@@ -193,9 +193,15 @@ impl SeqScan {
             return Ok(None);
         };
 
+        let start = Instant::now();
         Self::build_part_sources(part, &mut sources, stream_ctx.input.series_row_selector)?;
+        common_telemetry::info!("Build part sources cost: {:?}", start.elapsed());
 
-        Self::build_reader_from_sources(stream_ctx, sources, semaphore).await
+        let start = Instant::now();
+        let ret = Self::build_reader_from_sources(stream_ctx, sources, semaphore).await;
+        common_telemetry::info!("Build reader from sources cost: {:?}", start.elapsed());
+
+        ret
     }
 
     async fn build_reader_from_sources(
