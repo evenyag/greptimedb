@@ -25,13 +25,12 @@ use common_recordbatch::adapter::{MetricCollector, RecordBatchMetrics};
 use common_recordbatch::{DfRecordBatch, DfSendableRecordBatchStream};
 use datafusion::error::Result as DfResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     accept, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{internal_err, DataFusionError};
+use datafusion_common::DataFusionError;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use futures::StreamExt;
 
@@ -67,7 +66,8 @@ impl DistAnalyzeExec {
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
     fn compute_properties(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
         let eq_properties = EquivalenceProperties::new(schema);
-        let output_partitioning = Partitioning::UnknownPartitioning(1);
+        let output_partitioning =
+            Partitioning::UnknownPartitioning(input.output_partitioning().partition_count());
         let exec_mode = input.execution_mode();
         PlanProperties::new(eq_properties, output_partitioning, exec_mode)
     }
@@ -118,20 +118,22 @@ impl ExecutionPlan for DistAnalyzeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<DfSendableRecordBatchStream> {
-        if 0 != partition {
-            return internal_err!("AnalyzeExec invalid partition. Expected 0, got {partition}");
-        }
+        // if 0 != partition {
+        //     return internal_err!("AnalyzeExec invalid partition. Expected 0, got {partition}");
+        // }
+        common_telemetry::info!("Analyze Exec partition: {partition}");
 
         // Wrap the input plan using `CoalescePartitionsExec` to poll multiple
         // partitions in parallel
-        let coalesce_partition_plan = CoalescePartitionsExec::new(self.input.clone());
+        // let coalesce_partition_plan = CoalescePartitionsExec::new(self.input.clone());
 
         // Create future that computes thefinal output
         let captured_input = self.input.clone();
         let captured_schema = self.schema.clone();
 
         // Finish the input stream and create the output
-        let mut input_stream = coalesce_partition_plan.execute(0, context)?;
+        let mut input_stream = self.input.execute(partition, context)?;
+        // let mut input_stream = coalesce_partition_plan.execute(0, context)?;
         let output = async move {
             let mut total_rows = 0;
             while let Some(batch) = input_stream.next().await.transpose()? {

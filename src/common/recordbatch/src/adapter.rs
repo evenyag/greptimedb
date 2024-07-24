@@ -327,7 +327,7 @@ impl ExecutionPlanVisitor for MetricCollector {
             .sorted_for_display()
             .timestamps_removed();
         let mut plan_metric = PlanMetrics {
-            plan: displayable(plan).indent(true).to_string(),
+            plan: displayable(plan).one_line().to_string(),
             level: self.current_level,
             metrics: Vec::with_capacity(metric.iter().size_hint().0),
         };
