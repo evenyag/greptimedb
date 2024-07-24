@@ -159,10 +159,9 @@ impl MergeScanExec {
     ) -> Result<Self> {
         common_telemetry::info!("new MergeScanExec, target_partition: {target_partition}");
         let arrow_schema_without_metadata = Self::arrow_schema_without_metadata(arrow_schema);
-        let part_count = target_partition.min(regions.len());
         let properties = PlanProperties::new(
             EquivalenceProperties::new(arrow_schema_without_metadata.clone()),
-            Partitioning::UnknownPartitioning(part_count),
+            Partitioning::UnknownPartitioning(target_partition),
             ExecutionMode::Bounded,
         );
         let schema_without_metadata =
@@ -198,11 +197,9 @@ impl MergeScanExec {
         let current_schema = self.query_ctx.current_schema().to_string();
         let timezone = self.query_ctx.timezone().to_string();
         let extensions = self.query_ctx.extensions();
-        let target_partition = self.target_partition.min(regions.len());
+        let target_partition = self.target_partition;
 
-        common_telemetry::info!(
-            "Merge scan to stream, partition: {partition}, target_partition: {target_partition}"
-        );
+        common_telemetry::info!("Merge scan to stream, partition: {partition}");
 
         let sub_sgate_metrics_moved = self.sub_stage_metrics.clone();
         let plan = self.plan.clone();
