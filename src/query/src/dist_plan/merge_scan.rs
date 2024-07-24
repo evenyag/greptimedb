@@ -157,6 +157,7 @@ impl MergeScanExec {
         query_ctx: QueryContextRef,
         target_partition: usize,
     ) -> Result<Self> {
+        common_telemetry::info!("new MergeScanExec, target_partition: {target_partition}");
         let arrow_schema_without_metadata = Self::arrow_schema_without_metadata(arrow_schema);
         let properties = PlanProperties::new(
             EquivalenceProperties::new(arrow_schema_without_metadata.clone()),
@@ -232,6 +233,7 @@ impl MergeScanExec {
                 common_telemetry::info!(
                     "Merge scan do get, partition: {partition}, region_id: {region_id}"
                 );
+                let do_get_start = Instant::now();
                 let mut stream = region_query_handler
                     .do_get(request)
                     .await
@@ -248,7 +250,7 @@ impl MergeScanExec {
 
                 let mut poll_timer = Instant::now();
                 common_telemetry::info!(
-                    "Merge scan start poll stream, partition: {partition}, region_id: {region_id}"
+                    "Merge scan start poll stream, partition: {partition}, region_id: {region_id}, do_get_cost: {:?}", do_get_start.elapsed(),
                 );
                 while let Some(batch) = stream.next().await {
                     let poll_elapsed = poll_timer.elapsed();
