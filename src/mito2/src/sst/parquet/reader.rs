@@ -1188,11 +1188,16 @@ impl BatchReader for RowGroupReader {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use parquet::arrow::arrow_reader::RowSelector;
     use parquet::file::metadata::{FileMetaData, RowGroupMetaData};
     use parquet::schema::types::{SchemaDescriptor, Type};
 
     use super::*;
+    use crate::cache::test_util::new_fs_store;
+    use crate::compaction::test_util::new_file_handle;
+    use crate::sst::file::FileId;
 
     fn mock_parquet_metadata_from_row_groups(num_rows_in_row_groups: Vec<i64>) -> ParquetMetaData {
         let tp = Arc::new(Type::group_type_builder("test").build().unwrap());
@@ -1480,5 +1485,46 @@ mod tests {
         );
         assert_eq!(filtered_row_groups, 2);
         assert_eq!(filtered_rows, 10);
+    }
+
+    #[tokio::test]
+    async fn read_sst_file() {
+        common_telemetry::init_default_ut_logging();
+
+        let file_dir = std::env::var("FILE_DIR").unwrap();
+        let file_id = std::env::var("FILE_ID").unwrap();
+        let file_root = std::env::var("FILE_ROOT").unwrap();
+        let loops = std::env::var("LOOPS")
+            .ok()
+            .and_then(|x| x.parse::<usize>().ok())
+            .unwrap_or(1);
+
+        let file_handle = new_file_handle(FileId::from_str(&file_id).unwrap(), 0, 1000, 1);
+        let object_store = new_fs_store(&file_root);
+        for i in 0..loops {
+            let start = Instant::now();
+            let mut reader = ParquetReaderBuilder::new(
+                file_dir.clone(),
+                file_handle.clone(),
+                object_store.clone(),
+            )
+            .build()
+            .await
+            .unwrap();
+            common_telemetry::info!("loop: {}, build reader cost is {:?}", i, start.elapsed());
+            let mut total_batches = 0;
+            let mut total_rows = 0;
+            while let Some(batch) = reader.next_batch().await.unwrap() {
+                total_batches += 1;
+                total_rows += batch.num_rows();
+            }
+            common_telemetry::info!(
+                "loop: {}, scan reader done, {} batches, {} rows, total cost {:?}",
+                i,
+                total_batches,
+                total_rows,
+                start.elapsed()
+            );
+        }
     }
 }
