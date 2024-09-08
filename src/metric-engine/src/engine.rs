@@ -162,7 +162,7 @@ impl RegionEngine for MetricEngine {
 
         result.map_err(BoxedError::new).map(|rows| RegionResponse {
             affected_rows: rows,
-            extensions: extension_return_value,
+            extension: extension_return_value,
         })
     }
 

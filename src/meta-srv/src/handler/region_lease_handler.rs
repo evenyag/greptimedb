@@ -135,7 +135,6 @@ mod test {
             wcus: 0,
             approximate_bytes: 0,
             engine: String::new(),
-            extensions: Default::default(),
         }
     }
 

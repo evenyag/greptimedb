@@ -119,7 +119,7 @@ impl FlowServiceOperator {
             if let Some(prev) = &mut final_result {
                 prev.affected_rows = res.affected_rows;
                 prev.affected_flows.extend(res.affected_flows);
-                prev.extensions.extend(res.extensions);
+                prev.extension.extend(res.extension);
             } else {
                 final_result = Some(res);
             }

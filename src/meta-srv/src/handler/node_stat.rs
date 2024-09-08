@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use api::v1::meta::HeartbeatRequest;
 use common_meta::ClusterId;
@@ -57,8 +57,6 @@ pub struct RegionStat {
     pub engine: String,
     /// The region role.
     pub role: RegionRole,
-    /// The extension info of this region
-    pub extensions: HashMap<String, Vec<u8>>,
 }
 
 impl Stat {
@@ -144,7 +142,6 @@ impl TryFrom<api::v1::meta::RegionStat> for RegionStat {
             approximate_bytes: value.approximate_bytes,
             engine: value.engine.to_string(),
             role: RegionRole::from(value.role()),
-            extensions: value.extensions,
         })
     }
 }

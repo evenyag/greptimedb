@@ -100,7 +100,7 @@ pub mod mock {
                     }),
                 }),
                 affected_rows: 0,
-                extensions: Default::default(),
+                extension: Default::default(),
             })
         }
     }
