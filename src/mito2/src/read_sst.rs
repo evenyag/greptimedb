@@ -52,7 +52,7 @@ fn new_file_handle(
     )
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main]
 async fn main() {
     common_telemetry::init_default_ut_logging();
 
