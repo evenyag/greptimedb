@@ -248,7 +248,7 @@ git = "https://github.com/GreptimeTeam/greptime-meter.git"
 rev = "80eb97c24c88af4dd9a86f8bbaf50e741d4eb8cd"
 
 [profile.release]
-debug = 1
+debug = true
 
 [profile.nightly]
 inherits = "release"
@@ -256,6 +256,9 @@ strip = "debuginfo"
 lto = "thin"
 debug = false
 incremental = false
+
+[profile.bench]
+debug = true
 
 [profile.ci]
 inherits = "dev"

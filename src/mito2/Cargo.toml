@@ -8,6 +8,10 @@ license.workspace = true
 default = []
 test = ["common-test-util", "log-store", "rstest", "rstest_reuse", "rskafka"]
 
+[[bin]]
+name = "read-sst"
+path = "src/read_sst.rs"
+
 [lints]
 workspace = true
 
