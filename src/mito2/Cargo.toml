@@ -114,3 +114,7 @@ required-features = ["test"]
 name = "simple_bulk_memtable"
 harness = false
 required-features = ["test"]
+
+[[bin]]
+name = "read-sst"
+path = "src/read_sst.rs"
