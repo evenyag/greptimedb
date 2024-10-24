@@ -557,12 +557,12 @@ impl BatchChecker {
             return false;
         }
 
-        if let Some((start, first)) = (self.start, batch.first_timestamp()) {
+        if let (Some(start), Some(first)) = (self.start, batch.first_timestamp()) {
             if start > first {
                 return false;
             }
         }
-        if let Some((end, last)) = (self.end, batch.last_timestamp()) {
+        if let (Some(end), Some(last)) = (self.end, batch.last_timestamp()) {
             if end <= last {
                 return false;
             }
