@@ -24,7 +24,7 @@ use datafusion::common::arrow::compute::sort_to_indices;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, TaskContext};
 use datafusion::physical_plan::coalesce_batches::concat_batches;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -33,8 +33,6 @@ use datafusion_physical_expr::PhysicalSortExpr;
 use futures::Stream;
 use itertools::Itertools;
 use snafu::location;
-
-use crate::error::Result;
 
 /// Sort input within given PartitionRange
 ///
@@ -52,7 +50,7 @@ pub struct PartSortExec {
 }
 
 impl PartSortExec {
-    pub fn try_new(expression: PhysicalSortExpr, input: Arc<dyn ExecutionPlan>) -> Result<Self> {
+    pub fn new(expression: PhysicalSortExpr, input: Arc<dyn ExecutionPlan>) -> Self {
         let metrics = ExecutionPlanMetricsSet::new();
         let properties = PlanProperties::new(
             input.equivalence_properties().clone(),
@@ -60,12 +58,12 @@ impl PartSortExec {
             input.execution_mode(),
         );
 
-        Ok(Self {
+        Self {
             expression,
             input,
             metrics,
             properties,
-        })
+        }
     }
 
     pub fn to_stream(
@@ -76,7 +74,7 @@ impl PartSortExec {
         let input_stream: DfSendableRecordBatchStream =
             self.input.execute(partition, context.clone())?;
 
-        let df_stream = Box::pin(PartSortStream::new(context, self, input_stream)) as _;
+        let df_stream = Box::pin(PartSortStream::new(context, self, input_stream, partition)) as _;
 
         Ok(df_stream)
     }
@@ -114,10 +112,10 @@ impl ExecutionPlan for PartSortExec {
         } else {
             internal_err!("No children found")?
         };
-        Ok(Arc::new(Self::try_new(
+        Ok(Arc::new(Self::new(
             self.expression.clone(),
             new_input.clone(),
-        )?))
+        )))
     }
 
     fn execute(
@@ -131,6 +129,10 @@ impl ExecutionPlan for PartSortExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
 }
 
 struct PartSortStream {
@@ -142,6 +144,7 @@ struct PartSortStream {
     input: DfSendableRecordBatchStream,
     input_complete: bool,
     schema: SchemaRef,
+    metrics: BaselineMetrics,
 }
 
 impl PartSortStream {
@@ -149,6 +152,7 @@ impl PartSortStream {
         context: Arc<TaskContext>,
         sort: &PartSortExec,
         input: DfSendableRecordBatchStream,
+        partition: usize,
     ) -> Self {
         Self {
             reservation: MemoryConsumer::new("PartSortStream".to_string())
@@ -159,6 +163,7 @@ impl PartSortStream {
             input,
             input_complete: false,
             schema: sort.input.schema(),
+            metrics: BaselineMetrics::new(&sort.metrics, partition),
         }
     }
 }
@@ -271,10 +276,11 @@ impl Stream for PartSortStream {
     type Item = datafusion_common::Result<DfRecordBatch>;
 
     fn poll_next(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<datafusion_common::Result<DfRecordBatch>>> {
-        self.poll_next_inner(cx)
+        let result = self.as_mut().poll_next_inner(cx);
+        self.metrics.record_poll(result)
     }
 }
 
@@ -498,14 +504,13 @@ mod test {
             .collect_vec();
         let mock_input = MockInputExec::new(batches, schema.clone());
 
-        let exec = PartSortExec::try_new(
+        let exec = PartSortExec::new(
             PhysicalSortExpr {
                 expr: Arc::new(Column::new("ts", 0)),
                 options: opt,
             },
             Arc::new(mock_input),
-        )
-        .unwrap();
+        );
 
         let exec_stream = exec.execute(0, Arc::new(TaskContext::default())).unwrap();
 

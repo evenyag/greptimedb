@@ -80,12 +80,6 @@ impl RegionScanExec {
         }
     }
 
-    /// Set the expected output ordering for the plan.
-    pub fn with_output_ordering(mut self, output_ordering: Vec<PhysicalSortExpr>) -> Self {
-        self.output_ordering = Some(output_ordering);
-        self
-    }
-
     /// Get the partition ranges of the scanner. This method will collapse the ranges into
     /// a single vector.
     pub fn get_partition_ranges(&self) -> Vec<PartitionRange> {
@@ -99,6 +93,12 @@ impl RegionScanExec {
         }
 
         ranges
+    }
+
+    /// Similar to [`Self::get_partition_ranges`] but don't collapse the ranges.
+    pub fn get_uncollapsed_partition_ranges(&self) -> Vec<Vec<PartitionRange>> {
+        let scanner = self.scanner.lock().unwrap();
+        scanner.properties().partitions.clone()
     }
 
     /// Update the partition ranges of underlying scanner.
@@ -124,6 +124,15 @@ impl RegionScanExec {
             append_mode: self.append_mode,
             total_rows: self.total_rows,
         })
+    }
+
+    pub fn time_index(&self) -> Option<String> {
+        self.scanner
+            .lock()
+            .unwrap()
+            .schema()
+            .timestamp_column()
+            .map(|x| x.name.clone())
     }
 }
 
