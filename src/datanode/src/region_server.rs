@@ -355,6 +355,24 @@ impl RegionServer {
 #[async_trait]
 impl RegionServerHandler for RegionServer {
     async fn handle(&self, request: region_request::Body) -> ServerResult<RegionResponseV1> {
+        if matches!(request, region_request::Body::Inserts(_)) {
+            let resp = self
+                .handle_batch_body(request)
+                .await
+                .map_err(BoxedError::new)
+                .context(ExecuteGrpcRequestSnafu)?;
+            return Ok(RegionResponseV1 {
+                header: Some(ResponseHeader {
+                    status: Some(Status {
+                        status_code: StatusCode::Success as _,
+                        ..Default::default()
+                    }),
+                }),
+                affected_rows: resp.affected_rows as _,
+                extensions: resp.extensions,
+            });
+        }
+
         let is_parallel = matches!(
             request,
             region_request::Body::Inserts(_) | region_request::Body::Deletes(_)
@@ -855,7 +873,7 @@ impl RegionServerInner {
         //     }
         // }
 
-        todo!()
+        Ok(RegionResponse::new(0))
     }
 
     fn set_region_status_not_ready(
