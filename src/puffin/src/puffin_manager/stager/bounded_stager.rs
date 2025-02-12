@@ -75,6 +75,12 @@ impl BoundedStager {
 
         let recycle_bin = Cache::builder()
             .time_to_live(Duration::from_secs(60))
+            .async_eviction_listener(|k: Arc<String>, _, _| {
+                async move {
+                    common_telemetry::info!("[Stager] Recycle bin remove {}", k.as_str());
+                }
+                .boxed()
+            })
             .build();
 
         let recycle_bin_cloned = recycle_bin.clone();
@@ -84,6 +90,7 @@ impl BoundedStager {
             .async_eviction_listener(move |k, v, _| {
                 let recycle_bin = recycle_bin_cloned.clone();
                 async move {
+                    common_telemetry::info!("[Stager] Move to recycle bin {}", k.as_str());
                     recycle_bin.insert(k.as_str().to_string(), v).await;
                 }
                 .boxed()
@@ -158,11 +165,13 @@ impl Stager for BoundedStager {
             .cache
             .try_get_with(cache_key.clone(), async {
                 if let Some(v) = self.recycle_bin.remove(&cache_key).await {
+                    common_telemetry::info!("[Stager] get from recycle bin {}", cache_key);
                     return Ok(v);
                 }
 
                 let dir_name = format!("{}.{}", cache_key, uuid::Uuid::new_v4());
                 let path = self.base_dir.join(&dir_name);
+                common_telemetry::info!("[Stager] load from remote {}", cache_key);
 
                 let size = Self::write_dir(&path, init_fn).await?;
 
@@ -189,6 +198,7 @@ impl Stager for BoundedStager {
         size: u64,
     ) -> Result<()> {
         let cache_key = Self::encode_cache_key(puffin_file_name, key);
+        common_telemetry::info!("[Stager] put dir {}, size {}", cache_key, size);
 
         self.cache
             .try_get_with(cache_key.clone(), async move {
@@ -351,6 +361,8 @@ impl BoundedStager {
         while let Some(task) = receiver.recv().await {
             match task {
                 DeleteTask::File(path) => {
+                    common_telemetry::info!("[Stager] Delete file: {:?}", path);
+
                     if let Err(err) = fs::remove_file(&path).await {
                         if err.kind() == std::io::ErrorKind::NotFound {
                             continue;
@@ -360,6 +372,8 @@ impl BoundedStager {
                     }
                 }
                 DeleteTask::Dir(path) => {
+                    common_telemetry::info!("[Stager] Delete dir: {:?}", path);
+
                     let deleted_path = path.with_extension(DELETED_EXTENSION);
                     if let Err(err) = fs::rename(&path, &deleted_path).await {
                         if err.kind() == std::io::ErrorKind::NotFound {
