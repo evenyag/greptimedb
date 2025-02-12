@@ -15,6 +15,7 @@
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_compression::futures::bufread::ZstdDecoder;
 use async_trait::async_trait;
@@ -141,6 +142,12 @@ where
     }
 
     async fn dir(&self, key: &str) -> Result<Self::Dir> {
+        common_telemetry::info!(
+            "[Puffin] get dir, file: {}, key: {}",
+            self.puffin_file_name,
+            key
+        );
+
         self.stager
             .get_dir(
                 self.puffin_file_name.as_str(),
@@ -201,6 +208,8 @@ where
         writer_provider: DirWriterProviderRef,
         accessor: F,
     ) -> Result<u64> {
+        let start = Instant::now();
+
         let reader = accessor.reader(&puffin_file_name).await?;
         let mut file = PuffinFileReader::new(reader);
 
@@ -254,6 +263,13 @@ where
             .into_iter()
             .flatten()
             .sum::<Result<_>>()?;
+
+        common_telemetry::info!(
+            "[Stager] init dir to stager, file: {}, key: {}, cost: {:?}",
+            puffin_file_name,
+            key,
+            start.elapsed()
+        );
 
         Ok(size)
     }

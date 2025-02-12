@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use async_walkdir::{Filtering, WalkDir};
@@ -198,7 +198,13 @@ impl Stager for BoundedStager {
         size: u64,
     ) -> Result<()> {
         let cache_key = Self::encode_cache_key(puffin_file_name, key);
-        common_telemetry::info!("[Stager] put dir {}, size {}", cache_key, size);
+        common_telemetry::info!(
+            "[Stager] put dir {}, file: {}, key: {}, size {}",
+            cache_key,
+            puffin_file_name,
+            key,
+            size
+        );
 
         self.cache
             .try_get_with(cache_key.clone(), async move {
@@ -260,6 +266,7 @@ impl BoundedStager {
         target_path: &PathBuf,
         init_fn: Box<dyn InitDirFn + Send + Sync + '_>,
     ) -> Result<u64> {
+        let start = Instant::now();
         // To guarantee the atomicity of writing the directory, we need to write
         // the directory to a temporary directory first...
         let tmp_base = target_path.with_extension(TMP_EXTENSION);
@@ -270,6 +277,12 @@ impl BoundedStager {
         fs::rename(&tmp_base, target_path)
             .await
             .context(RenameSnafu)?;
+
+        common_telemetry::info!(
+            "[Stager] write dir, target_path: {:?}, cost: {:?}",
+            target_path,
+            start.elapsed()
+        );
         Ok(size)
     }
 
