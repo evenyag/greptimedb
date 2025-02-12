@@ -26,6 +26,7 @@ use common_runtime::runtime::RuntimeTrait;
 use common_telemetry::{info, warn};
 use futures::{FutureExt, StreamExt};
 use moka::future::Cache;
+use moka::policy::EvictionPolicy;
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tokio::fs;
@@ -86,6 +87,7 @@ impl BoundedStager {
         let recycle_bin_cloned = recycle_bin.clone();
         let cache = Cache::builder()
             .max_capacity(capacity)
+            .eviction_policy(EvictionPolicy::lru())
             .weigher(|_: &String, v: &CacheValue| v.weight())
             .async_eviction_listener(move |k, v, cause| {
                 let recycle_bin = recycle_bin_cloned.clone();
