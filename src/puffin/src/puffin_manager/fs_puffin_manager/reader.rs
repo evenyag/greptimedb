@@ -218,7 +218,7 @@ where
             .blobs
             .iter()
             .find(|m| m.blob_type == key.as_str())
-            .context(BlobNotFoundSnafu { blob: key })?;
+            .context(BlobNotFoundSnafu { blob: &key })?;
 
         let reader = file.blob_reader(blob_metadata)?;
         let meta = reader.metadata().await.context(MetadataSnafu)?;
