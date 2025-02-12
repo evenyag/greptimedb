@@ -142,12 +142,6 @@ where
     }
 
     async fn dir(&self, key: &str) -> Result<Self::Dir> {
-        common_telemetry::info!(
-            "[Puffin] get dir, file: {}, key: {}",
-            self.puffin_file_name,
-            key
-        );
-
         self.stager
             .get_dir(
                 self.puffin_file_name.as_str(),

@@ -17,7 +17,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use common_telemetry::debug;
 use snafu::{OptionExt, ResultExt};
 use tantivy::collector::DocSetCollector;
 use tantivy::query::QueryParser;
@@ -57,7 +56,7 @@ impl TantivyFulltextIndexSearcher {
             .get_field(TEXT_FIELD_NAME)
             .context(TantivySnafu)?;
 
-        debug!(
+        common_telemetry::info!(
             "Opened tantivy index on {:?} in {:?}",
             path.as_ref(),
             now.elapsed()

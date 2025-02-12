@@ -160,6 +160,12 @@ impl Stager for BoundedStager {
         init_fn: Box<dyn InitDirFn + Send + Sync + 'a>,
     ) -> Result<Self::Dir> {
         let cache_key = Self::encode_cache_key(puffin_file_name, key);
+        common_telemetry::info!(
+            "[Stager] try to get dir, file: {}, key: {}, cache_key: {}",
+            puffin_file_name,
+            key,
+            cache_key
+        );
 
         let v = self
             .cache
