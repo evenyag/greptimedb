@@ -352,8 +352,14 @@ impl BoundedStager {
         }
 
         for (key, value) in elems {
+            common_telemetry::info!("[Stager] recover key: {}, size: {}", key, value.size());
+
             self.cache.insert(key, value).await;
         }
+        common_telemetry::info!(
+            "[Stager] recover done, weighted size: {}",
+            self.cache.weighted_size()
+        );
 
         Ok(())
     }
