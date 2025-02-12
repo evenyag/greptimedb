@@ -87,10 +87,14 @@ impl BoundedStager {
         let cache = Cache::builder()
             .max_capacity(capacity)
             .weigher(|_: &String, v: &CacheValue| v.weight())
-            .async_eviction_listener(move |k, v, _| {
+            .async_eviction_listener(move |k, v, cause| {
                 let recycle_bin = recycle_bin_cloned.clone();
                 async move {
-                    common_telemetry::info!("[Stager] Move to recycle bin {}", k.as_str());
+                    common_telemetry::info!(
+                        "[Stager] Move to recycle bin {}, cause: {:?}",
+                        k.as_str(),
+                        cause
+                    );
                     recycle_bin.insert(k.as_str().to_string(), v).await;
                 }
                 .boxed()

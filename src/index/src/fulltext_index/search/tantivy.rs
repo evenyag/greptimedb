@@ -73,6 +73,7 @@ impl TantivyFulltextIndexSearcher {
 #[async_trait]
 impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
     async fn search(&self, query: &str) -> Result<BTreeSet<RowId>> {
+        let start = Instant::now();
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.default_field]);
         let query = query_parser
@@ -82,10 +83,18 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
             .search(&query, &DocSetCollector)
             .context(TantivySnafu)?;
 
+        common_telemetry::info!("Searcher search cost: {:?}", start.elapsed());
+
+        let start = Instant::now();
         let seg_metas = self
             .index
             .searchable_segment_metas()
             .context(TantivySnafu)?;
+        common_telemetry::info!(
+            "Searcher segment metas cost: {:?}, len: {}",
+            start.elapsed(),
+            seg_metas.len()
+        );
 
         // FAST PATH: only one segment, the doc id is the same as the row id.
         //            Also for compatibility with the old version.
@@ -94,6 +103,7 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
         }
 
         // SLOW PATH: multiple segments, need to calculate the row id.
+        let start = Instant::now();
         let rowid_field = searcher
             .schema()
             .get_field(ROWID_FIELD_NAME)
@@ -119,6 +129,10 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
 
             res.insert(doc_addr.doc_id + offset);
         }
+        common_telemetry::info!(
+            "Searcher segment search multiple segments cost: {:?}",
+            start.elapsed()
+        );
 
         Ok(res)
     }
