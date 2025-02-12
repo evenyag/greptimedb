@@ -387,6 +387,7 @@ impl ParquetReaderBuilder {
             return false;
         }
 
+        let start = Instant::now();
         let apply_res = match index_applier.apply(self.file_handle.file_id()).await {
             Ok(res) => res,
             Err(err) => {
@@ -416,6 +417,12 @@ impl ParquetReaderBuilder {
             output,
             &mut metrics.rg_fulltext_filtered,
             &mut metrics.rows_fulltext_filtered,
+        );
+
+        common_telemetry::info!(
+            "[Stager] prune fulltext {} cost: {:?}",
+            self.file_handle.file_id(),
+            start.elapsed()
         );
 
         true
