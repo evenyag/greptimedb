@@ -244,6 +244,8 @@ impl Stager for BoundedStager {
         // more quickly.
         self.cache.run_pending_tasks().await;
         self.recycle_bin.run_pending_tasks().await;
+
+        Ok(())
     }
 }
 
