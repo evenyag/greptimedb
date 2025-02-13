@@ -370,6 +370,7 @@ impl BoundedStager {
 
             self.cache.insert(key, value).await;
         }
+        self.cache.run_pending_tasks().await;
         common_telemetry::info!(
             "[Stager] recover done, weighted size: {}",
             self.cache.weighted_size()
