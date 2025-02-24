@@ -20,7 +20,9 @@ use api::v1::{
     ColumnDataType, ColumnSchema, Row, RowInsertRequest, RowInsertRequests, Rows, SemanticType,
     Value,
 };
+use bytes::Bytes;
 use common_query::prelude::{GREPTIME_TIMESTAMP, GREPTIME_VALUE};
+use datafusion::parquet::data_type::AsBytes;
 use hashbrown::hash_map::Entry;
 use hashbrown::HashMap;
 use prost::DecodeError;
@@ -65,6 +67,385 @@ impl TablesBuilder {
             })
             .collect();
         (RowInsertRequests { inserts }, total_rows)
+    }
+}
+
+/// [PoolTablesBuilder] serves as an intermediate container to build [RowInsertRequests].
+#[derive(Default, Debug)]
+pub(crate) struct PoolTablesBuilder {
+    tables: HashMap<String, PoolTableBuilder>,
+}
+
+impl Clear for PoolTablesBuilder {
+    fn clear(&mut self) {
+        self.tables.clear();
+    }
+}
+
+impl PoolTablesBuilder {
+    /// Gets table builder with given table name. Creates an empty [TableBuilder] if not exist.
+    pub(crate) fn get_or_create_table_builder(
+        &mut self,
+        table_name: String,
+        label_num: usize,
+        row_num: usize,
+    ) -> &mut PoolTableBuilder {
+        self.tables
+            .entry(table_name)
+            .or_insert_with(|| PoolTableBuilder::with_capacity(label_num + 2, row_num))
+    }
+
+    /// Converts [TablesBuilder] to [RowInsertRequests] and row numbers and clears inner states.
+    pub(crate) fn as_insert_requests(&mut self) -> (RowInsertRequests, usize) {
+        let mut total_rows = 0;
+        let inserts = self
+            .tables
+            .drain()
+            .map(|(name, mut table)| {
+                total_rows += table.num_rows();
+                table.as_row_insert_request(name)
+            })
+            .collect();
+        (RowInsertRequests { inserts }, total_rows)
+    }
+}
+
+/// Builder for one table.
+///
+/// It reuses the same buffer for rows and schema.
+/// It will try to use a fast mode that assumes all rows have the same schema.
+/// If it finds a row with a different schema, it will switch to the slow mode.
+#[derive(Debug)]
+pub(crate) struct PoolTableBuilder {
+    /// Column schemas.
+    /// The builder will reuse the same schema buffer.
+    /// The schema always contains at least two columns: timestamp and value.
+    schema: Vec<ColumnSchema>,
+    /// Rows written.
+    /// The builder will reuse the same rows buffer.
+    /// To get the number of rows written, we need to use `num_rows`.
+    /// It may contains more rows than `num_rows`.
+    rows: Vec<Row>,
+    /// Number of rows written.
+    num_rows: usize,
+
+    /// Indices of columns inside `schema` for slow mode.
+    /// By default this is empty. Once we switch to the slow mode, we will
+    /// fill this map and use the column name as the index.
+    col_indexes: HashMap<String, usize>,
+}
+
+impl PoolTableBuilder {
+    /// Creates a new `PoolTableBuilder` with the given capacity for columns and rows.
+    pub(crate) fn with_capacity(cols: usize, rows: usize) -> Self {
+        let mut schema = Vec::with_capacity(cols);
+        schema.push(ColumnSchema {
+            column_name: GREPTIME_TIMESTAMP.to_string(),
+            datatype: ColumnDataType::TimestampMillisecond as i32,
+            semantic_type: SemanticType::Timestamp as i32,
+            datatype_extension: None,
+            options: None,
+        });
+
+        schema.push(ColumnSchema {
+            column_name: GREPTIME_VALUE.to_string(),
+            datatype: ColumnDataType::Float64 as i32,
+            semantic_type: SemanticType::Field as i32,
+            datatype_extension: None,
+            options: None,
+        });
+
+        Self {
+            schema,
+            rows: Vec::with_capacity(rows),
+            num_rows: 0,
+            col_indexes: HashMap::new(),
+        }
+    }
+
+    /// Adds a set of labels and samples to table builder.
+    pub(crate) fn add_labels_and_samples(
+        &mut self,
+        labels: &[PromLabel],
+        samples: &[Sample],
+        is_strict_mode: bool,
+    ) -> Result<(), DecodeError> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+
+        if self.ensure_schema(labels, is_strict_mode)? {
+            self.add_labels_and_samples_fast(labels, samples, is_strict_mode)?;
+        } else {
+            self.add_labels_and_samples_slow(labels, samples, is_strict_mode)?;
+        }
+
+        Ok(())
+    }
+
+    /// Converts [PoolTableBuilder] to [RowInsertRequest] and clears buffered data.
+    pub(crate) fn as_row_insert_request(&mut self, table_name: String) -> RowInsertRequest {
+        let mut rows = std::mem::take(&mut self.rows);
+        let schema = std::mem::take(&mut self.schema);
+        self.num_rows = 0;
+
+        if !self.col_indexes.is_empty() {
+            // Slow mode, we have different schema.
+            let col_num = schema.len();
+            for row in &mut rows {
+                if row.values.len() < col_num {
+                    row.values.resize(col_num, Value { value_data: None });
+                }
+            }
+            self.col_indexes.clear();
+        }
+
+        RowInsertRequest {
+            table_name,
+            rows: Some(Rows { schema, rows }),
+        }
+    }
+
+    /// Returns the number of rows in the table builder.
+    fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Adds a set of labels and samples to table builder in slow mode.
+    fn add_labels_and_samples_slow(
+        &mut self,
+        labels: &[PromLabel],
+        samples: &[Sample],
+        is_strict_mode: bool,
+    ) -> Result<(), DecodeError> {
+        debug_assert!(!self.col_indexes.is_empty());
+
+        self.start_new_row();
+
+        for PromLabel { name, value } in labels {
+            // Safety: `Self::ensure_schema()` already checked that the name is valid UTF-8.
+            let tag_name = unsafe { std::str::from_utf8_unchecked(name.as_bytes()) };
+            let tag_value = Self::bytes_to_str(value, is_strict_mode)?;
+
+            if let Some(col_idx) = self.col_indexes.get(tag_name) {
+                // Name already exists, sets the value.
+                self.set_column_value(*col_idx, tag_value);
+            } else {
+                // A new column.
+                let tag_num = self.col_indexes.len();
+                debug_assert_eq!(tag_num, self.schema.len());
+                self.col_indexes.insert(tag_name.to_string(), tag_num);
+                self.schema.push(ColumnSchema {
+                    column_name: tag_value.to_string(),
+                    datatype: ColumnDataType::String as i32,
+                    semantic_type: SemanticType::Tag as i32,
+                    datatype_extension: None,
+                    options: None,
+                });
+                self.push_column_value(tag_value);
+            }
+        }
+
+        self.add_samples(samples);
+
+        Ok(())
+    }
+
+    /// Adds a set of labels and samples to table builder in fast mode.
+    fn add_labels_and_samples_fast(
+        &mut self,
+        labels: &[PromLabel],
+        samples: &[Sample],
+        is_strict_mode: bool,
+    ) -> Result<(), DecodeError> {
+        debug_assert!(self.col_indexes.is_empty());
+
+        self.start_new_row();
+
+        for (col_idx, label) in labels.iter().enumerate() {
+            let tag_value = Self::bytes_to_str(&label.name, is_strict_mode)?;
+            self.set_column_value(col_idx, tag_value);
+        }
+
+        self.add_samples(samples);
+
+        Ok(())
+    }
+
+    /// Allocates a new row to write.
+    /// It ensures the new row has the same number of columns as the schema.
+    fn start_new_row(&mut self) {
+        if self.num_rows >= self.rows.len() {
+            self.rows.push(Row {
+                values: vec![Value { value_data: None }; self.schema.len()],
+            });
+        } else {
+            self.rows[self.num_rows]
+                .values
+                .resize(self.schema.len(), Value { value_data: None });
+        }
+    }
+
+    /// Sets the value of a tag in the current row.
+    fn set_column_value(&mut self, col_idx: usize, tag_value: &str) {
+        let row = &mut self.rows[self.num_rows];
+        Self::update_tag_value(&mut row.values[col_idx], tag_value);
+    }
+
+    /// Pushes the value of a tag to the current row.
+    fn push_column_value(&mut self, tag_value: &str) {
+        let row = &mut self.rows[self.num_rows];
+        // Pushes a new value to the row.
+        row.values.push(Value {
+            value_data: Some(ValueData::StringValue(tag_value.to_string())),
+        });
+    }
+
+    /// Adds samples to rows and bumps `self.num_rows`.
+    fn add_samples(&mut self, samples: &[Sample]) {
+        debug_assert!(!samples.is_empty());
+
+        let sample = &samples[0];
+        let row = &mut self.rows[self.num_rows].values;
+        row[0].value_data = Some(ValueData::TimestampMillisecondValue(sample.timestamp));
+        row[1].value_data = Some(ValueData::F64Value(sample.value));
+        self.num_rows += 1;
+        if samples.len() == 1 {
+            // Fast path: only has one sample to add.
+            return;
+        }
+
+        // Slow path: multiple samples to add. We need to repeat all tag values.
+        // `Self::start_new_row()` ensures that the buffer >= self.num_rows.
+        if self.rows.len() - self.num_rows < samples.len() - 1 {
+            self.rows.resize(
+                self.rows.len() + samples.len() - 1,
+                Row { values: Vec::new() },
+            );
+        }
+        let (left, right) = self.rows.split_at_mut(self.num_rows);
+        for sample_idx in 1..samples.len() {
+            let row = &mut right[sample_idx - 1].values;
+            row.clone_from(&left[left.len() - 1].values);
+            let sample = &samples[sample_idx];
+            row[0].value_data = Some(ValueData::TimestampMillisecondValue(sample.timestamp));
+            row[1].value_data = Some(ValueData::F64Value(sample.value));
+            self.num_rows += 1;
+        }
+    }
+
+    fn update_tag_value(value: &mut Value, tag_value: &str) {
+        if let Some(ValueData::StringValue(existing_value)) = &mut value.value_data {
+            existing_value.clear();
+            existing_value.push_str(tag_value);
+        } else {
+            *value = Value {
+                value_data: Some(ValueData::StringValue(tag_value.to_string())),
+            };
+        }
+    }
+
+    /// Checks if the schema still matches the current row.
+    /// If the schema matches, returns true.
+    /// If the schema does not match, switches to the slow mode.
+    /// If labels have invalid label name, returns an error.
+    fn ensure_schema(
+        &mut self,
+        labels: &[PromLabel],
+        is_strict_mode: bool,
+    ) -> Result<bool, DecodeError> {
+        if self.schema.is_empty() {
+            // This is an empty builder.
+            for label in labels {
+                let column_name = Self::bytes_to_str(&label.name, is_strict_mode)?;
+
+                self.schema.push(ColumnSchema {
+                    column_name: column_name.to_string(),
+                    datatype: ColumnDataType::String as i32,
+                    semantic_type: SemanticType::Tag as i32,
+                    datatype_extension: None,
+                    options: None,
+                });
+            }
+
+            return Ok(true);
+        }
+
+        if self.num_rows == 0 {
+            // This is a builder with buffer to reuse, the schema is actually empty. We can
+            // reset the schema.
+            self.schema.resize(
+                labels.len() + 2,
+                ColumnSchema {
+                    column_name: String::new(),
+                    datatype: ColumnDataType::String as i32,
+                    semantic_type: SemanticType::Tag as i32,
+                    datatype_extension: None,
+                    options: None,
+                },
+            );
+            for (label_idx, label) in labels.iter().enumerate() {
+                let column_name = unsafe { std::str::from_utf8_unchecked(label.name.as_bytes()) };
+                self.schema[label_idx + 2].column_name.clear();
+                self.schema[label_idx + 2].column_name.push_str(column_name);
+            }
+
+            return Ok(true);
+        }
+
+        // Already has schema, checks whether the schema matches the given labels.
+        if !self.has_same_schema(labels, is_strict_mode)? {
+            // We already have existing schema for previous rows.
+            // Switch to slow mode.
+            self.switch_to_slow_mode();
+
+            Ok(false)
+        } else {
+            // We have the same schema.
+            Ok(true)
+        }
+    }
+
+    /// Returns true if the schema matches the given labels.
+    /// If labels have invalid label name, returns an error.
+    fn has_same_schema(
+        &self,
+        labels: &[PromLabel],
+        is_strict_mode: bool,
+    ) -> Result<bool, DecodeError> {
+        if labels.len() != self.schema.len() - 2 {
+            return Ok(false);
+        }
+
+        for (col_idx, label) in labels.iter().enumerate() {
+            let tag_name = Self::bytes_to_str(&label.name, is_strict_mode)?;
+            // Skip the first two columns which are reserved for the timestamp and sample value.
+            if tag_name != self.schema[col_idx + 2].column_name {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn switch_to_slow_mode(&mut self) {
+        // TODO(yingwen): maybe we can reuse the strings.
+        self.col_indexes.clear();
+        for (col_idx, column) in self.schema.iter().enumerate() {
+            self.col_indexes.insert(column.column_name.clone(), col_idx);
+        }
+    }
+
+    fn bytes_to_str(bytes: &Bytes, is_strict_mode: bool) -> Result<&str, DecodeError> {
+        let v = if is_strict_mode {
+            match std::str::from_utf8(bytes.as_ref()) {
+                Ok(s) => s,
+                Err(_) => return Err(DecodeError::new("invalid utf-8")),
+            }
+        } else {
+            unsafe { std::str::from_utf8_unchecked(bytes.as_ref()) }
+        };
+        Ok(v)
     }
 }
 
