@@ -90,6 +90,7 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
             count_start.elapsed()
         );
 
+        let search_start = Instant::now();
         let doc_addrs = searcher
             .search(&query, &DocSetCollector)
             .context(TantivySnafu)?;
@@ -102,6 +103,11 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
         // FAST PATH: only one segment, the doc id is the same as the row id.
         //            Also for compatibility with the old version.
         if seg_metas.len() == 1 {
+            common_telemetry::info!(
+                "[DBG] Search metas len 1, count: {}, cost: {:?}",
+                count,
+                search_start.elapsed(),
+            );
             return Ok(doc_addrs.into_iter().map(|d| d.doc_id).collect());
         }
 
@@ -131,6 +137,12 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
 
             res.insert(doc_addr.doc_id + offset);
         }
+
+        common_telemetry::info!(
+            "[DBG] Search multiple segments, count: {}, cost: {:?}",
+            count,
+            search_start.elapsed(),
+        );
 
         Ok(res)
     }

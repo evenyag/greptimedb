@@ -120,6 +120,12 @@ impl FulltextIndexApplier {
                 }
             };
 
+            common_telemetry::info!(
+                "[DBG] Start applying fulltext index, file_id: {}, path: {:?}",
+                file_id,
+                path
+            );
+
             let searcher =
                 TantivyFulltextIndexSearcher::new(path).context(ApplyFulltextIndexSnafu)?;
             let result = searcher
