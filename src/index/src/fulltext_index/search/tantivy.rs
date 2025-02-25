@@ -76,9 +76,20 @@ impl FulltextIndexSearcher for TantivyFulltextIndexSearcher {
     async fn search(&self, query: &str) -> Result<BTreeSet<RowId>> {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.default_field]);
+        common_telemetry::info!("[DBG] Searching for query: {}", query);
         let query = query_parser
             .parse_query(query)
             .context(TantivyParserSnafu)?;
+
+        let count_start = Instant::now();
+        let count = query.count(&searcher).unwrap();
+
+        common_telemetry::info!(
+            "[DBG] Query count: {}, cost: {:?}",
+            count,
+            count_start.elapsed()
+        );
+
         let doc_addrs = searcher
             .search(&query, &DocSetCollector)
             .context(TantivySnafu)?;
