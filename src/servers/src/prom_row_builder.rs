@@ -252,7 +252,7 @@ impl PoolTableBuilder {
                 debug_assert_eq!(tag_num, self.schema.len());
                 self.col_indexes.insert(tag_name.to_string(), tag_num);
                 self.schema.push(ColumnSchema {
-                    column_name: tag_value.to_string(),
+                    column_name: tag_name.to_string(),
                     datatype: ColumnDataType::String as i32,
                     semantic_type: SemanticType::Tag as i32,
                     datatype_extension: None,
