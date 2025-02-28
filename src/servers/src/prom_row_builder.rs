@@ -14,6 +14,7 @@
 
 use std::string::ToString;
 
+use api::pool::PROM_ROWS_POOL;
 use api::prom_store::remote::Sample;
 use api::v1::value::ValueData;
 use api::v1::{
@@ -90,9 +91,13 @@ impl PoolTablesBuilder {
         label_num: usize,
         row_num: usize,
     ) -> &mut PoolTableBuilder {
-        self.tables
-            .entry(table_name)
-            .or_insert_with(|| PoolTableBuilder::with_capacity(label_num + 2, row_num))
+        self.tables.entry(table_name).or_insert_with(|| {
+            if let Some(rows) = PROM_ROWS_POOL.try_pull() {
+                PoolTableBuilder::from_rows(rows.detach().1)
+            } else {
+                PoolTableBuilder::with_capacity(label_num + 2, row_num)
+            }
+        })
     }
 
     /// Converts [TablesBuilder] to [RowInsertRequests] and row numbers and clears inner states.
@@ -158,6 +163,17 @@ impl PoolTableBuilder {
         Self {
             schema,
             rows: Vec::with_capacity(rows),
+            num_rows: 0,
+            col_indexes: HashMap::new(),
+        }
+    }
+
+    /// Creates a `PoolTableBuilder` from the given `Rows`.
+    /// Reuses the memory.
+    pub fn from_rows(rows: Rows) -> Self {
+        Self {
+            schema: rows.schema,
+            rows: rows.rows,
             num_rows: 0,
             col_indexes: HashMap::new(),
         }

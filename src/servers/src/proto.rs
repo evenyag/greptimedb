@@ -22,7 +22,7 @@ use prost::encoding::message::merge;
 use prost::encoding::{decode_key, decode_varint, WireType};
 use prost::DecodeError;
 
-use crate::prom_row_builder::TablesBuilder;
+use crate::prom_row_builder::PoolTablesBuilder;
 use crate::prom_store::METRIC_NAME_LABEL_BYTES;
 use crate::repeated_field::{Clear, RepeatedField};
 
@@ -207,7 +207,7 @@ impl PromTimeSeries {
 
     fn add_to_table_data(
         &mut self,
-        table_builders: &mut TablesBuilder,
+        table_builders: &mut PoolTablesBuilder,
         is_strict_mode: bool,
     ) -> Result<(), DecodeError> {
         let label_num = self.labels.len();
@@ -231,7 +231,7 @@ impl PromTimeSeries {
 
 #[derive(Default, Debug)]
 pub struct PromWriteRequest {
-    table_data: TablesBuilder,
+    table_data: PoolTablesBuilder,
     series: PromTimeSeries,
 }
 

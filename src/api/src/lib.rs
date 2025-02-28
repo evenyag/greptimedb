@@ -28,3 +28,14 @@ pub mod v1;
 
 pub use greptime_proto;
 pub use prost::DecodeError;
+
+pub mod pool {
+    use lazy_static::lazy_static;
+    use object_pool::Pool;
+
+    use crate::v1::Rows;
+
+    lazy_static! {
+        pub static ref PROM_ROWS_POOL: Pool<Rows> = Pool::new(256, Rows::default);
+    }
+}
