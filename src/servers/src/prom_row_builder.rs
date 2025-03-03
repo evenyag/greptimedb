@@ -201,6 +201,14 @@ impl PoolTableBuilder {
 
     /// Converts [PoolTableBuilder] to [RowInsertRequest] and clears buffered data.
     pub(crate) fn as_row_insert_request(&mut self, table_name: String) -> RowInsertRequest {
+        if self.num_rows == 0 {
+            // The builder is empty, return an empty request.
+            return RowInsertRequest {
+                table_name,
+                rows: None,
+            };
+        }
+
         let mut rows = std::mem::take(&mut self.rows);
         let schema = std::mem::take(&mut self.schema);
         self.num_rows = 0;
@@ -245,6 +253,7 @@ impl PoolTableBuilder {
 
             if let Some(col_idx) = self.col_indexes.get(tag_name) {
                 // Name already exists, sets the value.
+                // In slow mode, the col idx already consider the timestamp and value.
                 self.set_column_value(*col_idx, tag_value);
             } else {
                 // A new column.
@@ -278,9 +287,10 @@ impl PoolTableBuilder {
 
         self.start_new_row();
 
-        for (col_idx, label) in labels.iter().enumerate() {
-            let tag_value = Self::bytes_to_str(&label.name, is_strict_mode)?;
-            self.set_column_value(col_idx, tag_value);
+        for (label_idx, label) in labels.iter().enumerate() {
+            let tag_value = Self::bytes_to_str(&label.value, is_strict_mode)?;
+            // Put tags behind timestamp and value.
+            self.set_column_value(label_idx + 2, tag_value);
         }
 
         self.add_samples(samples);
@@ -372,6 +382,22 @@ impl PoolTableBuilder {
     ) -> Result<bool, DecodeError> {
         if self.schema.is_empty() {
             // This is an empty builder.
+            self.schema.reserve(labels.len() + 2);
+            self.schema.push(ColumnSchema {
+                column_name: GREPTIME_TIMESTAMP.to_string(),
+                datatype: ColumnDataType::TimestampMillisecond as i32,
+                semantic_type: SemanticType::Timestamp as i32,
+                datatype_extension: None,
+                options: None,
+            });
+            self.schema.push(ColumnSchema {
+                column_name: GREPTIME_VALUE.to_string(),
+                datatype: ColumnDataType::Float64 as i32,
+                semantic_type: SemanticType::Field as i32,
+                datatype_extension: None,
+                options: None,
+            });
+
             for label in labels {
                 let column_name = Self::bytes_to_str(&label.name, is_strict_mode)?;
 
@@ -612,8 +638,9 @@ mod tests {
     use bytes::Bytes;
     use prost::DecodeError;
 
-    use crate::prom_row_builder::TableBuilder;
+    use crate::prom_row_builder::{PoolTableBuilder, TableBuilder};
     use crate::proto::PromLabel;
+
     #[test]
     fn test_table_builder() {
         let mut builder = TableBuilder::default();
@@ -710,5 +737,188 @@ mod tests {
             is_strict_mode,
         );
         assert_eq!(res, Err(DecodeError::new("invalid utf-8")));
+    }
+
+    #[test]
+    fn test_pool_table_builder_diff_schema() {
+        common_telemetry::init_default_ut_logging();
+
+        let mut builder = PoolTableBuilder::with_capacity(4, 2);
+        let is_strict_mode = true;
+        let _ = builder.add_labels_and_samples(
+            &[
+                PromLabel {
+                    name: Bytes::from("tag0"),
+                    value: Bytes::from("v0"),
+                },
+                PromLabel {
+                    name: Bytes::from("tag1"),
+                    value: Bytes::from("v1"),
+                },
+            ],
+            &[Sample {
+                value: 0.0,
+                timestamp: 0,
+            }],
+            is_strict_mode,
+        );
+
+        let _ = builder.add_labels_and_samples(
+            &[
+                PromLabel {
+                    name: Bytes::from("tag0"),
+                    value: Bytes::from("v0"),
+                },
+                PromLabel {
+                    name: Bytes::from("tag2"),
+                    value: Bytes::from("v2"),
+                },
+            ],
+            &[Sample {
+                value: 0.1,
+                timestamp: 1,
+            }],
+            is_strict_mode,
+        );
+
+        let request = builder.as_row_insert_request("test".to_string());
+        let rows = request.rows.unwrap().rows;
+        assert_eq!(2, rows.len());
+
+        assert_eq!(
+            vec![
+                Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(0))
+                },
+                Value {
+                    value_data: Some(ValueData::F64Value(0.0))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v0".to_string()))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v1".to_string()))
+                },
+                Value { value_data: None },
+            ],
+            rows[0].values
+        );
+
+        assert_eq!(
+            vec![
+                Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(1))
+                },
+                Value {
+                    value_data: Some(ValueData::F64Value(0.1))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v0".to_string()))
+                },
+                Value { value_data: None },
+                Value {
+                    value_data: Some(ValueData::StringValue("v2".to_string()))
+                },
+            ],
+            rows[1].values
+        );
+
+        let invalid_utf8_bytes = &[0xFF, 0xFF, 0xFF];
+
+        let res = builder.add_labels_and_samples(
+            &[PromLabel {
+                name: Bytes::from("tag0"),
+                value: invalid_utf8_bytes.to_byte_slice().into(),
+            }],
+            &[Sample {
+                value: 0.1,
+                timestamp: 1,
+            }],
+            is_strict_mode,
+        );
+        assert_eq!(res, Err(DecodeError::new("invalid utf-8")));
+    }
+
+    #[test]
+    fn test_pool_table_builder_same_schema() {
+        common_telemetry::init_default_ut_logging();
+
+        let mut builder = PoolTableBuilder::with_capacity(4, 2);
+        let is_strict_mode = true;
+        let _ = builder.add_labels_and_samples(
+            &[
+                PromLabel {
+                    name: Bytes::from("tag0"),
+                    value: Bytes::from("v0"),
+                },
+                PromLabel {
+                    name: Bytes::from("tag1"),
+                    value: Bytes::from("v1"),
+                },
+            ],
+            &[Sample {
+                value: 0.0,
+                timestamp: 0,
+            }],
+            is_strict_mode,
+        );
+
+        let _ = builder.add_labels_and_samples(
+            &[
+                PromLabel {
+                    name: Bytes::from("tag0"),
+                    value: Bytes::from("v0"),
+                },
+                PromLabel {
+                    name: Bytes::from("tag1"),
+                    value: Bytes::from("v2"),
+                },
+            ],
+            &[Sample {
+                value: 0.1,
+                timestamp: 1,
+            }],
+            is_strict_mode,
+        );
+
+        let request = builder.as_row_insert_request("test".to_string());
+        let rows = request.rows.unwrap().rows;
+        assert_eq!(2, rows.len());
+
+        assert_eq!(
+            vec![
+                Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(0))
+                },
+                Value {
+                    value_data: Some(ValueData::F64Value(0.0))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v0".to_string()))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v1".to_string()))
+                },
+            ],
+            rows[0].values
+        );
+
+        assert_eq!(
+            vec![
+                Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(1))
+                },
+                Value {
+                    value_data: Some(ValueData::F64Value(0.1))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v0".to_string()))
+                },
+                Value {
+                    value_data: Some(ValueData::StringValue("v2".to_string()))
+                },
+            ],
+            rows[1].values
+        );
     }
 }

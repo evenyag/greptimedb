@@ -264,9 +264,9 @@ fn mutations_to_record_batch(
         arrow_schema,
     };
 
-    sorter.sort().map(|(batch, min, max)|{
-        Some((batch, min, max, max_sequence))
-    })
+    sorter
+        .sort()
+        .map(|(batch, min, max)| Some((batch, min, max, max_sequence)))
 }
 
 struct ArraysSorter<I> {
@@ -564,7 +564,7 @@ mod tests {
 
         let pk_encoder = SparseEncoder::new(&metadata);
 
-        let (batch, _, _,_) = mutations_to_record_batch(&mutations, &metadata, dedup)
+        let (batch, _, _, _) = mutations_to_record_batch(&mutations, &metadata, dedup)
             .unwrap()
             .unwrap();
         let read_format = ReadFormat::new_with_all_columns(metadata.clone());
