@@ -427,6 +427,21 @@ impl PoolTableBuilder {
                     options: None,
                 },
             );
+            // Now row modifier will reset timestamp and value column schema.
+            self.schema[0] = ColumnSchema {
+                column_name: GREPTIME_TIMESTAMP.to_string(),
+                datatype: ColumnDataType::TimestampMillisecond as i32,
+                semantic_type: SemanticType::Timestamp as i32,
+                datatype_extension: None,
+                options: None,
+            };
+            self.schema[1] = ColumnSchema {
+                column_name: GREPTIME_VALUE.to_string(),
+                datatype: ColumnDataType::Float64 as i32,
+                semantic_type: SemanticType::Field as i32,
+                datatype_extension: None,
+                options: None,
+            };
             for (label_idx, label) in labels.iter().enumerate() {
                 let column_name = unsafe { std::str::from_utf8_unchecked(label.name.as_bytes()) };
                 self.schema[label_idx + 2].column_name.clear();
@@ -456,6 +471,7 @@ impl PoolTableBuilder {
         labels: &[PromLabel],
         is_strict_mode: bool,
     ) -> Result<bool, DecodeError> {
+        // TODO(yingwen): +2
         if labels.len() != self.schema.len() - 2 {
             return Ok(false);
         }
@@ -992,6 +1008,15 @@ mod tests {
         let request = builder.as_row_insert_request("test".to_string());
         let rows = request.rows.unwrap();
         assert_eq!(3, rows.schema.len());
+        let column_names: Vec<_> = rows
+            .schema
+            .iter()
+            .map(|col| col.column_name.clone())
+            .collect();
+        assert_eq!(
+            column_names,
+            vec!["greptime_timestamp", "greptime_value", "tag00"]
+        );
         assert_eq!(1, rows.rows.len());
 
         assert_eq!(
@@ -1086,6 +1111,15 @@ mod tests {
         let request = builder.as_row_insert_request("test".to_string());
         let rows = request.rows.unwrap();
         assert_eq!(4, rows.schema.len());
+        let column_names: Vec<_> = rows
+            .schema
+            .iter()
+            .map(|col| col.column_name.clone())
+            .collect();
+        assert_eq!(
+            column_names,
+            vec!["greptime_timestamp", "greptime_value", "tag00", "tag01"]
+        );
         assert_eq!(2, rows.rows.len());
 
         assert_eq!(
