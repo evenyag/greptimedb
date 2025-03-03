@@ -36,6 +36,6 @@ pub mod pool {
     use crate::v1::Rows;
 
     lazy_static! {
-        pub static ref PROM_ROWS_POOL: Pool<Rows> = Pool::new(256, Rows::default);
+        pub static ref PROM_ROWS_POOL: Pool<Rows> = Pool::new(4000, Rows::default);
     }
 }
