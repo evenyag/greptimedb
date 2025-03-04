@@ -15,6 +15,7 @@
 //! Handling write requests.
 
 use std::collections::{hash_map, HashMap};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use api::v1::OpType;
@@ -88,6 +89,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Write to WAL.
+        if std::env::var("enable_bulk_memtable")
+            .ok()
+            .and_then(|v| bool::from_str(&v).ok())
+            .unwrap_or(true)
         {
             let _timer = WRITE_STAGE_ELAPSED
                 .with_label_values(&["write_wal"])
