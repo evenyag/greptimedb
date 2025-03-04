@@ -92,8 +92,8 @@ impl PoolTablesBuilder {
         row_num: usize,
     ) -> &mut PoolTableBuilder {
         self.tables.entry(table_name).or_insert_with(|| {
-            if let Some(rows) = PROM_ROWS_POOL.try_pull() {
-                PoolTableBuilder::from_rows(rows.detach().1)
+            if let Some(rows) = PROM_ROWS_POOL.try_pull(row_num) {
+                PoolTableBuilder::from_rows(rows)
             } else {
                 PoolTableBuilder::with_capacity(label_num + 2, row_num)
             }

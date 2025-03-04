@@ -35,7 +35,41 @@ pub mod pool {
 
     use crate::v1::Rows;
 
+    pub struct RowsPool {
+        /// Pools for rows len:
+        /// `<16, <64, <256, >=256
+        pools: [Pool<Rows>; 4],
+    }
+
+    impl RowsPool {
+        pub fn new(capacity: usize) -> Self {
+            let pools = std::array::from_fn(|_| Pool::new(capacity, Rows::default));
+            Self { pools }
+        }
+
+        pub fn try_pull(&self, expect_size: usize) -> Option<Rows> {
+            let row_opt = match expect_size {
+                0..16 => self.pools[0].try_pull(),
+                16..64 => self.pools[1].try_pull(),
+                64..256 => self.pools[2].try_pull(),
+                _ => self.pools[3].try_pull(),
+            };
+
+            row_opt.map(|row| row.detach().1)
+        }
+
+        pub fn attach(&self, rows: Rows) {
+            let len = rows.rows.len();
+            match len {
+                0..16 => self.pools[0].attach(rows),
+                16..64 => self.pools[1].attach(rows),
+                64..256 => self.pools[2].attach(rows),
+                _ => self.pools[3].attach(rows),
+            };
+        }
+    }
+
     lazy_static! {
-        pub static ref PROM_ROWS_POOL: Pool<Rows> = Pool::new(4000, Rows::default);
+        pub static ref PROM_ROWS_POOL: RowsPool = RowsPool::new(4000);
     }
 }
