@@ -30,28 +30,37 @@ pub use greptime_proto;
 pub use prost::DecodeError;
 
 pub mod pool {
-    use lazy_static::lazy_static;
-    use object_pool::Pool;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
+    use lazy_static::lazy_static;
+
+    // use object_pool::Pool;
     use crate::v1::Rows;
 
     pub struct RowsPool {
-        pools: Pool<Rows>,
+        pools: Mutex<VecDeque<Rows>>,
+        capacity: usize,
     }
 
     impl RowsPool {
         pub fn new(capacity: usize) -> Self {
-            let pools = Pool::new(capacity, Rows::default);
-            Self { pools }
+            Self {
+                pools: Mutex::new(VecDeque::with_capacity(capacity)),
+                capacity,
+            }
         }
 
         pub fn try_pull(&self) -> Option<Rows> {
-            let row_opt = self.pools.try_pull();
-            row_opt.map(|row| row.detach().1)
+            self.pools.lock().unwrap().pop_front()
         }
 
         pub fn attach(&self, rows: Rows) {
-            self.pools.attach(rows)
+            let mut pools = self.pools.lock().unwrap();
+            if pools.len() >= self.capacity {
+                pools.pop_front();
+            }
+            pools.push_back(rows);
         }
     }
 
