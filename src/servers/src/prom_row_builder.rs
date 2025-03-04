@@ -190,11 +190,13 @@ impl PoolTableBuilder {
             return Ok(());
         }
 
-        if self.ensure_schema(labels, is_strict_mode)? {
-            self.add_labels_and_samples_fast(labels, samples, is_strict_mode)?;
-        } else {
-            self.add_labels_and_samples_slow(labels, samples, is_strict_mode)?;
-        }
+        self.ensure_schema(labels, is_strict_mode)?;
+        self.add_labels_and_samples_slow(labels, samples, is_strict_mode)?;
+        // if self.ensure_schema(labels, is_strict_mode)? {
+        //     self.add_labels_and_samples_fast(labels, samples, is_strict_mode)?;
+        // } else {
+        //     self.add_labels_and_samples_slow(labels, samples, is_strict_mode)?;
+        // }
 
         Ok(())
     }
@@ -382,7 +384,7 @@ impl PoolTableBuilder {
         &mut self,
         labels: &[PromLabel],
         is_strict_mode: bool,
-    ) -> Result<bool, DecodeError> {
+    ) -> Result<(), DecodeError> {
         if self.schema.is_empty() {
             // This is an empty builder.
             self.schema.reserve(labels.len() + 2);
@@ -413,7 +415,7 @@ impl PoolTableBuilder {
                 });
             }
 
-            return Ok(true);
+            return Ok(());
         }
 
         if self.num_rows == 0 {
@@ -450,20 +452,10 @@ impl PoolTableBuilder {
                 self.schema[label_idx + 2].column_name.push_str(column_name);
             }
 
-            return Ok(true);
-        }
-
-        // Already has schema, checks whether the schema matches the given labels.
-        if !self.has_same_schema(labels, is_strict_mode)? {
-            // We already have existing schema for previous rows.
-            // Switch to slow mode.
             self.switch_to_slow_mode();
-
-            Ok(false)
-        } else {
-            // We have the same schema.
-            Ok(true)
         }
+
+        Ok(())
     }
 
     /// Returns true if the schema matches the given labels.
