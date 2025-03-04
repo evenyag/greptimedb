@@ -75,8 +75,6 @@ impl TablesBuilder {
 #[derive(Default, Debug)]
 pub(crate) struct PoolTablesBuilder {
     tables: HashMap<String, PoolTableBuilder>,
-    /// Local row pool.
-    rows: Vec<Row>,
 }
 
 impl Clear for PoolTablesBuilder {
@@ -93,35 +91,33 @@ impl PoolTablesBuilder {
         label_num: usize,
         row_num: usize,
     ) -> &mut PoolTableBuilder {
-        self.tables
-            .entry(table_name)
-            .or_insert_with(|| {
-                if let Some(rows) = PROM_ROWS_POOL.try_pull() {
-                    PoolTableBuilder::from_rows(rows)
-                } else {
-                    PoolTableBuilder::with_capacity(label_num + 2, row_num)
-                }
-            })
-            .set_row_pool(std::mem::take(&mut self.rows))
+        self.tables.entry(table_name).or_insert_with(|| {
+            if let Some(rows) = PROM_ROWS_POOL.try_pull() {
+                PoolTableBuilder::from_rows(rows)
+            } else {
+                PoolTableBuilder::with_capacity(label_num + 2, row_num)
+            }
+        })
     }
 
     /// Converts [TablesBuilder] to [RowInsertRequests] and row numbers and clears inner states.
     pub(crate) fn as_insert_requests(&mut self) -> (RowInsertRequests, usize) {
         let mut total_rows = 0;
+        let mut remaining = Vec::new();
         let inserts = self
             .tables
             .drain()
             .map(|(name, mut table)| {
                 total_rows += table.num_rows();
-                table.as_row_insert_request(name, &mut self.rows)
+                table.as_row_insert_request(name, &mut remaining)
             })
             .collect();
+        let remaining_rows = Rows {
+            schema: Vec::new(),
+            rows: remaining,
+        };
+        PROM_ROWS_POOL.attach(remaining_rows);
         (RowInsertRequests { inserts }, total_rows)
-    }
-
-    /// Sets the row pool.
-    pub(crate) fn set_row_pool(&mut self, rows: Vec<Row>) {
-        self.rows = rows;
     }
 }
 
@@ -148,7 +144,6 @@ pub(crate) struct PoolTableBuilder {
     /// By default this is empty. Once we switch to the slow mode, we will
     /// fill this map and use the column name as the index.
     col_indexes: HashMap<String, usize>,
-    row_pool: Vec<Row>,
 }
 
 impl PoolTableBuilder {
@@ -176,7 +171,6 @@ impl PoolTableBuilder {
             rows: Vec::with_capacity(rows),
             num_rows: 0,
             col_indexes: HashMap::new(),
-            row_pool: Vec::new(),
         }
     }
 
@@ -188,19 +182,7 @@ impl PoolTableBuilder {
             rows: rows.rows,
             num_rows: 0,
             col_indexes: HashMap::new(),
-            row_pool: Vec::new(),
         }
-    }
-
-    /// Sets the row pool.
-    fn set_row_pool(&mut self, row_pool: Vec<Row>) -> &mut Self {
-        self.row_pool = row_pool;
-        self
-    }
-
-    /// Takes the row pool.
-    pub(crate) fn take_row_pool(&mut self) -> Vec<Row> {
-        std::mem::take(&mut self.row_pool)
     }
 
     /// Adds a set of labels and samples to table builder.
@@ -337,16 +319,9 @@ impl PoolTableBuilder {
     /// It ensures the new row has the same number of columns as the schema.
     fn start_new_row(&mut self) {
         if self.num_rows >= self.rows.len() {
-            if let Some(mut pooled_row) = self.row_pool.pop() {
-                pooled_row
-                    .values
-                    .resize(self.schema.len(), Value { value_data: None });
-                self.rows.push(pooled_row);
-            } else {
-                self.rows.push(Row {
-                    values: vec![Value { value_data: None }; self.schema.len()],
-                });
-            }
+            self.rows.push(Row {
+                values: vec![Value { value_data: None }; self.schema.len()],
+            });
         } else {
             self.rows[self.num_rows]
                 .values

@@ -222,8 +222,6 @@ impl PromTimeSeries {
             self.samples.as_slice(),
             is_strict_mode,
         )?;
-        let row_pool = table_data.take_row_pool();
-        table_builders.set_row_pool(row_pool);
         self.labels.clear();
         self.samples.clear();
 
