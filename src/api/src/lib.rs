@@ -39,24 +39,44 @@ pub mod pool {
     use crate::v1::Rows;
 
     pub struct RowsPool {
-        pools: Mutex<VecDeque<Rows>>,
+        /// Rows with capacity <= 8, <= 64, <= 512, > 512
+        pools: [Mutex<VecDeque<Rows>>; 4],
         capacity: usize,
     }
 
     impl RowsPool {
         pub fn new(capacity: usize) -> Self {
             Self {
-                pools: Mutex::new(VecDeque::with_capacity(capacity)),
+                pools: [
+                    Mutex::new(VecDeque::with_capacity(4000)),
+                    Mutex::new(VecDeque::with_capacity(400)),
+                    Mutex::new(VecDeque::with_capacity(100)),
+                    Mutex::new(VecDeque::with_capacity(50)),
+                ],
                 capacity,
             }
         }
 
-        pub fn try_pull(&self) -> Option<Rows> {
-            self.pools.lock().unwrap().pop_front()
+        pub fn try_pull(&self, expect_capacity: usize) -> Option<Rows> {
+            match expect_capacity {
+                0..=8 => self.pools[0].lock().unwrap().pop_front(),
+                9..=64 => self.pools[1].lock().unwrap().pop_front(),
+                65..=512 => self.pools[2].lock().unwrap().pop_front(),
+                _ => self.pools[3].lock().unwrap().pop_front(),
+            }
         }
 
         pub fn attach(&self, rows: Rows) {
-            let mut pools = self.pools.lock().unwrap();
+            match rows.rows.capacity() {
+                0..=8 => self.attach_pool(0, rows),
+                9..=64 => self.attach_pool(1, rows),
+                65..=512 => self.attach_pool(2, rows),
+                _ => self.attach_pool(3, rows),
+            }
+        }
+
+        fn attach_pool(&self, i: usize, rows: Rows) {
+            let mut pools = self.pools[i].lock().unwrap();
             if pools.len() >= self.capacity {
                 pools.pop_front();
             }
