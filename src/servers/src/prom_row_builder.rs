@@ -103,14 +103,20 @@ impl PoolTablesBuilder {
     /// Converts [TablesBuilder] to [RowInsertRequests] and row numbers and clears inner states.
     pub(crate) fn as_insert_requests(&mut self) -> (RowInsertRequests, usize) {
         let mut total_rows = 0;
+        let mut remaining = Vec::new();
         let inserts = self
             .tables
             .drain()
             .map(|(name, mut table)| {
                 total_rows += table.num_rows();
-                table.as_row_insert_request(name)
+                table.as_row_insert_request(name, &mut remaining)
             })
             .collect();
+        let remaining_rows = Rows {
+            schema: Vec::new(),
+            rows: remaining,
+        };
+        PROM_ROWS_POOL.attach(remaining_rows);
         (RowInsertRequests { inserts }, total_rows)
     }
 }
@@ -200,7 +206,11 @@ impl PoolTableBuilder {
     }
 
     /// Converts [PoolTableBuilder] to [RowInsertRequest] and clears buffered data.
-    pub(crate) fn as_row_insert_request(&mut self, table_name: String) -> RowInsertRequest {
+    pub(crate) fn as_row_insert_request(
+        &mut self,
+        table_name: String,
+        remaining: &mut Vec<Row>,
+    ) -> RowInsertRequest {
         if self.num_rows == 0 {
             // The builder is empty, return an empty request.
             return RowInsertRequest {
@@ -210,7 +220,9 @@ impl PoolTableBuilder {
         }
 
         if self.num_rows < self.rows.len() {
-            self.rows.truncate(self.num_rows);
+            // self.rows.truncate(self.num_rows);
+
+            remaining.extend(self.rows.drain(self.num_rows..));
         }
         let mut rows = std::mem::take(&mut self.rows);
         self.num_rows = 0;
@@ -800,7 +812,8 @@ mod tests {
             is_strict_mode,
         );
 
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(5, rows.schema.len());
         assert_eq!(2, rows.rows.len());
@@ -903,7 +916,8 @@ mod tests {
             is_strict_mode,
         );
 
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(4, rows.schema.len());
         assert_eq!(2, rows.rows.len());
@@ -989,7 +1003,8 @@ mod tests {
             is_strict_mode,
         );
 
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(4, rows.schema.len());
         assert_eq!(2, rows.rows.len());
@@ -1007,7 +1022,8 @@ mod tests {
             is_strict_mode,
         );
 
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(3, rows.schema.len());
         let column_names: Vec<_> = rows
@@ -1069,7 +1085,8 @@ mod tests {
             is_strict_mode,
         );
 
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(3, rows.schema.len());
         assert_eq!(2, rows.rows.len());
@@ -1110,7 +1127,8 @@ mod tests {
             }],
             is_strict_mode,
         );
-        let request = builder.as_row_insert_request("test".to_string());
+        let mut remaining = Vec::new();
+        let request = builder.as_row_insert_request("test".to_string(), &mut remaining);
         let rows = request.rows.unwrap();
         assert_eq!(4, rows.schema.len());
         let column_names: Vec<_> = rows
