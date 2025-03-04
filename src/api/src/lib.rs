@@ -39,7 +39,7 @@ pub mod pool {
     use crate::v1::Rows;
 
     pub struct RowsPool {
-        /// Rows with capacity <= 8, <= 64, <= 512, > 512
+        /// Rows with capacity == 1, <= 8, <= 64, > 64
         pools: [Mutex<VecDeque<Rows>>; 4],
         capacity: usize,
     }
@@ -59,18 +59,20 @@ pub mod pool {
 
         pub fn try_pull(&self, expect_capacity: usize) -> Option<Rows> {
             match expect_capacity {
-                0..=8 => self.pools[0].lock().unwrap().pop_front(),
-                9..=64 => self.pools[1].lock().unwrap().pop_front(),
-                65..=512 => self.pools[2].lock().unwrap().pop_front(),
+                0 => None,
+                1 => self.pools[0].lock().unwrap().pop_front(),
+                2..=8 => self.pools[1].lock().unwrap().pop_front(),
+                9..=64 => self.pools[2].lock().unwrap().pop_front(),
                 _ => self.pools[3].lock().unwrap().pop_front(),
             }
         }
 
         pub fn attach(&self, rows: Rows) {
             match rows.rows.capacity() {
-                0..=8 => self.attach_pool(0, rows),
-                9..=64 => self.attach_pool(1, rows),
-                65..=512 => self.attach_pool(2, rows),
+                0 => (),
+                1 => self.attach_pool(0, rows),
+                2..=8 => self.attach_pool(1, rows),
+                9..=64 => self.attach_pool(2, rows),
                 _ => self.attach_pool(3, rows),
             }
         }
