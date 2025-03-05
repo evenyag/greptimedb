@@ -89,7 +89,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         }
 
         // Write to WAL.
-        if std::env::var("enable_bulk_memtable")
+        if std::env::var("enable_wal")
             .ok()
             .and_then(|v| bool::from_str(&v).ok())
             .unwrap_or(true)
@@ -124,6 +124,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         let (mut put_rows, mut delete_rows) = (0, 0);
         // Write to memtables.
+        if std::env::var("enable_write_memtable")
+            .ok()
+            .and_then(|v| bool::from_str(&v).ok())
+            .unwrap_or(true)
         {
             let _timer = WRITE_STAGE_ELAPSED
                 .with_label_values(&["write_memtable"])
