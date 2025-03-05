@@ -395,38 +395,38 @@ impl PoolTableBuilder {
         labels: &[PromLabel],
         is_strict_mode: bool,
     ) -> Result<(), DecodeError> {
-        if self.schema.is_empty() {
-            // This is an empty builder.
-            self.schema.reserve(labels.len() + 2);
-            self.schema.push(ColumnSchema {
-                column_name: GREPTIME_TIMESTAMP.to_string(),
-                datatype: ColumnDataType::TimestampMillisecond as i32,
-                semantic_type: SemanticType::Timestamp as i32,
-                datatype_extension: None,
-                options: None,
-            });
-            self.schema.push(ColumnSchema {
-                column_name: GREPTIME_VALUE.to_string(),
-                datatype: ColumnDataType::Float64 as i32,
-                semantic_type: SemanticType::Field as i32,
-                datatype_extension: None,
-                options: None,
-            });
+        // if self.schema.is_empty() {
+        //     // This is an empty builder.
+        //     self.schema.reserve(labels.len() + 2);
+        //     self.schema.push(ColumnSchema {
+        //         column_name: GREPTIME_TIMESTAMP.to_string(),
+        //         datatype: ColumnDataType::TimestampMillisecond as i32,
+        //         semantic_type: SemanticType::Timestamp as i32,
+        //         datatype_extension: None,
+        //         options: None,
+        //     });
+        //     self.schema.push(ColumnSchema {
+        //         column_name: GREPTIME_VALUE.to_string(),
+        //         datatype: ColumnDataType::Float64 as i32,
+        //         semantic_type: SemanticType::Field as i32,
+        //         datatype_extension: None,
+        //         options: None,
+        //     });
 
-            for label in labels {
-                let column_name = Self::bytes_to_str(&label.name, is_strict_mode)?;
+        //     for label in labels {
+        //         let column_name = Self::bytes_to_str(&label.name, is_strict_mode)?;
 
-                self.schema.push(ColumnSchema {
-                    column_name: column_name.to_string(),
-                    datatype: ColumnDataType::String as i32,
-                    semantic_type: SemanticType::Tag as i32,
-                    datatype_extension: None,
-                    options: None,
-                });
-            }
+        //         self.schema.push(ColumnSchema {
+        //             column_name: column_name.to_string(),
+        //             datatype: ColumnDataType::String as i32,
+        //             semantic_type: SemanticType::Tag as i32,
+        //             datatype_extension: None,
+        //             options: None,
+        //         });
+        //     }
 
-            return Ok(());
-        }
+        //     return Ok(());
+        // }
 
         if self.num_rows == 0 {
             // This is a builder with buffer to reuse, the schema is actually empty. We can
