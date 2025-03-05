@@ -212,7 +212,16 @@ impl PoolTableBuilder {
         }
 
         if self.num_rows < self.rows.len() {
-            self.rows.truncate(self.num_rows);
+            if self.num_rows < self.rows.len() / 2 {
+                let remaining = self.rows.drain(self.num_rows..).collect();
+                let remaining_rows = Rows {
+                    schema: Vec::new(),
+                    rows: remaining,
+                };
+                PROM_ROWS_POOL.attach(remaining_rows);
+            } else {
+                self.rows.truncate(self.num_rows);
+            }
         }
         let mut rows = std::mem::take(&mut self.rows);
         self.num_rows = 0;
