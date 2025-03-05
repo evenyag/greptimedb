@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use api::prom_store::remote::ReadRequest;
 use api::v1::RowInsertRequests;
@@ -267,11 +268,19 @@ async fn decode_remote_write_request(
         try_decompress(!is_zstd, &body[..])?
     };
 
+    let decode_start = Instant::now();
     let mut request = PROM_WRITE_REQUEST_POOL.pull(PromWriteRequest::default);
     request
         .merge(buf, is_strict_mode)
         .context(error::DecodePromRemoteRequestSnafu)?;
-    Ok(request.as_row_insert_requests())
+    let requests = request.as_row_insert_requests();
+
+    common_telemetry::info!(
+        "Decode prom remote write request, cost: {:?}",
+        decode_start.elapsed()
+    );
+
+    Ok(requests)
 }
 
 async fn decode_remote_read_request(body: Bytes) -> Result<ReadRequest> {
