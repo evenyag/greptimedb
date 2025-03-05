@@ -74,7 +74,7 @@ impl RowModifier {
         let num_output_column = num_column - num_primary_key_column + 1;
 
         let mut buffer = vec![];
-        let mut old_rows = Vec::with_capacity(iter.rows.rows.len());
+        // let mut old_rows = Vec::with_capacity(iter.rows.rows.len());
         for mut iter in iter.iter_mut() {
             let (table_id, tsid) = self.fill_internal_columns(table_id, &iter);
             let mut values = Vec::with_capacity(num_output_column);
@@ -99,8 +99,9 @@ impl RowModifier {
             values.push(ValueData::BinaryValue(buffer.clone()).into());
             values.extend(iter.remaining());
             // Replace the row with the encoded row
-            let old_row = std::mem::replace(iter.row, Row { values });
-            old_rows.push(old_row);
+            *iter.row = Row { values };
+            // let old_row = std::mem::replace(iter.row, Row { values });
+            // old_rows.push(old_row);
         }
 
         // Update the schema
@@ -113,13 +114,16 @@ impl RowModifier {
             options: None,
         });
         schema.extend(iter.remaining_columns());
-        let old_schema = std::mem::replace(&mut iter.rows.schema, schema);
 
-        let old_rows = Rows {
-            schema: old_schema,
-            rows: old_rows,
-        };
-        PROM_ROWS_POOL.attach(old_rows);
+        iter.rows.schema = schema;
+
+        // let old_schema = std::mem::replace(&mut iter.rows.schema, schema);
+
+        // let old_rows = Rows {
+        //     schema: old_schema,
+        //     rows: old_rows,
+        // };
+        // PROM_ROWS_POOL.attach(old_rows);
 
         Ok(iter.rows)
     }
