@@ -286,6 +286,13 @@ impl<C: Access> ReadCache<C> {
     {
         OBJECT_STORE_LRU_CACHE_MISS.inc();
 
+        common_telemetry::info!(
+            "[DBG] Read cache, read key: {}, path: {}, args: {:?}",
+            read_key,
+            path,
+            args
+        );
+
         let (_, reader) = inner.read(path, args).await?;
         let result = self.try_write_cache::<I>(reader, read_key).await;
 

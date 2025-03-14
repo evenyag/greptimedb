@@ -284,6 +284,17 @@ impl<'a> InMemoryRowGroup<'a> {
             // is a synchronous, CPU-bound operation.
             yield_now().await;
 
+            self.base.column_chunks
+                .iter()
+                .zip(&self.base.column_uncompressed_pages)
+                .enumerate()
+                .for_each(|(idx, (chunk, uncompressed_pages))| {
+                    if chunk.is_none() && projection.leaf_included(idx) && uncompressed_pages.is_some() {
+                        let column = self.base.metadata.column(idx);
+                        common_telemetry::info!("[DBG] Fetching page from cache, {}-{}, row group: {}, column {}, range: {:?}", self.region_id, self.file_id, self.row_group_idx, idx, column.byte_range());
+                    }
+                });
+
             // Calculate ranges to read.
             let fetch_ranges = self.base.calc_dense_read_ranges(projection);
 
@@ -362,6 +373,14 @@ impl<'a> InMemoryRowGroup<'a> {
     /// Try to fetch data from WriteCache,
     /// if not in WriteCache, fetch data from object store directly.
     async fn fetch_bytes(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        common_telemetry::info!(
+            "[DBG] Fetching bytes from parquet, {}-{}, row group: {}, ranges: {:?}",
+            self.region_id,
+            self.file_id,
+            self.row_group_idx,
+            ranges
+        );
+
         let key = IndexKey::new(self.region_id, self.file_id, FileType::Parquet);
         match self.fetch_ranges_from_write_cache(key, ranges).await {
             Some(data) => Ok(data),
