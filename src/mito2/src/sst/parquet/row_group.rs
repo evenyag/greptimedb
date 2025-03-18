@@ -151,6 +151,14 @@ impl<'a> RowGroupBase<'a> {
                 chunk.is_none() && projection.leaf_included(idx) && uncompressed_pages.is_none()
             })
             .map(|(idx, (_chunk, _pages))| {
+                common_telemetry::info!(
+                    "[DBG] Fetching page from store, {}-{}, row group: {}, column {}, range: {:?}",
+                    self.region_id,
+                    self.file_id,
+                    self.row_group_idx,
+                    idx,
+                    column.byte_range()
+                );
                 let column = self.metadata.column(idx);
                 let (start, length) = column.byte_range();
                 start..(start + length)
