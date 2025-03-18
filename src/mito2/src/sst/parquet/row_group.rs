@@ -292,6 +292,9 @@ impl<'a> InMemoryRowGroup<'a> {
                     if chunk.is_none() && projection.leaf_included(idx) && uncompressed_pages.is_some() {
                         let column = self.base.metadata.column(idx);
                         common_telemetry::info!("[DBG] Fetching page from cache, {}-{}, row group: {}, column {}, range: {:?}", self.region_id, self.file_id, self.row_group_idx, idx, column.byte_range());
+                    } else if chunk.is_none() && projection.leaf_included(idx) && uncompressed_pages.is_none() {
+                        let column = self.base.metadata.column(idx);
+                        common_telemetry::info!("[DBG] Fetching page from store, {}-{}, row group: {}, column {}, range: {:?}", self.region_id, self.file_id, self.row_group_idx, idx, column.byte_range());
                     }
                 });
 
