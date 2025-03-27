@@ -47,6 +47,7 @@ pub enum ObjectStoreConfig {
     Oss(OssConfig),
     Azblob(AzblobConfig),
     Gcs(GcsConfig),
+    Mysql(MysqlConfig),
 }
 
 impl ObjectStoreConfig {
@@ -58,9 +59,11 @@ impl ObjectStoreConfig {
             Self::Oss(_) => "Oss",
             Self::Azblob(_) => "Azblob",
             Self::Gcs(_) => "Gcs",
+            Self::Mysql(_) => "Mysql",
         }
     }
 
+    // TODO(yingwen): Support using Mysql without local cache.
     /// Returns true when it's a remote object storage such as AWS s3 etc.
     pub fn is_object_storage(&self) -> bool {
         !matches!(self, Self::File(_))
@@ -75,6 +78,7 @@ impl ObjectStoreConfig {
             Self::Oss(oss) => &oss.name,
             Self::Azblob(az) => &az.name,
             Self::Gcs(gcs) => &gcs.name,
+            Self::Mysql(mysql) => &mysql.name,
         };
 
         if name.trim().is_empty() {
@@ -286,6 +290,49 @@ impl PartialEq for GcsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MysqlConfig {
+    /// Name to identify the mysql storage.
+    pub name: String,
+    /// the connection_string of the mysql service.
+    /// This connection string is used to connect to the mysql service. There are url based formats:
+    ///
+    /// This format resembles the url format of the mysql client. The format is: `[scheme://][user[:[password]]@]host[:port][/schema][?attribute1=value1&attribute2=value2...`
+    ///
+    /// - `mysql://user@localhost`
+    /// - `mysql://user:password@localhost`
+    /// - `mysql://user:password@localhost:3306`
+    /// - `mysql://user:password@localhost:3306/db`
+    #[serde(skip_serializing)]
+    pub connection_string: SecretString,
+    /// The working directory, all operations will be performed under it.
+    /// Default to `/` if not specified.
+    pub root: String,
+    /// The table name of the mysql service to read/write.
+    pub table: String,
+    /// Set the key field name of the mysql service to read/write.
+    /// Default to `key` if not specified.
+    pub key_field: String,
+    /// Set the value field name of the mysql service to read/write.
+    /// Default to `value` if not specified.
+    pub value_field: String,
+    #[serde(flatten)]
+    pub cache: ObjectStorageCacheConfig,
+}
+
+impl PartialEq for MysqlConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.connection_string.expose_secret() == other.connection_string.expose_secret()
+            && self.root == other.root
+            && self.table == other.table
+            && self.key_field == other.key_field
+            && self.value_field == other.value_field
+            && self.cache == other.cache
+    }
+}
+
 impl Default for S3Config {
     fn default() -> Self {
         Self {
@@ -346,6 +393,20 @@ impl Default for GcsConfig {
             endpoint: String::default(),
             cache: ObjectStorageCacheConfig::default(),
             http_client: HttpClientConfig::default(),
+        }
+    }
+}
+
+impl Default for MysqlConfig {
+    fn default() -> Self {
+        Self {
+            name: String::default(),
+            connection_string: SecretString::from(String::default()),
+            root: "/".to_string(),
+            table: String::default(),
+            key_field: "key".to_string(),
+            value_field: "value".to_string(),
+            cache: ObjectStorageCacheConfig::default(),
         }
     }
 }

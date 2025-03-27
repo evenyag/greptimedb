@@ -17,6 +17,7 @@
 mod azblob;
 pub mod fs;
 mod gcs;
+mod mysql;
 mod oss;
 mod s3;
 use std::path::Path;
@@ -49,6 +50,7 @@ pub(crate) async fn new_raw_object_store(
             azblob::new_azblob_object_store(azblob_config).await
         }
         ObjectStoreConfig::Gcs(gcs_config) => gcs::new_gcs_object_store(gcs_config).await,
+        ObjectStoreConfig::Mysql(mysql_config) => mysql::new_mysql_object_store(mysql_config).await,
     }?;
     Ok(object_store)
 }

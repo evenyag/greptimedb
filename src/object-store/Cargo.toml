@@ -26,6 +26,7 @@ opendal = { version = "0.51.1", features = [
     "services-http",
     "services-oss",
     "services-s3",
+    "services-mysql",
 ] }
 prometheus.workspace = true
 tokio.workspace = true
