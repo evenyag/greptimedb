@@ -710,8 +710,8 @@ pub enum Error {
         error: std::io::Error,
     },
 
-    #[snafu(display("Failed to filter record batch"))]
-    FilterRecordBatch {
+    #[snafu(display("Record batch error"))]
+    RecordBatch {
         source: common_recordbatch::error::Error,
         #[snafu(implicit)]
         location: Location,
@@ -968,6 +968,20 @@ pub enum Error {
 
     #[snafu(display("Manual compaction is override by following operations."))]
     ManualCompactionOverride {},
+
+    #[snafu(display("Failed to scan series"))]
+    ScanSeries {
+        #[snafu(implicit)]
+        location: Location,
+        source: Arc<Error>,
+    },
+
+    #[snafu(display("Partition {} scan multiple times", partition))]
+    ScanMultiTimes {
+        partition: usize,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1087,7 +1101,7 @@ impl ErrorExt for Error {
             InvalidConfig { .. } => StatusCode::InvalidArguments,
             StaleLogEntry { .. } => StatusCode::Unexpected,
 
-            FilterRecordBatch { source, .. } => source.status_code(),
+            RecordBatch { source, .. } => source.status_code(),
 
             Download { .. } | Upload { .. } => StatusCode::StorageUnavailable,
             ChecksumMismatch { .. } => StatusCode::Unexpected,
@@ -1114,6 +1128,10 @@ impl ErrorExt for Error {
             }
 
             ManualCompactionOverride {} => StatusCode::Cancelled,
+
+            ScanSeries { source, .. } => source.status_code(),
+
+            ScanMultiTimes { .. } => StatusCode::InvalidArguments,
         }
     }
 
