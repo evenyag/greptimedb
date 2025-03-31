@@ -66,7 +66,11 @@ impl ObjectStoreConfig {
     // TODO(yingwen): Support using Mysql without local cache.
     /// Returns true when it's a remote object storage such as AWS s3 etc.
     pub fn is_object_storage(&self) -> bool {
-        !matches!(self, Self::File(_))
+        match self {
+            Self::File(_) => false,
+            Self::S3(_) | Self::Oss(_) | Self::Azblob(_) | Self::Gcs(_) => true,
+            Self::Mysql(config) => config.use_cache,
+        }
     }
 
     /// Returns the object storage configuration name, return the provider name if it's empty.
@@ -317,6 +321,7 @@ pub struct MysqlConfig {
     /// Set the value field name of the mysql service to read/write.
     /// Default to `value` if not specified.
     pub value_field: String,
+    pub use_cache: bool,
     #[serde(flatten)]
     pub cache: ObjectStorageCacheConfig,
 }
@@ -329,6 +334,7 @@ impl PartialEq for MysqlConfig {
             && self.table == other.table
             && self.key_field == other.key_field
             && self.value_field == other.value_field
+            && self.use_cache == other.use_cache
             && self.cache == other.cache
     }
 }
@@ -406,6 +412,7 @@ impl Default for MysqlConfig {
             table: String::default(),
             key_field: "key".to_string(),
             value_field: "value".to_string(),
+            use_cache: false,
             cache: ObjectStorageCacheConfig::default(),
         }
     }
