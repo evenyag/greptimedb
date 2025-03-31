@@ -145,6 +145,15 @@ async fn build_cache_layer(
                 .unwrap_or(DEFAULT_OBJECT_STORE_CACHE_SIZE);
             (name, path, capacity)
         }
+        ObjectStoreConfig::Mysql(mysql_config) => {
+            let path = mysql_config.cache.cache_path.clone();
+            let name = &mysql_config.name;
+            let capacity = mysql_config
+                .cache
+                .cache_capacity
+                .unwrap_or(DEFAULT_OBJECT_STORE_CACHE_SIZE);
+            (name, path, capacity)
+        }
         _ => unreachable!("Already checked above"),
     };
 
