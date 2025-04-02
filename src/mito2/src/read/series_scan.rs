@@ -131,7 +131,7 @@ impl SeriesScan {
                     RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)?;
                 metrics.convert_cost += convert_start.elapsed();
 
-                common_telemetry::info!("Record batch converted, num_rows: {}", record_batch.num_rows());
+                common_telemetry::info!("Record batch converted, partition: {}, num_batches: {}, num_rows: {}", partition, metrics.num_batches, metrics.num_rows);
 
                 let yield_start = Instant::now();
                 yield record_batch;
@@ -350,9 +350,17 @@ impl SeriesDistributor {
                 continue;
             }
 
+            common_telemetry::info!(
+                "Try to send batch, num_batches: {}, num_rows: {}, last_key: {:?}",
+                metrics.num_batches,
+                metrics.num_rows,
+                last_key
+            );
+
             // We find a new series, send the current one.
             let to_send = std::mem::replace(&mut current_series, SeriesBatch::single(batch));
             let yield_start = Instant::now();
+
             self.senders.send_batch(to_send).await?;
             metrics.yield_cost += yield_start.elapsed();
 
@@ -432,6 +440,7 @@ impl SenderList {
 
             let sender_idx = self.fetch_add_sender_idx();
             let Some(sender) = &self.senders[sender_idx] else {
+                common_telemetry::info!("Sender is none, sender_idx: {}", sender_idx);
                 continue;
             };
             // Adds a timeout to avoid blocking indefinitely and sending
@@ -445,10 +454,13 @@ impl SenderList {
                     break;
                 }
                 Err(SendTimeoutError::Timeout(res)) => {
+                    common_telemetry::info!("Sent batch timeout, sender_idx: {}", sender_idx);
                     // Safety: we send Ok.
                     batch = res.unwrap();
                 }
                 Err(SendTimeoutError::Closed(res)) => {
+                    common_telemetry::info!("Sent batch closed, sender_idx: {}", sender_idx);
+                    // Safety: we send Ok.
                     self.senders[sender_idx] = None;
                     self.num_nones += 1;
                     // Safety: we send Ok.
