@@ -108,6 +108,7 @@ impl SeriesScan {
             let mut fetch_start = Instant::now();
             while let Some(result) = receiver.recv().await {
                 let series = result.map_err(BoxedError::new).context(ExternalSnafu)?;
+                common_telemetry::info!("Recv result, partition: {}, len: {}", partition, series.batches.len());
 
                 let convert_start = Instant::now();
                 df_record_batches.reserve(series.batches.len());
@@ -131,7 +132,7 @@ impl SeriesScan {
                     RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)?;
                 metrics.convert_cost += convert_start.elapsed();
 
-                common_telemetry::info!("Record batch converted, partition: {}, num_batches: {}, num_rows: {}", partition, metrics.num_batches, metrics.num_rows);
+                common_telemetry::info!("Record batch converted, partition: {}, num_batches: {}, num_rows: {}, cost: {:?}", partition, metrics.num_batches, metrics.num_rows, convert_start.elapsed());
 
                 let yield_start = Instant::now();
                 yield record_batch;
