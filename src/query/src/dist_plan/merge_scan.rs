@@ -238,6 +238,12 @@ impl MergeScanExec {
         context: Arc<TaskContext>,
         partition: usize,
     ) -> Result<SendableRecordBatchStream> {
+        common_telemetry::info!(
+            "MergeScan to_stream, partition: {}, target_partition: {}",
+            partition,
+            self.target_partition
+        );
+
         // prepare states to move
         let regions = self.regions.clone();
         let region_query_handler = self.region_query_handler.clone();
