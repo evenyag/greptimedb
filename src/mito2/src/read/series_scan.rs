@@ -131,6 +131,8 @@ impl SeriesScan {
                     RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)?;
                 metrics.convert_cost += convert_start.elapsed();
 
+                common_telemetry::info!("Record batch converted, num_rows: {}", record_batch.num_rows());
+
                 let yield_start = Instant::now();
                 yield record_batch;
                 metrics.yield_cost += yield_start.elapsed();
@@ -294,6 +296,8 @@ impl SeriesDistributor {
 
     /// Scans all parts.
     async fn scan_partitions(&mut self) -> Result<()> {
+        common_telemetry::info!("Start scanning partitions");
+
         let part_metrics = new_partition_metrics(&self.stream_ctx, self.partitions.len());
         part_metrics.on_first_poll();
 
@@ -316,6 +320,7 @@ impl SeriesDistributor {
                 );
             }
         }
+        common_telemetry::info!("Start scanning partitions, sources: {}", sources.len());
 
         // Builds a reader that merge sources from all parts.
         let mut reader =
@@ -365,6 +370,7 @@ impl SeriesDistributor {
         part_metrics.merge_metrics(&metrics);
 
         part_metrics.on_finish();
+        common_telemetry::info!("Stop scanning partitions");
 
         Ok(())
     }
@@ -420,6 +426,7 @@ impl SenderList {
 
     /// Finds a partition and sends the batch to the partition.
     async fn send_batch(&mut self, mut batch: SeriesBatch) -> Result<()> {
+        common_telemetry::info!("Try to send batch, len: {}", batch.batches.len());
         loop {
             ensure!(self.num_nones < self.senders.len(), InvalidSenderSnafu);
 
@@ -432,7 +439,11 @@ impl SenderList {
             // don't poll their inputs. This may happen if we have a
             // node like sort merging. But it is rare when we are using SeriesScan.
             match sender.send_timeout(Ok(batch), SEND_TIMEOUT).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    common_telemetry::info!("Sent batch successfully, sender_idx: {}", sender_idx);
+
+                    break;
+                }
                 Err(SendTimeoutError::Timeout(res)) => {
                     // Safety: we send Ok.
                     batch = res.unwrap();
