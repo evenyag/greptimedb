@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::v1::Rows;
 use common_base::Plugins;
@@ -22,19 +22,22 @@ use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
 use common_test_util::temp_dir::create_temp_dir;
+use datafusion_common::ScalarValue;
+use datafusion_expr::{col, lit, Expr};
+use futures::TryStreamExt;
 use object_store::manager::ObjectStoreManager;
 use object_store::services::Fs;
 use object_store::ObjectStore;
-use store_api::region_engine::{RegionEngine, RegionRole};
+use store_api::region_engine::{RegionEngine, RegionRole, RegionScanner};
 use store_api::region_request::{
     RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
 };
-use store_api::storage::{RegionId, ScanRequest};
+use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution};
 use tokio::sync::oneshot;
 
 use crate::compaction::compactor::{open_compaction_region, OpenCompactionRegionRequest};
 use crate::config::MitoConfig;
-use crate::engine::MitoEngine;
+use crate::engine::{MitoEngine, ScanRegion};
 use crate::error;
 use crate::region::options::RegionOptions;
 use crate::test_util::{
@@ -528,4 +531,48 @@ async fn test_engine_prom_scan() {
         )
         .await
         .unwrap();
+
+    let request = ScanRequest {
+        projection: Some(vec![
+            4, 5, 6, 0, 1, 7, 24, 25, 8, 49, 9, 10, 26, 11, 12, 18, 14, 15, 16,
+        ]),
+        filters: vec![
+            col("namespace").eq(lit("app-0")),
+            col("cluster").eq(lit("eks-us-east-1-qa1")),
+            col("greptime_timestamp").gt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1743439965000),
+                None,
+            ))),
+            col("greptime_timestamp").lt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1743566580000),
+                None,
+            ))),
+            col("__table_id").eq(Expr::Literal(ScalarValue::UInt32(Some(1085)))),
+        ],
+        output_ordering: None,
+        limit: None,
+        series_row_selector: None,
+        sequence: None,
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+    };
+    let scan_region = engine.scan_region(region_id, request).unwrap();
+    test_seq_scan(scan_region).await;
+}
+
+async fn test_seq_scan(scan_region: ScanRegion) {
+    let start = Instant::now();
+    let seq_scan = scan_region.seq_scan().unwrap();
+    seq_scan.scan_partition(0).unwrap();
+    let mut stream = seq_scan.scan_partition(0).unwrap();
+
+    let mut num_rows = 0;
+    while let Some(rb) = stream.try_next().await.unwrap() {
+        num_rows += rb.num_rows();
+    }
+
+    common_telemetry::info!(
+        "SeqScan per-series scan {} rows, total time: {:?}",
+        num_rows,
+        start.elapsed()
+    );
 }
