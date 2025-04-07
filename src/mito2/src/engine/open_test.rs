@@ -492,18 +492,20 @@ async fn test_open_compaction_region() {
 
 #[tokio::test]
 async fn test_engine_prom_scan() {
+    common_telemetry::init_default_ut_logging();
+
     let test_dir = create_temp_dir("prom");
     let data_home = test_dir.path();
     let wal_path = data_home.join("wal");
     let factory = RaftEngineLogStoreFactory;
     let log_store = factory.create_log_store(wal_path).await;
-    let data_path = "/home/yangyw/data-prom/data".to_string();
+    let data_path = "/home/yangyw/greptime/data-prom/data".to_string();
     let builder = Fs::default().root(&data_path);
     let object_store = ObjectStore::new(builder).unwrap().finish();
     let object_store_manager = Arc::new(ObjectStoreManager::new("default", object_store));
     let (schema_metadata_manager, _kv_backend) = mock_schema_metadata_manager();
     let engine = MitoEngine::new(
-        "/home/yangyw/data-prom/",
+        "/home/yangyw/greptime/data-prom/",
         MitoConfig::default(),
         Arc::new(log_store),
         object_store_manager,
@@ -519,7 +521,7 @@ async fn test_engine_prom_scan() {
             region_id,
             RegionRequest::Open(RegionOpenRequest {
                 engine: String::new(),
-                region_dir: "greptime/public/1024/1024/1024_0000000000/".to_string(),
+                region_dir: "greptime/public/1024/1024_0000000000/data/".to_string(),
                 options: HashMap::default(),
                 skip_wal_replay: false,
             }),
