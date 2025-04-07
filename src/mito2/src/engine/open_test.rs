@@ -24,6 +24,7 @@ use common_recordbatch::RecordBatches;
 use common_test_util::temp_dir::create_temp_dir;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{col, lit, Expr};
+use futures::future::try_join_all;
 use futures::TryStreamExt;
 use object_store::manager::ObjectStoreManager;
 use object_store::services::Fs;
@@ -494,7 +495,16 @@ async fn test_open_compaction_region() {
 }
 
 #[tokio::test]
-async fn test_engine_prom_scan() {
+async fn test_engine_prom_seq_scan() {
+    run_engine_prom_scan(false).await;
+}
+
+#[tokio::test]
+async fn test_engine_prom_series_scan() {
+    run_engine_prom_scan(true).await;
+}
+
+async fn run_engine_prom_scan(use_series_scan: bool) {
     common_telemetry::init_default_ut_logging();
 
     let test_dir = create_temp_dir("prom");
@@ -555,8 +565,12 @@ async fn test_engine_prom_scan() {
         sequence: None,
         distribution: Some(TimeSeriesDistribution::PerSeries),
     };
-    let scan_region = engine.scan_region(region_id, request).unwrap();
-    test_seq_scan(scan_region).await;
+    let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
+    if use_series_scan {
+        test_series_scan(scan_region).await;
+    } else {
+        test_seq_scan(scan_region).await;
+    }
 }
 
 async fn test_seq_scan(scan_region: ScanRegion) {
@@ -578,6 +592,40 @@ async fn test_seq_scan(scan_region: ScanRegion) {
 
     common_telemetry::info!(
         "SeqScan per-series scan {} rows, total time: {:?}",
+        num_rows,
+        start.elapsed()
+    );
+}
+
+async fn test_series_scan(scan_region: ScanRegion) {
+    let start = Instant::now();
+    let mut series_scan = scan_region.series_scan().unwrap();
+    series_scan
+        .prepare(PrepareRequest {
+            ranges: None,
+            distinguish_partition_range: None,
+            target_partitions: Some(8),
+        })
+        .unwrap();
+    let num_partitions = series_scan.properties().num_partitions();
+    let mut tasks = Vec::with_capacity(num_partitions);
+    for i in 0..num_partitions {
+        let mut stream = series_scan.scan_partition(i).unwrap();
+
+        let task = common_runtime::spawn_global(async move {
+            let mut num_rows = 0;
+            while let Some(rb) = stream.try_next().await.unwrap() {
+                num_rows += rb.num_rows();
+            }
+            num_rows
+        });
+        tasks.push(task);
+    }
+    let results = try_join_all(tasks).await.unwrap();
+    let num_rows = results.iter().sum::<usize>();
+
+    common_telemetry::info!(
+        "SeriesScan per-series scan {} rows, total time: {:?}",
         num_rows,
         start.elapsed()
     );
