@@ -314,6 +314,13 @@ impl SeqScan {
     ) -> Result<SendableRecordBatchStream, BoxedError> {
         let stream_ctx = self.stream_ctx.clone();
         let semaphore = self.new_semaphore();
+        common_telemetry::info!(
+            "Scan partition by series, semaphore: {}",
+            semaphore
+                .as_ref()
+                .map(|s| s.available_permits())
+                .unwrap_or(0)
+        );
         let partition_ranges = self.properties.partitions[partition].clone();
         let distinguish_range = self.properties.distinguish_partition_range;
         let part_metrics = self.new_partition_metrics(partition);
