@@ -28,7 +28,7 @@ use futures::TryStreamExt;
 use object_store::manager::ObjectStoreManager;
 use object_store::services::Fs;
 use object_store::ObjectStore;
-use store_api::region_engine::{RegionEngine, RegionRole, RegionScanner};
+use store_api::region_engine::{PrepareRequest, RegionEngine, RegionRole, RegionScanner};
 use store_api::region_request::{
     RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
 };
@@ -561,8 +561,14 @@ async fn test_engine_prom_scan() {
 
 async fn test_seq_scan(scan_region: ScanRegion) {
     let start = Instant::now();
-    let seq_scan = scan_region.seq_scan().unwrap();
-    seq_scan.scan_partition(0).unwrap();
+    let mut seq_scan = scan_region.seq_scan().unwrap();
+    seq_scan
+        .prepare(PrepareRequest {
+            ranges: None,
+            distinguish_partition_range: None,
+            target_partitions: Some(8),
+        })
+        .unwrap();
     let mut stream = seq_scan.scan_partition(0).unwrap();
 
     let mut num_rows = 0;
