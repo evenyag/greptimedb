@@ -127,7 +127,7 @@ pub(crate) fn single_kafka_log_store_factory(#[case] factory: Option<LogStoreFac
 pub(crate) struct RaftEngineLogStoreFactory;
 
 impl RaftEngineLogStoreFactory {
-    async fn create_log_store<P: AsRef<Path>>(&self, wal_path: P) -> RaftEngineLogStore {
+    pub(crate) async fn create_log_store<P: AsRef<Path>>(&self, wal_path: P) -> RaftEngineLogStore {
         log_store_util::create_tmp_local_file_log_store(wal_path).await
     }
 }

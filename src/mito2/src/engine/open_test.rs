@@ -13,12 +13,18 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use api::v1::Rows;
+use common_base::Plugins;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
+use common_test_util::temp_dir::create_temp_dir;
+use object_store::manager::ObjectStoreManager;
+use object_store::services::Fs;
+use object_store::ObjectStore;
 use store_api::region_engine::{RegionEngine, RegionRole};
 use store_api::region_request::{
     RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
@@ -28,10 +34,12 @@ use tokio::sync::oneshot;
 
 use crate::compaction::compactor::{open_compaction_region, OpenCompactionRegionRequest};
 use crate::config::MitoConfig;
+use crate::engine::MitoEngine;
 use crate::error;
 use crate::region::options::RegionOptions;
 use crate::test_util::{
-    build_rows, flush_region, put_rows, reopen_region, rows_schema, CreateRequestBuilder, TestEnv,
+    build_rows, flush_region, mock_schema_metadata_manager, put_rows, reopen_region, rows_schema,
+    CreateRequestBuilder, RaftEngineLogStoreFactory, TestEnv,
 };
 
 #[tokio::test]
@@ -480,4 +488,42 @@ async fn test_open_compaction_region() {
     .unwrap();
 
     assert_eq!(region_id, compaction_region.region_id);
+}
+
+#[tokio::test]
+async fn test_engine_prom_scan() {
+    let test_dir = create_temp_dir("prom");
+    let data_home = test_dir.path();
+    let wal_path = data_home.join("wal");
+    let factory = RaftEngineLogStoreFactory;
+    let log_store = factory.create_log_store(wal_path).await;
+    let data_path = "/home/yangyw/data-prom/data".to_string();
+    let builder = Fs::default().root(&data_path);
+    let object_store = ObjectStore::new(builder).unwrap().finish();
+    let object_store_manager = Arc::new(ObjectStoreManager::new("default", object_store));
+    let (schema_metadata_manager, _kv_backend) = mock_schema_metadata_manager();
+    let engine = MitoEngine::new(
+        "/home/yangyw/data-prom/",
+        MitoConfig::default(),
+        Arc::new(log_store),
+        object_store_manager,
+        schema_metadata_manager,
+        Plugins::new(),
+    )
+    .await
+    .unwrap();
+
+    let region_id = RegionId::new(1024, 0);
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Open(RegionOpenRequest {
+                engine: String::new(),
+                region_dir: "greptime/public/1024/1024/1024_0000000000/".to_string(),
+                options: HashMap::default(),
+                skip_wal_replay: false,
+            }),
+        )
+        .await
+        .unwrap();
 }
