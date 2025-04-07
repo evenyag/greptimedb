@@ -108,7 +108,7 @@ impl SeriesScan {
             let mut fetch_start = Instant::now();
             while let Some(result) = receiver.recv().await {
                 let series = result.map_err(BoxedError::new).context(ExternalSnafu)?;
-                common_telemetry::info!("Recv result, partition: {}, len: {}", partition, series.batches.len());
+                // common_telemetry::info!("Recv result, partition: {}, len: {}", partition, series.batches.len());
 
                 let convert_start = Instant::now();
                 df_record_batches.reserve(series.batches.len());
@@ -132,7 +132,7 @@ impl SeriesScan {
                     RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)?;
                 metrics.convert_cost += convert_start.elapsed();
 
-                common_telemetry::info!("Record batch converted, partition: {}, num_batches: {}, num_rows: {}, cost: {:?}", partition, metrics.num_batches, metrics.num_rows, convert_start.elapsed());
+                // common_telemetry::info!("Record batch converted, partition: {}, num_batches: {}, num_rows: {}, cost: {:?}", partition, metrics.num_batches, metrics.num_rows, convert_start.elapsed());
 
                 let yield_start = Instant::now();
                 yield record_batch;
@@ -297,7 +297,7 @@ impl SeriesDistributor {
 
     /// Scans all parts.
     async fn scan_partitions(&mut self) -> Result<()> {
-        common_telemetry::info!("Start scanning partitions");
+        // common_telemetry::info!("Start scanning partitions");
 
         let part_metrics = new_partition_metrics(&self.stream_ctx, self.partitions.len());
         part_metrics.on_first_poll();
@@ -321,7 +321,7 @@ impl SeriesDistributor {
                 );
             }
         }
-        common_telemetry::info!("Start scanning partitions, sources: {}", sources.len());
+        // common_telemetry::info!("Start scanning partitions, sources: {}", sources.len());
 
         // Builds a reader that merge sources from all parts.
         let mut reader =
@@ -351,12 +351,12 @@ impl SeriesDistributor {
                 continue;
             }
 
-            common_telemetry::info!(
-                "Try to send batch, num_batches: {}, num_rows: {}, last_key: {:?}",
-                metrics.num_batches,
-                metrics.num_rows,
-                last_key
-            );
+            // common_telemetry::info!(
+            //     "Try to send batch, num_batches: {}, num_rows: {}, last_key: {:?}",
+            //     metrics.num_batches,
+            //     metrics.num_rows,
+            //     last_key
+            // );
 
             // We find a new series, send the current one.
             let to_send = std::mem::replace(&mut current_series, SeriesBatch::single(batch));
@@ -379,7 +379,7 @@ impl SeriesDistributor {
         part_metrics.merge_metrics(&metrics);
 
         part_metrics.on_finish();
-        common_telemetry::info!("Stop scanning partitions");
+        // common_telemetry::info!("Stop scanning partitions");
 
         Ok(())
     }
@@ -435,13 +435,13 @@ impl SenderList {
 
     /// Finds a partition and sends the batch to the partition.
     async fn send_batch(&mut self, mut batch: SeriesBatch) -> Result<()> {
-        common_telemetry::info!("Try to send batch, len: {}", batch.batches.len());
+        // common_telemetry::info!("Try to send batch, len: {}", batch.batches.len());
         loop {
             ensure!(self.num_nones < self.senders.len(), InvalidSenderSnafu);
 
             let sender_idx = self.fetch_add_sender_idx();
             let Some(sender) = &self.senders[sender_idx] else {
-                common_telemetry::info!("Sender is none, sender_idx: {}", sender_idx);
+                // common_telemetry::info!("Sender is none, sender_idx: {}", sender_idx);
                 continue;
             };
             // Adds a timeout to avoid blocking indefinitely and sending
@@ -450,17 +450,17 @@ impl SenderList {
             // node like sort merging. But it is rare when we are using SeriesScan.
             match sender.send_timeout(Ok(batch), SEND_TIMEOUT).await {
                 Ok(()) => {
-                    common_telemetry::info!("Sent batch successfully, sender_idx: {}", sender_idx);
+                    // common_telemetry::info!("Sent batch successfully, sender_idx: {}", sender_idx);
 
                     break;
                 }
                 Err(SendTimeoutError::Timeout(res)) => {
-                    common_telemetry::info!("Sent batch timeout, sender_idx: {}", sender_idx);
+                    // common_telemetry::info!("Sent batch timeout, sender_idx: {}", sender_idx);
                     // Safety: we send Ok.
                     batch = res.unwrap();
                 }
                 Err(SendTimeoutError::Closed(res)) => {
-                    common_telemetry::info!("Sent batch closed, sender_idx: {}", sender_idx);
+                    // common_telemetry::info!("Sent batch closed, sender_idx: {}", sender_idx);
                     // Safety: we send Ok.
                     self.senders[sender_idx] = None;
                     self.num_nones += 1;
