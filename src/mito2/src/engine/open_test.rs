@@ -598,13 +598,29 @@ async fn test_seq_scan(scan_region: ScanRegion) {
 }
 
 async fn test_series_scan(scan_region: ScanRegion) {
+    let num_target_partitions = 8;
+
     let start = Instant::now();
     let mut series_scan = scan_region.series_scan().unwrap();
+    let ranges: Vec<_> = series_scan
+        .properties()
+        .partitions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let actual_part_num = ranges.len().min(num_target_partitions);
+    let mut partition_ranges = vec![vec![]; actual_part_num];
+    for (i, range) in ranges.into_iter().enumerate() {
+        partition_ranges[i % actual_part_num].push(range);
+    }
+    common_telemetry::info!("Test series scan, actual_part_num: {}", actual_part_num);
+
     series_scan
         .prepare(PrepareRequest {
-            ranges: None,
+            ranges: Some(partition_ranges),
             distinguish_partition_range: None,
-            target_partitions: Some(8),
+            target_partitions: Some(num_target_partitions),
         })
         .unwrap();
     let num_partitions = series_scan.properties().num_partitions();
