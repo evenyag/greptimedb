@@ -173,7 +173,8 @@ impl DedupStrategy for LastRow {
         match &mut self.prev_batch {
             Some(prev) => {
                 // Reuse the primary key buffer.
-                prev.primary_key.clone_from(&batch.primary_key);
+                prev.primary_key.clear();
+                prev.primary_key.extend_from_slice(batch.primary_key());
                 prev.timestamp = batch.last_timestamp().unwrap();
             }
             None => {

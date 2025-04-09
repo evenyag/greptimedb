@@ -250,7 +250,7 @@ impl SeqScan {
                         .context(ExternalSnafu)?;
                 let cache = &stream_ctx.input.cache_strategy;
                 #[cfg(debug_assertions)]
-                let mut checker = crate::read::BatchChecker::default()
+                let mut checker = crate::read::batch::BatchChecker::default()
                     .with_start(Some(part_range.start))
                     .with_end(Some(part_range.end));
 
