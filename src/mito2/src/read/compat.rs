@@ -160,9 +160,7 @@ impl CompatPrimaryKey {
         batch.set_primary_key(buffer);
 
         // update cache
-        if let Some(pk_values) = &mut batch.pk_values {
-            pk_values.extend(&self.values);
-        }
+        batch.extend_pk_values(&self.values);
 
         Ok(batch)
     }
@@ -799,7 +797,7 @@ mod tests {
         ]);
 
         let fn_batch_cast = |batch: Batch| {
-            let mut new_fields = batch.fields.clone();
+            let mut new_fields = batch.fields().to_vec();
             new_fields[0].data = new_fields[0]
                 .data
                 .cast(&ConcreteDataType::string_datatype())

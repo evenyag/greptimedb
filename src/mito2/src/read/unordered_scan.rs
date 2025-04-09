@@ -164,7 +164,7 @@ impl UnorderedScan {
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
                 #[cfg(debug_assertions)]
-                let mut checker = crate::read::BatchChecker::default()
+                let mut checker = crate::read::batch::BatchChecker::default()
                     .with_start(Some(part_range.start))
                     .with_end(Some(part_range.end));
 
