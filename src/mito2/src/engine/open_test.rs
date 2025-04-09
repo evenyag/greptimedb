@@ -13,25 +13,38 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use api::v1::Rows;
+use common_base::Plugins;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
-use store_api::region_engine::{RegionEngine, RegionRole};
+use common_test_util::temp_dir::create_temp_dir;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_common::ScalarValue;
+use datafusion_expr::{col, lit, Expr};
+use futures::future::try_join_all;
+use futures::TryStreamExt;
+use object_store::manager::ObjectStoreManager;
+use object_store::services::Fs;
+use object_store::ObjectStore;
+use store_api::region_engine::{PrepareRequest, RegionEngine, RegionRole, RegionScanner};
 use store_api::region_request::{
     RegionCloseRequest, RegionOpenRequest, RegionPutRequest, RegionRequest,
 };
-use store_api::storage::{RegionId, ScanRequest};
+use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution};
 use tokio::sync::oneshot;
 
 use crate::compaction::compactor::{open_compaction_region, OpenCompactionRegionRequest};
 use crate::config::MitoConfig;
+use crate::engine::{MitoEngine, ScanRegion};
 use crate::error;
 use crate::region::options::RegionOptions;
 use crate::test_util::{
-    build_rows, flush_region, put_rows, reopen_region, rows_schema, CreateRequestBuilder, TestEnv,
+    build_rows, flush_region, mock_schema_metadata_manager, put_rows, reopen_region, rows_schema,
+    CreateRequestBuilder, RaftEngineLogStoreFactory, TestEnv,
 };
 
 #[tokio::test]
@@ -480,4 +493,159 @@ async fn test_open_compaction_region() {
     .unwrap();
 
     assert_eq!(region_id, compaction_region.region_id);
+}
+
+#[tokio::test]
+async fn test_engine_prom_seq_scan() {
+    run_engine_prom_scan(false).await;
+}
+
+#[tokio::test]
+async fn test_engine_prom_series_scan() {
+    run_engine_prom_scan(true).await;
+}
+
+async fn run_engine_prom_scan(use_series_scan: bool) {
+    common_telemetry::init_default_ut_logging();
+
+    let test_dir = create_temp_dir("prom");
+    let data_home = test_dir.path();
+    let wal_path = data_home.join("wal");
+    let factory = RaftEngineLogStoreFactory;
+    let log_store = factory.create_log_store(wal_path).await;
+    let data_path = "/home/yangyw/greptime/data-prom/data".to_string();
+    let builder = Fs::default().root(&data_path);
+    let object_store = ObjectStore::new(builder).unwrap().finish();
+    let object_store_manager = Arc::new(ObjectStoreManager::new("default", object_store));
+    let (schema_metadata_manager, _kv_backend) = mock_schema_metadata_manager();
+    let engine = MitoEngine::new(
+        "/home/yangyw/greptime/data-prom/",
+        MitoConfig::default(),
+        Arc::new(log_store),
+        object_store_manager,
+        schema_metadata_manager,
+        Plugins::new(),
+    )
+    .await
+    .unwrap();
+
+    let region_id = RegionId::new(1024, 0);
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Open(RegionOpenRequest {
+                engine: String::new(),
+                region_dir: "greptime/public/1024/1024_0000000000/data/".to_string(),
+                options: HashMap::default(),
+                skip_wal_replay: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let request = ScanRequest {
+        projection: Some(vec![
+            4, 5, 6, 0, 1, 7, 24, 25, 8, 49, 9, 10, 26, 11, 12, 18, 14, 15, 16,
+        ]),
+        filters: vec![
+            col("namespace").eq(lit("app-0")),
+            col("cluster").eq(lit("eks-us-east-1-qa1")),
+            col("greptime_timestamp").gt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1743439965000),
+                None,
+            ))),
+            col("greptime_timestamp").lt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1743566580000),
+                None,
+            ))),
+            col("__table_id").eq(Expr::Literal(ScalarValue::UInt32(Some(1085)))),
+        ],
+        output_ordering: None,
+        limit: None,
+        series_row_selector: None,
+        sequence: None,
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+    };
+    let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
+    if use_series_scan {
+        test_series_scan(scan_region).await;
+    } else {
+        test_seq_scan(scan_region).await;
+    }
+}
+
+async fn test_seq_scan(scan_region: ScanRegion) {
+    let start = Instant::now();
+    let mut seq_scan = scan_region.seq_scan().unwrap();
+    seq_scan
+        .prepare(PrepareRequest {
+            ranges: None,
+            distinguish_partition_range: None,
+            target_partitions: Some(8),
+        })
+        .unwrap();
+    let metrics_set = ExecutionPlanMetricsSet::default();
+    let mut stream = seq_scan.scan_partition(&metrics_set, 0).unwrap();
+
+    let mut num_rows = 0;
+    while let Some(rb) = stream.try_next().await.unwrap() {
+        num_rows += rb.num_rows();
+    }
+
+    common_telemetry::info!(
+        "SeqScan per-series scan {} rows, total time: {:?}",
+        num_rows,
+        start.elapsed()
+    );
+}
+
+async fn test_series_scan(scan_region: ScanRegion) {
+    let num_target_partitions = 8;
+
+    let start = Instant::now();
+    let mut series_scan = scan_region.series_scan().unwrap();
+    let ranges: Vec<_> = series_scan
+        .properties()
+        .partitions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let actual_part_num = ranges.len().min(num_target_partitions);
+    let mut partition_ranges = vec![vec![]; actual_part_num];
+    for (i, range) in ranges.into_iter().enumerate() {
+        partition_ranges[i % actual_part_num].push(range);
+    }
+    common_telemetry::info!("Test series scan, actual_part_num: {}", actual_part_num);
+
+    series_scan
+        .prepare(PrepareRequest {
+            ranges: Some(partition_ranges),
+            distinguish_partition_range: None,
+            target_partitions: Some(num_target_partitions),
+        })
+        .unwrap();
+    let num_partitions = series_scan.properties().num_partitions();
+    let mut tasks = Vec::with_capacity(num_partitions);
+    let metrics_set = ExecutionPlanMetricsSet::default();
+    for i in 0..num_partitions {
+        let mut stream = series_scan.scan_partition(&metrics_set, i).unwrap();
+
+        let task = common_runtime::spawn_global(async move {
+            let mut num_rows = 0;
+            while let Some(rb) = stream.try_next().await.unwrap() {
+                num_rows += rb.num_rows();
+            }
+            num_rows
+        });
+        tasks.push(task);
+    }
+    let results = try_join_all(tasks).await.unwrap();
+    let num_rows = results.iter().sum::<usize>();
+
+    common_telemetry::info!(
+        "SeriesScan per-series scan {} rows, total time: {:?}",
+        num_rows,
+        start.elapsed()
+    );
 }
