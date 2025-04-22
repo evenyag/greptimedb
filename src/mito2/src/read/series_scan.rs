@@ -22,15 +22,17 @@ use async_stream::{stream, try_stream};
 use common_error::ext::BoxedError;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::{RecordBatch, RecordBatchStreamWrapper, SendableRecordBatchStream};
+use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::compute::concat_batches;
 use datatypes::schema::SchemaRef;
-use futures::StreamExt;
+use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use smallvec::{smallvec, SmallVec};
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{PartitionRange, PrepareRequest, RegionScanner, ScannerProperties};
+use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -39,11 +41,16 @@ use crate::error::{
     ComputeArrowSnafu, Error, InvalidSenderSnafu, PartitionOutOfRangeSnafu, Result,
     ScanMultiTimesSnafu, ScanSeriesSnafu,
 };
+use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
+use crate::read::last_row::LastRowReader;
+use crate::read::merge::MergeReaderBuilder;
 use crate::read::range::RangeBuilderList;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{PartitionMetrics, PartitionMetricsList};
 use crate::read::seq_scan::{build_sources, SeqScan};
-use crate::read::{Batch, ScannerMetrics};
+use crate::read::{Batch, BoxedBatchReader, ScannerMetrics, Source};
+use crate::region::options::MergeMode;
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 /// Timeout to send a batch to a sender.
 const SEND_TIMEOUT: Duration = Duration::from_millis(10);
@@ -385,6 +392,7 @@ impl SeriesDistributor {
             self.senders.send_batch(to_send).await?;
             metrics.yield_cost += yield_start.elapsed();
         }
+        metrics.scan_cost += fetch_start.elapsed();
 
         // todo: if not empty
         if !current_series.is_empty() {
@@ -393,7 +401,6 @@ impl SeriesDistributor {
             metrics.yield_cost += yield_start.elapsed();
         }
 
-        metrics.scan_cost += fetch_start.elapsed();
         part_metrics.merge_metrics(&metrics);
         part_metrics.set_num_series_send_timeout(self.senders.num_timeout);
 
@@ -559,3 +566,150 @@ fn new_partition_metrics(
     metrics_list.set(partition, metrics.clone());
     metrics
 }
+
+#[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
+pub(crate) async fn build_reader_from_sources(
+    stream_ctx: &StreamContext,
+    sources: Vec<Source>,
+) -> Result<BoxedBatchReader> {
+    let mut builder = MergeReaderBuilder::from_sources(sources);
+    let reader = builder.build().await?;
+
+    let dedup = !stream_ctx.input.append_mode;
+    let reader = if dedup {
+        match stream_ctx.input.merge_mode {
+            MergeMode::LastRow => Box::new(DedupReader::new(
+                reader,
+                LastRow::new(stream_ctx.input.filter_deleted),
+            )) as _,
+            MergeMode::LastNonNull => Box::new(DedupReader::new(
+                reader,
+                LastNonNull::new(stream_ctx.input.filter_deleted),
+            )) as _,
+        }
+    } else {
+        Box::new(reader) as _
+    };
+
+    let reader = match &stream_ctx.input.series_row_selector {
+        Some(TimeSeriesRowSelector::LastRow) => Box::new(LastRowReader::new(reader)) as _,
+        None => reader,
+    };
+
+    Ok(reader)
+}
+
+fn scan_partition_ranges_stream_background(
+    ranges: Vec<PartitionRange>,
+    part_metrics: PartitionMetrics,
+    stream_ctx: Arc<StreamContext>,
+) -> Source {
+    let (sender, mut receiver) = mpsc::channel(1);
+    common_runtime::spawn_global(async move {
+        let stream = scan_partition_ranges_stream(ranges, part_metrics, stream_ctx);
+        pin_mut!(stream);
+
+        loop {
+            let maybe_batches = stream.try_next().await;
+            match maybe_batches {
+                Ok(Some(batches)) => {
+                    let _ = sender.send(Ok(batches)).await;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = sender.send(Err(e)).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = try_stream! {
+        loop {
+            let Some(maybe_batches) = receiver.recv().await else {
+                break;
+            };
+            let batches = maybe_batches?;
+            for batch in batches {
+                yield batch;
+            }
+        }
+    };
+    let stream = Box::pin(stream);
+
+    Source::Stream(stream)
+}
+
+fn scan_partition_ranges_stream(
+    ranges: Vec<PartitionRange>,
+    part_metrics: PartitionMetrics,
+    stream_ctx: Arc<StreamContext>,
+) -> impl Stream<Item = Result<BatchVec>> {
+    try_stream! {
+        let range_builder_list = Arc::new(RangeBuilderList::new(
+            stream_ctx.input.num_memtables(),
+            stream_ctx.input.num_files(),
+        ));
+        let mut sources = Vec::with_capacity(ranges.len());
+        // Creates sources for all ranges.
+        for part_range in ranges {
+            build_sources(
+                &stream_ctx,
+                &part_range,
+                false,
+                &part_metrics,
+                range_builder_list.clone(),
+                &mut sources,
+            );
+        }
+
+        // Builds a reader that merge sources from all parts.
+        let mut reader =
+            SeqScan::build_reader_from_sources(&stream_ctx, sources, None)
+                .await?;
+        let mut metrics = ScannerMetrics::default();
+        let mut fetch_start = Instant::now();
+
+        // Loads batches from the merge reader.
+        // Yields the collected batches once the batch size exceeds a threshold.
+        let mut buffered = BatchVec::default();
+        // Number of rows in the buffer.
+        let mut buffered_rows = 0;
+        while let Some(batch) = reader.next_batch().await? {
+            metrics.scan_cost += fetch_start.elapsed();
+            fetch_start = Instant::now();
+            metrics.num_batches += 1;
+            metrics.num_rows += batch.num_rows();
+
+            debug_assert!(!batch.is_empty());
+            if batch.is_empty() {
+                continue;
+            }
+
+            buffered_rows += batch.num_rows();
+            buffered.push(batch);
+            if buffered_rows < DEFAULT_READ_BATCH_SIZE {
+                continue;
+            }
+
+            // We collects enough rows, yields them.
+            let to_yield = std::mem::take(&mut buffered);
+            buffered_rows = 0;
+
+            let yield_start = Instant::now();
+            yield to_yield;
+            metrics.yield_cost += yield_start.elapsed();
+        }
+        metrics.scan_cost += fetch_start.elapsed();
+
+        if !buffered.is_empty() {
+            let yield_start = Instant::now();
+            yield buffered;
+            metrics.yield_cost += yield_start.elapsed();
+        }
+
+        part_metrics.merge_metrics(&metrics);
+    }
+}
+
+type BatchVec = SmallVec<[Batch; 4]>;
