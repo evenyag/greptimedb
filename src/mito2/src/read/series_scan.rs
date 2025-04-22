@@ -380,7 +380,6 @@ impl SeriesDistributor {
         }
         metrics.scan_cost += fetch_start.elapsed();
 
-        // todo: if not empty
         if !current_series.is_empty() {
             let yield_start = Instant::now();
             self.senders.send_batch(current_series).await?;
