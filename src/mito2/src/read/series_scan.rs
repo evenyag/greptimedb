@@ -338,6 +338,7 @@ impl SeriesDistributor {
         part_metrics.on_first_poll();
 
         // Scans all parts.
+        common_telemetry::info!("Scanning partitions, {}", self.partitions.len());
         let mut sources = Vec::with_capacity(self.partitions.len());
         for (index, ranges) in self.partitions.iter().cloned().enumerate() {
             let scan_part_metrics = new_partition_metrics(
@@ -660,6 +661,7 @@ fn scan_partition_ranges_stream(
             );
         }
 
+        common_telemetry::info!("Building sources for all ranges, {} sources", sources.len());
         // Builds a reader that merge sources from all parts.
         let mut reader =
             SeqScan::build_reader_from_sources(&stream_ctx, sources, None)
