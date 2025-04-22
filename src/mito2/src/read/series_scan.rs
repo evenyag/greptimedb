@@ -339,10 +339,16 @@ impl SeriesDistributor {
 
         // Scans all parts.
         let mut sources = Vec::with_capacity(self.partitions.len());
-        for ranges in self.partitions.iter().cloned() {
+        for (index, ranges) in self.partitions.iter().cloned().enumerate() {
+            let scan_part_metrics = new_partition_metrics(
+                &self.stream_ctx,
+                &self.metrics_set,
+                self.partitions.len() + index,
+                &self.metrics_list,
+            );
             let source = scan_partition_ranges_in_background(
                 ranges,
-                part_metrics.clone(),
+                scan_part_metrics,
                 self.stream_ctx.clone(),
             );
             sources.push(source);
@@ -595,7 +601,7 @@ fn scan_partition_ranges_in_background(
 ) -> Source {
     let (sender, mut receiver) = mpsc::channel(1);
     common_runtime::spawn_global(async move {
-        let stream = scan_partition_ranges_stream(ranges, part_metrics, stream_ctx);
+        let stream = scan_partition_ranges_stream(ranges, part_metrics.clone(), stream_ctx);
         pin_mut!(stream);
 
         loop {
@@ -611,6 +617,8 @@ fn scan_partition_ranges_in_background(
                 }
             }
         }
+
+        part_metrics.on_finish();
     });
 
     let stream = try_stream! {
