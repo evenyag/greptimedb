@@ -925,6 +925,19 @@ impl StreamContext {
         }
     }
 
+    /// Creates a new [StreamContext] for [SeriesScan].
+    pub(crate) fn series_scan_ctx(input: ScanInput) -> Self {
+        let query_start = input.query_start.unwrap_or_else(Instant::now);
+        let ranges = RangeMeta::series_scan_ranges(&input);
+        READ_SST_COUNT.observe(input.num_files() as f64);
+
+        Self {
+            input,
+            ranges,
+            query_start,
+        }
+    }
+
     /// Returns true if the index refers to a memtable.
     pub(crate) fn is_mem_range_index(&self, index: RowGroupIndex) -> bool {
         self.input.num_memtables() > index.index

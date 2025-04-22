@@ -120,6 +120,15 @@ impl RangeMeta {
         ranges
     }
 
+    /// Creates a list of ranges from the `input` for series scan.
+    pub(crate) fn series_scan_ranges(input: &ScanInput) -> Vec<RangeMeta> {
+        let mut ranges = Vec::with_capacity(input.memtables.len() + input.files.len());
+        Self::push_seq_mem_ranges(&input.memtables, &mut ranges);
+        Self::push_seq_file_ranges(input.memtables.len(), &input.files, &mut ranges);
+
+        ranges
+    }
+
     /// Returns true if the time range of given `meta` overlaps with the time range of this meta.
     fn overlaps(&self, meta: &RangeMeta) -> bool {
         overlaps(&self.time_range, &meta.time_range)
