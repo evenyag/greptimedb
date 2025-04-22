@@ -505,6 +505,16 @@ async fn test_engine_prom_series_scan() {
     run_engine_prom_scan(true).await;
 }
 
+#[tokio::test]
+async fn test_engine_prombench_seq_scan() {
+    run_engine_prombench_scan(false).await;
+}
+
+#[tokio::test]
+async fn test_engine_prombench_series_scan() {
+    run_engine_prombench_scan(true).await;
+}
+
 async fn run_engine_prom_scan(use_series_scan: bool) {
     common_telemetry::init_default_ut_logging();
 
@@ -559,6 +569,86 @@ async fn run_engine_prom_scan(use_series_scan: bool) {
                 None,
             ))),
             col("__table_id").eq(Expr::Literal(ScalarValue::UInt32(Some(1085)))),
+        ],
+        output_ordering: None,
+        limit: None,
+        series_row_selector: None,
+        sequence: None,
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+    };
+    let loops = std::env::var("LOOPS")
+        .map(|v| v.parse::<usize>().unwrap_or(1))
+        .unwrap_or(1);
+
+    let loop_start = Instant::now();
+    for i in 0..loops {
+        let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
+        if use_series_scan {
+            test_series_scan(scan_region, i).await;
+        } else {
+            test_seq_scan(scan_region, i).await;
+        }
+    }
+    common_telemetry::info!(
+        "Loop {} times, series scan: {}, elapsed time: {:?}",
+        loops,
+        use_series_scan,
+        loop_start.elapsed()
+    );
+}
+
+async fn run_engine_prombench_scan(use_series_scan: bool) {
+    common_telemetry::init_default_ut_logging();
+
+    let test_dir = create_temp_dir("prom");
+    let data_home = test_dir.path();
+    let wal_path = data_home.join("wal");
+    let factory = RaftEngineLogStoreFactory;
+    let log_store = factory.create_log_store(wal_path).await;
+    let data_path = "/home/yangyw/greptime/data-prombench/data".to_string();
+    let builder = Fs::default().root(&data_path);
+    let object_store = ObjectStore::new(builder).unwrap().finish();
+    let object_store_manager = Arc::new(ObjectStoreManager::new("default", object_store));
+    let (schema_metadata_manager, _kv_backend) = mock_schema_metadata_manager();
+    let engine = MitoEngine::new(
+        "/home/yangyw/greptime/data-prombench/",
+        MitoConfig::default(),
+        Arc::new(log_store),
+        object_store_manager,
+        schema_metadata_manager,
+        Plugins::new(),
+    )
+    .await
+    .unwrap();
+
+    let region_id = RegionId::new(1024, 0);
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Open(RegionOpenRequest {
+                engine: String::new(),
+                region_dir: "greptime/public/1024/1024_0000000000/data/".to_string(),
+                options: HashMap::default(),
+                skip_wal_replay: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let request = ScanRequest {
+        projection: Some(vec![2, 5, 0, 1, 3, 25, 4]),
+        filters: vec![
+            col("region").eq(lit("us-west-2")),
+            col("mode").eq(lit("idle")),
+            col("greptime_timestamp").gt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1742550240000),
+                None,
+            ))),
+            col("greptime_timestamp").lt_eq(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some(1742552700000),
+                None,
+            ))),
+            col("__table_id").eq(Expr::Literal(ScalarValue::UInt32(Some(1032)))),
         ],
         output_ordering: None,
         limit: None,
