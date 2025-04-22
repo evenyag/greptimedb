@@ -337,30 +337,16 @@ impl SeriesDistributor {
         );
         part_metrics.on_first_poll();
 
-        let range_builder_list = Arc::new(RangeBuilderList::new(
-            self.stream_ctx.input.num_memtables(),
-            self.stream_ctx.input.num_files(),
-        ));
         // Scans all parts.
         let mut sources = Vec::with_capacity(self.partitions.len());
-        for partition in &self.partitions {
-            sources.reserve(partition.len());
-            for part_range in partition {
-                build_sources(
-                    &self.stream_ctx,
-                    &part_range,
-                    false,
-                    &part_metrics,
-                    range_builder_list.clone(),
-                    &mut sources,
-                );
-            }
+        for ranges in self.partitions.iter().cloned() {
+            let source = scan_partition_ranges_in_background(ranges, part_metrics, stream_ctx);
+            sources.push(source);
         }
 
         // Builds a reader that merge sources from all parts.
         let mut reader =
-            SeqScan::build_reader_from_sources(&self.stream_ctx, sources, self.semaphore.clone())
-                .await?;
+            SeqScan::build_reader_from_sources(&self.stream_ctx, sources, None).await?;
         let mut metrics = ScannerMetrics::default();
         let mut fetch_start = Instant::now();
 
@@ -599,7 +585,7 @@ pub(crate) async fn build_reader_from_sources(
     Ok(reader)
 }
 
-fn scan_partition_ranges_stream_background(
+fn scan_partition_ranges_in_background(
     ranges: Vec<PartitionRange>,
     part_metrics: PartitionMetrics,
     stream_ctx: Arc<StreamContext>,
