@@ -344,7 +344,7 @@ impl SeriesDistributor {
             let scan_part_metrics = new_partition_metrics(
                 &self.stream_ctx,
                 &self.metrics_set,
-                self.partitions.len() + index,
+                self.partitions.len() + index + 1,
                 &self.metrics_list,
             );
             let source = scan_partition_ranges_in_background(
