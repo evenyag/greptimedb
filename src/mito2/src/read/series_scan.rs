@@ -340,7 +340,11 @@ impl SeriesDistributor {
         // Scans all parts.
         let mut sources = Vec::with_capacity(self.partitions.len());
         for ranges in self.partitions.iter().cloned() {
-            let source = scan_partition_ranges_in_background(ranges, part_metrics, stream_ctx);
+            let source = scan_partition_ranges_in_background(
+                ranges,
+                part_metrics.clone(),
+                self.stream_ctx.clone(),
+            );
             sources.push(source);
         }
 
