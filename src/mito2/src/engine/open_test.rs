@@ -566,15 +566,28 @@ async fn run_engine_prom_scan(use_series_scan: bool) {
         sequence: None,
         distribution: Some(TimeSeriesDistribution::PerSeries),
     };
-    let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
-    if use_series_scan {
-        test_series_scan(scan_region).await;
-    } else {
-        test_seq_scan(scan_region).await;
+    let loops = std::env::var("LOOPS")
+        .map(|v| v.parse::<usize>().unwrap_or(1))
+        .unwrap_or(1);
+
+    let loop_start = Instant::now();
+    for i in 0..loops {
+        let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
+        if use_series_scan {
+            test_series_scan(scan_region, i).await;
+        } else {
+            test_seq_scan(scan_region, i).await;
+        }
     }
+    common_telemetry::info!(
+        "Loop {} times, series scan: {}, elapsed time: {:?}",
+        loops,
+        use_series_scan,
+        loop_start.elapsed()
+    );
 }
 
-async fn test_seq_scan(scan_region: ScanRegion) {
+async fn test_seq_scan(scan_region: ScanRegion, run: usize) {
     let start = Instant::now();
     let mut seq_scan = scan_region.seq_scan().unwrap();
     seq_scan
@@ -593,13 +606,14 @@ async fn test_seq_scan(scan_region: ScanRegion) {
     }
 
     common_telemetry::info!(
-        "SeqScan per-series scan {} rows, total time: {:?}",
+        "SeqScan per-series loop {} scan {} rows, total time: {:?}",
+        run,
         num_rows,
         start.elapsed()
     );
 }
 
-async fn test_series_scan(scan_region: ScanRegion) {
+async fn test_series_scan(scan_region: ScanRegion, run: usize) {
     let num_target_partitions = 8;
 
     let start = Instant::now();
@@ -616,7 +630,11 @@ async fn test_series_scan(scan_region: ScanRegion) {
     for (i, range) in ranges.into_iter().enumerate() {
         partition_ranges[i % actual_part_num].push(range);
     }
-    common_telemetry::info!("Test series scan, actual_part_num: {}", actual_part_num);
+    common_telemetry::info!(
+        "Test series scan, loop {}, actual_part_num: {}",
+        run,
+        actual_part_num
+    );
 
     series_scan
         .prepare(PrepareRequest {
@@ -644,7 +662,8 @@ async fn test_series_scan(scan_region: ScanRegion) {
     let num_rows = results.iter().sum::<usize>();
 
     common_telemetry::info!(
-        "SeriesScan per-series scan {} rows, total time: {:?}",
+        "SeriesScan per-series loop {} scan {} rows, total time: {:?}",
+        run,
         num_rows,
         start.elapsed()
     );
