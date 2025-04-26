@@ -18,13 +18,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datatypes::data_type::ConcreteDataType;
+use datatypes::prelude::DataType;
 use datatypes::value::Value;
 use datatypes::vectors::VectorRef;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
-use crate::error::{CompatReaderSnafu, CreateDefaultSnafu, Result};
+use crate::error::{
+    CompatReaderSnafu, ComputeArrowSnafu, CreateDefaultSnafu, InvalidRecordBatchSnafu, Result,
+};
 use crate::read::batch::multi_series::MultiSeries;
 use crate::read::projection::ProjectionMapper;
 use crate::read::{Batch, BatchColumn, BatchReader};
@@ -111,6 +114,21 @@ impl CompatBatch {
 
         Ok(batch)
     }
+
+    /// Adapts the `batch` to the expected schema.
+    pub(crate) fn compat_multi(&self, mut batch: MultiSeries) -> Result<MultiSeries> {
+        if let Some(rewrite_pk) = &self.rewrite_pk {
+            batch = rewrite_pk.compat_multi(batch)?;
+        }
+        if let Some(compat_pk) = &self.compat_pk {
+            batch = compat_pk.compat_multi(batch)?;
+        }
+        if let Some(compat_fields) = &self.compat_fields {
+            batch = compat_fields.compat_multi(batch)?;
+        }
+
+        Ok(batch)
+    }
 }
 
 /// Returns true if `left` and `right` have same columns and primary key encoding.
@@ -162,6 +180,30 @@ impl CompatPrimaryKey {
 
         // update cache
         batch.extend_pk_values(&self.values);
+
+        Ok(batch)
+    }
+
+    /// Make primary key of the `batch` compatible.
+    fn compat_multi(&self, mut batch: MultiSeries) -> Result<MultiSeries> {
+        let mut builder = batch.primary_key_values_builder()?;
+        let mut buffer = Vec::with_capacity(self.converter.estimated_size().unwrap_or_default());
+
+        let pk_values = batch.primary_key_values()?;
+        for pk in pk_values.iter() {
+            buffer.clear();
+            let pk = pk.context(InvalidRecordBatchSnafu {
+                reason: "primary key array should not contain null values",
+            })?;
+            buffer.extend_from_slice(pk);
+            self.converter.encode_values(&self.values, &mut buffer)?;
+
+            builder.append_value(&buffer);
+        }
+        let pk_values = builder.finish();
+        batch.replace_primary_key_array(pk_values)?;
+        // Clear cache
+        batch.clear_cache();
 
         Ok(batch)
     }
@@ -222,6 +264,43 @@ impl CompatFields {
 
         // Safety: We ensure all columns have the same length and the new batch should be valid.
         batch.with_fields(fields).unwrap()
+    }
+
+    /// Make fields of the `batch` compatible.
+    #[must_use]
+    fn compat_multi(&self, mut batch: MultiSeries) -> Result<MultiSeries> {
+        let len = batch.num_rows();
+        let fields = self
+            .index_or_defaults
+            .iter()
+            .map(|index_or_default| match index_or_default {
+                IndexOrDefault::Index { pos, cast_type } => {
+                    let old_column = batch.field_column(*pos);
+
+                    if let Some(ty) = cast_type {
+                        // Safety: We ensure type can be converted and the new batch should be valid.
+                        // Tips: `safe` must be true in `CastOptions`, which will replace the specific value with null when it cannot be converted.
+                        let casted =
+                            datatypes::arrow::compute::cast(old_column, &ty.as_arrow_type())
+                                .context(ComputeArrowSnafu)?;
+                        Ok(casted)
+                    } else {
+                        Ok(old_column.clone())
+                    }
+                }
+                IndexOrDefault::DefaultValue {
+                    column_id,
+                    default_vector,
+                } => {
+                    let data = default_vector.replicate(&[len]);
+                    Ok(data.to_arrow_array())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Safety: We ensure all columns have the same length and the new batch should be valid.
+        batch.replace_field_arrays(fields)?;
+        Ok(batch)
     }
 }
 
