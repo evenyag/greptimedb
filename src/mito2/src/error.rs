@@ -1032,6 +1032,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to build vector"))]
+    CreateVector {
+        #[snafu(implicit)]
+        location: Location,
+        source: datatypes::error::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1184,6 +1191,7 @@ impl ErrorExt for Error {
 
             IncompatibleWalProviderChange { .. } => StatusCode::InvalidArguments,
             ConvertDataType { .. } => StatusCode::Internal,
+            CreateVector { .. } => StatusCode::Internal,
         }
     }
 

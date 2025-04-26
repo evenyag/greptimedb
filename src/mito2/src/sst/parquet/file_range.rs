@@ -29,6 +29,7 @@ use store_api::storage::TimeSeriesRowSelector;
 use crate::error::{
     DecodeStatsSnafu, FieldTypeMismatchSnafu, FilterRecordBatchSnafu, Result, StatsNotPresentSnafu,
 };
+use crate::read::batch::multi_series::MultiSeries;
 use crate::read::compat::CompatBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::prune::PruneReader;
@@ -324,5 +325,70 @@ impl RangeBase {
         input.filter(&BooleanArray::from(mask).into())?;
 
         Ok(Some(input))
+    }
+
+    /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
+    /// Return the filtered batch. If the entire batch is filtered out, return None.
+    ///
+    /// Supported filter expr type is defined in [SimpleFilterEvaluator].
+    ///
+    /// When a filter is referencing primary key column, this method will decode
+    /// the primary key and put it into the batch.
+    pub(crate) fn precise_filter_multi(
+        &self,
+        mut input: MultiSeries,
+    ) -> Result<Option<MultiSeries>> {
+        let mut mask = BooleanBuffer::new_set(input.num_rows());
+
+        // Run filter one by one and combine them result
+        for filter_ctx in &self.filters {
+            let filter = match filter_ctx.filter() {
+                MaybeFilter::Filter(f) => f,
+                // Column matches.
+                MaybeFilter::Matched => continue,
+                // Column doesn't match, filter the entire batch.
+                MaybeFilter::Pruned => return Ok(None),
+            };
+            let result = match filter_ctx.semantic_type() {
+                SemanticType::Tag => {
+                    let pk_values =
+                        if let Some(pk_values) = input.composite_values() {
+                            pk_values
+                        } else {
+                            input.set_composite_values(input.decode_primary_key_array(
+                                self.read_format.metadata(),
+                                &*self.codec,
+                            )?);
+                            input.composite_values().unwrap()
+                        };
+                    let vector =
+                        pk_values.value_vector(filter_ctx.column_id(), filter_ctx.data_type())?;
+                    let value_to_eval = input.tag_column(&vector)?;
+                    filter
+                        .evaluate_array(&value_to_eval)
+                        .context(FilterRecordBatchSnafu)?
+                }
+                SemanticType::Field => {
+                    let Some(field_index) =
+                        self.read_format.field_index_by_id(filter_ctx.column_id())
+                    else {
+                        continue;
+                    };
+                    let field_col = input.field_column(field_index);
+                    filter
+                        .evaluate_array(field_col)
+                        .context(FilterRecordBatchSnafu)?
+                }
+                SemanticType::Timestamp => filter
+                    .evaluate_array(input.timestamp_column())
+                    .context(FilterRecordBatchSnafu)?,
+            };
+
+            mask = mask.bitand(&result);
+        }
+
+        let output = input.filter(&BooleanArray::from(mask))?;
+
+        Ok(Some(output))
     }
 }
