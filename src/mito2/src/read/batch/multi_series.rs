@@ -176,6 +176,25 @@ impl MultiSeries {
         Ok(())
     }
 
+    /// Replaces field arrays with new arrays.
+    pub(crate) fn replace_field_arrays(&mut self, new_arrays: Vec<ArrayRef>) -> Result<()> {
+        let mut columns = self.record_batch.columns().to_vec();
+        for (i, new_array) in new_arrays.into_iter().enumerate() {
+            columns[i] = new_array;
+        }
+        let record_batch =
+            RecordBatch::try_new(self.record_batch.schema(), columns).context(ComputeArrowSnafu)?;
+
+        self.record_batch = record_batch;
+        Ok(())
+    }
+
+    /// Clears the cache.
+    pub(crate) fn clear_cache(&mut self) {
+        self.composite_values = None;
+        self.pk_values_vec = None;
+    }
+
     /// Returns a builder for the primary key array.
     pub(crate) fn primary_key_values_builder(&self) -> Result<BinaryBuilder> {
         let dict_array = self.primary_key_array()?;
@@ -194,6 +213,23 @@ impl MultiSeries {
             dict_array.keys().len(),
             encoded_pks.values().len(),
         ))
+    }
+
+    /// Returns the array of primary key values.
+    pub(crate) fn primary_key_values(&self) -> Result<&BinaryArray> {
+        let dict_array = self.primary_key_array()?;
+        let encoded_pks = dict_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: format!(
+                    "values of primary key array should not be {:?}",
+                    dict_array.values().data_type()
+                ),
+            })?;
+
+        Ok(encoded_pks)
     }
 
     /// Returns the encoded primary key array.
