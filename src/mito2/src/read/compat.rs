@@ -29,6 +29,7 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::error::{CompatReaderSnafu, CreateDefaultSnafu, DecodeSnafu, EncodeSnafu, Result};
+use crate::read::batch::multi_series::MultiSeries;
 use crate::read::projection::ProjectionMapper;
 use crate::read::{Batch, BatchColumn, BatchReader};
 
@@ -438,6 +439,50 @@ impl RewritePrimaryKey {
             }
         }
         batch.set_primary_key(buffer);
+
+        Ok(batch)
+    }
+
+    /// Make primary key of the `batch` compatible.
+    fn compat_multi(&self, mut batch: MultiSeries) -> Result<MultiSeries> {
+        let pk_values = if let Some(pk_values) = batch.pk_values_vec() {
+            pk_values
+        } else {
+            let new_pk_values = batch.decode_primary_key_to_vec(&*self.original)?;
+            batch.set_pk_values_vec(new_pk_values);
+            // Safety: We ensure pk_values is not None.
+            batch.pk_values_vec().unwrap()
+        };
+
+        let mut builder = batch.primary_key_values_builder()?;
+        let mut buffer = Vec::with_capacity(self.new.estimated_size().unwrap_or_default());
+        for composite_values in pk_values {
+            buffer.clear();
+            match composite_values {
+                CompositeValues::Dense(values) => {
+                    self.new
+                        .encode_values(values.as_slice(), &mut buffer)
+                        .context(EncodeSnafu)?;
+                }
+                CompositeValues::Sparse(values) => {
+                    let values = self
+                        .fields
+                        .iter()
+                        .map(|id| {
+                            let value = values.get_or_null(*id);
+                            (*id, value.as_value_ref())
+                        })
+                        .collect::<Vec<_>>();
+                    self.new
+                        .encode_value_refs(&values, &mut buffer)
+                        .context(EncodeSnafu)?;
+                }
+            }
+
+            builder.append_value(&buffer);
+        }
+        let encoded = builder.finish();
+        batch.replace_primary_key_array(encoded)?;
 
         Ok(batch)
     }

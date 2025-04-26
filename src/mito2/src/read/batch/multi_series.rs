@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datatypes::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, UInt32Array,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, DictionaryArray, UInt32Array,
 };
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::compute::filter_record_batch;
@@ -47,8 +47,10 @@ use crate::sst::parquet::format::PrimaryKeyArray;
 pub struct MultiSeries {
     /// The original record batch.
     record_batch: RecordBatch,
-    /// Cached decoded composite values.
+    /// Cached decoded composite values list.
     composite_values: Option<CompositeValuesList>,
+    /// Cached decoded primary key values vec.
+    pk_values_vec: Option<Vec<CompositeValues>>,
 }
 
 impl MultiSeries {
@@ -57,6 +59,7 @@ impl MultiSeries {
         Self {
             record_batch,
             composite_values: None,
+            pk_values_vec: None,
         }
     }
 
@@ -76,8 +79,17 @@ impl MultiSeries {
         metadata: &RegionMetadata,
         codec: &dyn PrimaryKeyCodec,
     ) -> Result<CompositeValuesList> {
-        let array = self.primary_key_array();
+        let array = self.primary_key_array()?;
         decode_primary_key_array(array, metadata, codec)
+    }
+
+    /// Decodes the primary key part of the batch to a vec of [CompositeValues].
+    pub(crate) fn decode_primary_key_to_vec(
+        &self,
+        codec: &dyn PrimaryKeyCodec,
+    ) -> Result<Vec<CompositeValues>> {
+        let array = self.primary_key_array()?;
+        decode_primary_key_to_vec(array, codec)
     }
 
     /// Sets the decoded composite values.
@@ -88,6 +100,16 @@ impl MultiSeries {
     /// Gets the decoded composite values.
     pub(crate) fn composite_values(&self) -> Option<&CompositeValuesList> {
         self.composite_values.as_ref()
+    }
+
+    /// Sets the decoded primary key values vec.
+    pub(crate) fn set_pk_values_vec(&mut self, pk_values_vec: Vec<CompositeValues>) {
+        self.pk_values_vec = Some(pk_values_vec);
+    }
+
+    /// Gets the decoded primary key values vec.
+    pub(crate) fn pk_values_vec(&self) -> Option<&Vec<CompositeValues>> {
+        self.pk_values_vec.as_ref()
     }
 
     /// Gets the field column by the field index.
@@ -103,13 +125,7 @@ impl MultiSeries {
 
     /// Gets the tag column as a dictionary array.
     pub(crate) fn tag_column(&self, values: &VectorRef) -> Result<ArrayRef> {
-        let pk_array = self.primary_key_array();
-        let dict_array = pk_array
-            .as_any()
-            .downcast_ref::<PrimaryKeyArray>()
-            .with_context(|| InvalidRecordBatchSnafu {
-                reason: format!("primary key array should not be {:?}", pk_array.data_type()),
-            })?;
+        let dict_array = self.primary_key_array()?;
         let keys = dict_array
             .keys()
             .as_any()
@@ -134,24 +150,71 @@ impl MultiSeries {
         Ok(Self::new(record_batch))
     }
 
+    /// Replaces the primary key array with the given array.
+    /// It won't touch the cached values.
+    pub(crate) fn replace_primary_key_array(&mut self, values: BinaryArray) -> Result<()> {
+        let dict_array = self.primary_key_array()?;
+        let keys = dict_array
+            .keys()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: format!(
+                    "keys of primary key array should not be {:?}",
+                    dict_array.values().data_type()
+                ),
+            })?;
+
+        let new_array =
+            DictionaryArray::try_new(keys.clone(), Arc::new(values)).context(ComputeArrowSnafu)?;
+        let mut columns = self.record_batch.columns().to_vec();
+        columns[self.record_batch.num_columns() - 3] = Arc::new(new_array);
+        let record_batch =
+            RecordBatch::try_new(self.record_batch.schema(), columns).context(ComputeArrowSnafu)?;
+
+        self.record_batch = record_batch;
+        Ok(())
+    }
+
+    /// Returns a builder for the primary key array.
+    pub(crate) fn primary_key_values_builder(&self) -> Result<BinaryBuilder> {
+        let dict_array = self.primary_key_array()?;
+        let encoded_pks = dict_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: format!(
+                    "values of primary key array should not be {:?}",
+                    dict_array.values().data_type()
+                ),
+            })?;
+
+        Ok(BinaryBuilder::with_capacity(
+            dict_array.keys().len(),
+            encoded_pks.values().len(),
+        ))
+    }
+
     /// Returns the encoded primary key array.
-    fn primary_key_array(&self) -> &ArrayRef {
-        self.record_batch
-            .column(self.record_batch.num_columns() - 3)
+    fn primary_key_array(&self) -> Result<&PrimaryKeyArray> {
+        let array = self
+            .record_batch
+            .column(self.record_batch.num_columns() - 3);
+        array
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: format!("primary key array should not be {:?}", array.data_type()),
+            })
     }
 }
 
 fn decode_primary_key_array(
-    array: &ArrayRef,
+    dict_array: &PrimaryKeyArray,
     metadata: &RegionMetadata,
     codec: &dyn PrimaryKeyCodec,
 ) -> Result<CompositeValuesList> {
-    let dict_array = array
-        .as_any()
-        .downcast_ref::<PrimaryKeyArray>()
-        .with_context(|| InvalidRecordBatchSnafu {
-            reason: format!("primary key array should not be {:?}", array.data_type()),
-        })?;
     let encoded_pks = dict_array
         .values()
         .as_any()
@@ -173,6 +236,32 @@ fn decode_primary_key_array(
     }
 
     values_builder.build()
+}
+
+fn decode_primary_key_to_vec(
+    dict_array: &PrimaryKeyArray,
+    codec: &dyn PrimaryKeyCodec,
+) -> Result<Vec<CompositeValues>> {
+    let encoded_pks = dict_array
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .with_context(|| InvalidRecordBatchSnafu {
+            reason: format!(
+                "values of primary key array should not be {:?}",
+                dict_array.values().data_type()
+            ),
+        })?;
+    let mut values = Vec::with_capacity(encoded_pks.len());
+    for encoded_pk in encoded_pks.iter() {
+        let encoded_pk = encoded_pk.context(InvalidRecordBatchSnafu {
+            reason: "primary key array should not contain null values",
+        })?;
+        let pk_values = codec.decode(encoded_pk).context(DecodeSnafu)?;
+        values.push(pk_values);
+    }
+
+    Ok(values)
 }
 
 /// A list of composite values.
