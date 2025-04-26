@@ -208,6 +208,12 @@ impl FileRangeContext {
         self.base.precise_filter(input)
     }
 
+    /// TRY THE BEST to perform pushed down predicate precisely on the input [MultiSeries].
+    /// Return the filtered batch. If the entire batch is filtered out, return None.
+    pub(crate) fn precise_filter_multi(&self, input: MultiSeries) -> Result<Option<MultiSeries>> {
+        self.base.precise_filter_multi(input)
+    }
+
     //// Decodes parquet metadata and finds if row group contains delete op.
     pub(crate) fn contains_delete(&self, row_group_index: usize) -> Result<bool> {
         let metadata = self.reader_builder.parquet_metadata();
