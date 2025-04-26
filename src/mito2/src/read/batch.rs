@@ -14,6 +14,8 @@
 
 //! Batch structs for the engine.
 
+pub mod multi_series;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
