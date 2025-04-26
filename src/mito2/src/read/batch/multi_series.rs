@@ -17,11 +17,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common_recordbatch::filter::SimpleFilterEvaluator;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, UInt32Array,
 };
-use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::compute::filter_record_batch;
 use datatypes::prelude::{ConcreteDataType, DataType};
@@ -65,6 +63,11 @@ impl MultiSeries {
     /// Returns the number of rows in the batch.
     pub fn num_rows(&self) -> usize {
         self.record_batch.num_rows()
+    }
+
+    /// Returns true if the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.num_rows() == 0
     }
 
     /// Decodes the primary key part of the batch.
