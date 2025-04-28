@@ -46,7 +46,7 @@ use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::range::RangeBuilderList;
 use crate::read::scan_region::{ScanInput, StreamContext};
-use crate::read::scan_util::{PartitionMetrics, PartitionMetricsList};
+use crate::read::scan_util::{PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics};
 use crate::read::seq_scan::{build_sources, SeqScan};
 use crate::read::{Batch, BoxedBatchReader, ScannerMetrics, Source};
 use crate::region::options::MergeMode;
@@ -358,7 +358,8 @@ impl SeriesDistributor {
         // Builds a reader that merge sources from all parts.
         let mut reader =
             SeqScan::build_reader_from_sources(&self.stream_ctx, sources, None).await?;
-        let mut metrics = ScannerMetrics::default();
+        let mut metrics = SeriesDistributorMetrics::default();
+
         let mut fetch_start = Instant::now();
 
         let mut current_series = SeriesBatch::default();
@@ -397,8 +398,9 @@ impl SeriesDistributor {
             metrics.yield_cost += yield_start.elapsed();
         }
 
-        part_metrics.merge_metrics(&metrics);
-        part_metrics.set_num_series_send_timeout(self.senders.num_timeout);
+        metrics.scan_cost += fetch_start.elapsed();
+        metrics.num_series_send_timeout = self.senders.num_timeout;
+        part_metrics.set_distributor_metrics(&metrics);
 
         part_metrics.on_finish();
 
