@@ -30,6 +30,7 @@ use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROWS_IN_ROW_GROUP_TOTAL,
     READ_ROWS_RETURN, READ_ROW_GROUPS_TOTAL, READ_STAGE_ELAPSED,
 };
+use crate::read::batch::multi_series::MultiSeries;
 use crate::read::range::{RangeBuilderList, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
 use crate::read::{Batch, ScannerMetrics, Source};
@@ -565,6 +566,42 @@ pub(crate) fn scan_file_ranges(
                 let prune_metrics = reader.metrics();
                 reader_metrics.merge_from(&prune_metrics);
             }
+        }
+
+        // Reports metrics.
+        reader_metrics.observe_rows(read_type);
+        reader_metrics.filter_metrics.observe();
+        part_metrics.merge_reader_metrics(&reader_metrics);
+    }
+}
+
+/// Scans file ranges at `index`.
+pub(crate) fn scan_file_ranges_multi_series(
+    stream_ctx: Arc<StreamContext>,
+    part_metrics: PartitionMetrics,
+    index: RowGroupIndex,
+    read_type: &'static str,
+    range_builder: Arc<RangeBuilderList>,
+) -> impl Stream<Item = Result<MultiSeries>> {
+    try_stream! {
+        let mut reader_metrics = ReaderMetrics::default();
+        let ranges = range_builder.build_file_ranges(&stream_ctx.input, index, &mut reader_metrics).await?;
+        part_metrics.inc_num_file_ranges(ranges.len());
+
+        for range in ranges {
+            let build_reader_start = Instant::now();
+            let mut reader = range.multi_series_reader().await?;
+            let build_cost = build_reader_start.elapsed();
+            part_metrics.inc_build_reader_cost(build_cost);
+            let compat_batch = range.compat_batch();
+            while let Some(mut batch) = reader.next_batch().await? {
+                if let Some(compact_batch) = compat_batch {
+                    batch = compact_batch.compat_multi(batch)?;
+                }
+                yield batch;
+            }
+            let prune_metrics = reader.metrics();
+            reader_metrics.merge_from(&prune_metrics);
         }
 
         // Reports metrics.
