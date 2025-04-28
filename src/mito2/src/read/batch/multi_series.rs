@@ -20,16 +20,19 @@ use std::sync::Arc;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, DictionaryArray, UInt32Array,
 };
+use datatypes::arrow::compute;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::compute::filter_record_batch;
 use datatypes::prelude::{ConcreteDataType, DataType};
-use datatypes::vectors::{MutableVector, VectorRef};
+use datatypes::vectors::{Helper, MutableVector, VectorRef};
 use snafu::{OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadata;
 use store_api::storage::ColumnId;
 
-use crate::error::{ComputeArrowSnafu, CreateVectorSnafu, InvalidRecordBatchSnafu, Result};
+use crate::error::{
+    ComputeArrowSnafu, ConvertVectorSnafu, CreateVectorSnafu, InvalidRecordBatchSnafu, Result,
+};
 use crate::row_converter::{CompositeValues, PrimaryKeyCodec, SparseValues};
 use crate::sst::parquet::format::PrimaryKeyArray;
 
@@ -72,6 +75,8 @@ impl MultiSeries {
     }
 
     /// Decodes the primary key part of the batch.
+    /// The length of the returned list is equal to the number of values in the dictionary,
+    /// not the number of rows in the batch.
     pub(crate) fn decode_primary_key_array(
         &self,
         metadata: &RegionMetadata,
@@ -82,6 +87,8 @@ impl MultiSeries {
     }
 
     /// Decodes the primary key part of the batch to a vec of [CompositeValues].
+    /// The length of the returned vec is equal to the number of values in the dictionary,
+    /// not the number of rows in the batch.
     pub(crate) fn decode_primary_key_to_vec(
         &self,
         codec: &dyn PrimaryKeyCodec,
@@ -121,7 +128,7 @@ impl MultiSeries {
             .column(self.record_batch.num_columns() - 4)
     }
 
-    /// Gets the tag column as a dictionary array.
+    /// Gets the tag column as a dictionary array with the given dictionary values.
     pub(crate) fn tag_column(&self, values: &VectorRef) -> Result<ArrayRef> {
         let dict_array = self.primary_key_array()?;
         let keys = dict_array
@@ -138,6 +145,36 @@ impl MultiSeries {
 
         let array = DictionaryArray::try_new(keys.clone(), values).context(ComputeArrowSnafu)?;
         Ok(Arc::new(array))
+    }
+
+    /// Flattens the tag column from a dictionary array to a vector.
+    /// The `values_list` is a list of values for each column in the batch. It should be decoded from this batch.
+    /// The `column_id` is the id of the column to flatten.
+    /// The `data_type` is the data type of the column to flatten.
+    pub(crate) fn flatten_tag_column(
+        &self,
+        values_list: &CompositeValuesList,
+        column_id: ColumnId,
+        data_type: &ConcreteDataType,
+    ) -> Result<VectorRef> {
+        let dict_array = self.primary_key_array()?;
+        let keys = dict_array
+            .keys()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: format!(
+                    "keys of primary key array should not be {:?}",
+                    dict_array.values().data_type()
+                ),
+            })?;
+
+        let values = values_list.value_vector(column_id, data_type)?;
+
+        let flattened = compute::take(values.to_arrow_array().as_ref(), keys, None)
+            .context(ComputeArrowSnafu)?;
+
+        Helper::try_into_vector(flattened).context(ConvertVectorSnafu)
     }
 
     /// Filters this batch by the boolean array.
@@ -299,7 +336,7 @@ fn decode_primary_key_to_vec(
 }
 
 /// A list of composite values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum CompositeValuesList {
     Dense(HashMap<ColumnId, VectorRef>),
     Sparse(Vec<SparseValues>),

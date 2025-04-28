@@ -180,6 +180,11 @@ impl MultiSeriesPruneReader {
         Ok(None)
     }
 
+    /// Returns the metrics
+    pub fn metrics(&self) -> &ReaderMetrics {
+        &self.metrics
+    }
+
     /// Prunes the batch by the pushed down predicate.
     fn prune_multi_series(&mut self, batch: MultiSeries) -> Result<Option<MultiSeries>> {
         // fast path
