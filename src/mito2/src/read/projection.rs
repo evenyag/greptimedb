@@ -25,13 +25,14 @@ use common_recordbatch::RecordBatch;
 use datatypes::prelude::{ConcreteDataType, DataType};
 use datatypes::schema::{Schema, SchemaRef};
 use datatypes::value::Value;
-use datatypes::vectors::VectorRef;
+use datatypes::vectors::{Helper, VectorRef};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 
 use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, Result};
+use crate::read::batch::multi_series::MultiSeries;
 use crate::read::Batch;
 use crate::row_converter::{build_primary_key_codec, CompositeValues, PrimaryKeyCodec};
 
@@ -250,6 +251,69 @@ impl ProjectionMapper {
                 }
                 BatchIndex::Field(idx) => {
                     columns.push(batch.fields()[*idx].data.clone());
+                }
+            }
+        }
+
+        RecordBatch::new(self.output_schema.clone(), columns)
+    }
+
+    /// Converts a [MultiSeries] to a [RecordBatch].
+    ///
+    /// The batch must match the `projection` using to build the mapper.
+    pub(crate) fn convert_multi(
+        &self,
+        batch: &MultiSeries,
+    ) -> common_recordbatch::error::Result<RecordBatch> {
+        if self.is_empty_projection {
+            return RecordBatch::new_with_count(self.output_schema.clone(), batch.num_rows());
+        }
+
+        // Skips decoding pk if we don't need to output it.
+        // TODO(yingwen): Improve the performance of getting the primary key.
+        let pk_values = if self.has_tags {
+            let values_list = match batch.composite_values() {
+                Some(v) => v.clone(),
+                None => batch
+                    .decode_primary_key_array(&self.metadata, &*self.codec)
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?,
+            };
+            Some(values_list)
+        } else {
+            None
+        };
+
+        let mut columns = Vec::with_capacity(self.output_schema.num_columns());
+        for (index, column_schema) in self
+            .batch_indices
+            .iter()
+            .zip(self.output_schema.column_schemas())
+        {
+            match index {
+                BatchIndex::Tag((_idx, column_id)) => {
+                    // Safety: We have tags to output.
+                    let values_list = pk_values.as_ref().unwrap();
+                    let vector = batch
+                        .flatten_tag_column(values_list, *column_id, &column_schema.data_type)
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+
+                    columns.push(vector);
+                }
+                BatchIndex::Timestamp => {
+                    let timestamps = Helper::try_into_vector(batch.timestamp_column())
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+
+                    columns.push(timestamps);
+                }
+                BatchIndex::Field(idx) => {
+                    let fields = Helper::try_into_vector(batch.field_column(*idx))
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+
+                    columns.push(fields);
                 }
             }
         }
