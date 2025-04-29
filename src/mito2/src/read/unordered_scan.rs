@@ -229,7 +229,7 @@ impl UnorderedScan {
         Ok(stream)
     }
 
-    fn scan_partition_multi_series(
+    pub fn scan_partition_multi_series(
         &self,
         metrics_set: &ExecutionPlanMetricsSet,
         partition: usize,

@@ -495,27 +495,44 @@ async fn test_open_compaction_region() {
     assert_eq!(region_id, compaction_region.region_id);
 }
 
-#[tokio::test]
-async fn test_engine_prom_seq_scan() {
-    run_engine_prom_scan(false).await;
+#[derive(Debug)]
+enum ScanType {
+    SeqScan,
+    UnorderedScan,
+    UnorderedMultiSeriesScan,
 }
 
 #[tokio::test]
-async fn test_engine_prom_series_scan() {
-    run_engine_prom_scan(true).await;
+async fn test_engine_prom_seq_scan() {
+    run_engine_prom_scan(ScanType::SeqScan).await;
+}
+
+#[tokio::test]
+async fn test_engine_prom_unordered_scan() {
+    run_engine_prom_scan(ScanType::UnorderedScan).await;
+}
+
+#[tokio::test]
+async fn test_engine_prom_unordered_multi_series_scan() {
+    run_engine_prom_scan(ScanType::UnorderedMultiSeriesScan).await;
 }
 
 #[tokio::test]
 async fn test_engine_prombench_seq_scan() {
-    run_engine_prombench_scan(false).await;
+    run_engine_prombench_scan(ScanType::SeqScan).await;
 }
 
 #[tokio::test]
-async fn test_engine_prombench_series_scan() {
-    run_engine_prombench_scan(true).await;
+async fn test_engine_prombench_unordered_scan() {
+    run_engine_prombench_scan(ScanType::UnorderedScan).await;
 }
 
-async fn run_engine_prom_scan(use_series_scan: bool) {
+#[tokio::test]
+async fn test_engine_prombench_unordered_multi_series_scan() {
+    run_engine_prombench_scan(ScanType::UnorderedMultiSeriesScan).await;
+}
+
+async fn run_engine_prom_scan(scan_type: ScanType) {
     common_telemetry::init_default_ut_logging();
 
     let test_dir = create_temp_dir("prom");
@@ -583,21 +600,21 @@ async fn run_engine_prom_scan(use_series_scan: bool) {
     let loop_start = Instant::now();
     for i in 0..loops {
         let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
-        if use_series_scan {
-            test_series_scan(scan_region, i).await;
-        } else {
-            test_seq_scan(scan_region, i).await;
+        match scan_type {
+            ScanType::SeqScan => test_seq_scan(scan_region, i).await,
+            ScanType::UnorderedScan => test_unordered_scan(scan_region, i, false).await,
+            ScanType::UnorderedMultiSeriesScan => test_unordered_scan(scan_region, i, true).await,
         }
     }
     common_telemetry::info!(
-        "Loop {} times, series scan: {}, elapsed time: {:?}",
+        "Loop {} times, scan type: {:?}, elapsed time: {:?}",
         loops,
-        use_series_scan,
+        scan_type,
         loop_start.elapsed()
     );
 }
 
-async fn run_engine_prombench_scan(use_series_scan: bool) {
+async fn run_engine_prombench_scan(scan_type: ScanType) {
     common_telemetry::init_default_ut_logging();
 
     let test_dir = create_temp_dir("prom");
@@ -663,16 +680,16 @@ async fn run_engine_prombench_scan(use_series_scan: bool) {
     let loop_start = Instant::now();
     for i in 0..loops {
         let scan_region = engine.scan_region(region_id, request.clone()).unwrap();
-        if use_series_scan {
-            test_series_scan(scan_region, i).await;
-        } else {
-            test_seq_scan(scan_region, i).await;
+        match scan_type {
+            ScanType::SeqScan => test_seq_scan(scan_region, i).await,
+            ScanType::UnorderedScan => test_unordered_scan(scan_region, i, false).await,
+            ScanType::UnorderedMultiSeriesScan => test_unordered_scan(scan_region, i, true).await,
         }
     }
     common_telemetry::info!(
-        "Loop {} times, series scan: {}, elapsed time: {:?}",
+        "Loop {} times, scan type: {:?}, elapsed time: {:?}",
         loops,
-        use_series_scan,
+        scan_type,
         loop_start.elapsed()
     );
 }
@@ -703,12 +720,12 @@ async fn test_seq_scan(scan_region: ScanRegion, run: usize) {
     );
 }
 
-async fn test_series_scan(scan_region: ScanRegion, run: usize) {
+async fn test_unordered_scan(scan_region: ScanRegion, run: usize, multi_series: bool) {
     let num_target_partitions = 8;
 
     let start = Instant::now();
-    let mut series_scan = scan_region.series_scan().unwrap();
-    let ranges: Vec<_> = series_scan
+    let mut unordered_scan = scan_region.unordered_scan().unwrap();
+    let ranges: Vec<_> = unordered_scan
         .properties()
         .partitions
         .iter()
@@ -726,18 +743,24 @@ async fn test_series_scan(scan_region: ScanRegion, run: usize) {
         actual_part_num
     );
 
-    series_scan
+    unordered_scan
         .prepare(PrepareRequest {
             ranges: Some(partition_ranges),
             distinguish_partition_range: None,
             target_partitions: Some(num_target_partitions),
         })
         .unwrap();
-    let num_partitions = series_scan.properties().num_partitions();
+    let num_partitions = unordered_scan.properties().num_partitions();
     let mut tasks = Vec::with_capacity(num_partitions);
     let metrics_set = ExecutionPlanMetricsSet::default();
     for i in 0..num_partitions {
-        let mut stream = series_scan.scan_partition(&metrics_set, i).unwrap();
+        let mut stream = if multi_series {
+            unordered_scan
+                .scan_partition_multi_series(&metrics_set, i)
+                .unwrap()
+        } else {
+            unordered_scan.scan_partition(&metrics_set, i).unwrap()
+        };
 
         let task = common_runtime::spawn_global(async move {
             let mut num_rows = 0;
