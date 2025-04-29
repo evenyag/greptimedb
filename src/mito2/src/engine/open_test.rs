@@ -738,7 +738,8 @@ async fn test_unordered_scan(scan_region: ScanRegion, run: usize, multi_series: 
         partition_ranges[i % actual_part_num].push(range);
     }
     common_telemetry::info!(
-        "Test series scan, loop {}, actual_part_num: {}",
+        "Test unordered scan, multi_series: {}, loop {}, actual_part_num: {}",
+        multi_series,
         run,
         actual_part_num
     );
@@ -775,7 +776,8 @@ async fn test_unordered_scan(scan_region: ScanRegion, run: usize, multi_series: 
     let num_rows = results.iter().sum::<usize>();
 
     common_telemetry::info!(
-        "SeriesScan per-series loop {} scan {} rows, total time: {:?}",
+        "UnorderedScan multi_series: {}, loop {} scan {} rows, total time: {:?}",
+        multi_series,
         run,
         num_rows,
         start.elapsed()
