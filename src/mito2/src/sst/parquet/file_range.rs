@@ -452,7 +452,7 @@ impl RangeBase {
                 continue;
             };
             let col = input.column(column_index);
-            let result = filter.evaluate_array(col).context(FilterRecordBatchSnafu)?;
+            let result = filter.evaluate_array(col).context(RecordBatchSnafu)?;
 
             mask = mask.bitand(&result);
         }

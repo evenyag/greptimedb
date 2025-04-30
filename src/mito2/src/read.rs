@@ -37,6 +37,7 @@ use futures::TryStreamExt;
 
 use crate::error::Result;
 use crate::memtable::BoxedBatchIterator;
+use crate::read::batch::plain::PlainBatch;
 pub use crate::read::batch::{Batch, BatchBuilder, BatchColumn};
 use crate::read::prune::PruneReader;
 
@@ -52,9 +53,22 @@ pub enum Source {
     Stream(BoxedBatchStream),
     /// Source from a [PruneReader].
     PruneReader(PruneReader),
+
+    /// Source from a [BoxedPlainBatchStream].
+    PlainStream(BoxedPlainBatchStream),
 }
 
 impl Source {
+    /// Returns true if this source returns [PlainBatch].
+    pub(crate) fn is_plain(&self) -> bool {
+        match self {
+            Source::Reader(_) | Source::Iter(_) | Source::Stream(_) | Source::PruneReader(_) => {
+                false
+            }
+            Source::PlainStream(_) => true,
+        }
+    }
+
     /// Returns next [Batch] from this data source.
     pub(crate) async fn next_batch(&mut self) -> Result<Option<Batch>> {
         match self {
@@ -62,6 +76,17 @@ impl Source {
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
             Source::PruneReader(reader) => reader.next_batch().await,
+            Source::PlainStream(_) => panic!("PlainStream is not supported"),
+        }
+    }
+
+    /// Returns next [PlainBatch] from this data source.
+    pub(crate) async fn next_plain_batch(&mut self) -> Result<Option<PlainBatch>> {
+        match self {
+            Source::Reader(_) | Source::Iter(_) | Source::Stream(_) | Source::PruneReader(_) => {
+                panic!("Next plain batch is not supported")
+            }
+            Source::PlainStream(stream) => stream.try_next().await,
         }
     }
 }
@@ -93,6 +118,9 @@ impl<T: BatchReader + ?Sized> BatchReader for Box<T> {
         (**self).next_batch().await
     }
 }
+
+/// Pointer to a stream that yields [PlainBatch].
+pub type BoxedPlainBatchStream = BoxStream<'static, Result<PlainBatch>>;
 
 /// Local metrics for scanners.
 #[derive(Debug, Default)]

@@ -34,13 +34,13 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::DataType;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
-use snafu::ResultExt;
-use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
+use snafu::{OptionExt, ResultExt};
+use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::storage::{ColumnId, SequenceNumber};
 
-use crate::error::{NewRecordBatchSnafu, Result};
+use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result};
 use crate::read::batch::plain::PlainBatch;
-use crate::sst::file::{FileMeta, FileTimeRange};
+use crate::sst::file::{FileId, FileMeta, FileTimeRange};
 use crate::sst::parquet::format::StatValues;
 use crate::sst::{to_plain_sst_arrow_schema, to_sst_arrow_schema};
 
@@ -561,6 +561,58 @@ fn new_primary_key_array(primary_key: &[u8], num_rows: usize) -> ArrayRef {
 
     // Safety: The key index is valid.
     Arc::new(DictionaryArray::new(keys, values))
+}
+
+/// Gets the min/max time index of the SST from the parquet meta.
+/// It assumes the parquet is created by the mito engine.
+pub(crate) fn parquet_time_range(
+    file_id: FileId,
+    parquet_meta: &ParquetMetaData,
+    metadata: &RegionMetadata,
+) -> Option<FileTimeRange> {
+    let time_index_pos = metadata.time_index_column_pos();
+    // Safety: The time index column is valid.
+    let time_unit = metadata
+        .time_index_column()
+        .column_schema
+        .data_type
+        .as_timestamp()
+        .unwrap()
+        .unit();
+    let mut time_range: Option<FileTimeRange> = None;
+    for row_group_meta in parquet_meta.row_groups() {
+        let stats = row_group_meta.column(time_index_pos).statistics()?;
+        // The physical type for the timestamp should be i64.
+        let (min, max) = match stats {
+            Statistics::Int64(value_stats) => (*value_stats.min_opt()?, *value_stats.max_opt()?),
+            Statistics::Int32(_)
+            | Statistics::Boolean(_)
+            | Statistics::Int96(_)
+            | Statistics::Float(_)
+            | Statistics::Double(_)
+            | Statistics::ByteArray(_)
+            | Statistics::FixedLenByteArray(_) => {
+                common_telemetry::warn!(
+                    "Invalid statistics {:?} for time index in parquet in {}",
+                    stats,
+                    file_id
+                );
+                return None;
+            }
+        };
+        let (min_in_rg, max_in_rg) = (
+            Timestamp::new(min, time_unit),
+            Timestamp::new(max, time_unit),
+        );
+        if let Some(range) = &mut time_range {
+            range.0 = range.0.min(min_in_rg);
+            range.1 = range.1.max(max_in_rg);
+        } else {
+            time_range = Some((min_in_rg, max_in_rg));
+        }
+    }
+
+    time_range
 }
 
 /// Gets the min/max time index of the row group from the parquet meta.
