@@ -29,7 +29,8 @@ use crate::error::{
     CompatReaderSnafu, ComputeArrowSnafu, CreateDefaultSnafu, InvalidRecordBatchSnafu, Result,
 };
 use crate::read::batch::multi_series::MultiSeries;
-use crate::read::projection::ProjectionMapper;
+use crate::read::batch::plain::PlainBatch;
+use crate::read::projection::{plain_projected_columns, PlainProjectionMapper, ProjectionMapper};
 use crate::read::{Batch, BatchColumn, BatchReader};
 use crate::row_converter::{
     build_primary_key_codec, build_primary_key_codec_with_fields, CompositeValues, PrimaryKeyCodec,
@@ -128,6 +129,119 @@ impl CompatBatch {
         }
 
         Ok(batch)
+    }
+}
+
+/// A helper struct to adapt schema of the batch to an expected schema.
+pub(crate) struct CompatPlainBatch {
+    /// Column Ids and DataTypes the reader actually returns.
+    actual_schema: Vec<(ColumnId, ConcreteDataType)>,
+    /// Indices to convert actual fields to expect fields.
+    index_or_defaults: Vec<IndexOrDefault>,
+}
+
+impl CompatPlainBatch {
+    /// Creates a [CompatPlainBatch] if needed.
+    /// - `mapper` is built from the metadata users expect to see.
+    /// - `actual` is the [RegionMetadata] of the input reader.
+    pub(crate) fn may_new(
+        mapper: &PlainProjectionMapper,
+        actual: &RegionMetadata,
+    ) -> Result<Option<Self>> {
+        let expect_schema = mapper.batch_schema();
+        let actual_schema = plain_projected_columns(actual, mapper.column_ids());
+        if expect_schema == actual_schema {
+            return Ok(None);
+        }
+
+        // Maps column id to the index and data type in the actual schema.
+        let actual_schema_index: HashMap<_, _> = actual_schema
+            .iter()
+            .enumerate()
+            .map(|(idx, (column_id, data_type))| (*column_id, (idx, data_type)))
+            .collect();
+
+        let index_or_defaults = expect_schema
+            .iter()
+            .map(|(column_id, expect_data_type)| {
+                if let Some((index, actual_data_type)) = actual_schema_index.get(column_id) {
+                    let mut cast_type = None;
+
+                    if expect_data_type != *actual_data_type {
+                        cast_type = Some(expect_data_type.clone())
+                    }
+                    // Source has this column.
+                    Ok(IndexOrDefault::Index {
+                        pos: *index,
+                        cast_type,
+                    })
+                } else {
+                    // Safety: mapper must have this column.
+                    let column = mapper.metadata().column_by_id(*column_id).unwrap();
+                    // Create a default vector with 1 element for that column.
+                    let default_vector = column
+                        .column_schema
+                        .create_default_vector(1)
+                        .context(CreateDefaultSnafu {
+                            region_id: mapper.metadata().region_id,
+                            column: &column.column_schema.name,
+                        })?
+                        .with_context(|| CompatReaderSnafu {
+                            region_id: mapper.metadata().region_id,
+                            reason: format!(
+                                "column {} does not have a default value to read",
+                                column.column_schema.name
+                            ),
+                        })?;
+                    Ok(IndexOrDefault::DefaultValue {
+                        column_id: column.column_id,
+                        default_vector,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(Self {
+            actual_schema,
+            index_or_defaults,
+        }))
+    }
+
+    /// Make columns of the `batch` compatible.
+    #[must_use]
+    pub(crate) fn compat(&self, batch: PlainBatch) -> Result<PlainBatch> {
+        let len = batch.num_rows();
+        let columns = self
+            .index_or_defaults
+            .iter()
+            .map(|index_or_default| match index_or_default {
+                IndexOrDefault::Index { pos, cast_type } => {
+                    let old_column = batch.column(*pos);
+
+                    if let Some(ty) = cast_type {
+                        // Safety: We ensure type can be converted and the new batch should be valid.
+                        // Tips: `safe` must be true in `CastOptions`, which will replace the specific value with null when it cannot be converted.
+                        let casted =
+                            datatypes::arrow::compute::cast(old_column, &ty.as_arrow_type())
+                                .context(ComputeArrowSnafu)?;
+                        Ok(casted)
+                    } else {
+                        Ok(old_column.clone())
+                    }
+                }
+                IndexOrDefault::DefaultValue {
+                    column_id: _,
+                    default_vector,
+                } => {
+                    let data = default_vector.replicate(&[len]);
+                    Ok(data.to_arrow_array())
+                }
+            })
+            .chain(batch.internal_columns().iter().map(|col| Ok(col.clone())))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Safety: We ensure all columns have the same length and the new batch should be valid.
+        batch.with_new_columns(columns)
     }
 }
 
