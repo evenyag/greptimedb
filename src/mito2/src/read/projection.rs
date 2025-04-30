@@ -39,8 +39,88 @@ use crate::row_converter::{build_primary_key_codec, CompositeValues, PrimaryKeyC
 /// Only cache vector when its length `<=` this value.
 const MAX_VECTOR_LENGTH_TO_CACHE: usize = 16384;
 
+/// Handles projection and converts a projected batch to a projected [RecordBatch].
+pub enum ProjectionMapper {
+    PrimaryKey(PrimaryKeyProjectionMapper),
+    Plain(PlainProjectionMapper),
+}
+
+impl ProjectionMapper {
+    /// Returns a new mapper with projection.
+    pub fn new(
+        metadata: &RegionMetadataRef,
+        projection: impl Iterator<Item = usize>,
+    ) -> Result<ProjectionMapper> {
+        Ok(ProjectionMapper::PrimaryKey(
+            PrimaryKeyProjectionMapper::new(metadata, projection)?,
+        ))
+    }
+
+    /// Returns a new mapper without projection.
+    pub fn all(metadata: &RegionMetadataRef) -> Result<ProjectionMapper> {
+        Ok(ProjectionMapper::PrimaryKey(
+            PrimaryKeyProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())?,
+        ))
+    }
+
+    /// Returns the metadata that created the mapper.
+    pub(crate) fn metadata(&self) -> &RegionMetadataRef {
+        match self {
+            ProjectionMapper::PrimaryKey(mapper) => mapper.metadata(),
+            ProjectionMapper::Plain(mapper) => mapper.metadata(),
+        }
+    }
+
+    /// Returns ids of projected columns that we need to read
+    /// from memtables and SSTs.
+    pub(crate) fn column_ids(&self) -> &[ColumnId] {
+        match self {
+            ProjectionMapper::PrimaryKey(mapper) => mapper.column_ids(),
+            ProjectionMapper::Plain(mapper) => mapper.column_ids(),
+        }
+    }
+
+    /// Returns the schema of converted [RecordBatch].
+    /// This is the schema that the stream will output. This schema may contain
+    /// less columns than [ProjectionMapper::column_ids()].
+    pub(crate) fn output_schema(&self) -> SchemaRef {
+        match self {
+            ProjectionMapper::PrimaryKey(mapper) => mapper.output_schema(),
+            ProjectionMapper::Plain(mapper) => mapper.output_schema(),
+        }
+    }
+
+    /// Returns an empty [RecordBatch].
+    pub(crate) fn empty_record_batch(&self) -> RecordBatch {
+        match self {
+            ProjectionMapper::PrimaryKey(mapper) => mapper.empty_record_batch(),
+            ProjectionMapper::Plain(mapper) => mapper.empty_record_batch(),
+        }
+    }
+
+    /// Returns the mapper as a [PrimaryKeyProjectionMapper].
+    /// # Panics
+    /// Panics if the mapper is not a [PrimaryKeyProjectionMapper].
+    pub fn as_primary_key(&self) -> &PrimaryKeyProjectionMapper {
+        match self {
+            ProjectionMapper::PrimaryKey(mapper) => mapper,
+            _ => panic!("ProjectionMapper is not a PrimaryKeyProjectionMapper"),
+        }
+    }
+
+    /// Returns the mapper as a [PlainProjectionMapper].
+    /// # Panics
+    /// Panics if the mapper is not a [PlainProjectionMapper].
+    pub fn as_plain(&self) -> &PlainProjectionMapper {
+        match self {
+            ProjectionMapper::Plain(mapper) => mapper,
+            _ => panic!("ProjectionMapper is not a PlainProjectionMapper"),
+        }
+    }
+}
+
 /// Handles projection and converts a projected [Batch] to a projected [RecordBatch].
-pub struct ProjectionMapper {
+pub struct PrimaryKeyProjectionMapper {
     /// Metadata of the region.
     metadata: RegionMetadataRef,
     /// Maps column in [RecordBatch] to index in [Batch].
@@ -60,7 +140,7 @@ pub struct ProjectionMapper {
     is_empty_projection: bool,
 }
 
-impl ProjectionMapper {
+impl PrimaryKeyProjectionMapper {
     /// Returns a new mapper with projection.
     /// If `projection` is empty, it outputs [RecordBatch] without any column but only a row count.
     /// `SELECT COUNT(*) FROM table` is an example that uses an empty projection. DataFusion accepts
@@ -68,7 +148,7 @@ impl ProjectionMapper {
     pub fn new(
         metadata: &RegionMetadataRef,
         projection: impl Iterator<Item = usize>,
-    ) -> Result<ProjectionMapper> {
+    ) -> Result<PrimaryKeyProjectionMapper> {
         let mut projection: Vec<_> = projection.collect();
         // If the original projection is empty.
         let is_empty_projection = projection.is_empty();
@@ -97,7 +177,7 @@ impl ProjectionMapper {
         let codec = build_primary_key_codec(metadata);
         if is_empty_projection {
             // If projection is empty, we don't output any column.
-            return Ok(ProjectionMapper {
+            return Ok(PrimaryKeyProjectionMapper {
                 metadata: metadata.clone(),
                 batch_indices: vec![],
                 has_tags: false,
@@ -147,7 +227,7 @@ impl ProjectionMapper {
             batch_indices.push(batch_index);
         }
 
-        Ok(ProjectionMapper {
+        Ok(PrimaryKeyProjectionMapper {
             metadata: metadata.clone(),
             batch_indices,
             has_tags,
@@ -160,8 +240,8 @@ impl ProjectionMapper {
     }
 
     /// Returns a new mapper without projection.
-    pub fn all(metadata: &RegionMetadataRef) -> Result<ProjectionMapper> {
-        ProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())
+    pub fn all(metadata: &RegionMetadataRef) -> Result<PrimaryKeyProjectionMapper> {
+        PrimaryKeyProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())
     }
 
     /// Returns the metadata that created the mapper.
@@ -618,14 +698,14 @@ mod tests {
                 (3, ConcreteDataType::int64_datatype()),
                 (4, ConcreteDataType::int64_datatype())
             ],
-            mapper.batch_fields()
+            mapper.as_primary_key().batch_fields()
         );
 
         // With vector cache.
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
         let batch = new_batch(0, &[1, 2], &[(3, 3), (4, 4)], 3);
-        let record_batch = mapper.convert(&batch, &cache).unwrap();
+        let record_batch = mapper.as_primary_key().convert(&batch, &cache).unwrap();
         let expect = "\
 +---------------------+----+----+----+----+
 | ts                  | k0 | k1 | v0 | v1 |
@@ -645,7 +725,7 @@ mod tests {
         assert!(cache
             .get_repeated_vector(&ConcreteDataType::int64_datatype(), &Value::Int64(3))
             .is_none());
-        let record_batch = mapper.convert(&batch, &cache).unwrap();
+        let record_batch = mapper.as_primary_key().convert(&batch, &cache).unwrap();
         assert_eq!(expect, print_record_batch(record_batch));
     }
 
@@ -662,13 +742,13 @@ mod tests {
         assert_eq!([4, 1], mapper.column_ids());
         assert_eq!(
             [(4, ConcreteDataType::int64_datatype())],
-            mapper.batch_fields()
+            mapper.as_primary_key().batch_fields()
         );
 
         let batch = new_batch(0, &[1, 2], &[(4, 4)], 3);
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
-        let record_batch = mapper.convert(&batch, &cache).unwrap();
+        let record_batch = mapper.as_primary_key().convert(&batch, &cache).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |
@@ -689,7 +769,7 @@ mod tests {
                 .build(),
         );
         // Empty projection
-        let mapper = ProjectionMapper::new(&metadata, [].into_iter()).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::new(&metadata, [].into_iter()).unwrap();
         assert_eq!([0], mapper.column_ids()); // Should still read the time index column
         assert!(mapper.batch_fields().is_empty());
         assert!(!mapper.has_tags);

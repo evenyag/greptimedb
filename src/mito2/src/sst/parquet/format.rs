@@ -139,12 +139,17 @@ pub enum ReadFormat {
 }
 
 impl ReadFormat {
-    // TODO(yingwen): Remove this.
+    /// Creates a new [ReadFormat] with primary key.
     pub(crate) fn new(
         metadata: RegionMetadataRef,
+        is_plain: bool,
         column_ids: impl Iterator<Item = ColumnId>,
     ) -> Self {
-        Self::new_primary_key(metadata, column_ids)
+        if is_plain {
+            Self::new_plain(metadata, column_ids)
+        } else {
+            Self::new_primary_key(metadata, column_ids)
+        }
     }
 
     pub fn new_primary_key(
@@ -159,6 +164,11 @@ impl ReadFormat {
         column_ids: impl Iterator<Item = ColumnId>,
     ) -> Self {
         ReadFormat::Plain(PlainReadFormat::new(metadata, column_ids))
+    }
+
+    /// Returns true if the format is plain
+    pub(crate) fn is_plain(&self) -> bool {
+        matches!(self, ReadFormat::Plain(_))
     }
 
     pub(crate) fn as_primary_key(&self) -> &PrimaryKeyReadFormat {
@@ -975,16 +985,16 @@ mod tests {
     fn test_projection_indices() {
         let metadata = build_test_region_metadata();
         // Only read tag1
-        let read_format = ReadFormat::new(metadata.clone(), [3].iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata.clone(), [3].iter().copied());
         assert_eq!(&[2, 3, 4, 5], read_format.projection_indices());
         // Only read field1
-        let read_format = ReadFormat::new(metadata.clone(), [4].iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata.clone(), [4].iter().copied());
         assert_eq!(&[0, 2, 3, 4, 5], read_format.projection_indices());
         // Only read ts
-        let read_format = ReadFormat::new(metadata.clone(), [5].iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata.clone(), [5].iter().copied());
         assert_eq!(&[2, 3, 4, 5], read_format.projection_indices());
         // Read field0, tag0, ts
-        let read_format = ReadFormat::new(metadata, [2, 1, 5].iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata, [2, 1, 5].iter().copied());
         assert_eq!(&[1, 2, 3, 4, 5], read_format.projection_indices());
     }
 

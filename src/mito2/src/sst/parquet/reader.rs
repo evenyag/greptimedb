@@ -87,6 +87,8 @@ pub struct ParquetReaderBuilder {
     /// This is usually the latest metadata of the region. The reader use
     /// it get the correct column id of a column by name.
     expected_metadata: Option<RegionMetadataRef>,
+    /// Reads the plain format.
+    plain_format: bool,
 }
 
 impl ParquetReaderBuilder {
@@ -107,6 +109,7 @@ impl ParquetReaderBuilder {
             bloom_filter_index_applier: None,
             fulltext_index_applier: None,
             expected_metadata: None,
+            plain_format: false,
         }
     }
 
@@ -170,6 +173,13 @@ impl ParquetReaderBuilder {
         self
     }
 
+    /// Attaches the plain format to the builder.
+    #[must_use]
+    pub fn plain_format(mut self, plain_format: bool) -> Self {
+        self.plain_format = plain_format;
+        self
+    }
+
     /// Builds a [ParquetReader].
     ///
     /// This needs to perform IO operation.
@@ -199,12 +209,17 @@ impl ParquetReaderBuilder {
         // Gets the metadata stored in the SST.
         let region_meta = Arc::new(Self::get_region_metadata(&file_path, key_value_meta)?);
         let read_format = if let Some(column_ids) = &self.projection {
-            ReadFormat::new(region_meta.clone(), column_ids.iter().copied())
+            ReadFormat::new(
+                region_meta.clone(),
+                self.plain_format,
+                column_ids.iter().copied(),
+            )
         } else {
             // Lists all column ids to read, we always use the expected metadata if possible.
             let expected_meta = self.expected_metadata.as_ref().unwrap_or(&region_meta);
             ReadFormat::new(
                 region_meta.clone(),
+                self.plain_format,
                 expected_meta
                     .column_metadatas
                     .iter()
