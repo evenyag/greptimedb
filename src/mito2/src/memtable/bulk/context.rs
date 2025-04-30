@@ -101,10 +101,10 @@ fn build_read_format(
     projection: &Option<&[ColumnId]>,
 ) -> ReadFormat {
     let read_format = if let Some(column_ids) = &projection {
-        ReadFormat::new(region_metadata, column_ids.iter().copied())
+        ReadFormat::new_primary_key(region_metadata, column_ids.iter().copied())
     } else {
         // No projection, lists all column ids to read.
-        ReadFormat::new(
+        ReadFormat::new_primary_key(
             region_metadata.clone(),
             region_metadata
                 .column_metadatas

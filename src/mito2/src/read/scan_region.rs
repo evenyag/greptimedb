@@ -195,6 +195,8 @@ pub(crate) struct ScanRegion {
     ignore_bloom_filter: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
+    /// Whether to use plain format.
+    plain_format: bool,
 }
 
 impl ScanRegion {
@@ -215,6 +217,7 @@ impl ScanRegion {
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
             start_time: None,
+            plain_format: false,
         }
     }
 
@@ -252,6 +255,12 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_start_time(mut self, now: Instant) -> Self {
         self.start_time = Some(now);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_plain_format(mut self, plain: bool) -> Self {
+        self.plain_format = plain;
         self
     }
 
@@ -418,7 +427,8 @@ impl ScanRegion {
             .with_filter_deleted(filter_deleted)
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
-            .with_distribution(self.request.distribution);
+            .with_distribution(self.request.distribution)
+            .with_plain_format(self.plain_format);
         Ok(input)
     }
 
@@ -601,6 +611,8 @@ pub(crate) struct ScanInput {
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
+    /// Whether to read plain format.
+    plain_format: bool,
 }
 
 impl ScanInput {
@@ -626,6 +638,7 @@ impl ScanInput {
             merge_mode: MergeMode::default(),
             series_row_selector: None,
             distribution: None,
+            plain_format: false,
         }
     }
 
@@ -758,6 +771,13 @@ impl ScanInput {
         self
     }
 
+    /// Sets whether to read plain format.
+    #[must_use]
+    pub(crate) fn with_plain_format(mut self, plain_format: bool) -> Self {
+        self.plain_format = plain_format;
+        self
+    }
+
     /// Scans sources in parallel.
     ///
     /// # Panics if the input doesn't allow parallel scan.
@@ -808,6 +828,7 @@ impl ScanInput {
             .bloom_filter_index_applier(self.bloom_filter_index_applier.clone())
             .fulltext_index_applier(self.fulltext_index_applier.clone())
             .expected_metadata(Some(self.mapper.metadata().clone()))
+            .plain_format(self.plain_format)
             .build_reader_input(reader_metrics)
             .await;
         let (mut file_range_ctx, selection) = match res {
@@ -830,8 +851,9 @@ impl ScanInput {
             let compat = CompatBatch::new(
                 &self.mapper,
                 file_range_ctx.read_format().metadata().clone(),
+                self.plain_format,
             )?;
-            file_range_ctx.set_compat_batch(Some(compat));
+            file_range_ctx.set_compat_batch(compat);
         }
         Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
     }

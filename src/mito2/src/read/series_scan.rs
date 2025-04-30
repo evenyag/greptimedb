@@ -125,7 +125,7 @@ impl SeriesScan {
                     metrics.num_batches += 1;
                     metrics.num_rows += batch.num_rows();
 
-                    let record_batch = stream_ctx.input.mapper.convert(&batch, cache)?;
+                    let record_batch = stream_ctx.input.mapper.as_primary_key().convert(&batch, cache)?;
                     df_record_batches.push(record_batch.into_df_record_batch());
                 }
 

@@ -197,7 +197,7 @@ impl UnorderedScan {
                     );
 
                     let convert_start = Instant::now();
-                    let record_batch = stream_ctx.input.mapper.convert(&batch, cache)?;
+                    let record_batch = stream_ctx.input.mapper.as_primary_key().convert(&batch, cache)?;
                     metrics.convert_cost += convert_start.elapsed();
                     let yield_start = Instant::now();
                     yield record_batch;
@@ -299,7 +299,7 @@ impl UnorderedScan {
                     // );
 
                     let convert_start = Instant::now();
-                    let record_batch = stream_ctx.input.mapper.convert_multi(&batch)?;
+                    let record_batch = stream_ctx.input.mapper.as_primary_key().convert_multi(&batch)?;
                     metrics.convert_cost += convert_start.elapsed();
                     let yield_start = Instant::now();
                     yield record_batch;

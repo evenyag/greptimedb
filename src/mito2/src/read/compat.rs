@@ -43,7 +43,7 @@ pub struct CompatReader<R> {
     /// Underlying reader.
     reader: R,
     /// Helper to compat batches.
-    compat: CompatBatch,
+    compat: CompatPrimaryKeyBatch,
 }
 
 impl<R> CompatReader<R> {
@@ -58,7 +58,7 @@ impl<R> CompatReader<R> {
     ) -> Result<CompatReader<R>> {
         Ok(CompatReader {
             reader,
-            compat: CompatBatch::new(mapper, reader_meta)?,
+            compat: CompatPrimaryKeyBatch::new(mapper, reader_meta)?,
         })
     }
 }
@@ -77,7 +77,45 @@ impl<R: BatchReader> BatchReader for CompatReader<R> {
 }
 
 /// A helper struct to adapt schema of the batch to an expected schema.
-pub(crate) struct CompatBatch {
+pub(crate) enum CompatBatch {
+    PrimaryKey(CompatPrimaryKeyBatch),
+    Plain(CompatPlainBatch),
+}
+
+impl CompatBatch {
+    /// Creates a new [CompatBatch].
+    /// - `mapper` is built from the metadata users expect to see.
+    /// - `reader_meta` is the metadata of the input reader.
+    /// - `is_plain` indicates whether the batch is plain or not.
+    pub(crate) fn new(
+        mapper: &ProjectionMapper,
+        reader_meta: RegionMetadataRef,
+        is_plain: bool,
+    ) -> Result<Option<Self>> {
+        let compat_batch = if is_plain {
+            let Some(compat_plain) = CompatPlainBatch::may_new(mapper.as_plain(), &reader_meta)?
+            else {
+                return Ok(None);
+            };
+            CompatBatch::Plain(compat_plain)
+        } else {
+            CompatBatch::PrimaryKey(CompatPrimaryKeyBatch::new(mapper, reader_meta)?)
+        };
+
+        Ok(Some(compat_batch))
+    }
+
+    /// Returns the primary key adapter.
+    pub(crate) fn as_primary_key(&self) -> &CompatPrimaryKeyBatch {
+        match self {
+            CompatBatch::PrimaryKey(batch) => batch,
+            _ => panic!("CompatBatch::as_primary_key() called on a non-primary key batch"),
+        }
+    }
+}
+
+/// A helper struct to adapt schema of the batch to an expected schema.
+pub(crate) struct CompatPrimaryKeyBatch {
     /// Optional primary key adapter.
     rewrite_pk: Option<RewritePrimaryKey>,
     /// Optional primary key adapter.
@@ -86,8 +124,8 @@ pub(crate) struct CompatBatch {
     compat_fields: Option<CompatFields>,
 }
 
-impl CompatBatch {
-    /// Creates a new [CompatBatch].
+impl CompatPrimaryKeyBatch {
+    /// Creates a new [CompatPrimaryKeyBatch].
     /// - `mapper` is built from the metadata users expect to see.
     /// - `reader_meta` is the metadata of the input reader.
     pub(crate) fn new(mapper: &ProjectionMapper, reader_meta: RegionMetadataRef) -> Result<Self> {
@@ -511,7 +549,7 @@ fn may_compat_fields(
     mapper: &ProjectionMapper,
     actual: &RegionMetadata,
 ) -> Result<Option<CompatFields>> {
-    let expect_fields = mapper.batch_fields();
+    let expect_fields = mapper.as_primary_key().batch_fields();
     let actual_fields = Batch::projected_fields(actual, mapper.column_ids());
     if expect_fields == actual_fields {
         return Ok(None);

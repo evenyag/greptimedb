@@ -554,7 +554,7 @@ pub(crate) fn scan_file_ranges(
             let reader = range.reader(stream_ctx.input.series_row_selector).await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
-            let compat_batch = range.compat_batch();
+            let compat_batch = range.compat_batch().map(|compat| compat.as_primary_key());
             let mut source = Source::PruneReader(reader);
             while let Some(mut batch) = source.next_batch().await? {
                 if let Some(compact_batch) = compat_batch {
@@ -593,7 +593,7 @@ pub(crate) fn scan_file_ranges_multi_series(
             let mut reader = range.multi_series_reader().await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
-            let compat_batch = range.compat_batch();
+            let compat_batch = range.compat_batch().map(|compat| compat.as_primary_key());
             while let Some(mut batch) = reader.next_batch().await? {
                 if let Some(compact_batch) = compat_batch {
                     batch = compact_batch.compat_multi(batch)?;
