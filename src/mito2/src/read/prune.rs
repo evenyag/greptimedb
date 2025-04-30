@@ -27,6 +27,7 @@ use snafu::ResultExt;
 use crate::error::{RecordBatchSnafu, Result};
 use crate::memtable::BoxedBatchIterator;
 use crate::read::batch::multi_series::MultiSeries;
+use crate::read::batch::plain::PlainBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileTimeRange;
@@ -194,6 +195,84 @@ impl MultiSeriesPruneReader {
 
         let num_rows_before_filter = batch.num_rows();
         let Some(batch_filtered) = self.context.precise_filter_multi(batch)? else {
+            // the entire batch is filtered out
+            self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
+            return Ok(None);
+        };
+
+        // update metric
+        let filtered_rows = num_rows_before_filter - batch_filtered.num_rows();
+        self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
+
+        if !batch_filtered.is_empty() {
+            Ok(Some(batch_filtered))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Tries to fetch next [RecordBatch] from the reader.
+    fn fetch_next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.context.map_result(self.reader.next().transpose())
+    }
+}
+
+/// A reader that prunes batches by the pushed down predicate.
+pub struct PlainPruneReader {
+    reader: ParquetRecordBatchReader,
+    /// Context for file ranges.
+    context: FileRangeContextRef,
+    metrics: ReaderMetrics,
+}
+
+impl PlainPruneReader {
+    /// Creates a new [PlainPruneReader] with the given reader.
+    pub fn new(reader: ParquetRecordBatchReader, context: FileRangeContextRef) -> Self {
+        Self {
+            reader,
+            context,
+            metrics: ReaderMetrics::default(),
+        }
+    }
+
+    /// Returns the next batch.
+    pub(crate) async fn next_batch(&mut self) -> Result<Option<PlainBatch>> {
+        let scan_start = Instant::now();
+        while let Some(batch) = self.fetch_next_record_batch()? {
+            self.metrics.num_record_batches += 1;
+            self.metrics.num_batches += 1;
+            self.metrics.num_rows += batch.num_rows();
+            self.metrics.scan_cost += scan_start.elapsed();
+
+            let batch = PlainBatch::new(batch);
+            match self.prune_plain(batch)? {
+                Some(b) => {
+                    return Ok(Some(b));
+                }
+                None => {
+                    continue;
+                }
+            }
+        }
+        self.metrics.scan_cost += scan_start.elapsed();
+
+        Ok(None)
+    }
+
+    /// Returns the metrics
+    pub fn metrics(&self) -> &ReaderMetrics {
+        &self.metrics
+    }
+
+    /// Prunes the batch by the pushed down predicate.
+    fn prune_plain(&mut self, batch: PlainBatch) -> Result<Option<PlainBatch>> {
+        // fast path
+        if self.context.filters().is_empty() {
+            return Ok(Some(batch));
+        }
+
+        let num_rows_before_filter = batch.num_rows();
+        let Some(batch_filtered) = self.context.precise_filter_plain(batch)? else {
             // the entire batch is filtered out
             self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
             return Ok(None);

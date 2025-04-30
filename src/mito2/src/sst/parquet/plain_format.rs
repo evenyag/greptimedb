@@ -215,6 +215,11 @@ impl PlainReadFormat {
         &self.projection_indices
     }
 
+    /// Index of a column in the projected batch by its column id.
+    pub fn projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
+        self.column_id_to_projected_index.get(&column_id).copied()
+    }
+
     // /// Convert a arrow record batch into `batches`.
     // ///
     // /// Note that the `record_batch` may only contains a subset of columns if it is projected.

@@ -168,6 +168,13 @@ impl ReadFormat {
         }
     }
 
+    pub(crate) fn as_plain(&self) -> &PlainReadFormat {
+        match self {
+            ReadFormat::Plain(format) => format,
+            _ => panic!("not a plain format"),
+        }
+    }
+
     /// Gets the arrow schema of the SST file.
     ///
     /// This schema is computed from the region metadata but should be the same

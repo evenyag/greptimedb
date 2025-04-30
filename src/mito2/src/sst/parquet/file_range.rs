@@ -32,6 +32,7 @@ use crate::error::{
     StatsNotPresentSnafu,
 };
 use crate::read::batch::multi_series::MultiSeries;
+use crate::read::batch::plain::PlainBatch;
 use crate::read::compat::CompatBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::prune::{MultiSeriesPruneReader, PruneReader};
@@ -228,6 +229,12 @@ impl FileRangeContext {
         self.base.precise_filter_multi(input)
     }
 
+    /// TRY THE BEST to perform pushed down predicate precisely on the input [PlainBatch].
+    /// Return the filtered batch. If the entire batch is filtered out, return None.
+    pub(crate) fn precise_filter_plain(&self, input: PlainBatch) -> Result<Option<PlainBatch>> {
+        self.base.precise_filter_plain(input)
+    }
+
     //// Decodes parquet metadata and finds if row group contains delete op.
     pub(crate) fn contains_delete(&self, row_group_index: usize) -> Result<bool> {
         let metadata = self.reader_builder.parquet_metadata();
@@ -409,6 +416,43 @@ impl RangeBase {
                     .evaluate_array(input.timestamp_column())
                     .context(RecordBatchSnafu)?,
             };
+
+            mask = mask.bitand(&result);
+        }
+
+        let output = input.filter(&BooleanArray::from(mask))?;
+
+        Ok(Some(output))
+    }
+
+    /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
+    /// Return the filtered batch. If the entire batch is filtered out, return None.
+    ///
+    /// Supported filter expr type is defined in [SimpleFilterEvaluator].
+    ///
+    /// When a filter is referencing primary key column, this method will decode
+    /// the primary key and put it into the batch.
+    pub(crate) fn precise_filter_plain(&self, mut input: PlainBatch) -> Result<Option<PlainBatch>> {
+        let mut mask = BooleanBuffer::new_set(input.num_rows());
+
+        // Run filter one by one and combine them result
+        for filter_ctx in &self.filters {
+            let filter = match filter_ctx.filter() {
+                MaybeFilter::Filter(f) => f,
+                // Column matches.
+                MaybeFilter::Matched => continue,
+                // Column doesn't match, filter the entire batch.
+                MaybeFilter::Pruned => return Ok(None),
+            };
+            let Some(column_index) = self
+                .read_format
+                .as_plain()
+                .projected_index_by_id(filter_ctx.column_id())
+            else {
+                continue;
+            };
+            let col = input.column(column_index);
+            let result = filter.evaluate_array(col).context(FilterRecordBatchSnafu)?;
 
             mask = mask.bitand(&result);
         }
