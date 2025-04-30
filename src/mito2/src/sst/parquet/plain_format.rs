@@ -23,53 +23,45 @@
 //!
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use api::v1::SemanticType;
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
 use datatypes::arrow::array::{ArrayRef, BinaryArray, DictionaryArray, UInt32Array, UInt64Array};
 use datatypes::arrow::datatypes::{SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::DataType;
-use datatypes::vectors::{Helper, Vector};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::ResultExt;
 use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
 use store_api::storage::{ColumnId, SequenceNumber};
 
-use crate::error::{
-    ConvertVectorSnafu, InvalidBatchSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result,
-};
-use crate::read::{Batch, BatchBuilder, BatchColumn};
-use crate::row_converter::{build_primary_key_codec_with_fields, SortField};
+use crate::error::{NewRecordBatchSnafu, Result};
+use crate::read::batch::plain::PlainBatch;
 use crate::sst::file::{FileMeta, FileTimeRange};
 use crate::sst::parquet::format::StatValues;
 use crate::sst::{to_plain_sst_arrow_schema, to_sst_arrow_schema};
 
-/// Arrow array type for the primary key dictionary.
-pub(crate) type PrimaryKeyArray = DictionaryArray<UInt32Type>;
-
 /// Number of columns that have fixed positions.
 ///
-/// Contains: time index and internal columns.
+/// Contains all internal columns.
 pub(crate) const PLAIN_FIXED_POS_COLUMN_NUM: usize = 2;
 
 /// Helper for writing the SST format.
-pub(crate) struct WriteFormat {
+pub(crate) struct PlainWriteFormat {
     metadata: RegionMetadataRef,
     /// SST file schema.
     arrow_schema: SchemaRef,
     override_sequence: Option<SequenceNumber>,
 }
 
-impl WriteFormat {
+impl PlainWriteFormat {
     /// Creates a new helper.
-    pub(crate) fn new(metadata: RegionMetadataRef) -> WriteFormat {
+    pub(crate) fn new(metadata: RegionMetadataRef) -> PlainWriteFormat {
         let arrow_schema = to_sst_arrow_schema(&metadata);
-        WriteFormat {
+        PlainWriteFormat {
             metadata,
             arrow_schema,
             override_sequence: None,
@@ -91,39 +83,16 @@ impl WriteFormat {
     }
 
     /// Convert `batch` to a arrow record batch to store in parquet.
-    pub(crate) fn convert_batch(&self, batch: &Batch) -> Result<RecordBatch> {
-        debug_assert_eq!(
-            batch.fields().len() + PLAIN_FIXED_POS_COLUMN_NUM,
-            self.arrow_schema.fields().len()
-        );
-        let mut columns = Vec::with_capacity(batch.fields().len() + PLAIN_FIXED_POS_COLUMN_NUM);
-        // Store all fields first.
-        for (column, column_metadata) in batch.fields().iter().zip(self.metadata.field_columns()) {
-            ensure!(
-                column.column_id == column_metadata.column_id,
-                InvalidBatchSnafu {
-                    reason: format!(
-                        "Batch has column {} but metadata has column {}",
-                        column.column_id, column_metadata.column_id
-                    ),
-                }
-            );
+    pub(crate) fn convert_batch(&self, batch: &PlainBatch) -> Result<RecordBatch> {
+        debug_assert_eq!(batch.num_rows(), self.arrow_schema.fields().len());
 
-            columns.push(column.data.to_arrow_array());
-        }
-        // Add time index column.
-        columns.push(batch.timestamps().to_arrow_array());
-        // Add internal columns: primary key, sequences, op types.
-        columns.push(new_primary_key_array(batch.primary_key(), batch.num_rows()));
+        let Some(override_sequence) = self.override_sequence else {
+            return Ok(batch.as_record_batch().clone());
+        };
 
-        if let Some(override_sequence) = self.override_sequence {
-            let sequence_array =
-                Arc::new(UInt64Array::from(vec![override_sequence; batch.num_rows()]));
-            columns.push(sequence_array);
-        } else {
-            columns.push(batch.sequences().to_arrow_array());
-        }
-        columns.push(batch.op_types().to_arrow_array());
+        let mut columns = batch.columns().to_vec();
+        let sequence_array = Arc::new(UInt64Array::from(vec![override_sequence; batch.num_rows()]));
+        columns[batch.sequence_column_index()] = sequence_array;
 
         RecordBatch::try_new(self.arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
     }
@@ -563,27 +532,27 @@ impl PlainReadFormat {
 }
 
 /// Compute offsets of different primary keys in the array.
-fn primary_key_offsets(pk_dict_array: &PrimaryKeyArray) -> Result<Vec<usize>> {
-    if pk_dict_array.is_empty() {
-        return Ok(Vec::new());
-    }
+// fn primary_key_offsets(pk_dict_array: &PrimaryKeyArray) -> Result<Vec<usize>> {
+//     if pk_dict_array.is_empty() {
+//         return Ok(Vec::new());
+//     }
 
-    // Init offsets.
-    let mut offsets = vec![0];
-    let keys = pk_dict_array.keys();
-    // We know that primary keys are always not null so we iterate `keys.values()` directly.
-    let pk_indices = keys.values();
-    for (i, key) in pk_indices.iter().take(keys.len() - 1).enumerate() {
-        // Compare each key with next key
-        if *key != pk_indices[i + 1] {
-            // We meet a new key, push the next index as end of the offset.
-            offsets.push(i + 1);
-        }
-    }
-    offsets.push(keys.len());
+//     // Init offsets.
+//     let mut offsets = vec![0];
+//     let keys = pk_dict_array.keys();
+//     // We know that primary keys are always not null so we iterate `keys.values()` directly.
+//     let pk_indices = keys.values();
+//     for (i, key) in pk_indices.iter().take(keys.len() - 1).enumerate() {
+//         // Compare each key with next key
+//         if *key != pk_indices[i + 1] {
+//             // We meet a new key, push the next index as end of the offset.
+//             offsets.push(i + 1);
+//         }
+//     }
+//     offsets.push(keys.len());
 
-    Ok(offsets)
-}
+//     Ok(offsets)
+// }
 
 /// Creates a new array for specific `primary_key`.
 fn new_primary_key_array(primary_key: &[u8], num_rows: usize) -> ArrayRef {
