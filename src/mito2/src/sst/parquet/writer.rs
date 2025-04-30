@@ -29,7 +29,7 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use smallvec::smallvec;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::SEQUENCE_COLUMN_NAME;
 use store_api::storage::SequenceNumber;
@@ -37,12 +37,16 @@ use tokio::io::AsyncWrite;
 use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 
 use crate::access_layer::{FilePathProvider, SstInfoArray};
-use crate::error::{InvalidMetadataSnafu, OpenDalSnafu, Result, WriteParquetSnafu};
+use crate::error::{
+    InvalidMetadataSnafu, InvalidParquetSnafu, OpenDalSnafu, Result, WriteParquetSnafu,
+};
+use crate::read::batch::plain::PlainBatch;
 use crate::read::{Batch, Source};
 use crate::sst::file::FileId;
-use crate::sst::index::{Indexer, IndexerBuilder};
+use crate::sst::index::{IndexOutput, Indexer, IndexerBuilder};
 use crate::sst::parquet::format::WriteFormat;
 use crate::sst::parquet::helper::parse_parquet_metadata;
+use crate::sst::parquet::plain_format::{parquet_time_range, PlainWriteFormat};
 use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
@@ -153,6 +157,23 @@ where
     /// Returns the [SstInfo] if the SST is written.
     pub async fn write_all(
         &mut self,
+        source: Source,
+        override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        if source.is_plain() {
+            self.write_all_plain(source, override_sequence, opts).await
+        } else {
+            self.write_all_primary_key(source, override_sequence, opts)
+                .await
+        }
+    }
+
+    /// Iterates source and writes all rows to Parquet file.
+    ///
+    /// Returns the [SstInfo] if the SST is written.
+    pub async fn write_all_primary_key(
+        &mut self,
         mut source: Source,
         override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
         opts: &WriteOptions,
@@ -214,6 +235,69 @@ where
         }])
     }
 
+    /// Iterates source and writes all rows to Parquet file.
+    ///
+    /// Returns the [SstInfo] if the SST is written.
+    pub async fn write_all_plain(
+        &mut self,
+        mut source: Source,
+        override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let write_format =
+            PlainWriteFormat::new(self.metadata.clone()).with_override_sequence(override_sequence);
+        let mut stats = SourceStats::default();
+
+        while let Some(res) = self
+            .write_next_plain_batch(&mut source, &write_format, opts)
+            .await
+            .transpose()
+        {
+            match res {
+                Ok(batch) => {
+                    stats.update_plain(&batch);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        if stats.num_rows == 0 {
+            return Ok(smallvec![]);
+        }
+
+        let Some(mut arrow_writer) = self.writer.take() else {
+            // No batch actually written.
+            return Ok(smallvec![]);
+        };
+
+        arrow_writer.flush().await.context(WriteParquetSnafu)?;
+
+        let file_meta = arrow_writer.close().await.context(WriteParquetSnafu)?;
+        let file_size = self.bytes_written.load(Ordering::Relaxed) as u64;
+
+        // convert FileMetaData to ParquetMetaData
+        let parquet_metadata = parse_parquet_metadata(file_meta)?;
+        let file_id = self.current_file;
+        let time_range = parquet_time_range(file_id, &parquet_metadata, &self.metadata)
+            .with_context(|| InvalidParquetSnafu {
+                file: file_id.to_string(),
+                reason: "No time range statistics available",
+            })?;
+
+        // object_store.write will make sure all bytes are written or an error is raised.
+        Ok(smallvec![SstInfo {
+            file_id,
+            time_range,
+            file_size,
+            num_rows: stats.num_rows,
+            num_row_groups: parquet_metadata.num_row_groups() as u64,
+            file_metadata: Some(Arc::new(parquet_metadata)),
+            index_metadata: IndexOutput::default(),
+        }])
+    }
+
     /// Customizes per-column config according to schema and maybe column cardinality.
     fn customize_column_config(
         builder: WriterPropertiesBuilder,
@@ -240,6 +324,25 @@ where
         opts: &WriteOptions,
     ) -> Result<Option<Batch>> {
         let Some(batch) = source.next_batch().await? else {
+            return Ok(None);
+        };
+
+        let arrow_batch = write_format.convert_batch(&batch)?;
+        self.maybe_init_writer(write_format.arrow_schema(), opts)
+            .await?
+            .write(&arrow_batch)
+            .await
+            .context(WriteParquetSnafu)?;
+        Ok(Some(batch))
+    }
+
+    async fn write_next_plain_batch(
+        &mut self,
+        source: &mut Source,
+        write_format: &PlainWriteFormat,
+        opts: &WriteOptions,
+    ) -> Result<Option<PlainBatch>> {
+        let Some(batch) = source.next_plain_batch().await? else {
             return Ok(None);
         };
 
@@ -314,6 +417,15 @@ impl SourceStats {
         } else {
             self.time_range = Some((min_in_batch, max_in_batch));
         }
+    }
+
+    /// Only update the number of rows fetched.
+    fn update_plain(&mut self, batch: &PlainBatch) {
+        if batch.is_empty() {
+            return;
+        }
+
+        self.num_rows += batch.num_rows();
     }
 }
 

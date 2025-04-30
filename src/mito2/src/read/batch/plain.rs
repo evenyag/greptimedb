@@ -14,9 +14,12 @@
 
 //! Plain Batch.
 
+use common_time::Timestamp;
 use datatypes::arrow::array::{ArrayRef, BooleanArray};
+use datatypes::arrow::compute;
+use datatypes::arrow::compute::filter_record_batch;
 use datatypes::arrow::record_batch::RecordBatch;
-use datatypes::compute::filter_record_batch;
+use datatypes::prelude::ConcreteDataType;
 use snafu::ResultExt;
 
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
@@ -88,7 +91,7 @@ impl PlainBatch {
     }
 
     /// Returns the column index of the sequence column.
-    pub fn sequence_column_index(&self) -> usize {
+    pub(crate) fn sequence_column_index(&self) -> usize {
         self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM
     }
 }
