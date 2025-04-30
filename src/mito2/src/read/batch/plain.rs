@@ -19,7 +19,8 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::compute::filter_record_batch;
 use snafu::ResultExt;
 
-use crate::error::{ComputeArrowSnafu, Result};
+use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
+use crate::sst::parquet::plain_format::PLAIN_FIXED_POS_COLUMN_NUM;
 
 /// [PlainBatch] represents a batch of rows.
 /// It is a wrapper around [RecordBatch] that provides additional functionality for multi-series data.
@@ -32,9 +33,21 @@ pub struct PlainBatch {
 }
 
 impl PlainBatch {
-    /// Creates a new [MultiSeries] from a [RecordBatch].
+    /// Creates a new [PlainBatch] from a [RecordBatch].
     pub fn new(record_batch: RecordBatch) -> Self {
         Self { record_batch }
+    }
+
+    /// Returns a new [PlainBatch] with the given columns.
+    pub fn with_new_columns(&self, columns: Vec<ArrayRef>) -> Result<Self> {
+        let record_batch = RecordBatch::try_new(self.record_batch.schema(), columns)
+            .context(NewRecordBatchSnafu)?;
+        Ok(Self { record_batch })
+    }
+
+    /// Returns the number of columns in the batch.
+    pub fn num_columns(&self) -> usize {
+        self.record_batch.num_columns()
     }
 
     /// Returns the number of rows in the batch.
@@ -47,9 +60,24 @@ impl PlainBatch {
         self.num_rows() == 0
     }
 
+    /// Returns all columns.
+    pub fn columns(&self) -> &[ArrayRef] {
+        &self.record_batch.columns()
+    }
+
     /// Returns the array of column at index `idx`.
     pub fn column(&self, idx: usize) -> &ArrayRef {
         self.record_batch.column(idx)
+    }
+
+    /// Returns the slice of internal columns.
+    pub fn internal_columns(&self) -> &[ArrayRef] {
+        &self.record_batch.columns()[self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM..]
+    }
+
+    /// Returns the inner record batch.
+    pub(crate) fn as_record_batch(&self) -> &RecordBatch {
+        &self.record_batch
     }
 
     /// Filters this batch by the boolean array.
@@ -57,5 +85,10 @@ impl PlainBatch {
         let record_batch =
             filter_record_batch(&self.record_batch, predicate).context(ComputeArrowSnafu)?;
         Ok(Self::new(record_batch))
+    }
+
+    /// Returns the column index of the sequence column.
+    pub fn sequence_column_index(&self) -> usize {
+        self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM
     }
 }
