@@ -46,6 +46,7 @@ use crate::error::{
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::row_converter::{build_primary_key_codec_with_fields, SortField};
 use crate::sst::file::{FileMeta, FileTimeRange};
+use crate::sst::parquet::format::StatValues;
 use crate::sst::{to_plain_sst_arrow_schema, to_sst_arrow_schema};
 
 /// Arrow array type for the primary key dictionary.
@@ -129,7 +130,7 @@ impl WriteFormat {
 }
 
 /// Helper for reading the SST format.
-pub struct ReadFormat {
+pub struct PlainReadFormat {
     /// The metadata stored in the SST.
     metadata: RegionMetadataRef,
     /// SST file schema.
@@ -147,12 +148,12 @@ pub struct ReadFormat {
     column_id_to_projected_index: HashMap<ColumnId, usize>,
 }
 
-impl ReadFormat {
+impl PlainReadFormat {
     /// Creates a helper with existing `metadata` and `column_ids` to read.
     pub fn new(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
-    ) -> ReadFormat {
+    ) -> PlainReadFormat {
         let arrow_schema = to_plain_sst_arrow_schema(&metadata);
 
         // Maps column id of a projected column to its index in SST.
@@ -188,7 +189,7 @@ impl ReadFormat {
             .map(|(index, column_id)| (column_id, index))
             .collect();
 
-        ReadFormat {
+        PlainReadFormat {
             metadata,
             arrow_schema,
             projection_indices,
@@ -545,33 +546,10 @@ impl ReadFormat {
     // }
 }
 
-/// Values of column statistics of the SST.
-///
-/// It also distinguishes the case that a column is not found and
-/// the column exists but has no statistics.
-pub enum StatValues {
-    /// Values of each row group.
-    Values(ArrayRef),
-    /// No such column.
-    NoColumn,
-    /// Column exists but has no statistics.
-    NoStats,
-}
-
-impl StatValues {
-    /// Creates a new `StatValues` instance from optional statistics.
-    pub fn from_stats_opt(stats: Option<ArrayRef>) -> Self {
-        match stats {
-            Some(stats) => StatValues::Values(stats),
-            None => StatValues::NoStats,
-        }
-    }
-}
-
 #[cfg(test)]
-impl ReadFormat {
+impl PlainReadFormat {
     /// Creates a helper with existing `metadata` and all columns.
-    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> ReadFormat {
+    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> PlainReadFormat {
         Self::new(
             Arc::clone(&metadata),
             metadata.column_metadatas.iter().map(|c| c.column_id),

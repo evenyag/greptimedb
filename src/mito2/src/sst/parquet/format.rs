@@ -50,6 +50,7 @@ use crate::error::{
 };
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::sst::file::{FileMeta, FileTimeRange};
+use crate::sst::parquet::plain_format::PlainReadFormat;
 use crate::sst::to_sst_arrow_schema;
 
 /// Arrow array type for the primary key dictionary.
@@ -132,8 +133,107 @@ impl WriteFormat {
     }
 }
 
+pub enum ReadFormat {
+    PrimaryKey(PrimaryKeyReadFormat),
+    Plain(PlainReadFormat),
+}
+
+impl ReadFormat {
+    // TODO(yingwen): Remove this.
+    pub(crate) fn new(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+    ) -> Self {
+        Self::new_primary_key(metadata, column_ids)
+    }
+
+    pub fn new_primary_key(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+    ) -> Self {
+        ReadFormat::PrimaryKey(PrimaryKeyReadFormat::new(metadata, column_ids))
+    }
+
+    pub fn new_plain(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+    ) -> Self {
+        ReadFormat::Plain(PlainReadFormat::new(metadata, column_ids))
+    }
+
+    pub(crate) fn as_primary_key(&self) -> &PrimaryKeyReadFormat {
+        match self {
+            ReadFormat::PrimaryKey(format) => format,
+            _ => panic!("not a primary key format"),
+        }
+    }
+
+    /// Gets the arrow schema of the SST file.
+    ///
+    /// This schema is computed from the region metadata but should be the same
+    /// as the arrow schema decoded from the file metadata.
+    pub(crate) fn arrow_schema(&self) -> &SchemaRef {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.arrow_schema(),
+            ReadFormat::Plain(format) => format.arrow_schema(),
+        }
+    }
+
+    /// Gets the metadata of the SST.
+    pub(crate) fn metadata(&self) -> &RegionMetadataRef {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.metadata(),
+            ReadFormat::Plain(format) => format.metadata(),
+        }
+    }
+
+    /// Gets sorted projection indices to read.
+    pub(crate) fn projection_indices(&self) -> &[usize] {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.projection_indices(),
+            ReadFormat::Plain(format) => format.projection_indices(),
+        }
+    }
+
+    /// Returns min values of specific column in row groups.
+    pub fn min_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.min_values(row_groups, column_id),
+            ReadFormat::Plain(format) => format.min_values(row_groups, column_id),
+        }
+    }
+
+    /// Returns max values of specific column in row groups.
+    pub fn max_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.max_values(row_groups, column_id),
+            ReadFormat::Plain(format) => format.max_values(row_groups, column_id),
+        }
+    }
+
+    /// Returns null counts of specific column in row groups.
+    pub fn null_counts(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.null_counts(row_groups, column_id),
+            ReadFormat::Plain(format) => format.null_counts(row_groups, column_id),
+        }
+    }
+}
+
 /// Helper for reading the SST format.
-pub struct ReadFormat {
+pub struct PrimaryKeyReadFormat {
     /// The metadata stored in the SST.
     metadata: RegionMetadataRef,
     /// SST file schema.
@@ -148,12 +248,12 @@ pub struct ReadFormat {
     field_id_to_projected_index: HashMap<ColumnId, usize>,
 }
 
-impl ReadFormat {
+impl PrimaryKeyReadFormat {
     /// Creates a helper with existing `metadata` and `column_ids` to read.
     pub fn new(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
-    ) -> ReadFormat {
+    ) -> PrimaryKeyReadFormat {
         let field_id_to_index: HashMap<_, _> = metadata
             .field_columns()
             .enumerate()
@@ -191,7 +291,7 @@ impl ReadFormat {
             .map(|(index, column_id)| (column_id, index))
             .collect();
 
-        ReadFormat {
+        PrimaryKeyReadFormat {
             metadata,
             arrow_schema,
             field_id_to_index,
@@ -606,9 +706,9 @@ impl StatValues {
 }
 
 #[cfg(test)]
-impl ReadFormat {
+impl PrimaryKeyReadFormat {
     /// Creates a helper with existing `metadata` and all columns.
-    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> ReadFormat {
+    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> PrimaryKeyReadFormat {
         Self::new(
             Arc::clone(&metadata),
             metadata.column_metadatas.iter().map(|c| c.column_id),
@@ -924,7 +1024,7 @@ mod tests {
             .iter()
             .map(|col| col.column_id)
             .collect();
-        let read_format = ReadFormat::new(metadata, column_ids.iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata, column_ids.iter().copied());
         assert_eq!(arrow_schema, *read_format.arrow_schema());
 
         let record_batch = RecordBatch::new_empty(arrow_schema);
@@ -943,7 +1043,7 @@ mod tests {
             .iter()
             .map(|col| col.column_id)
             .collect();
-        let read_format = ReadFormat::new(metadata, column_ids.iter().copied());
+        let read_format = PrimaryKeyReadFormat::new(metadata, column_ids.iter().copied());
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![1, 1, 10, 10])), // field1
