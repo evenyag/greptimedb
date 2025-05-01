@@ -25,16 +25,18 @@ use common_recordbatch::RecordBatch;
 use datatypes::prelude::{ConcreteDataType, DataType};
 use datatypes::schema::{Schema, SchemaRef};
 use datatypes::value::Value;
-use datatypes::vectors::{Helper, VectorRef};
+use datatypes::vectors::{Helper, Vector, VectorRef};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::cache::CacheStrategy;
-use crate::error::{InvalidRequestSnafu, Result};
+use crate::error::{ConvertRecordBatchSnafu, InvalidRequestSnafu, NewRecordBatchSnafu, Result};
 use crate::read::batch::multi_series::MultiSeries;
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::row_converter::{build_primary_key_codec, CompositeValues, PrimaryKeyCodec};
+use crate::sst::to_plain_sst_arrow_schema;
 
 /// Only cache vector when its length `<=` this value.
 const MAX_VECTOR_LENGTH_TO_CACHE: usize = 16384;
@@ -561,6 +563,31 @@ pub(crate) fn plain_projected_columns(
             }
         })
         .collect()
+}
+
+/// Converts a [Batch] with all columns to a [PlainBatch].
+pub(crate) fn batch_to_plain_batch(
+    batch: &Batch,
+    mapper: &PrimaryKeyProjectionMapper,
+    cache_strategy: &CacheStrategy,
+) -> Result<PlainBatch> {
+    let record_batch = mapper
+        .convert(batch, cache_strategy)
+        .context(ConvertRecordBatchSnafu)?;
+    let columns = record_batch
+        .df_record_batch()
+        .columns()
+        .iter()
+        .cloned()
+        .chain([
+            batch.sequences().to_arrow_array(),
+            batch.op_types().to_arrow_array(),
+        ])
+        .collect::<Vec<_>>();
+    let schema = to_plain_sst_arrow_schema(mapper.metadata());
+    let new_rb = datatypes::arrow::record_batch::RecordBatch::try_new(schema, columns)
+        .context(NewRecordBatchSnafu)?;
+    Ok(PlainBatch::new(new_rb))
 }
 
 /// Index of a vector in a [Batch].
