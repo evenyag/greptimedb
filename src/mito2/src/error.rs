@@ -681,6 +681,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to convert record batch"))]
+    ConvertRecordBatch {
+        source: common_recordbatch::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("BiErrors, first: {first}, second: {second}"))]
     BiErrors {
         first: Box<Error>,
@@ -1182,6 +1189,8 @@ impl ErrorExt for Error {
 
             Encode { source, .. } | Decode { source, .. } => source.status_code(),
             CreateVector { .. } => StatusCode::Internal,
+
+            ConvertRecordBatch { source, .. } => source.status_code(),
         }
     }
 
