@@ -717,6 +717,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to convert record batch"))]
+    ConvertRecordBatch {
+        source: common_recordbatch::error::Error,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("BiErrors, first: {first}, second: {second}"))]
     BiErrors {
         first: Box<Error>,
@@ -1192,6 +1199,8 @@ impl ErrorExt for Error {
             IncompatibleWalProviderChange { .. } => StatusCode::InvalidArguments,
             ConvertDataType { .. } => StatusCode::Internal,
             CreateVector { .. } => StatusCode::Internal,
+
+            ConvertRecordBatch { source, .. } => source.status_code(),
         }
     }
 
