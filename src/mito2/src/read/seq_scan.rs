@@ -37,10 +37,12 @@ use crate::error::{PartitionOutOfRangeSnafu, Result};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
+use crate::read::merge_plain::{merge_plain, PlainSource};
 use crate::read::range::RangeBuilderList;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
-    scan_file_ranges, scan_mem_ranges, PartitionMetrics, PartitionMetricsList,
+    scan_file_ranges, scan_file_ranges_plain, scan_mem_ranges, PartitionMetrics,
+    PartitionMetricsList,
 };
 use crate::read::{BatchReader, BoxedBatchReader, ScannerMetrics, Source};
 use crate::region::options::MergeMode;
@@ -93,11 +95,11 @@ impl SeqScan {
         Ok(Box::pin(aggr_stream))
     }
 
-    /// Builds a [BoxedBatchReader] from sequential scan for compaction.
+    /// Builds a [Source] from sequential scan for compaction.
     ///
     /// # Panics
     /// Panics if the compaction flag is not set.
-    pub async fn build_reader_for_compaction(&self) -> Result<BoxedBatchReader> {
+    pub async fn build_reader_for_compaction(&self) -> Result<Source> {
         assert!(self.compaction);
 
         let metrics_set = ExecutionPlanMetricsSet::new();
@@ -105,13 +107,22 @@ impl SeqScan {
         debug_assert_eq!(1, self.properties.partitions.len());
         let partition_ranges = &self.properties.partitions[0];
 
+        if self.stream_ctx.input.plain_format {
+            return Self::merge_all_plain_ranges_for_compaction(
+                &self.stream_ctx,
+                partition_ranges,
+                &part_metrics,
+            )
+            .await;
+        }
+
         let reader = Self::merge_all_ranges_for_compaction(
             &self.stream_ctx,
             partition_ranges,
             &part_metrics,
         )
         .await?;
-        Ok(Box::new(reader))
+        Ok(Source::Reader(Box::new(reader)))
     }
 
     /// Builds a merge reader that reads all ranges.
@@ -434,6 +445,51 @@ impl SeqScan {
 
         metrics
     }
+
+    /// Builds a reader to read sources.
+    #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
+    async fn build_plain_reader_from_sources(
+        stream_ctx: &StreamContext,
+        sources: Vec<Source>,
+    ) -> Result<Source> {
+        let metadata = stream_ctx.input.mapper.metadata();
+        let sources = sources.into_iter().map(PlainSource::from_source).collect();
+        let stream = merge_plain(metadata, sources)?;
+
+        Ok(Source::PlainStream(stream))
+    }
+
+    /// Builds a merge reader that reads all ranges.
+    /// Callers MUST not split ranges before calling this method.
+    async fn merge_all_plain_ranges_for_compaction(
+        stream_ctx: &Arc<StreamContext>,
+        partition_ranges: &[PartitionRange],
+        part_metrics: &PartitionMetrics,
+    ) -> Result<Source> {
+        let mut sources = Vec::new();
+        let range_builder_list = Arc::new(RangeBuilderList::new(
+            stream_ctx.input.num_memtables(),
+            stream_ctx.input.num_files(),
+        ));
+        for part_range in partition_ranges {
+            build_sources_plain(
+                stream_ctx,
+                part_range,
+                true,
+                part_metrics,
+                range_builder_list.clone(),
+                &mut sources,
+            );
+        }
+
+        common_telemetry::debug!(
+            "Build reader to read all parts, region_id: {}, num_part_ranges: {}, num_sources: {}",
+            stream_ctx.input.mapper.metadata().region_id,
+            partition_ranges.len(),
+            sources.len()
+        );
+        Self::build_plain_reader_from_sources(stream_ctx, sources).await
+    }
 }
 
 impl RegionScanner for SeqScan {
@@ -548,6 +604,55 @@ fn build_sources(
             Box::pin(stream) as _
         };
         sources.push(Source::Stream(stream));
+    }
+}
+
+/// Builds sources for the partition range and push them to the `sources` vector.
+fn build_sources_plain(
+    stream_ctx: &Arc<StreamContext>,
+    part_range: &PartitionRange,
+    compaction: bool,
+    part_metrics: &PartitionMetrics,
+    range_builder_list: Arc<RangeBuilderList>,
+    sources: &mut Vec<Source>,
+) {
+    // Gets range meta.
+    let range_meta = &stream_ctx.ranges[part_range.identifier];
+    #[cfg(debug_assertions)]
+    if compaction || stream_ctx.input.distribution == Some(TimeSeriesDistribution::PerSeries) {
+        // Compaction or per series distribution expects input sources are not been split.
+        debug_assert_eq!(range_meta.indices.len(), range_meta.row_group_indices.len());
+        for (i, row_group_idx) in range_meta.row_group_indices.iter().enumerate() {
+            // It should scan all row groups.
+            debug_assert_eq!(
+                -1, row_group_idx.row_group_index,
+                "Expect {} range scan all row groups, given: {}",
+                i, row_group_idx.row_group_index,
+            );
+        }
+    }
+
+    sources.reserve(range_meta.row_group_indices.len());
+    for index in &range_meta.row_group_indices {
+        let stream = if stream_ctx.is_mem_range_index(*index) {
+            common_telemetry::error!("Memory range plain scan is not supported yet");
+            panic!("Memory range plain scan is not supported yet");
+        } else {
+            let read_type = if compaction {
+                "compaction"
+            } else {
+                "seq_scan_files"
+            };
+            let stream = scan_file_ranges_plain(
+                stream_ctx.clone(),
+                part_metrics.clone(),
+                *index,
+                read_type,
+                range_builder_list.clone(),
+            );
+            Box::pin(stream) as _
+        };
+        sources.push(Source::PlainStream(stream));
     }
 }
 

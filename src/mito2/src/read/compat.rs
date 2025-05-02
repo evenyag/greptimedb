@@ -108,7 +108,15 @@ impl CompatBatch {
     pub(crate) fn as_primary_key(&self) -> &CompatPrimaryKeyBatch {
         match self {
             CompatBatch::PrimaryKey(batch) => batch,
-            _ => panic!("CompatBatch::as_primary_key() called on a non-primary key batch"),
+            _ => panic!("CompatBatch::as_primary_key() called on a non-primary key adapter"),
+        }
+    }
+
+    /// Returns the plain adapter.
+    pub(crate) fn as_plain(&self) -> &CompatPlainBatch {
+        match self {
+            CompatBatch::Plain(batch) => batch,
+            _ => panic!("CompatBatch::as_plain() called on a non-primary key adapter"),
         }
     }
 }
