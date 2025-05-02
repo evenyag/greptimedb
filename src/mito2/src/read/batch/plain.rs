@@ -14,13 +14,23 @@
 
 //! Plain Batch.
 
-use datatypes::arrow::array::{ArrayRef, BooleanArray};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use api::v1::OpType;
+use datatypes::arrow::array::{ArrayRef, BooleanArray, UInt64Array, UInt8Array};
 use datatypes::arrow::compute::filter_record_batch;
 use datatypes::arrow::record_batch::RecordBatch;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
+use store_api::metadata::RegionMetadata;
+use store_api::storage::SequenceNumber;
 
-use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
+use crate::error::{
+    ComputeArrowSnafu, CreateDefaultSnafu, InvalidRequestSnafu, NewRecordBatchSnafu, Result,
+    UnexpectedImpureDefaultSnafu,
+};
 use crate::sst::parquet::plain_format::PLAIN_FIXED_POS_COLUMN_NUM;
+use crate::sst::to_plain_sst_arrow_schema;
 
 // TODO(yingwen): Should we require the internal columns to be present?
 // TODO(yingwen): Maybe use datafusion SendableRecordBatchStream directly.
@@ -98,4 +108,73 @@ impl PlainBatch {
     pub(crate) fn sequence_column_index(&self) -> usize {
         self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM
     }
+}
+
+/// Fill default values for the batch.
+/// Also adds internal columns.
+/// Now it doesn't consider the op type.
+pub fn fill_default_values(
+    metadata: &RegionMetadata,
+    record_batch: &RecordBatch,
+    sequence: SequenceNumber,
+) -> Result<RecordBatch> {
+    // Column name to index in the `record_batch`.
+    let name_to_index: HashMap<_, _> = record_batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| (field.name().clone(), i))
+        .collect();
+    let mut new_columns =
+        Vec::with_capacity(record_batch.num_columns() + PLAIN_FIXED_POS_COLUMN_NUM);
+    // Fill default values.
+    for column in &metadata.column_metadatas {
+        let array = match name_to_index.get(&column.column_schema.name) {
+            Some(index) => record_batch.column(*index).clone(),
+            None => {
+                // For put requests, we use the default value from column schema.
+                if column.column_schema.is_default_impure() {
+                    return UnexpectedImpureDefaultSnafu {
+                        region_id: metadata.region_id,
+                        column: &column.column_schema.name,
+                        default_value: format!("{:?}", column.column_schema.default_constraint()),
+                    }
+                    .fail();
+                }
+                let vector = column
+                    .column_schema
+                    .create_default_vector(record_batch.num_rows())
+                    .context(CreateDefaultSnafu {
+                        region_id: metadata.region_id,
+                        column: &column.column_schema.name,
+                    })?
+                    // This column doesn't have default value.
+                    .with_context(|| InvalidRequestSnafu {
+                        region_id: metadata.region_id,
+                        reason: format!(
+                            "column {} does not have default value",
+                            column.column_schema.name
+                        ),
+                    })?;
+                vector.to_arrow_array()
+            }
+        };
+
+        new_columns.push(array);
+    }
+    // Adds internal columns.
+    // Adds the sequence number.
+    let sequence_array = Arc::new(UInt64Array::from(vec![sequence; record_batch.num_rows()]));
+    // Adds the op type.
+    let op_type_array = Arc::new(UInt8Array::from(vec![
+        OpType::Put as u8;
+        record_batch.num_rows()
+    ]));
+    new_columns.push(sequence_array);
+    new_columns.push(op_type_array);
+
+    // TODO(yingwen): How to avoid creating a new schema instance?
+    let schema = to_plain_sst_arrow_schema(metadata);
+    RecordBatch::try_new(schema, new_columns).context(NewRecordBatchSnafu)
 }
