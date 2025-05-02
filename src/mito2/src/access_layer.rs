@@ -220,6 +220,9 @@ pub struct SstWriteRequest {
     pub inverted_index_config: InvertedIndexConfig,
     pub fulltext_index_config: FulltextIndexConfig,
     pub bloom_filter_index_config: BloomFilterConfig,
+
+    /// Plain format
+    pub plain_format: bool,
 }
 
 /// Cleaner to remove temp files on the atomic write dir.

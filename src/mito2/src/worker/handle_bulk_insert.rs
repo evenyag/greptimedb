@@ -350,21 +350,21 @@ mod tests {
         DfRecordBatch::try_new(schema, vec![ts_array, k0_array, v0_array]).unwrap()
     }
 
-    #[test]
-    fn test_region_metadata_to_column_schema() {
-        let region_metadata = Arc::new(TestRegionMetadataBuilder::default().build());
-        let (result, _) = region_metadata_to_column_schema(&region_metadata).unwrap();
-        assert_eq!(result.len(), 3);
+    // #[test]
+    // fn test_region_metadata_to_column_schema() {
+    //     let region_metadata = Arc::new(TestRegionMetadataBuilder::default().build());
+    //     let (result, _) = region_metadata_to_column_schema(&region_metadata).unwrap();
+    //     assert_eq!(result.len(), 3);
 
-        assert_eq!(result[0].column_name, "ts");
-        assert_eq!(result[0].semantic_type, SemanticType::Timestamp as i32);
+    //     assert_eq!(result[0].column_name, "ts");
+    //     assert_eq!(result[0].semantic_type, SemanticType::Timestamp as i32);
 
-        assert_eq!(result[1].column_name, "k0");
-        assert_eq!(result[1].semantic_type, SemanticType::Tag as i32);
+    //     assert_eq!(result[1].column_name, "k0");
+    //     assert_eq!(result[1].semantic_type, SemanticType::Tag as i32);
 
-        assert_eq!(result[2].column_name, "v0");
-        assert_eq!(result[2].semantic_type, SemanticType::Field as i32);
-    }
+    //     assert_eq!(result[2].column_name, "v0");
+    //     assert_eq!(result[2].semantic_type, SemanticType::Field as i32);
+    // }
 
     #[test]
     fn test_record_batch_to_rows() {

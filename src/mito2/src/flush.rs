@@ -27,7 +27,7 @@ use strum::IntoStaticStr;
 use tokio::sync::{mpsc, watch};
 
 use crate::access_layer::{AccessLayerRef, OperationType, SstWriteRequest};
-use crate::cache::CacheManagerRef;
+use crate::cache::{CacheManagerRef, CacheStrategy};
 use crate::config::MitoConfig;
 use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
@@ -361,7 +361,15 @@ impl RegionFlushTask {
 
             let max_sequence = mem.stats().max_sequence();
             let iter = mem.iter(None, None, None)?;
-            let source = Source::Iter(iter);
+
+            let source = if self.engine_config.enable_plain_format {
+                Source::Iter(iter).to_plain_source(
+                    &version.metadata,
+                    &CacheStrategy::EnableAll(self.cache_manager.clone()),
+                )?
+            } else {
+                Source::Iter(iter)
+            };
 
             // Flush to level 0.
             let write_request = SstWriteRequest {
@@ -375,6 +383,7 @@ impl RegionFlushTask {
                 inverted_index_config: self.engine_config.inverted_index.clone(),
                 fulltext_index_config: self.engine_config.fulltext_index.clone(),
                 bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                plain_format: self.engine_config.enable_plain_format,
             };
 
             let ssts_written = self
@@ -514,6 +523,7 @@ impl RegionFlushTask {
                 inverted_index_config: self.engine_config.inverted_index.clone(),
                 fulltext_index_config: self.engine_config.fulltext_index.clone(),
                 bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                plain_format: self.engine_config.enable_plain_format,
             };
 
             let ssts_written = self

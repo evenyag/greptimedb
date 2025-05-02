@@ -30,7 +30,7 @@ use datatypes::schema::SchemaRef;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{PartitionRange, PrepareRequest, RegionScanner, ScannerProperties};
-use store_api::storage::TimeSeriesRowSelector;
+use store_api::storage::{TimeSeriesDistribution, TimeSeriesRowSelector};
 use tokio::sync::Semaphore;
 
 use crate::error::{PartitionOutOfRangeSnafu, Result};
