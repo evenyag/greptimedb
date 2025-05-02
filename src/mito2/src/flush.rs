@@ -363,6 +363,8 @@ impl RegionFlushTask {
             let iter = mem.iter(None, None, None)?;
 
             let source = if self.engine_config.enable_plain_format {
+                common_telemetry::info!("Converting source into plain format");
+
                 Source::Iter(iter).to_plain_source(
                     &version.metadata,
                     &CacheStrategy::EnableAll(self.cache_manager.clone()),

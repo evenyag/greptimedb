@@ -624,6 +624,7 @@ struct CompactionSstReaderBuilder<'a> {
     filter_deleted: bool,
     time_range: Option<TimestampRange>,
     merge_mode: MergeMode,
+    plain_format: bool,
 }
 
 impl CompactionSstReaderBuilder<'_> {
@@ -637,7 +638,8 @@ impl CompactionSstReaderBuilder<'_> {
             .with_filter_deleted(self.filter_deleted)
             // We ignore file not found error during compaction.
             .with_ignore_file_not_found(true)
-            .with_merge_mode(self.merge_mode);
+            .with_merge_mode(self.merge_mode)
+            .with_plain_format(self.plain_format);
 
         // This serves as a workaround of https://github.com/GreptimeTeam/greptimedb/issues/3944
         // by converting time ranges into predicate.
