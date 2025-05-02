@@ -337,6 +337,7 @@ impl Compactor for DefaultCompactor {
                     filter_deleted: output.filter_deleted,
                     time_range: output.output_time_range,
                     merge_mode,
+                    plain_format,
                 }
                 .build_sst_reader()
                 .await?;

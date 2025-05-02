@@ -291,6 +291,8 @@ where
         override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
         opts: &WriteOptions,
     ) -> Result<SstInfoArray> {
+        common_telemetry::info!("Write parquet in plain format");
+
         let write_format =
             PlainWriteFormat::new(self.metadata.clone()).with_override_sequence(override_sequence);
         let mut stats = SourceStats::default();
