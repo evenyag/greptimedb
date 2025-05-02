@@ -44,6 +44,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         pending_write_requests: &mut Vec<SenderWriteRequest>,
         sender: OptionOutputTx,
     ) {
+        if self.config.enable_plain_format {
+            self.handle_bulk_inserts_plain(request, sender).await;
+            return;
+        }
+
         let (column_schemas, name_to_index) =
             match region_metadata_to_column_schema(&region_metadata) {
                 Ok(schema) => schema,

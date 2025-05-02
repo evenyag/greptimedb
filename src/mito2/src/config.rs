@@ -109,6 +109,8 @@ pub struct MitoConfig {
     pub parallel_scan_channel_size: usize,
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
+    /// Whether to use plain format.
+    pub enable_plain_format: bool,
 
     /// Index configs.
     pub index: IndexConfig,
@@ -153,6 +155,7 @@ impl Default for MitoConfig {
             sst_write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
             allow_stale_entries: false,
+            enable_plain_format: false,
             index: IndexConfig::default(),
             inverted_index: InvertedIndexConfig::default(),
             fulltext_index: FulltextIndexConfig::default(),
