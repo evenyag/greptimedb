@@ -14,6 +14,8 @@
 
 //! Handles bulk insert requests.
 
+use std::sync::Arc;
+
 use api::helper::{value_to_grpc_value, ColumnDataTypeWrapper};
 use api::v1::{ColumnSchema, OpType, Row, Rows};
 use common_recordbatch::DfRecordBatch;
@@ -24,7 +26,10 @@ use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_request::{BulkInsertPayload, RegionBulkInsertsRequest};
 
-use crate::error;
+use crate::config::MitoConfig;
+use crate::error::{self, RegionNotFoundSnafu, RegionStateSnafu};
+use crate::flush::{FlushReason, RegionFlushTask};
+use crate::region::{MitoRegionRef, RegionLeaderState, RegionRoleState};
 use crate::request::{OptionOutputTx, SenderWriteRequest, WriteRequest};
 use crate::worker::RegionWorkerLoop;
 
@@ -97,6 +102,68 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             };
             sender.send(result1);
         });
+    }
+
+    pub(crate) async fn handle_bulk_inserts_plain(
+        &mut self,
+        request: RegionBulkInsertsRequest,
+        mut sender: OptionOutputTx,
+    ) {
+        let region_id = request.region_id;
+        let Some(region) = self.regions.get_region_or(region_id, &mut sender) else {
+            // No such region.
+            sender.send(RegionNotFoundSnafu { region_id }.fail());
+            return;
+        };
+        match region.state() {
+            RegionRoleState::Leader(RegionLeaderState::Writable)
+            | RegionRoleState::Leader(RegionLeaderState::Altering) => (),
+            state => {
+                // The region is not writable.
+                sender.send(
+                    RegionStateSnafu {
+                        region_id,
+                        state,
+                        expect: RegionRoleState::Leader(RegionLeaderState::Writable),
+                    }
+                    .fail(),
+                );
+                return;
+            }
+        }
+
+        let mut task =
+            self.new_bulk_insert_flush_task(&region, self.config.clone(), request.payloads);
+        task.push_sender(sender);
+        if let Err(e) =
+            self.flush_scheduler
+                .schedule_flush(region.region_id, &region.version_control, task)
+        {
+            common_telemetry::error!(e; "Failed to schedule bulk insert flush task for region {}", region.region_id);
+        }
+    }
+
+    /// Creates a flush task to bulk insert to the `region`.
+    pub(crate) fn new_bulk_insert_flush_task(
+        &mut self,
+        region: &MitoRegionRef,
+        engine_config: Arc<MitoConfig>,
+        payloads: Vec<BulkInsertPayload>,
+    ) -> RegionFlushTask {
+        RegionFlushTask {
+            region_id: region.region_id,
+            reason: FlushReason::BulkInsert,
+            senders: Vec::new(),
+            request_sender: self.sender.clone(),
+            access_layer: region.access_layer.clone(),
+            listener: self.listener.clone(),
+            engine_config,
+            row_group_size: None,
+            cache_manager: self.cache_manager.clone(),
+            manifest_ctx: region.manifest_ctx.clone(),
+            index_options: region.version().options.index_options.clone(),
+            bulk_insert_payloads: payloads,
+        }
     }
 }
 
