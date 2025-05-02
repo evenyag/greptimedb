@@ -211,6 +211,9 @@ pub struct SstWriteRequest {
     pub inverted_index_config: InvertedIndexConfig,
     pub fulltext_index_config: FulltextIndexConfig,
     pub bloom_filter_index_config: BloomFilterConfig,
+
+    /// Plain format
+    pub plain_format: bool,
 }
 
 pub(crate) async fn new_fs_cache_store(root: &str) -> Result<ObjectStore> {

@@ -305,6 +305,7 @@ impl Compactor for DefaultCompactor {
             let fulltext_index_config = compaction_region.engine_config.fulltext_index.clone();
             let bloom_filter_index_config =
                 compaction_region.engine_config.bloom_filter_index.clone();
+            let plain_format = compaction_region.engine_config.enable_plain_format;
             let max_sequence = output
                 .inputs
                 .iter()
@@ -342,6 +343,7 @@ impl Compactor for DefaultCompactor {
                             inverted_index_config,
                             fulltext_index_config,
                             bloom_filter_index_config,
+                            plain_format,
                         },
                         &write_opts,
                     )

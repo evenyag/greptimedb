@@ -456,6 +456,7 @@ mod tests {
             inverted_index_config: Default::default(),
             fulltext_index_config: Default::default(),
             bloom_filter_index_config: Default::default(),
+            plain_format: false,
         };
 
         let upload_request = SstUploadRequest {
@@ -552,6 +553,7 @@ mod tests {
             inverted_index_config: Default::default(),
             fulltext_index_config: Default::default(),
             bloom_filter_index_config: Default::default(),
+            plain_format: false,
         };
         let write_opts = WriteOptions {
             row_group_size: 512,
