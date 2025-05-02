@@ -136,6 +136,12 @@ impl VersionControl {
         );
 
         let mut version_data = self.data.write().unwrap();
+        // Bulk insert will updates the last_entry_id and committed sequence.
+        // TODO(yingwen): Maybe add a method set_version() to update all related data.
+        version_data.committed_sequence = new_version
+            .flushed_sequence
+            .max(version_data.committed_sequence);
+        version_data.last_entry_id = new_version.flushed_entry_id.max(version_data.last_entry_id);
         version_data.version = new_version;
     }
 

@@ -1042,6 +1042,14 @@ pub enum Error {
         #[snafu(source)]
         error: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Sort batch error"))]
+    SortBatch {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1200,7 +1208,7 @@ impl ErrorExt for Error {
 
             ConvertRecordBatch { source, .. } => source.status_code(),
 
-            MergeStream { .. } => StatusCode::Internal,
+            MergeStream { .. } | SortBatch { .. } => StatusCode::Internal,
         }
     }
 

@@ -105,7 +105,7 @@ fn plain_source_to_stream(
 /// Builds the sort expressions from the region metadata
 /// to sort by:
 /// (primary key ASC, time index ASC, sequence DESC)
-fn sort_expressions(metadata: &RegionMetadata) -> LexOrdering {
+pub(crate) fn sort_expressions(metadata: &RegionMetadata) -> LexOrdering {
     let time_index_expr = create_sort_expr(
         &metadata.time_index_column().column_schema.name,
         metadata.time_index_column_pos(),
