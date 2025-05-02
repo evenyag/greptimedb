@@ -14,17 +14,16 @@
 
 //! Plain Batch.
 
-use common_time::Timestamp;
 use datatypes::arrow::array::{ArrayRef, BooleanArray};
-use datatypes::arrow::compute;
 use datatypes::arrow::compute::filter_record_batch;
 use datatypes::arrow::record_batch::RecordBatch;
-use datatypes::prelude::ConcreteDataType;
 use snafu::ResultExt;
 
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 use crate::sst::parquet::plain_format::PLAIN_FIXED_POS_COLUMN_NUM;
 
+// TODO(yingwen): Should we require the internal columns to be present?
+// TODO(yingwen): Maybe use datafusion SendableRecordBatchStream directly.
 /// [PlainBatch] represents a batch of rows.
 /// It is a wrapper around [RecordBatch] that provides additional functionality for multi-series data.
 /// The columns order is the same as the order of the columns read the SST.
@@ -81,6 +80,11 @@ impl PlainBatch {
     /// Returns the inner record batch.
     pub(crate) fn as_record_batch(&self) -> &RecordBatch {
         &self.record_batch
+    }
+
+    /// Converts this batch into a record batch.
+    pub fn into_record_batch(self) -> RecordBatch {
+        self.record_batch
     }
 
     /// Filters this batch by the boolean array.
