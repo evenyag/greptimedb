@@ -30,14 +30,18 @@ pub(crate) mod unordered_scan;
 
 use std::time::Duration;
 
+use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
+use store_api::metadata::RegionMetadataRef;
 
+use crate::cache::CacheStrategy;
 use crate::error::Result;
 use crate::memtable::BoxedBatchIterator;
 use crate::read::batch::plain::PlainBatch;
 pub use crate::read::batch::{Batch, BatchBuilder, BatchColumn};
+use crate::read::projection::{batch_to_plain_batch, PrimaryKeyProjectionMapper};
 use crate::read::prune::PruneReader;
 
 /// Async [Batch] reader and iterator wrapper.
@@ -87,6 +91,29 @@ impl Source {
             }
             Source::PlainStream(stream) => stream.try_next().await,
         }
+    }
+
+    /// Converts a source that returns [Batch] to a source that returns [PlainBatch].
+    pub(crate) fn to_plain_source(
+        mut self,
+        metadata: &RegionMetadataRef,
+        cache_strategy: &CacheStrategy,
+    ) -> Result<Source> {
+        if self.is_plain() {
+            return Ok(self);
+        }
+
+        let mapper = PrimaryKeyProjectionMapper::all(metadata)?;
+        let cache = cache_strategy.clone();
+        let stream = try_stream! {
+            while let Some(batch) = self.next_batch().await? {
+                let batch = batch_to_plain_batch(&batch, &mapper, &cache)?;
+                yield batch;
+            }
+        };
+        let stream = Box::pin(stream);
+
+        Ok(Source::PlainStream(stream))
     }
 }
 
