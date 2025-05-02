@@ -1034,6 +1034,14 @@ pub enum Error {
         location: Location,
         source: datatypes::error::Error,
     },
+
+    #[snafu(display("Merge stream error"))]
+    MergeStream {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1191,6 +1199,8 @@ impl ErrorExt for Error {
             CreateVector { .. } => StatusCode::Internal,
 
             ConvertRecordBatch { source, .. } => source.status_code(),
+
+            MergeStream { .. } => StatusCode::Internal,
         }
     }
 
