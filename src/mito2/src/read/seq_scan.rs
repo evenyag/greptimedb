@@ -108,6 +108,8 @@ impl SeqScan {
         let partition_ranges = &self.properties.partitions[0];
 
         if self.stream_ctx.input.plain_format {
+            common_telemetry::info!("Building reader for compaction in plain format");
+
             return Self::merge_all_plain_ranges_for_compaction(
                 &self.stream_ctx,
                 partition_ranges,
