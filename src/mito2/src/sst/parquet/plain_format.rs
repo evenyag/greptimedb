@@ -60,7 +60,7 @@ pub(crate) struct PlainWriteFormat {
 impl PlainWriteFormat {
     /// Creates a new helper.
     pub(crate) fn new(metadata: RegionMetadataRef) -> PlainWriteFormat {
-        let arrow_schema = to_sst_arrow_schema(&metadata);
+        let arrow_schema = to_plain_sst_arrow_schema(&metadata);
         PlainWriteFormat {
             metadata,
             arrow_schema,
@@ -84,7 +84,7 @@ impl PlainWriteFormat {
 
     /// Convert `batch` to a arrow record batch to store in parquet.
     pub(crate) fn convert_batch(&self, batch: &PlainBatch) -> Result<RecordBatch> {
-        debug_assert_eq!(batch.num_rows(), self.arrow_schema.fields().len());
+        debug_assert_eq!(batch.num_columns(), self.arrow_schema.fields().len());
 
         let Some(override_sequence) = self.override_sequence else {
             return Ok(batch.as_record_batch().clone());
