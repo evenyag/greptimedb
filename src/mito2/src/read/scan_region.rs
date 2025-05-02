@@ -612,7 +612,7 @@ pub(crate) struct ScanInput {
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
     /// Whether to read plain format.
-    plain_format: bool,
+    pub(crate) plain_format: bool,
 }
 
 impl ScanInput {

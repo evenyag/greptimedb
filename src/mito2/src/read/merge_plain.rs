@@ -33,7 +33,7 @@ use store_api::storage::consts::SEQUENCE_COLUMN_NAME;
 
 use crate::error::{MergeStreamSnafu, Result};
 use crate::read::batch::plain::PlainBatch;
-use crate::read::BoxedPlainBatchStream;
+use crate::read::{BoxedPlainBatchStream, Source};
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::to_plain_sst_arrow_schema;
 
@@ -42,6 +42,15 @@ pub(crate) enum PlainSource {
 }
 
 impl PlainSource {
+    /// Creates a [PlainSource] from [Source].
+    pub(crate) fn from_source(source: Source) -> Self {
+        if let Source::PlainStream(stream) = source {
+            Self::Stream(stream)
+        } else {
+            panic!("Not a plain stream");
+        }
+    }
+
     pub(crate) async fn next_batch(&mut self) -> Result<Option<PlainBatch>> {
         match self {
             PlainSource::Stream(stream) => stream.try_next().await,

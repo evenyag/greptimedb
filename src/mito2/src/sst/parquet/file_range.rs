@@ -35,7 +35,7 @@ use crate::read::batch::multi_series::MultiSeries;
 use crate::read::batch::plain::PlainBatch;
 use crate::read::compat::CompatBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
-use crate::read::prune::{MultiSeriesPruneReader, PruneReader};
+use crate::read::prune::{MultiSeriesPruneReader, PlainPruneReader, PruneReader};
 use crate::read::Batch;
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::format::ReadFormat;
@@ -143,6 +143,19 @@ impl FileRange {
             .await?;
 
         let prune_reader = MultiSeriesPruneReader::new(parquet_reader, self.context.clone());
+
+        Ok(prune_reader)
+    }
+
+    /// Returns a plain reader to read the [FileRange].
+    pub(crate) async fn plain_reader(&self) -> Result<PlainPruneReader> {
+        let parquet_reader = self
+            .context
+            .reader_builder
+            .build(self.row_group_idx, self.row_selection.clone())
+            .await?;
+
+        let prune_reader = PlainPruneReader::new(parquet_reader, self.context.clone());
 
         Ok(prune_reader)
     }

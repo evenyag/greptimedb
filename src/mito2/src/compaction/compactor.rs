@@ -344,7 +344,7 @@ impl Compactor for DefaultCompactor {
                         SstWriteRequest {
                             op_type: OperationType::Compact,
                             metadata: region_metadata,
-                            source: Source::Reader(reader),
+                            source: reader,
                             cache_manager,
                             storage,
                             max_sequence: max_sequence.map(NonZero::get),
