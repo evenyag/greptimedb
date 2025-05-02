@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use common_telemetry::{debug, error, info, trace};
 use snafu::ResultExt;
+use store_api::region_request::BulkInsertPayload;
 use store_api::storage::RegionId;
 use strum::IntoStaticStr;
 use tokio::sync::{mpsc, watch};
@@ -36,6 +37,7 @@ use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_ERRORS_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
 };
+use crate::read::batch::plain::build_plain_batch_stream;
 use crate::read::Source;
 use crate::region::options::IndexOptions;
 use crate::region::version::{VersionControlData, VersionControlRef};
@@ -205,6 +207,8 @@ pub enum FlushReason {
     Periodically,
     /// Flush memtable during downgrading state.
     Downgrading,
+    /// Bulk insert.
+    BulkInsert,
 }
 
 impl FlushReason {
@@ -234,6 +238,9 @@ pub(crate) struct RegionFlushTask {
 
     /// Index options for the region.
     pub(crate) index_options: IndexOptions,
+
+    /// Bulk insert payloads.
+    pub(crate) bulk_insert_payloads: Vec<BulkInsertPayload>,
 }
 
 impl RegionFlushTask {
@@ -280,7 +287,13 @@ impl RegionFlushTask {
         let timer = FLUSH_ELAPSED.with_label_values(&["total"]).start_timer();
         self.listener.on_flush_begin(self.region_id).await;
 
-        let worker_request = match self.flush_memtables(&version_data).await {
+        let flush_res = if self.bulk_insert_payloads.is_empty() {
+            self.flush_memtables(&version_data).await
+        } else {
+            self.flush_bulk_insert_payloads(&version_data).await
+        };
+
+        let worker_request = match flush_res {
             Ok(edit) => {
                 let memtables_to_remove = version_data
                     .version
@@ -450,6 +463,133 @@ impl RegionFlushTask {
         assert_eq!(self.region_id, other.region_id);
         // Now we only merge senders. They share the same flush reason.
         self.senders.append(&mut other.senders);
+
+        // Merge bulk insert payloads.
+        self.bulk_insert_payloads
+            .append(&mut other.bulk_insert_payloads);
+    }
+
+    /// Flushes bulk insert payloads.
+    async fn flush_bulk_insert_payloads(
+        &mut self,
+        version_data: &VersionControlData,
+    ) -> Result<RegionEdit> {
+        let timer = FLUSH_ELAPSED
+            .with_label_values(&["flush_memtables"])
+            .start_timer();
+
+        let mut write_opts = WriteOptions {
+            write_buffer_size: self.engine_config.sst_write_buffer_size,
+            ..Default::default()
+        };
+        if let Some(row_group_size) = self.row_group_size {
+            write_opts.row_group_size = row_group_size;
+        }
+
+        let version = &version_data.version;
+        let metadata = &version.metadata;
+        let max_sequence = version_data.committed_sequence + 1;
+
+        // TODO(yingwen): Parallelize the flush process.
+        let mut file_metas = Vec::with_capacity(self.bulk_insert_payloads.len());
+        let mut flushed_bytes = 0;
+        for payload in self.bulk_insert_payloads.drain(..) {
+            match payload {
+                BulkInsertPayload::ArrowIpc(record_batch) => {
+                    if record_batch.num_rows() == 0 {
+                        // Skip empty payloads.
+                        continue;
+                    }
+
+                    let stream = build_plain_batch_stream(metadata, record_batch, max_sequence)?;
+                    let source = Source::PlainStream(stream);
+
+                    // Flush to level 0.
+                    let write_request = SstWriteRequest {
+                        op_type: OperationType::Flush,
+                        metadata: version.metadata.clone(),
+                        source,
+                        cache_manager: self.cache_manager.clone(),
+                        storage: version.options.storage.clone(),
+                        max_sequence: Some(max_sequence),
+                        index_options: self.index_options.clone(),
+                        inverted_index_config: self.engine_config.inverted_index.clone(),
+                        fulltext_index_config: self.engine_config.fulltext_index.clone(),
+                        bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                    };
+
+                    let ssts_written = self
+                        .access_layer
+                        .write_sst(write_request, &write_opts)
+                        .await?;
+                    if ssts_written.is_empty() {
+                        // No data written.
+                        continue;
+                    }
+
+                    file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                        flushed_bytes += sst_info.file_size;
+                        FileMeta {
+                            region_id: self.region_id,
+                            file_id: sst_info.file_id,
+                            time_range: sst_info.time_range,
+                            level: 0,
+                            file_size: sst_info.file_size,
+                            available_indexes: sst_info.index_metadata.build_available_indexes(),
+                            index_file_size: sst_info.index_metadata.file_size,
+                            num_rows: sst_info.num_rows as u64,
+                            num_row_groups: sst_info.num_row_groups,
+                            sequence: NonZeroU64::new(max_sequence),
+                        }
+                    }));
+                }
+                BulkInsertPayload::Rows { .. } => todo!(),
+            }
+        }
+
+        if !file_metas.is_empty() {
+            FLUSH_BYTES_TOTAL.inc_by(flushed_bytes);
+        }
+
+        let file_ids: Vec<_> = file_metas.iter().map(|f| f.file_id).collect();
+        info!(
+            "Successfully flush memtables, region: {}, reason: {}, files: {:?}, cost: {:?}s",
+            self.region_id,
+            self.reason.as_str(),
+            file_ids,
+            timer.stop_and_record(),
+        );
+
+        let edit = RegionEdit {
+            files_to_add: file_metas,
+            files_to_remove: Vec::new(),
+            compaction_time_window: None,
+            // The last entry has been flushed.
+            flushed_entry_id: Some(version_data.last_entry_id),
+            flushed_sequence: Some(version_data.committed_sequence),
+        };
+        info!("Applying {edit:?} to region {}", self.region_id);
+
+        let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit.clone()));
+
+        let expected_state = if matches!(self.reason, FlushReason::Downgrading) {
+            RegionLeaderState::Downgrading
+        } else {
+            RegionLeaderState::Writable
+        };
+        // We will leak files if the manifest update fails, but we ignore them for simplicity. We can
+        // add a cleanup job to remove them later.
+        let version = self
+            .manifest_ctx
+            .update_manifest(expected_state, action_list)
+            .await?;
+        info!(
+            "Successfully update manifest version to {version}, region: {}, reason: {}",
+            self.region_id,
+            self.reason.as_str()
+        );
+
+        Ok(edit)
     }
 }
 
@@ -857,6 +997,7 @@ mod tests {
                 .mock_manifest_context(version_control.current().version.metadata.clone())
                 .await,
             index_options: IndexOptions::default(),
+            bulk_insert_payloads: Vec::new(),
         };
         task.push_sender(OptionOutputTx::from(output_tx));
         scheduler
@@ -898,6 +1039,7 @@ mod tests {
                 cache_manager: Arc::new(CacheManager::default()),
                 manifest_ctx: manifest_ctx.clone(),
                 index_options: IndexOptions::default(),
+                bulk_insert_payloads: Vec::new(),
             })
             .collect();
         // Schedule first task.

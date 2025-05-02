@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::OpType;
+use datafusion::physical_plan::sorts::sort::sort_batch;
 use datatypes::arrow::array::{ArrayRef, BooleanArray, UInt64Array, UInt8Array};
 use datatypes::arrow::compute::filter_record_batch;
 use datatypes::arrow::record_batch::RecordBatch;
@@ -27,8 +28,10 @@ use store_api::storage::SequenceNumber;
 
 use crate::error::{
     ComputeArrowSnafu, CreateDefaultSnafu, InvalidRequestSnafu, NewRecordBatchSnafu, Result,
-    UnexpectedImpureDefaultSnafu,
+    SortBatchSnafu, UnexpectedImpureDefaultSnafu,
 };
+use crate::read::merge_plain::sort_expressions;
+use crate::read::BoxedPlainBatchStream;
 use crate::sst::parquet::plain_format::PLAIN_FIXED_POS_COLUMN_NUM;
 use crate::sst::to_plain_sst_arrow_schema;
 
@@ -113,7 +116,7 @@ impl PlainBatch {
 /// Fill default values for the batch.
 /// Also adds internal columns.
 /// Now it doesn't consider the op type.
-pub fn fill_default_values(
+pub(crate) fn fill_values(
     metadata: &RegionMetadata,
     record_batch: &RecordBatch,
     sequence: SequenceNumber,
@@ -128,7 +131,8 @@ pub fn fill_default_values(
         .collect();
     let mut new_columns =
         Vec::with_capacity(record_batch.num_columns() + PLAIN_FIXED_POS_COLUMN_NUM);
-    // Fill default values.
+    // Fills default values.
+    // Implementation based on `WriteRequest::fill_missing_columns()`.
     for column in &metadata.column_metadatas {
         let array = match name_to_index.get(&column.column_schema.name) {
             Some(index) => record_batch.column(*index).clone(),
@@ -177,4 +181,29 @@ pub fn fill_default_values(
     // TODO(yingwen): How to avoid creating a new schema instance?
     let schema = to_plain_sst_arrow_schema(metadata);
     RecordBatch::try_new(schema, new_columns).context(NewRecordBatchSnafu)
+}
+
+// TODO(yingwen): Sort multiple record batches.
+/// Sorts the record batch in the following order:
+/// (primary key ASC, time index ASC, sequence DESC)
+///
+/// The record batch must contains all columns.
+fn sort_record_batch(metadata: &RegionMetadata, record_batch: &RecordBatch) -> Result<RecordBatch> {
+    let sort_exprs = sort_expressions(metadata);
+    sort_batch(&record_batch, &sort_exprs, None).context(SortBatchSnafu)
+}
+
+/// Builds a [BoxedPlainBatchStream] from a [RecordBatch].
+/// It fills missing columns and sorts the record batch.
+pub(crate) fn build_plain_batch_stream(
+    metadata: &RegionMetadata,
+    record_batch: RecordBatch,
+    sequence: SequenceNumber,
+) -> Result<BoxedPlainBatchStream> {
+    let record_batch = fill_values(metadata, &record_batch, sequence)?;
+    let record_batch = sort_record_batch(metadata, &record_batch)?;
+
+    let stream = futures::stream::once(async move { Ok(PlainBatch::new(record_batch)) });
+    let stream = Box::pin(stream);
+    Ok(stream)
 }
