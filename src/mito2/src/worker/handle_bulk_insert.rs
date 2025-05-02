@@ -52,11 +52,15 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         pending_bulk_request: &mut Vec<SenderBulkRequest>,
         sender: OptionOutputTx,
     ) {
+        if self.config.enable_plain_format {
+            self.handle_bulk_inserts_plain(request, sender).await;
+            return;
+        }
+
         let _timer = metrics::REGION_WORKER_HANDLE_WRITE_ELAPSED
             .with_label_values(&["process_bulk_req"])
             .start_timer();
         let batch = request.payload;
-
         let Some((ts_index, ts)) = batch
             .schema()
             .column_with_name(&region_metadata.time_index_column().column_schema.name)
@@ -346,21 +350,21 @@ mod tests {
         DfRecordBatch::try_new(schema, vec![ts_array, k0_array, v0_array]).unwrap()
     }
 
-    // #[test]
-    // fn test_region_metadata_to_column_schema() {
-    //     let region_metadata = Arc::new(TestRegionMetadataBuilder::default().build());
-    //     let (result, _) = region_metadata_to_column_schema(&region_metadata).unwrap();
-    //     assert_eq!(result.len(), 3);
+    #[test]
+    fn test_region_metadata_to_column_schema() {
+        let region_metadata = Arc::new(TestRegionMetadataBuilder::default().build());
+        let (result, _) = region_metadata_to_column_schema(&region_metadata).unwrap();
+        assert_eq!(result.len(), 3);
 
-    //     assert_eq!(result[0].column_name, "ts");
-    //     assert_eq!(result[0].semantic_type, SemanticType::Timestamp as i32);
+        assert_eq!(result[0].column_name, "ts");
+        assert_eq!(result[0].semantic_type, SemanticType::Timestamp as i32);
 
-    //     assert_eq!(result[1].column_name, "k0");
-    //     assert_eq!(result[1].semantic_type, SemanticType::Tag as i32);
+        assert_eq!(result[1].column_name, "k0");
+        assert_eq!(result[1].semantic_type, SemanticType::Tag as i32);
 
-    //     assert_eq!(result[2].column_name, "v0");
-    //     assert_eq!(result[2].semantic_type, SemanticType::Field as i32);
-    // }
+        assert_eq!(result[2].column_name, "v0");
+        assert_eq!(result[2].semantic_type, SemanticType::Field as i32);
+    }
 
     #[test]
     fn test_record_batch_to_rows() {
