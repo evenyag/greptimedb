@@ -21,6 +21,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, UnboundedMemoryPool};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
@@ -74,12 +75,15 @@ pub(crate) fn merge_plain(
 
     let memory_pool = Arc::new(UnboundedMemoryPool::default()) as _;
     let reservation = MemoryConsumer::new("merge_plain").register(&memory_pool);
+    let metrics_set = ExecutionPlanMetricsSet::new();
+    let baseline_metrics = BaselineMetrics::new(&metrics_set, 0);
     let mut stream = StreamingMergeBuilder::new()
         .with_schema(schema)
         .with_streams(streams)
         .with_expressions(&exprs)
         .with_batch_size(DEFAULT_READ_BATCH_SIZE)
         .with_reservation(reservation)
+        .with_metrics(baseline_metrics)
         .build()
         .context(MergeStreamSnafu)?;
 
