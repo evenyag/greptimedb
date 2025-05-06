@@ -19,13 +19,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use api::helper::{
-    is_column_type_value_eq, is_semantic_type_eq, proto_value_type, to_proto_value,
-    ColumnDataTypeWrapper,
+    is_column_type_value_eq, is_semantic_type_eq, pb_value_to_value_ref, proto_value_type,
+    to_proto_value, ColumnDataTypeWrapper,
 };
 use api::v1::column_def::options_from_column_schema;
 use api::v1::{ColumnDataType, ColumnSchema, OpType, Rows, SemanticType, Value, WriteHint};
 use common_telemetry::info;
-use datatypes::prelude::DataType;
+use datatypes::arrow::datatypes::{Field, Schema};
+use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::prelude::{ConcreteDataType, DataType};
 use prometheus::HistogramTimer;
 use prost::Message;
 use smallvec::SmallVec;
@@ -35,16 +37,17 @@ use store_api::manifest::ManifestVersion;
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{SetRegionRoleStateResponse, SettableRegionRoleState};
 use store_api::region_request::{
-    AffectedRows, RegionAlterRequest, RegionBulkInsertsRequest, RegionCatchupRequest,
-    RegionCloseRequest, RegionCompactRequest, RegionCreateRequest, RegionFlushRequest,
-    RegionOpenRequest, RegionRequest, RegionTruncateRequest,
+    AffectedRows, BulkInsertPayload, RegionAlterRequest, RegionBulkInsertsRequest,
+    RegionCatchupRequest, RegionCloseRequest, RegionCompactRequest, RegionCreateRequest,
+    RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
 };
 use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::oneshot::{self, Receiver, Sender};
 
 use crate::error::{
-    CompactRegionSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu, Error, FillDefaultSnafu,
-    FlushRegionSnafu, InvalidRequestSnafu, Result, UnexpectedImpureDefaultSnafu,
+    CompactRegionSnafu, ComputeArrowSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu,
+    CreateVectorSnafu, Error, FillDefaultSnafu, FlushRegionSnafu, InvalidRequestSnafu, Result,
+    UnexpectedImpureDefaultSnafu,
 };
 use crate::manifest::action::RegionEdit;
 use crate::memtable::MemtableId;
@@ -685,6 +688,35 @@ impl WorkerRequest {
         Ok((worker_request, receiver))
     }
 
+    /// If the request is a put request, converts it into a bulk insert request.
+    pub(crate) fn maybe_into_bulk_inserts(self) -> Result<Self> {
+        let WorkerRequest::Write(sender_request) = self else {
+            return Ok(self);
+        };
+        // TODO(yingwen): Write hint and delete is not supported yet.
+        if sender_request.request.op_type != OpType::Put {
+            return Ok(WorkerRequest::Write(sender_request));
+        }
+        let SenderWriteRequest { sender, request } = sender_request;
+
+        common_telemetry::debug!(
+            "Converting put request to bulk insert request, rows: {}",
+            request.rows.rows.len(),
+        );
+
+        let record_batch = rows_to_record_batch(&request.rows)?;
+        let bulk_request = RegionBulkInsertsRequest {
+            region_id: request.region_id,
+            payloads: vec![BulkInsertPayload::ArrowIpc(record_batch)],
+        };
+
+        Ok(Self::BulkInserts {
+            metadata: None,
+            request: bulk_request,
+            sender,
+        })
+    }
+
     pub(crate) fn new_set_readonly_gracefully(
         region_id: RegionId,
         region_role_state: SettableRegionRoleState,
@@ -715,6 +747,47 @@ impl WorkerRequest {
             receiver,
         )
     }
+}
+
+/// Converts rows into a record batch.
+pub(crate) fn rows_to_record_batch(rows: &Rows) -> Result<RecordBatch> {
+    let mut fields = Vec::with_capacity(rows.schema.len());
+    let mut builders = Vec::with_capacity(rows.schema.len());
+    let num_rows = rows.rows.len();
+    for column_schema in &rows.schema {
+        let data_type = ColumnDataTypeWrapper::try_new(
+            column_schema.datatype,
+            column_schema.datatype_extension,
+        )
+        .with_context(|_| ConvertColumnDataTypeSnafu {
+            reason: format!(
+                "Unsupported data type of column {}: {:?}",
+                column_schema.column_name, column_schema.datatype
+            ),
+        })?;
+        let data_type = ConcreteDataType::from(data_type);
+        let arrow_type = data_type.as_arrow_type();
+        fields.push(Field::new(
+            column_schema.column_name.clone(),
+            arrow_type,
+            true,
+        ));
+        builders.push(data_type.create_mutable_vector(num_rows));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    for row in &rows.rows {
+        for (i, value) in row.values.iter().enumerate() {
+            let value_ref = pb_value_to_value_ref(value, &rows.schema[i].datatype_extension);
+            builders[i]
+                .try_push_value_ref(value_ref)
+                .context(CreateVectorSnafu)?;
+        }
+    }
+    let columns = builders
+        .into_iter()
+        .map(|mut builder| builder.to_vector().to_arrow_array())
+        .collect();
+    RecordBatch::try_new(schema, columns).context(ComputeArrowSnafu)
 }
 
 /// DDL request to a region.
