@@ -293,6 +293,7 @@ where
     ) -> Result<SstInfoArray> {
         common_telemetry::info!("Write parquet in plain format");
 
+        let mut results = smallvec![];
         let write_format =
             PlainWriteFormat::new(self.metadata.clone()).with_override_sequence(override_sequence);
         let mut stats = SourceStats::default();
@@ -305,46 +306,25 @@ where
             match res {
                 Ok(batch) => {
                     stats.update_plain(&batch);
+                    // safety: self.current_indexer must be set when first batch has been written.
+                    self.current_indexer
+                        .as_mut()
+                        .unwrap()
+                        .update_plain(&batch)
+                        .await;
                 }
                 Err(e) => {
+                    if let Some(indexer) = &mut self.current_indexer {
+                        indexer.abort().await;
+                    }
                     return Err(e);
                 }
             }
         }
 
-        if stats.num_rows == 0 {
-            return Ok(smallvec![]);
-        }
+        self.finish_current_file(&mut results, &mut stats).await?;
 
-        let Some(mut arrow_writer) = self.writer.take() else {
-            // No batch actually written.
-            return Ok(smallvec![]);
-        };
-
-        arrow_writer.flush().await.context(WriteParquetSnafu)?;
-
-        let file_meta = arrow_writer.close().await.context(WriteParquetSnafu)?;
-        let file_size = self.bytes_written.load(Ordering::Relaxed) as u64;
-
-        // convert FileMetaData to ParquetMetaData
-        let parquet_metadata = parse_parquet_metadata(file_meta)?;
-        let file_id = self.current_file;
-        let time_range = parquet_time_range(file_id, &parquet_metadata, &self.metadata)
-            .with_context(|| InvalidParquetSnafu {
-                file: file_id.to_string(),
-                reason: "No time range statistics available",
-            })?;
-
-        // object_store.write will make sure all bytes are written or an error is raised.
-        Ok(smallvec![SstInfo {
-            file_id,
-            time_range,
-            file_size,
-            num_rows: stats.num_rows,
-            num_row_groups: parquet_metadata.num_row_groups() as u64,
-            file_metadata: Some(Arc::new(parquet_metadata)),
-            index_metadata: IndexOutput::default(),
-        }])
+        Ok(results)
     }
 
     /// Customizes per-column config according to schema and maybe column cardinality.

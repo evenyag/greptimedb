@@ -58,7 +58,7 @@ use crate::metrics::{COMPACTION_STAGE_ELAPSED, INFLIGHT_COMPACTION_COUNT};
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_region::{PredicateGroup, ScanInput};
 use crate::read::seq_scan::SeqScan;
-use crate::read::{BoxedBatchReader, Source};
+use crate::read::Source;
 use crate::region::options::MergeMode;
 use crate::region::version::VersionControlRef;
 use crate::region::ManifestContextRef;

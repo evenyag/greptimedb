@@ -37,7 +37,6 @@ use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::manifest::storage::manifest_compress_type;
 use crate::metrics;
-use crate::read::Source;
 use crate::region::opener::new_manifest_dir;
 use crate::region::options::RegionOptions;
 use crate::region::version::VersionRef;
