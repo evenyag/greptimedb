@@ -29,11 +29,11 @@ use datatypes::arrow::array::{
 use datatypes::arrow::datatypes::{DataType, TimeUnit};
 use datatypes::prelude::VectorRef;
 use datatypes::vectors::Helper;
-use futures::channel::oneshot::Receiver;
 use snafu::ResultExt;
 use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_request::RegionBulkInsertsRequest;
+use tokio::sync::oneshot::Receiver;
 
 use crate::config::MitoConfig;
 use crate::error::{self, RegionNotFoundSnafu, RegionStateSnafu};
@@ -336,9 +336,9 @@ mod tests {
 
     use api::v1::SemanticType;
     use datatypes::arrow::array::{Int64Array, TimestampMillisecondArray};
+    use mito_codec::test_util::TestRegionMetadataBuilder;
 
     use super::*;
-    use crate::test_util::meta_util::TestRegionMetadataBuilder;
 
     fn build_record_batch(num_rows: usize) -> DfRecordBatch {
         let region_metadata = Arc::new(TestRegionMetadataBuilder::default().build());

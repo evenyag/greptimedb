@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use common_telemetry::{debug, warn};
+use datatypes::vectors::Helper;
 use index::inverted_index::create::sort::external_sort::ExternalSorter;
 use index::inverted_index::create::sort_create::SortIndexCreator;
 use index::inverted_index::create::InvertedIndexCreator;
@@ -32,9 +33,10 @@ use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::error::{
-    BiErrorsSnafu, EncodeSnafu, IndexFinishSnafu, OperateAbortedIndexSnafu, PuffinAddBlobSnafu,
-    PushIndexValueSnafu, Result,
+    BiErrorsSnafu, ConvertVectorSnafu, EncodeSnafu, IndexFinishSnafu, OperateAbortedIndexSnafu,
+    PuffinAddBlobSnafu, PushIndexValueSnafu, Result,
 };
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::sst::file::FileId;
 use crate::sst::index::intermediate::{
@@ -50,6 +52,16 @@ const MIN_MEMORY_USAGE_THRESHOLD_PER_COLUMN: usize = 1024 * 1024; // 1MB
 
 /// The buffer size for the pipe used to send index data to the puffin blob.
 const PIPE_BUFFER_SIZE_FOR_SENDING_BLOB: usize = 8192;
+
+/// Metadata for an indexed column.
+struct IndexedColumn {
+    /// Id of the column.
+    col_id: ColumnId,
+    /// `to_string` of the column id.
+    col_id_str: String,
+    /// Index of the column in the region metadata.
+    col_index: usize,
+}
 
 /// `InvertedIndexer` creates inverted index for SST files.
 pub struct InvertedIndexer {
@@ -72,7 +84,7 @@ pub struct InvertedIndexer {
     memory_usage: Arc<AtomicUsize>,
 
     /// Ids of indexed columns and their names (`to_string` of the column id).
-    indexed_column_ids: Vec<(ColumnId, String)>,
+    indexed_column_ids: Vec<IndexedColumn>,
 }
 
 impl InvertedIndexer {
@@ -107,9 +119,21 @@ impl InvertedIndexer {
         );
         let indexed_column_ids = indexed_column_ids
             .into_iter()
-            .map(|col_id| {
+            .filter_map(|col_id| {
                 let col_id_str = col_id.to_string();
-                (col_id, col_id_str)
+                let Some(col_index) = metadata.column_index_by_id(col_id) else {
+                    debug!(
+                        "Column {} not found in the schema during building inverted index",
+                        col_id
+                    );
+                    return None;
+                };
+
+                Some(IndexedColumn {
+                    col_id,
+                    col_id_str,
+                    col_index,
+                })
             })
             .collect();
         Self {
@@ -134,6 +158,30 @@ impl InvertedIndexer {
         }
 
         if let Err(update_err) = self.do_update(batch).await {
+            // clean up garbage if failed to update
+            if let Err(err) = self.do_cleanup().await {
+                if cfg!(any(test, feature = "test")) {
+                    panic!("Failed to clean up index creator, err: {err}",);
+                } else {
+                    warn!(err; "Failed to clean up index creator");
+                }
+            }
+            return Err(update_err);
+        }
+
+        Ok(())
+    }
+
+    /// Updates index with a batch of rows.
+    /// Garbage will be cleaned up if failed to update.
+    pub async fn update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        ensure!(!self.aborted, OperateAbortedIndexSnafu);
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(update_err) = self.do_update_plain(batch).await {
             // clean up garbage if failed to update
             if let Err(err) = self.do_cleanup().await {
                 if cfg!(any(test, feature = "test")) {
@@ -190,7 +238,10 @@ impl InvertedIndexer {
         let n = batch.num_rows();
         guard.inc_row_count(n);
 
-        for (col_id, col_id_str) in &self.indexed_column_ids {
+        for IndexedColumn {
+            col_id, col_id_str, ..
+        } in &self.indexed_column_ids
+        {
             match self.codec.pk_col_info(*col_id) {
                 // pk
                 Some(col_info) => {
@@ -247,6 +298,43 @@ impl InvertedIndexer {
                                 .context(PushIndexValueSnafu)?;
                         }
                     }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn do_update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        let mut guard = self.stats.record_update();
+
+        let n = batch.num_rows();
+        guard.inc_row_count(n);
+
+        for IndexedColumn {
+            col_id_str,
+            col_index,
+            ..
+        } in &self.indexed_column_ids
+        {
+            let array = batch.column(*col_index);
+            let vector = Helper::try_into_vector(array).context(ConvertVectorSnafu)?;
+            let sort_field = SortField::new(vector.data_type());
+            for i in 0..n {
+                self.value_buf.clear();
+                let value = vector.get_ref(i);
+                if value.is_null() {
+                    self.index_creator
+                        .push_with_name(col_id_str, None)
+                        .await
+                        .context(PushIndexValueSnafu)?;
+                } else {
+                    IndexValueCodec::encode_nonnull_value(value, &sort_field, &mut self.value_buf)
+                        .context(EncodeSnafu)?;
+                    self.index_creator
+                        .push_with_name(col_id_str, Some(&self.value_buf))
+                        .await
+                        .context(PushIndexValueSnafu)?;
                 }
             }
         }
@@ -317,7 +405,7 @@ impl InvertedIndexer {
     }
 
     pub fn column_ids(&self) -> impl Iterator<Item = ColumnId> + '_ {
-        self.indexed_column_ids.iter().map(|(col_id, _)| *col_id)
+        self.indexed_column_ids.iter().map(|col| col.col_id)
     }
 
     pub fn memory_usage(&self) -> usize {

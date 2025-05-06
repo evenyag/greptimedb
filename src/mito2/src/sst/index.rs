@@ -34,6 +34,7 @@ use store_api::storage::{ColumnId, RegionId};
 use crate::access_layer::OperationType;
 use crate::config::{BloomFilterConfig, FulltextIndexConfig, InvertedIndexConfig};
 use crate::metrics::INDEX_CREATE_MEMORY_USAGE;
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::region::options::IndexOptions;
 use crate::sst::file::{FileId, IndexType};
@@ -118,6 +119,13 @@ impl Indexer {
     /// Updates the index with the given batch.
     pub async fn update(&mut self, batch: &mut Batch) {
         self.do_update(batch).await;
+
+        self.flush_mem_metrics();
+    }
+
+    /// Updates the index with the given plain batch.
+    pub async fn update_plain(&mut self, batch: &PlainBatch) {
+        self.do_update_plain(batch).await;
 
         self.flush_mem_metrics();
     }

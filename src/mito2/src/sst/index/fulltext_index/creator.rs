@@ -17,6 +17,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use common_telemetry::warn;
+use datatypes::arrow::array::StringArray;
+use datatypes::arrow::datatypes::DataType;
 use datatypes::schema::{FulltextAnalyzer, FulltextBackend};
 use index::fulltext_index::create::{
     BloomFilterFulltextIndexCreator, FulltextIndexCreator, TantivyFulltextIndexCreator,
@@ -29,9 +31,11 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, ConcreteDataType, RegionId};
 
 use crate::error::{
-    CastVectorSnafu, CreateFulltextCreatorSnafu, DataTypeMismatchSnafu, FulltextFinishSnafu,
-    FulltextPushTextSnafu, IndexOptionsSnafu, OperateAbortedIndexSnafu, Result,
+    CastVectorSnafu, ComputeArrowSnafu, CreateFulltextCreatorSnafu, DataTypeMismatchSnafu,
+    FulltextFinishSnafu, FulltextPushTextSnafu, IndexOptionsSnafu, OperateAbortedIndexSnafu,
+    Result,
 };
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::sst::file::FileId;
 use crate::sst::index::fulltext_index::{INDEX_BLOB_TYPE_BLOOM, INDEX_BLOB_TYPE_TANTIVY};
@@ -65,7 +69,7 @@ impl FulltextIndexer {
     ) -> Result<Option<Self>> {
         let mut creators = HashMap::new();
 
-        for column in &metadata.column_metadatas {
+        for (column_index, column) in metadata.column_metadatas.iter().enumerate() {
             let options = column
                 .column_schema
                 .fulltext_options()
@@ -119,6 +123,7 @@ impl FulltextIndexer {
                 column_id,
                 SingleCreator {
                     column_id,
+                    column_index,
                     inner,
                     compress,
                 },
@@ -137,6 +142,24 @@ impl FulltextIndexer {
         ensure!(!self.aborted, OperateAbortedIndexSnafu);
 
         if let Err(update_err) = self.do_update(batch).await {
+            if let Err(err) = self.do_abort().await {
+                if cfg!(any(test, feature = "test")) {
+                    panic!("Failed to abort index creator, err: {err}");
+                } else {
+                    warn!(err; "Failed to abort index creator");
+                }
+            }
+            return Err(update_err);
+        }
+
+        Ok(())
+    }
+
+    /// Updates the index with the given batch.
+    pub async fn update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        ensure!(!self.aborted, OperateAbortedIndexSnafu);
+
+        if let Err(update_err) = self.do_update_plain(batch).await {
             if let Err(err) = self.do_abort().await {
                 if cfg!(any(test, feature = "test")) {
                     panic!("Failed to abort index creator, err: {err}");
@@ -204,6 +227,17 @@ impl FulltextIndexer {
         Ok(())
     }
 
+    async fn do_update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        let mut guard = self.stats.record_update();
+        guard.inc_row_count(batch.num_rows());
+
+        for creator in self.creators.values_mut() {
+            creator.update_plain(batch).await?;
+        }
+
+        Ok(())
+    }
+
     async fn do_finish(&mut self, puffin_writer: &mut SstPuffinWriter) -> Result<()> {
         let mut guard = self.stats.record_finish();
 
@@ -233,6 +267,8 @@ impl FulltextIndexer {
 struct SingleCreator {
     /// Column ID.
     column_id: ColumnId,
+    /// Column Index in the region metadata.
+    column_index: usize,
     /// Inner creator.
     inner: AltFulltextCreator,
     /// Whether the index should be compressed.
@@ -272,6 +308,20 @@ impl SingleCreator {
                     self.inner.push_text("").await?;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        let text_column = batch.column(self.column_index);
+        let string_text = datatypes::arrow::compute::cast(text_column, &DataType::Utf8)
+            .context(ComputeArrowSnafu)?;
+        // Safety: We cast to string array.
+        let string_array = string_text.as_any().downcast_ref::<StringArray>().unwrap();
+        for data in string_array.iter() {
+            let text = data.unwrap_or_default();
+            self.inner.push_text(text).await?;
         }
 
         Ok(())
