@@ -258,12 +258,19 @@ where
             match res {
                 Ok(batch) => {
                     stats.update_plain(&batch);
+                    self.get_or_create_indexer()
+                        .await
+                        .update_plain(&batch)
+                        .await;
                 }
                 Err(e) => {
+                    self.get_or_create_indexer().await.abort().await;
                     return Err(e);
                 }
             }
         }
+
+        let index_output = self.get_or_create_indexer().await.finish().await;
 
         if stats.num_rows == 0 {
             return Ok(smallvec![]);
@@ -296,7 +303,7 @@ where
             num_rows: stats.num_rows,
             num_row_groups: parquet_metadata.num_row_groups() as u64,
             file_metadata: Some(Arc::new(parquet_metadata)),
-            index_metadata: IndexOutput::default(),
+            index_metadata: index_output,
         }])
     }
 
