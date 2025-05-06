@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use common_telemetry::{debug, warn};
 use datatypes::schema::SkippingIndexType;
+use datatypes::vectors::Helper;
 use index::bloom_filter::creator::BloomFilterCreator;
 use puffin::puffin_manager::{PuffinWriter, PutOptions};
 use snafu::{ensure, ResultExt};
@@ -26,9 +27,10 @@ use store_api::storage::ColumnId;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::error::{
-    BiErrorsSnafu, BloomFilterFinishSnafu, IndexOptionsSnafu, OperateAbortedIndexSnafu,
-    PuffinAddBlobSnafu, PushBloomFilterValueSnafu, Result,
+    BiErrorsSnafu, BloomFilterFinishSnafu, ConvertVectorSnafu, IndexOptionsSnafu,
+    OperateAbortedIndexSnafu, PuffinAddBlobSnafu, PushBloomFilterValueSnafu, Result,
 };
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::row_converter::SortField;
 use crate::sst::file::FileId;
@@ -47,7 +49,8 @@ const PIPE_BUFFER_SIZE_FOR_SENDING_BLOB: usize = 8192;
 /// The indexer for the bloom filter index.
 pub struct BloomFilterIndexer {
     /// The bloom filter creators.
-    creators: HashMap<ColumnId, BloomFilterCreator>,
+    /// The value is a tuple of (BloomFilterCreator, column index in schema).
+    creators: HashMap<ColumnId, (BloomFilterCreator, usize)>,
 
     /// The provider for intermediate files.
     temp_file_provider: Arc<TempFileProvider>,
@@ -81,7 +84,7 @@ impl BloomFilterIndexer {
         ));
         let global_memory_usage = Arc::new(AtomicUsize::new(0));
 
-        for column in &metadata.column_metadatas {
+        for (index, column) in metadata.column_metadatas.iter().enumerate() {
             let options =
                 column
                     .column_schema
@@ -101,7 +104,7 @@ impl BloomFilterIndexer {
                 global_memory_usage.clone(),
                 memory_usage_threshold,
             );
-            creators.insert(column.column_id, creator);
+            creators.insert(column.column_id, (creator, index));
         }
 
         if creators.is_empty() {
@@ -135,6 +138,32 @@ impl BloomFilterIndexer {
         }
 
         if let Err(update_err) = self.do_update(batch).await {
+            // clean up garbage if failed to update
+            if let Err(err) = self.do_cleanup().await {
+                if cfg!(any(test, feature = "test")) {
+                    panic!("Failed to clean up index creator, err: {err:?}",);
+                } else {
+                    warn!(err; "Failed to clean up index creator");
+                }
+            }
+            return Err(update_err);
+        }
+
+        Ok(())
+    }
+
+    /// Updates index with a batch of rows.
+    /// Garbage will be cleaned up if failed to update.
+    ///
+    /// TODO(zhongzc): duplicate with `mito2::sst::index::inverted_index::creator::InvertedIndexCreator`
+    pub async fn update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        ensure!(!self.aborted, OperateAbortedIndexSnafu);
+
+        if self.creators.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(update_err) = self.do_update_plain(batch).await {
             // clean up garbage if failed to update
             if let Err(err) = self.do_cleanup().await {
                 if cfg!(any(test, feature = "test")) {
@@ -195,7 +224,7 @@ impl BloomFilterIndexer {
         let n = batch.num_rows();
         guard.inc_row_count(n);
 
-        for (col_id, creator) in &mut self.creators {
+        for (col_id, (creator, _index)) in &mut self.creators {
             match self.codec.pk_col_info(*col_id) {
                 // tags
                 Some(col_info) => {
@@ -255,12 +284,43 @@ impl BloomFilterIndexer {
         Ok(())
     }
 
+    async fn do_update_plain(&mut self, batch: &PlainBatch) -> Result<()> {
+        let mut guard = self.stats.record_update();
+
+        let n = batch.num_rows();
+        guard.inc_row_count(n);
+
+        for (_col_id, (creator, index)) in &mut self.creators {
+            let array = batch.column(*index);
+            let vector = Helper::try_into_vector(array).context(ConvertVectorSnafu)?;
+            let sort_field = SortField::new(vector.data_type());
+            for i in 0..n {
+                let value = vector.get_ref(i);
+                let elems = (!value.is_null())
+                    .then(|| {
+                        let mut buf = vec![];
+                        IndexValueCodec::encode_nonnull_value(value, &sort_field, &mut buf)?;
+                        Ok(buf)
+                    })
+                    .transpose()?;
+
+                creator
+                    .push_row_elems(elems)
+                    .await
+                    .context(PushBloomFilterValueSnafu)?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// TODO(zhongzc): duplicate with `mito2::sst::index::inverted_index::creator::InvertedIndexCreator`
     async fn do_finish(&mut self, puffin_writer: &mut SstPuffinWriter) -> Result<()> {
         let mut guard = self.stats.record_finish();
 
         for (id, creator) in &mut self.creators {
-            let written_bytes = Self::do_finish_single_creator(id, creator, puffin_writer).await?;
+            let written_bytes =
+                Self::do_finish_single_creator(id, &mut creator.0, puffin_writer).await?;
             guard.inc_byte_count(written_bytes);
         }
 

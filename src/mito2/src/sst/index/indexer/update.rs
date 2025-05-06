@@ -14,6 +14,7 @@
 
 use common_telemetry::warn;
 
+use crate::read::batch::plain::PlainBatch;
 use crate::read::Batch;
 use crate::sst::index::Indexer;
 
@@ -34,6 +35,22 @@ impl Indexer {
         }
     }
 
+    pub(crate) async fn do_update_plain(&mut self, batch: &PlainBatch) {
+        if batch.is_empty() {
+            return;
+        }
+
+        if !self.do_update_inverted_index_plain(batch).await {
+            self.do_abort().await;
+        }
+        if !self.do_update_fulltext_index_plain(batch).await {
+            self.do_abort().await;
+        }
+        if !self.do_update_bloom_filter_plain(batch).await {
+            self.do_abort().await;
+        }
+    }
+
     /// Returns false if the update failed.
     async fn do_update_inverted_index(&mut self, batch: &mut Batch) -> bool {
         let Some(creator) = self.inverted_indexer.as_mut() else {
@@ -41,6 +58,31 @@ impl Indexer {
         };
 
         let Err(err) = creator.update(batch).await else {
+            return true;
+        };
+
+        if cfg!(any(test, feature = "test")) {
+            panic!(
+                "Failed to update inverted index, region_id: {}, file_id: {}, err: {:?}",
+                self.region_id, self.file_id, err
+            );
+        } else {
+            warn!(
+                err; "Failed to update inverted index, region_id: {}, file_id: {}",
+                self.region_id, self.file_id,
+            );
+        }
+
+        false
+    }
+
+    /// Returns false if the update failed.
+    async fn do_update_inverted_index_plain(&mut self, batch: &PlainBatch) -> bool {
+        let Some(creator) = self.inverted_indexer.as_mut() else {
+            return true;
+        };
+
+        let Err(err) = creator.update_plain(batch).await else {
             return true;
         };
 
@@ -85,12 +127,62 @@ impl Indexer {
     }
 
     /// Returns false if the update failed.
+    async fn do_update_fulltext_index_plain(&mut self, batch: &PlainBatch) -> bool {
+        let Some(creator) = self.fulltext_indexer.as_mut() else {
+            return true;
+        };
+
+        let Err(err) = creator.update_plain(batch).await else {
+            return true;
+        };
+
+        if cfg!(any(test, feature = "test")) {
+            panic!(
+                "Failed to update full-text index, region_id: {}, file_id: {}, err: {:?}",
+                self.region_id, self.file_id, err
+            );
+        } else {
+            warn!(
+                err; "Failed to update full-text index, region_id: {}, file_id: {}",
+                self.region_id, self.file_id,
+            );
+        }
+
+        false
+    }
+
+    /// Returns false if the update failed.
     async fn do_update_bloom_filter(&mut self, batch: &mut Batch) -> bool {
         let Some(creator) = self.bloom_filter_indexer.as_mut() else {
             return true;
         };
 
         let Err(err) = creator.update(batch).await else {
+            return true;
+        };
+
+        if cfg!(any(test, feature = "test")) {
+            panic!(
+                "Failed to update bloom filter, region_id: {}, file_id: {}, err: {:?}",
+                self.region_id, self.file_id, err
+            );
+        } else {
+            warn!(
+                err; "Failed to update bloom filter, region_id: {}, file_id: {}",
+                self.region_id, self.file_id,
+            );
+        }
+
+        false
+    }
+
+    /// Returns false if the update failed.
+    async fn do_update_bloom_filter_plain(&mut self, batch: &PlainBatch) -> bool {
+        let Some(creator) = self.bloom_filter_indexer.as_mut() else {
+            return true;
+        };
+
+        let Err(err) = creator.update_plain(batch).await else {
             return true;
         };
 
