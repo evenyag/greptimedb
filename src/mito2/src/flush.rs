@@ -19,8 +19,13 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use api::helper::pb_value_to_value_ref;
+use api::v1::Row;
 use common_telemetry::{debug, error, info, trace};
+use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::prelude::DataType;
 use snafu::ResultExt;
+use store_api::metadata::RegionMetadata;
 use store_api::region_request::BulkInsertPayload;
 use store_api::storage::RegionId;
 use strum::IntoStaticStr;
@@ -30,7 +35,8 @@ use crate::access_layer::{AccessLayerRef, OperationType, SstWriteRequest};
 use crate::cache::{CacheManagerRef, CacheStrategy};
 use crate::config::MitoConfig;
 use crate::error::{
-    Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
+    ComputeArrowSnafu, CreateVectorSnafu, Error, FlushRegionSnafu, RegionClosedSnafu,
+    RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
 use crate::metrics::{
@@ -505,58 +511,58 @@ impl RegionFlushTask {
         let mut file_metas = Vec::with_capacity(self.bulk_insert_payloads.len());
         let mut flushed_bytes = 0;
         for payload in self.bulk_insert_payloads.drain(..) {
-            match payload {
-                BulkInsertPayload::ArrowIpc(record_batch) => {
-                    if record_batch.num_rows() == 0 {
-                        // Skip empty payloads.
-                        continue;
-                    }
+            let record_batch = match payload {
+                BulkInsertPayload::ArrowIpc(record_batch) => record_batch,
+                BulkInsertPayload::Rows { data, .. } => rows_vec_to_record_batch(&metadata, &data)?,
+            };
 
-                    let stream = build_plain_batch_stream(metadata, record_batch, max_sequence)?;
-                    let source = Source::PlainStream(stream);
-
-                    // Flush to level 0.
-                    let write_request = SstWriteRequest {
-                        op_type: OperationType::Flush,
-                        metadata: version.metadata.clone(),
-                        source,
-                        cache_manager: self.cache_manager.clone(),
-                        storage: version.options.storage.clone(),
-                        max_sequence: Some(max_sequence),
-                        index_options: self.index_options.clone(),
-                        inverted_index_config: self.engine_config.inverted_index.clone(),
-                        fulltext_index_config: self.engine_config.fulltext_index.clone(),
-                        bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
-                        plain_format: self.engine_config.enable_plain_format,
-                    };
-
-                    let ssts_written = self
-                        .access_layer
-                        .write_sst(write_request, &write_opts)
-                        .await?;
-                    if ssts_written.is_empty() {
-                        // No data written.
-                        continue;
-                    }
-
-                    file_metas.extend(ssts_written.into_iter().map(|sst_info| {
-                        flushed_bytes += sst_info.file_size;
-                        FileMeta {
-                            region_id: self.region_id,
-                            file_id: sst_info.file_id,
-                            time_range: sst_info.time_range,
-                            level: 0,
-                            file_size: sst_info.file_size,
-                            available_indexes: sst_info.index_metadata.build_available_indexes(),
-                            index_file_size: sst_info.index_metadata.file_size,
-                            num_rows: sst_info.num_rows as u64,
-                            num_row_groups: sst_info.num_row_groups,
-                            sequence: NonZeroU64::new(max_sequence),
-                        }
-                    }));
-                }
-                BulkInsertPayload::Rows { .. } => todo!(),
+            if record_batch.num_rows() == 0 {
+                // Skip empty payloads.
+                continue;
             }
+
+            let stream = build_plain_batch_stream(metadata, record_batch, max_sequence)?;
+            let source = Source::PlainStream(stream);
+
+            // Flush to level 0.
+            let write_request = SstWriteRequest {
+                op_type: OperationType::Flush,
+                metadata: version.metadata.clone(),
+                source,
+                cache_manager: self.cache_manager.clone(),
+                storage: version.options.storage.clone(),
+                max_sequence: Some(max_sequence),
+                index_options: self.index_options.clone(),
+                inverted_index_config: self.engine_config.inverted_index.clone(),
+                fulltext_index_config: self.engine_config.fulltext_index.clone(),
+                bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                plain_format: self.engine_config.enable_plain_format,
+            };
+
+            let ssts_written = self
+                .access_layer
+                .write_sst(write_request, &write_opts)
+                .await?;
+            if ssts_written.is_empty() {
+                // No data written.
+                continue;
+            }
+
+            file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                flushed_bytes += sst_info.file_size;
+                FileMeta {
+                    region_id: self.region_id,
+                    file_id: sst_info.file_id,
+                    time_range: sst_info.time_range,
+                    level: 0,
+                    file_size: sst_info.file_size,
+                    available_indexes: sst_info.index_metadata.build_available_indexes(),
+                    index_file_size: sst_info.index_metadata.file_size,
+                    num_rows: sst_info.num_rows as u64,
+                    num_row_groups: sst_info.num_row_groups,
+                    sequence: NonZeroU64::new(max_sequence),
+                }
+            }));
         }
 
         if !file_metas.is_empty() {
@@ -603,6 +609,35 @@ impl RegionFlushTask {
 
         Ok(edit)
     }
+}
+
+// problem: rows doesn't have schema...
+fn rows_vec_to_record_batch(metadata: &RegionMetadata, rows: &[Row]) -> Result<RecordBatch> {
+    let mut builders = Vec::with_capacity(metadata.column_metadatas.len());
+    let num_rows = rows.len();
+    for col_meta in &metadata.column_metadatas {
+        builders.push(
+            col_meta
+                .column_schema
+                .data_type
+                .create_mutable_vector(num_rows),
+        );
+    }
+
+    for row in rows {
+        for (i, value) in row.values.iter().enumerate() {
+            //
+            let value_ref = pb_value_to_value_ref(value, &None);
+            builders[i]
+                .try_push_value_ref(value_ref)
+                .context(CreateVectorSnafu)?;
+        }
+    }
+    let columns = builders
+        .into_iter()
+        .map(|mut builder| builder.to_vector().to_arrow_array())
+        .collect();
+    RecordBatch::try_new(metadata.schema.arrow_schema().clone(), columns).context(ComputeArrowSnafu)
 }
 
 /// Manages background flushes of a worker.
