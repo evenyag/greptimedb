@@ -19,9 +19,13 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use common_recordbatch::DfRecordBatch;
+use api::helper::pb_value_to_value_ref;
+use api::v1::Row;
 use common_telemetry::{debug, error, info, trace};
+use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::prelude::DataType;
 use snafu::ResultExt;
+use store_api::metadata::RegionMetadata;
 use store_api::storage::RegionId;
 use strum::IntoStaticStr;
 use tokio::sync::{mpsc, watch};
@@ -30,7 +34,8 @@ use crate::access_layer::{AccessLayerRef, OperationType, SstWriteRequest};
 use crate::cache::{CacheManagerRef, CacheStrategy};
 use crate::config::MitoConfig;
 use crate::error::{
-    Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
+    ComputeArrowSnafu, CreateVectorSnafu, Error, FlushRegionSnafu, RegionClosedSnafu,
+    RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
 use crate::metrics::{
@@ -240,7 +245,7 @@ pub(crate) struct RegionFlushTask {
     pub(crate) index_options: IndexOptions,
 
     /// Bulk insert payloads.
-    pub(crate) bulk_insert_payloads: Vec<DfRecordBatch>,
+    pub(crate) bulk_insert_payloads: Vec<RecordBatch>,
 }
 
 impl RegionFlushTask {
@@ -598,6 +603,35 @@ impl RegionFlushTask {
 
         Ok(edit)
     }
+}
+
+// problem: rows doesn't have schema...
+fn rows_vec_to_record_batch(metadata: &RegionMetadata, rows: &[Row]) -> Result<RecordBatch> {
+    let mut builders = Vec::with_capacity(metadata.column_metadatas.len());
+    let num_rows = rows.len();
+    for col_meta in &metadata.column_metadatas {
+        builders.push(
+            col_meta
+                .column_schema
+                .data_type
+                .create_mutable_vector(num_rows),
+        );
+    }
+
+    for row in rows {
+        for (i, value) in row.values.iter().enumerate() {
+            //
+            let value_ref = pb_value_to_value_ref(value, &None);
+            builders[i]
+                .try_push_value_ref(value_ref)
+                .context(CreateVectorSnafu)?;
+        }
+    }
+    let columns = builders
+        .into_iter()
+        .map(|mut builder| builder.to_vector().to_arrow_array())
+        .collect();
+    RecordBatch::try_new(metadata.schema.arrow_schema().clone(), columns).context(ComputeArrowSnafu)
 }
 
 /// Manages background flushes of a worker.

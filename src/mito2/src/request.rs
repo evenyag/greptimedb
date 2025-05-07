@@ -23,7 +23,9 @@ use api::helper::{
     to_proto_value, ColumnDataTypeWrapper,
 };
 use api::v1::column_def::options_from_column_schema;
-use api::v1::{ColumnDataType, ColumnSchema, OpType, Rows, SemanticType, Value, WriteHint};
+use api::v1::{
+    ArrowIpc, ColumnDataType, ColumnSchema, OpType, Rows, SemanticType, Value, WriteHint,
+};
 use common_telemetry::info;
 use datatypes::arrow::datatypes::{Field, Schema};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -37,9 +39,9 @@ use store_api::manifest::ManifestVersion;
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{SetRegionRoleStateResponse, SettableRegionRoleState};
 use store_api::region_request::{
-    AffectedRows, BulkInsertPayload, RegionAlterRequest, RegionBulkInsertsRequest,
-    RegionCatchupRequest, RegionCloseRequest, RegionCompactRequest, RegionCreateRequest,
-    RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
+    AffectedRows, RegionAlterRequest, RegionBulkInsertsRequest, RegionCatchupRequest,
+    RegionCloseRequest, RegionCompactRequest, RegionCreateRequest, RegionFlushRequest,
+    RegionOpenRequest, RegionRequest, RegionTruncateRequest,
 };
 use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::oneshot::{self, Receiver, Sender};
@@ -715,7 +717,8 @@ impl WorkerRequest {
         let record_batch = rows_to_record_batch(&request.rows)?;
         let bulk_request = RegionBulkInsertsRequest {
             region_id: request.region_id,
-            payloads: vec![BulkInsertPayload::ArrowIpc(record_batch)],
+            payload: record_batch,
+            raw_data: ArrowIpc::default(),
         };
 
         Ok(Self::BulkInserts {
