@@ -257,6 +257,7 @@ pub(crate) fn reduce_runs<T: Item>(runs: Vec<SortedRun<T>>, target: usize) -> Ve
     let k = runs.len() + 1 - target;
     runs.into_iter()
         .combinations(k) // find all possible solutions
+        .take(1000)
         .map(|runs_to_merge| merge_all_runs(runs_to_merge)) // calculate merge penalty
         .min_by(|p, r| p.penalty.cmp(&r.penalty)) // find solution with the min penalty
         .unwrap() // safety: their must be at least one solution.
