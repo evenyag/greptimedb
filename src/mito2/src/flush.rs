@@ -705,7 +705,6 @@ impl FlushScheduler {
             .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
         // Checks whether we can flush the region now.
         if flush_status.flushing {
-            common_telemetry::info!("Flushing, merge task");
             // There is already a flush job running.
             flush_status.merge_task(task);
             return Ok(());
@@ -714,7 +713,6 @@ impl FlushScheduler {
         // TODO(yingwen): We can merge with pending and execute directly.
         // If there are pending tasks, then we should push it to pending list.
         if flush_status.pending_task.is_some() {
-            common_telemetry::info!("Has pending, merge task");
             flush_status.merge_task(task);
             return Ok(());
         }
@@ -771,7 +769,14 @@ impl FlushScheduler {
             ))
         } else {
             let version_data = flush_status.version_control.current();
-            if version_data.version.memtables.is_empty() {
+            if version_data.version.memtables.is_empty()
+                && flush_status
+                    .pending_task
+                    .as_ref()
+                    .unwrap()
+                    .bulk_insert_payloads
+                    .is_empty()
+            {
                 // The region has nothing to flush, we also need to remove it from the status.
                 // Safety: The pending task is not None.
                 let task = flush_status.pending_task.take().unwrap();
