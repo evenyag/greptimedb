@@ -834,18 +834,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     request,
                     sender,
                 } => {
-                    if let Some(region_metadata) = metadata {
-                        self.handle_bulk_insert(request, region_metadata, write_requests, sender)
-                            .await;
-                    } else {
-                        error!("Cannot find region metadata for {}", request.region_id);
-                        sender.send(
-                            error::RegionNotFoundSnafu {
-                                region_id: request.region_id,
-                            }
-                            .fail(),
-                        );
-                    }
+                    self.handle_bulk_insert(request, metadata, write_requests, sender)
+                        .await;
                 }
             }
         }

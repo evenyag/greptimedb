@@ -40,7 +40,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     pub(crate) async fn handle_bulk_insert(
         &mut self,
         mut request: RegionBulkInsertsRequest,
-        region_metadata: RegionMetadataRef,
+        region_metadata: Option<RegionMetadataRef>,
         pending_write_requests: &mut Vec<SenderWriteRequest>,
         sender: OptionOutputTx,
     ) {
@@ -48,6 +48,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             self.handle_bulk_inserts_plain(request, sender).await;
             return;
         }
+
+        let Some(region_metadata) = region_metadata else {
+            common_telemetry::error!("Cannot find region metadata for {}", request.region_id);
+            sender.send(
+                error::RegionNotFoundSnafu {
+                    region_id: request.region_id,
+                }
+                .fail(),
+            );
+            return;
+        };
 
         let (column_schemas, name_to_index) =
             match region_metadata_to_column_schema(&region_metadata) {
