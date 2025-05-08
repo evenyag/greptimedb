@@ -671,7 +671,7 @@ impl FlushScheduler {
         debug_assert_eq!(region_id, task.region_id);
 
         let version = version_control.current().version;
-        if version.memtables.is_empty() {
+        if version.memtables.is_empty() && task.bulk_insert_payloads.is_empty() {
             debug_assert!(!self.region_status.contains_key(&region_id));
             // The region has nothing to flush.
             task.on_success();
