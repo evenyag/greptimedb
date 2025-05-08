@@ -247,19 +247,19 @@ fn merge_all_runs<T: Item>(runs: Vec<SortedRun<T>>) -> SortedRun<T> {
 
 /// Reduces the num of runs to given target and returns items to merge.
 /// The time complexity of this function is `C_{k}_{runs.len()}` where k=`runs.len()`-target+1.
-pub(crate) fn reduce_runs<T: Item>(runs: Vec<SortedRun<T>>, target: usize) -> Vec<Vec<T>> {
+pub(crate) fn reduce_runs<T: Item>(mut runs: Vec<SortedRun<T>>, target: usize) -> Vec<Vec<T>> {
     assert_ne!(target, 0);
     if target >= runs.len() {
         // already satisfied.
         return vec![];
     }
 
-    let k = runs.len() + 1 - target;
+    runs.sort_unstable_by_key(|run| run.penalty);
     runs.into_iter()
-        .combinations(k) // find all possible solutions
-        .take(1000)
-        .map(|runs_to_merge| merge_all_runs(runs_to_merge)) // calculate merge penalty
-        .min_by(|p, r| p.penalty.cmp(&r.penalty)) // find solution with the min penalty
+        .chunks(target)
+        .into_iter()
+        .map(|runs_to_merge| merge_all_runs(runs_to_merge.collect_vec())) // calculate merge penalty
+        .next()
         .unwrap() // safety: their must be at least one solution.
         .items
         .into_iter()
