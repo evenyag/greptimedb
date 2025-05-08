@@ -478,12 +478,18 @@ impl RegionFlushTask {
     /// Merge two flush tasks.
     fn merge(&mut self, mut other: RegionFlushTask) {
         assert_eq!(self.region_id, other.region_id);
+
         // Now we only merge senders. They share the same flush reason.
         self.senders.append(&mut other.senders);
 
         // Merge bulk insert payloads.
         self.bulk_insert_payloads
             .append(&mut other.bulk_insert_payloads);
+
+        common_telemetry::info!(
+            "Flush task merge pending, num_payloads: {}",
+            self.bulk_insert_payloads.len()
+        );
     }
 
     /// Flushes bulk insert payloads.
@@ -510,6 +516,8 @@ impl RegionFlushTask {
         // TODO(yingwen): Parallelize the flush process.
         let mut file_metas = Vec::with_capacity(self.bulk_insert_payloads.len());
         let mut flushed_bytes = 0;
+        let num_payloads = self.bulk_insert_payloads.len();
+        let mut num_rows_flushed = 0;
         for payload in self.bulk_insert_payloads.drain(..) {
             let record_batch = match payload {
                 BulkInsertPayload::ArrowIpc(record_batch) => record_batch,
@@ -550,6 +558,7 @@ impl RegionFlushTask {
 
             file_metas.extend(ssts_written.into_iter().map(|sst_info| {
                 flushed_bytes += sst_info.file_size;
+                num_rows_flushed += sst_info.num_rows;
                 FileMeta {
                     region_id: self.region_id,
                     file_id: sst_info.file_id,
@@ -564,6 +573,12 @@ impl RegionFlushTask {
                 }
             }));
         }
+
+        common_telemetry::info!(
+            "flush bulk insert payloads, num_payloads: {}, num_rows_flushed: {}",
+            num_payloads,
+            num_rows_flushed
+        );
 
         if !file_metas.is_empty() {
             FLUSH_BYTES_TOTAL.inc_by(flushed_bytes);
@@ -696,6 +711,7 @@ impl FlushScheduler {
             .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
         // Checks whether we can flush the region now.
         if flush_status.flushing {
+            common_telemetry::info!("Flushing, merge task");
             // There is already a flush job running.
             flush_status.merge_task(task);
             return Ok(());
@@ -704,6 +720,7 @@ impl FlushScheduler {
         // TODO(yingwen): We can merge with pending and execute directly.
         // If there are pending tasks, then we should push it to pending list.
         if flush_status.pending_task.is_some() {
+            common_telemetry::info!("Has pending, merge task");
             flush_status.merge_task(task);
             return Ok(());
         }
