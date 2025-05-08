@@ -709,11 +709,6 @@ impl WorkerRequest {
         }
         let SenderWriteRequest { sender, request } = sender_request;
 
-        common_telemetry::debug!(
-            "Converting put request to bulk insert request, rows: {}",
-            request.rows.rows.len(),
-        );
-
         let record_batch = rows_to_record_batch(&request.rows)?;
         let bulk_request = RegionBulkInsertsRequest {
             region_id: request.region_id,
