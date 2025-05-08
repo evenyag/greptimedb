@@ -82,7 +82,9 @@ impl TwcsPicker {
                 !files.overlapping && (found_runs == 1 || max_runs == 1) && !self.append_mode;
 
             let inputs = if found_runs > max_runs {
+                let start = std::time::Instant::now();
                 let files_to_compact = reduce_runs(sorted_runs, max_runs);
+                let reduce_time = start.elapsed();
                 let files_to_compact_len = files_to_compact.len();
                 info!(
                     "Building compaction output, active window: {:?}, \
@@ -91,14 +93,16 @@ impl TwcsPicker {
                         found runs: {}, \
                         output size: {}, \
                         max output size: {:?}, \
-                        remove deletion markers: {}",
+                        remove deletion markers: {}, \
+                        reduce_time: {:?}",
                     active_window,
                     *window,
                     max_runs,
                     found_runs,
                     files_to_compact_len,
                     self.max_output_file_size,
-                    filter_deleted
+                    filter_deleted,
+                    reduce_time,
                 );
                 files_to_compact
             } else if files.files.len() > max_files {
