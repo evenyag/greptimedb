@@ -19,7 +19,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use api::helper::pb_value_to_value_ref;
+use api::helper::{pb_value_to_value_ref, ColumnDataTypeWrapper};
 use api::v1::Row;
 use common_telemetry::{debug, error, info, trace};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -605,7 +605,8 @@ impl RegionFlushTask {
     }
 }
 
-// problem: rows doesn't have schema...
+// FIXME(yingwen): rows may not have the same column order as the metadata.
+// problem: rows doesn't have schema... We should add schema to the bulk payload.
 fn rows_vec_to_record_batch(metadata: &RegionMetadata, rows: &[Row]) -> Result<RecordBatch> {
     let mut builders = Vec::with_capacity(metadata.column_metadatas.len());
     let num_rows = rows.len();
@@ -620,8 +621,12 @@ fn rows_vec_to_record_batch(metadata: &RegionMetadata, rows: &[Row]) -> Result<R
 
     for row in rows {
         for (i, value) in row.values.iter().enumerate() {
-            //
-            let value_ref = pb_value_to_value_ref(value, &None);
+            let col_meta = &metadata.column_metadatas[i];
+            // Safety: we converts from the data type.
+            let type_wrapper =
+                ColumnDataTypeWrapper::try_from(col_meta.column_schema.data_type.clone()).unwrap();
+            let (_, type_ext) = type_wrapper.to_parts();
+            let value_ref = pb_value_to_value_ref(value, &type_ext);
             builders[i]
                 .try_push_value_ref(value_ref)
                 .context(CreateVectorSnafu)?;
