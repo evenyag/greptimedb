@@ -396,8 +396,12 @@ impl ScanRegion {
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters);
         // The mapper always computes projected column ids as the schema of SSTs may change.
         let mapper = match &self.request.projection {
-            Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied())?,
-            None => ProjectionMapper::all(&self.version.metadata)?,
+            Some(p) => ProjectionMapper::new_with_plain(
+                &self.version.metadata,
+                p.iter().copied(),
+                self.plain_format,
+            )?,
+            None => ProjectionMapper::all_with_plain(&self.version.metadata, self.plain_format)?,
         };
         // Get memtable ranges to scan.
         let memtables = memtables

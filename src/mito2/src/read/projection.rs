@@ -58,11 +58,45 @@ impl ProjectionMapper {
         ))
     }
 
+    /// Returns a new mapper with projection.
+    pub fn new_with_plain(
+        metadata: &RegionMetadataRef,
+        projection: impl Iterator<Item = usize>,
+        plain_format: bool,
+    ) -> Result<ProjectionMapper> {
+        if plain_format {
+            Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
+                metadata, projection,
+            )?))
+        } else {
+            Ok(ProjectionMapper::PrimaryKey(
+                PrimaryKeyProjectionMapper::new(metadata, projection)?,
+            ))
+        }
+    }
+
     /// Returns a new mapper without projection.
     pub fn all(metadata: &RegionMetadataRef) -> Result<ProjectionMapper> {
         Ok(ProjectionMapper::PrimaryKey(
             PrimaryKeyProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())?,
         ))
+    }
+
+    /// Returns a new mapper without projection.
+    pub fn all_with_plain(
+        metadata: &RegionMetadataRef,
+        plain_format: bool,
+    ) -> Result<ProjectionMapper> {
+        if plain_format {
+            Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
+                metadata,
+                0..metadata.column_metadatas.len(),
+            )?))
+        } else {
+            Ok(ProjectionMapper::PrimaryKey(
+                PrimaryKeyProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())?,
+            ))
+        }
     }
 
     /// Returns the metadata that created the mapper.
