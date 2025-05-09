@@ -255,8 +255,9 @@ pub(crate) fn reduce_runs<T: Item>(mut runs: Vec<SortedRun<T>>, target: usize) -
     }
 
     runs.sort_unstable_by_key(|run| run.penalty);
+    let k = runs.len() + 1 - target;
     runs.into_iter()
-        .chunks(target)
+        .chunks(k)
         .into_iter()
         .map(|runs_to_merge| merge_all_runs(runs_to_merge.collect_vec())) // calculate merge penalty
         .next()
