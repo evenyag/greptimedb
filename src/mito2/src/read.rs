@@ -17,6 +17,7 @@
 pub mod batch;
 pub mod compat;
 pub mod dedup;
+pub mod dedup_plain;
 pub mod last_row;
 pub mod merge;
 pub mod merge_plain;
