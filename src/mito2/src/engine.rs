@@ -444,9 +444,9 @@ impl EngineInner {
         let region_metadata = self.get_metadata(region_id).ok();
         let (mut request, receiver) =
             WorkerRequest::try_from_region_request(region_id, request, region_metadata)?;
-        if self.config.enable_plain_format {
-            request = request.maybe_into_bulk_inserts()?;
-        }
+        // if self.config.enable_plain_format {
+        //     request = request.maybe_into_bulk_inserts()?;
+        // }
         self.workers.submit_to_worker(region_id, request).await?;
 
         receiver.await.context(RecvSnafu)?
