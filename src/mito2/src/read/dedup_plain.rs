@@ -17,10 +17,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use api::v1::OpType;
-use async_trait::async_trait;
 use common_telemetry::debug;
-use common_time::Timestamp;
 use datatypes::arrow::array::{
     make_comparator, Array, ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
@@ -34,16 +31,12 @@ use datatypes::arrow::datatypes::{DataType, TimeUnit};
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::compute::take;
-use datatypes::prelude::ScalarVector;
-use datatypes::value::Value;
-use datatypes::vectors::MutableVector;
 use futures::{Stream, TryStreamExt};
 use snafu::ResultExt;
 
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 use crate::metrics::MERGE_FILTER_ROWS_TOTAL;
 use crate::read::batch::plain::PlainBatch;
-use crate::read::{Batch, BatchColumn, BatchReader};
 
 /// A reader that dedup sorted batches from a source based on the
 /// dedup strategy.
@@ -313,6 +306,7 @@ impl PlainDedupStrategy for LastRow {
         // with this batch. We store batch before filtering it as rows with `OpType::Delete`
         // would be removed from the batch after filter, then we may store an incorrect `last row`
         // of previous batch.
+        // Safety: We checked the batch is not empty before.
         self.prev_batch = Some(BatchLastRow {
             last_batch: batch.clone(),
         });
@@ -392,7 +386,7 @@ impl PlainDedupStrategy for LastRow {
     }
 }
 
-/// State of the last row in a batch for dedup.
+/// State of the batch with the last row for dedup.
 struct BatchLastRow {
     /// The record batch that contains the last row.
     /// The record batch must has at least one row.
@@ -400,7 +394,18 @@ struct BatchLastRow {
 }
 
 impl BatchLastRow {
-    /// Returns true if the `batch` has duplicate row with the last row.
+    /// Returns a new [BatchLastRow] if the record batch is not empty.
+    fn try_new(record_batch: RecordBatch) -> Option<Self> {
+        if record_batch.num_rows() > 0 {
+            Some(Self {
+                last_batch: record_batch,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the first row of the input `batch` is duplicated with the last row.
     fn is_last_row_duplicated(
         &self,
         key_indices: &[usize],
@@ -652,36 +657,103 @@ pub(crate) struct LastNonNull {
     pk_indices: Vec<usize>,
     /// Index of the time index column.
     timestamp_index: usize,
+    /// Filter deleted rows.
+    filter_deleted: bool,
     /// Buffered batch to check whether the next batch have duplicated rows with this batch.
     /// Fields in the last row of this batch may be updated by the next batch.
-    buffer: Option<RecordBatch>,
-    // /// Fields that overlaps with the last row of the `buffer`.
-    // last_fields: LastFieldsBuilder,
+    /// The buffered batch should contain no duplication.
+    buffer: Option<BatchLastRow>,
 }
 
+// TODO(yingwen): metrics.
 impl PlainDedupStrategy for LastNonNull {
     fn push_batch(
         &mut self,
         batch: PlainBatch,
         metrics: &mut DedupMetrics,
     ) -> Result<Option<PlainBatch>> {
-        // The dedup algorithm:
-        // - fetch a batch
-        // - If the buffer is None, dedup the batch, put the batch into the buffer and return.
-        // - We always buffer the record batch until the next batch contains a key that is different
-        //   from the last key of the buffered batch.
-        // - If the first row of batch has different key from the buffer, return the buffer and put current batch to the buffer.
-        // - If the first row of the batch has the same key from the buffer, return the buffer without the last row
-        // - Concat the last row of the buffer with the batch, then dedup the batch.
-        todo!()
+        if batch.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(buffer) = self.buffer.take() else {
+            // If the buffer is None, dedup the batch, put the batch into the buffer and return.
+            let record_batch = Self::dedup_one_batch(
+                batch.into_record_batch(),
+                &self.pk_indices,
+                self.timestamp_index,
+            )?;
+            self.buffer = BatchLastRow::try_new(record_batch);
+
+            return Ok(None);
+        };
+
+        if !buffer.is_last_row_duplicated(
+            &self.pk_indices,
+            self.timestamp_index,
+            batch.as_record_batch(),
+        )? {
+            // The first row of batch has different key from the buffer.
+            // We can replace the buffer with the new batch.
+            // Dedup the batch.
+            let record_batch = Self::dedup_one_batch(
+                batch.into_record_batch(),
+                &self.pk_indices,
+                self.timestamp_index,
+            )?;
+            debug_assert!(record_batch.num_rows() > 0);
+            self.buffer = BatchLastRow::try_new(record_batch);
+
+            return Ok(Some(PlainBatch::new(buffer.last_batch)));
+        }
+
+        // The next batch has duplicated rows.
+        // We can return rows except the last row in the buffer.
+        let output = if buffer.last_batch.num_rows() > 1 {
+            let dedup_batch = buffer.last_batch.slice(0, buffer.last_batch.num_rows() - 1);
+            debug_assert_eq!(buffer.last_batch.num_rows() - 1, dedup_batch.num_rows());
+            Some(PlainBatch::new(dedup_batch))
+        } else {
+            None
+        };
+        let last_row = buffer.last_batch.slice(buffer.last_batch.num_rows() - 1, 1);
+
+        // We concat the last row with the next batch.
+        let next_batch = batch.into_record_batch();
+        let schema = next_batch.schema();
+        let merged = concat_batches(&schema, &[last_row, next_batch]).context(ComputeArrowSnafu)?;
+        // Dedup the merged batch and update the buffer.
+        let record_batch = Self::dedup_one_batch(merged, &self.pk_indices, self.timestamp_index)?;
+        debug_assert!(record_batch.num_rows() > 0);
+        self.buffer = BatchLastRow::try_new(record_batch);
+
+        Ok(output)
     }
 
     fn finish(&mut self, metrics: &mut DedupMetrics) -> Result<Option<PlainBatch>> {
-        todo!()
+        let Some(buffer) = self.buffer.take() else {
+            return Ok(None);
+        };
+
+        Ok(Some(PlainBatch::new(buffer.last_batch)))
     }
 }
 
 impl LastNonNull {
+    /// Creates a new strategy with the given `filter_deleted` flag.
+    pub(crate) fn new(
+        pk_indices: Vec<usize>,
+        timestamp_index: usize,
+        filter_deleted: bool,
+    ) -> Self {
+        Self {
+            pk_indices,
+            timestamp_index,
+            filter_deleted,
+            buffer: None,
+        }
+    }
+
     /// Remove duplications from the batch without considering the previous and next rows.
     // FIXME(yingwen): Avoid repeating code.
     fn dedup_one_batch(
@@ -726,7 +798,7 @@ impl LastNonNull {
         // Each range at least has 1 row.
         let num_duplications: usize = ranges.iter().map(|r| r.end - r.start - 1).sum();
         if num_duplications == 0 {
-            // Fast path, no duplications.
+            // Fast path, no duplication.
             return Ok(batch);
         }
 
