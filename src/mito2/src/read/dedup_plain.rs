@@ -15,30 +15,32 @@
 //! Utilities to remove duplicate rows from a sorted batch.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use api::v1::OpType;
 use async_trait::async_trait;
 use common_telemetry::debug;
 use common_time::Timestamp;
 use datatypes::arrow::array::{
-    make_comparator, Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+    make_comparator, Array, ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::compute::kernels::cmp::distinct;
 use datatypes::arrow::compute::{
-    concat_batches, partition, take_record_batch, Partitions, SortOptions,
+    concat_batches, partition, take_record_batch, Partitions, SortOptions, TakeOptions,
 };
 use datatypes::arrow::datatypes::{DataType, TimeUnit};
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::compute::take;
 use datatypes::prelude::ScalarVector;
 use datatypes::value::Value;
 use datatypes::vectors::MutableVector;
 use futures::{Stream, TryStreamExt};
 use snafu::ResultExt;
 
-use crate::error::{ComputeArrowSnafu, Result};
+use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 use crate::metrics::MERGE_FILTER_ROWS_TOTAL;
 use crate::read::batch::plain::PlainBatch;
 use crate::read::{Batch, BatchColumn, BatchReader};
@@ -643,6 +645,139 @@ pub(crate) struct DedupMetrics {
 //         self.initialized = false;
 //     }
 // }
+
+/// Dedup strategy that keeps the last non-null field for the same key.
+pub(crate) struct LastNonNull {
+    /// Indices of the primary key columns.
+    pk_indices: Vec<usize>,
+    /// Index of the time index column.
+    timestamp_index: usize,
+    /// Buffered batch to check whether the next batch have duplicated rows with this batch.
+    /// Fields in the last row of this batch may be updated by the next batch.
+    buffer: Option<RecordBatch>,
+    // /// Fields that overlaps with the last row of the `buffer`.
+    // last_fields: LastFieldsBuilder,
+}
+
+impl PlainDedupStrategy for LastNonNull {
+    fn push_batch(
+        &mut self,
+        batch: PlainBatch,
+        metrics: &mut DedupMetrics,
+    ) -> Result<Option<PlainBatch>> {
+        // The dedup algorithm:
+        // - fetch a batch
+        // - If the buffer is None, dedup the batch, put the batch into the buffer and return.
+        // - We always buffer the record batch until the next batch contains a key that is different
+        //   from the last key of the buffered batch.
+        // - If the first row of batch has different key from the buffer, return the buffer and put current batch to the buffer.
+        // - If the first row of the batch has the same key from the buffer, return the buffer without the last row
+        // - Concat the last row of the buffer with the batch, then dedup the batch.
+        todo!()
+    }
+
+    fn finish(&mut self, metrics: &mut DedupMetrics) -> Result<Option<PlainBatch>> {
+        todo!()
+    }
+}
+
+impl LastNonNull {
+    /// Remove duplications from the batch without considering the previous and next rows.
+    // FIXME(yingwen): Avoid repeating code.
+    fn dedup_one_batch(
+        batch: RecordBatch,
+        pk_indices: &[usize],
+        timestamp_index: usize,
+    ) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+        if num_rows < 2 {
+            return Ok(batch);
+        }
+
+        let timestamps = batch.column(timestamp_index);
+        // Checks duplications based on the timestamp.
+        let mask = find_boundaries(timestamps).context(ComputeArrowSnafu)?;
+        if mask.count_set_bits() == num_rows - 1 {
+            // Fast path: No duplication.
+            return Ok(batch);
+        }
+
+        // The batch has duplicated timestamps, but it doesn't mean it must
+        // has duplicated rows.
+        // Partitions the batch by the primary key and time index.
+        let columns: Vec<_> = pk_indices
+            .iter()
+            .chain([&timestamp_index])
+            .map(|index| batch.column(*index).clone())
+            .collect();
+        let partitions = partition(&columns).context(ComputeArrowSnafu)?;
+
+        Self::dedup_by_partitions(batch, &partitions, pk_indices, timestamp_index)
+    }
+
+    /// Remove depulications for each partition.
+    fn dedup_by_partitions(
+        batch: RecordBatch,
+        partitions: &Partitions,
+        pk_indices: &[usize],
+        timestamp_index: usize,
+    ) -> Result<RecordBatch> {
+        let ranges = partitions.ranges();
+        // Each range at least has 1 row.
+        let num_duplications: usize = ranges.iter().map(|r| r.end - r.start - 1).sum();
+        if num_duplications == 0 {
+            // Fast path, no duplications.
+            return Ok(batch);
+        }
+
+        let mut is_field = vec![true; batch.num_columns()];
+        is_field[timestamp_index] = false;
+        for idx in pk_indices {
+            is_field[*idx] = false;
+        }
+
+        let take_options = Some(TakeOptions {
+            check_bounds: false,
+        });
+        // Always takes the first value for non-field columns in each range.
+        let non_field_indices: UInt64Array = ranges.iter().map(|r| Some(r.start as u64)).collect();
+        let new_columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(col_idx, column)| {
+                if is_field[col_idx] {
+                    let field_indices = Self::compute_field_indices(&ranges, column);
+                    take(column, &field_indices, take_options.clone()).context(ComputeArrowSnafu)
+                } else {
+                    take(column, &non_field_indices, take_options.clone())
+                        .context(ComputeArrowSnafu)
+                }
+            })
+            .collect::<Result<Vec<ArrayRef>>>()?;
+
+        RecordBatch::try_new(batch.schema(), new_columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Returns an array of indices of the latest non null value for
+    /// each input range.
+    /// If all values in a range are null, the returned index is unspecific.
+    fn compute_field_indices(ranges: &[Range<usize>], field_array: &ArrayRef) -> UInt64Array {
+        ranges
+            .iter()
+            .map(|r| {
+                let value_index = r
+                    .clone()
+                    .filter(|&i| field_array.is_valid(i))
+                    .next()
+                    .map(|i| i as u64)
+                    // if all field values are none, pick one arbitrarily
+                    .unwrap_or(r.start as u64);
+                Some(value_index)
+            })
+            .collect()
+    }
+}
 
 // /// Dedup strategy that keeps the last non-null field for the same key.
 // ///
