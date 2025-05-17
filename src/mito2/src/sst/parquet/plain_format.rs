@@ -119,6 +119,7 @@ pub struct PlainReadFormat {
 
 impl PlainReadFormat {
     /// Creates a helper with existing `metadata` and `column_ids` to read.
+    /// It dedups the column ids when reading from the file.
     pub fn new(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
