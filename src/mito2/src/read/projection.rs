@@ -455,6 +455,8 @@ pub struct PlainProjectionMapper {
     output_schema: SchemaRef,
     /// Ids of columns to project. It keeps ids in the same order as the `projection`
     /// indices to build the mapper.
+    /// If we need to read the primary key, it appends primary key column ids to the end.
+    /// So this field may has more columns than the actual projection.
     column_ids: Vec<ColumnId>,
     /// Ids and DataTypes of columns of the expected batch.
     /// We can use this to check if the batch is compatible with the expected schema.
@@ -474,12 +476,21 @@ impl PlainProjectionMapper {
         metadata: &RegionMetadataRef,
         projection: impl Iterator<Item = usize>,
     ) -> Result<Self> {
-        let mut projection: Vec<_> = projection.collect();
+        let projection: Vec<_> = projection.collect();
         // If the original projection is empty.
         let is_empty_projection = projection.is_empty();
         if is_empty_projection {
             // If the projection is empty, we still read the time index column.
-            projection.push(metadata.time_index_column_pos());
+            let column_ids = vec![metadata.time_index_column().column_id];
+            // If projection is empty, we don't output any column.
+            return Ok(PlainProjectionMapper {
+                metadata: metadata.clone(),
+                output_schema: Arc::new(Schema::new(vec![])),
+                column_ids,
+                batch_schema: vec![],
+                is_empty_projection,
+                batch_indices: vec![],
+            });
         }
 
         // Output column schemas for the projection.
@@ -501,7 +512,57 @@ impl PlainProjectionMapper {
             column_schemas.push(metadata.schema.column_schemas()[*idx].clone());
         }
 
+        // Safety: Columns come from existing schema.
+        let output_schema = Arc::new(Schema::new(column_schemas));
+        // Sorts and deduplicates the projection by index.
+        let mut dedup_projection = projection.clone();
+        dedup_projection.sort_unstable();
+        dedup_projection.dedup();
+        // Maps the projection to the index in the batch schema.
+        // (projection -> index in the batch)
+        let projection_to_index = dedup_projection
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, i))
+            .collect::<HashMap<_, _>>();
+        // Computes the index in the batch schema for each projection index.
+        let batch_indices = projection
+            .iter()
+            .map(|p| {
+                // Safety: The map is computed from `projection` itself.
+                projection_to_index.get(p).copied().unwrap()
+            })
+            .collect();
+        let batch_schema = plain_projected_columns(metadata, &column_ids);
+
+        Ok(PlainProjectionMapper {
+            metadata: metadata.clone(),
+            output_schema,
+            column_ids,
+            batch_schema,
+            is_empty_projection,
+            batch_indices,
+        })
+    }
+
+    /// Returns a new mapper with projection.
+    /// If `projection` is empty, it outputs [RecordBatch] without any column but only a row count.
+    /// `SELECT COUNT(*) FROM table` is an example that uses an empty projection. DataFusion accepts
+    /// empty `RecordBatch` and only use its row count in this query.
+    pub fn new_with_primary_key(
+        metadata: &RegionMetadataRef,
+        projection: impl Iterator<Item = usize>,
+    ) -> Result<Self> {
+        let projection: Vec<_> = projection.collect();
+        // If the original projection is empty.
+        let is_empty_projection = projection.is_empty();
         if is_empty_projection {
+            let column_ids: Vec<_> = metadata
+                .primary_key
+                .iter()
+                .copied()
+                .chain([metadata.time_index_column().column_id])
+                .collect();
             // If projection is empty, we don't output any column.
             return Ok(PlainProjectionMapper {
                 metadata: metadata.clone(),
@@ -513,10 +574,43 @@ impl PlainProjectionMapper {
             });
         }
 
+        // Output column schemas for the projection.
+        let mut column_schemas = Vec::with_capacity(projection.len());
+        // Column ids of the projection without deduplication.
+        let mut column_ids = Vec::with_capacity(projection.len());
+        for idx in &projection {
+            // For each projection index, we get the column id for projection.
+            let column = metadata
+                .column_metadatas
+                .get(*idx)
+                .context(InvalidRequestSnafu {
+                    region_id: metadata.region_id,
+                    reason: format!("projection index {} is out of bound", idx),
+                })?;
+
+            column_ids.push(column.column_id);
+            // Safety: idx is valid.
+            column_schemas.push(metadata.schema.column_schemas()[*idx].clone());
+        }
+
         // Safety: Columns come from existing schema.
         let output_schema = Arc::new(Schema::new(column_schemas));
-        // Sorts and deduplicates the projection by index.
+
+        // Now we need to add all primary key columns into the projection.
+        column_ids.extend_from_slice(&metadata.primary_key);
+        column_ids.push(metadata.time_index_column().column_id);
+        // TODO(yingwen): We can build a map for the index to avoid adding
+        // duplicated columns to the column ids.
         let mut dedup_projection = projection.clone();
+        for id in &metadata.primary_key {
+            // Safety: the primary key should have index.
+            let index = metadata.column_index_by_id(*id).unwrap();
+            dedup_projection.push(index);
+        }
+        // Also adds the time index.
+        dedup_projection.push(metadata.time_index_column_pos());
+
+        // Sorts and deduplicates the projection by index.
         dedup_projection.sort_unstable();
         dedup_projection.dedup();
         // Maps the projection to the index in the batch schema.
@@ -604,6 +698,7 @@ impl PlainProjectionMapper {
 }
 
 /// Returns ids and datatypes of columns of the output batch after applying the `projection`.
+/// It dedups the projection.
 pub(crate) fn plain_projected_columns(
     metadata: &RegionMetadata,
     projection: &[ColumnId],
