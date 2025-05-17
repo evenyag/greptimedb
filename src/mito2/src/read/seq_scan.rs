@@ -221,6 +221,10 @@ impl SeqScan {
             ));
         }
 
+        if self.stream_ctx.input.plain_format {
+            return self.scan_partition_plain(metrics_set, partition);
+        }
+
         if self.stream_ctx.input.distribution == Some(TimeSeriesDistribution::PerSeries) {
             return self.scan_partition_by_series(metrics_set, partition);
         }
@@ -400,6 +404,116 @@ impl SeqScan {
 
             metrics.scan_cost += fetch_start.elapsed();
             part_metrics.merge_metrics(&metrics);
+
+            part_metrics.on_finish();
+        };
+
+        let stream = Box::pin(RecordBatchStreamWrapper::new(
+            self.stream_ctx.input.mapper.output_schema(),
+            Box::pin(stream),
+        ));
+
+        Ok(stream)
+    }
+
+    /// Scans the given partition when the part list is set properly.
+    /// Otherwise the returned stream might not contains any data.
+    fn scan_partition_plain(
+        &self,
+        metrics_set: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Result<SendableRecordBatchStream, BoxedError> {
+        if partition >= self.properties.partitions.len() {
+            return Err(BoxedError::new(
+                PartitionOutOfRangeSnafu {
+                    given: partition,
+                    all: self.properties.partitions.len(),
+                }
+                .build(),
+            ));
+        }
+
+        let stream_ctx = self.stream_ctx.clone();
+        let partition_ranges = self.properties.partitions[partition].clone();
+        let compaction = self.compaction;
+        let distinguish_range = self.properties.distinguish_partition_range;
+        let part_metrics = self.new_partition_metrics(metrics_set, partition);
+
+        let stream = try_stream! {
+            part_metrics.on_first_poll();
+
+            let range_builder_list = Arc::new(RangeBuilderList::new(
+                stream_ctx.input.num_memtables(),
+                stream_ctx.input.num_files(),
+            ));
+            // Scans each part.
+            for part_range in partition_ranges {
+                let mut sources = Vec::new();
+                build_sources_plain(
+                    &stream_ctx,
+                    &part_range,
+                    compaction,
+                    &part_metrics,
+                    range_builder_list.clone(),
+                    &mut sources,
+                );
+
+                let mut stream =
+                    Self::build_plain_reader_from_sources(&stream_ctx, sources)
+                        .await
+                        .map_err(BoxedError::new)
+                        .context(ExternalSnafu)?;
+                let mut metrics = ScannerMetrics::default();
+                let mut fetch_start = Instant::now();
+                // #[cfg(debug_assertions)]
+                // let mut checker = crate::read::batch::BatchChecker::default()
+                //     .with_start(Some(part_range.start))
+                //     .with_end(Some(part_range.end));
+
+                while let Some(batch) = stream
+                    .next_plain_batch()
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)? {
+                    metrics.scan_cost += fetch_start.elapsed();
+                    metrics.num_batches += 1;
+                    metrics.num_rows += batch.num_rows();
+
+                    debug_assert!(!batch.is_empty());
+                    if batch.is_empty() {
+                        continue;
+                    }
+
+                    // #[cfg(debug_assertions)]
+                    // checker.ensure_part_range_batch(
+                    //     "SeqScan",
+                    //     stream_ctx.input.mapper.metadata().region_id,
+                    //     partition,
+                    //     part_range,
+                    //     &batch,
+                    // );
+
+                    let convert_start = Instant::now();
+                    let record_batch = stream_ctx.input.mapper.as_plain().convert(&batch)?;
+                    metrics.convert_cost += convert_start.elapsed();
+                    let yield_start = Instant::now();
+                    yield record_batch;
+                    metrics.yield_cost += yield_start.elapsed();
+
+                    fetch_start = Instant::now();
+                }
+
+                // Yields an empty part to indicate this range is terminated.
+                // The query engine can use this to optimize some queries.
+                if distinguish_range {
+                    let yield_start = Instant::now();
+                    yield stream_ctx.input.mapper.empty_record_batch();
+                    metrics.yield_cost += yield_start.elapsed();
+                }
+
+                metrics.scan_cost += fetch_start.elapsed();
+                part_metrics.merge_metrics(&metrics);
+            }
 
             part_metrics.on_finish();
         };
