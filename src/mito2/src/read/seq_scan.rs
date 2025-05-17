@@ -35,6 +35,7 @@ use tokio::sync::Semaphore;
 
 use crate::error::{PartitionOutOfRangeSnafu, Result};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
+use crate::read::dedup_plain::{PlainDedupReader, PlainLastNonNull, PlainLastRow};
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::merge_plain::{merge_plain, PlainSource};
@@ -367,9 +368,37 @@ impl SeqScan {
         stream_ctx: &StreamContext,
         sources: Vec<Source>,
     ) -> Result<Source> {
+        common_telemetry::info!(
+            "Build plain reader from sources, append_mode: {}",
+            stream_ctx.input.append_mode
+        );
+
         let metadata = stream_ctx.input.mapper.metadata();
         let sources = sources.into_iter().map(PlainSource::from_source).collect();
         let stream = merge_plain(metadata, sources)?;
+        if stream_ctx.input.append_mode {
+            return Ok(Source::PlainStream(stream));
+        }
+
+        let pk_indices = metadata
+            .primary_key
+            .iter()
+            .map(|id| metadata.column_index_by_id(*id).unwrap())
+            .collect();
+        let timestamp_index = metadata.time_index_column_pos();
+
+        let stream = match stream_ctx.input.merge_mode {
+            MergeMode::LastRow => PlainDedupReader::new(
+                stream,
+                PlainLastRow::new(pk_indices, timestamp_index, stream_ctx.input.filter_deleted),
+            )
+            .into_stream(),
+            MergeMode::LastNonNull => PlainDedupReader::new(
+                stream,
+                PlainLastNonNull::new(pk_indices, timestamp_index, stream_ctx.input.filter_deleted),
+            )
+            .into_stream(),
+        };
 
         Ok(Source::PlainStream(stream))
     }
