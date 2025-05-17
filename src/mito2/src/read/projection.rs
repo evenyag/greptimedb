@@ -482,6 +482,10 @@ pub struct PlainProjectionMapper {
     is_empty_projection: bool,
     /// The index in `PlainBatch` of each column in the output [RecordBatch].
     batch_indices: Vec<usize>,
+    /// Column id to their index in the projected schema (
+    /// the schema after projection).
+    /// Only sets it in when using the primary key.
+    column_id_to_projected_index: HashMap<ColumnId, usize>,
 }
 
 impl PlainProjectionMapper {
@@ -507,6 +511,7 @@ impl PlainProjectionMapper {
                 batch_schema: vec![],
                 is_empty_projection,
                 batch_indices: vec![],
+                column_id_to_projected_index: HashMap::new(),
             });
         }
 
@@ -559,6 +564,7 @@ impl PlainProjectionMapper {
             batch_schema,
             is_empty_projection,
             batch_indices,
+            column_id_to_projected_index: HashMap::new(),
         })
     }
 
@@ -580,6 +586,9 @@ impl PlainProjectionMapper {
                 .copied()
                 .chain([metadata.time_index_column().column_id])
                 .collect();
+            let column_id_to_projected_index =
+                Self::build_column_id_to_projected_index(metadata, &column_ids);
+
             // If projection is empty, we don't output any column.
             return Ok(PlainProjectionMapper {
                 metadata: metadata.clone(),
@@ -588,6 +597,7 @@ impl PlainProjectionMapper {
                 batch_schema: vec![],
                 is_empty_projection,
                 batch_indices: vec![],
+                column_id_to_projected_index,
             });
         }
 
@@ -646,6 +656,8 @@ impl PlainProjectionMapper {
             })
             .collect();
         let batch_schema = plain_projected_columns(metadata, &column_ids);
+        let column_id_to_projected_index =
+            Self::build_column_id_to_projected_index(metadata, &column_ids);
 
         Ok(PlainProjectionMapper {
             metadata: metadata.clone(),
@@ -654,6 +666,7 @@ impl PlainProjectionMapper {
             batch_schema,
             is_empty_projection,
             batch_indices,
+            column_id_to_projected_index,
         })
     }
 
@@ -711,6 +724,43 @@ impl PlainProjectionMapper {
         }
 
         RecordBatch::new(self.output_schema.clone(), columns)
+    }
+
+    /// Index of a column in the projected batch by its column id.
+    pub(crate) fn projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
+        self.column_id_to_projected_index.get(&column_id).copied()
+    }
+
+    // TODO(yingwen): The same as PlainReadFormat.
+    fn build_column_id_to_projected_index(
+        metadata: &RegionMetadata,
+        column_ids: &[ColumnId],
+    ) -> HashMap<ColumnId, usize> {
+        // Maps column id of a projected column to its index in SST.
+        // The metadata and the SST have the same column order.
+        // [(column id, index in SST)]
+        let mut projected_column_id_index: Vec<_> = column_ids
+            .iter()
+            .filter_map(|column_id| {
+                metadata
+                    .column_index_by_id(*column_id)
+                    .map(|index| (*column_id, index))
+            })
+            .collect();
+
+        // Sorts columns by their indices in the SST. Then the output order is their order
+        // in the batch returned from the SST.
+        projected_column_id_index.sort_unstable_by_key(|x| x.1);
+        // Dedups the entries.
+        projected_column_id_index.dedup_by_key(|x| x.1);
+        // Then we map the column id to the index of the column id in `projected_column_id_index`.
+        // So we can get the index of the column id in the batch returned from the SST.
+        projected_column_id_index
+            .into_iter()
+            .map(|(column_id, _)| column_id)
+            .enumerate()
+            .map(|(index, column_id)| (column_id, index))
+            .collect()
     }
 }
 

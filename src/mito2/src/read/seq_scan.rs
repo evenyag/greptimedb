@@ -494,12 +494,15 @@ impl SeqScan {
             return Ok(Source::PlainStream(stream));
         }
 
+        let plain_mapper = stream_ctx.input.mapper.as_plain();
         let pk_indices = metadata
             .primary_key
             .iter()
-            .map(|id| metadata.column_index_by_id(*id).unwrap())
+            .map(|id| plain_mapper.projected_index_by_id(*id).unwrap())
             .collect();
-        let timestamp_index = metadata.time_index_column_pos();
+        let timestamp_index = plain_mapper
+            .projected_index_by_id(metadata.time_index_column().column_id)
+            .unwrap();
 
         let stream = match stream_ctx.input.merge_mode {
             MergeMode::LastRow => PlainDedupReader::new(
