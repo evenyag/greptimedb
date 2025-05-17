@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use async_stream::try_stream;
 use common_telemetry::debug;
 use datatypes::arrow::array::{
     make_comparator, Array, ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -37,6 +38,7 @@ use snafu::ResultExt;
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 use crate::metrics::MERGE_FILTER_ROWS_TOTAL;
 use crate::read::batch::plain::PlainBatch;
+use crate::read::BoxedPlainBatchStream;
 
 /// A reader that dedup sorted batches from a source based on the
 /// dedup strategy.
@@ -57,7 +59,11 @@ impl<R, S> PlainDedupReader<R, S> {
     }
 }
 
-impl<R: Stream<Item = Result<PlainBatch>> + Unpin, S: PlainDedupStrategy> PlainDedupReader<R, S> {
+impl<
+        R: Stream<Item = Result<PlainBatch>> + Unpin + Send + 'static,
+        S: PlainDedupStrategy + 'static,
+    > PlainDedupReader<R, S>
+{
     /// Returns the next deduplicated batch.
     async fn fetch_next_batch(&mut self) -> Result<Option<PlainBatch>> {
         while let Some(batch) = self.source.try_next().await? {
@@ -67,6 +73,17 @@ impl<R: Stream<Item = Result<PlainBatch>> + Unpin, S: PlainDedupStrategy> PlainD
         }
 
         self.strategy.finish(&mut self.metrics)
+    }
+
+    /// Converts the reader into a stream.
+    fn into_stream(mut self) -> BoxedPlainBatchStream {
+        let stream = try_stream! {
+            while let Some(batch) = self.fetch_next_batch().await? {
+                yield batch;
+            }
+        };
+
+        Box::pin(stream)
     }
 }
 
