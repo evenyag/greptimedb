@@ -364,8 +364,13 @@ impl ScanRegion {
                 &self.version.metadata,
                 p.iter().copied(),
                 self.plain_format,
+                self.version.options.append_mode,
             )?,
-            None => ProjectionMapper::all_with_plain(&self.version.metadata, self.plain_format)?,
+            None => ProjectionMapper::all_with_plain(
+                &self.version.metadata,
+                self.plain_format,
+                self.version.options.append_mode,
+            )?,
         };
         // Get memtable ranges to scan.
         let memtables = memtables

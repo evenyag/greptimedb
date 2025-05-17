@@ -632,7 +632,7 @@ impl CompactionSstReaderBuilder<'_> {
     async fn build_sst_reader(self) -> Result<Source> {
         let mut scan_input = ScanInput::new(
             self.sst_layer,
-            ProjectionMapper::all_with_plain(&self.metadata, self.plain_format)?,
+            ProjectionMapper::all_with_plain(&self.metadata, self.plain_format, self.append_mode)?,
         )
         .with_files(self.inputs.to_vec())
         .with_append_mode(self.append_mode)

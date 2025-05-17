@@ -63,11 +63,18 @@ impl ProjectionMapper {
         metadata: &RegionMetadataRef,
         projection: impl Iterator<Item = usize>,
         plain_format: bool,
+        append_mode: bool,
     ) -> Result<ProjectionMapper> {
         if plain_format {
-            Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
-                metadata, projection,
-            )?))
+            if append_mode {
+                Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
+                    metadata, projection,
+                )?))
+            } else {
+                Ok(ProjectionMapper::Plain(
+                    PlainProjectionMapper::new_with_primary_key(metadata, projection)?,
+                ))
+            }
         } else {
             Ok(ProjectionMapper::PrimaryKey(
                 PrimaryKeyProjectionMapper::new(metadata, projection)?,
@@ -86,12 +93,22 @@ impl ProjectionMapper {
     pub fn all_with_plain(
         metadata: &RegionMetadataRef,
         plain_format: bool,
+        append_mode: bool,
     ) -> Result<ProjectionMapper> {
         if plain_format {
-            Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
-                metadata,
-                0..metadata.column_metadatas.len(),
-            )?))
+            if append_mode {
+                Ok(ProjectionMapper::Plain(PlainProjectionMapper::new(
+                    metadata,
+                    0..metadata.column_metadatas.len(),
+                )?))
+            } else {
+                Ok(ProjectionMapper::Plain(
+                    PlainProjectionMapper::new_with_primary_key(
+                        metadata,
+                        0..metadata.column_metadatas.len(),
+                    )?,
+                ))
+            }
         } else {
             Ok(ProjectionMapper::PrimaryKey(
                 PrimaryKeyProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())?,

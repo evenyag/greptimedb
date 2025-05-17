@@ -64,6 +64,17 @@ impl<
         S: PlainDedupStrategy + 'static,
     > PlainDedupReader<R, S>
 {
+    /// Converts the reader into a stream.
+    pub(crate) fn into_stream(mut self) -> BoxedPlainBatchStream {
+        let stream = try_stream! {
+            while let Some(batch) = self.fetch_next_batch().await? {
+                yield batch;
+            }
+        };
+
+        Box::pin(stream)
+    }
+
     /// Returns the next deduplicated batch.
     async fn fetch_next_batch(&mut self) -> Result<Option<PlainBatch>> {
         while let Some(batch) = self.source.try_next().await? {
@@ -73,17 +84,6 @@ impl<
         }
 
         self.strategy.finish(&mut self.metrics)
-    }
-
-    /// Converts the reader into a stream.
-    fn into_stream(mut self) -> BoxedPlainBatchStream {
-        let stream = try_stream! {
-            while let Some(batch) = self.fetch_next_batch().await? {
-                yield batch;
-            }
-        };
-
-        Box::pin(stream)
     }
 }
 
@@ -213,7 +213,7 @@ fn timestamp_value(array: &dyn Array, idx: usize) -> i64 {
 }
 
 /// Dedup strategy that keeps the row with latest sequence of each key.
-pub(crate) struct LastRow {
+pub(crate) struct PlainLastRow {
     /// Meta of the last row in the previous batch that has the same key
     /// as the batch to push.
     prev_batch: Option<BatchLastRow>,
@@ -225,7 +225,7 @@ pub(crate) struct LastRow {
     filter_deleted: bool,
 }
 
-impl LastRow {
+impl PlainLastRow {
     /// Creates a new strategy with the given `filter_deleted` flag.
     pub(crate) fn new(
         pk_indices: Vec<usize>,
@@ -288,7 +288,7 @@ impl LastRow {
     }
 }
 
-impl PlainDedupStrategy for LastRow {
+impl PlainDedupStrategy for PlainLastRow {
     fn push_batch(
         &mut self,
         batch: PlainBatch,
@@ -669,7 +669,7 @@ pub(crate) struct DedupMetrics {
 // }
 
 /// Dedup strategy that keeps the last non-null field for the same key.
-pub(crate) struct LastNonNull {
+pub(crate) struct PlainLastNonNull {
     /// Indices of the primary key columns.
     pk_indices: Vec<usize>,
     /// Index of the time index column.
@@ -683,7 +683,7 @@ pub(crate) struct LastNonNull {
 }
 
 // TODO(yingwen): metrics.
-impl PlainDedupStrategy for LastNonNull {
+impl PlainDedupStrategy for PlainLastNonNull {
     fn push_batch(
         &mut self,
         batch: PlainBatch,
@@ -756,7 +756,7 @@ impl PlainDedupStrategy for LastNonNull {
     }
 }
 
-impl LastNonNull {
+impl PlainLastNonNull {
     /// Creates a new strategy with the given `filter_deleted` flag.
     pub(crate) fn new(
         pk_indices: Vec<usize>,
