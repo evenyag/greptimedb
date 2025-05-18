@@ -98,7 +98,7 @@ pub fn to_plain_sst_arrow_schema(metadata: &RegionMetadata) -> SchemaRef {
 }
 
 /// Fields for internal columns.
-fn plain_internal_fields() -> [FieldRef; 2] {
+pub(crate) fn plain_internal_fields() -> [FieldRef; 2] {
     // Internal columns are always not null.
     [
         Arc::new(Field::new(
