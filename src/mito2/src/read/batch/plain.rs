@@ -189,7 +189,7 @@ pub(crate) fn fill_values(
 ///
 /// The record batch must contains all columns.
 fn sort_record_batch(metadata: &RegionMetadata, record_batch: &RecordBatch) -> Result<RecordBatch> {
-    let sort_exprs = sort_expressions(metadata);
+    let sort_exprs = sort_expressions(metadata, None);
     sort_batch(&record_batch, &sort_exprs, None).context(SortBatchSnafu)
 }
 

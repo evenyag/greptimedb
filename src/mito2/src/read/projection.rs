@@ -503,12 +503,13 @@ impl PlainProjectionMapper {
         if is_empty_projection {
             // If the projection is empty, we still read the time index column.
             let column_ids = vec![metadata.time_index_column().column_id];
+            let batch_schema = plain_projected_columns(metadata, &column_ids);
             // If projection is empty, we don't output any column.
             return Ok(PlainProjectionMapper {
                 metadata: metadata.clone(),
                 output_schema: Arc::new(Schema::new(vec![])),
                 column_ids,
-                batch_schema: vec![],
+                batch_schema,
                 is_empty_projection,
                 batch_indices: vec![],
                 column_id_to_projected_index: HashMap::new(),
@@ -586,6 +587,7 @@ impl PlainProjectionMapper {
                 .copied()
                 .chain([metadata.time_index_column().column_id])
                 .collect();
+            let batch_schema = plain_projected_columns(metadata, &column_ids);
             let column_id_to_projected_index =
                 Self::build_column_id_to_projected_index(metadata, &column_ids);
 
@@ -594,7 +596,7 @@ impl PlainProjectionMapper {
                 metadata: metadata.clone(),
                 output_schema: Arc::new(Schema::new(vec![])),
                 column_ids,
-                batch_schema: vec![],
+                batch_schema,
                 is_empty_projection,
                 batch_indices: vec![],
                 column_id_to_projected_index,

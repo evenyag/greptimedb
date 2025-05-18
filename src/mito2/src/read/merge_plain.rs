@@ -26,7 +26,7 @@ use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use datatypes::arrow::compute::SortOptions;
-use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::datatypes::{Schema, SchemaRef};
 use futures::TryStreamExt;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadata;
@@ -34,9 +34,10 @@ use store_api::storage::consts::SEQUENCE_COLUMN_NAME;
 
 use crate::error::{MergeStreamSnafu, Result};
 use crate::read::batch::plain::PlainBatch;
+use crate::read::projection::PlainProjectionMapper;
 use crate::read::{BoxedPlainBatchStream, Source};
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::to_plain_sst_arrow_schema;
+use crate::sst::{plain_internal_fields, to_plain_sst_arrow_schema};
 
 pub(crate) enum PlainSource {
     Stream(BoxedPlainBatchStream),
@@ -64,14 +65,31 @@ impl PlainSource {
 pub(crate) fn merge_plain(
     metadata: &RegionMetadata,
     sources: Vec<PlainSource>,
+    mapper: Option<&PlainProjectionMapper>,
 ) -> Result<BoxedPlainBatchStream> {
     // TODO(yingwen): Can we pass the schema as an argument?
-    let schema = to_plain_sst_arrow_schema(metadata);
+    let schema = match mapper {
+        Some(mapper) => {
+            let batch_schema = mapper.batch_schema();
+            let fields: Vec<_> = batch_schema
+                .iter()
+                .map(|(id, _)| {
+                    let index = metadata.column_index_by_id(*id).unwrap();
+                    metadata.schema.arrow_schema().fields[index].clone()
+                })
+                .chain(plain_internal_fields())
+                .collect();
+            Arc::new(Schema::new(fields))
+        }
+        None => to_plain_sst_arrow_schema(metadata),
+    };
     let streams = sources
         .into_iter()
         .map(|source| plain_source_to_stream(source, &schema))
         .collect();
-    let exprs = sort_expressions(metadata);
+    let exprs = sort_expressions(metadata, mapper);
+
+    common_telemetry::info!("Merge plain, exprs: {:?}, schema: {:?}", exprs, schema);
 
     let memory_pool = Arc::new(UnboundedMemoryPool::default()) as _;
     let reservation = MemoryConsumer::new("merge_plain").register(&memory_pool);
@@ -118,21 +136,44 @@ fn plain_source_to_stream(
 /// Builds the sort expressions from the region metadata
 /// to sort by:
 /// (primary key ASC, time index ASC, sequence DESC)
-pub(crate) fn sort_expressions(metadata: &RegionMetadata) -> LexOrdering {
+pub(crate) fn sort_expressions(
+    metadata: &RegionMetadata,
+    mapper: Option<&PlainProjectionMapper>,
+) -> LexOrdering {
+    // TODO(yingwen): Error handling.
+    // TODO(yingwen): Return time index column id from metadata.
+    let time_index_pos = match mapper {
+        Some(mapper) => mapper
+            .projected_index_by_id(metadata.time_index_column().column_id)
+            .unwrap(),
+        None => metadata.time_index_column_pos(),
+    };
     let time_index_expr = create_sort_expr(
         &metadata.time_index_column().column_schema.name,
-        metadata.time_index_column_pos(),
+        time_index_pos,
         false,
     );
-    let sequence_expr =
-        create_sort_expr(SEQUENCE_COLUMN_NAME, metadata.column_metadatas.len(), true);
+    let sequence_index = match mapper {
+        Some(mapper) => mapper.batch_schema().len(),
+        None => metadata.column_metadatas.len(),
+    };
+    let sequence_expr = create_sort_expr(SEQUENCE_COLUMN_NAME, sequence_index, true);
+
+    common_telemetry::info!(
+        "Sort exprs, time_index_pos: {}, sequence_index: {}",
+        time_index_pos,
+        sequence_index
+    );
 
     let exprs = metadata
         .primary_key
         .iter()
         .map(|id| {
             // Safety: We know the primary key exists in the metadata
-            let index = metadata.column_index_by_id(*id).unwrap();
+            let index = match mapper {
+                Some(mapper) => mapper.projected_index_by_id(*id).unwrap(),
+                None => metadata.column_index_by_id(*id).unwrap(),
+            };
             let col_meta = &metadata.column_metadatas[index];
             create_sort_expr(&col_meta.column_schema.name, index, false)
         })
