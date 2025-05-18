@@ -107,6 +107,11 @@ impl PlainBatch {
         Ok(Self::new(record_batch))
     }
 
+    /// Slice the batch.
+    pub(crate) fn slice(&self, offset: usize, length: usize) -> Self {
+        Self::new(self.record_batch.slice(offset, length))
+    }
+
     /// Returns the column index of the sequence column.
     pub(crate) fn sequence_column_index(&self) -> usize {
         self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM
