@@ -38,7 +38,7 @@ use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::dedup_plain::{PlainDedupReader, PlainLastNonNull, PlainLastRow};
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
-use crate::read::merge_plain::{merge_plain, PlainSource};
+use crate::read::merge_plain::{merge_plain, merge_plain_by_reader, PlainSource};
 use crate::read::range::RangeBuilderList;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
@@ -489,7 +489,9 @@ impl SeqScan {
 
         let metadata = stream_ctx.input.mapper.metadata();
         let sources = sources.into_iter().map(PlainSource::from_source).collect();
-        let stream = merge_plain(metadata, sources, Some(stream_ctx.input.mapper.as_plain()))?;
+        // let stream = merge_plain(metadata, sources, Some(stream_ctx.input.mapper.as_plain()))?;
+        let stream =
+            merge_plain_by_reader(metadata, sources, stream_ctx.input.mapper.as_plain()).await?;
         if stream_ctx.input.append_mode {
             return Ok(Source::PlainStream(stream));
         }

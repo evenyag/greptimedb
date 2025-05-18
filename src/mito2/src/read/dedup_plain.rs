@@ -135,7 +135,7 @@ pub(crate) trait PlainDedupStrategy: Send {
 
 /// Returns true if the left row at `left` and the right row at `righ` has the same key.
 /// The key columns are compared in the order of `key_indices`.
-fn has_same_key(
+pub(crate) fn has_same_key(
     key_indices: &[usize],
     left: &RecordBatch,
     left_row_idx: usize,
