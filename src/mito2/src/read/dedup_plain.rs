@@ -80,12 +80,20 @@ impl<
     /// Returns the next deduplicated batch.
     async fn fetch_next_batch(&mut self) -> Result<Option<PlainBatch>> {
         while let Some(batch) = self.source.try_next().await? {
+            self.metrics.num_input_rows += batch.num_rows();
             if let Some(batch) = self.strategy.push_batch(batch, &mut self.metrics)? {
+                self.metrics.num_output_rows += batch.num_rows();
                 return Ok(Some(batch));
             }
         }
 
-        self.strategy.finish(&mut self.metrics)
+        let output = self.strategy.finish(&mut self.metrics)?;
+        if let Some(output) = output {
+            self.metrics.num_output_rows += output.num_rows();
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -104,10 +112,10 @@ impl<R, S> Drop for PlainDedupReader<R, S> {
 
         MERGE_FILTER_ROWS_TOTAL
             .with_label_values(&["dedup"])
-            .inc_by(self.metrics.num_unselected_rows as u64);
+            .inc_by(self.metrics.num_input_rows as u64 - self.metrics.num_output_rows as u64);
         MERGE_FILTER_ROWS_TOTAL
             .with_label_values(&["delete"])
-            .inc_by(self.metrics.num_unselected_rows as u64);
+            .inc_by(self.metrics.num_deleted_rows as u64);
     }
 }
 
@@ -517,8 +525,10 @@ fn filter_deleted_from_batch(batch: PlainBatch, metrics: &mut DedupMetrics) -> R
 /// Metrics for deduplication.
 #[derive(Debug, Default)]
 pub(crate) struct DedupMetrics {
-    /// Number of rows removed during deduplication.
-    pub(crate) num_unselected_rows: usize,
+    /// Number of input rows.
+    pub(crate) num_input_rows: usize,
+    /// Number of output rows.
+    pub(crate) num_output_rows: usize,
     /// Number of deleted rows.
     pub(crate) num_deleted_rows: usize,
 }
