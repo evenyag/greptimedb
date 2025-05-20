@@ -17,14 +17,16 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use api::v1::OpType;
 use async_stream::try_stream;
 use common_telemetry::debug;
 use datatypes::arrow::array::{
-    make_comparator, Array, ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    make_comparator, Array, ArrayRef, BooleanArray, BooleanBufferBuilder,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt64Array, UInt8Array,
 };
 use datatypes::arrow::buffer::BooleanBuffer;
-use datatypes::arrow::compute::kernels::cmp::distinct;
+use datatypes::arrow::compute::kernels::cmp::{distinct, neq};
 use datatypes::arrow::compute::{
     concat_batches, partition, take_record_batch, Partitions, SortOptions, TakeOptions,
 };
@@ -328,9 +330,8 @@ impl PlainDedupStrategy for PlainLastRow {
             last_batch: batch.clone(),
         });
 
-        // FIXME(yingwen): filter deleted
-        let batch = PlainBatch::new(batch);
-        Ok(Some(batch))
+        // Filters deleted rows at last.
+        maybe_filter_deleted(batch, self.filter_deleted, metrics)
     }
 
     // fn push_batch(
@@ -468,17 +469,50 @@ fn find_boundaries(v: &dyn Array) -> Result<BooleanBuffer, ArrowError> {
     Ok((0..slice_len).map(|i| !cmp(i, i).is_eq()).collect())
 }
 
-// /// Removes deleted rows from the batch and updates metrics.
-// fn filter_deleted_from_batch(batch: &mut Batch, metrics: &mut DedupMetrics) -> Result<()> {
-//     let num_rows = batch.num_rows();
-//     batch.filter_deleted()?;
-//     let num_rows_after_filter = batch.num_rows();
-//     let num_deleted = num_rows - num_rows_after_filter;
-//     metrics.num_deleted_rows += num_deleted;
-//     metrics.num_unselected_rows += num_deleted;
+/// Filters deleted rows from the record batch if `filter_deleted` is true.
+fn maybe_filter_deleted(
+    record_batch: RecordBatch,
+    filter_deleted: bool,
+    metrics: &mut DedupMetrics,
+) -> Result<Option<PlainBatch>> {
+    if !filter_deleted {
+        return Ok(None);
+    }
+    let batch = filter_deleted_from_batch(PlainBatch::new(record_batch), metrics)?;
+    Ok(Some(batch))
+}
 
-//     Ok(())
-// }
+/// Removes deleted rows from the batch and updates metrics.
+fn filter_deleted_from_batch(batch: PlainBatch, metrics: &mut DedupMetrics) -> Result<PlainBatch> {
+    let num_rows = batch.num_rows();
+    let op_type_column = batch.op_type_column();
+    // Safety: The column should be op type.
+    let op_types = op_type_column
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    let has_delete = op_types
+        .values()
+        .iter()
+        .any(|op_type| *op_type != OpType::Put as u8);
+    if !has_delete {
+        return Ok(batch);
+    }
+
+    let mut builder = BooleanBufferBuilder::new(op_types.len());
+    for op_type in op_types.values() {
+        if *op_type == OpType::Delete as u8 {
+            builder.append(false);
+        } else {
+            builder.append(true);
+        }
+    }
+    let predicate = BooleanArray::new(builder.into(), None);
+    let new_batch = batch.filter(&predicate)?;
+    metrics.num_deleted_rows += num_rows - new_batch.num_rows();
+
+    Ok(new_batch)
+}
 
 /// Metrics for deduplication.
 #[derive(Debug, Default)]
@@ -721,7 +755,7 @@ impl PlainDedupStrategy for PlainLastNonNull {
             debug_assert!(record_batch.num_rows() > 0);
             self.buffer = BatchLastRow::try_new(record_batch);
 
-            return Ok(Some(PlainBatch::new(buffer.last_batch)));
+            return maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics);
         }
 
         // The next batch has duplicated rows.
@@ -729,7 +763,8 @@ impl PlainDedupStrategy for PlainLastNonNull {
         let output = if buffer.last_batch.num_rows() > 1 {
             let dedup_batch = buffer.last_batch.slice(0, buffer.last_batch.num_rows() - 1);
             debug_assert_eq!(buffer.last_batch.num_rows() - 1, dedup_batch.num_rows());
-            Some(PlainBatch::new(dedup_batch))
+
+            maybe_filter_deleted(dedup_batch, self.filter_deleted, metrics)?
         } else {
             None
         };
@@ -752,7 +787,7 @@ impl PlainDedupStrategy for PlainLastNonNull {
             return Ok(None);
         };
 
-        Ok(Some(PlainBatch::new(buffer.last_batch)))
+        maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics)
     }
 }
 
