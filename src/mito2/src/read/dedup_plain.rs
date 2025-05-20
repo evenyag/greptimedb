@@ -484,7 +484,7 @@ fn maybe_filter_deleted(
     metrics: &mut DedupMetrics,
 ) -> Result<Option<PlainBatch>> {
     if !filter_deleted {
-        return Ok(None);
+        return Ok(Some(PlainBatch::new(record_batch)));
     }
     let batch = filter_deleted_from_batch(PlainBatch::new(record_batch), metrics)?;
     Ok(Some(batch))

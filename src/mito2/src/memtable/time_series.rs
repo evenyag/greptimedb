@@ -790,11 +790,6 @@ impl ValueBuilder {
                 if let Some(field) = self.fields[idx].as_mut() {
                     let _ = field.try_push_value_ref(field_value);
                 } else {
-                    common_telemetry::info!(
-                        "Creating mutable vector for field {}, capacity {}",
-                        idx,
-                        num_rows.max(INITIAL_BUILDER_CAPACITY)
-                    );
                     let mut mutable_vector = self.field_types[idx]
                         .create_mutable_vector(num_rows.max(INITIAL_BUILDER_CAPACITY));
                     mutable_vector.push_nulls(num_rows - 1);
