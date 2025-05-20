@@ -42,9 +42,7 @@ use crate::error::{InvalidParquetSnafu, NewRecordBatchSnafu, Result};
 use crate::read::batch::plain::PlainBatch;
 use crate::sst::file::{FileId, FileMeta, FileTimeRange};
 use crate::sst::parquet::format::StatValues;
-use crate::sst::{
-    to_plain_sst_arrow_schema, to_plain_sst_arrow_schema_for_read, to_sst_arrow_schema,
-};
+use crate::sst::{to_plain_sst_arrow_schema, to_sst_arrow_schema};
 
 /// Number of columns that have fixed positions.
 ///
@@ -126,7 +124,7 @@ impl PlainReadFormat {
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
     ) -> PlainReadFormat {
-        let arrow_schema = to_plain_sst_arrow_schema_for_read(&metadata);
+        let arrow_schema = to_plain_sst_arrow_schema(&metadata);
 
         // Maps column id of a projected column to its index in SST.
         // The metadata and the SST have the same column order.
