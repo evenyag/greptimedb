@@ -116,6 +116,12 @@ impl PlainBatch {
     pub(crate) fn sequence_column_index(&self) -> usize {
         self.record_batch.num_columns() - PLAIN_FIXED_POS_COLUMN_NUM
     }
+
+    /// Returns the op types array.
+    pub(crate) fn op_type_column(&self) -> &ArrayRef {
+        self.record_batch
+            .column(self.record_batch.num_columns() - 1)
+    }
 }
 
 /// Fill default values for the batch.
