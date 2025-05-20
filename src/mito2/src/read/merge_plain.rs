@@ -43,7 +43,10 @@ use crate::read::batch::plain::PlainBatch;
 use crate::read::projection::PlainProjectionMapper;
 use crate::read::{BoxedPlainBatchStream, Source};
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::{plain_internal_fields, to_plain_sst_arrow_schema};
+use crate::sst::{
+    plain_column_metadata_to_field_for_read, plain_internal_fields, to_plain_sst_arrow_schema,
+    to_plain_sst_arrow_schema_for_read,
+};
 
 pub(crate) enum PlainSource {
     Stream(BoxedPlainBatchStream),
@@ -88,13 +91,13 @@ pub(crate) fn merge_plain(
                 .iter()
                 .map(|(id, _)| {
                     let index = metadata.column_index_by_id(*id).unwrap();
-                    metadata.schema.arrow_schema().fields[index].clone()
+                    plain_column_metadata_to_field_for_read(metadata, index)
                 })
                 .chain(plain_internal_fields())
                 .collect();
             Arc::new(Schema::new(fields))
         }
-        None => to_plain_sst_arrow_schema(metadata),
+        None => to_plain_sst_arrow_schema_for_read(metadata),
     };
     let streams = sources
         .into_iter()
