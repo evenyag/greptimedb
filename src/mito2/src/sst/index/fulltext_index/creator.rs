@@ -406,7 +406,7 @@ impl AltFulltextCreator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use api::v1::SemanticType;
@@ -623,7 +623,7 @@ mod tests {
             let object_store = object_store.clone();
             let factory = factory.clone();
 
-            let mut requests: HashMap<ColumnId, FulltextRequest> = HashMap::new();
+            let mut requests: BTreeMap<ColumnId, FulltextRequest> = BTreeMap::new();
 
             // Add queries
             for (column_id, query) in queries {
