@@ -41,7 +41,7 @@ use crate::sst::to_plain_sst_arrow_schema;
 /// It is a wrapper around [RecordBatch] that provides additional functionality for multi-series data.
 /// The columns order is the same as the order of the columns read the SST.
 /// It also contains the internal columns.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlainBatch {
     /// The original record batch.
     record_batch: RecordBatch,

@@ -409,8 +409,12 @@ impl Drop for PlainMergeReader {
 /// Splits batches in the source by the time index.
 fn split_by_timestamp(mut source: Source, timestamp_index: usize) -> Source {
     let stream = try_stream! {
+        let mut input_rows = 0;
+        let mut output_rows = 0;
         while let Some(batch) = source.next_plain_batch().await? {
+            input_rows += batch.num_rows();
             if batch.num_rows() < 2 {
+                output_rows += batch.num_rows();
                 yield batch;
                 continue;
             }
@@ -423,15 +427,19 @@ fn split_by_timestamp(mut source: Source, timestamp_index: usize) -> Source {
                 if timestamps[next_idx - 1] > timestamps[next_idx] {
                     let length = next_idx - offset;
                     let left = batch.slice(offset, length);
+                    output_rows += left.num_rows();
                     yield left;
                     offset = next_idx;
                 }
             }
             if offset < timestamps.len() {
                 let remain = batch.slice(offset, timestamps.len() - offset);
+                output_rows += remain.num_rows();
                 yield remain
             }
         }
+
+        assert_eq!(input_rows, output_rows);
     };
 
     Source::PlainStream(Box::pin(stream))
@@ -439,7 +447,7 @@ fn split_by_timestamp(mut source: Source, timestamp_index: usize) -> Source {
 
 impl PlainMergeReader {
     /// Creates and initializes a new [MergeReader].
-    pub async fn new(
+    pub(crate) async fn new(
         sources: Vec<Source>,
         sort_indices: Arc<SortIndices>,
     ) -> Result<PlainMergeReader> {
@@ -826,5 +834,174 @@ impl Ord for CompareFirst {
                 self.indices
                     .compare_sequence(&other.batch, 0, &self.batch, 0)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datatypes::arrow::array::{
+        Int64Array, StringArray, TimestampMillisecondArray, UInt64Array, UInt8Array,
+    };
+    use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datatypes::arrow::record_batch::RecordBatch;
+    use store_api::storage::consts::OP_TYPE_COLUMN_NAME;
+
+    use super::*;
+    use crate::read::batch::plain::PlainBatch;
+
+    #[tokio::test]
+    async fn test_plain_merge_reader_empty() {
+        // For empty sources, verify reader returns None
+        let sources = Vec::new();
+        let sort_indices = Arc::new(SortIndices {
+            pk_indices: vec![0],
+            timestamp_index: 2, // timestamp is at index 2 in our test schema
+        });
+
+        let mut reader = PlainMergeReader::new(sources, sort_indices).await.unwrap();
+        assert!(reader.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_merge_non_overlapping() {
+        // Create sources
+        let source1 = create_source(&[
+            new_plain_batch(&["key1", "key1"], &[1, 2], &[11, 12], &[21, 22]),
+            new_plain_batch(&["key1", "key1"], &[7, 8], &[17, 18], &[27, 28]),
+            new_plain_batch(&["key2", "key2"], &[2, 3], &[12, 13], &[22, 23]),
+        ]);
+        let source2 = create_source(&[new_plain_batch(
+            &["key1", "key1"],
+            &[4, 5],
+            &[14, 15],
+            &[24, 25],
+        )]);
+
+        let sources = vec![source1, source2];
+
+        // Create sort indices
+        let sort_indices = Arc::new(SortIndices {
+            pk_indices: vec![0],
+            timestamp_index: 2, // timestamp is at index 2 in our test schema
+        });
+
+        let mut reader = PlainMergeReader::new(sources, sort_indices).await.unwrap();
+        check_reader_result(
+            &mut reader,
+            &[
+                new_plain_batch(&["key1", "key1"], &[1, 2], &[11, 12], &[21, 22]),
+                new_plain_batch(&["key1", "key1"], &[4, 5], &[14, 15], &[24, 25]),
+                new_plain_batch(&["key1", "key1"], &[7, 8], &[17, 18], &[27, 28]),
+                new_plain_batch(&["key2", "key2"], &[2, 3], &[12, 13], &[22, 23]),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_merge_reheap_hot() {
+        // Create sources
+        let source1 = create_source(&[
+            new_plain_batch(&["key1", "key1"], &[1, 3], &[10, 10], &[21, 23]),
+            new_plain_batch(&["key2"], &[3], &[10], &[23]),
+        ]);
+        let source2 = create_source(&[new_plain_batch(
+            &["key1", "key1"],
+            &[2, 4],
+            &[11, 11],
+            &[32, 34],
+        )]);
+
+        let sources = vec![source1, source2];
+
+        // Create sort indices
+        let sort_indices = Arc::new(SortIndices {
+            pk_indices: vec![0],
+            timestamp_index: 2, // timestamp is at index 2 in our test schema
+        });
+
+        let mut reader = PlainMergeReader::new(sources, sort_indices).await.unwrap();
+        check_reader_result(
+            &mut reader,
+            &[
+                new_plain_batch(&["key1"], &[1], &[10], &[21]),
+                new_plain_batch(&["key1"], &[2], &[11], &[32]),
+                new_plain_batch(&["key1"], &[3], &[10], &[23]),
+                new_plain_batch(&["key1"], &[4], &[11], &[34]),
+                new_plain_batch(&["key2"], &[3], &[10], &[23]),
+            ],
+        )
+        .await;
+    }
+
+    /// Creates a new PlainBatch for testing
+    fn new_plain_batch(
+        pks: &[&str],
+        timestamps: &[i64],
+        sequences: &[u64],
+        values: &[i64],
+    ) -> PlainBatch {
+        assert_eq!(pks.len(), timestamps.len());
+        assert_eq!(timestamps.len(), sequences.len());
+        assert_eq!(sequences.len(), values.len());
+
+        // Create schema
+        let schema = SchemaRef::new(Schema::new(vec![
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(datatypes::arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(SEQUENCE_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(OP_TYPE_COLUMN_NAME, DataType::UInt8, false),
+        ]));
+
+        // Create arrays
+        let pk_array = StringArray::from(pks.iter().cloned().collect::<Vec<_>>());
+        let val_array = Int64Array::from(values.iter().cloned().collect::<Vec<_>>());
+        let ts_array = TimestampMillisecondArray::from_iter_values(timestamps.iter().copied());
+        let seq_array = UInt64Array::from_iter_values(sequences.iter().copied());
+        // Always use Put operation for simplicity
+        let op_array = UInt8Array::from_iter_values(
+            std::iter::repeat(api::v1::OpType::Put as u8).take(pks.len()),
+        );
+
+        // Create record batch
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(pk_array),
+                Arc::new(val_array),
+                Arc::new(ts_array),
+                Arc::new(seq_array),
+                Arc::new(op_array),
+            ],
+        )
+        .unwrap();
+
+        PlainBatch::new(record_batch)
+    }
+
+    // Helper function to create a test source from slice of batches
+    fn create_source(batches: &[PlainBatch]) -> Source {
+        let batches = batches.iter().cloned().map(Ok).collect::<Vec<_>>();
+        let stream = futures::stream::iter(batches);
+
+        // Create the source
+        Source::PlainStream(Box::pin(stream))
+    }
+
+    /// Ensure the reader returns batch as `expect`.
+    async fn check_reader_result(reader: &mut PlainMergeReader, expect: &[PlainBatch]) {
+        let mut result = Vec::new();
+        while let Some(batch) = reader.next_batch().await.unwrap() {
+            result.push(batch);
+        }
+
+        assert_eq!(expect, result);
     }
 }
