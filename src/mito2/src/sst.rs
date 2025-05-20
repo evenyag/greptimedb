@@ -21,7 +21,7 @@ use common_base::readable_size::ReadableSize;
 use datatypes::arrow::datatypes::{
     DataType as ArrowDataType, Field, FieldRef, Fields, Schema, SchemaRef,
 };
-use store_api::metadata::RegionMetadata;
+use store_api::metadata::{ColumnMetadata, RegionMetadata};
 use store_api::storage::consts::{
     OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
 };
@@ -95,6 +95,36 @@ pub fn to_plain_sst_arrow_schema(metadata: &RegionMetadata) -> SchemaRef {
     );
 
     Arc::new(Schema::new(fields))
+}
+
+/// Gets the arrow schema to store in parquet.
+pub(crate) fn to_plain_sst_arrow_schema_for_read(metadata: &RegionMetadata) -> SchemaRef {
+    // TODO(yingwen): Maybe we should check this via dictionary page.
+    let fields = (0..metadata.column_metadatas.len())
+        .map(|i| plain_column_metadata_to_field_for_read(metadata, i))
+        .chain(plain_internal_fields());
+
+    let fields = Fields::from_iter(fields);
+
+    Arc::new(Schema::new(fields))
+}
+
+pub(crate) fn plain_column_metadata_to_field_for_read(
+    metadata: &RegionMetadata,
+    index: usize,
+) -> Arc<Field> {
+    let col = &metadata.column_metadatas[index];
+    let field = &metadata.schema.arrow_schema().fields[index];
+    if col.semantic_type == SemanticType::Tag {
+        Arc::new(Field::new_dictionary(
+            field.name(),
+            ArrowDataType::UInt32,
+            field.data_type().clone(),
+            field.is_nullable(),
+        ))
+    } else {
+        field.clone()
+    }
 }
 
 /// Fields for internal columns.
