@@ -114,7 +114,7 @@ pub(crate) fn merge_plain(
         .with_expressions(&exprs)
         .with_batch_size(DEFAULT_READ_BATCH_SIZE)
         .with_reservation(reservation)
-        .with_metrics(baseline_metrics)
+        .with_metrics(baseline_metrics.clone())
         .build()
         .context(MergeStreamSnafu)?;
 
@@ -122,6 +122,8 @@ pub(crate) fn merge_plain(
         while let Some(record_batch) = stream.try_next().await.context(MergeStreamSnafu)? {
             yield PlainBatch::new(record_batch);
         }
+
+        common_telemetry::info!("Merge plain, output_rows: {}, elapsed_compute: {}", baseline_metrics.output_rows(), baseline_metrics.elapsed_compute());
     };
 
     Ok(Box::pin(stream))
@@ -153,13 +155,20 @@ fn plain_source_to_stream(
     schema: &SchemaRef,
 ) -> SendableRecordBatchStream {
     let stream = try_stream! {
+        let mut fetch_start = Instant::now();
+        let mut fetch_cost = Duration::ZERO;
         while let Some(batch) = source
             .next_batch()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
+            fetch_cost += fetch_start.elapsed();
             yield batch.into_record_batch();
+            fetch_start = Instant::now();
         }
+        fetch_cost += fetch_start.elapsed();
+
+        common_telemetry::info!("plain source to stream, fetch cost: {:?}", fetch_cost);
     };
 
     let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
