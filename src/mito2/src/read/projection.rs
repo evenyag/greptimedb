@@ -484,7 +484,6 @@ pub struct PlainProjectionMapper {
     batch_indices: Vec<usize>,
     /// Column id to their index in the projected schema (
     /// the schema after projection).
-    /// Only sets it in when using the primary key.
     column_id_to_projected_index: HashMap<ColumnId, usize>,
 }
 
@@ -504,6 +503,8 @@ impl PlainProjectionMapper {
             // If the projection is empty, we still read the time index column.
             let column_ids = vec![metadata.time_index_column().column_id];
             let batch_schema = plain_projected_columns(metadata, &column_ids);
+            let column_id_to_projected_index =
+                Self::build_column_id_to_projected_index(metadata, &column_ids);
             // If projection is empty, we don't output any column.
             return Ok(PlainProjectionMapper {
                 metadata: metadata.clone(),
@@ -512,7 +513,7 @@ impl PlainProjectionMapper {
                 batch_schema,
                 is_empty_projection,
                 batch_indices: vec![],
-                column_id_to_projected_index: HashMap::new(),
+                column_id_to_projected_index,
             });
         }
 
@@ -557,6 +558,8 @@ impl PlainProjectionMapper {
             })
             .collect();
         let batch_schema = plain_projected_columns(metadata, &column_ids);
+        let column_id_to_projected_index =
+            Self::build_column_id_to_projected_index(metadata, &column_ids);
 
         Ok(PlainProjectionMapper {
             metadata: metadata.clone(),
@@ -565,7 +568,7 @@ impl PlainProjectionMapper {
             batch_schema,
             is_empty_projection,
             batch_indices,
-            column_id_to_projected_index: HashMap::new(),
+            column_id_to_projected_index,
         })
     }
 
