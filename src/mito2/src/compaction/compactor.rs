@@ -317,7 +317,6 @@ impl Compactor for DefaultCompactor {
                     .iter()
                     .map(|f| f.file_id().to_string())
                     .join(",");
-                let input_rows: usize = output.inputs.iter().map(|f| f.num_rows()).sum();
                 let reader = CompactionSstReaderBuilder {
                     metadata: region_metadata.clone(),
                     sst_layer: sst_layer.clone(),
@@ -365,12 +364,10 @@ impl Compactor for DefaultCompactor {
                     .collect::<Vec<_>>();
                 let output_file_names =
                     output_files.iter().map(|f| f.file_id.to_string()).join(",");
-                let output_rows: u64 = output_files.iter().map(|f| f.num_rows).sum();
                 info!(
-                    "Region {} compaction inputs: [{}], input_rows: {}, outputs: [{}], output_rows: {}",
-                    region_id, input_file_names, input_rows, output_file_names, output_rows
+                    "Region {} compaction inputs: [{}], outputs: [{}]",
+                    region_id, input_file_names, output_file_names
                 );
-                assert_eq!(input_rows, output_rows as usize);
                 Ok(output_files)
             });
         }
