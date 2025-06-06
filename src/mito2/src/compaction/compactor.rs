@@ -315,6 +315,7 @@ impl Compactor for DefaultCompactor {
             let bloom_filter_index_config =
                 compaction_region.engine_config.bloom_filter_index.clone();
             let plain_format = compaction_region.engine_config.enable_plain_format;
+            let merge_by_series = compaction_region.engine_config.merge_by_series;
             let max_sequence = output
                 .inputs
                 .iter()
@@ -337,6 +338,7 @@ impl Compactor for DefaultCompactor {
                     time_range: output.output_time_range,
                     merge_mode,
                     plain_format,
+                    merge_by_series,
                 }
                 .build_sst_reader()
                 .await?;

@@ -489,9 +489,11 @@ impl SeqScan {
 
         let metadata = stream_ctx.input.mapper.metadata();
         let sources = sources.into_iter().map(PlainSource::from_source).collect();
-        let stream = merge_plain(metadata, sources, Some(stream_ctx.input.mapper.as_plain()))?;
-        // let stream =
-        //     merge_plain_by_reader(metadata, sources, stream_ctx.input.mapper.as_plain()).await?;
+        let stream = if stream_ctx.input.merge_by_series {
+            merge_plain_by_reader(metadata, sources, stream_ctx.input.mapper.as_plain()).await?
+        } else {
+            merge_plain(metadata, sources, Some(stream_ctx.input.mapper.as_plain()))?
+        };
         if stream_ctx.input.append_mode {
             return Ok(Source::PlainStream(stream));
         }

@@ -197,6 +197,8 @@ pub(crate) struct ScanRegion {
     start_time: Option<Instant>,
     /// Whether to use plain format.
     plain_format: bool,
+    /// Whether to merge by series.
+    merge_by_series: bool,
 }
 
 impl ScanRegion {
@@ -218,6 +220,7 @@ impl ScanRegion {
             ignore_bloom_filter: false,
             start_time: None,
             plain_format: false,
+            merge_by_series: false,
         }
     }
 
@@ -261,6 +264,12 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_plain_format(mut self, plain: bool) -> Self {
         self.plain_format = plain;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_merge_by_series(mut self, merge: bool) -> Self {
+        self.merge_by_series = merge;
         self
     }
 
@@ -437,7 +446,8 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
-            .with_plain_format(self.plain_format);
+            .with_plain_format(self.plain_format)
+            .with_merge_by_series(self.merge_by_series);
         Ok(input)
     }
 
@@ -622,6 +632,8 @@ pub(crate) struct ScanInput {
     pub(crate) distribution: Option<TimeSeriesDistribution>,
     /// Whether to read plain format.
     pub(crate) plain_format: bool,
+    /// Whether to merge by series.
+    pub(crate) merge_by_series: bool,
 }
 
 impl ScanInput {
@@ -648,6 +660,7 @@ impl ScanInput {
             series_row_selector: None,
             distribution: None,
             plain_format: false,
+            merge_by_series: false,
         }
     }
 
@@ -784,6 +797,13 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_plain_format(mut self, plain_format: bool) -> Self {
         self.plain_format = plain_format;
+        self
+    }
+
+    /// Sets whether to merge by series.
+    #[must_use]
+    pub(crate) fn with_merge_by_series(mut self, merge_by_series: bool) -> Self {
+        self.merge_by_series = merge_by_series;
         self
     }
 
@@ -1010,6 +1030,8 @@ impl StreamContext {
         if let Some(distribution) = &self.input.distribution {
             write!(f, ", \"distribution\":\"{}\"", distribution)?;
         }
+        write!(f, ", plain={}", self.input.plain_format)?;
+        write!(f, ", merge_by_series={}", self.input.merge_by_series)?;
 
         if verbose {
             self.format_verbose_content(f)?;

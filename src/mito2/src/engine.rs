@@ -486,7 +486,8 @@ impl EngineInner {
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
         .with_start_time(query_start)
-        .with_plain_format(self.config.enable_plain_format);
+        .with_plain_format(self.config.enable_plain_format)
+        .with_merge_by_series(self.config.merge_by_series);
 
         Ok(scan_region)
     }
