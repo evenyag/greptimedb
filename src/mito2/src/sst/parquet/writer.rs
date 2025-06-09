@@ -176,11 +176,15 @@ where
             let file_meta = current_writer.close().await.context(WriteParquetSnafu)?;
             let file_size = self.bytes_written.load(Ordering::Relaxed) as u64;
 
-            // Safety: num rows > 0 so we must have min/max.
-            let time_range = stats.time_range.unwrap();
-
             // convert FileMetaData to ParquetMetaData
             let parquet_metadata = parse_parquet_metadata(file_meta)?;
+            let file_id = self.current_file;
+            let time_range = parquet_time_range(file_id, &parquet_metadata, &self.metadata)
+                .with_context(|| InvalidParquetSnafu {
+                    file: file_id.to_string(),
+                    reason: "No time range statistics available",
+                })?;
+
             ssts.push(SstInfo {
                 file_id: self.current_file,
                 time_range,
@@ -312,6 +316,11 @@ where
                         .unwrap()
                         .update_plain(&batch)
                         .await;
+                    if let Some(max_file_size) = opts.max_file_size
+                        && self.bytes_written.load(Ordering::Relaxed) > max_file_size
+                    {
+                        self.finish_current_file(&mut results, &mut stats).await?;
+                    }
                 }
                 Err(e) => {
                     if let Some(indexer) = &mut self.current_indexer {
