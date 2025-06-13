@@ -701,7 +701,8 @@ fn build_sources_plain(
     for index in &range_meta.row_group_indices {
         let stream = if stream_ctx.is_mem_range_index(*index) {
             common_telemetry::error!("Memory range plain scan is not supported yet");
-            panic!("Memory range plain scan is not supported yet");
+            continue;
+            // panic!("Memory range plain scan is not supported yet");
         } else {
             let read_type = if compaction {
                 "compaction"

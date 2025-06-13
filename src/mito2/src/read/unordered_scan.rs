@@ -474,7 +474,8 @@ impl UnorderedScan {
             for index in &range_meta.row_group_indices {
                 if stream_ctx.is_mem_range_index(*index) {
                     common_telemetry::error!("Memory range plain scan is not supported yet");
-                    panic!("Memory range plain scan is not supported yet");
+                    continue;
+                    // panic!("Memory range plain scan is not supported yet");
                 } else {
                     let stream = scan_file_ranges_plain(
                         stream_ctx.clone(),
