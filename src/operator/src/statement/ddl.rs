@@ -1549,7 +1549,7 @@ impl StatementExecutor {
 }
 
 /// Parse partition statement [Partitions] into [MetaPartition] and partition columns.
-fn parse_partitions(
+pub(crate) fn parse_partitions(
     create_table: &CreateTableExpr,
     partitions: Option<Partitions>,
     query_ctx: &QueryContextRef,
@@ -1582,7 +1582,7 @@ fn parse_partitions(
     ))
 }
 
-fn create_table_info(
+pub(crate) fn create_table_info(
     create_table: &CreateTableExpr,
     partition_columns: Vec<String>,
 ) -> Result<RawTableInfo> {
