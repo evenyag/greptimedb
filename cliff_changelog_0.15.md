@@ -6,6 +6,7 @@ Release date: July 04, 2025
   * fix!: disable append mode in trace services table by [@zyy17](https://github.com/zyy17) in [#6066](https://github.com/GreptimeTeam/greptimedb/pull/6066)
   * feat!: revise compaction picker by [@v0y4g3r](https://github.com/v0y4g3r) in [#6121](https://github.com/GreptimeTeam/greptimedb/pull/6121)
   * refactor(cli)!: reorganize cli subcommands by [@paomian](https://github.com/paomian) in [#6265](https://github.com/GreptimeTeam/greptimedb/pull/6265)
+  * feat!: point matrix based partition rule checker by [@waynexia](https://github.com/waynexia) in [#6431](https://github.com/GreptimeTeam/greptimedb/pull/6431)
 
 ### 🚀 Features
     * feat: introduce `RegionStatAwareSelector` trait by [@WenyXu](https://github.com/WenyXu) in [#5990](https://github.com/GreptimeTeam/greptimedb/pull/5990)
@@ -84,8 +85,14 @@ Release date: July 04, 2025
     * feat(storage): Add skip_ssl_validation option for object storage HTTP client by [@rgidda](https://github.com/rgidda) in [#6358](https://github.com/GreptimeTeam/greptimedb/pull/6358)
     * feat: update dashboard to v0.10.0 by [@ZonaHex](https://github.com/ZonaHex) in [#6368](https://github.com/GreptimeTeam/greptimedb/pull/6368)
     * feat(pipeline): introduce pipeline doc version 2 for combine-transform by [@shuiyisong](https://github.com/shuiyisong) in [#6360](https://github.com/GreptimeTeam/greptimedb/pull/6360)
-    * feat: cherry-pick #6384 #6388 #6396 #6403 #6412 #6405 to 0.15 branch by [@evenyag](https://github.com/evenyag) in [#6414](https://github.com/GreptimeTeam/greptimedb/pull/6414)
-    * feat: pick #6416 to release/0.15 by [@zhongzc](https://github.com/zhongzc) in [#6445](https://github.com/GreptimeTeam/greptimedb/pull/6445)
+    * feat: supports CsvWithNames and CsvWithNamesAndTypes formats by [@killme2008](https://github.com/killme2008) in [#6384](https://github.com/GreptimeTeam/greptimedb/pull/6384)
+    * feat: introduce /v1/health for healthcheck from external by [@sunng87](https://github.com/sunng87) in [#6388](https://github.com/GreptimeTeam/greptimedb/pull/6388)
+    * feat: update dashboard to v0.10.1 by [@ZonaHex](https://github.com/ZonaHex) in [#6396](https://github.com/GreptimeTeam/greptimedb/pull/6396)
+    * feat: add `granularity` and `false_positive_rate` options for indexes by [@zhongzc](https://github.com/zhongzc) in [#6416](https://github.com/GreptimeTeam/greptimedb/pull/6416)
+    * feat: override logical table's partition key indices by [@fengjiachun](https://github.com/fengjiachun) in [#6385](https://github.com/GreptimeTeam/greptimedb/pull/6385)
+    * feat(pipeline): support Loki API by [@shuiyisong](https://github.com/shuiyisong) in [#6390](https://github.com/GreptimeTeam/greptimedb/pull/6390)
+    * feat: `Collider` for playing with `PartitionRule` by [@waynexia](https://github.com/waynexia) in [#6399](https://github.com/GreptimeTeam/greptimedb/pull/6399)
+    * feat: skip rule checker on ingestion by [@waynexia](https://github.com/waynexia) in [#6453](https://github.com/GreptimeTeam/greptimedb/pull/6453)
 
 ### 🐛 Bug Fixes
     * fix: check if memtable is empty by stats by [@v0y4g3r](https://github.com/v0y4g3r) in [#5989](https://github.com/GreptimeTeam/greptimedb/pull/5989)
@@ -152,6 +159,13 @@ Release date: July 04, 2025
     * fix(metric-engine): properly propagate errors during batch open operation by [@WenyXu](https://github.com/WenyXu) in [#6325](https://github.com/GreptimeTeam/greptimedb/pull/6325)
     * fix(meta): enhance mysql election client with timeouts and reconnection by [@WenyXu](https://github.com/WenyXu) in [#6341](https://github.com/GreptimeTeam/greptimedb/pull/6341)
     * fix: test test_tls_file_change_watch by [@killme2008](https://github.com/killme2008) in [#6366](https://github.com/GreptimeTeam/greptimedb/pull/6366)
+    * fix: complete partial index search results in cache by [@zhongzc](https://github.com/zhongzc) in [#6403](https://github.com/GreptimeTeam/greptimedb/pull/6403)
+    * fix: skip failing nodes when gathering porcess info by [@v0y4g3r](https://github.com/v0y4g3r) in [#6412](https://github.com/GreptimeTeam/greptimedb/pull/6412)
+    * fix: fix dest_keys chunks bug in TombstoneManager by [@WenyXu](https://github.com/WenyXu) in [#6432](https://github.com/GreptimeTeam/greptimedb/pull/6432)
+    * fix: correct MAX_EXECUTION_TIME timeout calculation by [@evenyag](https://github.com/evenyag) in [#6444](https://github.com/GreptimeTeam/greptimedb/pull/6444)
+    * fix: remap column indices on overriding logical table partitions by [@waynexia](https://github.com/waynexia) in [#6446](https://github.com/GreptimeTeam/greptimedb/pull/6446)
+    * fix: label_replace and label_join functions when used as sub‐expressions by [@killme2008](https://github.com/killme2008) in [#6443](https://github.com/GreptimeTeam/greptimedb/pull/6443)
+    * fix: enable max_execution time for other read only statements by [@evenyag](https://github.com/evenyag) in [#6454](https://github.com/GreptimeTeam/greptimedb/pull/6454)
 
 ### 🚜 Refactor
     * refactor: datanode instance builder by [@MichaelScofield](https://github.com/MichaelScofield) in [#6034](https://github.com/GreptimeTeam/greptimedb/pull/6034)
@@ -172,6 +186,8 @@ Release date: July 04, 2025
     * refactor: make metadata region option opt-in by [@sunng87](https://github.com/sunng87) in [#6350](https://github.com/GreptimeTeam/greptimedb/pull/6350)
     * refactor: make scanner creation async by [@MichaelScofield](https://github.com/MichaelScofield) in [#6349](https://github.com/GreptimeTeam/greptimedb/pull/6349)
     * refactor(cli): simplify metadata command parameters by [@WenyXu](https://github.com/WenyXu) in [#6364](https://github.com/GreptimeTeam/greptimedb/pull/6364)
+    * refactor: pass pipeline name through http header and get db from query context by [@zyy17](https://github.com/zyy17) in [#6405](https://github.com/GreptimeTeam/greptimedb/pull/6405)
+    * refactor: avoid adding feature to parameter by [@fengys1996](https://github.com/fengys1996) in [#6391](https://github.com/GreptimeTeam/greptimedb/pull/6391)
 
 ### ⚡ Performance
     * perf: avoid some atomic operation on array slice by [@waynexia](https://github.com/waynexia) in [#6101](https://github.com/GreptimeTeam/greptimedb/pull/6101)
@@ -254,9 +270,6 @@ Release date: July 04, 2025
     * chore: security updates by [@sunng87](https://github.com/sunng87) in [#6351](https://github.com/GreptimeTeam/greptimedb/pull/6351)
     * docs: added YouTube link to documentation by [@Olexandr88](https://github.com/Olexandr88) in [#6362](https://github.com/GreptimeTeam/greptimedb/pull/6362)
     * chore: prints a warning when skip_ssl_validation is true by [@evenyag](https://github.com/evenyag) in [#6367](https://github.com/GreptimeTeam/greptimedb/pull/6367)
-    * chore: cherry pick #6385, #6390, #6432, #6446, #6444 to 0.15 branch by [@evenyag](https://github.com/evenyag) in [#6447](https://github.com/GreptimeTeam/greptimedb/pull/6447)
-    * chore: cherry pick pr 6391 to release/v0.15 by [@fengys1996](https://github.com/fengys1996) in [#6449](https://github.com/GreptimeTeam/greptimedb/pull/6449)
-    * chore: pick #6399, #6443, #6431, #6453, #6454 to v0.15 by [@evenyag](https://github.com/evenyag) in [#6455](https://github.com/GreptimeTeam/greptimedb/pull/6455)
 
 ## New Contributors
   * [@omahs](https://github.com/omahs) made their first contribution in [#6084](https://github.com/GreptimeTeam/greptimedb/pull/6084)

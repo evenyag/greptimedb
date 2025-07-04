@@ -53,12 +53,12 @@ The script detects entries like:
 And expands them to:
 
 ```markdown
-* feat: supports CsvWithNames and CsvWithNamesAndTypes formats by [@killme2008](https://github.com/killme2008) in [#6384](https://github.com/GreptimeTeam/greptimedb/pull/6384)
-* feat: introduce /v1/health for healthcheck from external by [@sunng87](https://github.com/sunng87) in [#6388](https://github.com/GreptimeTeam/greptimedb/pull/6388)
-* feat: update dashboard to v0.10.1 by [@ZonaHex](https://github.com/ZonaHex) in [#6396](https://github.com/GreptimeTeam/greptimedb/pull/6396)
-* fix: complete partial index search results in cache by [@zhongzc](https://github.com/zhongzc) in [#6403](https://github.com/GreptimeTeam/greptimedb/pull/6403)
-* refactor: pass pipeline name through http header and get db from query context by [@zyy17](https://github.com/zyy17) in [#6405](https://github.com/GreptimeTeam/greptimedb/pull/6405)
-* fix: skip failing nodes when gathering porcess info by [@v0y4g3r](https://github.com/v0y4g3r) in [#6412](https://github.com/GreptimeTeam/greptimedb/pull/6412)
+* feat: supports CsvWithNames and CsvWithNamesAndTypes formats by @killme2008 in https://github.com/GreptimeTeam/greptimedb/pull/6384
+* feat: introduce /v1/health for healthcheck from external by @sunng87 in https://github.com/GreptimeTeam/greptimedb/pull/6388
+* feat: update dashboard to v0.10.1 by @ZonaHex in https://github.com/GreptimeTeam/greptimedb/pull/6396
+* fix: complete partial index search results in cache by @zhongzc in https://github.com/GreptimeTeam/greptimedb/pull/6403
+* refactor: pass pipeline name through http header and get db from query context by @zyy17 in https://github.com/GreptimeTeam/greptimedb/pull/6405
+* fix: skip failing nodes when gathering porcess info by @v0y4g3r in https://github.com/GreptimeTeam/greptimedb/pull/6412
 ```
 
 ## Processing Output

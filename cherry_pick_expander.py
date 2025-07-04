@@ -168,15 +168,15 @@ class CherryPickExpander:
                 try:
                     pr_info = self.get_pr_info(pr_number)
                     
-                    # Format as changelog entry
-                    changelog_entry = f"* {pr_info.title} by [@{pr_info.author}](https://github.com/{pr_info.author}) in [#{pr_info.number}](https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr_info.number})"
+                    # Format as changelog entry (match original GitHub format)
+                    changelog_entry = f"* {pr_info.title} by @{pr_info.author} in https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr_info.number}"
                     replacement_entries.append(changelog_entry)
                     print(f"    → {pr_info.title} by @{pr_info.author} in #{pr_info.number}")
                     
                 except Exception as e:
                     print(f"    Error processing PR #{pr_number}: {e}")
                     # Add a placeholder entry
-                    changelog_entry = f"* PR #{pr_number} (could not fetch details) by [@unknown](https://github.com/unknown) in [#{pr_number}](https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr_number})"
+                    changelog_entry = f"* PR #{pr_number} (could not fetch details) by @unknown in https://github.com/{self.repo_owner}/{self.repo_name}/pull/{pr_number}"
                     replacement_entries.append(changelog_entry)
                     print(f"    → PR #{pr_number} (could not fetch details)")
             
