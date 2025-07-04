@@ -2,7 +2,7 @@
 
 Release date: July 04, 2025
 
-## Breaking changes
+### Breaking changes
 * fix!: disable append mode in trace services table by [@zyy17](https://github.com/zyy17) in [#6066](https://github.com/GreptimeTeam/greptimedb/pull/6066)
 * feat!: revise compaction picker by [@v0y4g3r](https://github.com/v0y4g3r) in [#6121](https://github.com/GreptimeTeam/greptimedb/pull/6121)
 * refactor(cli)!: reorganize cli subcommands by [@paomian](https://github.com/paomian) in [#6265](https://github.com/GreptimeTeam/greptimedb/pull/6265)
