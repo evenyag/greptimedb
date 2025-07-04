@@ -2,6 +2,27 @@
 
 Release date: July 04, 2025
 
+## 👍 Highlights
+
+- **Process Management**: Implements complete process management system with `ProcessManager`,
+`information_schema.process_list` table, process killing functionality, and MySQL client
+`Ctrl+C` support for query termination (#5865, #6309, #6320).
+
+- **Bulk Insert Performance**: Introducing `SimpleBulkMemtable` for tables without primary keys to
+accelerate bulk write operations (#6054).
+
+- **Partition Rule Checker**: Introduces a robust point matrix-based partition rule checker that
+ensures completeness and uniqueness, eliminating false negatives and providing better error
+messages with specific uncovered/overlapped value ranges (#6431).
+
+- **Pipeline Integration**: Adds pipeline support for Prometheus remote write and
+Loki API (#5981, #6390).
+
+- **VRL Processing**: Introduces Vector Remap Language (VRL) processor for advanced data
+transformation within pipelines, allowing users to write VRL scripts for flexible data
+processing (#6205).
+
+
 ## Breaking changes
   * fix!: disable append mode in trace services table by [@zyy17](https://github.com/zyy17) in [#6066](https://github.com/GreptimeTeam/greptimedb/pull/6066)
   * feat!: revise compaction picker by [@v0y4g3r](https://github.com/v0y4g3r) in [#6121](https://github.com/GreptimeTeam/greptimedb/pull/6121)
