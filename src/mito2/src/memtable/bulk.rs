@@ -29,6 +29,8 @@ use crate::memtable::{
 };
 
 #[allow(unused)]
+pub(crate) mod buffer;
+#[allow(unused)]
 mod context;
 #[allow(unused)]
 pub(crate) mod part;
