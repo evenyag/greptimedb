@@ -351,7 +351,8 @@ mod tests {
         assert_eq!(2, builder.len());
 
         let actual_vector = builder.finish().unwrap();
-        let expected_vector = Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000])) as VectorRef;
+        let expected_vector =
+            Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000])) as VectorRef;
         assert_eq!(expected_vector, actual_vector);
     }
 
@@ -413,7 +414,8 @@ mod tests {
         assert_eq!(3, builder.len());
 
         let actual_vector = builder.finish().unwrap();
-        let expected_vector = Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000, 3000])) as VectorRef;
+        let expected_vector =
+            Arc::new(TimestampMillisecondVector::from_vec(vec![1000, 2000, 3000])) as VectorRef;
         assert_eq!(expected_vector, actual_vector);
     }
 
@@ -535,7 +537,8 @@ mod tests {
         ts_builder.push_nulls(2);
 
         let actual_vector = ts_builder.finish().unwrap();
-        let expected_vector = Arc::new(TimestampMillisecondVector::from_vec(vec![0, 0])) as VectorRef;
+        let expected_vector =
+            Arc::new(TimestampMillisecondVector::from_vec(vec![0, 0])) as VectorRef;
         assert_eq!(expected_vector, actual_vector);
     }
 }

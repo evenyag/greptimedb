@@ -18,14 +18,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::OpType;
+use datatypes::arrow::array::ArrayRef;
+use datatypes::arrow::compute::SortOptions;
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
+use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::value::ValueRef;
 use mito_codec::key_values::{KeyValue, KeyValues};
 use mito_codec::row_converter::PrimaryKeyCodec;
 use snafu::ResultExt;
-use store_api::metadata::RegionMetadataRef;
+use store_api::metadata::{RegionMetadata, RegionMetadataRef};
+use store_api::storage::consts::{
+    OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
+};
 use store_api::storage::ColumnId;
 
-use crate::error::{EncodeSnafu, Result};
+use crate::error::{
+    ComputeArrowSnafu, ComputeVectorSnafu, EncodeSnafu, NewRecordBatchSnafu, Result,
+};
 use crate::memtable::bulk::buffer::BulkBuffer;
 
 /// Writer for bulk buffer operations that encodes primary keys
@@ -146,5 +156,107 @@ impl PrimaryKeyBufferWriter {
             self.write_one(buffer, key_value)?;
         }
         Ok(())
+    }
+
+    /// Finishes the `buffer` and builds a sorted record batch.
+    ///
+    /// The record batch is sorted by (primary key, time index, sequence desc).
+    /// Returns None if the `buffer` is empty.
+    fn build_record_batch(&self, buffer: &mut BulkBuffer) -> Result<Option<RecordBatch>> {
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+
+        // Convert buffer to vectors
+        let vectors = buffer.finish_vectors()?;
+
+        // Build schema for the record batch
+        let mut fields = Vec::with_capacity(vectors.len());
+
+        // Add field columns first
+        for field_column in self.metadata.field_columns() {
+            fields.push(Field::new(
+                &field_column.column_schema.name,
+                field_column.column_schema.data_type.as_arrow_type(),
+                field_column.column_schema.is_nullable(),
+            ));
+        }
+
+        // Add time index column
+        let time_column = &self.metadata.time_index_column().column_schema;
+        fields.push(Field::new(
+            &time_column.name,
+            time_column.data_type.as_arrow_type(),
+            time_column.is_nullable(),
+        ));
+
+        // Add primary key column (binary)
+        fields.push(Field::new(
+            PRIMARY_KEY_COLUMN_NAME,
+            ArrowDataType::Binary,
+            false,
+        ));
+
+        // Add sequence column
+        fields.push(Field::new(
+            SEQUENCE_COLUMN_NAME,
+            ArrowDataType::UInt64,
+            false,
+        ));
+
+        // Add op type column
+        fields.push(Field::new(OP_TYPE_COLUMN_NAME, ArrowDataType::UInt8, false));
+
+        let schema = Arc::new(Schema::new(fields));
+
+        // Convert vectors to arrow arrays
+        let arrays: Vec<ArrayRef> = vectors
+            .into_iter()
+            .map(|vector| vector.to_arrow_array())
+            .collect();
+
+        // Create record batch
+        let record_batch =
+            RecordBatch::try_new(schema.clone(), arrays).context(NewRecordBatchSnafu)?;
+
+        // Sort by (primary key, time index, sequence desc)
+        let sort_columns = vec![
+            // Primary key column (ascending)
+            datafusion::arrow::compute::SortColumn {
+                values: record_batch
+                    .column(self.column_indices.primary_key_index)
+                    .clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+            // Time index column (ascending)
+            datafusion::arrow::compute::SortColumn {
+                values: record_batch.column(self.column_indices.time_index).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+            // Sequence column (descending)
+            datafusion::arrow::compute::SortColumn {
+                values: record_batch
+                    .column(self.column_indices.sequence_index)
+                    .clone(),
+                options: Some(SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                }),
+            },
+        ];
+
+        let indices = datafusion::arrow::compute::lexsort_to_indices(&sort_columns, None)
+            .context(ComputeArrowSnafu)?;
+
+        let sorted_batch = datafusion::arrow::compute::take_record_batch(&record_batch, &indices)
+            .context(ComputeArrowSnafu)?;
+
+        Ok(Some(sorted_batch))
     }
 }
