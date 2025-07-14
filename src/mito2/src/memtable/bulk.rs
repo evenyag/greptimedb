@@ -35,9 +35,9 @@ mod context;
 #[allow(unused)]
 pub(crate) mod part;
 mod part_reader;
-mod row_group_reader;
 #[allow(unused)]
-pub(crate) mod writer;
+pub(crate) mod primary_key;
+mod row_group_reader;
 
 #[derive(Debug)]
 pub struct BulkMemtable {
