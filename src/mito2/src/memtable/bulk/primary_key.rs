@@ -41,6 +41,7 @@ use crate::error::{
     Result,
 };
 use crate::memtable::bulk::buffer::BulkBuffer;
+use crate::memtable::stats::WriteMetrics;
 
 /// Mapping of column types to their buffer indices
 #[derive(Debug)]
@@ -111,7 +112,12 @@ impl PrimaryKeyBufferWriter {
     }
 
     /// Writes a single KeyValue to the buffer.
-    pub fn write_one(&self, buffer: &mut BulkBuffer, key_value: KeyValue) -> Result<()> {
+    pub fn write_one(
+        &self,
+        buffer: &mut BulkBuffer,
+        key_value: KeyValue,
+        metrics: &mut WriteMetrics,
+    ) -> Result<()> {
         // Extract values from the key_value
         let timestamp = key_value.timestamp();
         let sequence = key_value.sequence();
@@ -119,6 +125,7 @@ impl PrimaryKeyBufferWriter {
 
         // Write timestamp
         buffer.push_value(self.column_indices.time_index, timestamp)?;
+        metrics.value_bytes += timestamp.data_size();
 
         // Handle primary key based on encoding type
         let primary_key_bytes = if self.primary_key_codec.encoding() == PrimaryKeyEncoding::Sparse {
@@ -149,33 +156,53 @@ impl PrimaryKeyBufferWriter {
             self.column_indices.primary_key_index,
             ValueRef::Binary(&primary_key_bytes),
         )?;
+        metrics.key_bytes += primary_key_bytes.len();
 
         // Write sequence
         buffer.push_value(
             self.column_indices.sequence_index,
             ValueRef::UInt64(sequence),
         )?;
+        metrics.value_bytes += std::mem::size_of::<SequenceNumber>();
 
         // Write op type
         buffer.push_value(
             self.column_indices.op_type_index,
             ValueRef::UInt8(op_type as u8),
         )?;
+        metrics.value_bytes += std::mem::size_of::<u8>();
 
         // Write field values
         for (buffer_index, value) in key_value.fields().enumerate() {
             buffer.push_value(buffer_index, value)?;
+            metrics.value_bytes += value.data_size();
         }
 
         // Finish the row
         buffer.finish_one();
+
+        // Update remaining metrics
+        if let Some(ts_value) = timestamp.as_timestamp().unwrap() {
+            let ts_millis = ts_value.value();
+            metrics.min_ts = metrics.min_ts.min(ts_millis);
+            metrics.max_ts = metrics.max_ts.max(ts_millis);
+        }
+
+        metrics.max_sequence = metrics.max_sequence.max(sequence);
+        metrics.num_rows += 1;
+
         Ok(())
     }
 
     /// Writes multiple KeyValues to the buffer
-    pub fn write(&self, buffer: &mut BulkBuffer, key_values: &KeyValues) -> Result<()> {
+    pub fn write(
+        &self,
+        buffer: &mut BulkBuffer,
+        key_values: &KeyValues,
+        metrics: &mut WriteMetrics,
+    ) -> Result<()> {
         for key_value in key_values.iter() {
-            self.write_one(buffer, key_value)?;
+            self.write_one(buffer, key_value, metrics)?;
         }
         Ok(())
     }

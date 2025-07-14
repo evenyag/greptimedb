@@ -14,6 +14,7 @@
 
 //! Memtable implementation for bulk load
 
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use api::v1::OpType;
@@ -27,9 +28,10 @@ use crate::error::Result;
 use crate::memtable::bulk::buffer::{BulkBuffer, BulkValueBuilder, SortedBatchBuffer};
 use crate::memtable::bulk::part::{BulkPart, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
+use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    BoxedBatchIterator, Memtable, MemtableId, MemtableRanges, MemtableRef, MemtableStats,
-    PredicateGroup,
+    AllocTracker, BoxedBatchIterator, Memtable, MemtableId, MemtableRanges, MemtableRef,
+    MemtableStats, PredicateGroup, WriteBufferManagerRef,
 };
 
 #[allow(unused)]
@@ -50,6 +52,11 @@ pub struct BulkMemtable {
     primary_key_writer: PrimaryKeyBufferWriter,
     bulk_buffer: RwLock<BulkBuffer>,
     sorted_batch_buffer: RwLock<SortedBatchBuffer>,
+    alloc_tracker: AllocTracker,
+    max_timestamp: AtomicI64,
+    min_timestamp: AtomicI64,
+    max_sequence: AtomicU64,
+    num_rows: AtomicUsize,
 }
 
 impl std::fmt::Debug for BulkMemtable {
@@ -60,12 +67,21 @@ impl std::fmt::Debug for BulkMemtable {
             .field("metadata", &self.metadata)
             .field("bulk_buffer", &"<RwLock<BulkBuffer>>")
             .field("sorted_batch_buffer", &"<RwLock<SortedBatchBuffer>>")
+            .field("alloc_tracker", &self.alloc_tracker)
+            .field("max_timestamp", &self.max_timestamp)
+            .field("min_timestamp", &self.min_timestamp)
+            .field("max_sequence", &self.max_sequence)
+            .field("num_rows", &self.num_rows)
             .finish()
     }
 }
 
 impl BulkMemtable {
-    pub fn new(id: MemtableId, metadata: RegionMetadataRef) -> Self {
+    pub fn new(
+        id: MemtableId,
+        metadata: RegionMetadataRef,
+        write_buffer_manager: Option<WriteBufferManagerRef>,
+    ) -> Self {
         let primary_key_codec = build_primary_key_codec(&metadata);
         let primary_key_writer = PrimaryKeyBufferWriter::new(primary_key_codec, metadata.clone());
 
@@ -107,6 +123,11 @@ impl BulkMemtable {
             primary_key_writer,
             bulk_buffer: RwLock::new(bulk_buffer),
             sorted_batch_buffer: RwLock::new(SortedBatchBuffer::default()),
+            alloc_tracker: AllocTracker::new(write_buffer_manager),
+            max_timestamp: AtomicI64::new(i64::MIN),
+            min_timestamp: AtomicI64::new(i64::MAX),
+            max_sequence: AtomicU64::new(0),
+            num_rows: AtomicUsize::new(0),
         }
     }
 
@@ -126,6 +147,35 @@ impl BulkMemtable {
 
         Ok(())
     }
+
+    /// Updates memtable statistics from WriteMetrics
+    fn update_stats(&self, stats: &WriteMetrics) {
+        // Update allocation tracker
+        self.alloc_tracker
+            .on_allocation(stats.key_bytes + stats.value_bytes);
+
+        // Update atomic fields for global tracking
+        self.max_timestamp
+            .fetch_max(stats.max_ts, Ordering::Relaxed);
+        self.min_timestamp
+            .fetch_min(stats.min_ts, Ordering::Relaxed);
+        self.max_sequence
+            .fetch_max(stats.max_sequence, Ordering::Relaxed);
+        self.num_rows.fetch_add(stats.num_rows, Ordering::Relaxed);
+    }
+
+    /// Updates memtable statistics from BulkPart
+    fn update_stats_from_bulk_part(&self, part: &BulkPart) {
+        let estimated_size = part.estimated_size();
+        self.alloc_tracker.on_allocation(estimated_size);
+
+        // Update atomic fields for global tracking
+        self.max_timestamp.fetch_max(part.max_ts, Ordering::Relaxed);
+        self.min_timestamp.fetch_min(part.min_ts, Ordering::Relaxed);
+        self.max_sequence
+            .fetch_max(part.sequence, Ordering::Relaxed);
+        self.num_rows.fetch_add(part.num_rows(), Ordering::Relaxed);
+    }
 }
 
 impl Memtable for BulkMemtable {
@@ -134,10 +184,15 @@ impl Memtable for BulkMemtable {
     }
 
     fn write(&self, kvs: &KeyValues) -> Result<()> {
+        let mut write_metrics = WriteMetrics::default();
         {
             let mut buffer = self.bulk_buffer.write().unwrap();
-            self.primary_key_writer.write(&mut buffer, kvs)?;
+            self.primary_key_writer
+                .write(&mut buffer, kvs, &mut write_metrics)?;
         }
+
+        // Update statistics
+        self.update_stats(&write_metrics);
 
         // Check if we need to flush the buffer
         self.check_and_flush_buffer()?;
@@ -146,10 +201,15 @@ impl Memtable for BulkMemtable {
     }
 
     fn write_one(&self, key_value: KeyValue) -> Result<()> {
+        let mut write_metrics = WriteMetrics::default();
         {
             let mut buffer = self.bulk_buffer.write().unwrap();
-            self.primary_key_writer.write_one(&mut buffer, key_value)?;
+            self.primary_key_writer
+                .write_one(&mut buffer, key_value, &mut write_metrics)?;
         }
+
+        // Update statistics
+        self.update_stats(&write_metrics);
 
         // Check if we need to flush the buffer
         self.check_and_flush_buffer()?;
@@ -171,6 +231,9 @@ impl Memtable for BulkMemtable {
         let sorted_batch = self
             .primary_key_writer
             .sort_primary_key_batch(&encoded_batch)?;
+
+        // Update statistics from BulkPart
+        self.update_stats_from_bulk_part(&fragment);
 
         // Push to sorted batch buffer
         let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
@@ -199,17 +262,57 @@ impl Memtable for BulkMemtable {
 
     fn is_empty(&self) -> bool {
         self.parts.read().unwrap().is_empty()
+            && self.sorted_batch_buffer.read().unwrap().num_rows() == 0
+            && self.bulk_buffer.read().unwrap().row_count() == 0
     }
 
     fn freeze(&self) -> Result<()> {
+        self.alloc_tracker.done_allocating();
         Ok(())
     }
 
     fn stats(&self) -> MemtableStats {
-        todo!()
+        let estimated_bytes = self.alloc_tracker.bytes_allocated();
+        let num_rows = self.num_rows.load(Ordering::Relaxed);
+
+        if num_rows == 0 {
+            // no rows ever written
+            return MemtableStats {
+                estimated_bytes,
+                time_range: None,
+                num_rows: 0,
+                num_ranges: 0,
+                max_sequence: 0,
+                series_count: 0,
+            };
+        }
+
+        let ts_type = self
+            .metadata
+            .time_index_column()
+            .column_schema
+            .data_type
+            .clone()
+            .as_timestamp()
+            .expect("Timestamp column must have timestamp type");
+        let max_timestamp = ts_type.create_timestamp(self.max_timestamp.load(Ordering::Relaxed));
+        let min_timestamp = ts_type.create_timestamp(self.min_timestamp.load(Ordering::Relaxed));
+
+        MemtableStats {
+            estimated_bytes,
+            time_range: Some((min_timestamp, max_timestamp)),
+            num_rows,
+            num_ranges: 1,
+            max_sequence: self.max_sequence.load(Ordering::Relaxed),
+            series_count: 1,
+        }
     }
 
     fn fork(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
-        Arc::new(Self::new(id, metadata.clone()))
+        Arc::new(Self::new(
+            id,
+            metadata.clone(),
+            self.alloc_tracker.write_buffer_manager(),
+        ))
     }
 }
