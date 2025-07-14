@@ -392,12 +392,18 @@ impl PrimaryKeyBufferWriter {
             RecordBatch::try_new(schema.clone(), arrays).context(NewRecordBatchSnafu)?;
 
         // Sort by (primary key, time index, sequence desc)
+        let sorted_batch = self.sort_primary_key_batch(&record_batch)?;
+
+        Ok(Some(sorted_batch))
+    }
+
+    /// Sorts the input `batch` by (primary key, time index, sequence desc).
+    /// The expected schema is: (fields, time index, primary key, sequence, op type)
+    fn sort_primary_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let sort_columns = vec![
             // Primary key column (ascending)
             datafusion::arrow::compute::SortColumn {
-                values: record_batch
-                    .column(self.column_indices.primary_key_index)
-                    .clone(),
+                values: batch.column(self.column_indices.primary_key_index).clone(),
                 options: Some(SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -405,7 +411,7 @@ impl PrimaryKeyBufferWriter {
             },
             // Time index column (ascending)
             datafusion::arrow::compute::SortColumn {
-                values: record_batch.column(self.column_indices.time_index).clone(),
+                values: batch.column(self.column_indices.time_index).clone(),
                 options: Some(SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -413,9 +419,7 @@ impl PrimaryKeyBufferWriter {
             },
             // Sequence column (descending)
             datafusion::arrow::compute::SortColumn {
-                values: record_batch
-                    .column(self.column_indices.sequence_index)
-                    .clone(),
+                values: batch.column(self.column_indices.sequence_index).clone(),
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: false,
@@ -426,14 +430,9 @@ impl PrimaryKeyBufferWriter {
         let indices = datafusion::arrow::compute::lexsort_to_indices(&sort_columns, None)
             .context(ComputeArrowSnafu)?;
 
-        let sorted_batch = datafusion::arrow::compute::take_record_batch(&record_batch, &indices)
+        let sorted_batch = datafusion::arrow::compute::take_record_batch(batch, &indices)
             .context(ComputeArrowSnafu)?;
 
-        Ok(Some(sorted_batch))
+        Ok(sorted_batch)
     }
-}
-
-/// Sorts the input `batch` by (primary key, time index, sequence desc).
-fn sort_primary_key_batch(batch: &RecordBatch) -> Result<RecordBatch> {
-    todo!()
 }
