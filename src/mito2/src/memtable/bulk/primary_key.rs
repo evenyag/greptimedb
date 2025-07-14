@@ -111,14 +111,7 @@ impl PrimaryKeyBufferWriter {
     }
 
     /// Writes a single KeyValue to the buffer.
-    /// TODO(yingwen): Checks the codec. When the codec is sparse, the key is already encoded.
     pub fn write_one(&self, buffer: &mut BulkBuffer, key_value: KeyValue) -> Result<()> {
-        // Encode the primary key
-        let mut primary_key_bytes = Vec::new();
-        self.primary_key_codec
-            .encode_key_value(&key_value, &mut primary_key_bytes)
-            .context(EncodeSnafu)?;
-
         // Extract values from the key_value
         let timestamp = key_value.timestamp();
         let sequence = key_value.sequence();
@@ -126,6 +119,30 @@ impl PrimaryKeyBufferWriter {
 
         // Write timestamp
         buffer.push_value(self.column_indices.time_index, timestamp)?;
+
+        // Handle primary key based on encoding type
+        let primary_key_bytes = if self.primary_key_codec.encoding() == PrimaryKeyEncoding::Sparse {
+            // For sparse encoding, the primary key is already encoded in the KeyValue
+            // Get the first (and only) primary key value which contains the encoded key
+            let mut primary_keys = key_value.primary_keys();
+            // Safety: __primary_key should be binary type.
+            let encoded_key = primary_keys
+                .next()
+                .context(ColumnNotFoundSnafu {
+                    column: PRIMARY_KEY_COLUMN_NAME,
+                })?
+                .as_binary()
+                .unwrap()
+                .unwrap();
+            encoded_key.to_vec()
+        } else {
+            // For dense encoding, we need to encode the primary key columns
+            let mut primary_key_bytes = Vec::new();
+            self.primary_key_codec
+                .encode_key_value(&key_value, &mut primary_key_bytes)
+                .context(EncodeSnafu)?;
+            primary_key_bytes
+        };
 
         // Write primary key
         buffer.push_value(
