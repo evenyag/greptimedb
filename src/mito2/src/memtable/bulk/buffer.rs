@@ -21,6 +21,7 @@ use datatypes::arrow::array::{
     ArrayRef, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt64Array, UInt8Array,
 };
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::{MutableVector, Vector, VectorRef};
 use datatypes::types::TimestampType;
@@ -307,6 +308,40 @@ impl BulkBuffer {
     /// Checks if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
+    }
+}
+
+/// A buffer that contains a list of sorted record batches.
+#[derive(Default)]
+pub(crate) struct SortedBatchBuffer {
+    batches: Vec<RecordBatch>,
+    memory_size: usize,
+    num_rows: usize,
+}
+
+impl SortedBatchBuffer {
+    /// Pushes a new record batch into the buffer.
+    pub(crate) fn push(&mut self, batch: RecordBatch) {
+        self.memory_size += batch.get_array_memory_size();
+        self.num_rows += batch.num_rows();
+        self.batches.push(batch);
+    }
+
+    /// Returns the memory size of the buffer.
+    pub(crate) fn memory_size(&self) -> usize {
+        self.memory_size
+    }
+
+    /// Returns the number of rows in the buffer.
+    pub(crate) fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Finishes the buffer and returns all record batches.
+    pub(crate) fn finish(&mut self) -> Vec<RecordBatch> {
+        self.memory_size = 0;
+        self.num_rows = 0;
+        std::mem::take(&mut self.batches)
     }
 }
 
