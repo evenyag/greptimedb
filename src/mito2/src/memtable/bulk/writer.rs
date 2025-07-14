@@ -18,35 +18,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::OpType;
-use datatypes::arrow::array::ArrayRef;
+use datatypes::arrow::array::{ArrayRef, BinaryBuilder};
 use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::{ConcreteDataType, DataType};
+use datatypes::prelude::VectorRef;
 use datatypes::value::ValueRef;
+use datatypes::vectors::Helper;
 use mito_codec::key_values::{KeyValue, KeyValues};
 use mito_codec::row_converter::PrimaryKeyCodec;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
+use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::consts::{
     OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
 };
-use store_api::storage::ColumnId;
+use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{
-    ComputeArrowSnafu, ComputeVectorSnafu, EncodeSnafu, NewRecordBatchSnafu, Result,
+    ColumnNotFoundSnafu, ComputeArrowSnafu, ComputeVectorSnafu, EncodeSnafu, NewRecordBatchSnafu,
+    Result,
 };
 use crate::memtable::bulk::buffer::BulkBuffer;
-
-/// Writer for bulk buffer operations that encodes primary keys
-pub struct PrimaryKeyBufferWriter {
-    /// Primary key codec for encoding keys
-    primary_key_codec: Arc<dyn PrimaryKeyCodec>,
-    /// Region metadata for schema information
-    metadata: RegionMetadataRef,
-    /// Column indices mapping for efficient access
-    column_indices: ColumnIndices,
-}
 
 /// Mapping of column types to their buffer indices
 #[derive(Debug)]
@@ -59,6 +53,16 @@ struct ColumnIndices {
     sequence_index: usize,
     /// Index of op type column in the buffer
     op_type_index: usize,
+}
+
+/// Writer for bulk buffer operations that encodes primary keys
+pub struct PrimaryKeyBufferWriter {
+    /// Primary key codec for encoding keys
+    primary_key_codec: Arc<dyn PrimaryKeyCodec>,
+    /// Region metadata for schema information
+    metadata: RegionMetadataRef,
+    /// Column indices mapping for efficient access
+    column_indices: ColumnIndices,
 }
 
 impl PrimaryKeyBufferWriter {
@@ -106,7 +110,8 @@ impl PrimaryKeyBufferWriter {
         }
     }
 
-    /// Writes a single KeyValue to the buffer
+    /// Writes a single KeyValue to the buffer.
+    /// TODO(yingwen): Checks the codec. When the codec is sparse, the key is already encoded.
     pub fn write_one(&self, buffer: &mut BulkBuffer, key_value: KeyValue) -> Result<()> {
         // Encode the primary key
         let mut primary_key_bytes = Vec::new();
@@ -156,6 +161,173 @@ impl PrimaryKeyBufferWriter {
             self.write_one(buffer, key_value)?;
         }
         Ok(())
+    }
+
+    /// Encodes the `batch` into a new `RecordBatch` with primary key columns.
+    /// `batch_encoding` is the encoding of the `batch`, if it is `sparse`, then the primary key is
+    /// already encoded in the `__primary_key` column.
+    ///
+    /// The output record batch has the schema:
+    /// `(fields, time index, primary key, sequence, op type)`.
+    ///
+    /// It doesn't sort the `batch`.
+    fn encode_primary_key_record_batch(
+        &self,
+        batch: &RecordBatch,
+        batch_encoding: PrimaryKeyEncoding,
+        sequence: SequenceNumber,
+        op_type: OpType,
+    ) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+        let batch_schema = batch.schema();
+
+        // Build output schema: (fields, time index, primary key, sequence, op type)
+        let mut output_fields = Vec::new();
+
+        // Add field columns
+        for field_column in self.metadata.field_columns() {
+            output_fields.push(Field::new(
+                &field_column.column_schema.name,
+                field_column.column_schema.data_type.as_arrow_type(),
+                field_column.column_schema.is_nullable(),
+            ));
+        }
+
+        // Add time index column
+        let time_column = &self.metadata.time_index_column().column_schema;
+        output_fields.push(Field::new(
+            &time_column.name,
+            time_column.data_type.as_arrow_type(),
+            time_column.is_nullable(),
+        ));
+
+        // Add primary key column (binary)
+        output_fields.push(Field::new(
+            PRIMARY_KEY_COLUMN_NAME,
+            ArrowDataType::Binary,
+            false,
+        ));
+
+        // Add sequence column
+        output_fields.push(Field::new(
+            SEQUENCE_COLUMN_NAME,
+            ArrowDataType::UInt64,
+            false,
+        ));
+
+        // Add op type column
+        output_fields.push(Field::new(OP_TYPE_COLUMN_NAME, ArrowDataType::UInt8, false));
+
+        let output_schema = Arc::new(Schema::new(output_fields));
+
+        // Prepare output arrays
+        let mut output_arrays: Vec<ArrayRef> = Vec::new();
+
+        // Copy field columns
+        for field_column in self.metadata.field_columns() {
+            let column_name = &field_column.column_schema.name;
+            let column_index =
+                batch_schema
+                    .index_of(column_name)
+                    .ok()
+                    .with_context(|| ColumnNotFoundSnafu {
+                        column: column_name.clone(),
+                    })?;
+            output_arrays.push(batch.column(column_index).clone());
+        }
+
+        // Copy time index column
+        let time_column_name = &self.metadata.time_index_column().column_schema.name;
+        let time_index = batch_schema
+            .index_of(time_column_name)
+            .ok()
+            .with_context(|| ColumnNotFoundSnafu {
+                column: time_column_name.clone(),
+            })?;
+        output_arrays.push(batch.column(time_index).clone());
+
+        // Handle primary key column based on encoding
+        let primary_key_array = match batch_encoding {
+            PrimaryKeyEncoding::Sparse => {
+                // For sparse encoding, primary key is already encoded in __primary_key column
+                let pk_index = batch_schema
+                    .index_of(PRIMARY_KEY_COLUMN_NAME)
+                    .ok()
+                    .with_context(|| ColumnNotFoundSnafu {
+                        column: PRIMARY_KEY_COLUMN_NAME.to_string(),
+                    })?;
+                batch.column(pk_index).clone()
+            }
+            PrimaryKeyEncoding::Dense => {
+                // For dense encoding, we need to encode the primary key columns
+                let mut binary_builder = BinaryBuilder::new();
+
+                // Collect primary key columns and their column IDs
+                let pk_columns: Result<Vec<(ColumnId, Option<VectorRef>)>> = self
+                    .metadata
+                    .primary_key_columns()
+                    .map(|col| {
+                        let column_name = &col.column_schema.name;
+                        let vector_ref = if let Ok(idx) = batch_schema.index_of(column_name) {
+                            Some(
+                                Helper::try_into_vector(batch.column(idx).clone())
+                                    .context(ComputeVectorSnafu)?,
+                            )
+                        } else {
+                            None
+                        };
+                        Ok((col.column_id, vector_ref))
+                    })
+                    .collect();
+                let pk_columns = pk_columns?;
+
+                // Reusable vector for primary key values
+                let mut primary_key_values = Vec::with_capacity(pk_columns.len());
+
+                // Encode each row's primary key
+                for row_idx in 0..num_rows {
+                    primary_key_values.clear();
+                    for (column_id, vector_ref) in &pk_columns {
+                        let value = if let Some(vector) = vector_ref {
+                            vector.get_ref(row_idx)
+                        } else {
+                            // Use null for missing primary key columns
+                            ValueRef::Null
+                        };
+                        primary_key_values.push((*column_id, value));
+                    }
+
+                    let mut encoded_key = Vec::new();
+                    self.primary_key_codec
+                        .encode_value_refs(&primary_key_values, &mut encoded_key)
+                        .context(EncodeSnafu)?;
+
+                    binary_builder.append_value(&encoded_key);
+                }
+
+                // Create binary array from builder
+                Arc::new(binary_builder.finish()) as ArrayRef
+            }
+        };
+
+        output_arrays.push(primary_key_array);
+
+        // Add sequence column (constant value for all rows)
+        let sequence_array = Arc::new(datatypes::arrow::array::UInt64Array::from(vec![
+            sequence;
+            num_rows
+        ])) as ArrayRef;
+        output_arrays.push(sequence_array);
+
+        // Add op type column (constant value for all rows)
+        let op_type_array = Arc::new(datatypes::arrow::array::UInt8Array::from(vec![
+            op_type as u8;
+            num_rows
+        ])) as ArrayRef;
+        output_arrays.push(op_type_array);
+
+        // Create the output record batch
+        RecordBatch::try_new(output_schema, output_arrays).context(NewRecordBatchSnafu)
     }
 
     /// Finishes the `buffer` and builds a sorted record batch.
@@ -259,4 +431,9 @@ impl PrimaryKeyBufferWriter {
 
         Ok(Some(sorted_batch))
     }
+}
+
+/// Sorts the input `batch` by (primary key, time index, sequence desc).
+fn sort_primary_key_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    todo!()
 }
