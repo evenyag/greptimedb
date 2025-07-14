@@ -173,11 +173,16 @@ impl PrimaryKeyBufferWriter {
     }
 
     /// Writes multiple KeyValues to the buffer
-    pub fn write(&self, buffer: &mut BulkBuffer, key_values: KeyValues) -> Result<()> {
+    pub fn write(&self, buffer: &mut BulkBuffer, key_values: &KeyValues) -> Result<()> {
         for key_value in key_values.iter() {
             self.write_one(buffer, key_value)?;
         }
         Ok(())
+    }
+
+    /// Returns the primary key codec
+    pub(crate) fn primary_key_codec(&self) -> &Arc<dyn PrimaryKeyCodec> {
+        &self.primary_key_codec
     }
 
     /// Encodes the `batch` into a new `RecordBatch` with primary key columns.
@@ -188,7 +193,7 @@ impl PrimaryKeyBufferWriter {
     /// `(fields, time index, primary key, sequence, op type)`.
     ///
     /// It doesn't sort the `batch`.
-    fn encode_primary_key_record_batch(
+    pub(crate) fn encode_primary_key_record_batch(
         &self,
         batch: &RecordBatch,
         batch_encoding: PrimaryKeyEncoding,
@@ -351,7 +356,10 @@ impl PrimaryKeyBufferWriter {
     ///
     /// The record batch is sorted by (primary key, time index, sequence desc).
     /// Returns None if the `buffer` is empty.
-    fn build_record_batch(&self, buffer: &mut BulkBuffer) -> Result<Option<RecordBatch>> {
+    pub(crate) fn build_record_batch(
+        &self,
+        buffer: &mut BulkBuffer,
+    ) -> Result<Option<RecordBatch>> {
         if buffer.is_empty() {
             return Ok(None);
         }
@@ -416,7 +424,7 @@ impl PrimaryKeyBufferWriter {
 
     /// Sorts the input `batch` by (primary key, time index, sequence desc).
     /// The expected schema is: (fields, time index, primary key, sequence, op type)
-    fn sort_primary_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    pub(crate) fn sort_primary_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let sort_columns = vec![
             // Primary key column (ascending)
             datafusion::arrow::compute::SortColumn {
