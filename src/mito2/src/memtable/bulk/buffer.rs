@@ -219,23 +219,23 @@ impl BulkValueBuilder {
             Self::Timestamp(vec, timestamp_type) => {
                 let timestamp: VectorRef = match timestamp_type {
                     ConcreteDataType::Timestamp(TimestampType::Second(_)) => {
-                        Arc::new(TimestampSecondVector::from_vec(vec.clone()))
+                        Arc::new(TimestampSecondVector::from_vec(std::mem::take(vec)))
                     }
                     ConcreteDataType::Timestamp(TimestampType::Millisecond(_)) => {
-                        Arc::new(TimestampMillisecondVector::from_vec(vec.clone()))
+                        Arc::new(TimestampMillisecondVector::from_vec(std::mem::take(vec)))
                     }
                     ConcreteDataType::Timestamp(TimestampType::Microsecond(_)) => {
-                        Arc::new(TimestampMicrosecondVector::from_vec(vec.clone()))
+                        Arc::new(TimestampMicrosecondVector::from_vec(std::mem::take(vec)))
                     }
                     ConcreteDataType::Timestamp(TimestampType::Nanosecond(_)) => {
-                        Arc::new(TimestampNanosecondVector::from_vec(vec.clone()))
+                        Arc::new(TimestampNanosecondVector::from_vec(std::mem::take(vec)))
                     }
                     _ => unreachable!(),
                 };
                 Ok(timestamp)
             }
-            Self::Sequence(vec) => Ok(Arc::new(UInt64Vector::from_vec(vec.clone()))),
-            Self::OpType(vec) => Ok(Arc::new(UInt8Vector::from_vec(vec.clone()))),
+            Self::Sequence(vec) => Ok(Arc::new(UInt64Vector::from_vec(std::mem::take(vec)))),
+            Self::OpType(vec) => Ok(Arc::new(UInt8Vector::from_vec(std::mem::take(vec)))),
         }
     }
 }
