@@ -27,14 +27,14 @@ use table::predicate::Predicate;
 
 use crate::error::Result;
 use crate::memtable::bulk::buffer::{BulkBuffer, BulkValueBuilder, SortedBatchBuffer};
-use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::context::BulkIterContext;
+use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, IterBuilder, Memtable, MemtableId, MemtableRange,
-    MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
-    WriteBufferManagerRef,
+    AllocTracker, BoxedBatchIterator, IterBuilder, Memtable, MemtableBuilder, MemtableId,
+    MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
+    PredicateGroup, WriteBufferManagerRef,
 };
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
@@ -321,7 +321,7 @@ impl Memtable for BulkMemtable {
     ) -> Result<MemtableRanges> {
         let projection = projection.map(|p| p.to_vec());
         let mut ranges = BTreeMap::new();
-        
+
         // Create a range for each EncodedBulkPart
         let parts = self.parts.read().unwrap();
         for (range_id, part) in parts.iter().enumerate() {
@@ -332,16 +332,16 @@ impl Memtable for BulkMemtable {
                 predicate: predicate.predicate().cloned(),
                 sequence,
             });
-            
+
             let context = Arc::new(MemtableRangeContext::new(
                 self.id,
                 builder,
                 predicate.clone(),
             ));
-            
+
             ranges.insert(range_id, MemtableRange::new(context));
         }
-        
+
         Ok(MemtableRanges {
             ranges,
             stats: self.stats(),
@@ -402,6 +402,31 @@ impl Memtable for BulkMemtable {
             id,
             metadata.clone(),
             self.alloc_tracker.write_buffer_manager(),
+        ))
+    }
+}
+
+/// Builder for BulkMemtable
+#[derive(Debug)]
+pub struct BulkMemtableBuilder {
+    write_buffer_manager: Option<WriteBufferManagerRef>,
+}
+
+impl BulkMemtableBuilder {
+    /// Creates a new builder with specific `write_buffer_manager`.
+    pub fn new(write_buffer_manager: Option<WriteBufferManagerRef>) -> Self {
+        Self {
+            write_buffer_manager,
+        }
+    }
+}
+
+impl MemtableBuilder for BulkMemtableBuilder {
+    fn build(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
+        Arc::new(BulkMemtable::new(
+            id,
+            metadata.clone(),
+            self.write_buffer_manager.clone(),
         ))
     }
 }

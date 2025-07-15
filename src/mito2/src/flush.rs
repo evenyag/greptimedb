@@ -38,7 +38,6 @@ use crate::metrics::{
 };
 use crate::read::scan_region::PredicateGroup;
 use crate::read::Source;
-use crate::sst::file::FileTimeRange;
 use crate::region::options::IndexOptions;
 use crate::region::version::{VersionControlData, VersionControlRef};
 use crate::region::{ManifestContextRef, RegionLeaderState};
@@ -47,7 +46,7 @@ use crate::request::{
     SenderDdlRequest, SenderWriteRequest, WorkerRequest,
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
-use crate::sst::file::FileMeta;
+use crate::sst::file::{FileMeta, FileTimeRange};
 use crate::sst::parquet::WriteOptions;
 use crate::worker::WorkerListener;
 
@@ -343,7 +342,7 @@ impl RegionFlushTask {
         let mut file_metas = Vec::new();
         let mut flushed_bytes = 0;
         let mut series_count = 0;
-        
+
         for mem in memtables {
             if mem.is_empty() {
                 // Skip empty memtables.
@@ -353,21 +352,22 @@ impl RegionFlushTask {
             let stats = mem.stats();
             let max_sequence = stats.max_sequence();
             series_count += stats.series_count();
-            
+
             // Get ranges from the memtable
             let predicate_group = PredicateGroup::default();
             let ranges = mem.ranges(None, predicate_group, None)?;
-            
+
             // Process each range separately
             for (_range_id, range) in ranges.ranges {
                 // Create a time range covering all possible timestamps for this range
-                let time_range: FileTimeRange = if let Some((min_ts, max_ts)) = ranges.stats.time_range() {
-                    (min_ts, max_ts)
-                } else {
-                    // If no time range, skip this range
-                    continue;
-                };
-                
+                let time_range: FileTimeRange =
+                    if let Some((min_ts, max_ts)) = ranges.stats.time_range() {
+                        (min_ts, max_ts)
+                    } else {
+                        // If no time range, skip this range
+                        continue;
+                    };
+
                 // Build iterator for this range
                 let iter = range.build_iter(time_range)?;
                 let source = Source::Iter(iter);

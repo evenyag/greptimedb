@@ -31,6 +31,7 @@ use table::predicate::Predicate;
 use crate::config::MitoConfig;
 use crate::error::Result;
 use crate::flush::WriteBufferManagerRef;
+use crate::memtable::bulk::BulkMemtableBuilder;
 use crate::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtableBuilder};
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
@@ -65,6 +66,7 @@ pub type MemtableId = u32;
 pub enum MemtableConfig {
     PartitionTree(PartitionTreeConfig),
     TimeSeries,
+    Bulk,
 }
 
 impl Default for MemtableConfig {
@@ -347,6 +349,9 @@ impl MemtableBuilderProvider {
                 dedup,
                 merge_mode,
             )),
+            MemtableConfig::Bulk => {
+                Arc::new(BulkMemtableBuilder::new(self.write_buffer_manager.clone()))
+            }
         }
     }
 }
