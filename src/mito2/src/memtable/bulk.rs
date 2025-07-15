@@ -134,8 +134,8 @@ impl BulkMemtable {
     fn check_and_flush_buffer(&self) -> Result<()> {
         let mut buffer = self.bulk_buffer.write().unwrap();
 
-        // Check if buffer has more than 4096 rows
-        if buffer.row_count() > 4096 {
+        // Check if buffer has more than 1024 rows
+        if buffer.row_count() > 1024 {
             // Build record batch from buffer (this resets the buffer internally)
             if let Some(record_batch) = self.primary_key_writer.build_record_batch(&mut buffer)? {
                 // Push to sorted batch buffer
