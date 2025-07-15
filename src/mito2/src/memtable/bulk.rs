@@ -14,6 +14,7 @@
 
 //! Memtable implementation for bulk load
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -27,11 +28,13 @@ use table::predicate::Predicate;
 use crate::error::Result;
 use crate::memtable::bulk::buffer::{BulkBuffer, BulkValueBuilder, SortedBatchBuffer};
 use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
+use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, Memtable, MemtableId, MemtableRanges, MemtableRef,
-    MemtableStats, PredicateGroup, WriteBufferManagerRef,
+    AllocTracker, BoxedBatchIterator, IterBuilder, Memtable, MemtableId, MemtableRange,
+    MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
+    WriteBufferManagerRef,
 };
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
@@ -59,6 +62,31 @@ pub struct BulkMemtable {
     min_timestamp: AtomicI64,
     max_sequence: AtomicU64,
     num_rows: AtomicUsize,
+}
+
+/// Iterator builder for a single EncodedBulkPart range.
+struct BulkMemtableIterBuilder {
+    part: EncodedBulkPart,
+    metadata: RegionMetadataRef,
+    projection: Option<Vec<ColumnId>>,
+    predicate: Option<Predicate>,
+    sequence: Option<SequenceNumber>,
+}
+
+impl IterBuilder for BulkMemtableIterBuilder {
+    fn build(&self) -> Result<BoxedBatchIterator> {
+        let context = Arc::new(BulkIterContext::new(
+            self.metadata.clone(),
+            &self.projection.as_ref().map(|p| p.as_slice()),
+            self.predicate.clone(),
+        ));
+
+        if let Some(iter) = self.part.read(context, self.sequence)? {
+            Ok(iter)
+        } else {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
 }
 
 impl std::fmt::Debug for BulkMemtable {
@@ -287,11 +315,37 @@ impl Memtable for BulkMemtable {
 
     fn ranges(
         &self,
-        _projection: Option<&[ColumnId]>,
-        _predicate: PredicateGroup,
-        _sequence: Option<SequenceNumber>,
+        projection: Option<&[ColumnId]>,
+        predicate: PredicateGroup,
+        sequence: Option<SequenceNumber>,
     ) -> Result<MemtableRanges> {
-        todo!()
+        let projection = projection.map(|p| p.to_vec());
+        let mut ranges = BTreeMap::new();
+        
+        // Create a range for each EncodedBulkPart
+        let parts = self.parts.read().unwrap();
+        for (range_id, part) in parts.iter().enumerate() {
+            let builder = Box::new(BulkMemtableIterBuilder {
+                part: part.clone(),
+                metadata: self.metadata.clone(),
+                projection: projection.clone(),
+                predicate: predicate.predicate().cloned(),
+                sequence,
+            });
+            
+            let context = Arc::new(MemtableRangeContext::new(
+                self.id,
+                builder,
+                predicate.clone(),
+            ));
+            
+            ranges.insert(range_id, MemtableRange::new(context));
+        }
+        
+        Ok(MemtableRanges {
+            ranges,
+            stats: self.stats(),
+        })
     }
 
     fn is_empty(&self) -> bool {
