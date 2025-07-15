@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Writer for bulk buffer operations with primary key encoding
+//! Utilities for record batches with primary key encoding.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -486,5 +486,29 @@ impl PrimaryKeyBufferWriter {
             .context(ComputeArrowSnafu)?;
 
         Ok(sorted_batch)
+    }
+
+    /// Sorts the partial sorted record batches.
+    pub(crate) fn sort_partial_sorted(
+        &self,
+        buffers: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        if buffers.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if buffers.len() == 1 {
+            return Ok(buffers);
+        }
+
+        // Concatenate all batches and sort the result
+        let schema = buffers[0].schema();
+        let concatenated_batch = datafusion::arrow::compute::concat_batches(&schema, &buffers)
+            .context(ComputeArrowSnafu)?;
+
+        // Sort the concatenated batch
+        let sorted_batch = self.sort_primary_key_batch(&concatenated_batch)?;
+
+        Ok(vec![sorted_batch])
     }
 }
