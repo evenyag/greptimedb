@@ -67,7 +67,7 @@ impl PrimaryKeyBufferWriter {
 
     /// Creates the column indices based on the schema
     /// Schema follows format: field 0, field 1, ..., field N, time index, primary key, sequence, op type
-    fn create_column_indices(metadata: &RegionMetadataRef) -> ColumnIndices {
+    pub(crate) fn create_column_indices(metadata: &RegionMetadataRef) -> ColumnIndices {
         let mut buffer_index = 0;
 
         // Add field columns first (in the order they appear in metadata)
@@ -460,13 +460,13 @@ impl PrimaryKeyBufferWriter {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ColumnIndices {
     /// Index of time column in the buffer
-    time_index: usize,
+    pub(crate) time_index: usize,
     /// Index of primary key column in the buffer
-    primary_key_index: usize,
+    pub(crate) primary_key_index: usize,
     /// Index of sequence column in the buffer
-    sequence_index: usize,
+    pub(crate) sequence_index: usize,
     /// Index of op type column in the buffer
-    op_type_index: usize,
+    pub(crate) op_type_index: usize,
 }
 
 impl ColumnIndices {

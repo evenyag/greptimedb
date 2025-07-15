@@ -54,6 +54,7 @@ use crate::error::{
 };
 use crate::memtable::bulk::context::BulkIterContextRef;
 use crate::memtable::bulk::part_reader::BulkPartIter;
+use crate::memtable::bulk::primary_key::ColumnIndices;
 use crate::memtable::BoxedBatchIterator;
 use crate::sst::parquet::format::{PrimaryKeyArray, ReadFormat};
 use crate::sst::parquet::helper::parse_parquet_metadata;
@@ -279,24 +280,43 @@ impl BulkPartEncoder {
 }
 
 impl BulkPartEncoder {
-    /// Encodes mutations to a [EncodedBulkPart], returns true if encoded data has been written to `dest`.
-    fn encode_mutations(&self, mutations: &[Mutation]) -> Result<Option<EncodedBulkPart>> {
-        let Some((arrow_record_batch, min_ts, max_ts)) =
-            mutations_to_record_batch(mutations, &self.metadata, &self.pk_encoder, self.dedup)?
-        else {
+    /// Encodes a record batch to a [EncodedBulkPart].
+    /// The record batch should have the schema: (fields, time index, primary key, sequence, op type)
+    pub(crate) fn encode_record_batches(
+        &self,
+        batches: &[RecordBatch],
+        column_indices: &ColumnIndices,
+    ) -> Result<Option<EncodedBulkPart>> {
+        if batches.is_empty() {
             return Ok(None);
+        }
+
+        // Concatenate all batches if we have multiple
+        let record_batch = if batches.len() == 1 {
+            batches[0].clone()
+        } else {
+            let schema = batches[0].schema();
+            datafusion::arrow::compute::concat_batches(&schema, batches)
+                .context(crate::error::ComputeArrowSnafu)?
         };
 
+        if record_batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        // Find min and max timestamps from the time index column
+        let time_column = record_batch.column(column_indices.time_index);
+        let (min_ts, max_ts) = extract_min_max_timestamp(time_column, &self.metadata)?;
+
+        // Encode the record batch to parquet
         let mut buf = Vec::with_capacity(4096);
-        let arrow_schema = arrow_record_batch.schema();
+        let arrow_schema = record_batch.schema();
 
         let file_metadata = {
             let mut writer =
                 ArrowWriter::try_new(&mut buf, arrow_schema, self.writer_props.clone())
                     .context(EncodeMemtableSnafu)?;
-            writer
-                .write(&arrow_record_batch)
-                .context(EncodeMemtableSnafu)?;
+            writer.write(&record_batch).context(EncodeMemtableSnafu)?;
             writer.finish().context(EncodeMemtableSnafu)?
         };
 
@@ -306,13 +326,32 @@ impl BulkPartEncoder {
         Ok(Some(EncodedBulkPart {
             data: buf,
             metadata: BulkPartMeta {
-                num_rows: arrow_record_batch.num_rows(),
+                num_rows: record_batch.num_rows(),
                 max_timestamp: max_ts,
                 min_timestamp: min_ts,
                 parquet_metadata,
                 region_metadata: self.metadata.clone(),
             },
         }))
+    }
+
+    /// Encodes mutations to a [EncodedBulkPart].
+    pub(crate) fn encode_mutations(
+        &self,
+        mutations: &[Mutation],
+    ) -> Result<Option<EncodedBulkPart>> {
+        let Some((arrow_record_batch, _min_ts, _max_ts)) =
+            mutations_to_record_batch(mutations, &self.metadata, &self.pk_encoder, self.dedup)?
+        else {
+            return Ok(None);
+        };
+
+        // Create column indices for the SST schema (which is different from buffer schema)
+        // SST schema: (fields, time index, primary key, sequence, op type)
+        let column_indices = create_sst_column_indices(&self.metadata);
+
+        // Reuse encode_record_batches method
+        self.encode_record_batches(&[arrow_record_batch], &column_indices)
     }
 }
 
@@ -544,6 +583,38 @@ fn timestamp_array_to_iter(
             .values()
             .iter(),
     }
+}
+
+/// Creates column indices for SST schema (same as buffer schema)
+/// SST schema: (fields, time index, primary key, sequence, op type)
+fn create_sst_column_indices(
+    metadata: &RegionMetadataRef,
+) -> crate::memtable::bulk::primary_key::ColumnIndices {
+    crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter::create_column_indices(metadata)
+}
+
+/// Extracts min and max timestamps from a timestamp column
+fn extract_min_max_timestamp(
+    time_column: &ArrayRef,
+    metadata: &RegionMetadataRef,
+) -> Result<(i64, i64)> {
+    let timestamp_unit = metadata
+        .time_index_column()
+        .column_schema
+        .data_type
+        .as_timestamp()
+        .unwrap()
+        .unit();
+
+    let timestamp_iter = timestamp_array_to_iter(timestamp_unit, time_column);
+    let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+
+    for &ts in timestamp_iter {
+        min_ts = min_ts.min(ts);
+        max_ts = max_ts.max(ts);
+    }
+
+    Ok((min_ts, max_ts))
 }
 
 /// Converts a **sorted** [BinaryArray] to [DictionaryArray].

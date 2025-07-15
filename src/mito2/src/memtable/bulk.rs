@@ -26,13 +26,14 @@ use table::predicate::Predicate;
 
 use crate::error::Result;
 use crate::memtable::bulk::buffer::{BulkBuffer, BulkValueBuilder, SortedBatchBuffer};
-use crate::memtable::bulk::part::{BulkPart, EncodedBulkPart};
+use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, Memtable, MemtableId, MemtableRanges, MemtableRef,
     MemtableStats, PredicateGroup, WriteBufferManagerRef,
 };
+use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
 #[allow(unused)]
 pub(crate) mod buffer;
@@ -50,6 +51,7 @@ pub struct BulkMemtable {
     parts: RwLock<Vec<EncodedBulkPart>>,
     metadata: RegionMetadataRef,
     primary_key_writer: PrimaryKeyBufferWriter,
+    part_encoder: BulkPartEncoder,
     bulk_buffer: RwLock<BulkBuffer>,
     sorted_batch_buffer: RwLock<SortedBatchBuffer>,
     alloc_tracker: AllocTracker,
@@ -65,6 +67,7 @@ impl std::fmt::Debug for BulkMemtable {
             .field("id", &self.id)
             .field("parts", &self.parts)
             .field("metadata", &self.metadata)
+            .field("part_encoder", &"<BulkPartEncoder>")
             .field("bulk_buffer", &"<RwLock<BulkBuffer>>")
             .field("sorted_batch_buffer", &"<RwLock<SortedBatchBuffer>>")
             .field("alloc_tracker", &self.alloc_tracker)
@@ -84,6 +87,7 @@ impl BulkMemtable {
     ) -> Self {
         let primary_key_codec = build_primary_key_codec(&metadata);
         let primary_key_writer = PrimaryKeyBufferWriter::new(primary_key_codec, metadata.clone());
+        let part_encoder = BulkPartEncoder::new(metadata.clone(), true, DEFAULT_ROW_GROUP_SIZE);
 
         // Create builders for buffer: fields, time index, primary key, sequence, op type
         let mut builders = Vec::new();
@@ -121,6 +125,7 @@ impl BulkMemtable {
             parts: RwLock::new(Vec::new()),
             metadata,
             primary_key_writer,
+            part_encoder,
             bulk_buffer: RwLock::new(bulk_buffer),
             sorted_batch_buffer: RwLock::new(SortedBatchBuffer::default()),
             alloc_tracker: AllocTracker::new(write_buffer_manager),
@@ -132,17 +137,46 @@ impl BulkMemtable {
     }
 
     fn check_and_flush_buffer(&self) -> Result<()> {
-        let mut buffer = self.bulk_buffer.write().unwrap();
+        // First check and flush bulk_buffer to sorted_batch_buffer
+        {
+            let mut buffer = self.bulk_buffer.write().unwrap();
 
-        // Check if buffer has more than 1024 rows
-        if buffer.row_count() > 1024 {
-            // Build record batch from buffer (this resets the buffer internally)
-            if let Some(record_batch) = self.primary_key_writer.build_record_batch(&mut buffer)? {
-                // Push to sorted batch buffer
-                let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
-                sorted_buffer.push(record_batch);
+            // Check if buffer has more than 1024 rows
+            if buffer.row_count() > 1024 {
+                // Build record batch from buffer (this resets the buffer internally)
+                if let Some(record_batch) =
+                    self.primary_key_writer.build_record_batch(&mut buffer)?
+                {
+                    // Push to sorted batch buffer
+                    let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
+                    sorted_buffer.push(record_batch);
+                }
+                // Buffer is already reset by build_record_batch, no need to recreate
             }
-            // Buffer is already reset by build_record_batch, no need to recreate
+        }
+
+        // Then check if sorted_batch_buffer needs to be flushed to parts
+        {
+            let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
+
+            // Check if total rows in sorted_batch_buffer reach DEFAULT_ROW_GROUP_SIZE
+            if sorted_buffer.num_rows() >= DEFAULT_ROW_GROUP_SIZE {
+                // Finish the sorted batch buffer and get all batches
+                let batches = sorted_buffer.finish();
+
+                // Sort the partial sorted batches
+                let sorted_batches = self.primary_key_writer.sort_partial_sorted(batches)?;
+
+                // Encode the sorted batches into EncodedBulkPart
+                if let Some(encoded_part) = self.part_encoder.encode_record_batches(
+                    &sorted_batches,
+                    &self.primary_key_writer.column_indices(),
+                )? {
+                    // Push the encoded part into parts
+                    let mut parts = self.parts.write().unwrap();
+                    parts.push(encoded_part);
+                }
+            }
         }
 
         Ok(())
