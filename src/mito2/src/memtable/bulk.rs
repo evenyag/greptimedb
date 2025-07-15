@@ -77,7 +77,7 @@ impl IterBuilder for BulkMemtableIterBuilder {
     fn build(&self) -> Result<BoxedBatchIterator> {
         let context = Arc::new(BulkIterContext::new(
             self.metadata.clone(),
-            &self.projection.as_ref().map(|p| p.as_slice()),
+            &self.projection.as_deref(),
             self.predicate.clone(),
         ));
 

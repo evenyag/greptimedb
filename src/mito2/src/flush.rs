@@ -36,7 +36,9 @@ use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
 };
+use crate::read::scan_region::PredicateGroup;
 use crate::read::Source;
+use crate::sst::file::FileTimeRange;
 use crate::region::options::IndexOptions;
 use crate::region::version::{VersionControlData, VersionControlRef};
 use crate::region::{ManifestContextRef, RegionLeaderState};
@@ -338,9 +340,10 @@ impl RegionFlushTask {
         }
 
         let memtables = version.memtables.immutables();
-        let mut file_metas = Vec::with_capacity(memtables.len());
+        let mut file_metas = Vec::new();
         let mut flushed_bytes = 0;
         let mut series_count = 0;
+        
         for mem in memtables {
             if mem.is_empty() {
                 // Skip empty memtables.
@@ -350,47 +353,64 @@ impl RegionFlushTask {
             let stats = mem.stats();
             let max_sequence = stats.max_sequence();
             series_count += stats.series_count();
-            let iter = mem.iter(None, None, None)?;
-            let source = Source::Iter(iter);
+            
+            // Get ranges from the memtable
+            let predicate_group = PredicateGroup::default();
+            let ranges = mem.ranges(None, predicate_group, None)?;
+            
+            // Process each range separately
+            for (_range_id, range) in ranges.ranges {
+                // Create a time range covering all possible timestamps for this range
+                let time_range: FileTimeRange = if let Some((min_ts, max_ts)) = ranges.stats.time_range() {
+                    (min_ts, max_ts)
+                } else {
+                    // If no time range, skip this range
+                    continue;
+                };
+                
+                // Build iterator for this range
+                let iter = range.build_iter(time_range)?;
+                let source = Source::Iter(iter);
 
-            // Flush to level 0.
-            let write_request = SstWriteRequest {
-                op_type: OperationType::Flush,
-                metadata: version.metadata.clone(),
-                source,
-                cache_manager: self.cache_manager.clone(),
-                storage: version.options.storage.clone(),
-                max_sequence: Some(max_sequence),
-                index_options: self.index_options.clone(),
-                inverted_index_config: self.engine_config.inverted_index.clone(),
-                fulltext_index_config: self.engine_config.fulltext_index.clone(),
-                bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
-            };
+                // Flush this range to level 0
+                let write_request = SstWriteRequest {
+                    op_type: OperationType::Flush,
+                    metadata: version.metadata.clone(),
+                    source,
+                    cache_manager: self.cache_manager.clone(),
+                    storage: version.options.storage.clone(),
+                    max_sequence: Some(max_sequence),
+                    index_options: self.index_options.clone(),
+                    inverted_index_config: self.engine_config.inverted_index.clone(),
+                    fulltext_index_config: self.engine_config.fulltext_index.clone(),
+                    bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                };
 
-            let ssts_written = self
-                .access_layer
-                .write_sst(write_request, &write_opts)
-                .await?;
-            if ssts_written.is_empty() {
-                // No data written.
-                continue;
-            }
-
-            file_metas.extend(ssts_written.into_iter().map(|sst_info| {
-                flushed_bytes += sst_info.file_size;
-                FileMeta {
-                    region_id: self.region_id,
-                    file_id: sst_info.file_id,
-                    time_range: sst_info.time_range,
-                    level: 0,
-                    file_size: sst_info.file_size,
-                    available_indexes: sst_info.index_metadata.build_available_indexes(),
-                    index_file_size: sst_info.index_metadata.file_size,
-                    num_rows: sst_info.num_rows as u64,
-                    num_row_groups: sst_info.num_row_groups,
-                    sequence: NonZeroU64::new(max_sequence),
+                let ssts_written = self
+                    .access_layer
+                    .write_sst(write_request, &write_opts)
+                    .await?;
+                if ssts_written.is_empty() {
+                    // No data written from this range.
+                    continue;
                 }
-            }));
+
+                file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                    flushed_bytes += sst_info.file_size;
+                    FileMeta {
+                        region_id: self.region_id,
+                        file_id: sst_info.file_id,
+                        time_range: sst_info.time_range,
+                        level: 0,
+                        file_size: sst_info.file_size,
+                        available_indexes: sst_info.index_metadata.build_available_indexes(),
+                        index_file_size: sst_info.index_metadata.file_size,
+                        num_rows: sst_info.num_rows as u64,
+                        num_row_groups: sst_info.num_row_groups,
+                        sequence: NonZeroU64::new(max_sequence),
+                    }
+                }));
+            }
         }
 
         if !file_metas.is_empty() {
