@@ -43,19 +43,6 @@ use crate::error::{
 use crate::memtable::bulk::buffer::BulkBuffer;
 use crate::memtable::stats::WriteMetrics;
 
-/// Mapping of column types to their buffer indices
-#[derive(Debug)]
-struct ColumnIndices {
-    /// Index of time column in the buffer
-    time_index: usize,
-    /// Index of primary key column in the buffer
-    primary_key_index: usize,
-    /// Index of sequence column in the buffer
-    sequence_index: usize,
-    /// Index of op type column in the buffer
-    op_type_index: usize,
-}
-
 /// Writer for bulk buffer operations that encodes primary keys
 pub struct PrimaryKeyBufferWriter {
     /// Primary key codec for encoding keys
@@ -379,6 +366,11 @@ impl PrimaryKeyBufferWriter {
         RecordBatch::try_new(output_schema, output_arrays).context(NewRecordBatchSnafu)
     }
 
+    /// Gets the column indices.
+    pub(crate) fn column_indices(&self) -> ColumnIndices {
+        self.column_indices
+    }
+
     /// Finishes the `buffer` and builds a sorted record batch.
     ///
     /// The record batch is sorted by (primary key, time index, sequence desc).
@@ -444,7 +436,7 @@ impl PrimaryKeyBufferWriter {
             RecordBatch::try_new(schema.clone(), arrays).context(NewRecordBatchSnafu)?;
 
         // Sort by (primary key, time index, sequence desc)
-        let sorted_batch = self.sort_primary_key_batch(&record_batch)?;
+        let sorted_batch = self.column_indices.sort_primary_key_batch(&record_batch)?;
 
         Ok(Some(sorted_batch))
     }
@@ -452,10 +444,39 @@ impl PrimaryKeyBufferWriter {
     /// Sorts the input `batch` by (primary key, time index, sequence desc).
     /// The expected schema is: (fields, time index, primary key, sequence, op type)
     pub(crate) fn sort_primary_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        self.column_indices.sort_primary_key_batch(batch)
+    }
+
+    /// Sorts the partial sorted record batches.
+    pub(crate) fn sort_partial_sorted(
+        &self,
+        buffers: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        self.column_indices.sort_partial_sorted(buffers)
+    }
+}
+
+/// Mapping of column types to their buffer indices
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColumnIndices {
+    /// Index of time column in the buffer
+    time_index: usize,
+    /// Index of primary key column in the buffer
+    primary_key_index: usize,
+    /// Index of sequence column in the buffer
+    sequence_index: usize,
+    /// Index of op type column in the buffer
+    op_type_index: usize,
+}
+
+impl ColumnIndices {
+    /// Sorts the input `batch` by (primary key, time index, sequence desc).
+    /// The expected schema is: (fields, time index, primary key, sequence, op type)
+    pub fn sort_primary_key_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let sort_columns = vec![
             // Primary key column (ascending)
             datafusion::arrow::compute::SortColumn {
-                values: batch.column(self.column_indices.primary_key_index).clone(),
+                values: batch.column(self.primary_key_index).clone(),
                 options: Some(SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -463,7 +484,7 @@ impl PrimaryKeyBufferWriter {
             },
             // Time index column (ascending)
             datafusion::arrow::compute::SortColumn {
-                values: batch.column(self.column_indices.time_index).clone(),
+                values: batch.column(self.time_index).clone(),
                 options: Some(SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -471,7 +492,7 @@ impl PrimaryKeyBufferWriter {
             },
             // Sequence column (descending)
             datafusion::arrow::compute::SortColumn {
-                values: batch.column(self.column_indices.sequence_index).clone(),
+                values: batch.column(self.sequence_index).clone(),
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: false,
@@ -489,10 +510,7 @@ impl PrimaryKeyBufferWriter {
     }
 
     /// Sorts the partial sorted record batches.
-    pub(crate) fn sort_partial_sorted(
-        &self,
-        buffers: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>> {
+    pub fn sort_partial_sorted(&self, buffers: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         if buffers.is_empty() {
             return Ok(Vec::new());
         }
