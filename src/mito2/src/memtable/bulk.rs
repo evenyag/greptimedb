@@ -136,13 +136,13 @@ impl BulkMemtable {
         }
     }
 
-    fn check_and_flush_buffer(&self) -> Result<()> {
+    fn check_and_flush_buffer(&self, force: bool) -> Result<()> {
         // First check and flush bulk_buffer to sorted_batch_buffer
         {
             let mut buffer = self.bulk_buffer.write().unwrap();
 
-            // Check if buffer has more than 1024 rows
-            if buffer.row_count() > 1024 {
+            // Check if buffer has more than 1024 rows or force is true
+            if force || buffer.row_count() > 1024 {
                 // Build record batch from buffer (this resets the buffer internally)
                 if let Some(record_batch) =
                     self.primary_key_writer.build_record_batch(&mut buffer)?
@@ -159,8 +159,8 @@ impl BulkMemtable {
         {
             let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
 
-            // Check if total rows in sorted_batch_buffer reach DEFAULT_ROW_GROUP_SIZE
-            if sorted_buffer.num_rows() >= DEFAULT_ROW_GROUP_SIZE {
+            // Check if total rows in sorted_batch_buffer reach DEFAULT_ROW_GROUP_SIZE or force is true
+            if force || sorted_buffer.num_rows() >= DEFAULT_ROW_GROUP_SIZE {
                 // Finish the sorted batch buffer and get all batches
                 let batches = sorted_buffer.finish();
 
@@ -229,7 +229,7 @@ impl Memtable for BulkMemtable {
         self.update_stats(&write_metrics);
 
         // Check if we need to flush the buffer
-        self.check_and_flush_buffer()?;
+        self.check_and_flush_buffer(false)?;
 
         Ok(())
     }
@@ -246,7 +246,7 @@ impl Memtable for BulkMemtable {
         self.update_stats(&write_metrics);
 
         // Check if we need to flush the buffer
-        self.check_and_flush_buffer()?;
+        self.check_and_flush_buffer(false)?;
 
         Ok(())
     }
@@ -301,6 +301,7 @@ impl Memtable for BulkMemtable {
     }
 
     fn freeze(&self) -> Result<()> {
+        self.check_and_flush_buffer(true)?;
         self.alloc_tracker.done_allocating();
         Ok(())
     }
