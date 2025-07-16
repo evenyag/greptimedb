@@ -36,6 +36,7 @@ use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
 };
+use crate::read::merge::MergeReader;
 use crate::read::scan_region::PredicateGroup;
 use crate::read::Source;
 use crate::region::options::IndexOptions;
@@ -357,7 +358,8 @@ impl RegionFlushTask {
             let predicate_group = PredicateGroup::default();
             let ranges = mem.ranges(None, predicate_group, None)?;
 
-            // Process each range separately
+            // Process each range.
+            let mut sources = Vec::with_capacity(ranges.ranges.len());
             for (_range_id, range) in ranges.ranges {
                 // Create a time range covering all possible timestamps for this range
                 let time_range: FileTimeRange =
@@ -372,45 +374,50 @@ impl RegionFlushTask {
                 let iter = range.build_iter(time_range)?;
                 let source = Source::Iter(iter);
 
-                // Flush this range to level 0
-                let write_request = SstWriteRequest {
-                    op_type: OperationType::Flush,
-                    metadata: version.metadata.clone(),
-                    source,
-                    cache_manager: self.cache_manager.clone(),
-                    storage: version.options.storage.clone(),
-                    max_sequence: Some(max_sequence),
-                    index_options: self.index_options.clone(),
-                    inverted_index_config: self.engine_config.inverted_index.clone(),
-                    fulltext_index_config: self.engine_config.fulltext_index.clone(),
-                    bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
-                };
-
-                let ssts_written = self
-                    .access_layer
-                    .write_sst(write_request, &write_opts)
-                    .await?;
-                if ssts_written.is_empty() {
-                    // No data written from this range.
-                    continue;
-                }
-
-                file_metas.extend(ssts_written.into_iter().map(|sst_info| {
-                    flushed_bytes += sst_info.file_size;
-                    FileMeta {
-                        region_id: self.region_id,
-                        file_id: sst_info.file_id,
-                        time_range: sst_info.time_range,
-                        level: 0,
-                        file_size: sst_info.file_size,
-                        available_indexes: sst_info.index_metadata.build_available_indexes(),
-                        index_file_size: sst_info.index_metadata.file_size,
-                        num_rows: sst_info.num_rows as u64,
-                        num_row_groups: sst_info.num_row_groups,
-                        sequence: NonZeroU64::new(max_sequence),
-                    }
-                }));
+                sources.push(source);
             }
+
+            let reader = MergeReader::new(sources).await?;
+            let source = Source::Reader(Box::new(reader));
+
+            // Flush this range to level 0
+            let write_request = SstWriteRequest {
+                op_type: OperationType::Flush,
+                metadata: version.metadata.clone(),
+                source,
+                cache_manager: self.cache_manager.clone(),
+                storage: version.options.storage.clone(),
+                max_sequence: Some(max_sequence),
+                index_options: self.index_options.clone(),
+                inverted_index_config: self.engine_config.inverted_index.clone(),
+                fulltext_index_config: self.engine_config.fulltext_index.clone(),
+                bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+            };
+
+            let ssts_written = self
+                .access_layer
+                .write_sst(write_request, &write_opts)
+                .await?;
+            if ssts_written.is_empty() {
+                // No data written from this range.
+                continue;
+            }
+
+            file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                flushed_bytes += sst_info.file_size;
+                FileMeta {
+                    region_id: self.region_id,
+                    file_id: sst_info.file_id,
+                    time_range: sst_info.time_range,
+                    level: 0,
+                    file_size: sst_info.file_size,
+                    available_indexes: sst_info.index_metadata.build_available_indexes(),
+                    index_file_size: sst_info.index_metadata.file_size,
+                    num_rows: sst_info.num_rows as u64,
+                    num_row_groups: sst_info.num_row_groups,
+                    sequence: NonZeroU64::new(max_sequence),
+                }
+            }));
         }
 
         if !file_metas.is_empty() {
