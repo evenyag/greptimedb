@@ -426,6 +426,14 @@ lazy_static! {
         "greptime_mito_memtable_field_builder_count",
         "active field builder count in TimeSeriesMemtable",
         ).unwrap();
+
+    /// Elapsed time for bulk memtable operations.
+    pub static ref BULK_MEMTABLE_STAGE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_mito_bulk_memtable_stage_elapsed",
+        "mito bulk memtable stage elapsed",
+        &[STAGE_LABEL],
+        exponential_buckets(0.001, 10.0, 6).unwrap(),
+    ).unwrap();
 }
 
 /// Stager notifier to collect metrics.

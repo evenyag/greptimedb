@@ -31,6 +31,7 @@ use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
 use crate::memtable::stats::WriteMetrics;
+use crate::metrics::BULK_MEMTABLE_STAGE_ELAPSED;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, IterBuilder, Memtable, MemtableBuilder, MemtableId,
     MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
@@ -184,6 +185,10 @@ impl BulkMemtable {
 
             // Check if buffer has more than 1024 rows or force is true
             if force || buffer.row_count() > 1024 {
+                let _timer = BULK_MEMTABLE_STAGE_ELAPSED
+                    .with_label_values(&["build_record_batch"])
+                    .start_timer();
+                
                 // Build record batch from buffer (this resets the buffer internally)
                 if let Some(record_batch) =
                     self.primary_key_writer.build_record_batch(&mut buffer)?
@@ -202,6 +207,10 @@ impl BulkMemtable {
 
             // Check if total rows in sorted_batch_buffer reach DEFAULT_ROW_GROUP_SIZE or force is true
             if force || sorted_buffer.num_rows() >= DEFAULT_ROW_GROUP_SIZE {
+                let _timer = BULK_MEMTABLE_STAGE_ELAPSED
+                    .with_label_values(&["sort_encode_batches"])
+                    .start_timer();
+                
                 // Finish the sorted batch buffer and get all batches
                 let batches = sorted_buffer.finish();
 
@@ -266,6 +275,10 @@ impl Memtable for BulkMemtable {
             self.buffer_selector.fetch_add(1, Ordering::Relaxed) % self.bulk_buffers.len();
 
         {
+            let _timer = BULK_MEMTABLE_STAGE_ELAPSED
+                .with_label_values(&["write_bulk_buffers"])
+                .start_timer();
+            
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write(&mut buffer, kvs, &mut write_metrics)?;
@@ -288,6 +301,10 @@ impl Memtable for BulkMemtable {
             self.buffer_selector.fetch_add(1, Ordering::Relaxed) % self.bulk_buffers.len();
 
         {
+            let _timer = BULK_MEMTABLE_STAGE_ELAPSED
+                .with_label_values(&["write_bulk_buffers"])
+                .start_timer();
+            
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write_one(&mut buffer, key_value, &mut write_metrics)?;
