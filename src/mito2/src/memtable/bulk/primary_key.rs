@@ -26,6 +26,7 @@ use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::prelude::VectorRef;
 use datatypes::value::ValueRef;
 use datatypes::vectors::Helper;
+use itertools::Itertools;
 use mito_codec::key_values::{KeyValue, KeyValues};
 use mito_codec::row_converter::PrimaryKeyCodec;
 use snafu::{OptionExt, ResultExt};
@@ -529,4 +530,57 @@ impl ColumnIndices {
 
         Ok(vec![sorted_batch])
     }
+}
+
+/// Merges a list of sorted RecordBatches and returns an iterator that yields merged RecordBatches.
+///
+/// Each input RecordBatch must be sorted by primary key, time index, sequence desc.
+/// The function takes a closure to compare specific rows in two record batches,
+/// and a batch size to control the output record batch size.
+///
+/// # Arguments
+///
+/// * `batches` - A vector of sorted RecordBatches to merge
+/// * `compare_fn` - A closure that compares two rows from different batches a, b, returns true if a is ordered before b.
+/// * `batch_size` - The target size for output record batches
+///
+/// # Returns
+///
+/// Returns a iterator that yields merged RecordBatches in sorted order.
+pub fn merge_sorted_batches<F>(
+    batches: Vec<RecordBatch>,
+    compare_fn: F,
+    batch_size: usize,
+) -> Box<dyn Iterator<Item = Result<RecordBatch>>>
+where
+    F: Fn(&RecordBatch, usize, &RecordBatch, usize) -> bool + 'static,
+{
+    if batches.len() < 2 {
+        return Box::new(batches.into_iter().map(Ok));
+    }
+
+    let batches_clone = batches.clone();
+    let batche_lens = batches.iter().map(|batch| batch.num_rows()).collect_vec();
+    let index_chunks = batche_lens
+        .into_iter()
+        .enumerate()
+        .map(|(batch_idx, num_rows)| (0..num_rows).map(move |row_idx| (batch_idx, row_idx)))
+        .kmerge_by(move |left, right| {
+            compare_fn(
+                &batches_clone[left.0],
+                left.1,
+                &batches_clone[right.0],
+                right.1,
+            )
+        })
+        .chunks(batch_size)
+        .into_iter()
+        .map(|chunk| chunk.collect_vec())
+        .collect_vec();
+    let iter = index_chunks.into_iter().map(move |indices| {
+        let batches = batches.iter().collect_vec();
+        datatypes::arrow::compute::interleave_record_batch(&batches, &indices)
+            .context(ComputeArrowSnafu)
+    });
+    Box::new(iter)
 }
