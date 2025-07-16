@@ -31,12 +31,12 @@ use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
 use crate::memtable::stats::WriteMetrics;
-use crate::metrics::BULK_MEMTABLE_STAGE_ELAPSED;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, IterBuilder, Memtable, MemtableBuilder, MemtableId,
     MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
     PredicateGroup, WriteBufferManagerRef,
 };
+use crate::metrics::BULK_MEMTABLE_STAGE_ELAPSED;
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
 #[allow(unused)]
@@ -58,7 +58,7 @@ pub struct BulkMemtable {
     part_encoder: BulkPartEncoder,
     bulk_buffers: Vec<RwLock<BulkBuffer>>,
     buffer_selector: AtomicUsize,
-    sorted_batch_buffer: RwLock<SortedBatchBuffer>,
+    sorted_batch_buffers: Vec<RwLock<SortedBatchBuffer>>,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
     min_timestamp: AtomicI64,
@@ -103,7 +103,13 @@ impl std::fmt::Debug for BulkMemtable {
                 &format!("<Vec<RwLock<BulkBuffer>>>[{}]", self.bulk_buffers.len()),
             )
             .field("buffer_selector", &self.buffer_selector)
-            .field("sorted_batch_buffer", &"<RwLock<SortedBatchBuffer>>")
+            .field(
+                "sorted_batch_buffers",
+                &format!(
+                    "<Vec<RwLock<SortedBatchBuffer>>>[{}]",
+                    self.sorted_batch_buffers.len()
+                ),
+            )
             .field("alloc_tracker", &self.alloc_tracker)
             .field("max_timestamp", &self.max_timestamp)
             .field("min_timestamp", &self.min_timestamp)
@@ -126,6 +132,7 @@ impl BulkMemtable {
         // Create multiple bulk buffers for parallelism
         let num_buffers = common_config::utils::get_cpus();
         let mut bulk_buffers = Vec::with_capacity(num_buffers);
+        let mut sorted_batch_buffers = Vec::with_capacity(num_buffers);
 
         for _ in 0..num_buffers {
             // Create builders for buffer: fields, time index, primary key, sequence, op type
@@ -159,6 +166,9 @@ impl BulkMemtable {
 
             let bulk_buffer = BulkBuffer::new(builders);
             bulk_buffers.push(RwLock::new(bulk_buffer));
+
+            // Create corresponding sorted batch buffer
+            sorted_batch_buffers.push(RwLock::new(SortedBatchBuffer::default()));
         }
 
         Self {
@@ -169,7 +179,7 @@ impl BulkMemtable {
             part_encoder,
             bulk_buffers,
             buffer_selector: AtomicUsize::new(0),
-            sorted_batch_buffer: RwLock::new(SortedBatchBuffer::default()),
+            sorted_batch_buffers,
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
             min_timestamp: AtomicI64::new(i64::MAX),
@@ -188,13 +198,14 @@ impl BulkMemtable {
                 let _timer = BULK_MEMTABLE_STAGE_ELAPSED
                     .with_label_values(&["build_record_batch"])
                     .start_timer();
-                
+
                 // Build record batch from buffer (this resets the buffer internally)
                 if let Some(record_batch) =
                     self.primary_key_writer.build_record_batch(&mut buffer)?
                 {
                     // Push to sorted batch buffer
-                    let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
+                    let mut sorted_buffer =
+                        self.sorted_batch_buffers[buffer_index].write().unwrap();
                     sorted_buffer.push(record_batch);
                 }
                 // Buffer is already reset by build_record_batch, no need to recreate
@@ -203,14 +214,17 @@ impl BulkMemtable {
 
         // Then check if sorted_batch_buffer needs to be flushed to parts
         {
-            let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
+            let mut sorted_buffer = self.sorted_batch_buffers[buffer_index].write().unwrap();
 
             // Check if total rows in sorted_batch_buffer reach DEFAULT_ROW_GROUP_SIZE or force is true
-            if force || sorted_buffer.num_rows() >= DEFAULT_ROW_GROUP_SIZE {
+            if force
+                || sorted_buffer.num_rows()
+                    >= DEFAULT_ROW_GROUP_SIZE / self.sorted_batch_buffers.len()
+            {
                 let _timer = BULK_MEMTABLE_STAGE_ELAPSED
                     .with_label_values(&["sort_encode_batches"])
                     .start_timer();
-                
+
                 // Finish the sorted batch buffer and get all batches
                 let batches = sorted_buffer.finish();
 
@@ -278,7 +292,7 @@ impl Memtable for BulkMemtable {
             let _timer = BULK_MEMTABLE_STAGE_ELAPSED
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
-            
+
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write(&mut buffer, kvs, &mut write_metrics)?;
@@ -304,7 +318,7 @@ impl Memtable for BulkMemtable {
             let _timer = BULK_MEMTABLE_STAGE_ELAPSED
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
-            
+
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write_one(&mut buffer, key_value, &mut write_metrics)?;
@@ -337,8 +351,12 @@ impl Memtable for BulkMemtable {
         // Update statistics from BulkPart
         self.update_stats_from_bulk_part(&fragment);
 
+        // Select sorted batch buffer using round-robin
+        let buffer_index =
+            self.buffer_selector.fetch_add(1, Ordering::Relaxed) % self.sorted_batch_buffers.len();
+
         // Push to sorted batch buffer
-        let mut sorted_buffer = self.sorted_batch_buffer.write().unwrap();
+        let mut sorted_buffer = self.sorted_batch_buffers[buffer_index].write().unwrap();
         sorted_buffer.push(sorted_batch);
 
         Ok(())
@@ -394,9 +412,11 @@ impl Memtable for BulkMemtable {
             return false;
         }
 
-        // Check if sorted batch buffer is empty
-        if self.sorted_batch_buffer.read().unwrap().num_rows() != 0 {
-            return false;
+        // Check if all sorted batch buffers are empty
+        for sorted_buffer in &self.sorted_batch_buffers {
+            if sorted_buffer.read().unwrap().num_rows() != 0 {
+                return false;
+            }
         }
 
         // Check if all bulk buffers are empty
