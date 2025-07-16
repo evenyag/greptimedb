@@ -55,7 +55,8 @@ pub struct BulkMemtable {
     metadata: RegionMetadataRef,
     primary_key_writer: PrimaryKeyBufferWriter,
     part_encoder: BulkPartEncoder,
-    bulk_buffer: RwLock<BulkBuffer>,
+    bulk_buffers: Vec<RwLock<BulkBuffer>>,
+    buffer_selector: AtomicUsize,
     sorted_batch_buffer: RwLock<SortedBatchBuffer>,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
@@ -96,7 +97,11 @@ impl std::fmt::Debug for BulkMemtable {
             .field("parts", &self.parts)
             .field("metadata", &self.metadata)
             .field("part_encoder", &"<BulkPartEncoder>")
-            .field("bulk_buffer", &"<RwLock<BulkBuffer>>")
+            .field(
+                "bulk_buffers",
+                &format!("<Vec<RwLock<BulkBuffer>>>[{}]", self.bulk_buffers.len()),
+            )
+            .field("buffer_selector", &self.buffer_selector)
             .field("sorted_batch_buffer", &"<RwLock<SortedBatchBuffer>>")
             .field("alloc_tracker", &self.alloc_tracker)
             .field("max_timestamp", &self.max_timestamp)
@@ -117,36 +122,43 @@ impl BulkMemtable {
         let primary_key_writer = PrimaryKeyBufferWriter::new(primary_key_codec, metadata.clone());
         let part_encoder = BulkPartEncoder::new(metadata.clone(), true, DEFAULT_ROW_GROUP_SIZE);
 
-        // Create builders for buffer: fields, time index, primary key, sequence, op type
-        let mut builders = Vec::new();
+        // Create multiple bulk buffers for parallelism
+        let num_buffers = common_config::utils::get_cpus();
+        let mut bulk_buffers = Vec::with_capacity(num_buffers);
 
-        // Add field columns
-        for field_column in metadata.field_columns() {
-            builders.push(BulkValueBuilder::new_regular(
-                &field_column.column_schema.data_type,
+        for _ in 0..num_buffers {
+            // Create builders for buffer: fields, time index, primary key, sequence, op type
+            let mut builders = Vec::new();
+
+            // Add field columns
+            for field_column in metadata.field_columns() {
+                builders.push(BulkValueBuilder::new_regular(
+                    &field_column.column_schema.data_type,
+                    1024,
+                ));
+            }
+
+            // Add time index column
+            builders.push(BulkValueBuilder::new_timestamp(
+                metadata.time_index_column().column_schema.data_type.clone(),
                 1024,
             ));
+
+            // Add primary key column (binary)
+            builders.push(BulkValueBuilder::new_regular(
+                &datatypes::data_type::ConcreteDataType::binary_datatype(),
+                1024,
+            ));
+
+            // Add sequence column
+            builders.push(BulkValueBuilder::new_sequence(1024));
+
+            // Add op type column
+            builders.push(BulkValueBuilder::new_op_type(1024));
+
+            let bulk_buffer = BulkBuffer::new(builders);
+            bulk_buffers.push(RwLock::new(bulk_buffer));
         }
-
-        // Add time index column
-        builders.push(BulkValueBuilder::new_timestamp(
-            metadata.time_index_column().column_schema.data_type.clone(),
-            1024,
-        ));
-
-        // Add primary key column (binary)
-        builders.push(BulkValueBuilder::new_regular(
-            &datatypes::data_type::ConcreteDataType::binary_datatype(),
-            1024,
-        ));
-
-        // Add sequence column
-        builders.push(BulkValueBuilder::new_sequence(1024));
-
-        // Add op type column
-        builders.push(BulkValueBuilder::new_op_type(1024));
-
-        let bulk_buffer = BulkBuffer::new(builders);
 
         Self {
             id,
@@ -154,7 +166,8 @@ impl BulkMemtable {
             metadata,
             primary_key_writer,
             part_encoder,
-            bulk_buffer: RwLock::new(bulk_buffer),
+            bulk_buffers,
+            buffer_selector: AtomicUsize::new(0),
             sorted_batch_buffer: RwLock::new(SortedBatchBuffer::default()),
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -164,10 +177,10 @@ impl BulkMemtable {
         }
     }
 
-    fn check_and_flush_buffer(&self, force: bool) -> Result<()> {
-        // First check and flush bulk_buffer to sorted_batch_buffer
+    fn check_and_flush_buffer(&self, buffer_index: usize, force: bool) -> Result<()> {
+        // First check and flush the specific bulk_buffer to sorted_batch_buffer
         {
-            let mut buffer = self.bulk_buffer.write().unwrap();
+            let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
 
             // Check if buffer has more than 1024 rows or force is true
             if force || buffer.row_count() > 1024 {
@@ -247,8 +260,13 @@ impl Memtable for BulkMemtable {
 
     fn write(&self, kvs: &KeyValues) -> Result<()> {
         let mut write_metrics = WriteMetrics::default();
+
+        // Select buffer using round-robin
+        let buffer_index =
+            self.buffer_selector.fetch_add(1, Ordering::Relaxed) % self.bulk_buffers.len();
+
         {
-            let mut buffer = self.bulk_buffer.write().unwrap();
+            let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write(&mut buffer, kvs, &mut write_metrics)?;
         }
@@ -256,16 +274,21 @@ impl Memtable for BulkMemtable {
         // Update statistics
         self.update_stats(&write_metrics);
 
-        // Check if we need to flush the buffer
-        self.check_and_flush_buffer(false)?;
+        // Check if we need to flush the buffer we just wrote to
+        self.check_and_flush_buffer(buffer_index, false)?;
 
         Ok(())
     }
 
     fn write_one(&self, key_value: KeyValue) -> Result<()> {
         let mut write_metrics = WriteMetrics::default();
+
+        // Select buffer using round-robin
+        let buffer_index =
+            self.buffer_selector.fetch_add(1, Ordering::Relaxed) % self.bulk_buffers.len();
+
         {
-            let mut buffer = self.bulk_buffer.write().unwrap();
+            let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
                 .write_one(&mut buffer, key_value, &mut write_metrics)?;
         }
@@ -273,8 +296,8 @@ impl Memtable for BulkMemtable {
         // Update statistics
         self.update_stats(&write_metrics);
 
-        // Check if we need to flush the buffer
-        self.check_and_flush_buffer(false)?;
+        // Check if we need to flush the buffer we just wrote to
+        self.check_and_flush_buffer(buffer_index, false)?;
 
         Ok(())
     }
@@ -349,13 +372,31 @@ impl Memtable for BulkMemtable {
     }
 
     fn is_empty(&self) -> bool {
-        self.parts.read().unwrap().is_empty()
-            && self.sorted_batch_buffer.read().unwrap().num_rows() == 0
-            && self.bulk_buffer.read().unwrap().row_count() == 0
+        // Check if parts are empty
+        if !self.parts.read().unwrap().is_empty() {
+            return false;
+        }
+
+        // Check if sorted batch buffer is empty
+        if self.sorted_batch_buffer.read().unwrap().num_rows() != 0 {
+            return false;
+        }
+
+        // Check if all bulk buffers are empty
+        for buffer in &self.bulk_buffers {
+            if buffer.read().unwrap().row_count() != 0 {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn freeze(&self) -> Result<()> {
-        self.check_and_flush_buffer(true)?;
+        // Flush all buffers
+        for i in 0..self.bulk_buffers.len() {
+            self.check_and_flush_buffer(i, true)?;
+        }
         self.alloc_tracker.done_allocating();
         Ok(())
     }
