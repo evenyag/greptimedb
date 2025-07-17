@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::OpType;
-use datatypes::arrow::array::{ArrayRef, BinaryBuilder};
+use datatypes::arrow::array::{ArrayRef, BinaryBuilder, DictionaryArray, UInt32Array};
 use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -44,6 +44,7 @@ use crate::error::{
 use crate::memtable::bulk::buffer::BulkBuffer;
 use crate::memtable::stats::WriteMetrics;
 use crate::read::BoxedRecordBatchIterator;
+use crate::sst::parquet::format::PrimaryKeyArray;
 
 /// Writer for bulk buffer operations that encodes primary keys
 pub struct PrimaryKeyBufferWriter {
@@ -935,6 +936,10 @@ where
 /// `encode_primary_key_record_batch`: (fields, time index, primary key, sequence, op type)
 /// where the last 4 columns are: time index, primary key, sequence, op type
 ///
+/// The primary key column can be either:
+/// - BinaryArray: Raw binary-encoded primary key values
+/// - PrimaryKeyArray: Dictionary-encoded binary primary key values (DictionaryArray<UInt32Type>)
+///
 /// # Arguments
 ///
 /// * `iterators` - Vector of BoxedRecordBatchIterator instances to merge
@@ -956,21 +961,12 @@ pub fn merge_iterators_by_primary_key(
             let primary_key_index = num_cols - 3;
             let sequence_index = num_cols - 2;
 
-            // Compare primary key column (binary data)
+            // Compare primary key column (binary data or dictionary-encoded binary)
             let pk_a = batch_a.column(primary_key_index);
             let pk_b = batch_b.column(primary_key_index);
 
-            let pk_array_a = pk_a
-                .as_any()
-                .downcast_ref::<datatypes::arrow::array::BinaryArray>()
-                .unwrap();
-            let pk_array_b = pk_b
-                .as_any()
-                .downcast_ref::<datatypes::arrow::array::BinaryArray>()
-                .unwrap();
-
-            let pk_value_a = pk_array_a.value(row_a);
-            let pk_value_b = pk_array_b.value(row_b);
+            let pk_value_a = extract_primary_key_value(pk_a, row_a);
+            let pk_value_b = extract_primary_key_value(pk_b, row_b);
 
             match pk_value_a.cmp(pk_value_b) {
                 std::cmp::Ordering::Less => return true,
@@ -1011,6 +1007,44 @@ pub fn merge_iterators_by_primary_key(
         };
 
     merge_iterators(iterators, compare_fn, batch_size)
+}
+
+/// Helper function to extract primary key value from either BinaryArray or PrimaryKeyArray
+fn extract_primary_key_value(array: &ArrayRef, row: usize) -> &[u8] {
+    use datatypes::arrow::datatypes::DataType;
+    
+    match array.data_type() {
+        DataType::Binary => {
+            let binary_array = array
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::BinaryArray>()
+                .unwrap();
+            binary_array.value(row)
+        }
+        DataType::Dictionary(key_type, value_type) => {
+            // Check if this is a PrimaryKeyArray (Dictionary<UInt32, Binary>)
+            if let (DataType::UInt32, DataType::Binary) = (key_type.as_ref(), value_type.as_ref()) {
+                let dict_array = array
+                    .as_any()
+                    .downcast_ref::<PrimaryKeyArray>()
+                    .unwrap();
+                
+                // Get the key (index into the dictionary)
+                let key = dict_array.key(row).unwrap();
+                
+                // Get the value from the dictionary
+                let values = dict_array.values();
+                let binary_values = values
+                    .as_any()
+                    .downcast_ref::<datatypes::arrow::array::BinaryArray>()
+                    .unwrap();
+                binary_values.value(key as usize)
+            } else {
+                panic!("Unsupported dictionary type for primary key");
+            }
+        }
+        _ => panic!("Unsupported array type for primary key"),
+    }
 }
 
 /// Helper function to compare timestamp values from two arrays
