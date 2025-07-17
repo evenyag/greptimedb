@@ -561,7 +561,7 @@ where
 
     let batches_clone = batches.clone();
     let batche_lens = batches.iter().map(|batch| batch.num_rows()).collect_vec();
-    let index_chunks = batche_lens
+    let merge_iter = batche_lens
         .into_iter()
         .enumerate()
         .map(|(batch_idx, num_rows)| (0..num_rows).map(move |row_idx| (batch_idx, row_idx)))
@@ -572,15 +572,45 @@ where
                 &batches_clone[right.0],
                 right.1,
             )
-        })
-        .chunks(batch_size)
-        .into_iter()
-        .map(|chunk| chunk.collect_vec())
-        .collect_vec();
-    let iter = index_chunks.into_iter().map(move |indices| {
+        });
+    let chunk_iter = ChunkIter {
+        iter: merge_iter,
+        chunks: Vec::new(),
+        batch_size,
+        end: false,
+    };
+    let iter = chunk_iter.map(move |indices| {
         let batches = batches.iter().collect_vec();
         datatypes::arrow::compute::interleave_record_batch(&batches, &indices)
             .context(ComputeArrowSnafu)
     });
     Box::new(iter)
+}
+
+struct ChunkIter<I> {
+    iter: I,
+    chunks: Vec<(usize, usize)>,
+    batch_size: usize,
+    end: bool,
+}
+
+impl<I: Iterator<Item = (usize, usize)>> Iterator for ChunkIter<I> {
+    type Item = Vec<(usize, usize)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end {
+            return None;
+        }
+
+        for _ in 0..self.batch_size {
+            if let Some(v) = self.iter.next() {
+                self.chunks.push(v);
+            } else {
+                self.end = true;
+                return Some(std::mem::take(&mut self.chunks));
+            }
+        }
+
+        Some(std::mem::take(&mut self.chunks))
+    }
 }
