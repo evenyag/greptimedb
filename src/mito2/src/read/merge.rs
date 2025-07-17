@@ -27,6 +27,44 @@ use crate::memtable::BoxedBatchIterator;
 use crate::metrics::READ_STAGE_ELAPSED;
 use crate::read::{Batch, BatchReader, BoxedBatchReader, Source};
 
+const MIN_BATCH_SIZE: usize = 128;
+
+#[derive(Default)]
+struct BatchBuf {
+    batches: Vec<Batch>,
+    num_rows: usize,
+}
+
+impl BatchBuf {
+    fn can_output(&self) -> bool {
+        self.num_rows >= MIN_BATCH_SIZE
+    }
+
+    /// Panics: self.is_empty()
+    fn can_push(&self, batch: &Batch) -> bool {
+        self.batches[0].primary_key() == batch.primary_key()
+    }
+
+    fn push(&mut self, batch: Batch) {
+        self.num_rows += batch.num_rows();
+        self.batches.push(batch);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.num_rows == 0
+    }
+
+    fn concat(&mut self) -> Result<Option<Batch>> {
+        if self.num_rows == 0 {
+            return Ok(None);
+        }
+
+        self.num_rows = 0;
+        let batch = Batch::concat(std::mem::take(&mut self.batches))?;
+        Ok(Some(batch))
+    }
+}
+
 /// Reader to merge sorted batches.
 ///
 /// The merge reader merges [Batch]es from multiple sources that yield sorted batches.
@@ -52,13 +90,14 @@ pub struct MergeReader {
     output_batch: Option<Batch>,
     /// Local metrics.
     metrics: Metrics,
+    batch_buf: BatchBuf,
 }
 
 #[async_trait]
 impl BatchReader for MergeReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
         let start = Instant::now();
-        while !self.hot.is_empty() && self.output_batch.is_none() {
+        while !self.hot.is_empty() && self.output_batch.is_none() && !self.batch_buf.can_output() {
             if self.hot.len() == 1 {
                 // No need to do merge sort if only one batch in the hot heap.
                 self.fetch_batch_from_hottest().await?;
@@ -76,8 +115,9 @@ impl BatchReader for MergeReader {
             Ok(Some(batch))
         } else {
             // Nothing fetched.
+            let output = self.batch_buf.concat();
             self.metrics.scan_cost += start.elapsed();
-            Ok(None)
+            output
         }
     }
 }
@@ -116,6 +156,7 @@ impl MergeReader {
             cold,
             output_batch: None,
             metrics,
+            batch_buf: BatchBuf::default(),
         };
         // Initializes the reader.
         reader.refill_hot();
@@ -149,7 +190,7 @@ impl MergeReader {
 
         let mut hottest = self.hot.pop().unwrap();
         let batch = hottest.fetch_batch(&mut self.metrics).await?;
-        Self::maybe_output_batch(batch, &mut self.output_batch)?;
+        Self::maybe_output_batch(batch, &mut self.output_batch, &mut self.batch_buf)?;
         self.reheap(hottest)
     }
 
@@ -178,7 +219,11 @@ impl MergeReader {
             Ok(pos) => pos,
             Err(pos) => {
                 // No duplicate timestamp. Outputs timestamp before `pos`.
-                Self::maybe_output_batch(top.slice(0, pos), &mut self.output_batch)?;
+                Self::maybe_output_batch(
+                    top.slice(0, pos),
+                    &mut self.output_batch,
+                    &mut self.batch_buf,
+                )?;
                 top_node.skip_rows(pos, &mut self.metrics).await?;
                 return self.reheap(top_node);
             }
@@ -194,7 +239,11 @@ impl MergeReader {
             // the duplicate pos.
             duplicate_pos
         };
-        Self::maybe_output_batch(top.slice(0, output_end), &mut self.output_batch)?;
+        Self::maybe_output_batch(
+            top.slice(0, output_end),
+            &mut self.output_batch,
+            &mut self.batch_buf,
+        )?;
         top_node.skip_rows(output_end, &mut self.metrics).await?;
         self.reheap(top_node)
     }
@@ -232,12 +281,30 @@ impl MergeReader {
     /// If `filter_deleted` is set to true, removes deleted entries and sets the `batch` to the `output_batch`.
     ///
     /// Ignores the `batch` if it is empty.
-    fn maybe_output_batch(batch: Batch, output_batch: &mut Option<Batch>) -> Result<()> {
+    fn maybe_output_batch(
+        batch: Batch,
+        output_batch: &mut Option<Batch>,
+        batch_buf: &mut BatchBuf,
+    ) -> Result<()> {
         debug_assert!(output_batch.is_none());
         if batch.is_empty() {
             return Ok(());
         }
-        *output_batch = Some(batch);
+
+        if !batch_buf.is_empty() {
+            if !batch_buf.can_push(&batch) || batch_buf.can_output() {
+                *output_batch = batch_buf.concat()?;
+            }
+
+            batch_buf.push(batch);
+            return Ok(());
+        }
+
+        if batch.num_rows() >= MIN_BATCH_SIZE {
+            *output_batch = Some(batch);
+        } else {
+            batch_buf.push(batch);
+        }
 
         Ok(())
     }
