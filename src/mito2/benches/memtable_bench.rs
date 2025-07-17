@@ -21,6 +21,7 @@ use datafusion_common::Column;
 use datafusion_expr::{lit, Expr};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::schema::ColumnSchema;
+use mito2::memtable::bulk::BulkMemtable;
 use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
 use mito2::memtable::{KeyValues, Memtable};
@@ -359,5 +360,57 @@ fn cpu_metadata() -> RegionMetadata {
     builder.build().unwrap()
 }
 
-criterion_group!(benches, write_rows, full_scan, filter_1_host);
+fn bulk_memtable_write_2m_rows(c: &mut Criterion) {
+    let metadata = Arc::new(cpu_metadata());
+    let start_sec = 1710043200;
+    let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
+
+    let mut group = c.benchmark_group("write_2m_bulk_memtable");
+    group.sample_size(10);
+    group.bench_function("write_2m_rows", |b| {
+        b.iter(|| {
+            let memtable = BulkMemtable::new(1, metadata.clone(), None);
+            let mut total_rows = 0;
+            for kvs in generator.iter() {
+                memtable.write(&kvs).unwrap();
+                total_rows += kvs.num_rows();
+                if total_rows >= 2_000_000 {
+                    break;
+                }
+            }
+        });
+    });
+}
+
+fn time_series_memtable_write_2m_rows(c: &mut Criterion) {
+    let metadata = Arc::new(cpu_metadata());
+    let start_sec = 1710043200;
+    let generator = CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 3600 * 2);
+
+    let mut group = c.benchmark_group("write_2m_time_series_memtable");
+    group.sample_size(10);
+    group.bench_function("write_2m_rows", |b| {
+        b.iter(|| {
+            let memtable =
+                TimeSeriesMemtable::new(metadata.clone(), 1, None, true, MergeMode::LastRow);
+            let mut total_rows = 0;
+            for kvs in generator.iter() {
+                memtable.write(&kvs).unwrap();
+                total_rows += kvs.num_rows();
+                if total_rows >= 2_000_000 {
+                    break;
+                }
+            }
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    write_rows,
+    full_scan,
+    filter_1_host,
+    bulk_memtable_write_2m_rows,
+    time_series_memtable_write_2m_rows
+);
 criterion_main!(benches);
