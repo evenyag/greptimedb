@@ -430,6 +430,10 @@ impl Memtable for BulkMemtable {
     }
 
     fn freeze(&self) -> Result<()> {
+        let _timer = BULK_MEMTABLE_STAGE_ELAPSED
+            .with_label_values(&["freeze_bulk"])
+            .start_timer();
+
         // Flush all buffers
         for i in 0..self.bulk_buffers.len() {
             self.check_and_flush_buffer(i, true)?;
