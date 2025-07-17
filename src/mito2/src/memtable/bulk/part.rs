@@ -53,9 +53,10 @@ use crate::error::{
     self, ComputeArrowSnafu, EncodeMemtableSnafu, EncodeSnafu, NewRecordBatchSnafu, Result,
 };
 use crate::memtable::bulk::context::BulkIterContextRef;
-use crate::memtable::bulk::part_reader::BulkPartIter;
+use crate::memtable::bulk::part_reader::{BulkPartIter, BulkPartRecordBatchIter};
 use crate::memtable::bulk::primary_key::ColumnIndices;
 use crate::memtable::BoxedBatchIterator;
+use crate::read::BoxedRecordBatchIterator;
 use crate::sst::parquet::format::{PrimaryKeyArray, ReadFormat};
 use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::to_sst_arrow_schema;
@@ -231,6 +232,31 @@ impl EncodedBulkPart {
             sequence,
         )?;
         Ok(Some(Box::new(iter) as BoxedBatchIterator))
+    }
+
+    pub(crate) fn read_record_batch(
+        &self,
+        context: BulkIterContextRef,
+        sequence: Option<SequenceNumber>,
+    ) -> Result<Option<BoxedRecordBatchIterator>> {
+        // use predicate to find row groups to read.
+        let row_groups_to_read = context.row_groups_to_read(&self.metadata.parquet_metadata);
+
+        if row_groups_to_read.is_empty() {
+            // All row groups are filtered.
+            return Ok(None);
+        }
+
+        let iter = BulkPartIter::try_new(
+            context,
+            row_groups_to_read,
+            self.metadata.parquet_metadata.clone(),
+            self.data.clone(),
+            sequence,
+        )?;
+        Ok(Some(
+            Box::new(BulkPartRecordBatchIter(iter)) as BoxedRecordBatchIterator
+        ))
     }
 }
 
@@ -594,7 +620,7 @@ fn create_sst_column_indices(
 }
 
 /// Extracts min and max timestamps from a timestamp column
-fn extract_min_max_timestamp(
+pub(crate) fn extract_min_max_timestamp(
     time_column: &ArrayRef,
     metadata: &RegionMetadataRef,
 ) -> Result<(i64, i64)> {

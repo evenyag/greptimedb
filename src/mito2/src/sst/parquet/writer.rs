@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 use common_telemetry::debug;
 use common_time::Timestamp;
 use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
@@ -40,6 +41,7 @@ use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 
 use crate::access_layer::{FilePathProvider, SstInfoArray, TempFileCleaner};
 use crate::error::{InvalidMetadataSnafu, OpenDalSnafu, Result, WriteParquetSnafu};
+use crate::memtable::bulk::part::extract_min_max_timestamp;
 use crate::read::{Batch, Source};
 use crate::sst::file::FileId;
 use crate::sst::index::{Indexer, IndexerBuilder};
@@ -202,9 +204,13 @@ where
         override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
         opts: &WriteOptions,
     ) -> Result<SstInfoArray> {
-        let res = self
-            .write_all_without_cleaning(source, override_sequence, opts)
-            .await;
+        let res = if source.is_record_batch() {
+            self.write_all_record_batch_without_cleaning(source, override_sequence, opts)
+                .await
+        } else {
+            self.write_all_without_cleaning(source, override_sequence, opts)
+                .await
+        };
         if res.is_err() {
             // Clean tmp files explicitly on failure.
             let file_id = self.current_file;
@@ -261,6 +267,52 @@ where
         Ok(results)
     }
 
+    async fn write_all_record_batch_without_cleaning(
+        &mut self,
+        mut source: Source,
+        override_sequence: Option<SequenceNumber>, // override the `sequence` field from `Source`
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let mut results = smallvec![];
+        let write_format =
+            WriteFormat::new(self.metadata.clone()).with_override_sequence(override_sequence);
+        let mut stats = SourceStats::default();
+
+        while let Some(res) = self
+            .write_next_record_batch(&mut source, &write_format, opts)
+            .await
+            .transpose()
+        {
+            match res {
+                Ok(batch) => {
+                    stats.update_record_batch(&self.metadata, &batch)?;
+                    // // safety: self.current_indexer must be set when first batch has been written.
+                    // self.current_indexer
+                    //     .as_mut()
+                    //     .unwrap()
+                    //     .update(&mut batch)
+                    //     .await;
+                    if let Some(max_file_size) = opts.max_file_size
+                        && self.bytes_written.load(Ordering::Relaxed) > max_file_size
+                    {
+                        self.finish_current_file(&mut results, &mut stats).await?;
+                    }
+                }
+                Err(e) => {
+                    // if let Some(indexer) = &mut self.current_indexer {
+                    //     indexer.abort().await;
+                    // }
+                    return Err(e);
+                }
+            }
+        }
+
+        self.finish_current_file(&mut results, &mut stats).await?;
+
+        // object_store.write will make sure all bytes are written or an error is raised.
+        Ok(results)
+    }
+
     /// Customizes per-column config according to schema and maybe column cardinality.
     fn customize_column_config(
         builder: WriterPropertiesBuilder,
@@ -294,6 +346,24 @@ where
         self.maybe_init_writer(write_format.arrow_schema(), opts)
             .await?
             .write(&arrow_batch)
+            .await
+            .context(WriteParquetSnafu)?;
+        Ok(Some(batch))
+    }
+
+    async fn write_next_record_batch(
+        &mut self,
+        source: &mut Source,
+        write_format: &WriteFormat,
+        opts: &WriteOptions,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(batch) = source.next_record_batch().await? else {
+            return Ok(None);
+        };
+
+        self.maybe_init_writer(write_format.arrow_schema(), opts)
+            .await?
+            .write(&batch)
             .await
             .context(WriteParquetSnafu)?;
         Ok(Some(batch))
@@ -365,6 +435,40 @@ impl SourceStats {
         } else {
             self.time_range = Some((min_in_batch, max_in_batch));
         }
+    }
+
+    fn update_record_batch(
+        &mut self,
+        metadata: &RegionMetadataRef,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        self.num_rows += batch.num_rows();
+        // Safety: batch is not empty.
+        let (min_in_batch, max_in_batch) =
+            extract_min_max_timestamp(batch.column(batch.num_columns() - 3), metadata)?;
+        let timestamp_unit = metadata
+            .time_index_column()
+            .column_schema
+            .data_type
+            .as_timestamp()
+            .unwrap()
+            .unit();
+        let (min_in_batch, max_in_batch) = (
+            Timestamp::new(min_in_batch, timestamp_unit),
+            Timestamp::new(max_in_batch, timestamp_unit),
+        );
+        if let Some(time_range) = &mut self.time_range {
+            time_range.0 = time_range.0.min(min_in_batch);
+            time_range.1 = time_range.1.max(max_in_batch);
+        } else {
+            self.time_range = Some((min_in_batch, max_in_batch));
+        }
+
+        Ok(())
     }
 }
 

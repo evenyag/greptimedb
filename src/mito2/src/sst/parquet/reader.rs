@@ -1283,7 +1283,7 @@ where
     }
 
     /// Tries to fetch next [RecordBatch] from the reader.
-    fn fetch_next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
+    pub(crate) fn fetch_next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.context.map_result(self.reader.next().transpose())
     }
 

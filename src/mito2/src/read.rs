@@ -40,6 +40,7 @@ use datafusion_common::arrow::array::UInt8Array;
 use datatypes::arrow;
 use datatypes::arrow::array::{Array, ArrayRef, UInt64Array};
 use datatypes::arrow::compute::SortOptions;
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::arrow::row::{RowConverter, SortField};
 use datatypes::prelude::{ConcreteDataType, DataType, ScalarVector};
 use datatypes::scalars::ScalarVectorBuilder;
@@ -964,6 +965,8 @@ impl From<Batch> for BatchBuilder {
     }
 }
 
+pub type BoxedRecordBatchIterator = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
+
 /// Async [Batch] reader and iterator wrapper.
 ///
 /// This is the data source for SST writers or internal readers.
@@ -976,9 +979,16 @@ pub enum Source {
     Stream(BoxedBatchStream),
     /// Source from a [PruneReader].
     PruneReader(PruneReader),
+
+    RecordBatchIter(BoxedRecordBatchIterator),
 }
 
 impl Source {
+    /// Returns true if the source returns record batches.
+    pub(crate) fn is_record_batch(&self) -> bool {
+        matches!(self, Source::RecordBatchIter(_))
+    }
+
     /// Returns next [Batch] from this data source.
     pub(crate) async fn next_batch(&mut self) -> Result<Option<Batch>> {
         match self {
@@ -986,6 +996,15 @@ impl Source {
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
             Source::PruneReader(reader) => reader.next_batch().await,
+            Source::RecordBatchIter(_) => panic!("Should not fetch batch from record batch iter"),
+        }
+    }
+
+    /// Returns next [RecordBatch] from this data source.
+    pub(crate) async fn next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self {
+            Source::RecordBatchIter(iter) => iter.next().transpose(),
+            _ => panic!("Should not fetch record batch from batch source"),
         }
     }
 }

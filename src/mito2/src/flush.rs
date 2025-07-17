@@ -32,6 +32,7 @@ use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
+use crate::memtable::bulk::primary_key::merge_iterators_by_primary_key;
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
@@ -48,7 +49,7 @@ use crate::request::{
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::{FileMeta, FileTimeRange};
-use crate::sst::parquet::WriteOptions;
+use crate::sst::parquet::{WriteOptions, DEFAULT_READ_BATCH_SIZE};
 use crate::worker::WorkerListener;
 
 /// Global write buffer (memtable) manager.
@@ -357,28 +358,46 @@ impl RegionFlushTask {
             // Get ranges from the memtable
             let predicate_group = PredicateGroup::default();
             let ranges = mem.ranges(None, predicate_group, None)?;
+            let is_bulk = ranges
+                .ranges
+                .iter()
+                .next()
+                .map(|(_, range)| range.is_record_batch())
+                .unwrap_or_default();
 
             // Process each range.
-            let mut sources = Vec::with_capacity(ranges.ranges.len());
-            for (_range_id, range) in ranges.ranges {
-                // Create a time range covering all possible timestamps for this range
-                let time_range: FileTimeRange =
-                    if let Some((min_ts, max_ts)) = ranges.stats.time_range() {
-                        (min_ts, max_ts)
-                    } else {
-                        // If no time range, skip this range
-                        continue;
-                    };
+            let source = if !is_bulk {
+                let mut sources = Vec::with_capacity(ranges.ranges.len());
+                for (_range_id, range) in ranges.ranges {
+                    // Create a time range covering all possible timestamps for this range
+                    let time_range: FileTimeRange =
+                        if let Some((min_ts, max_ts)) = ranges.stats.time_range() {
+                            (min_ts, max_ts)
+                        } else {
+                            // If no time range, skip this range
+                            continue;
+                        };
 
-                // Build iterator for this range
-                let iter = range.build_iter(time_range)?;
-                let source = Source::Iter(iter);
+                    // Build iterator for this range
+                    let iter = range.build_iter(time_range)?;
+                    let source = Source::Iter(iter);
 
-                sources.push(source);
-            }
+                    sources.push(source);
+                }
 
-            let reader = MergeReader::new(sources).await?;
-            let source = Source::Reader(Box::new(reader));
+                let reader = MergeReader::new(sources).await?;
+                Source::Reader(Box::new(reader))
+            } else {
+                let mut sources = Vec::with_capacity(ranges.ranges.len());
+                for (_range_id, range) in ranges.ranges {
+                    // Build iterator for this range
+                    let iter = range.build_record_batch(None)?;
+
+                    sources.push(iter);
+                }
+                let iter = merge_iterators_by_primary_key(sources, DEFAULT_READ_BATCH_SIZE)?;
+                Source::RecordBatchIter(iter)
+            };
 
             // Flush this range to level 0
             let write_request = SstWriteRequest {

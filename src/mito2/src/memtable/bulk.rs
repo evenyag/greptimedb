@@ -37,6 +37,7 @@ use crate::memtable::{
     PredicateGroup, WriteBufferManagerRef,
 };
 use crate::metrics::BULK_MEMTABLE_STAGE_ELAPSED;
+use crate::read::BoxedRecordBatchIterator;
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 
 #[allow(unused)]
@@ -84,6 +85,24 @@ impl IterBuilder for BulkMemtableIterBuilder {
         ));
 
         if let Some(iter) = self.part.read(context, self.sequence)? {
+            Ok(iter)
+        } else {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    fn is_record_batch(&self) -> bool {
+        true
+    }
+
+    fn build_record_batch(&self) -> Result<BoxedRecordBatchIterator> {
+        let context = Arc::new(BulkIterContext::new(
+            self.metadata.clone(),
+            &self.projection.as_deref(),
+            self.predicate.clone(),
+        ));
+
+        if let Some(iter) = self.part.read_record_batch(context, self.sequence)? {
             Ok(iter)
         } else {
             Ok(Box::new(std::iter::empty()))

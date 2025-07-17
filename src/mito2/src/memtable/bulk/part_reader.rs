@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use datatypes::arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
 use store_api::storage::SequenceNumber;
@@ -90,6 +91,27 @@ impl BulkPartIter {
         }
         Ok(None)
     }
+
+    // TODO(yingwen): Support prune
+    pub(crate) fn next_record_batch(&mut self) -> error::Result<Option<RecordBatch>> {
+        let Some(current) = &mut self.current_reader else {
+            // All row group exhausted.
+            return Ok(None);
+        };
+
+        if let Some(batch) = current.next_record_batch()? {
+            return Ok(Some(batch));
+        }
+
+        // Previous row group exhausted, read next row group
+        while let Some(next_row_group) = self.row_groups_to_read.pop_front() {
+            current.reset(self.builder.build_row_group_reader(next_row_group, None)?);
+            if let Some(next_batch) = current.next_record_batch()? {
+                return Ok(Some(next_batch));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl Iterator for BulkPartIter {
@@ -97,6 +119,16 @@ impl Iterator for BulkPartIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_batch().transpose()
+    }
+}
+
+pub(crate) struct BulkPartRecordBatchIter(pub(crate) BulkPartIter);
+
+impl Iterator for BulkPartRecordBatchIter {
+    type Item = error::Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next_record_batch().transpose()
     }
 }
 
@@ -127,6 +159,10 @@ impl PruneReader {
             }
         }
         Ok(None)
+    }
+
+    fn next_record_batch(&mut self) -> error::Result<Option<RecordBatch>> {
+        self.row_group_reader.fetch_next_record_batch()
     }
 
     /// Prunes batch according to filters.

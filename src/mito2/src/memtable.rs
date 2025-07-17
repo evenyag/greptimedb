@@ -37,7 +37,7 @@ use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
 use crate::read::prune::PruneTimeIterator;
 use crate::read::scan_region::PredicateGroup;
-use crate::read::Batch;
+use crate::read::{Batch, BoxedRecordBatchIterator};
 use crate::region::options::{MemtableOptions, MergeMode};
 use crate::sst::file::FileTimeRange;
 
@@ -361,6 +361,16 @@ impl MemtableBuilderProvider {
 pub trait IterBuilder: Send + Sync {
     /// Returns the iterator to read the range.
     fn build(&self) -> Result<BoxedBatchIterator>;
+
+    /// Is scan by record batch.
+    fn is_record_batch(&self) -> bool {
+        false
+    }
+
+    /// Returns the iterator to read the range in record batch.
+    fn build_record_batch(&self) -> Result<BoxedRecordBatchIterator> {
+        unimplemented!()
+    }
 }
 
 pub type BoxedIterBuilder = Box<dyn IterBuilder>;
@@ -417,6 +427,18 @@ impl MemtableRange {
             time_range,
             time_filters,
         )))
+    }
+
+    pub fn is_record_batch(&self) -> bool {
+        self.context.builder.is_record_batch()
+    }
+
+    pub fn build_record_batch(
+        &self,
+        _time_range: Option<FileTimeRange>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        // TODO(yingwen): time range check.
+        self.context.builder.build_record_batch()
     }
 }
 
