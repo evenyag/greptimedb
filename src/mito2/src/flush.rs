@@ -32,7 +32,7 @@ use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
-use crate::memtable::bulk::primary_key::merge_iterators_by_primary_key;
+use crate::memtable::bulk::primary_key::merge_record_batch_df;
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
@@ -49,7 +49,7 @@ use crate::request::{
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::{FileMeta, FileTimeRange};
-use crate::sst::parquet::{WriteOptions, DEFAULT_READ_BATCH_SIZE};
+use crate::sst::parquet::WriteOptions;
 use crate::worker::WorkerListener;
 
 /// Global write buffer (memtable) manager.
@@ -395,8 +395,7 @@ impl RegionFlushTask {
 
                     sources.push(iter);
                 }
-                let iter = merge_iterators_by_primary_key(sources, DEFAULT_READ_BATCH_SIZE)?;
-                Source::RecordBatchIter(iter)
+                merge_record_batch_df(&version.metadata, sources)?
             };
 
             // Flush this range to level 0

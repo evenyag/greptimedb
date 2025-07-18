@@ -22,6 +22,7 @@ use common_macro::stack_trace_debug;
 use common_runtime::JoinError;
 use common_time::timestamp::TimeUnit;
 use common_time::Timestamp;
+use datafusion_common::DataFusionError;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
@@ -1029,6 +1030,14 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Datafusion"))]
+    Datafusion {
+        #[snafu(source)]
+        error: DataFusionError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1189,6 +1198,8 @@ impl ErrorExt for Error {
             ScanExternalRange { source, .. } => source.status_code(),
 
             InconsistentTimestampLength { .. } => StatusCode::InvalidArguments,
+
+            Datafusion { .. } => StatusCode::Internal,
         }
     }
 

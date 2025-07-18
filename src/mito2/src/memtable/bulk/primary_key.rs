@@ -18,6 +18,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::v1::OpType;
+use datafusion::execution::memory_pool::{MemoryConsumer, UnboundedMemoryPool};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_common::DataFusionError;
 use datatypes::arrow::array::{ArrayRef, BinaryBuilder, DictionaryArray, UInt32Array};
 use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
@@ -26,6 +33,7 @@ use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::prelude::VectorRef;
 use datatypes::value::ValueRef;
 use datatypes::vectors::Helper;
+use futures::TryStreamExt;
 use itertools::Itertools;
 use mito_codec::key_values::{KeyValue, KeyValues};
 use mito_codec::row_converter::PrimaryKeyCodec;
@@ -38,13 +46,15 @@ use store_api::storage::consts::{
 use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{
-    ColumnNotFoundSnafu, ComputeArrowSnafu, ComputeVectorSnafu, EncodeSnafu, NewRecordBatchSnafu,
-    Result,
+    ColumnNotFoundSnafu, ComputeArrowSnafu, ComputeVectorSnafu, DatafusionSnafu, EncodeSnafu,
+    NewRecordBatchSnafu, Result,
 };
 use crate::memtable::bulk::buffer::BulkBuffer;
 use crate::memtable::stats::WriteMetrics;
-use crate::read::BoxedRecordBatchIterator;
+use crate::read::{BoxedRecordBatchIterator, Source};
 use crate::sst::parquet::format::PrimaryKeyArray;
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::to_sst_arrow_schema;
 
 /// Writer for bulk buffer operations that encodes primary keys
 pub struct PrimaryKeyBufferWriter {
@@ -731,7 +741,7 @@ where
         }
 
         let min_idx = self.heap[0];
-        
+
         // Advance the iterator
         let should_reinsert = if let Some(state) = &mut self.states[min_idx] {
             // Check if we can advance to the next row in the current batch
@@ -900,6 +910,131 @@ where
     }
 }
 
+/// Merges batches from multiple sorted sources into a single sorted stream.
+/// Input sources must be sorted by primary key and have the same schema.
+pub(crate) fn merge_record_batch_df(
+    metadata: &RegionMetadata,
+    sources: Vec<BoxedRecordBatchIterator>,
+) -> Result<Source> {
+    // TODO(yingwen): Can we pass the schema as an argument?
+    let schema = to_sst_arrow_schema(metadata);
+    let streams = sources
+        .into_iter()
+        .map(|source| {
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(source).map_err(|e| DataFusionError::External(Box::new(e))),
+            )) as _
+        })
+        .collect();
+    let exprs = sort_expressions(metadata);
+
+    common_telemetry::info!("Merge plain, exprs: {:?}, schema: {:?}", exprs, schema);
+
+    let memory_pool = Arc::new(UnboundedMemoryPool::default()) as _;
+    let reservation = MemoryConsumer::new("merge_plain").register(&memory_pool);
+    let metrics_set = ExecutionPlanMetricsSet::new();
+    let baseline_metrics = BaselineMetrics::new(&metrics_set, 0);
+    let mut stream = StreamingMergeBuilder::new()
+        .with_schema(schema)
+        .with_streams(streams)
+        .with_expressions(&exprs)
+        .with_batch_size(DEFAULT_READ_BATCH_SIZE)
+        .with_reservation(reservation)
+        .with_metrics(baseline_metrics.clone())
+        .build()
+        .unwrap();
+
+    // Convert the stream to an iterator by polling manually
+    // Since it's pure memory operation, Poll won't return Pending
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    use futures::Stream;
+
+    struct ManualPollIter<S> {
+        stream: Pin<Box<S>>,
+        waker: Waker,
+    }
+
+    impl<S> ManualPollIter<S>
+    where
+        S: Stream<Item = Result<RecordBatch, DataFusionError>> + Send,
+    {
+        fn new(stream: S) -> Self {
+            let waker = futures::task::noop_waker();
+            Self {
+                stream: Box::pin(stream),
+                waker,
+            }
+        }
+    }
+
+    impl<S> Iterator for ManualPollIter<S>
+    where
+        S: Stream<Item = Result<RecordBatch, DataFusionError>> + Send,
+    {
+        type Item = Result<RecordBatch>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let mut context = Context::from_waker(&self.waker);
+            match self.stream.as_mut().poll_next(&mut context) {
+                Poll::Ready(Some(Ok(batch))) => Some(Ok(batch)),
+                Poll::Ready(Some(Err(e))) => Some(Err(e).context(DatafusionSnafu)),
+                Poll::Ready(None) => None,
+                Poll::Pending => {
+                    // This should not happen for pure memory operations
+                    unreachable!("Stream should not return Pending for pure memory operations")
+                }
+            }
+        }
+    }
+
+    let iter = ManualPollIter::new(stream);
+    Ok(Source::RecordBatchIter(Box::new(iter)))
+}
+
+/// Builds the sort expressions from the region metadata
+/// to sort by:
+/// (primary key ASC, time index ASC, sequence DESC)
+pub(crate) fn sort_expressions(metadata: &RegionMetadata) -> LexOrdering {
+    // TODO(yingwen): Error handling.
+    // TODO(yingwen): Return time index column id from metadata.
+    let time_index_pos = metadata.time_index_column_pos();
+    let time_index_expr = create_sort_expr(
+        &metadata.time_index_column().column_schema.name,
+        time_index_pos,
+        false,
+    );
+    let sequence_index = metadata.column_metadatas.len();
+    let sequence_expr = create_sort_expr(SEQUENCE_COLUMN_NAME, sequence_index, true);
+
+    let exprs = metadata
+        .primary_key
+        .iter()
+        .map(|id| {
+            // Safety: We know the primary key exists in the metadata
+            let index = metadata.column_index_by_id(*id).unwrap();
+            let col_meta = &metadata.column_metadatas[index];
+            create_sort_expr(&col_meta.column_schema.name, index, false)
+        })
+        .chain([time_index_expr, sequence_expr])
+        .collect();
+    LexOrdering::new(exprs)
+}
+
+/// Helper function to create a sort expression for a column.
+fn create_sort_expr(column_name: &str, column_index: usize, descending: bool) -> PhysicalSortExpr {
+    let column = Column::new(column_name, column_index);
+    PhysicalSortExpr {
+        expr: Arc::new(column),
+        options: SortOptions {
+            descending,
+            nulls_first: true,
+        },
+    }
+}
+
 /// Creates a merge iterator that merges multiple BoxedRecordBatchIterator instances
 /// using a KMergeBy-style merge algorithm similar to merge_sorted_batches.
 ///
@@ -1025,7 +1160,8 @@ where
 
         // If we consumed a row that would advance to next batch, advance the iterator now
         if !self.merge_state.output_buffer.is_empty() {
-            let last_consumed = &self.merge_state.output_buffer[self.merge_state.output_buffer.len() - 1];
+            let last_consumed =
+                &self.merge_state.output_buffer[self.merge_state.output_buffer.len() - 1];
             if self.merge_state.states[last_consumed.0].is_some() {
                 let current_state = &self.merge_state.states[last_consumed.0].as_ref().unwrap();
                 // Check if this was the last row in the current batch
