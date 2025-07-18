@@ -695,6 +695,89 @@ where
         Ok(result)
     }
 
+    /// Peeks at the minimum iterator to check if it will advance to next batch
+    fn peek_min_will_advance_to_next_batch(&self) -> bool {
+        if self.heap.is_empty() {
+            return false;
+        }
+
+        let min_idx = self.heap[0];
+        if let Some(state) = &self.states[min_idx] {
+            state.current_row_idx + 1 >= state.current_batch.num_rows()
+        } else {
+            false
+        }
+    }
+
+    /// Consumes the current row from the minimum iterator without advancing to next batch
+    /// Returns the iterator index and the row index that was consumed
+    fn consume_min_row(&self) -> Option<(usize, usize)> {
+        if self.heap.is_empty() {
+            return None;
+        }
+
+        let min_idx = self.heap[0];
+        if let Some(state) = &self.states[min_idx] {
+            Some((min_idx, state.current_row_idx))
+        } else {
+            None
+        }
+    }
+
+    /// Advances the minimum iterator to the next batch and adjusts the heap
+    fn advance_min_iterator(&mut self, iterators: &mut [BoxedRecordBatchIterator]) -> Result<()> {
+        if self.heap.is_empty() {
+            return Ok(());
+        }
+
+        let min_idx = self.heap[0];
+        
+        // Advance the iterator
+        let should_reinsert = if let Some(state) = &mut self.states[min_idx] {
+            // Check if we can advance to the next row in the current batch
+            if state.current_row_idx + 1 < state.current_batch.num_rows() {
+                state.current_row_idx += 1;
+                true
+            } else {
+                // Need to get the next batch from this iterator
+                if let Some(next_batch_result) = iterators[min_idx].next() {
+                    let next_batch = next_batch_result?;
+                    if next_batch.num_rows() > 0 {
+                        state.current_batch = next_batch;
+                        state.current_row_idx = 0;
+                        true
+                    } else {
+                        // Empty batch, mark this iterator as exhausted
+                        self.states[min_idx] = None;
+                        false
+                    }
+                } else {
+                    // Iterator is exhausted
+                    self.states[min_idx] = None;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if should_reinsert {
+            // Re-establish heap property from the root
+            self.sift_down(0);
+        } else {
+            // Remove the exhausted iterator from the heap
+            if !self.heap.is_empty() {
+                self.heap[0] = self.heap[self.heap.len() - 1];
+                self.heap.pop();
+                if !self.heap.is_empty() {
+                    self.sift_down(0);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Pops the minimum iterator from the heap and advances it
     /// Returns the iterator index and the row index that was consumed
     fn pop_min_and_advance(
@@ -883,17 +966,34 @@ where
 
         // Fill the output buffer with up to batch_size rows
         while self.merge_state.output_buffer.len() < self.merge_state.batch_size {
-            match self.merge_state.pop_min_and_advance(&mut self.iterators) {
-                Ok(Some((min_idx, row_idx))) => {
+            // Check if the minimum iterator will advance to next batch
+            let will_advance_to_next_batch = self.merge_state.peek_min_will_advance_to_next_batch();
+
+            if will_advance_to_next_batch {
+                // If the iterator will advance to next batch, consume the current row without advancing
+                if let Some((min_idx, row_idx)) = self.merge_state.consume_min_row() {
                     // Add this row to the output buffer
                     self.merge_state.output_buffer.push((min_idx, row_idx));
-                }
-                Ok(None) => {
+                    // Break and return the current batch now
+                    break;
+                } else {
                     // No more items available
                     break;
                 }
-                Err(e) => {
-                    return Some(Err(e));
+            } else {
+                // Normal case: consume row and advance iterator
+                match self.merge_state.pop_min_and_advance(&mut self.iterators) {
+                    Ok(Some((min_idx, row_idx))) => {
+                        // Add this row to the output buffer
+                        self.merge_state.output_buffer.push((min_idx, row_idx));
+                    }
+                    Ok(None) => {
+                        // No more items available
+                        break;
+                    }
+                    Err(e) => {
+                        return Some(Err(e));
+                    }
                 }
             }
         }
@@ -915,13 +1015,30 @@ where
         }
 
         // Use the interleave function to create the output batch
-        match datatypes::arrow::compute::interleave_record_batch(
+        let result = match datatypes::arrow::compute::interleave_record_batch(
             &batches,
             &self.merge_state.output_buffer,
         ) {
             Ok(batch) => Some(Ok(batch)),
             Err(e) => Some(Err(ComputeArrowSnafu.into_error(e))),
+        };
+
+        // If we consumed a row that would advance to next batch, advance the iterator now
+        if !self.merge_state.output_buffer.is_empty() {
+            let last_consumed = &self.merge_state.output_buffer[self.merge_state.output_buffer.len() - 1];
+            if self.merge_state.states[last_consumed.0].is_some() {
+                let current_state = &self.merge_state.states[last_consumed.0].as_ref().unwrap();
+                // Check if this was the last row in the current batch
+                if current_state.current_row_idx + 1 >= current_state.current_batch.num_rows() {
+                    // Advance the iterator for the next call
+                    if let Err(e) = self.merge_state.advance_min_iterator(&mut self.iterators) {
+                        return Some(Err(e));
+                    }
+                }
+            }
         }
+
+        result
     }
 }
 
@@ -1012,7 +1129,7 @@ pub fn merge_iterators_by_primary_key(
 /// Helper function to extract primary key value from either BinaryArray or PrimaryKeyArray
 fn extract_primary_key_value(array: &ArrayRef, row: usize) -> &[u8] {
     use datatypes::arrow::datatypes::DataType;
-    
+
     match array.data_type() {
         DataType::Binary => {
             let binary_array = array
@@ -1024,14 +1141,11 @@ fn extract_primary_key_value(array: &ArrayRef, row: usize) -> &[u8] {
         DataType::Dictionary(key_type, value_type) => {
             // Check if this is a PrimaryKeyArray (Dictionary<UInt32, Binary>)
             if let (DataType::UInt32, DataType::Binary) = (key_type.as_ref(), value_type.as_ref()) {
-                let dict_array = array
-                    .as_any()
-                    .downcast_ref::<PrimaryKeyArray>()
-                    .unwrap();
-                
+                let dict_array = array.as_any().downcast_ref::<PrimaryKeyArray>().unwrap();
+
                 // Get the key (index into the dictionary)
                 let key = dict_array.key(row).unwrap();
-                
+
                 // Get the value from the dictionary
                 let values = dict_array.values();
                 let binary_values = values
