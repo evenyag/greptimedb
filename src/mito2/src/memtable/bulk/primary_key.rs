@@ -918,7 +918,7 @@ pub(crate) fn merge_record_batch_df(
 ) -> Result<Source> {
     // TODO(yingwen): Can we pass the schema as an argument?
     let schema = to_sst_arrow_schema(metadata);
-    let streams = sources
+    let streams: Vec<_> = sources
         .into_iter()
         .map(|source| {
             Box::pin(RecordBatchStreamAdapter::new(
@@ -927,9 +927,14 @@ pub(crate) fn merge_record_batch_df(
             )) as _
         })
         .collect();
-    let exprs = sort_expressions(metadata);
+    let exprs = sort_expressions(&schema);
 
-    common_telemetry::info!("Merge plain, exprs: {:?}, schema: {:?}", exprs, schema);
+    common_telemetry::info!(
+        "Merge plain, num_sources: {}, exprs: {:?}, schema: {:?}",
+        streams.len(),
+        exprs,
+        schema
+    );
 
     let memory_pool = Arc::new(UnboundedMemoryPool::default()) as _;
     let reservation = MemoryConsumer::new("merge_plain").register(&memory_pool);
@@ -997,30 +1002,18 @@ pub(crate) fn merge_record_batch_df(
 /// Builds the sort expressions from the region metadata
 /// to sort by:
 /// (primary key ASC, time index ASC, sequence DESC)
-pub(crate) fn sort_expressions(metadata: &RegionMetadata) -> LexOrdering {
+pub(crate) fn sort_expressions(schema: &SchemaRef) -> LexOrdering {
     // TODO(yingwen): Error handling.
     // TODO(yingwen): Return time index column id from metadata.
-    let time_index_pos = metadata.time_index_column_pos();
-    let time_index_expr = create_sort_expr(
-        &metadata.time_index_column().column_schema.name,
-        time_index_pos,
-        false,
-    );
-    let sequence_index = metadata.column_metadatas.len();
+    let time_index_pos = schema.fields.len() - 4;
+    let time_index_expr =
+        create_sort_expr(&schema.fields[time_index_pos].name(), time_index_pos, false);
+    let sequence_index = schema.fields.len() - 2;
     let sequence_expr = create_sort_expr(SEQUENCE_COLUMN_NAME, sequence_index, true);
+    let primary_key_expr =
+        create_sort_expr(PRIMARY_KEY_COLUMN_NAME, schema.fields.len() - 3, false);
 
-    let exprs = metadata
-        .primary_key
-        .iter()
-        .map(|id| {
-            // Safety: We know the primary key exists in the metadata
-            let index = metadata.column_index_by_id(*id).unwrap();
-            let col_meta = &metadata.column_metadatas[index];
-            create_sort_expr(&col_meta.column_schema.name, index, false)
-        })
-        .chain([time_index_expr, sequence_expr])
-        .collect();
-    LexOrdering::new(exprs)
+    LexOrdering::new(vec![primary_key_expr, time_index_expr, sequence_expr])
 }
 
 /// Helper function to create a sort expression for a column.
