@@ -449,7 +449,7 @@ impl SourceStats {
         self.num_rows += batch.num_rows();
         // Safety: batch is not empty.
         let (min_in_batch, max_in_batch) =
-            extract_min_max_timestamp(batch.column(batch.num_columns() - 3), metadata)?;
+            extract_min_max_timestamp(batch.column(batch.num_columns() - 4), metadata)?;
         let timestamp_unit = metadata
             .time_index_column()
             .column_schema
