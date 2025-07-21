@@ -440,7 +440,7 @@ impl RegionFlushTask {
                         .ranges
                         .values()
                         .skip(partition)
-                        .step_by(partition)
+                        .step_by(self.engine_config.max_background_flushes)
                         .cloned()
                         .collect();
 
