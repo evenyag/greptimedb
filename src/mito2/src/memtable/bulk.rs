@@ -218,10 +218,10 @@ impl BulkMemtable {
                     .with_label_values(&["build_record_batch"])
                     .start_timer();
 
-                common_telemetry::info!(
-                    "check and flush buffer {buffer_index}, row count: {}, force: {force}",
-                    buffer.row_count()
-                );
+                // common_telemetry::info!(
+                //     "check and flush buffer {buffer_index}, row count: {}, force: {force}",
+                //     buffer.row_count()
+                // );
 
                 // Build record batch from buffer (this resets the buffer internally)
                 if let Some(record_batch) =
@@ -257,11 +257,11 @@ impl BulkMemtable {
                 // Sort the partial sorted batches
                 let sorted_batches = self.primary_key_writer.sort_partial_sorted(batches)?;
 
-                common_telemetry::info!(
-                    "check and flush buffer {buffer_index}, batch count: {}, row count: {}, force: {force}",
-                    num_batches,
-                    row_count,
-                );
+                // common_telemetry::info!(
+                //     "check and flush buffer {buffer_index}, batch count: {}, row count: {}, force: {force}",
+                //     num_batches,
+                //     row_count,
+                // );
 
                 // Encode the sorted batches into EncodedBulkPart
                 if let Some(encoded_part) = self.part_encoder.encode_record_batches(
