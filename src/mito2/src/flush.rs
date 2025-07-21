@@ -29,7 +29,8 @@ use crate::access_layer::{AccessLayerRef, OperationType, SstWriteRequest};
 use crate::cache::CacheManagerRef;
 use crate::config::MitoConfig;
 use crate::error::{
-    Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
+    Error, FlushRegionSnafu, JoinSnafu, RegionClosedSnafu, RegionDroppedSnafu,
+    RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
 use crate::memtable::bulk::primary_key::merge_record_batch_df;
@@ -366,7 +367,7 @@ impl RegionFlushTask {
                 .unwrap_or_default();
 
             // Process each range.
-            let source = if !is_bulk {
+            if !is_bulk {
                 let mut sources = Vec::with_capacity(ranges.ranges.len());
                 for (_range_id, range) in ranges.ranges {
                     // Create a time range covering all possible timestamps for this range
@@ -386,56 +387,138 @@ impl RegionFlushTask {
                 }
 
                 let reader = MergeReader::new(sources).await?;
-                Source::Reader(Box::new(reader))
+                let source = Source::Reader(Box::new(reader));
+
+                // Flush this range to level 0
+                let write_request = SstWriteRequest {
+                    op_type: OperationType::Flush,
+                    metadata: version.metadata.clone(),
+                    source,
+                    cache_manager: self.cache_manager.clone(),
+                    storage: version.options.storage.clone(),
+                    max_sequence: Some(max_sequence),
+                    index_options: self.index_options.clone(),
+                    inverted_index_config: self.engine_config.inverted_index.clone(),
+                    fulltext_index_config: self.engine_config.fulltext_index.clone(),
+                    bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
+                };
+
+                let ssts_written = self
+                    .access_layer
+                    .write_sst(write_request, &write_opts)
+                    .await?;
+                if ssts_written.is_empty() {
+                    // No data written from this range.
+                    continue;
+                }
+
+                file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                    flushed_bytes += sst_info.file_size;
+                    FileMeta {
+                        region_id: self.region_id,
+                        file_id: sst_info.file_id,
+                        time_range: sst_info.time_range,
+                        level: 0,
+                        file_size: sst_info.file_size,
+                        available_indexes: sst_info.index_metadata.build_available_indexes(),
+                        index_file_size: sst_info.index_metadata.file_size,
+                        num_rows: sst_info.num_rows as u64,
+                        num_row_groups: sst_info.num_row_groups,
+                        sequence: NonZeroU64::new(max_sequence),
+                    }
+                }));
             } else {
-                let mut sources = Vec::with_capacity(ranges.ranges.len());
-                for (_range_id, range) in ranges.ranges {
-                    // Build iterator for this range
-                    let iter = range.build_record_batch(None)?;
+                common_telemetry::info!(
+                    "Flush in parallel, rows: {}, ranges: {}, par: {}",
+                    ranges.stats.num_rows(),
+                    ranges.stats.num_ranges(),
+                    self.engine_config.max_background_flushes
+                );
+                let mut futures = Vec::new();
+                for partition in 0..self.engine_config.max_background_flushes {
+                    let part_ranges: Vec<_> = ranges
+                        .ranges
+                        .values()
+                        .skip(partition)
+                        .step_by(partition)
+                        .cloned()
+                        .collect();
 
-                    sources.push(iter);
+                    let version = version.clone();
+                    let cache_manager = self.cache_manager.clone();
+                    let storage = version.options.storage.clone();
+                    let index_options = self.index_options.clone();
+                    let inverted_index_config = self.engine_config.inverted_index.clone();
+                    let fulltext_index_config = self.engine_config.fulltext_index.clone();
+                    let bloom_filter_index_config = self.engine_config.bloom_filter_index.clone();
+                    let access_layer = self.access_layer.clone();
+                    let region_id = self.region_id;
+                    let write_opts = write_opts.clone();
+                    let future = common_runtime::spawn_global(async move {
+                        let mut sources = Vec::with_capacity(part_ranges.len());
+                        for range in part_ranges {
+                            // Build iterator for this range
+                            let iter = range.build_record_batch(None)?;
+
+                            sources.push(iter);
+                        }
+                        let source = merge_record_batch_df(&version.metadata, sources)?;
+
+                        // Flush this range to level 0
+                        let write_request = SstWriteRequest {
+                            op_type: OperationType::Flush,
+                            metadata: version.metadata.clone(),
+                            source,
+                            cache_manager,
+                            storage,
+                            max_sequence: Some(max_sequence),
+                            index_options,
+                            inverted_index_config,
+                            fulltext_index_config,
+                            bloom_filter_index_config,
+                        };
+
+                        let ssts_written =
+                            access_layer.write_sst(write_request, &write_opts).await?;
+                        if ssts_written.is_empty() {
+                            // No data written from this range.
+                            return Ok(Vec::new());
+                        }
+
+                        let info_list = ssts_written
+                            .into_iter()
+                            .map(|sst_info| {
+                                flushed_bytes += sst_info.file_size;
+                                FileMeta {
+                                    region_id,
+                                    file_id: sst_info.file_id,
+                                    time_range: sst_info.time_range,
+                                    level: 0,
+                                    file_size: sst_info.file_size,
+                                    available_indexes: sst_info
+                                        .index_metadata
+                                        .build_available_indexes(),
+                                    index_file_size: sst_info.index_metadata.file_size,
+                                    num_rows: sst_info.num_rows as u64,
+                                    num_row_groups: sst_info.num_row_groups,
+                                    sequence: NonZeroU64::new(max_sequence),
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(info_list)
+                    });
+
+                    futures.push(future);
                 }
-                merge_record_batch_df(&version.metadata, sources)?
-            };
 
-            // Flush this range to level 0
-            let write_request = SstWriteRequest {
-                op_type: OperationType::Flush,
-                metadata: version.metadata.clone(),
-                source,
-                cache_manager: self.cache_manager.clone(),
-                storage: version.options.storage.clone(),
-                max_sequence: Some(max_sequence),
-                index_options: self.index_options.clone(),
-                inverted_index_config: self.engine_config.inverted_index.clone(),
-                fulltext_index_config: self.engine_config.fulltext_index.clone(),
-                bloom_filter_index_config: self.engine_config.bloom_filter_index.clone(),
-            };
-
-            let ssts_written = self
-                .access_layer
-                .write_sst(write_request, &write_opts)
-                .await?;
-            if ssts_written.is_empty() {
-                // No data written from this range.
-                continue;
-            }
-
-            file_metas.extend(ssts_written.into_iter().map(|sst_info| {
-                flushed_bytes += sst_info.file_size;
-                FileMeta {
-                    region_id: self.region_id,
-                    file_id: sst_info.file_id,
-                    time_range: sst_info.time_range,
-                    level: 0,
-                    file_size: sst_info.file_size,
-                    available_indexes: sst_info.index_metadata.build_available_indexes(),
-                    index_file_size: sst_info.index_metadata.file_size,
-                    num_rows: sst_info.num_rows as u64,
-                    num_row_groups: sst_info.num_row_groups,
-                    sequence: NonZeroU64::new(max_sequence),
+                let results = futures::future::try_join_all(futures)
+                    .await
+                    .context(JoinSnafu)?;
+                for result in results {
+                    let mut result = result?;
+                    file_metas.append(&mut result);
                 }
-            }));
+            };
         }
 
         if !file_metas.is_empty() {
