@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::thread;
 
 use api::v1::value::ValueData;
 use api::v1::{Row, Rows, SemanticType};
@@ -242,6 +243,23 @@ impl CpuDataGenerator {
         }
     }
 
+    fn new_with_host_range(
+        metadata: RegionMetadataRef,
+        host_start: usize,
+        host_count: usize,
+        start_sec: i64,
+        end_sec: i64,
+    ) -> Self {
+        let column_schemas = region_metadata_to_row_schema(&metadata);
+        Self {
+            metadata,
+            column_schemas,
+            hosts: Self::generate_hosts_with_range(host_start, host_count),
+            start_sec,
+            end_sec,
+        }
+    }
+
     fn iter(&self) -> impl Iterator<Item = KeyValues> + '_ {
         // point per 10s.
         (self.start_sec..self.end_sec)
@@ -300,6 +318,10 @@ impl CpuDataGenerator {
 
     fn generate_hosts(num_hosts: usize) -> Vec<Host> {
         (0..num_hosts).map(Host::random_with_id).collect()
+    }
+
+    fn generate_hosts_with_range(host_start: usize, host_count: usize) -> Vec<Host> {
+        (host_start..host_start + host_count).map(Host::random_with_id).collect()
     }
 }
 
@@ -405,12 +427,105 @@ fn time_series_memtable_write_2m_rows(c: &mut Criterion) {
     });
 }
 
+fn concurrent_write_benchmark(c: &mut Criterion) {
+    let metadata = Arc::new(cpu_metadata());
+    let start_sec = 1710043200;
+    let num_hosts = 8000;
+    let num_threads = 8;
+    let writes_per_thread = 1_000_000;
+    let hosts_per_thread = num_hosts / num_threads;
+    
+    let mut group = c.benchmark_group("concurrent_write");
+    group.sample_size(10);
+    
+    group.bench_function("bulk_memtable_concurrent", |b| {
+        b.iter(|| {
+            let memtable = Arc::new(BulkMemtable::new(1, metadata.clone(), None));
+            
+            let handles: Vec<_> = (0..num_threads)
+                .map(|thread_id| {
+                    let memtable = Arc::clone(&memtable);
+                    let metadata = Arc::clone(&metadata);
+                    
+                    thread::spawn(move || {
+                        let host_start = thread_id * hosts_per_thread;
+                        let thread_generator = CpuDataGenerator::new_with_host_range(
+                            metadata,
+                            host_start,
+                            hosts_per_thread,
+                            start_sec,
+                            start_sec + 10_000,
+                        );
+                        
+                        let mut writes_done = 0;
+                        for kvs in thread_generator.iter() {
+                            if writes_done >= writes_per_thread {
+                                break;
+                            }
+                            memtable.write(&kvs).unwrap();
+                            writes_done += 1;
+                        }
+                    })
+                })
+                .collect();
+            
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    });
+    
+    group.bench_function("time_series_memtable_concurrent", |b| {
+        b.iter(|| {
+            let memtable = Arc::new(TimeSeriesMemtable::new(
+                metadata.clone(), 
+                1, 
+                None, 
+                true, 
+                MergeMode::LastRow
+            ));
+            
+            let handles: Vec<_> = (0..num_threads)
+                .map(|thread_id| {
+                    let memtable = Arc::clone(&memtable);
+                    let metadata = Arc::clone(&metadata);
+                    
+                    thread::spawn(move || {
+                        let host_start = thread_id * hosts_per_thread;
+                        let thread_generator = CpuDataGenerator::new_with_host_range(
+                            metadata,
+                            host_start,
+                            hosts_per_thread,
+                            start_sec,
+                            start_sec + 10_000,
+                        );
+                        
+                        let mut writes_done = 0;
+                        for kvs in thread_generator.iter() {
+                            if writes_done >= writes_per_thread {
+                                break;
+                            }
+                            memtable.write(&kvs).unwrap();
+                            writes_done += 1;
+                        }
+                    })
+                })
+                .collect();
+            
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     write_rows,
     full_scan,
     filter_1_host,
     bulk_memtable_write_2m_rows,
-    time_series_memtable_write_2m_rows
+    time_series_memtable_write_2m_rows,
+    concurrent_write_benchmark
 );
 criterion_main!(benches);
