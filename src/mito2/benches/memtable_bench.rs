@@ -321,7 +321,9 @@ impl CpuDataGenerator {
     }
 
     fn generate_hosts_with_range(host_start: usize, host_count: usize) -> Vec<Host> {
-        (host_start..host_start + host_count).map(Host::random_with_id).collect()
+        (host_start..host_start + host_count)
+            .map(Host::random_with_id)
+            .collect()
     }
 }
 
@@ -434,19 +436,19 @@ fn concurrent_write_benchmark(c: &mut Criterion) {
     let num_threads = 8;
     let writes_per_thread = 1_000_000;
     let hosts_per_thread = num_hosts / num_threads;
-    
+
     let mut group = c.benchmark_group("concurrent_write");
     group.sample_size(10);
-    
+
     group.bench_function("bulk_memtable_concurrent", |b| {
         b.iter(|| {
             let memtable = Arc::new(BulkMemtable::new(1, metadata.clone(), None));
-            
+
             let handles: Vec<_> = (0..num_threads)
                 .map(|thread_id| {
                     let memtable = Arc::clone(&memtable);
                     let metadata = Arc::clone(&metadata);
-                    
+
                     thread::spawn(move || {
                         let host_start = thread_id * hosts_per_thread;
                         let thread_generator = CpuDataGenerator::new_with_host_range(
@@ -456,7 +458,7 @@ fn concurrent_write_benchmark(c: &mut Criterion) {
                             start_sec,
                             start_sec + 10_000,
                         );
-                        
+
                         let mut writes_done = 0;
                         for kvs in thread_generator.iter() {
                             if writes_done >= writes_per_thread {
@@ -468,28 +470,28 @@ fn concurrent_write_benchmark(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            
+
             for handle in handles {
                 handle.join().unwrap();
             }
         });
     });
-    
+
     group.bench_function("time_series_memtable_concurrent", |b| {
         b.iter(|| {
             let memtable = Arc::new(TimeSeriesMemtable::new(
-                metadata.clone(), 
-                1, 
-                None, 
-                true, 
-                MergeMode::LastRow
+                metadata.clone(),
+                1,
+                None,
+                true,
+                MergeMode::LastRow,
             ));
-            
+
             let handles: Vec<_> = (0..num_threads)
                 .map(|thread_id| {
                     let memtable = Arc::clone(&memtable);
                     let metadata = Arc::clone(&metadata);
-                    
+
                     thread::spawn(move || {
                         let host_start = thread_id * hosts_per_thread;
                         let thread_generator = CpuDataGenerator::new_with_host_range(
@@ -499,7 +501,7 @@ fn concurrent_write_benchmark(c: &mut Criterion) {
                             start_sec,
                             start_sec + 10_000,
                         );
-                        
+
                         let mut writes_done = 0;
                         for kvs in thread_generator.iter() {
                             if writes_done >= writes_per_thread {
@@ -511,7 +513,7 @@ fn concurrent_write_benchmark(c: &mut Criterion) {
                     })
                 })
                 .collect();
-            
+
             for handle in handles {
                 handle.join().unwrap();
             }
