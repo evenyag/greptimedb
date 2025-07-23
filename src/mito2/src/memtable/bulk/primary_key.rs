@@ -56,6 +56,85 @@ use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::to_sst_arrow_schema;
 
+/// Trait for deduplication strategies on RecordBatch
+pub trait RecordBatchDedupStrategy: Send {
+    /// Pushes a batch for deduplication processing
+    fn push_batch(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>>;
+    
+    /// Finishes the deduplication process and returns any remaining batch
+    fn finish(&mut self) -> Result<Option<RecordBatch>>;
+}
+
+/// Strategy that keeps the last row for each unique key
+pub struct RecordBatchLastRow {
+    /// Previous batch to handle cross-batch deduplication
+    prev_batch: Option<RecordBatch>,
+    /// Whether to filter out deleted rows (op_type == DELETE)
+    filter_deleted: bool,
+}
+
+impl RecordBatchLastRow {
+    pub fn new(filter_deleted: bool) -> Self {
+        Self {
+            prev_batch: None,
+            filter_deleted,
+        }
+    }
+}
+
+impl RecordBatchDedupStrategy for RecordBatchLastRow {
+    fn push_batch(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        
+        // TODO: Implement cross-batch deduplication logic
+        // For now, store current batch and return previous if exists
+        let result = self.prev_batch.take();
+        self.prev_batch = Some(batch);
+        Ok(result)
+    }
+    
+    fn finish(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(self.prev_batch.take())
+    }
+}
+
+/// Strategy that merges non-null fields for rows with the same key
+pub struct RecordBatchLastNonNull {
+    /// Buffer for merging non-null values
+    buffer: Option<RecordBatch>,
+    /// Whether to filter out deleted rows (op_type == DELETE)
+    filter_deleted: bool,
+}
+
+impl RecordBatchLastNonNull {
+    pub fn new(filter_deleted: bool) -> Self {
+        Self {
+            buffer: None,
+            filter_deleted,
+        }
+    }
+}
+
+impl RecordBatchDedupStrategy for RecordBatchLastNonNull {
+    fn push_batch(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        
+        // TODO: Implement non-null merging logic
+        // For now, store current batch and return previous if exists
+        let result = self.buffer.take();
+        self.buffer = Some(batch);
+        Ok(result)
+    }
+    
+    fn finish(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(self.buffer.take())
+    }
+}
+
 /// Writer for bulk buffer operations that encodes primary keys
 pub struct PrimaryKeyBufferWriter {
     /// Primary key codec for encoding keys
