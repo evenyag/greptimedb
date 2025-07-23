@@ -250,9 +250,9 @@ impl BulkMemtable {
                     .start_timer();
 
                 // Finish the sorted batch buffer and get all batches
-                let row_count = sorted_buffer.num_rows();
+                // let row_count = sorted_buffer.num_rows();
                 let batches = sorted_buffer.finish();
-                let num_batches = batches.len();
+                // let num_batches = batches.len();
 
                 // Sort the partial sorted batches
                 let sorted_batches = self.primary_key_writer.sort_partial_sorted(batches)?;
