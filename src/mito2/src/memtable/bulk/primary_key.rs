@@ -25,8 +25,11 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
-use datatypes::arrow::array::{ArrayRef, BinaryBuilder, DictionaryArray, UInt32Array};
-use datatypes::arrow::compute::SortOptions;
+use datatypes::arrow::array::{
+    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray, UInt32Array,
+    UInt64Array, UInt8Array,
+};
+use datatypes::arrow::compute::{filter_record_batch, SortOptions};
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::{ConcreteDataType, DataType};
@@ -56,11 +59,89 @@ use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::to_sst_arrow_schema;
 
+/// Helper functions for RecordBatch deduplication
+fn has_same_key_cross_batch(
+    left_batch: &RecordBatch,
+    left_row: usize,
+    right_batch: &RecordBatch,
+    right_row: usize,
+) -> Result<bool> {
+    // Get primary key columns (assuming same schema structure)
+    let pk_index = left_batch.schema().fields().len() - 3; // primary key is 3rd from end
+
+    let pk_array_left = left_batch.column(pk_index);
+    let pk_array_right = right_batch.column(pk_index);
+
+    // Use make_comparator for efficient comparison
+    let comparator = make_comparator(pk_array_left, pk_array_right, SortOptions::default())
+        .context(ComputeArrowSnafu)?;
+
+    Ok(comparator(left_row, right_row) == std::cmp::Ordering::Equal)
+}
+
+/// Compares rows within the same batch
+fn has_same_key_same_batch(batch: &RecordBatch, left_row: usize, right_row: usize) -> Result<bool> {
+    has_same_key_cross_batch(batch, left_row, batch, right_row)
+}
+
+/// Compares two rows by (primary_key, timestamp, sequence) to determine ordering
+/// Returns true if left row should come before right row
+fn should_row_come_before(
+    left_batch: &RecordBatch,
+    left_row: usize,
+    right_batch: &RecordBatch,
+    right_row: usize,
+) -> Result<bool> {
+    let schema_len = left_batch.schema().fields().len();
+    let pk_index = schema_len - 3;
+    let time_index = schema_len - 4;
+    let seq_index = schema_len - 2;
+
+    // Compare primary keys first
+    let pk_left = left_batch.column(pk_index);
+    let pk_right = right_batch.column(pk_index);
+    let pk_comparator =
+        make_comparator(pk_left, pk_right, SortOptions::default()).context(ComputeArrowSnafu)?;
+
+    match pk_comparator(left_row, right_row) {
+        std::cmp::Ordering::Less => return Ok(true),
+        std::cmp::Ordering::Greater => return Ok(false),
+        std::cmp::Ordering::Equal => {
+            // Same primary key, compare timestamps
+            let ts_left = left_batch.column(time_index);
+            let ts_right = right_batch.column(time_index);
+            let ts_comparator = make_comparator(ts_left, ts_right, SortOptions::default())
+                .context(ComputeArrowSnafu)?;
+
+            match ts_comparator(left_row, right_row) {
+                std::cmp::Ordering::Less => return Ok(true),
+                std::cmp::Ordering::Greater => return Ok(false),
+                std::cmp::Ordering::Equal => {
+                    // Same timestamp, compare sequence (descending - higher sequence comes first)
+                    let seq_left = left_batch.column(seq_index);
+                    let seq_right = right_batch.column(seq_index);
+                    let seq_comparator = make_comparator(
+                        seq_left,
+                        seq_right,
+                        SortOptions {
+                            descending: true,
+                            nulls_first: false,
+                        },
+                    )
+                    .context(ComputeArrowSnafu)?;
+
+                    Ok(seq_comparator(left_row, right_row) == std::cmp::Ordering::Less)
+                }
+            }
+        }
+    }
+}
+
 /// Trait for deduplication strategies on RecordBatch
 pub trait RecordBatchDedupStrategy: Send {
     /// Pushes a batch for deduplication processing
     fn push_batch(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>>;
-    
+
     /// Finishes the deduplication process and returns any remaining batch
     fn finish(&mut self) -> Result<Option<RecordBatch>>;
 }
@@ -87,14 +168,14 @@ impl RecordBatchDedupStrategy for RecordBatchLastRow {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        
+
         // TODO: Implement cross-batch deduplication logic
         // For now, store current batch and return previous if exists
         let result = self.prev_batch.take();
         self.prev_batch = Some(batch);
         Ok(result)
     }
-    
+
     fn finish(&mut self) -> Result<Option<RecordBatch>> {
         Ok(self.prev_batch.take())
     }
@@ -122,14 +203,14 @@ impl RecordBatchDedupStrategy for RecordBatchLastNonNull {
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        
+
         // TODO: Implement non-null merging logic
         // For now, store current batch and return previous if exists
         let result = self.buffer.take();
         self.buffer = Some(batch);
         Ok(result)
     }
-    
+
     fn finish(&mut self) -> Result<Option<RecordBatch>> {
         Ok(self.buffer.take())
     }
