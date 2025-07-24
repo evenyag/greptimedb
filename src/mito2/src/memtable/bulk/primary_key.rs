@@ -354,15 +354,108 @@ impl PrimaryKeyBufferWriter {
         Ok(())
     }
 
+    /// Writes a single KeyValue to the buffer with separate primary key buffer.
+    pub fn write_one_with_pk_buffer(
+        &self,
+        buffer: &mut BulkBuffer,
+        primary_key_buffer: &mut BulkBuffer,
+        key_value: KeyValue,
+        metrics: &mut WriteMetrics,
+    ) -> Result<()> {
+        // Extract values from the key_value
+        let timestamp = key_value.timestamp();
+        let sequence = key_value.sequence();
+        let op_type = key_value.op_type();
+
+        // Write timestamp
+        buffer.push_value(self.column_indices.time_index, timestamp)?;
+        metrics.value_bytes += timestamp.data_size();
+
+        // Handle primary key based on encoding type
+        let primary_key_bytes = if self.primary_key_codec.encoding() == PrimaryKeyEncoding::Sparse {
+            // For sparse encoding, the primary key is already encoded in the KeyValue
+            // Get the first (and only) primary key value which contains the encoded key
+            let mut primary_keys = key_value.primary_keys();
+            // Safety: __primary_key should be binary type.
+            let encoded_key = primary_keys
+                .next()
+                .context(ColumnNotFoundSnafu {
+                    column: PRIMARY_KEY_COLUMN_NAME,
+                })?
+                .as_binary()
+                .unwrap()
+                .unwrap();
+            encoded_key.to_vec()
+        } else {
+            // For dense encoding, we need to encode the primary key columns
+            let mut primary_key_bytes = Vec::new();
+            self.primary_key_codec
+                .encode_key_value(&key_value, &mut primary_key_bytes)
+                .context(EncodeSnafu)?;
+            primary_key_bytes
+        };
+
+        // Write primary key
+        buffer.push_value(
+            self.column_indices.primary_key_index,
+            ValueRef::Binary(&primary_key_bytes),
+        )?;
+        metrics.key_bytes += primary_key_bytes.len();
+
+        // Write primary key columns to the separate primary key buffer
+        let mut pk_column_index = 0;
+        for value in key_value.primary_keys() {
+            primary_key_buffer.push_value(pk_column_index, value)?;
+            pk_column_index += 1;
+        }
+        primary_key_buffer.finish_one();
+
+        // Write sequence
+        buffer.push_value(
+            self.column_indices.sequence_index,
+            ValueRef::UInt64(sequence),
+        )?;
+        metrics.value_bytes += std::mem::size_of::<SequenceNumber>();
+
+        // Write op type
+        buffer.push_value(
+            self.column_indices.op_type_index,
+            ValueRef::UInt8(op_type as u8),
+        )?;
+        metrics.value_bytes += std::mem::size_of::<u8>();
+
+        // Write field values
+        for (buffer_index, value) in key_value.fields().enumerate() {
+            buffer.push_value(buffer_index, value)?;
+            metrics.value_bytes += value.data_size();
+        }
+
+        // Finish the row
+        buffer.finish_one();
+
+        // Update remaining metrics
+        if let Some(ts_value) = timestamp.as_timestamp().unwrap() {
+            let ts_millis = ts_value.value();
+            metrics.min_ts = metrics.min_ts.min(ts_millis);
+            metrics.max_ts = metrics.max_ts.max(ts_millis);
+        }
+
+        metrics.max_sequence = metrics.max_sequence.max(sequence);
+        metrics.num_rows += 1;
+
+        Ok(())
+    }
+
     /// Writes multiple KeyValues to the buffer
     pub fn write(
         &self,
         buffer: &mut BulkBuffer,
+        primary_key_buffer: &mut BulkBuffer,
         key_values: &KeyValues,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
         for key_value in key_values.iter() {
-            self.write_one(buffer, key_value, metrics)?;
+            self.write_one_with_pk_buffer(buffer, primary_key_buffer, key_value, metrics)?;
         }
         Ok(())
     }

@@ -139,6 +139,21 @@ impl std::fmt::Debug for BulkMemtable {
 }
 
 impl BulkMemtable {
+    /// Creates a BulkBuffer for primary key columns only
+    fn create_primary_key_buffer(metadata: &RegionMetadataRef) -> BulkBuffer {
+        let mut builders = Vec::new();
+        
+        // Add builders for each primary key column
+        for pk_column in metadata.primary_key_columns() {
+            builders.push(BulkValueBuilder::new_regular(
+                &pk_column.column_schema.data_type,
+                1024,
+            ));
+        }
+        
+        BulkBuffer::new(builders)
+    }
+
     pub fn new(
         id: MemtableId,
         metadata: RegionMetadataRef,
@@ -325,9 +340,12 @@ impl Memtable for BulkMemtable {
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
 
+            // Create primary key buffer for this write operation
+            let mut primary_key_buffer = Self::create_primary_key_buffer(&self.metadata);
+
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
-                .write(&mut buffer, kvs, &mut write_metrics)?;
+                .write(&mut buffer, &mut primary_key_buffer, kvs, &mut write_metrics)?;
         }
 
         // Update statistics
@@ -351,9 +369,12 @@ impl Memtable for BulkMemtable {
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
 
+            // Create primary key buffer for this write operation
+            let mut primary_key_buffer = Self::create_primary_key_buffer(&self.metadata);
+
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
-                .write_one(&mut buffer, key_value, &mut write_metrics)?;
+                .write_one_with_pk_buffer(&mut buffer, &mut primary_key_buffer, key_value, &mut write_metrics)?;
         }
 
         // Update statistics
