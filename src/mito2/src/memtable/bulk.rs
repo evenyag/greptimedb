@@ -27,6 +27,8 @@ use table::predicate::Predicate;
 
 use crate::error::Result;
 use crate::memtable::bulk::buffer::{BulkBuffer, BulkValueBuilder, SortedBatchBuffer};
+use datatypes::arrow::array::StringDictionaryBuilder;
+use datatypes::arrow::datatypes::Int32Type;
 use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder, EncodedBulkPart};
 use crate::memtable::bulk::primary_key::PrimaryKeyBufferWriter;
@@ -139,19 +141,16 @@ impl std::fmt::Debug for BulkMemtable {
 }
 
 impl BulkMemtable {
-    /// Creates a BulkBuffer for primary key columns only
-    fn create_primary_key_buffer(metadata: &RegionMetadataRef) -> BulkBuffer {
+    /// Creates StringDictionaryBuilders for primary key columns only
+    fn create_primary_key_builders(metadata: &RegionMetadataRef) -> Vec<StringDictionaryBuilder<Int32Type>> {
         let mut builders = Vec::new();
         
-        // Add builders for each primary key column
-        for pk_column in metadata.primary_key_columns() {
-            builders.push(BulkValueBuilder::new_regular(
-                &pk_column.column_schema.data_type,
-                1024,
-            ));
+        // Add StringDictionaryBuilder for each primary key column (assuming all are strings)
+        for _pk_column in metadata.primary_key_columns() {
+            builders.push(StringDictionaryBuilder::new());
         }
         
-        BulkBuffer::new(builders)
+        builders
     }
 
     pub fn new(
@@ -340,12 +339,12 @@ impl Memtable for BulkMemtable {
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
 
-            // Create primary key buffer for this write operation
-            let mut primary_key_buffer = Self::create_primary_key_buffer(&self.metadata);
+            // Create primary key builders for this write operation
+            let mut primary_key_builders = Self::create_primary_key_builders(&self.metadata);
 
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
-                .write(&mut buffer, &mut primary_key_buffer, kvs, &mut write_metrics)?;
+                .write(&mut buffer, &mut primary_key_builders, kvs, &mut write_metrics)?;
         }
 
         // Update statistics
@@ -369,12 +368,12 @@ impl Memtable for BulkMemtable {
                 .with_label_values(&["write_bulk_buffers"])
                 .start_timer();
 
-            // Create primary key buffer for this write operation
-            let mut primary_key_buffer = Self::create_primary_key_buffer(&self.metadata);
+            // Create primary key builders for this write operation
+            let mut primary_key_builders = Self::create_primary_key_builders(&self.metadata);
 
             let mut buffer = self.bulk_buffers[buffer_index].write().unwrap();
             self.primary_key_writer
-                .write_one_with_pk_buffer(&mut buffer, &mut primary_key_buffer, key_value, &mut write_metrics)?;
+                .write_one_with_pk_buffer(&mut buffer, &mut primary_key_builders, key_value, &mut write_metrics)?;
         }
 
         // Update statistics

@@ -106,6 +106,20 @@ fn full_scan(c: &mut Criterion) {
             }
         });
     });
+    group.bench_function("bulk", |b| {
+        let memtable = BulkMemtable::new(1, metadata.clone(), None);
+        for kvs in generator.iter() {
+            memtable.write(&kvs).unwrap();
+        }
+        memtable.freeze().unwrap();
+
+        b.iter(|| {
+            let iter = memtable.iter(None, None, None).unwrap();
+            for batch in iter {
+                let _batch = batch.unwrap();
+            }
+        });
+    });
 }
 
 /// Filters 1 host.
@@ -137,6 +151,21 @@ fn filter_1_host(c: &mut Criterion) {
         for kvs in generator.iter() {
             memtable.write(&kvs).unwrap();
         }
+        let predicate = generator.random_host_filter();
+
+        b.iter(|| {
+            let iter = memtable.iter(None, Some(predicate.clone()), None).unwrap();
+            for batch in iter {
+                let _batch = batch.unwrap();
+            }
+        });
+    });
+    group.bench_function("bulk", |b| {
+        let memtable = BulkMemtable::new(1, metadata.clone(), None);
+        for kvs in generator.iter() {
+            memtable.write(&kvs).unwrap();
+        }
+        memtable.freeze().unwrap();
         let predicate = generator.random_host_filter();
 
         b.iter(|| {

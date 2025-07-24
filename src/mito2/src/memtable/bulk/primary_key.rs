@@ -26,11 +26,11 @@ use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use datatypes::arrow::array::{
-    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray, UInt32Array,
+    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray, StringDictionaryBuilder, UInt32Array,
     UInt64Array, UInt8Array,
 };
 use datatypes::arrow::compute::{filter_record_batch, SortOptions};
-use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Int32Type, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::prelude::VectorRef;
@@ -354,11 +354,11 @@ impl PrimaryKeyBufferWriter {
         Ok(())
     }
 
-    /// Writes a single KeyValue to the buffer with separate primary key buffer.
+    /// Writes a single KeyValue to the buffer with separate primary key builders.
     pub fn write_one_with_pk_buffer(
         &self,
         buffer: &mut BulkBuffer,
-        primary_key_buffer: &mut BulkBuffer,
+        primary_key_builders: &mut Vec<StringDictionaryBuilder<Int32Type>>,
         key_value: KeyValue,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
@@ -402,13 +402,25 @@ impl PrimaryKeyBufferWriter {
         )?;
         metrics.key_bytes += primary_key_bytes.len();
 
-        // Write primary key columns to the separate primary key buffer
+        // Write primary key columns to the separate primary key builders
         let mut pk_column_index = 0;
         for value in key_value.primary_keys() {
-            primary_key_buffer.push_value(pk_column_index, value)?;
-            pk_column_index += 1;
+            if pk_column_index < primary_key_builders.len() {
+                // Assuming all primary key columns are strings
+                match value {
+                    ValueRef::String(s) => {
+                        primary_key_builders[pk_column_index].append_option(Some(s));
+                    }
+                    ValueRef::Null => {
+                        primary_key_builders[pk_column_index].append_option(None::<&str>);
+                    }
+                    _ => {
+                        panic!("Primary key column is not a string: {:?}", value);
+                    }
+                };
+                pk_column_index += 1;
+            }
         }
-        primary_key_buffer.finish_one();
 
         // Write sequence
         buffer.push_value(
@@ -450,12 +462,12 @@ impl PrimaryKeyBufferWriter {
     pub fn write(
         &self,
         buffer: &mut BulkBuffer,
-        primary_key_buffer: &mut BulkBuffer,
+        primary_key_builders: &mut Vec<StringDictionaryBuilder<Int32Type>>,
         key_values: &KeyValues,
         metrics: &mut WriteMetrics,
     ) -> Result<()> {
         for key_value in key_values.iter() {
-            self.write_one_with_pk_buffer(buffer, primary_key_buffer, key_value, metrics)?;
+            self.write_one_with_pk_buffer(buffer, primary_key_builders, key_value, metrics)?;
         }
         Ok(())
     }
