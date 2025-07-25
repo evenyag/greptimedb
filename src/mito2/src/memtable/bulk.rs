@@ -52,6 +52,7 @@ mod part_reader;
 #[allow(unused)]
 pub(crate) mod primary_key;
 mod row_group_reader;
+mod record_batch_iter;
 
 pub struct BulkMemtable {
     id: MemtableId,
