@@ -65,6 +65,12 @@ use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::to_sst_arrow_schema;
 
 #[derive(Clone)]
+pub(crate) struct BulkPartWithId {
+    pub(crate) bulk_part: BulkPart,
+    pub(crate) id: u32,
+}
+
+#[derive(Clone)]
 pub struct BulkPart {
     pub batch: RecordBatch,
     pub max_ts: i64,
