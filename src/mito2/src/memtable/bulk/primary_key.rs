@@ -15,6 +15,7 @@
 //! Utilities for record batches with primary key encoding.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use api::v1::OpType;
@@ -26,12 +27,21 @@ use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use datatypes::arrow::array::{
-    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray,
-    StringDictionaryBuilder, UInt32Array, UInt64Array, UInt8Array,
+    make_comparator, Array, ArrayRef, BinaryBuilder, BooleanArray, BooleanBufferBuilder,
+    DictionaryArray, StringDictionaryBuilder, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array, UInt8Array,
 };
+use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::compute::{filter_record_batch, SortOptions};
-use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Int32Type, Schema, SchemaRef};
+use datatypes::arrow::datatypes::{
+    DataType as ArrowDataType, Field, Int32Type, Schema, SchemaRef, TimeUnit,
+};
+use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::compute::kernels::cmp::distinct;
+use datatypes::compute::kernels::partition::partition;
+use datatypes::compute::kernels::take;
+use datatypes::compute::{concat_batches, take_record_batch, Partitions, TakeOptions};
 use datatypes::data_type::{ConcreteDataType, DataType};
 use datatypes::prelude::VectorRef;
 use datatypes::value::ValueRef;
@@ -54,11 +64,13 @@ use crate::error::{
 };
 use crate::memtable::bulk::buffer::BulkBuffer;
 use crate::memtable::stats::WriteMetrics;
+use crate::read::dedup::DedupMetrics;
 use crate::read::{BoxedRecordBatchIterator, Source};
 use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::to_sst_arrow_schema;
 
+// TODO(yingwen): Downcast and get binary value.
 /// Helper functions for RecordBatch deduplication
 fn has_same_key_cross_batch(
     left_batch: &RecordBatch,
@@ -924,5 +936,445 @@ fn create_sort_expr(column_name: &str, column_index: usize, descending: bool) ->
             descending,
             nulls_first: true,
         },
+    }
+}
+
+/// State of the batch with the last row for dedup.
+struct BatchLastRow {
+    /// The record batch that contains the last row.
+    /// The record batch must has at least one row.
+    last_batch: RecordBatch,
+}
+
+impl BatchLastRow {
+    /// Returns a new [BatchLastRow] if the record batch is not empty.
+    fn try_new(record_batch: RecordBatch) -> Option<Self> {
+        if record_batch.num_rows() > 0 {
+            Some(Self {
+                last_batch: record_batch,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if the first row of the input `batch` is duplicated with the last row.
+    fn is_last_row_duplicated(&self, timestamp_index: usize, batch: &RecordBatch) -> Result<bool> {
+        if batch.num_rows() == 0 {
+            return Ok(false);
+        }
+
+        let last_timestamp = timestamp_value(
+            self.last_batch.column(timestamp_index),
+            self.last_batch.num_rows() - 1,
+        );
+        let batch_timestamp = timestamp_value(batch.column(timestamp_index), 0);
+        if batch_timestamp != last_timestamp {
+            return Ok(false);
+        }
+
+        has_same_key_cross_batch(&self.last_batch, self.last_batch.num_rows() - 1, batch, 0)
+    }
+}
+
+/// Gets the timestamp value from the timestamp array.
+///
+/// # Panics
+/// Panics if the array is not a timestamp array or
+/// the index is out of bound.
+fn timestamp_value(array: &dyn Array, idx: usize) -> i64 {
+    match array.data_type() {
+        datatypes::arrow::datatypes::DataType::Timestamp(TimeUnit::Second, None) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            array.value(idx)
+        }
+        datatypes::arrow::datatypes::DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            array.value(idx)
+        }
+        datatypes::arrow::datatypes::DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            array.value(idx)
+        }
+        datatypes::arrow::datatypes::DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            array.value(idx)
+        }
+        _ => panic!("Expected timestamp array, got: {:?}", array.data_type()),
+    }
+}
+
+// Port from https://github.com/apache/arrow-rs/blob/55.0.0/arrow-ord/src/partition.rs#L155-L168
+/// Returns a mask with bits set whenever the value or nullability changes
+fn find_boundaries(v: &dyn Array) -> Result<BooleanBuffer, ArrowError> {
+    let slice_len = v.len() - 1;
+    let v1 = v.slice(0, slice_len);
+    let v2 = v.slice(1, slice_len);
+
+    if !v.data_type().is_nested() {
+        return Ok(distinct(&v1, &v2)?.values().clone());
+    }
+    // Given that we're only comparing values, null ordering in the input or
+    // sort options do not matter.
+    let cmp = make_comparator(&v1, &v2, SortOptions::default())?;
+    Ok((0..slice_len).map(|i| !cmp(i, i).is_eq()).collect())
+}
+
+/// Filters deleted rows from the record batch if `filter_deleted` is true.
+fn maybe_filter_deleted(
+    record_batch: RecordBatch,
+    filter_deleted: bool,
+    metrics: &mut DedupMetrics,
+) -> Result<Option<RecordBatch>> {
+    if !filter_deleted {
+        return Ok(Some(record_batch));
+    }
+    let batch = filter_deleted_from_batch(record_batch, metrics)?;
+    Ok(Some(batch))
+}
+
+/// Removes deleted rows from the batch and updates metrics.
+fn filter_deleted_from_batch(
+    batch: RecordBatch,
+    metrics: &mut DedupMetrics,
+) -> Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let op_type_column = batch.column(batch.num_columns() - 1);
+    // Safety: The column should be op type.
+    let op_types = op_type_column
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .unwrap();
+    let has_delete = op_types
+        .values()
+        .iter()
+        .any(|op_type| *op_type != OpType::Put as u8);
+    if !has_delete {
+        return Ok(batch);
+    }
+
+    let mut builder = BooleanBufferBuilder::new(op_types.len());
+    for op_type in op_types.values() {
+        if *op_type == OpType::Delete as u8 {
+            builder.append(false);
+        } else {
+            builder.append(true);
+        }
+    }
+    let predicate = BooleanArray::new(builder.into(), None);
+    let new_batch = filter_record_batch(&batch, &predicate).context(ComputeArrowSnafu)?;
+    metrics.num_deleted_rows += num_rows - new_batch.num_rows();
+
+    Ok(new_batch)
+}
+
+/// Dedup strategy that keeps the row with latest sequence of each key.
+pub(crate) struct PlainLastRow {
+    /// Meta of the last row in the previous batch that has the same key
+    /// as the batch to push.
+    prev_batch: Option<BatchLastRow>,
+    /// Index of the time index column.
+    timestamp_index: usize,
+    /// Filter deleted rows.
+    filter_deleted: bool,
+}
+
+impl PlainLastRow {
+    /// Creates a new strategy with the given `filter_deleted` flag.
+    pub(crate) fn new(timestamp_index: usize, filter_deleted: bool) -> Self {
+        Self {
+            prev_batch: None,
+            timestamp_index,
+            filter_deleted,
+        }
+    }
+
+    /// Remove duplications from the batch without considering previous rows.
+    fn dedup_one_batch(batch: RecordBatch, timestamp_index: usize) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+        if num_rows < 2 {
+            return Ok(batch);
+        }
+
+        let timestamps = batch.column(timestamp_index);
+        // Checks duplications based on the timestamp.
+        let mask = find_boundaries(timestamps).context(ComputeArrowSnafu)?;
+        if mask.count_set_bits() == num_rows - 1 {
+            // Fast path: No duplication.
+            return Ok(batch);
+        }
+
+        // The batch has duplicated timestamps, but it doesn't mean it must
+        // has duplicated rows.
+        // Partitions the batch by the primary key and time index.
+        let columns: Vec<_> = [batch.num_columns() - 3, timestamp_index]
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect();
+        let partitions = partition(&columns).context(ComputeArrowSnafu)?;
+
+        Self::dedup_by_partitions(batch, &partitions)
+    }
+
+    /// Remove depulications for each partition.
+    fn dedup_by_partitions(batch: RecordBatch, partitions: &Partitions) -> Result<RecordBatch> {
+        let ranges = partitions.ranges();
+        // Each range at least has 1 row.
+        let num_duplications: usize = ranges.iter().map(|r| r.end - r.start - 1).sum();
+        if num_duplications == 0 {
+            // Fast path, no duplications.
+            return Ok(batch);
+        }
+
+        // Always takes the first row in each range.
+        let take_indices: UInt64Array = ranges.iter().map(|r| Some(r.start as u64)).collect();
+        take_record_batch(&batch, &take_indices).context(ComputeArrowSnafu)
+    }
+}
+
+impl PlainLastRow {
+    fn push_batch(
+        &mut self,
+        batch: RecordBatch,
+        metrics: &mut DedupMetrics,
+    ) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        // Dedup current batch to ensure no duplication before we checking the previous row.
+        let mut batch = Self::dedup_one_batch(batch, self.timestamp_index)?;
+
+        if let Some(prev_batch) = &self.prev_batch {
+            // If we have previous batch.
+            if prev_batch.is_last_row_duplicated(self.timestamp_index, &batch)? {
+                // Duplicated with the last batch, skip the first row.
+                batch = batch.slice(1, batch.num_rows() - 1);
+            }
+        }
+
+        if batch.num_rows() == 0 {
+            // We don't need to update `prev_batch` because they have the same
+            // key and timestamp.
+            return Ok(None);
+        }
+
+        // Store current batch to `prev_batch` so we could compare the next batch
+        // with this batch. We store batch before filtering it as rows with `OpType::Delete`
+        // would be removed from the batch after filter, then we may store an incorrect `last row`
+        // of previous batch.
+        // Safety: We checked the batch is not empty before.
+        self.prev_batch = Some(BatchLastRow {
+            last_batch: batch.clone(),
+        });
+
+        // Filters deleted rows at last.
+        maybe_filter_deleted(batch, self.filter_deleted, metrics)
+    }
+
+    fn finish(&mut self, _metrics: &mut DedupMetrics) -> Result<Option<RecordBatch>> {
+        Ok(None)
+    }
+}
+
+/// Dedup strategy that keeps the last non-null field for the same key.
+pub(crate) struct PlainLastNonNull {
+    /// Index of the time index column.
+    timestamp_index: usize,
+    /// Indices of the field columns.
+    field_indices: Vec<usize>,
+    /// Filter deleted rows.
+    filter_deleted: bool,
+    /// Buffered batch to check whether the next batch have duplicated rows with this batch.
+    /// Fields in the last row of this batch may be updated by the next batch.
+    /// The buffered batch should contain no duplication.
+    buffer: Option<BatchLastRow>,
+}
+
+impl PlainLastNonNull {
+    /// Creates a new strategy with the given `filter_deleted` flag.
+    pub(crate) fn new(
+        timestamp_index: usize,
+        field_indices: Vec<usize>,
+        filter_deleted: bool,
+    ) -> Self {
+        Self {
+            timestamp_index,
+            field_indices,
+            filter_deleted,
+            buffer: None,
+        }
+    }
+
+    /// Remove duplications from the batch without considering the previous and next rows.
+    // FIXME(yingwen): Avoid repeating code.
+    fn dedup_one_batch(
+        batch: RecordBatch,
+        timestamp_index: usize,
+        field_indices: &[usize],
+    ) -> Result<RecordBatch> {
+        let num_rows = batch.num_rows();
+        if num_rows < 2 {
+            return Ok(batch);
+        }
+
+        let timestamps = batch.column(timestamp_index);
+        // Checks duplications based on the timestamp.
+        let mask = find_boundaries(timestamps).context(ComputeArrowSnafu)?;
+        if mask.count_set_bits() == num_rows - 1 {
+            // Fast path: No duplication.
+            return Ok(batch);
+        }
+
+        // The batch has duplicated timestamps, but it doesn't mean it must
+        // has duplicated rows.
+        // Partitions the batch by the primary key and time index.
+        let columns: Vec<_> = [batch.num_columns() - 3, timestamp_index]
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect();
+        let partitions = partition(&columns).context(ComputeArrowSnafu)?;
+
+        Self::dedup_by_partitions(batch, &partitions, timestamp_index, field_indices)
+    }
+
+    /// Remove depulications for each partition.
+    fn dedup_by_partitions(
+        batch: RecordBatch,
+        partitions: &Partitions,
+        timestamp_index: usize,
+        field_indices: &[usize],
+    ) -> Result<RecordBatch> {
+        let ranges = partitions.ranges();
+        // Each range at least has 1 row.
+        let num_duplications: usize = ranges.iter().map(|r| r.end - r.start - 1).sum();
+        if num_duplications == 0 {
+            // Fast path, no duplication.
+            return Ok(batch);
+        }
+
+        let mut is_field = vec![false; batch.num_columns()];
+        for idx in field_indices {
+            is_field[*idx] = true;
+        }
+
+        let take_options = Some(TakeOptions {
+            check_bounds: false,
+        });
+        // Always takes the first value for non-field columns in each range.
+        let non_field_indices: UInt64Array = ranges.iter().map(|r| Some(r.start as u64)).collect();
+        let new_columns = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(col_idx, column)| {
+                if is_field[col_idx] {
+                    let field_indices = Self::compute_field_indices(&ranges, column);
+                    take::take(column, &field_indices, take_options.clone())
+                        .context(ComputeArrowSnafu)
+                } else {
+                    take::take(column, &non_field_indices, take_options.clone())
+                        .context(ComputeArrowSnafu)
+                }
+            })
+            .collect::<Result<Vec<ArrayRef>>>()?;
+
+        RecordBatch::try_new(batch.schema(), new_columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Returns an array of indices of the latest non null value for
+    /// each input range.
+    /// If all values in a range are null, the returned index is unspecific.
+    fn compute_field_indices(ranges: &[Range<usize>], field_array: &ArrayRef) -> UInt64Array {
+        ranges
+            .iter()
+            .map(|r| {
+                let value_index = r
+                    .clone()
+                    .filter(|&i| field_array.is_valid(i))
+                    .next()
+                    .map(|i| i as u64)
+                    // if all field values are none, pick one arbitrarily
+                    .unwrap_or(r.start as u64);
+                Some(value_index)
+            })
+            .collect()
+    }
+}
+
+impl PlainLastNonNull {
+    fn push_batch(
+        &mut self,
+        batch: RecordBatch,
+        metrics: &mut DedupMetrics,
+    ) -> Result<Option<RecordBatch>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+
+        let Some(buffer) = self.buffer.take() else {
+            // If the buffer is None, dedup the batch, put the batch into the buffer and return.
+            let record_batch =
+                Self::dedup_one_batch(batch, self.timestamp_index, &self.field_indices)?;
+            self.buffer = BatchLastRow::try_new(record_batch);
+
+            return Ok(None);
+        };
+
+        if !buffer.is_last_row_duplicated(self.timestamp_index, &batch)? {
+            // The first row of batch has different key from the buffer.
+            // We can replace the buffer with the new batch.
+            // Dedup the batch.
+            let record_batch =
+                Self::dedup_one_batch(batch, self.timestamp_index, &self.field_indices)?;
+            debug_assert!(record_batch.num_rows() > 0);
+            self.buffer = BatchLastRow::try_new(record_batch);
+
+            return maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics);
+        }
+
+        // The next batch has duplicated rows.
+        // We can return rows except the last row in the buffer.
+        let output = if buffer.last_batch.num_rows() > 1 {
+            let dedup_batch = buffer.last_batch.slice(0, buffer.last_batch.num_rows() - 1);
+            debug_assert_eq!(buffer.last_batch.num_rows() - 1, dedup_batch.num_rows());
+
+            maybe_filter_deleted(dedup_batch, self.filter_deleted, metrics)?
+        } else {
+            None
+        };
+        let last_row = buffer.last_batch.slice(buffer.last_batch.num_rows() - 1, 1);
+
+        // We concat the last row with the next batch.
+        let next_batch = batch;
+        let schema = next_batch.schema();
+        let merged = concat_batches(&schema, &[last_row, next_batch]).context(ComputeArrowSnafu)?;
+        // Dedup the merged batch and update the buffer.
+        let record_batch =
+            Self::dedup_one_batch(merged, self.timestamp_index, &self.field_indices)?;
+        debug_assert!(record_batch.num_rows() > 0);
+        self.buffer = BatchLastRow::try_new(record_batch);
+
+        Ok(output)
+    }
+
+    fn finish(&mut self, metrics: &mut DedupMetrics) -> Result<Option<RecordBatch>> {
+        let Some(buffer) = self.buffer.take() else {
+            return Ok(None);
+        };
+
+        maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics)
     }
 }
