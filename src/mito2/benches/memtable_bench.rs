@@ -17,6 +17,7 @@ use std::thread;
 
 use api::v1::value::ValueData;
 use api::v1::{Row, Rows, SemanticType};
+use common_time::Timestamp;
 use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion_common::Column;
 use datafusion_expr::{lit, Expr};
@@ -26,6 +27,7 @@ use mito2::memtable::bulk::BulkMemtable;
 use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
 use mito2::memtable::{KeyValues, Memtable};
+use mito2::read::scan_region::PredicateGroup;
 use mito2::region::options::MergeMode;
 use mito2::test_util::memtable_util::{self, region_metadata_to_row_schema};
 use mito_codec::row_converter::DensePrimaryKeyCodec;
@@ -169,9 +171,20 @@ fn filter_1_host(c: &mut Criterion) {
         let predicate = generator.random_host_filter();
 
         b.iter(|| {
-            let iter = memtable.iter(None, Some(predicate.clone()), None).unwrap();
-            for batch in iter {
-                let _batch = batch.unwrap();
+            let ranges = memtable
+                .ranges(
+                    None,
+                    PredicateGroup::new(&metadata, predicate.exprs()),
+                    None,
+                )
+                .unwrap();
+            for range in ranges.ranges.values() {
+                let iter = range
+                    .build_iter((Timestamp::MIN_MILLISECOND, Timestamp::MAX_MILLISECOND))
+                    .unwrap();
+                for batch in iter {
+                    let _batch = batch.unwrap();
+                }
             }
         });
     });

@@ -26,8 +26,8 @@ use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
 use datatypes::arrow::array::{
-    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray, StringDictionaryBuilder, UInt32Array,
-    UInt64Array, UInt8Array,
+    make_comparator, ArrayRef, BinaryBuilder, BooleanArray, DictionaryArray,
+    StringDictionaryBuilder, UInt32Array, UInt64Array, UInt8Array,
 };
 use datatypes::arrow::compute::{filter_record_batch, SortOptions};
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Int32Type, Schema, SchemaRef};
