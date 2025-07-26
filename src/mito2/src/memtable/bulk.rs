@@ -34,10 +34,10 @@ use crate::read::dedup::LastNonNullIter;
 use crate::region::options::MergeMode;
 
 #[allow(unused)]
-mod context;
+pub mod context;
 #[allow(unused)]
 pub mod part;
-mod part_reader;
+pub mod part_reader;
 mod row_group_reader;
 
 pub struct BulkMemtable {
