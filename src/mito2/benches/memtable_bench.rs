@@ -116,9 +116,16 @@ fn full_scan(c: &mut Criterion) {
         memtable.freeze().unwrap();
 
         b.iter(|| {
-            let iter = memtable.iter(None, None, None).unwrap();
-            for batch in iter {
-                let _batch = batch.unwrap();
+            let ranges = memtable
+                .ranges(None, PredicateGroup::default(), None)
+                .unwrap();
+            for range in ranges.ranges.values() {
+                let iter = range
+                    .build_iter((Timestamp::MIN_MILLISECOND, Timestamp::MAX_MILLISECOND))
+                    .unwrap();
+                for batch in iter {
+                    let _batch = batch.unwrap();
+                }
             }
         });
     });
