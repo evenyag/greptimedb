@@ -46,6 +46,7 @@ use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 pub(crate) mod buffer;
 #[allow(unused)]
 mod context;
+mod merge;
 #[allow(unused)]
 pub(crate) mod part;
 mod part_reader;
