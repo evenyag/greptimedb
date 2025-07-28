@@ -395,7 +395,7 @@ impl Ord for RowCursor {
     }
 }
 
-struct MergeIterator {
+pub struct MergeIterator {
     algo: MergeAlgo<IterNode>,
     in_progress: BatchBuilder,
     /// Batch to output.
@@ -404,7 +404,7 @@ struct MergeIterator {
 }
 
 impl MergeIterator {
-    fn new(
+    pub fn new(
         schema: SchemaRef,
         iters: Vec<BoxedRecordBatchIterator>,
         time_index: usize,
@@ -435,7 +435,7 @@ impl MergeIterator {
         })
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while !self.algo.hot.is_empty() && self.output_batch.is_none() {
             if self.algo.hot.len() == 1 && !self.in_progress.is_empty() {
                 // Only one batch in the hot heap, but we have pending rows, output the pending rows first.
