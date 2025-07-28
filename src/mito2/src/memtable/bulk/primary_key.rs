@@ -982,7 +982,7 @@ impl BatchLastRow {
 /// # Panics
 /// Panics if the array is not a timestamp array or
 /// the index is out of bound.
-fn timestamp_value(array: &dyn Array, idx: usize) -> i64 {
+pub(crate) fn timestamp_value(array: &dyn Array, idx: usize) -> i64 {
     match array.data_type() {
         datatypes::arrow::datatypes::DataType::Timestamp(TimeUnit::Second, None) => {
             let array = array

@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use common_recordbatch::DfRecordBatch as RecordBatch;
+use datatypes::arrow::array::{ArrayRef, UInt64Array};
 use datatypes::arrow::compute::interleave;
 use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow_array::BinaryArray;
 use snafu::ResultExt;
+use store_api::storage::SequenceNumber;
 
 use crate::error::{ComputeArrowSnafu, Result};
+use crate::memtable::bulk::primary_key::timestamp_value;
+use crate::read::BoxedRecordBatchIterator;
+use crate::sst::parquet::format::PrimaryKeyArray;
 
 /// Keeps track of the current position in a batch
 #[derive(Debug, Copy, Clone, Default)]
@@ -121,6 +128,36 @@ impl BatchBuilder {
         // for each stream have been yielded to the newly created record batch
         //
         // We can therefore drop all but the last batch for each stream
+        self.retain_batches();
+
+        RecordBatch::try_new(Arc::clone(&self.schema), columns)
+            .context(ComputeArrowSnafu)
+            .map(Some)
+    }
+
+    /// Slice and take remaining rows from the last batch of `stream_idx` and push
+    /// the next batch if available.
+    pub fn take_remaining_rows(
+        &mut self,
+        stream_idx: usize,
+        next: Option<RecordBatch>,
+    ) -> RecordBatch {
+        let cursor = &mut self.cursors[stream_idx];
+        let batch = &self.batches[cursor.batch_idx];
+        let output = batch
+            .1
+            .slice(cursor.row_idx, batch.1.num_rows() - cursor.row_idx);
+        cursor.row_idx = batch.1.num_rows();
+
+        if let Some(b) = next {
+            self.push_batch(stream_idx, b);
+            self.retain_batches();
+        }
+
+        output
+    }
+
+    fn retain_batches(&mut self) {
         let mut batch_idx = 0;
         let mut retained = 0;
         self.batches.retain(|(stream_idx, _)| {
@@ -134,10 +171,6 @@ impl BatchBuilder {
             }
             retain
         });
-
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .context(ComputeArrowSnafu)
-            .map(Some)
     }
 }
 
@@ -230,5 +263,339 @@ impl<T: NodeCmp> MergeAlgo<T> {
             // Anyway, the merge window has been changed, we need to refill the hot heap.
             self.refill_hot();
         }
+    }
+
+    fn pop_hot(&mut self) -> Option<T> {
+        self.hot.pop()
+    }
+}
+
+/// Columns to compare.
+struct SortColumns {
+    primary_key: PrimaryKeyArray,
+    timestamp: ArrayRef,
+    sequence: UInt64Array,
+}
+
+impl SortColumns {
+    fn new(batch: &RecordBatch, time_index: usize) -> Self {
+        let primary_key = batch
+            .column(batch.num_columns() - 4)
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .unwrap()
+            .clone();
+        let timestamp = batch.column(time_index).clone();
+        let sequence = batch
+            .column(batch.num_columns() - 2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .clone();
+
+        Self {
+            primary_key,
+            timestamp,
+            sequence,
+        }
+    }
+
+    fn primary_key_at(&self, index: usize) -> &[u8] {
+        let key = self.primary_key.keys().value(index);
+        let binary_values = self
+            .primary_key
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        binary_values.value(key as usize)
+    }
+
+    fn timestamp_at(&self, index: usize) -> i64 {
+        timestamp_value(&self.timestamp, index)
+    }
+
+    fn sequence_at(&self, index: usize) -> SequenceNumber {
+        self.sequence.value(index)
+    }
+}
+
+/// Cursor to a row in the [RecordBatch].
+///
+/// It compares batches by rows. During comparison, it ignores op type as sequence is enough to
+/// distinguish different rows.
+struct RowCursor {
+    /// Current row offset.
+    offset: usize,
+    columns: SortColumns,
+}
+
+impl RowCursor {
+    fn new(columns: SortColumns) -> Self {
+        Self { offset: 0, columns }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.offset >= self.columns.timestamp.len()
+    }
+
+    fn advance(&mut self) {
+        self.offset += 1;
+    }
+
+    fn first_primary_key(&self) -> &[u8] {
+        self.columns.primary_key_at(self.offset)
+    }
+
+    fn first_timestamp(&self) -> i64 {
+        self.columns.timestamp_at(self.offset)
+    }
+
+    fn first_sequence(&self) -> SequenceNumber {
+        self.columns.sequence_at(self.offset)
+    }
+
+    fn last_primary_key(&self) -> &[u8] {
+        self.columns
+            .primary_key_at(self.columns.timestamp.len() - 1)
+    }
+
+    fn last_timestamp(&self) -> i64 {
+        self.columns.timestamp_at(self.columns.timestamp.len() - 1)
+    }
+
+    fn last_sequence(&self) -> SequenceNumber {
+        self.columns.sequence_at(self.columns.timestamp.len() - 1)
+    }
+}
+
+impl PartialEq for RowCursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.first_primary_key() == other.first_primary_key()
+            && self.first_timestamp() == other.first_timestamp()
+            && self.first_sequence() == other.first_sequence()
+    }
+}
+
+impl Eq for RowCursor {}
+
+impl PartialOrd for RowCursor {
+    fn partial_cmp(&self, other: &RowCursor) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowCursor {
+    /// Compares by primary key, time index, sequence desc.
+    fn cmp(&self, other: &RowCursor) -> Ordering {
+        self.first_primary_key()
+            .cmp(other.first_primary_key())
+            .then_with(|| self.first_timestamp().cmp(&other.first_timestamp()))
+            .then_with(|| other.first_sequence().cmp(&self.first_sequence()))
+    }
+}
+
+struct MergeIterator {
+    algo: MergeAlgo<IterNode>,
+    in_progress: BatchBuilder,
+    /// Batch to output.
+    output_batch: Option<RecordBatch>,
+    batch_size: usize,
+}
+
+impl MergeIterator {
+    fn new(
+        schema: SchemaRef,
+        iters: Vec<BoxedRecordBatchIterator>,
+        time_index: usize,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
+        let mut nodes = Vec::with_capacity(iters.len());
+        for (node_index, iter) in iters.into_iter().enumerate() {
+            let mut node = IterNode {
+                node_index,
+                iter,
+                cursor: None,
+                time_index,
+            };
+            if let Some(batch) = node.next_batch()? {
+                in_progress.push_batch(node_index, batch);
+                nodes.push(node);
+            }
+        }
+
+        let algo = MergeAlgo::new(nodes);
+
+        Ok(Self {
+            algo,
+            in_progress,
+            output_batch: None,
+            batch_size,
+        })
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        while !self.algo.hot.is_empty() && self.output_batch.is_none() {
+            if self.algo.hot.len() == 1 && !self.in_progress.is_empty() {
+                // Only one batch in the hot heap, but we have pending rows, output the pending rows first.
+                self.output_batch = self.in_progress.build_record_batch()?;
+                debug_assert!(self.output_batch.is_some());
+            } else if self.algo.hot.len() == 1 {
+                self.fetch_batch_from_hottest()?;
+            } else {
+                self.fetch_row_from_hottest()?;
+            }
+        }
+
+        if let Some(batch) = self.output_batch.take() {
+            Ok(Some(batch))
+        } else {
+            // No more batches.
+            Ok(None)
+        }
+    }
+
+    fn fetch_batch_from_hottest(&mut self) -> Result<()> {
+        debug_assert!(self.in_progress.is_empty());
+
+        // Safety: next_batch() ensures the heap is not empty.
+        let mut hottest = self.algo.pop_hot().unwrap();
+        debug_assert!(!hottest.current_cursor().is_finished());
+        let next = hottest.next_batch()?;
+        // The node is the heap is not empty, so it must have existing rows in the builder.
+        let batch = self
+            .in_progress
+            .take_remaining_rows(hottest.node_index, next);
+        Self::maybe_output_batch(batch, &mut self.output_batch);
+        self.algo.reheap(hottest);
+
+        Ok(())
+    }
+
+    fn fetch_row_from_hottest(&mut self) -> Result<()> {
+        // Safety: next_batch() ensures the heap has more than 1 element.
+        let mut hottest = self.algo.pop_hot().unwrap();
+        debug_assert!(!hottest.current_cursor().is_finished());
+        self.in_progress.push_row(hottest.node_index);
+        if self.in_progress.len() >= self.batch_size {
+            // We buffered enough rows.
+            if let Some(output) = self.in_progress.build_record_batch()? {
+                Self::maybe_output_batch(output, &mut self.output_batch);
+            }
+        }
+
+        if let Some(next) = hottest.advance_row()? {
+            self.in_progress.push_batch(hottest.node_index, next);
+        }
+
+        self.algo.reheap(hottest);
+        Ok(())
+    }
+
+    fn maybe_output_batch(batch: RecordBatch, output_batch: &mut Option<RecordBatch>) {
+        debug_assert!(output_batch.is_none());
+        if batch.num_rows() > 0 {
+            *output_batch = Some(batch);
+        }
+    }
+}
+
+struct IterNode {
+    /// Index of the node.
+    node_index: usize,
+    /// Iterator of this `Node`.
+    iter: BoxedRecordBatchIterator,
+    /// Current batch to be read. The node ensures the batch is not empty.
+    ///
+    /// `None` means the `iter` has reached EOF.
+    cursor: Option<RowCursor>,
+    /// Index of the time index column.
+    time_index: usize,
+}
+
+impl IterNode {
+    /// Returns current cursor.
+    ///
+    /// # Panics
+    /// Panics if the node has reached EOF.
+    fn current_cursor(&self) -> &RowCursor {
+        self.cursor.as_ref().unwrap()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let batch = self.advance_iter()?;
+        let columns = batch
+            .as_ref()
+            .map(|rb| SortColumns::new(rb, self.time_index));
+        self.cursor = columns.map(|c| RowCursor::new(c));
+
+        Ok(batch)
+    }
+
+    fn advance_row(&mut self) -> Result<Option<RecordBatch>> {
+        let cursor = self.cursor.as_mut().unwrap();
+        cursor.advance();
+        if !cursor.is_finished() {
+            return Ok(None);
+        }
+
+        self.next_batch()
+    }
+
+    fn advance_iter(&mut self) -> Result<Option<RecordBatch>> {
+        while let Some(batch) = self.iter.next().transpose()? {
+            if batch.num_rows() > 0 {
+                return Ok(Some(batch));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl NodeCmp for IterNode {
+    fn is_eof(&self) -> bool {
+        self.cursor.is_none()
+    }
+
+    fn is_behind(&self, other: &Self) -> bool {
+        debug_assert!(!self.current_cursor().is_finished());
+        debug_assert!(!other.current_cursor().is_finished());
+
+        // TODO(yingwen): Bind current cursor to a variable first.
+        // We only compare pk and timestamp so nodes in the cold
+        // heap don't have overlapping timestamps with the hottest node
+        // in the hot heap.
+        self.current_cursor()
+            .first_primary_key()
+            .cmp(other.current_cursor().last_primary_key())
+            .then_with(|| {
+                self.current_cursor()
+                    .first_timestamp()
+                    .cmp(&other.current_cursor().last_timestamp())
+            })
+            == Ordering::Greater
+    }
+}
+
+impl PartialEq for IterNode {
+    fn eq(&self, other: &IterNode) -> bool {
+        self.cursor == other.cursor
+    }
+}
+
+impl Eq for IterNode {}
+
+impl PartialOrd for IterNode {
+    fn partial_cmp(&self, other: &IterNode) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IterNode {
+    fn cmp(&self, other: &IterNode) -> Ordering {
+        // The std binary heap is a max heap, but we want the nodes are ordered in
+        // ascend order, so we compare the nodes in reverse order.
+        other.cursor.cmp(&self.cursor)
     }
 }
