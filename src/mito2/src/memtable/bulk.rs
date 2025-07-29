@@ -51,7 +51,7 @@ pub mod merge;
 pub(crate) mod part;
 mod part_reader;
 #[allow(unused)]
-pub(crate) mod primary_key;
+pub mod primary_key;
 mod record_batch_iter;
 mod row_group_reader;
 

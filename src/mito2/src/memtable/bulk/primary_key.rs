@@ -823,7 +823,7 @@ impl ColumnIndices {
 
 /// Merges batches from multiple sorted sources into a single sorted stream.
 /// Input sources must be sorted by primary key and have the same schema.
-pub(crate) fn merge_record_batch_df(
+pub fn merge_record_batch_df(
     metadata: &RegionMetadata,
     sources: Vec<BoxedRecordBatchIterator>,
 ) -> Result<Source> {
