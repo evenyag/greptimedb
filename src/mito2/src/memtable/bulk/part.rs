@@ -399,7 +399,8 @@ impl BulkPartConverter {
     /// Converts buffered content into a [BulkPart].
     ///
     /// It sorts the record batch by (primary key, timestamp, sequence desc).
-    pub fn convert(mut self) -> Result<BulkPart> {
+    /// Returns the BulkPart and optionally sorted primary key arrays if store_primary_key_columns is enabled.
+    pub fn convert(mut self) -> Result<(BulkPart, Option<Vec<ArrayRef>>)> {
         let values = Values::from(self.value_builder);
         let mut columns = Vec::with_capacity(4 + values.fields.len());
 
@@ -428,17 +429,19 @@ impl BulkPartConverter {
 
         let batch = RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)?;
         // Sorts the record batch.
-        let (batch, _sorted_primary_key_arrays) =
+        let (batch, sorted_primary_key_arrays) =
             sort_primary_key_record_batch(&batch, primary_key_arrays)?;
 
-        Ok(BulkPart {
+        let bulk_part = BulkPart {
             batch,
             max_ts: self.max_ts,
             min_ts: self.min_ts,
             sequence: self.max_sequence,
             timestamp_index,
             raw_data: None,
-        })
+        };
+
+        Ok((bulk_part, sorted_primary_key_arrays))
     }
 }
 
@@ -1409,7 +1412,7 @@ mod tests {
         converter.append_key_values(&key_values1).unwrap();
         converter.append_key_values(&key_values2).unwrap();
 
-        let bulk_part = converter.convert().unwrap();
+        let (bulk_part, _) = converter.convert().unwrap();
 
         assert_eq!(bulk_part.num_rows(), 3);
         assert_eq!(bulk_part.min_ts, 1000);
@@ -1457,7 +1460,7 @@ mod tests {
         converter.append_key_values(&key_values2).unwrap();
         converter.append_key_values(&key_values3).unwrap();
 
-        let bulk_part = converter.convert().unwrap();
+        let (bulk_part, _) = converter.convert().unwrap();
 
         assert_eq!(bulk_part.num_rows(), 3);
 
@@ -1482,7 +1485,7 @@ mod tests {
 
         let converter = BulkPartConverter::new(&metadata, capacity, primary_key_codec, false);
 
-        let bulk_part = converter.convert().unwrap();
+        let (bulk_part, _) = converter.convert().unwrap();
 
         assert_eq!(bulk_part.num_rows(), 0);
         assert_eq!(bulk_part.min_ts, i64::MAX);

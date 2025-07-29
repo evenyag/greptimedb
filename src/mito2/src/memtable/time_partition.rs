@@ -246,7 +246,7 @@ impl TimePartitions {
                 false,
             );
             converter.append_key_values(kvs)?;
-            let part = converter.convert()?;
+            let (part, _) = converter.convert()?;
 
             return self.write_bulk(part);
         }

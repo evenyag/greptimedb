@@ -441,12 +441,10 @@ impl NonEncodedRecordBatchIter {
                     if let (Some(pk_index), Some(pk_arrays)) = (pk_index, pk_columns) {
                         if pk_index < pk_arrays.len() {
                             let pk_array = &pk_arrays[pk_index];
-                            // Convert the array to a vector for evaluation
-                            let pk_vector = datatypes::vectors::Helper::try_into_vector(pk_array)
-                                .context(crate::error::ComputeVectorSnafu)?;
-
+                            
+                            // Use evaluate_array to evaluate the primary key array directly
                             filter
-                                .evaluate_vector(&pk_vector)
+                                .evaluate_array(pk_array)
                                 .context(crate::error::RecordBatchSnafu)?
                         } else {
                             // Primary key index out of bounds, skip this filter
@@ -468,13 +466,10 @@ impl NonEncodedRecordBatchIter {
                         // Field columns are at the beginning of the record batch
                         if field_index < record_batch.num_columns() {
                             let field_array = record_batch.column(field_index);
-                            // Convert the array to a vector for evaluation
-                            let field_vector =
-                                datatypes::vectors::Helper::try_into_vector(field_array)
-                                    .context(crate::error::ComputeVectorSnafu)?;
-
+                            
+                            // Use evaluate_array to evaluate the field array directly
                             filter
-                                .evaluate_vector(&field_vector)
+                                .evaluate_array(field_array)
                                 .context(crate::error::RecordBatchSnafu)?
                         } else {
                             // Field index out of bounds, skip this filter
@@ -492,13 +487,10 @@ impl NonEncodedRecordBatchIter {
                     let timestamp_pos = record_batch.num_columns() - 4;
                     if timestamp_pos < record_batch.num_columns() {
                         let timestamp_array = record_batch.column(timestamp_pos);
-                        // Convert the array to a vector for evaluation
-                        let timestamp_vector =
-                            datatypes::vectors::Helper::try_into_vector(timestamp_array)
-                                .context(crate::error::ComputeVectorSnafu)?;
-
+                        
+                        // Use evaluate_array to evaluate the timestamp array directly
                         filter
-                            .evaluate_vector(&timestamp_vector)
+                            .evaluate_array(timestamp_array)
                             .context(crate::error::RecordBatchSnafu)?
                     } else {
                         // Timestamp position out of bounds, skip this filter
