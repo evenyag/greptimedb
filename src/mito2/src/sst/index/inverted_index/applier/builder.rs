@@ -45,7 +45,7 @@ use crate::sst::index::inverted_index::applier::InvertedIndexApplier;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
 /// Constructs an [`InvertedIndexApplier`] which applies predicates to SST files during scan.
-pub(crate) struct InvertedIndexApplierBuilder<'a> {
+pub struct InvertedIndexApplierBuilder<'a> {
     /// Directory of the table, required argument for constructing [`InvertedIndexApplier`].
     table_dir: String,
 

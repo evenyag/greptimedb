@@ -89,3 +89,58 @@ fn page_to_page_meta(page: &Page) -> PageMetadata {
         },
     }
 }
+
+/// A reader that reads all pages from a cache.
+pub(crate) struct MetricsPageReader<T> {
+    row_group: usize,
+    column_idx: usize,
+    reader: T,
+    num_get: usize,
+    num_skip: usize,
+}
+
+impl<T> MetricsPageReader<T> {
+    /// Returns a new reader from pages of a column in a row group.
+    pub(crate) fn new(row_group: usize, column_idx: usize, reader: T) -> Self {
+        Self {
+            row_group,
+            column_idx,
+            reader,
+            num_get: 0,
+            num_skip: 0,
+        }
+    }
+}
+
+impl<T: PageReader> PageReader for MetricsPageReader<T> {
+    fn get_next_page(&mut self) -> Result<Option<Page>> {
+        self.num_get += 1;
+        self.reader.get_next_page()
+    }
+
+    fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
+        self.reader.peek_next_page()
+    }
+
+    fn skip_next_page(&mut self) -> Result<()> {
+        self.num_skip += 1;
+        self.reader.skip_next_page()
+    }
+}
+
+impl<T: PageReader> Iterator for MetricsPageReader<T> {
+    type Item = Result<Page>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.get_next_page().transpose()
+    }
+}
+
+impl<T> Drop for MetricsPageReader<T> {
+    fn drop(&mut self) {
+        common_telemetry::info!(
+            "Page reader metrics: num get: {}, num skip: {}",
+            self.num_get,
+            self.num_skip
+        );
+    }
+}

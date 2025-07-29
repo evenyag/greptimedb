@@ -163,7 +163,7 @@ impl ParquetReaderBuilder {
 
     /// Attaches the inverted index applier to the builder.
     #[must_use]
-    pub(crate) fn inverted_index_applier(
+    pub fn inverted_index_applier(
         mut self,
         index_applier: Option<InvertedIndexApplierRef>,
     ) -> Self {
@@ -173,7 +173,7 @@ impl ParquetReaderBuilder {
 
     /// Attaches the bloom filter index applier to the builder.
     #[must_use]
-    pub(crate) fn bloom_filter_index_applier(
+    pub fn bloom_filter_index_applier(
         mut self,
         index_applier: Option<BloomFilterIndexApplierRef>,
     ) -> Self {
@@ -183,7 +183,7 @@ impl ParquetReaderBuilder {
 
     /// Attaches the fulltext index applier to the builder.
     #[must_use]
-    pub(crate) fn fulltext_index_applier(
+    pub fn fulltext_index_applier(
         mut self,
         index_applier: Option<FulltextIndexApplierRef>,
     ) -> Self {

@@ -36,7 +36,7 @@ use crate::cache::{CacheStrategy, PageKey, PageValue};
 use crate::metrics::{READ_STAGE_ELAPSED, READ_STAGE_FETCH_PAGES};
 use crate::sst::file::FileId;
 use crate::sst::parquet::helper::fetch_byte_ranges;
-use crate::sst::parquet::page_reader::RowGroupCachedReader;
+use crate::sst::parquet::page_reader::{MetricsPageReader, RowGroupCachedReader};
 
 pub(crate) struct RowGroupBase<'a> {
     metadata: &'a RowGroupMetaData,
@@ -400,6 +400,7 @@ impl<'a> InMemoryRowGroup<'a> {
         }
 
         let page_reader = self.base.column_reader(i)?;
+        let page_reader = MetricsPageReader::new(self.row_group_idx, i, page_reader);
 
         let column = self.base.metadata.column(i);
         if cache_uncompressed_pages(column) {

@@ -46,7 +46,7 @@ use crate::sst::index::TYPE_INVERTED_INDEX;
 
 /// `InvertedIndexApplier` is responsible for applying predicates to the provided SST files
 /// and returning the relevant row group ids for further scan.
-pub(crate) struct InvertedIndexApplier {
+pub struct InvertedIndexApplier {
     /// The root directory of the table.
     table_dir: String,
 

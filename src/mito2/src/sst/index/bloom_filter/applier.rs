@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod builder;
+pub mod builder;
 
 use std::collections::BTreeMap;
 use std::ops::Range;

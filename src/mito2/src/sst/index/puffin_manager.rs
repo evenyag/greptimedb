@@ -102,7 +102,7 @@ impl PuffinManagerFactory {
 
 #[cfg(test)]
 impl PuffinManagerFactory {
-    pub(crate) async fn new_for_test_async(
+    pub async fn new_for_test_async(
         prefix: &str,
     ) -> (common_test_util::temp_dir::TempDir, Self) {
         let tempdir = common_test_util::temp_dir::create_temp_dir(prefix);
@@ -112,7 +112,7 @@ impl PuffinManagerFactory {
         (tempdir, factory)
     }
 
-    pub(crate) fn new_for_test_block(prefix: &str) -> (common_test_util::temp_dir::TempDir, Self) {
+    pub fn new_for_test_block(prefix: &str) -> (common_test_util::temp_dir::TempDir, Self) {
         let tempdir = common_test_util::temp_dir::create_temp_dir(prefix);
 
         let f = Self::new(tempdir.path().to_path_buf(), 1024, None, None);

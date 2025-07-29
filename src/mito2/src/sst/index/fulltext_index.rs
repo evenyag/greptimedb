@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod applier;
+pub mod applier;
 pub(crate) mod creator;
 
 const INDEX_BLOB_TYPE_TANTIVY: &str = "greptime-fulltext-index-v1";

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod bloom_filter;
-pub(crate) mod fulltext_index;
+pub mod bloom_filter;
+pub mod fulltext_index;
 mod indexer;
 pub mod intermediate;
-pub(crate) mod inverted_index;
+pub mod inverted_index;
 pub mod puffin_manager;
 mod statistics;
 pub(crate) mod store;
