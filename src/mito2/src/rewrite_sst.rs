@@ -1,34 +1,33 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
-use common_function::function::FunctionRef;
-use common_function::function_factory::ScalarFunctionFactory;
-use common_function::scalars::matches_term::MatchesTermFunction;
+use api::v1::SemanticType;
+use common_base::readable_size::ReadableSize;
 use common_time::Timestamp;
-use datafusion_common::{Column, ScalarValue};
-use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{col, lit, BinaryExpr, Expr, Operator};
-use mito2::read::BatchReader;
+use datatypes::data_type::ConcreteDataType;
+use datatypes::schema::ColumnSchema;
+use mito2::access_layer::{OperationType, RegionFilePathFactory};
+use mito2::config::{BloomFilterConfig, FulltextIndexConfig, InvertedIndexConfig};
+use mito2::read::{BoxedBatchReader, Source};
+use mito2::region::options::IndexOptions;
 use mito2::sst::file::{FileHandle, FileId, FileMeta, IndexType, Level};
 use mito2::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
-use mito2::sst::index::bloom_filter::applier::BloomFilterIndexApplierBuilder;
-use mito2::sst::index::fulltext_index::applier::builder::FulltextIndexApplierBuilder;
-use mito2::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
+use mito2::sst::index::intermediate::IntermediateManager;
+use mito2::sst::index::puffin_manager::PuffinManagerFactory;
+use mito2::sst::index::IndexerBuilderImpl;
 use mito2::sst::parquet::reader::ParquetReaderBuilder;
+use mito2::sst::parquet::writer::ParquetWriter;
+use mito2::sst::parquet::{WriteOptions, DEFAULT_ROW_GROUP_SIZE};
 use object_store::services::Fs;
-use object_store::util::with_instrument_layers;
 use object_store::ObjectStore;
 use smallvec::SmallVec;
-use store_api::metadata::RegionMetadata;
+use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
 use store_api::region_request::PathType;
 use store_api::storage::ColumnId;
-use table::predicate::Predicate;
 
 fn new_fs_store(path: &str) -> ObjectStore {
     let builder = Fs::default();
-    let store = ObjectStore::new(builder.root(path)).unwrap().finish();
-    with_instrument_layers(store, false)
+    ObjectStore::new(builder.root(path)).unwrap().finish()
 }
 
 #[derive(Debug)]
@@ -93,11 +92,6 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
     // - helm.sh/chart (column_id=12): String with bloom filter
     // - timestamp (column_id=13): Timestamp(Nanosecond) - time index
     // - statefulset.kubernetes.io/pod-name (column_id=14): String
-
-    use api::v1::SemanticType;
-    use datatypes::data_type::ConcreteDataType;
-    use datatypes::schema::ColumnSchema;
-    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
 
     // Create region metadata using the consuming builder pattern
     let mut message_metadata = HashMap::new();
@@ -190,74 +184,59 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
 async fn main() {
     common_telemetry::init_default_ut_logging();
 
+    // Get environment variables - similar to read_sst.rs
     let file_dir = std::env::var("FILE_DIR").unwrap_or_else(|_| "inverted".to_string());
-    let file_id = std::env::var("FILE_ID")
+    let input_file_id = std::env::var("INPUT_FILE_ID")
         .unwrap_or_else(|_| "0235c947-9988-4d46-96a9-9fcee770896a".to_string());
     let file_root = std::env::var("FILE_ROOT")
         .unwrap_or_else(|_| "/Users/evenyag/Documents/test/etcd-fulltext/".to_string());
-    let loops = std::env::var("LOOPS")
+    let output_dir = std::env::var("OUTPUT_DIR")
+        .unwrap_or_else(|_| "/Users/evenyag/Documents/test/etcd-fulltext/rewrite".to_string());
+    let new_file_id = std::env::var("NEW_FILE_ID").unwrap_or_else(|_| FileId::random().to_string());
+    let data_page_row_count = std::env::var("DATA_PAGE_ROW_COUNT")
         .ok()
-        .and_then(|x| x.parse::<usize>().ok())
-        .unwrap_or(1);
-    let use_fulltext = std::env::var("USE_FULLTEXT")
-        .ok()
-        .and_then(|x| x.parse::<bool>().ok())
-        .unwrap_or(true);
+        .and_then(|x| x.parse::<usize>().ok());
 
-    let object_store = new_fs_store(&file_root);
+    common_telemetry::info!("Reading SST from: {}/{}", file_root, input_file_id);
+    common_telemetry::info!("Writing new SST to: {}", output_dir);
+    common_telemetry::info!("New file ID: {}", new_file_id);
+
+    // Create necessary components - same as read_sst.rs
+    let input_object_store = new_fs_store(&file_root);
 
     // Get actual file sizes from object store
-    let parsed_file_id = FileId::parse_str(&file_id).unwrap();
+    let parsed_input_file_id = FileId::parse_str(&input_file_id).unwrap();
     let parquet_path = format!(
         "{}/0_0000000000/{}.parquet",
         file_dir.trim_end_matches('/'),
-        parsed_file_id
+        parsed_input_file_id
     );
     let puffin_path = format!(
         "{}/0_0000000000/index/{}.puffin",
         file_dir.trim_end_matches('/'),
-        parsed_file_id
+        parsed_input_file_id
     );
 
-    let parquet_meta = object_store.stat(&parquet_path).await.unwrap();
-    let puffin_meta = object_store.stat(&puffin_path).await.unwrap();
+    let parquet_meta = input_object_store.stat(&parquet_path).await.unwrap();
+    let puffin_meta = input_object_store.stat(&puffin_path).await.unwrap();
 
     let actual_file_size = parquet_meta.content_length();
     let actual_index_file_size = puffin_meta.content_length();
 
-    common_telemetry::info!(
-        "Read {} ({} bytes) and {} ({} bytes)",
-        parquet_path,
-        actual_file_size,
-        puffin_path,
-        actual_index_file_size
-    );
-
-    let file_handle = new_file_handle(
-        parsed_file_id,
+    let input_file_handle = new_file_handle(
+        parsed_input_file_id,
         0,
         1000,
         1,
         actual_file_size,
         actual_index_file_size,
     );
+    let output_object_store = new_fs_store(&output_dir);
     let region_metadata = create_region_metadata_from_json();
 
-    // Hard-coded projection: only read level (column_id=1) and message (column_id=0)
-    let projection = Some(vec![ColumnId::from(1u32), ColumnId::from(0u32)]);
-
-    // Hard-coded predicate for (level = 'error' OR level = 'warn')
-    let level_filter = Expr::BinaryExpr(BinaryExpr {
-        left: Box::new(col("level").eq(lit("error"))),
-        op: Operator::Or,
-        right: Box::new(col("level").eq(lit("warn"))),
-    });
-    let filters = vec![level_filter];
-    let predicate = Some(Predicate::new(filters.clone()));
-
-    // Create PuffinManagerFactory with proper parameters
-    let temp_dir = std::env::temp_dir().join("greptime_read_sst_test");
-    let puffin_factory = mito2::sst::index::puffin_manager::PuffinManagerFactory::new(
+    // Create PuffinManagerFactory for input reading
+    let temp_dir = std::env::temp_dir().join("greptime_rewrite_sst");
+    let puffin_factory = PuffinManagerFactory::new(
         temp_dir,
         1024 * 1024, // 1MB staging capacity
         None,        // no write buffer size limit
@@ -266,113 +245,73 @@ async fn main() {
     .await
     .unwrap();
 
-    // Build inverted index applier for level column
-    let inverted_index_applier = InvertedIndexApplierBuilder::new(
+    // Create parquet reader to read from existing SST
+    let reader_builder = ParquetReaderBuilder::new(
         file_dir.clone(),
         PathType::Bare,
-        object_store.clone(),
-        region_metadata.as_ref(),
-        HashSet::from([ColumnId::from(1u32)]), // level column has inverted index
-        puffin_factory.clone(),
+        input_file_handle,
+        input_object_store,
     )
-    .build(&filters)
-    .ok()
-    .flatten()
-    .map(Arc::new);
+    .expected_metadata(Some(region_metadata.clone()));
 
-    // Build fulltext index applier for message column using matches_term
-    let matches_term_func = Arc::new(
-        ScalarFunctionFactory::from(Arc::new(MatchesTermFunction) as FunctionRef)
-            .provide(Default::default()),
-    );
+    let reader = reader_builder.build().await.unwrap();
 
-    let fulltext_filters = vec![Expr::ScalarFunction(ScalarFunction {
-        args: vec![
-            Expr::Column(Column::from_name("message")),
-            Expr::Literal(ScalarValue::Utf8(Some("leader failed".to_string()))),
-        ],
-        func: matches_term_func,
-    })];
+    // Create source from the reader
+    let source = Source::Reader(Box::new(reader) as BoxedBatchReader);
 
-    let fulltext_index_applier = FulltextIndexApplierBuilder::new(
-        file_dir.clone(),
-        PathType::Bare,
-        object_store.clone(),
-        puffin_factory.clone(),
-        region_metadata.as_ref(),
+    // Create path provider for output
+    let path_provider = RegionFilePathFactory::new("0_0000000000".to_string(), PathType::Bare);
+
+    // Create intermediate manager for inverted index
+    let intermediate_manager = IntermediateManager::init_fs("index_tmp").await.unwrap();
+
+    // Create indexer builder for output - following access_layer.rs pattern
+    let indexer_builder = IndexerBuilderImpl {
+        op_type: OperationType::Compact, // This is a rewrite/compaction operation
+        metadata: region_metadata.clone(),
+        row_group_size: DEFAULT_ROW_GROUP_SIZE, // Default row group size
+        puffin_manager: puffin_factory.build(output_object_store.clone(), path_provider.clone()),
+        intermediate_manager,
+        index_options: IndexOptions::default(),
+        inverted_index_config: InvertedIndexConfig::default(),
+        fulltext_index_config: FulltextIndexConfig::default(),
+        bloom_filter_index_config: BloomFilterConfig::default(),
+    };
+
+    // Create ParquetWriter
+    let mut writer = ParquetWriter::new_with_object_store(
+        output_object_store,
+        region_metadata.clone(),
+        indexer_builder,
+        path_provider,
     )
-    .build(&fulltext_filters)
-    .ok()
-    .flatten()
-    .map(Arc::new);
+    .await;
 
-    // Build bloom filter applier
-    let bloom_filter_applier = BloomFilterIndexApplierBuilder::new(
-        file_dir.clone(),
-        PathType::Bare,
-        object_store.clone(),
-        region_metadata.as_ref(),
-        puffin_factory.clone(),
-    )
-    .build(&filters)
-    .ok()
-    .flatten()
-    .map(Arc::new);
+    // Write options
+    let write_options = WriteOptions {
+        write_buffer_size: ReadableSize::mb(8),
+        row_group_size: DEFAULT_ROW_GROUP_SIZE,
+        // 300MB max file size
+        max_file_size: Some(1024 * 1024 * 300),
+        data_page_row_count,
+    };
 
-    for i in 0..loops {
-        let start = Instant::now();
-        let mut builder = ParquetReaderBuilder::new(
-            file_dir.clone(),
-            PathType::Bare,
-            file_handle.clone(),
-            object_store.clone(),
-        )
-        .projection(projection.clone())
-        .predicate(predicate.clone())
-        .expected_metadata(Some(region_metadata.clone()));
+    // Write all data from input SST to new SST
+    common_telemetry::info!("Starting rewrite from SST to new SST...");
+    let sst_infos = writer
+        .write_all(source, None, &write_options)
+        .await
+        .unwrap();
 
-        // Apply inverted index applier if available
-        if let Some(applier) = &inverted_index_applier {
-            builder = builder.inverted_index_applier(Some(applier.clone()));
-        }
-
-        // Apply fulltext index applier if available
-        if use_fulltext {
-            common_telemetry::info!("Use fulltext");
-
-            if let Some(applier) = &fulltext_index_applier {
-                builder = builder.fulltext_index_applier(Some(applier.clone()));
-            }
-        }
-
-        // Apply bloom filter applier if available
-        if let Some(applier) = &bloom_filter_applier {
-            builder = builder.bloom_filter_index_applier(Some(applier.clone()));
-        }
-
-        let mut reader = builder.build().await.unwrap();
-
-        common_telemetry::info!("loop: {}, build reader cost is {:?}", i, start.elapsed());
-        let mut total_batches = 0;
-        let mut total_rows = 0;
-
-        while let Some(batch) = reader.next_batch().await.unwrap() {
-            total_batches += 1;
-            total_rows += batch.num_rows();
-            // common_telemetry::info!(
-            //     "Batch {}: {} rows, primary_key: {:?}",
-            //     total_batches,
-            //     batch.num_rows(),
-            //     std::str::from_utf8(batch.primary_key()).unwrap_or("<invalid utf8>")
-            // );
-        }
-
+    common_telemetry::info!("Successfully created {} SST files:", sst_infos.len());
+    for sst_info in &sst_infos {
         common_telemetry::info!(
-            "loop: {}, scan reader done, {} batches, {} rows, total cost {:?}",
-            i,
-            total_batches,
-            total_rows,
-            start.elapsed()
+            "  File ID: {}, Size: {} bytes, Rows: {}, Row groups: {}, Index size: {} bytes",
+            sst_info.file_id,
+            sst_info.file_size,
+            sst_info.num_rows,
+            sst_info.num_row_groups,
+            sst_info.index_metadata.file_size
         );
     }
 }

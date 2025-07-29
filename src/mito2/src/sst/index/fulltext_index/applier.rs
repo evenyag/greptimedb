@@ -78,6 +78,8 @@ impl FulltextIndexApplier {
         requests: BTreeMap<ColumnId, FulltextRequest>,
         puffin_manager_factory: PuffinManagerFactory,
     ) -> Self {
+        common_telemetry::info!("FulltextIndexApplier requests: {:?}", requests);
+
         let requests = Arc::new(requests);
         let index_source = IndexSource::new(table_dir, path_type, puffin_manager_factory, store);
 
@@ -242,6 +244,8 @@ impl FulltextIndexApplier {
         file_size_hint: Option<u64>,
         row_groups: impl Iterator<Item = (usize, bool)>,
     ) -> Result<Option<Vec<(usize, Vec<Range<usize>>)>>> {
+        common_telemetry::info!("apply_coarse, file: {file_id}");
+
         let timer = INDEX_APPLY_ELAPSED
             .with_label_values(&[TYPE_FULLTEXT_INDEX])
             .start_timer();
@@ -284,11 +288,13 @@ impl FulltextIndexApplier {
         output: &mut [(usize, Vec<Range<usize>>)],
     ) -> Result<bool> {
         let blob_key = format!("{INDEX_BLOB_TYPE_BLOOM}-{column_id}");
+        common_telemetry::info!("apply coarse one column, key: {}", blob_key);
         let Some(reader) = self
             .index_source
             .blob(file_id, &blob_key, file_size_hint)
             .await?
         else {
+            common_telemetry::info!("apply coarse one column, blob key: {} not found", blob_key);
             return Ok(false);
         };
         let config =
@@ -296,6 +302,7 @@ impl FulltextIndexApplier {
 
         let predicates = Self::terms_to_predicates(terms, &config);
         if predicates.is_empty() {
+            common_telemetry::info!("apply coarse one column, predicate empty");
             return Ok(false);
         }
 
@@ -411,6 +418,8 @@ impl FulltextIndexApplier {
             Analyzer::English => EnglishTokenizer {}.tokenize(term),
             Analyzer::Chinese => ChineseTokenizer {}.tokenize(term),
         };
+
+        common_telemetry::info!("term {} to probes: {:?}", term, tokens);
 
         tokens.into_iter().map(|t| {
             if !config.case_sensitive {

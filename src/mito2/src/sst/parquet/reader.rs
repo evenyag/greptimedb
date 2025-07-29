@@ -205,6 +205,9 @@ impl ParquetReaderBuilder {
         let mut metrics = ReaderMetrics::default();
 
         let (context, selection) = self.build_reader_input(&mut metrics).await?;
+
+        common_telemetry::info!("Parquet reader prune metrics: {:?}", metrics);
+
         ParquetReader::new(Arc::new(context), selection).await
     }
 
@@ -271,6 +274,7 @@ impl ParquetReaderBuilder {
         };
 
         let filters = if let Some(predicate) = &self.predicate {
+            common_telemetry::info!("predicate: {:?}", predicate);
             predicate
                 .exprs()
                 .iter()

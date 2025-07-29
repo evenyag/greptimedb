@@ -138,7 +138,9 @@ impl<T: PageReader> Iterator for MetricsPageReader<T> {
 impl<T> Drop for MetricsPageReader<T> {
     fn drop(&mut self) {
         common_telemetry::info!(
-            "Page reader metrics: num get: {}, num skip: {}",
+            "Page reader metrics: row group: {}, column: {}, num get: {}, num skip: {}",
+            self.row_group,
+            self.column_idx,
             self.num_get,
             self.num_skip
         );

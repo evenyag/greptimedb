@@ -101,6 +101,8 @@ where
     }
 
     async fn blob(&self, key: &str) -> Result<GuardWithMetadata<Self::Blob>> {
+        common_telemetry::info!("FsPuffinReader get key: {}", key);
+
         let mut file = self.puffin_reader().await?;
         let blob_metadata = self.get_blob_metadata(key, &mut file).await?;
         let blob = if blob_metadata.compression_codec.is_none() {

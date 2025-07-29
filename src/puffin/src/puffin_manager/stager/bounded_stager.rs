@@ -169,6 +169,8 @@ impl<H: ToString + Clone + Send + Sync> Stager for BoundedStager<H> {
                 let file_name = format!("{}.{}", cache_key, uuid::Uuid::new_v4());
                 let path = self.base_dir.join(&file_name);
 
+                common_telemetry::info!("Get blob from path: {}", path.display());
+
                 let size = Self::write_blob(&path, init_fn).await?;
                 if let Some(notifier) = self.notifier.as_ref() {
                     notifier.on_cache_insert(size);

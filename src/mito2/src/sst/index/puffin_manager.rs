@@ -81,11 +81,13 @@ impl PuffinManagerFactory {
         })
     }
 
-    pub(crate) fn build(
+    pub fn build(
         &self,
         store: ObjectStore,
         path_provider: impl FilePathProvider + 'static,
     ) -> SstPuffinManager {
+        common_telemetry::info!("PuffinManagerFactory build ObjectStorePuffinFileAccessor");
+
         let store = InstrumentedStore::new(store).with_write_buffer_size(self.write_buffer_size);
         let puffin_file_accessor =
             ObjectStorePuffinFileAccessor::new(store, Arc::new(path_provider));
@@ -102,9 +104,7 @@ impl PuffinManagerFactory {
 
 #[cfg(test)]
 impl PuffinManagerFactory {
-    pub async fn new_for_test_async(
-        prefix: &str,
-    ) -> (common_test_util::temp_dir::TempDir, Self) {
+    pub async fn new_for_test_async(prefix: &str) -> (common_test_util::temp_dir::TempDir, Self) {
         let tempdir = common_test_util::temp_dir::create_temp_dir(prefix);
         let factory = Self::new(tempdir.path().to_path_buf(), 1024, None, None)
             .await
@@ -124,7 +124,7 @@ impl PuffinManagerFactory {
 
 /// A `PuffinFileAccessor` implementation that uses an object store as the underlying storage.
 #[derive(Clone)]
-pub(crate) struct ObjectStorePuffinFileAccessor {
+pub struct ObjectStorePuffinFileAccessor {
     object_store: InstrumentedStore,
     path_provider: Arc<dyn FilePathProvider>,
 }
@@ -146,6 +146,7 @@ impl PuffinFileAccessor for ObjectStorePuffinFileAccessor {
 
     async fn reader(&self, handle: &RegionFileId) -> PuffinResult<Self::Reader> {
         let file_path = self.path_provider.build_index_file_path(*handle);
+        common_telemetry::info!("ObjectStorePuffinFileAccessor file_path: {}", file_path);
         self.object_store
             .range_reader(
                 &file_path,

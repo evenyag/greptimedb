@@ -211,6 +211,12 @@ impl InvertedIndexApplier {
         file_id: RegionFileId,
         file_size_hint: Option<u64>,
     ) -> Result<BlobReader> {
+        common_telemetry::info!(
+            "Inverted index remote blob reader: {}, {}",
+            self.table_dir,
+            file_id
+        );
+
         let puffin_manager = self
             .puffin_manager_factory
             .build(

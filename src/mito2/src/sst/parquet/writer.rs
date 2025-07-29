@@ -311,11 +311,14 @@ where
             let key_value_meta = KeyValue::new(PARQUET_METADATA_KEY.to_string(), json);
 
             // TODO(yingwen): Find and set proper column encoding for internal columns: op type and tsid.
-            let props_builder = WriterProperties::builder()
+            let mut props_builder = WriterProperties::builder()
                 .set_key_value_metadata(Some(vec![key_value_meta]))
                 .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .set_encoding(Encoding::PLAIN)
                 .set_max_row_group_size(opts.row_group_size);
+            if let Some(data_page_row_count) = opts.data_page_row_count {
+                props_builder = props_builder.set_data_page_row_count_limit(data_page_row_count);
+            }
 
             let props_builder = Self::customize_column_config(props_builder, &self.metadata);
             let writer_props = props_builder.build();

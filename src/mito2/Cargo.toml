@@ -119,3 +119,7 @@ required-features = ["test"]
 [[bin]]
 name = "read-sst"
 path = "src/read_sst.rs"
+
+[[bin]]
+name = "rewrite-sst"
+path = "src/rewrite_sst.rs"

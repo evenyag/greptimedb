@@ -54,6 +54,7 @@ pub struct WriteOptions {
     /// Note: This is not a hard limit as we can only observe the file size when
     /// ArrowWrite writes to underlying writers.
     pub max_file_size: Option<usize>,
+    pub data_page_row_count: Option<usize>,
 }
 
 impl Default for WriteOptions {
@@ -62,6 +63,7 @@ impl Default for WriteOptions {
             write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
             max_file_size: None,
+            data_page_row_count: None,
         }
     }
 }

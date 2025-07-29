@@ -142,6 +142,7 @@ impl<'a> FulltextIndexApplierBuilder<'a> {
         for expr in exprs {
             Self::extract_requests(expr, self.metadata, &mut requests);
         }
+        common_telemetry::info!("exprs: {:?}, requests: {:?}", exprs, requests);
 
         // Check if any requests have queries or terms
         let has_requests = requests
@@ -219,9 +220,11 @@ impl<'a> FulltextIndexApplierBuilder<'a> {
         f: &ScalarFunction,
     ) -> Option<(ColumnId, FulltextTerm)> {
         if f.name() != "matches_term" {
+            common_telemetry::info!("expr_to_query not matches_term");
             return None;
         }
         if f.args.len() != 2 {
+            common_telemetry::info!("args len not 2");
             return None;
         }
 
@@ -245,10 +248,12 @@ impl<'a> FulltextIndexApplierBuilder<'a> {
 
         let column = metadata.column_by_name(&column.name)?;
         if column.column_schema.data_type != ConcreteDataType::string_datatype() {
+            common_telemetry::info!("column {} not string", column.column_schema.name);
             return None;
         }
 
         let Expr::Literal(ScalarValue::Utf8(Some(term))) = &f.args[1] else {
+            common_telemetry::info!("scalar not utf8");
             return None;
         };
 
