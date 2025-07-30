@@ -15,7 +15,7 @@
 //! Parquet reader.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
@@ -23,14 +23,16 @@ use async_trait::async_trait;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::{debug, warn};
 use datafusion_expr::Expr;
-use datatypes::arrow::array::ArrayRef;
+use datatypes::arrow::array::{Array, ArrayRef};
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::compute::prep_null_mask_filter;
 use datatypes::data_type::ConcreteDataType;
 use mito_codec::row_converter::build_primary_key_codec;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
+use parquet::arrow::arrow_reader::{ArrowPredicate, ParquetRecordBatchReader, RowSelection};
 use parquet::arrow::{parquet_to_arrow_field_levels, FieldLevels, ProjectionMask};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::format::KeyValue;
 use snafu::{OptionExt, ResultExt};
@@ -58,6 +60,7 @@ use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 use crate::sst::parquet::file_range::{FileRangeContext, FileRangeContextRef};
 use crate::sst::parquet::format::{need_override_sequence, ReadFormat};
 use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::row_filter::{build_row_filter, DatafusionArrowPredicate};
 use crate::sst::parquet::row_group::InMemoryRowGroup;
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -263,6 +266,8 @@ impl ParquetReaderBuilder {
             .row_groups_to_read(&read_format, &parquet_meta, &mut metrics.filter_metrics)
             .await;
 
+        let row_filters = self.build_row_filter(&parquet_meta, &read_format)?;
+
         let reader_builder = RowGroupReaderBuilder {
             file_handle: self.file_handle.clone(),
             file_path,
@@ -271,6 +276,7 @@ impl ParquetReaderBuilder {
             projection: projection_mask,
             field_levels,
             cache_strategy: self.cache_strategy.clone(),
+            row_filters,
         };
 
         let filters = if let Some(predicate) = &self.predicate {
@@ -297,6 +303,49 @@ impl ParquetReaderBuilder {
         metrics.build_cost += start.elapsed();
 
         Ok((context, selection))
+    }
+
+    fn build_row_filter(
+        &self,
+        parquet_meta: &ParquetMetaData,
+        read_format: &ReadFormat,
+    ) -> Result<Vec<RowFilter>> {
+        if let Some(predicate) = &self.predicate {
+            let mut row_filters = Vec::with_capacity(predicate.exprs().len());
+            // TODO(yingwen): Check column id.
+            // TODO(yingwen): error handling.
+            let exprs = predicate
+                .to_physical_exprs(read_format.arrow_schema())
+                .unwrap();
+            let predicates = build_row_filter(
+                &exprs,
+                read_format.arrow_schema(),
+                read_format.arrow_schema(),
+                parquet_meta,
+                true,
+            )
+            .unwrap();
+            let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
+            // Computes the field levels.
+            let hint = Some(read_format.arrow_schema().fields());
+            for p in predicates {
+                let field_levels = parquet_to_arrow_field_levels(
+                    parquet_schema_desc,
+                    p.projection().clone(),
+                    hint.clone(),
+                )
+                .context(ReadDataPartSnafu)?;
+
+                row_filters.push(RowFilter {
+                    predicate: Mutex::new(p),
+                    field_levels,
+                });
+            }
+
+            Ok(row_filters)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Decodes region metadata from key value.
@@ -858,6 +907,12 @@ impl ReaderFilterMetrics {
     }
 }
 
+struct RowFilter {
+    predicate: Mutex<DatafusionArrowPredicate>,
+    /// Field levels to read.
+    field_levels: FieldLevels,
+}
+
 /// Parquet reader metrics.
 #[derive(Debug, Default, Clone)]
 pub struct ReaderMetrics {
@@ -912,6 +967,8 @@ pub(crate) struct RowGroupReaderBuilder {
     field_levels: FieldLevels,
     /// Cache.
     cache_strategy: CacheStrategy,
+    /// Row filters.
+    row_filters: Vec<RowFilter>,
 }
 
 impl RowGroupReaderBuilder {
@@ -956,18 +1013,87 @@ impl RowGroupReaderBuilder {
                 path: &self.file_path,
             })?;
 
+        let mut selection = row_selection;
+        for filter in &self.row_filters {
+            if !selects_any(selection.as_ref()) {
+                break;
+            }
+
+            let reader = ParquetRecordBatchReader::try_new_with_row_groups(
+                &self.field_levels,
+                &row_group,
+                DEFAULT_READ_BATCH_SIZE,
+                selection.clone(),
+            )
+            .context(ReadParquetSnafu {
+                path: &self.file_path,
+            })?;
+
+            let mut p = filter.predicate.lock().unwrap();
+            selection = Some(evaluate_predicate(reader, selection, &mut *p).context(
+                ReadParquetSnafu {
+                    path: &self.file_path,
+                },
+            )?);
+        }
+
         // Builds the parquet reader.
         // Now the row selection is None.
         ParquetRecordBatchReader::try_new_with_row_groups(
             &self.field_levels,
             &row_group,
             DEFAULT_READ_BATCH_SIZE,
-            row_selection,
+            selection,
         )
         .context(ReadParquetSnafu {
             path: &self.file_path,
         })
     }
+}
+
+/// Returns `true` if `selection` is `None` or selects some rows
+pub(crate) fn selects_any(selection: Option<&RowSelection>) -> bool {
+    selection.map(|x| x.selects_any()).unwrap_or(true)
+}
+
+/// Evaluates an [`ArrowPredicate`], returning a [`RowSelection`] indicating
+/// which rows to return.
+///
+/// `input_selection`: Optional pre-existing selection. If `Some`, then the
+/// final [`RowSelection`] will be the conjunction of it and the rows selected
+/// by `predicate`.
+///
+/// Note: A pre-existing selection may come from evaluating a previous predicate
+/// or if the [`ParquetRecordBatchReader`] specified an explicit
+/// [`RowSelection`] in addition to one or more predicates.
+pub(crate) fn evaluate_predicate(
+    reader: ParquetRecordBatchReader,
+    input_selection: Option<RowSelection>,
+    predicate: &mut dyn ArrowPredicate,
+) -> parquet::errors::Result<RowSelection> {
+    let mut filters = vec![];
+    for maybe_batch in reader {
+        let maybe_batch = maybe_batch?;
+        let input_rows = maybe_batch.num_rows();
+        let filter = predicate.evaluate(maybe_batch)?;
+        // Since user supplied predicate, check error here to catch bugs quickly
+        if filter.len() != input_rows {
+            return Err(ParquetError::ArrowError(format!(
+                "ArrowPredicate predicate returned {} rows, expected {input_rows}",
+                filter.len()
+            )));
+        }
+        match filter.null_count() {
+            0 => filters.push(filter),
+            _ => filters.push(prep_null_mask_filter(&filter)),
+        };
+    }
+
+    let raw = RowSelection::from_filters(&filters);
+    Ok(match input_selection {
+        Some(selection) => selection.and_then(&raw),
+        None => raw,
+    })
 }
 
 /// The state of a [ParquetReader].

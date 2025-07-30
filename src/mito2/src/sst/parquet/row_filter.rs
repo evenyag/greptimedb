@@ -14,15 +14,102 @@
 
 // Forked from https://github.com/apache/datafusion/blob/cca9d4c537da86105343d42de82622542b47b187/datafusion/datasource-parquet/src/row_filter.rs
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use datafusion::datasource::physical_plan::ParquetFileMetrics;
+use datafusion::physical_expr::split_conjunction;
+use datafusion::physical_expr::utils::reassign_predicate_columns;
 use datafusion::physical_plan::expressions::Column;
-use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_plan::{metrics, PhysicalExpr};
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::Result;
+use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datatypes::arrow::error::{ArrowError, Result as ArrowResult};
+use datatypes::arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter};
+use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
+
+/// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
+/// row-level filtering during parquet decoding.
+///
+/// See the module level documentation for more information.
+///
+/// Implements the `ArrowPredicate` trait used by the parquet decoder
+///
+/// An expression can be evaluated as a `DatafusionArrowPredicate` if it:
+/// * Does not reference any projected columns
+/// * Does not reference columns with non-primitive types (e.g. structs / lists)
+#[derive(Debug)]
+pub(crate) struct DatafusionArrowPredicate {
+    /// the filter expression
+    physical_expr: Arc<dyn PhysicalExpr>,
+    /// Path to the columns in the parquet schema required to evaluate the
+    /// expression
+    projection_mask: ProjectionMask,
+    // /// how many rows were filtered out by this predicate
+    // rows_pruned: metrics::Count,
+    // /// how many rows passed this predicate
+    // rows_matched: metrics::Count,
+    // /// how long was spent evaluating this predicate
+    // time: metrics::Time,
+}
+
+impl DatafusionArrowPredicate {
+    /// Create a new `DatafusionArrowPredicate` from a `FilterCandidate`
+    pub fn try_new(
+        candidate: FilterCandidate,
+        metadata: &ParquetMetaData,
+        // rows_pruned: metrics::Count,
+        // rows_matched: metrics::Count,
+        // time: metrics::Time,
+    ) -> Result<Self> {
+        let projected_schema = Arc::clone(&candidate.filter_schema);
+        let physical_expr = reassign_predicate_columns(candidate.expr, &projected_schema, true)?;
+
+        Ok(Self {
+            physical_expr,
+            projection_mask: ProjectionMask::roots(
+                metadata.file_metadata().schema_descr(),
+                candidate.projection,
+            ),
+            // rows_pruned,
+            // rows_matched,
+            // time,
+        })
+    }
+}
+
+impl ArrowPredicate for DatafusionArrowPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection_mask
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
+        // // scoped timer updates on drop
+        // let mut timer = self.time.timer();
+
+        self.physical_expr
+            .evaluate(&batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .and_then(|array| {
+                let bool_arr = as_boolean_array(&array)?.clone();
+                let num_matched = bool_arr.true_count();
+                let num_pruned = bool_arr.len() - num_matched;
+                // self.rows_pruned.add(num_pruned);
+                // self.rows_matched.add(num_matched);
+                // timer.stop();
+                Ok(bool_arr)
+            })
+            .map_err(|e| {
+                ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))
+            })
+    }
+}
 
 /// A candidate expression for creating a `RowFilter`.
 ///
@@ -120,19 +207,30 @@ impl FilterCandidateBuilder {
                 .project(&required_indices_into_table_schema)?,
         );
 
-        let (schema_mapper, projection_into_file_schema) = self
-            .schema_adapter_factory
-            .create(Arc::clone(&projected_table_schema), self.table_schema)
-            .map_schema(&self.file_schema)?;
+        // let (schema_mapper, projection_into_file_schema) = self
+        //     .schema_adapter_factory
+        //     .create(Arc::clone(&projected_table_schema), self.table_schema)
+        //     .map_schema(&self.file_schema)?;
 
-        let required_bytes = size_of_columns(&projection_into_file_schema, metadata)?;
-        let can_use_index = columns_sorted(&projection_into_file_schema, metadata)?;
+        // let required_bytes = size_of_columns(&projection_into_file_schema, metadata)?;
+        // let can_use_index = columns_sorted(&projection_into_file_schema, metadata)?;
+
+        // Ok(Some(FilterCandidate {
+        //     expr: self.expr,
+        //     required_bytes,
+        //     can_use_index,
+        //     projection: projection_into_file_schema,
+        //     filter_schema: Arc::clone(&projected_table_schema),
+        // }))
+
+        let required_bytes = size_of_columns(&required_indices_into_table_schema, metadata)?;
+        let can_use_index = columns_sorted(&required_indices_into_table_schema, metadata)?;
 
         Ok(Some(FilterCandidate {
             expr: self.expr,
             required_bytes,
             can_use_index,
-            projection: projection_into_file_schema,
+            projection: required_indices_into_table_schema,
             filter_schema: Arc::clone(&projected_table_schema),
         }))
     }
@@ -254,4 +352,80 @@ fn size_of_columns(columns: &[usize], metadata: &ParquetMetaData) -> Result<usiz
 fn columns_sorted(_columns: &[usize], _metadata: &ParquetMetaData) -> Result<bool> {
     // TODO How do we know this?
     Ok(false)
+}
+
+/// Build a [`RowFilter`] from the given predicate `Expr` if possible
+///
+/// # returns
+/// * `Ok(Some(row_filter))` if the expression can be used as RowFilter
+/// * `Ok(None)` if the expression cannot be used as an RowFilter
+/// * `Err(e)` if an error occurs while building the filter
+///
+/// Note that the returned `RowFilter` may not contains all conjuncts in the
+/// original expression. This is because some conjuncts may not be able to be
+/// evaluated as an `ArrowPredicate` and will be ignored.
+///
+/// For example, if the expression is `a = 1 AND b = 2 AND c = 3` and `b = 2`
+/// can not be evaluated for some reason, the returned `RowFilter` will contain
+/// `a = 1` and `c = 3`.
+pub fn build_row_filter(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    physical_file_schema: &SchemaRef,
+    predicate_file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    reorder_predicates: bool,
+    // file_metrics: &ParquetFileMetrics,
+) -> Result<Vec<DatafusionArrowPredicate>> {
+    // let rows_pruned = &file_metrics.pushdown_rows_pruned;
+    // let rows_matched = &file_metrics.pushdown_rows_matched;
+    // let time = &file_metrics.row_pushdown_eval_time;
+
+    // Split into conjuncts:
+    // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
+    let mut predicates = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let mut expr_predicates = split_conjunction(expr);
+        predicates.append(&mut expr_predicates);
+    }
+
+    // Determine which conjuncts can be evaluated as ArrowPredicates, if any
+    let mut candidates: Vec<FilterCandidate> = predicates
+        .into_iter()
+        .map(|expr| {
+            FilterCandidateBuilder::new(
+                Arc::clone(expr),
+                Arc::clone(physical_file_schema),
+                Arc::clone(predicate_file_schema),
+            )
+            .build(metadata)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // no candidates
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if reorder_predicates {
+        candidates.sort_unstable_by(|c1, c2| match c1.can_use_index.cmp(&c2.can_use_index) {
+            Ordering::Equal => c1.required_bytes.cmp(&c2.required_bytes),
+            ord => ord,
+        });
+    }
+
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            DatafusionArrowPredicate::try_new(
+                candidate,
+                metadata,
+                // rows_pruned.clone(),
+                // rows_matched.clone(),
+                // time.clone(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
 }

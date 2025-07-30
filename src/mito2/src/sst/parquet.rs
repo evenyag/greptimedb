@@ -30,6 +30,7 @@ pub(crate) mod metadata;
 pub(crate) mod page_reader;
 pub mod plain_format;
 pub mod reader;
+mod row_filter;
 pub mod row_group;
 pub mod row_selection;
 pub(crate) mod stats;
