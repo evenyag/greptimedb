@@ -97,7 +97,7 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
     let mut message_metadata = HashMap::new();
     message_metadata.insert(
         "greptime:fulltext".to_string(),
-        "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":10240,\"false-positive-rate-in-10000\":100}".to_string()
+        "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":4096,\"false-positive-rate-in-10000\":100}".to_string()
     );
 
     let mut level_metadata = HashMap::new();
