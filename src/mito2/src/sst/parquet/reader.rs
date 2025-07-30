@@ -317,6 +317,13 @@ impl ParquetReaderBuilder {
             let exprs = predicate
                 .to_physical_exprs(read_format.arrow_schema())
                 .unwrap();
+
+            common_telemetry::info!(
+                "build row filter, num exprs: {}, exprs: {:?}",
+                exprs.len(),
+                exprs
+            );
+
             let predicates = build_row_filter(
                 &exprs,
                 read_format.arrow_schema(),
@@ -996,6 +1003,9 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         row_selection: Option<RowSelection>,
     ) -> Result<ParquetRecordBatchReader> {
+        let start = Instant::now();
+        common_telemetry::info!("Use row filter, row group {row_group_idx}");
+
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
             self.file_handle.file_id().file_id(),
@@ -1012,7 +1022,12 @@ impl RowGroupReaderBuilder {
             .context(ReadParquetSnafu {
                 path: &self.file_path,
             })?;
+        let fetch_cost = start.elapsed();
+        let before = row_selection.as_ref().map(|x| x.row_count());
 
+        common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, fetch_cost: {fetch_cost:?}");
+
+        let start = Instant::now();
         let mut selection = row_selection;
         for filter in &self.row_filters {
             if !selects_any(selection.as_ref()) {
@@ -1020,7 +1035,7 @@ impl RowGroupReaderBuilder {
             }
 
             let reader = ParquetRecordBatchReader::try_new_with_row_groups(
-                &self.field_levels,
+                &filter.field_levels,
                 &row_group,
                 DEFAULT_READ_BATCH_SIZE,
                 selection.clone(),
@@ -1035,6 +1050,15 @@ impl RowGroupReaderBuilder {
                     path: &self.file_path,
                 },
             )?);
+        }
+        let eval_cost = start.elapsed();
+        let after = selection.as_ref().map(|x| x.row_count());
+
+        common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, after: {after:?}, fetch_cost: {fetch_cost:?}, eval_cost: {eval_cost:?}");
+
+        // If selection is empty, truncate
+        if !selects_any(selection.as_ref()) {
+            selection = Some(RowSelection::from(vec![]));
         }
 
         // Builds the parquet reader.

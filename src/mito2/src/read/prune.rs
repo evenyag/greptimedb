@@ -74,6 +74,11 @@ impl PruneReader {
     }
 
     pub(crate) fn reset_source(&mut self, source: Source) {
+        if let Source::RowGroup(reader) = &source {
+            let mut metrics = self.metrics();
+            metrics.merge_from(reader.metrics());
+            self.metrics = metrics;
+        }
         self.source = source;
     }
 

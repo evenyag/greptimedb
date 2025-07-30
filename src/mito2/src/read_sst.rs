@@ -244,7 +244,8 @@ async fn main() {
     let region_metadata = create_region_metadata_from_json();
 
     // Hard-coded projection: only read level (column_id=1) and message (column_id=0)
-    let projection = Some(vec![ColumnId::from(1u32), ColumnId::from(0u32)]);
+    let projection = Some(vec![ColumnId::from(0u32), ColumnId::from(1u32)]);
+    // let projection = Some(vec![ColumnId::from(1u32)]);
 
     // Hard-coded predicate for (level = 'error' OR level = 'warn')
     let level_filter = Expr::BinaryExpr(BinaryExpr {
@@ -252,8 +253,24 @@ async fn main() {
         op: Operator::Or,
         right: Box::new(col("level").eq(lit("warn"))),
     });
-    let filters = vec![level_filter];
+    // Build fulltext index applier for message column using matches_term
+    let matches_term_func = Arc::new(
+        ScalarFunctionFactory::from(Arc::new(MatchesTermFunction) as FunctionRef)
+            .provide(Default::default()),
+    );
+
+    let fulltext_filter = Expr::ScalarFunction(ScalarFunction {
+        args: vec![
+            Expr::Column(Column::from_name("message")),
+            Expr::Literal(ScalarValue::Utf8(Some("leader failed".to_string()))),
+        ],
+        func: matches_term_func,
+    });
+    let filters = vec![level_filter, fulltext_filter.clone()];
     let predicate = Some(Predicate::new(filters.clone()));
+
+    // let filters = vec![level_filter];
+    // let predicate = Some(Predicate::new(filters.clone()));
 
     // Create PuffinManagerFactory with proper parameters
     let temp_dir = std::env::temp_dir().join("greptime_read_sst_test");
@@ -280,20 +297,6 @@ async fn main() {
     .flatten()
     .map(Arc::new);
 
-    // Build fulltext index applier for message column using matches_term
-    let matches_term_func = Arc::new(
-        ScalarFunctionFactory::from(Arc::new(MatchesTermFunction) as FunctionRef)
-            .provide(Default::default()),
-    );
-
-    let fulltext_filters = vec![Expr::ScalarFunction(ScalarFunction {
-        args: vec![
-            Expr::Column(Column::from_name("message")),
-            Expr::Literal(ScalarValue::Utf8(Some("leader failed".to_string()))),
-        ],
-        func: matches_term_func,
-    })];
-
     let fulltext_index_applier = FulltextIndexApplierBuilder::new(
         file_dir.clone(),
         PathType::Bare,
@@ -301,7 +304,7 @@ async fn main() {
         puffin_factory.clone(),
         region_metadata.as_ref(),
     )
-    .build(&fulltext_filters)
+    .build(&[fulltext_filter])
     .ok()
     .flatten()
     .map(Arc::new);
@@ -357,6 +360,14 @@ async fn main() {
         let mut total_rows = 0;
 
         while let Some(batch) = reader.next_batch().await.unwrap() {
+            if total_rows == 0 {
+                common_telemetry::info!(
+                    "loop: {}, number of fields is {:?}",
+                    i,
+                    batch.fields().len()
+                );
+            }
+
             total_batches += 1;
             total_rows += batch.num_rows();
             // common_telemetry::info!(

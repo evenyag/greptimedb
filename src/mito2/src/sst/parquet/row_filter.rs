@@ -71,6 +71,13 @@ impl DatafusionArrowPredicate {
         let projected_schema = Arc::clone(&candidate.filter_schema);
         let physical_expr = reassign_predicate_columns(candidate.expr, &projected_schema, true)?;
 
+        common_telemetry::info!(
+            "New predicate, projection: {:?}, expr: {}, schema: {:?}",
+            candidate.projection,
+            physical_expr,
+            candidate.filter_schema,
+        );
+
         Ok(Self {
             physical_expr,
             projection_mask: ProjectionMask::roots(

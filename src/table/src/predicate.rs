@@ -90,6 +90,7 @@ impl Predicate {
         Ok(self
             .exprs
             .iter()
+            .filter(|expr| !matches!(expr, Expr::ScalarFunction(_)))
             .filter_map(|expr| create_physical_expr(expr, df_schema.as_ref(), execution_props).ok())
             .collect::<Vec<_>>())
     }
