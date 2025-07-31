@@ -56,6 +56,7 @@ pub struct WriteOptions {
     /// ArrowWrite writes to underlying writers.
     pub max_file_size: Option<usize>,
     pub data_page_row_count: Option<usize>,
+    pub data_page_size: Option<usize>,
 }
 
 impl Default for WriteOptions {
@@ -65,6 +66,7 @@ impl Default for WriteOptions {
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
             max_file_size: None,
             data_page_row_count: None,
+            data_page_size: None,
         }
     }
 }

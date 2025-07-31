@@ -226,8 +226,12 @@ impl ParquetReaderBuilder {
         let file_path = self.file_handle.file_path(&self.file_dir, self.path_type);
         let file_size = self.file_handle.meta_ref().file_size;
 
+        let read_meta_start = Instant::now();
         // Loads parquet metadata of the file.
         let parquet_meta = self.read_parquet_metadata(&file_path, file_size).await?;
+        let read_meta_cost = read_meta_start.elapsed();
+
+        let prepare_format_start = Instant::now();
         // Decodes region metadata.
         let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
         // Gets the metadata stored in the SST.
@@ -256,7 +260,9 @@ impl ParquetReaderBuilder {
         // Now we assumes we don't have nested schemas.
         // TODO(yingwen): Revisit this if we introduce nested types such as JSON type.
         let projection_mask = ProjectionMask::roots(parquet_schema_desc, indices.iter().copied());
+        let prepare_format_cost = prepare_format_start.elapsed();
 
+        let prune_row_groups_start = Instant::now();
         // Computes the field levels.
         let hint = Some(read_format.arrow_schema().fields());
         let field_levels =
@@ -265,6 +271,7 @@ impl ParquetReaderBuilder {
         let selection = self
             .row_groups_to_read(&read_format, &parquet_meta, &mut metrics.filter_metrics)
             .await;
+        let prune_row_groups_cost = prune_row_groups_start.elapsed();
 
         let row_filters = self.build_row_filter(&parquet_meta, &read_format)?;
 
@@ -301,6 +308,8 @@ impl ParquetReaderBuilder {
         let context = FileRangeContext::new(reader_builder, filters, read_format, codec);
 
         metrics.build_cost += start.elapsed();
+
+        common_telemetry::info!("Build reader input, read_meta_cost: {read_meta_cost:?}, prepare_format_cost: {prepare_format_cost:?}, prune_row_groups_cost: {prune_row_groups_cost:?}");
 
         Ok((context, selection))
     }
@@ -434,7 +443,9 @@ impl ParquetReaderBuilder {
 
         let mut output = RowGroupSelection::new(row_group_size, num_rows as _);
 
+        let start = Instant::now();
         self.prune_row_groups_by_minmax(read_format, parquet_meta, &mut output, metrics);
+        common_telemetry::info!("row groups pruned minmax cost: {:?}", start.elapsed());
         if output.is_empty() {
             return output;
         }
@@ -451,6 +462,7 @@ impl ParquetReaderBuilder {
             return output;
         }
 
+        let start = Instant::now();
         self.prune_row_groups_by_inverted_index(
             row_group_size,
             num_row_groups,
@@ -458,17 +470,21 @@ impl ParquetReaderBuilder {
             metrics,
         )
         .await;
+        common_telemetry::info!("row groups pruned inverted cost: {:?}", start.elapsed());
         if output.is_empty() {
             return output;
         }
 
+        let start = Instant::now();
         self.prune_row_groups_by_bloom_filter(row_group_size, parquet_meta, &mut output, metrics)
             .await;
+        common_telemetry::info!("row groups pruned bloom cost: {:?}", start.elapsed());
         if output.is_empty() {
             return output;
         }
 
         if !fulltext_filtered {
+            let start = Instant::now();
             self.prune_row_groups_by_fulltext_bloom(
                 row_group_size,
                 parquet_meta,
@@ -476,6 +492,10 @@ impl ParquetReaderBuilder {
                 metrics,
             )
             .await;
+            common_telemetry::info!(
+                "row groups pruned fulltext bloom cost: {:?}",
+                start.elapsed()
+            );
         }
         output
     }
@@ -1004,7 +1024,7 @@ impl RowGroupReaderBuilder {
         row_selection: Option<RowSelection>,
     ) -> Result<ParquetRecordBatchReader> {
         let start = Instant::now();
-        common_telemetry::info!("Use row filter, row group {row_group_idx}");
+        // common_telemetry::info!("Use row filter, row group {row_group_idx}");
 
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
@@ -1023,43 +1043,44 @@ impl RowGroupReaderBuilder {
                 path: &self.file_path,
             })?;
         let fetch_cost = start.elapsed();
-        let before = row_selection.as_ref().map(|x| x.row_count());
 
-        common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, fetch_cost: {fetch_cost:?}");
-
-        let start = Instant::now();
         let mut selection = row_selection;
-        for filter in &self.row_filters {
-            if !selects_any(selection.as_ref()) {
-                break;
-            }
 
-            let reader = ParquetRecordBatchReader::try_new_with_row_groups(
-                &filter.field_levels,
-                &row_group,
-                DEFAULT_READ_BATCH_SIZE,
-                selection.clone(),
-            )
-            .context(ReadParquetSnafu {
-                path: &self.file_path,
-            })?;
+        // let before = row_selection.as_ref().map(|x| x.row_count());
+        // common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, fetch_cost: {fetch_cost:?}");
 
-            let mut p = filter.predicate.lock().unwrap();
-            selection = Some(evaluate_predicate(reader, selection, &mut *p).context(
-                ReadParquetSnafu {
-                    path: &self.file_path,
-                },
-            )?);
-        }
-        let eval_cost = start.elapsed();
-        let after = selection.as_ref().map(|x| x.row_count());
+        // let start = Instant::now();
+        // for filter in &self.row_filters {
+        //     if !selects_any(selection.as_ref()) {
+        //         break;
+        //     }
 
-        common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, after: {after:?}, fetch_cost: {fetch_cost:?}, eval_cost: {eval_cost:?}");
+        //     let reader = ParquetRecordBatchReader::try_new_with_row_groups(
+        //         &filter.field_levels,
+        //         &row_group,
+        //         DEFAULT_READ_BATCH_SIZE,
+        //         selection.clone(),
+        //     )
+        //     .context(ReadParquetSnafu {
+        //         path: &self.file_path,
+        //     })?;
 
-        // If selection is empty, truncate
-        if !selects_any(selection.as_ref()) {
-            selection = Some(RowSelection::from(vec![]));
-        }
+        //     let mut p = filter.predicate.lock().unwrap();
+        //     selection = Some(evaluate_predicate(reader, selection, &mut *p).context(
+        //         ReadParquetSnafu {
+        //             path: &self.file_path,
+        //         },
+        //     )?);
+        // }
+        // let eval_cost = start.elapsed();
+        // let after = selection.as_ref().map(|x| x.row_count());
+
+        // common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, after: {after:?}, fetch_cost: {fetch_cost:?}, eval_cost: {eval_cost:?}");
+
+        // // If selection is empty, truncate
+        // if !selects_any(selection.as_ref()) {
+        //     selection = Some(RowSelection::from(vec![]));
+        // }
 
         // Builds the parquet reader.
         // Now the row selection is None.

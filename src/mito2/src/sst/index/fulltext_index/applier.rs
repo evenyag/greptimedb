@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::iter;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common_base::range_read::RangeReader;
 use common_telemetry::warn;
@@ -329,17 +330,32 @@ impl FulltextIndexApplier {
         let mut applier = BloomFilterApplier::new(reader)
             .await
             .context(ApplyBloomFilterIndexSnafu)?;
+        let mut num_output = 0;
+        let mut num_ranges = 0;
+        let start = Instant::now();
         for (_, row_group_output) in output.iter_mut() {
             // All rows are filtered out, skip the search
             if row_group_output.is_empty() {
                 continue;
             }
 
+            num_output += 1;
+            num_ranges += row_group_output.len();
             *row_group_output = applier
                 .search(&predicates, row_group_output)
                 .await
                 .context(ApplyBloomFilterIndexSnafu)?;
         }
+        common_telemetry::info!(
+            "Bloom filter search {} output {} ranges took {:?}, load cost: {:?}, bloom size: {}, seg num: {}, bloom num: {}",
+            num_output,
+            num_ranges,
+            start.elapsed(),
+            applier.load_bloom_cost,
+            applier.bloom_size,
+            applier.seg_num,
+            applier.bloom_num,
+        );
 
         Ok(true)
     }

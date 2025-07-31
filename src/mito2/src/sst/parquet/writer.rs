@@ -319,6 +319,10 @@ where
             if let Some(data_page_row_count) = opts.data_page_row_count {
                 props_builder = props_builder.set_data_page_row_count_limit(data_page_row_count);
             }
+            if let Some(data_page_size) = opts.data_page_size {
+                props_builder = props_builder.set_data_page_size_limit(data_page_size);
+            }
+            props_builder = props_builder.set_write_batch_size(128);
 
             let props_builder = Self::customize_column_config(props_builder, &self.metadata);
             let writer_props = props_builder.build();

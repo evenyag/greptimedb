@@ -97,7 +97,7 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
     let mut message_metadata = HashMap::new();
     message_metadata.insert(
         "greptime:fulltext".to_string(),
-        "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":4096,\"false-positive-rate-in-10000\":100}".to_string()
+        "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":256,\"false-positive-rate-in-10000\":100}".to_string()
     );
 
     let mut level_metadata = HashMap::new();
@@ -194,6 +194,9 @@ async fn main() {
         .unwrap_or_else(|_| "/Users/evenyag/Documents/test/etcd-fulltext/rewrite".to_string());
     let new_file_id = std::env::var("NEW_FILE_ID").unwrap_or_else(|_| FileId::random().to_string());
     let data_page_row_count = std::env::var("DATA_PAGE_ROW_COUNT")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok());
+    let data_page_size = std::env::var("DATA_PAGE_SIZE")
         .ok()
         .and_then(|x| x.parse::<usize>().ok());
 
@@ -294,6 +297,7 @@ async fn main() {
         // 300MB max file size
         max_file_size: Some(1024 * 1024 * 300),
         data_page_row_count,
+        data_page_size,
     };
 
     // Write all data from input SST to new SST

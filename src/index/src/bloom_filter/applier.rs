@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use fastbloom::BloomFilter;
 use greptime_proto::v1::index::BloomFilterMeta;
@@ -34,13 +35,24 @@ pub struct InListPredicate {
 pub struct BloomFilterApplier {
     reader: Box<dyn BloomFilterReader + Send>,
     meta: BloomFilterMeta,
+    pub load_bloom_cost: Duration,
+    pub bloom_size: usize,
+    pub seg_num: usize,
+    pub bloom_num: usize,
 }
 
 impl BloomFilterApplier {
     pub async fn new(reader: Box<dyn BloomFilterReader + Send>) -> Result<Self> {
         let meta = reader.metadata().await?;
 
-        Ok(Self { reader, meta })
+        Ok(Self {
+            reader,
+            meta,
+            load_bloom_cost: Duration::ZERO,
+            bloom_size: 0,
+            seg_num: 0,
+            bloom_num: 0,
+        })
     }
 
     /// Searches ranges of rows that match all the given predicates in the search ranges.
@@ -96,6 +108,7 @@ impl BloomFilterApplier {
         &mut self,
         segments: &[usize],
     ) -> Result<(Vec<(u64, usize)>, Vec<BloomFilter>)> {
+        self.seg_num += segments.len();
         let segment_locations = segments
             .iter()
             .map(|&seg| (self.meta.segment_loc_indices[seg], seg))
@@ -107,8 +120,15 @@ impl BloomFilterApplier {
             .dedup()
             .map(|i| self.meta.bloom_filter_locs[i as usize])
             .collect::<Vec<_>>();
+        self.bloom_num += bloom_filter_locs.len();
 
+        let start = Instant::now();
         let bloom_filters = self.reader.bloom_filter_vec(&bloom_filter_locs).await?;
+        self.load_bloom_cost += start.elapsed();
+        self.bloom_size += bloom_filter_locs
+            .iter()
+            .map(|loc| loc.size as usize)
+            .sum::<usize>();
 
         Ok((segment_locations, bloom_filters))
     }
