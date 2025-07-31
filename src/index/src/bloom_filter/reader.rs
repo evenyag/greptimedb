@@ -71,7 +71,15 @@ pub trait BloomFilterReader: Sync {
             .iter()
             .map(|l| l.offset..l.offset + l.size)
             .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
         let bss = self.read_vec(&ranges).await?;
+        let bloom_bss_size = bss.iter().map(|bs| bs.len()).sum::<usize>();
+        common_telemetry::info!(
+            "bloom filter read vec, total size: {}, len: {}, cost: {:?}",
+            bloom_bss_size,
+            bss.len(),
+            start.elapsed(),
+        );
 
         let mut result = Vec::with_capacity(bss.len());
         for (bs, loc) in bss.into_iter().zip(locs.iter()) {

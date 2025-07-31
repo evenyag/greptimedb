@@ -186,7 +186,7 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
     Arc::new(builder.build().unwrap())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     common_telemetry::init_default_ut_logging();
 

@@ -120,6 +120,7 @@ impl<R: BloomFilterReader + Send> BloomFilterReader for CachedBloomFilterIndexBl
     }
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        common_telemetry::info!("bloom filter read vec from cache");
         let fetch = ranges.iter().map(|range| {
             let inner = &self.inner;
             self.cache.get_or_load(

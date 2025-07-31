@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fastbloom::BloomFilter;
@@ -32,13 +33,18 @@ pub struct InListPredicate {
     pub list: BTreeSet<Bytes>,
 }
 
-pub struct BloomFilterApplier {
-    reader: Box<dyn BloomFilterReader + Send>,
-    meta: BloomFilterMeta,
+#[derive(Default, Clone)]
+pub struct BloomMetrics {
     pub load_bloom_cost: Duration,
     pub bloom_size: usize,
     pub seg_num: usize,
     pub bloom_num: usize,
+}
+
+pub struct BloomFilterApplier {
+    reader: Box<dyn BloomFilterReader + Send>,
+    meta: BloomFilterMeta,
+    metrics: Mutex<BloomMetrics>,
 }
 
 impl BloomFilterApplier {
@@ -48,10 +54,7 @@ impl BloomFilterApplier {
         Ok(Self {
             reader,
             meta,
-            load_bloom_cost: Duration::ZERO,
-            bloom_size: 0,
-            seg_num: 0,
-            bloom_num: 0,
+            metrics: Mutex::new(BloomMetrics::default()),
         })
     }
 
@@ -59,7 +62,7 @@ impl BloomFilterApplier {
     /// Each predicate represents an OR condition of probes, and all predicates must match (AND semantics).
     /// The logic is: (probe1 OR probe2 OR ...) AND (probe3 OR probe4 OR ...)
     pub async fn search(
-        &mut self,
+        &self,
         predicates: &[InListPredicate],
         search_ranges: &[Range<usize>],
     ) -> Result<Vec<Range<usize>>> {
@@ -105,10 +108,10 @@ impl BloomFilterApplier {
 
     /// Loads bloom filters for the given segments and returns the segment locations and bloom filters
     async fn load_bloom_filters(
-        &mut self,
+        &self,
         segments: &[usize],
     ) -> Result<(Vec<(u64, usize)>, Vec<BloomFilter>)> {
-        self.seg_num += segments.len();
+        let seg_num = segments.len();
         let segment_locations = segments
             .iter()
             .map(|&seg| (self.meta.segment_loc_indices[seg], seg))
@@ -120,17 +123,29 @@ impl BloomFilterApplier {
             .dedup()
             .map(|i| self.meta.bloom_filter_locs[i as usize])
             .collect::<Vec<_>>();
-        self.bloom_num += bloom_filter_locs.len();
+        let bloom_num = bloom_filter_locs.len();
 
         let start = Instant::now();
         let bloom_filters = self.reader.bloom_filter_vec(&bloom_filter_locs).await?;
-        self.load_bloom_cost += start.elapsed();
-        self.bloom_size += bloom_filter_locs
+        let load_bloom_cost = start.elapsed();
+        let bloom_size = bloom_filter_locs
             .iter()
             .map(|loc| loc.size as usize)
             .sum::<usize>();
 
+        {
+            let mut metrics = self.metrics.lock().unwrap();
+            metrics.seg_num += seg_num;
+            metrics.bloom_num += bloom_num;
+            metrics.bloom_size += bloom_size;
+            metrics.load_bloom_cost += load_bloom_cost;
+        }
+
         Ok((segment_locations, bloom_filters))
+    }
+
+    pub fn metrics(&self) -> BloomMetrics {
+        self.metrics.lock().unwrap().clone()
     }
 
     /// Finds segments that match all predicates and converts them to row ranges

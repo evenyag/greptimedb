@@ -39,8 +39,8 @@ use crate::cache::index::bloom_filter_index::{
 };
 use crate::cache::index::result_cache::PredicateKey;
 use crate::error::{
-    ApplyBloomFilterIndexSnafu, ApplyFulltextIndexSnafu, MetadataSnafu, PuffinBuildReaderSnafu,
-    PuffinReadBlobSnafu, Result,
+    ApplyBloomFilterIndexSnafu, ApplyFulltextIndexSnafu, JoinSnafu, MetadataSnafu,
+    PuffinBuildReaderSnafu, PuffinReadBlobSnafu, Result,
 };
 use crate::metrics::INDEX_APPLY_ELAPSED;
 use crate::sst::file::RegionFileId;
@@ -327,13 +327,34 @@ impl FulltextIndexApplier {
             Box::new(BloomFilterReaderImpl::new(range_reader)) as _
         };
 
-        let mut applier = BloomFilterApplier::new(reader)
-            .await
-            .context(ApplyBloomFilterIndexSnafu)?;
+        let applier = Arc::new(
+            BloomFilterApplier::new(reader)
+                .await
+                .context(ApplyBloomFilterIndexSnafu)?,
+        );
         let mut num_output = 0;
         let mut num_ranges = 0;
         let start = Instant::now();
-        for (_, row_group_output) in output.iter_mut() {
+        // for (_, row_group_output) in output.iter_mut() {
+        //     // All rows are filtered out, skip the search
+        //     if row_group_output.is_empty() {
+        //         continue;
+        //     }
+
+        //     num_output += 1;
+        //     num_ranges += row_group_output.len();
+        //     let search_start = Instant::now();
+        //     common_telemetry::info!("row_group to search: {:?}", row_group_output);
+        //     *row_group_output = applier
+        //         .search(&predicates, row_group_output)
+        //         .await
+        //         .context(ApplyBloomFilterIndexSnafu)?;
+        //     common_telemetry::info!("Search cost: {:?}", search_start.elapsed());
+        // }
+
+        // Collect work items (index, ranges) for non-empty row groups
+        let mut work_items = Vec::new();
+        for (index, (_, row_group_output)) in output.iter().enumerate() {
             // All rows are filtered out, skip the search
             if row_group_output.is_empty() {
                 continue;
@@ -341,20 +362,66 @@ impl FulltextIndexApplier {
 
             num_output += 1;
             num_ranges += row_group_output.len();
-            *row_group_output = applier
-                .search(&predicates, row_group_output)
-                .await
-                .context(ApplyBloomFilterIndexSnafu)?;
+            work_items.push((index, row_group_output.clone()));
         }
+
+        // Split work items into batches for 8 tasks
+        const MAX_TASKS: usize = 8;
+        let num_tasks = std::cmp::min(MAX_TASKS, work_items.len());
+        if num_tasks == 0 {
+            return Ok(true);
+        }
+
+        let chunk_size = (work_items.len() + num_tasks - 1) / num_tasks;
+        let mut tasks = Vec::with_capacity(num_tasks);
+        let predicates = Arc::new(predicates);
+
+        for batch in work_items.chunks(chunk_size) {
+            let applier = applier.clone();
+            let predicates = predicates.clone();
+            let batch = batch.to_vec();
+
+            let task = tokio::spawn(async move {
+                let mut results = Vec::with_capacity(batch.len());
+                for (index, search_ranges) in batch {
+                    let start = Instant::now();
+                    let output = applier
+                        .search(&predicates, &search_ranges)
+                        .await
+                        .context(ApplyBloomFilterIndexSnafu)?;
+                    common_telemetry::info!(
+                        "row_group to search: {:?}, cost: {:?}",
+                        search_ranges,
+                        start.elapsed()
+                    );
+                    results.push((index, output));
+                }
+                Ok::<_, crate::error::Error>(results)
+            });
+            tasks.push(task);
+        }
+
+        let task_results = futures::future::try_join_all(tasks)
+            .await
+            .context(JoinSnafu)?;
+
+        for batch_result in task_results {
+            let batch_results = batch_result?;
+            for (index, row_group_output) in batch_results {
+                output[index].1 = row_group_output;
+            }
+        }
+
+        let metrics = applier.metrics();
         common_telemetry::info!(
             "Bloom filter search {} output {} ranges took {:?}, load cost: {:?}, bloom size: {}, seg num: {}, bloom num: {}",
             num_output,
             num_ranges,
             start.elapsed(),
-            applier.load_bloom_cost,
-            applier.bloom_size,
-            applier.seg_num,
-            applier.bloom_num,
+            metrics.load_bloom_cost,
+            metrics.bloom_size,
+            metrics.seg_num,
+            metrics.bloom_num,
         );
 
         Ok(true)
