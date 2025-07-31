@@ -41,6 +41,7 @@ pub trait BloomFilterReader: Sync {
 
     /// Reads bunch of ranges from the file.
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        common_telemetry::info!("BloomFilterReader get ranges: {}", ranges.len());
         let mut results = Vec::with_capacity(ranges.len());
         for range in ranges {
             let size = (range.end - range.start) as u32;

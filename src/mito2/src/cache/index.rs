@@ -194,6 +194,8 @@ where
             }
         }
         if !cache_miss_range.is_empty() {
+            common_telemetry::info!("Cache miss range: {:?}", cache_miss_range);
+
             let pages = load(cache_miss_range).await?;
             for (i, page) in cache_miss_idx.into_iter().zip(pages.into_iter()) {
                 let page_key = page_keys[i];

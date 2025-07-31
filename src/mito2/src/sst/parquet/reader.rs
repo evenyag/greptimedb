@@ -1270,6 +1270,8 @@ pub struct ParquetReader {
     selection: RowGroupSelection,
     /// Reader of current row group.
     reader_state: ReaderState,
+    /// Total reader build cost
+    build_cost: Duration,
 }
 
 #[async_trait]
@@ -1286,11 +1288,13 @@ impl BatchReader for ParquetReader {
 
         // No more items in current row group, reads next row group.
         while let Some((row_group_idx, row_selection)) = self.selection.pop_first() {
+            let build_start = Instant::now();
             let parquet_reader = self
                 .context
                 .reader_builder()
                 .build(row_group_idx, Some(row_selection))
                 .await?;
+            self.build_cost += build_start.elapsed();
 
             // Resets the parquet reader.
             reader.reset_source(Source::RowGroup(RowGroupReader::new(
@@ -1303,7 +1307,9 @@ impl BatchReader for ParquetReader {
         }
 
         // The reader is exhausted.
-        self.reader_state = ReaderState::Exhausted(reader.metrics().clone());
+        let mut reader_metrics = reader.metrics().clone();
+        reader_metrics.build_cost = self.build_cost;
+        self.reader_state = ReaderState::Exhausted(reader_metrics);
         Ok(None)
     }
 }
@@ -1361,6 +1367,7 @@ impl ParquetReader {
             context,
             selection,
             reader_state,
+            build_cost: Duration::default(),
         })
     }
 

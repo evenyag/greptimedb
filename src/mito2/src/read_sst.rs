@@ -9,6 +9,7 @@ use common_time::Timestamp;
 use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{col, lit, BinaryExpr, Expr, Operator};
+use mito2::cache::{CacheManagerBuilder, CacheStrategy};
 use mito2::read::BatchReader;
 use mito2::sst::file::{FileHandle, FileId, FileMeta, IndexType, Level};
 use mito2::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
@@ -283,6 +284,13 @@ async fn main() {
     .await
     .unwrap();
 
+    let cache = Arc::new(
+        CacheManagerBuilder::default()
+            .index_content_size(64 * 1024 * 1024)
+            .index_content_page_size(64 * 1024)
+            .build(),
+    );
+
     // Build inverted index applier for level column
     let inverted_index_applier = InvertedIndexApplierBuilder::new(
         file_dir.clone(),
@@ -304,6 +312,7 @@ async fn main() {
         puffin_factory.clone(),
         region_metadata.as_ref(),
     )
+    .with_bloom_filter_cache(cache.bloom_filter_index_cache().cloned())
     .build(&[fulltext_filter])
     .ok()
     .flatten()

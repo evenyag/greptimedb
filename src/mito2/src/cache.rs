@@ -407,7 +407,7 @@ impl CacheManager {
         self.inverted_index_cache.as_ref()
     }
 
-    pub(crate) fn bloom_filter_index_cache(&self) -> Option<&BloomFilterIndexCacheRef> {
+    pub fn bloom_filter_index_cache(&self) -> Option<&BloomFilterIndexCacheRef> {
         self.bloom_filter_index_cache.as_ref()
     }
 
