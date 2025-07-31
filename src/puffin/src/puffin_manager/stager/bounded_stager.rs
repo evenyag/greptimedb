@@ -151,11 +151,18 @@ impl<H: ToString + Clone + Send + Sync> Stager for BoundedStager<H> {
         let handle_str = handle.to_string();
         let cache_key = Self::encode_cache_key(&handle_str, key);
 
+        common_telemetry::info!(
+            "Bounded stager get blob, handle_str: {}, key: {}",
+            handle_str,
+            key
+        );
+
         let mut miss = false;
         let v = self
             .cache
             .try_get_with_by_ref(&cache_key, async {
                 if let Some(v) = self.recycle_bin.remove(&cache_key).await {
+                    common_telemetry::info!("Get blob from recycle bin: {}", cache_key);
                     if let Some(notifier) = self.notifier.as_ref() {
                         let size = v.size();
                         notifier.on_cache_insert(size);
@@ -373,6 +380,11 @@ impl<H> BoundedStager<H> {
     async fn recover(&self) -> Result<()> {
         let mut read_dir = fs::read_dir(&self.base_dir).await.context(ReadSnafu)?;
 
+        common_telemetry::info!(
+            "Bounded stager recover from dir: {}",
+            self.base_dir.display()
+        );
+
         let mut elems = HashMap::new();
         while let Some(entry) = read_dir.next_entry().await.context(ReadSnafu)? {
             let path = entry.path();
@@ -390,6 +402,8 @@ impl<H> BoundedStager<H> {
                 // Insert the guard of the file or directory to the cache
                 let meta = entry.metadata().await.context(MetadataSnafu)?;
                 let file_path = path.file_name().unwrap().to_string_lossy().into_owned();
+
+                common_telemetry::info!("Bounded stager recover file: {}", file_path);
 
                 // <key>.<uuid>
                 let key = match file_path.split('.').next() {

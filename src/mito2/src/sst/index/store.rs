@@ -16,6 +16,7 @@ use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes};
@@ -306,6 +307,7 @@ impl RangeReader for InstrumentedRangeReader<'_> {
     }
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> io::Result<Vec<Bytes>> {
+        let start = Instant::now();
         let bufs = self
             .store
             .reader(&self.path)
@@ -315,6 +317,12 @@ impl RangeReader for InstrumentedRangeReader<'_> {
         let total_size: usize = bufs.iter().map(|buf| buf.len()).sum();
         self.read_byte_count.inc_by(total_size as _);
         self.read_count.inc_by(1);
+        common_telemetry::info!(
+            "Object store range reader fetch {} ranges, size: {}, cost: {:?}",
+            ranges.len(),
+            total_size,
+            start.elapsed()
+        );
         Ok(bufs.into_iter().map(|buf| buf.to_bytes()).collect())
     }
 }

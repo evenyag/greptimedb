@@ -2199,6 +2199,7 @@ dependencies = [
  "bytes",
  "common-error",
  "common-macro",
+ "common-telemetry",
  "common-test-util",
  "futures",
  "paste",

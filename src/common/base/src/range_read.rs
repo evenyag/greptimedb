@@ -238,6 +238,8 @@ impl RangeReader for FileReader {
     }
 
     async fn read(&self, mut range: Range<u64>) -> io::Result<Bytes> {
+        common_telemetry::info!("FileReader read range: {:?}", range);
+
         let mut file = self.file.lock().await;
 
         if range.start != self.position.load(Ordering::Relaxed) {

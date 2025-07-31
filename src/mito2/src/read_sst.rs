@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -274,12 +275,12 @@ async fn main() {
     // let predicate = Some(Predicate::new(filters.clone()));
 
     // Create PuffinManagerFactory with proper parameters
-    let temp_dir = std::env::temp_dir().join("greptime_read_sst_test");
+    let temp_dir = Path::new(&file_root);
     let puffin_factory = mito2::sst::index::puffin_manager::PuffinManagerFactory::new(
         temp_dir,
-        1024 * 1024, // 1MB staging capacity
-        None,        // no write buffer size limit
-        None,        // no staging TTL
+        64 * 1024 * 1024, // 64MB staging capacity
+        None,             // no write buffer size limit
+        None,             // no staging TTL
     )
     .await
     .unwrap();

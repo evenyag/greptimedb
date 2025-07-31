@@ -682,6 +682,8 @@ impl IndexSource {
         file_id: RegionFileId,
         file_size_hint: Option<u64>,
     ) -> Result<SstPuffinReader> {
+        common_telemetry::info!("Fulltext build remote");
+
         let puffin_manager = self
             .puffin_manager_factory
             .build(

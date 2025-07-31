@@ -121,6 +121,7 @@ impl<R: RangeReader> BloomFilterReader for BloomFilterReaderImpl<R> {
     }
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        common_telemetry::info!("BloomFilterReaderImpl read vec, ranges: {}", ranges.len());
         self.reader.read_vec(ranges).await.context(IoSnafu)
     }
 

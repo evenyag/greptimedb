@@ -15,6 +15,7 @@
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_compression::futures::bufread::ZstdDecoder;
 use async_trait::async_trait;
@@ -106,6 +107,7 @@ where
         let mut file = self.puffin_reader().await?;
         let blob_metadata = self.get_blob_metadata(key, &mut file).await?;
         let blob = if blob_metadata.compression_codec.is_none() {
+            common_telemetry::info!("FsPuffinReader get key: {} not compressed", key);
             // If the blob is not compressed, we can directly read it from the puffin file.
             Either::L(RandomReadBlob {
                 handle: self.handle.clone(),
@@ -113,6 +115,7 @@ where
                 blob_metadata: blob_metadata.clone(),
             })
         } else {
+            common_telemetry::info!("FsPuffinReader get key: {} compressed", key);
             // If the blob is compressed, we need to decompress it into staging space before reading.
             let blob_metadata = blob_metadata.clone();
             let staged_blob = self
@@ -211,10 +214,19 @@ where
         blob_metadata: BlobMetadata,
         mut writer: BoxWriter,
     ) -> Result<u64> {
+        let start = Instant::now();
         let reader = reader.into_blob_reader(&blob_metadata);
         let reader = AsyncReadAdapter::new(reader).await.context(MetadataSnafu)?;
         let compression = blob_metadata.compression_codec;
         let size = Self::handle_decompress(reader, &mut writer, compression).await?;
+
+        common_telemetry::info!(
+            "Init blob to stager, type: {}, blob size: {}, after size: {}, cost: {:?}",
+            blob_metadata.blob_type,
+            blob_metadata.length,
+            size,
+            start.elapsed(),
+        );
         Ok(size)
     }
 
@@ -310,6 +322,8 @@ impl<F: PuffinFileAccessor + Clone> BlobGuard for RandomReadBlob<F> {
     type Reader = PartialReader<F::Reader>;
 
     async fn reader(&self) -> Result<Self::Reader> {
+        common_telemetry::info!("Random read blob");
+
         ensure!(
             self.blob_metadata.compression_codec.is_none(),
             UnsupportedDecompressionSnafu {
