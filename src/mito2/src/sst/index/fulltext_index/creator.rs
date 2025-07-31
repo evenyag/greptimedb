@@ -318,7 +318,7 @@ impl AltFulltextCreator {
         &mut self,
         puffin_writer: &mut SstPuffinWriter,
         column_id: &ColumnId,
-        put_options: PutOptions,
+        mut put_options: PutOptions,
     ) -> Result<ByteCount> {
         match self {
             Self::Tantivy(creator) => {
@@ -330,6 +330,11 @@ impl AltFulltextCreator {
             }
             Self::Bloom(creator) => {
                 let key = format!("{INDEX_BLOB_TYPE_BLOOM}-{}", column_id);
+                if put_options.compression.is_some() {
+                    put_options.compression = None;
+                    common_telemetry::warn!("Disable compression for {}", key);
+                }
+
                 creator
                     .finish(puffin_writer, &key, put_options)
                     .await
