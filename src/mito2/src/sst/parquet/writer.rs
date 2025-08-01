@@ -291,6 +291,23 @@ where
         };
 
         let arrow_batch = write_format.convert_batch(&batch)?;
+        // let names: Vec<_> = arrow_batch
+        //     .schema()
+        //     .fields()
+        //     .iter()
+        //     .map(|field| field.name().clone())
+        //     .collect();
+        // let byte_sizes: Vec<_> = arrow_batch
+        //     .columns()
+        //     .iter()
+        //     .map(|arr| arr.get_buffer_memory_size())
+        //     .collect();
+        // common_telemetry::info!(
+        //     "write one batch, len: {}, names: {:?}, byte_sizes: {:?}",
+        //     arrow_batch.num_rows(),
+        //     names,
+        //     byte_sizes
+        // );
         self.maybe_init_writer(write_format.arrow_schema(), opts)
             .await?
             .write(&arrow_batch)
@@ -322,7 +339,7 @@ where
             if let Some(data_page_size) = opts.data_page_size {
                 props_builder = props_builder.set_data_page_size_limit(data_page_size);
             }
-            props_builder = props_builder.set_write_batch_size(128);
+            props_builder = props_builder.set_write_batch_size(256);
 
             let props_builder = Self::customize_column_config(props_builder, &self.metadata);
             let writer_props = props_builder.build();
