@@ -75,7 +75,7 @@ fn new_file_handle(
     )
 }
 
-fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
+fn create_region_metadata_from_json(fulltext_granularity: usize) -> Arc<RegionMetadata> {
     // Based on the JSON metadata provided:
     // - message (column_id=0): String with fulltext index
     // - level (column_id=1): String with inverted index
@@ -97,7 +97,7 @@ fn create_region_metadata_from_json() -> Arc<RegionMetadata> {
     let mut message_metadata = HashMap::new();
     message_metadata.insert(
         "greptime:fulltext".to_string(),
-        "{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":256,\"false-positive-rate-in-10000\":100}".to_string()
+        format!("{{\"enable\":true,\"analyzer\":\"English\",\"case-sensitive\":false,\"backend\":\"bloom\",\"granularity\":{fulltext_granularity},\"false-positive-rate-in-10000\":100}}")
     );
 
     let mut level_metadata = HashMap::new();
@@ -199,10 +199,15 @@ async fn main() {
     let data_page_size = std::env::var("DATA_PAGE_SIZE")
         .ok()
         .and_then(|x| x.parse::<usize>().ok());
+    let fulltext_granularity = std::env::var("FULLTEXT_GRAN")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(1024);
 
     common_telemetry::info!("Reading SST from: {}/{}", file_root, input_file_id);
     common_telemetry::info!("Writing new SST to: {}", output_dir);
     common_telemetry::info!("New file ID: {}", new_file_id);
+    common_telemetry::info!("granularity: {}", fulltext_granularity);
 
     // Create necessary components - same as read_sst.rs
     let input_object_store = new_fs_store(&file_root);
@@ -235,7 +240,7 @@ async fn main() {
         actual_index_file_size,
     );
     let output_object_store = new_fs_store(&output_dir);
-    let region_metadata = create_region_metadata_from_json();
+    let region_metadata = create_region_metadata_from_json(fulltext_granularity);
 
     // Create PuffinManagerFactory for input reading
     let temp_dir = std::env::temp_dir().join("greptime_rewrite_sst");
