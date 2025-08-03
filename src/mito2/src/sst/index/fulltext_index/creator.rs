@@ -190,6 +190,20 @@ impl FulltextIndexer {
     pub fn column_ids(&self) -> impl Iterator<Item = ColumnId> + '_ {
         self.creators.keys().copied()
     }
+
+    /// Collects fulltext index granularities from bloom filter fulltext indexers.
+    /// Returns a vector of (ColumnId, granularity) pairs.
+    pub fn collect_granularities(&self) -> Vec<(ColumnId, usize)> {
+        self.creators
+            .iter()
+            .filter_map(|(&column_id, creator)| {
+                creator
+                    .inner
+                    .granularity()
+                    .map(|granularity| (column_id, granularity))
+            })
+            .collect()
+    }
 }
 
 impl FulltextIndexer {
@@ -311,6 +325,13 @@ impl AltFulltextCreator {
         match self {
             Self::Tantivy(creator) => creator.memory_usage(),
             Self::Bloom(creator) => creator.memory_usage(),
+        }
+    }
+
+    fn granularity(&self) -> Option<usize> {
+        match self {
+            Self::Tantivy(_) => None,
+            Self::Bloom(creator) => creator.granularity(),
         }
     }
 

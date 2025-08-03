@@ -69,6 +69,11 @@ impl BloomFilterFulltextIndexCreator {
             config,
         }
     }
+
+    /// Returns the granularity (rows_per_segment) of the bloom filter.
+    pub fn granularity(&self) -> Option<usize> {
+        self.inner.as_ref().map(|i| i.granularity())
+    }
 }
 
 #[async_trait]

@@ -135,6 +135,15 @@ impl Indexer {
         self.flush_mem_metrics();
     }
 
+    /// Collects fulltext index granularities from bloom filter fulltext indexers.
+    /// Returns a vector of (ColumnId, granularity) pairs.
+    pub fn collect_fulltext_index_granularities(&self) -> Vec<(ColumnId, usize)> {
+        self.fulltext_indexer
+            .as_ref()
+            .map(|indexer| indexer.collect_granularities())
+            .unwrap_or_default()
+    }
+
     fn flush_mem_metrics(&mut self) {
         let inverted_mem = self
             .inverted_indexer
@@ -699,5 +708,39 @@ mod tests {
         .await;
 
         assert!(indexer.inverted_indexer.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_collect_fulltext_index_granularities() {
+        let (dir, factory) =
+            PuffinManagerFactory::new_for_test_async("test_collect_fulltext_index_granularities_")
+                .await;
+        let intm_manager = mock_intm_mgr(dir.path().to_string_lossy()).await;
+
+        let metadata = mock_region_metadata(MetaConfig {
+            with_inverted: false,
+            with_fulltext: true,
+            with_skipping_bloom: false,
+        });
+        let indexer = IndexerBuilderImpl {
+            op_type: OperationType::Flush,
+            metadata,
+            row_group_size: 1024,
+            puffin_manager: factory.build(mock_object_store(), NoopPathProvider),
+            intermediate_manager: intm_manager,
+            index_options: IndexOptions::default(),
+            inverted_index_config: InvertedIndexConfig::default(),
+            fulltext_index_config: FulltextIndexConfig::default(),
+            bloom_filter_index_config: BloomFilterConfig::default(),
+        }
+        .build(FileId::random())
+        .await;
+
+        assert!(indexer.fulltext_indexer.is_some());
+        let granularities = indexer.collect_fulltext_index_granularities();
+        assert!(!granularities.is_empty());
+        assert_eq!(granularities.len(), 1);
+        assert_eq!(granularities[0].0, 4); // column_id for text column
+        assert_eq!(granularities[0].1, 10240); // default granularity from fulltext options
     }
 }

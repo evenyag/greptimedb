@@ -221,6 +221,11 @@ impl BloomFilterCreator {
         self.cur_seg_distinct_elems_mem_usage + self.finalized_bloom_filters.memory_usage()
     }
 
+    /// Returns the granularity (rows_per_segment) of the bloom filter.
+    pub fn granularity(&self) -> usize {
+        self.rows_per_segment
+    }
+
     async fn finalize_segment(&mut self) -> Result<()> {
         let elem_count = self.cur_seg_distinct_elems.len();
         self.finalized_bloom_filters
