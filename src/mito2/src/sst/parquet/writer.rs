@@ -25,17 +25,18 @@ use std::time::Instant;
 use common_telemetry::debug;
 use common_time::Timestamp;
 use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
+use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder, DEFAULT_PAGE_SIZE};
 use parquet::schema::types::ColumnPath;
 use smallvec::smallvec;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::SEQUENCE_COLUMN_NAME;
-use store_api::storage::SequenceNumber;
+use store_api::storage::{ColumnId, SequenceNumber};
 use tokio::io::AsyncWrite;
 use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 
@@ -48,6 +49,13 @@ use crate::sst::parquet::format::WriteFormat;
 use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
+
+/// Max batch size to write parquet files.
+pub(crate) const MAX_WRITE_BATCH_SIZE: usize = 1024;
+/// Min batch size to write parquet files.
+pub(crate) const MIN_WRITE_BATCH_SIZE: usize = 64;
+/// Min data page size of the parquet file.
+pub(crate) const MIN_DATA_PAGE_SIZE: usize = 16 * 1024;
 
 /// Parquet SST writer.
 pub struct ParquetWriter<F: WriterFactory, I: IndexerBuilder, P: FilePathProvider> {
@@ -63,6 +71,8 @@ pub struct ParquetWriter<F: WriterFactory, I: IndexerBuilder, P: FilePathProvide
     indexer_builder: I,
     /// Current active indexer.
     current_indexer: Option<Indexer>,
+    /// Column granularities collected from the current indexer.
+    column_granularities: Vec<(ColumnId, usize)>,
     bytes_written: Arc<AtomicUsize>,
     /// Cleaner to remove temp files on failure.
     file_cleaner: Option<TempFileCleaner>,
@@ -138,6 +148,9 @@ where
         let init_file = FileId::random();
         let indexer = indexer_builder.build(init_file).await;
 
+        // Collect granularities from the initial indexer
+        let column_granularities = indexer.collect_fulltext_index_granularities();
+
         ParquetWriter {
             path_provider,
             writer: None,
@@ -146,6 +159,7 @@ where
             metadata,
             indexer_builder,
             current_indexer: Some(indexer),
+            column_granularities,
             bytes_written: Arc::new(AtomicUsize::new(0)),
             file_cleaner: None,
             metrics,
@@ -304,7 +318,7 @@ where
         let arrow_batch = write_format.convert_batch(&batch)?;
 
         let start = Instant::now();
-        self.maybe_init_writer(write_format.arrow_schema(), opts)
+        self.maybe_init_writer(write_format.arrow_schema(), opts, &arrow_batch)
             .await?
             .write(&arrow_batch)
             .await
@@ -317,6 +331,7 @@ where
         &mut self,
         schema: &SchemaRef,
         opts: &WriteOptions,
+        first_batch: &RecordBatch,
     ) -> Result<&mut AsyncArrowWriter<SizeAwareWriter<F::Writer>>> {
         if let Some(ref mut w) = self.writer {
             Ok(w)
@@ -332,6 +347,7 @@ where
                 .set_max_row_group_size(opts.row_group_size);
 
             let props_builder = Self::customize_column_config(props_builder, &self.metadata);
+            let props_builder = self.tune_writer_props(props_builder, first_batch);
             let writer_props = props_builder.build();
 
             let sst_file_path = self.path_provider.build_sst_file_path(RegionFileId::new(
@@ -358,6 +374,49 @@ where
     /// Consumes write and return the collected metrics.
     pub fn into_metrics(self) -> Metrics {
         self.metrics
+    }
+
+    /// Tune parquet writer properties according to index granularity and the first batch.
+    fn tune_writer_props(
+        &self,
+        props_builder: WriterPropertiesBuilder,
+        first_batch: &RecordBatch,
+    ) -> WriterPropertiesBuilder {
+        let mut write_batch_size = MAX_WRITE_BATCH_SIZE;
+        let mut data_page_size = DEFAULT_PAGE_SIZE;
+        for (column_id, granularity) in &self.column_granularities {
+            let Some(column) = self.metadata.column_by_id(*column_id) else {
+                continue;
+            };
+            let Some(array) = first_batch.column_by_name(&column.column_schema.name) else {
+                continue;
+            };
+            // Uses half of the granularity as the write batch size. Use granularity/2 to compute page
+            // size later as we will round the page size to 2^N.
+            // Ensures column_batch_size >= MIN_WRITE_BATCH_SIZE.
+            let column_batch_size = MIN_WRITE_BATCH_SIZE.max(granularity / 2);
+            // Uses the smaller one.
+            write_batch_size = write_batch_size.min(column_batch_size);
+            let array_size_kb = array.get_buffer_memory_size() / 1024;
+            // Computes the chunk size in KB for a batch with `write_batch_size`.
+            // Then round to the power of 2.
+            let array_chunk_kb = (array_size_kb / write_batch_size).next_power_of_two();
+            // Ensures page size >= MIN_DATA_PAGE_SIZE and <= DEFAULT_PAGE_SIZE;
+            data_page_size = (array_chunk_kb * 1024)
+                .max(MIN_DATA_PAGE_SIZE)
+                .min(data_page_size);
+        }
+
+        if write_batch_size != MAX_WRITE_BATCH_SIZE || data_page_size != DEFAULT_PAGE_SIZE {
+            debug!(
+                "Tune write properties for {}, write_batch_size: {}, data_page_size: {}",
+                self.current_file, write_batch_size, data_page_size
+            );
+        }
+
+        props_builder
+            .set_write_batch_size(write_batch_size)
+            .set_data_page_size_limit(data_page_size)
     }
 }
 
