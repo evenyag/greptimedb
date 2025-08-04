@@ -15,9 +15,68 @@
 //! Parquet page reader.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
+use lazy_static::lazy_static;
 use parquet::column::page::{Page, PageMetadata, PageReader};
 use parquet::errors::Result;
+
+lazy_static! {
+    /// Global page reader metrics.
+    static ref GLOBAL_PAGE_METRICS: GlobalPageMetrics = GlobalPageMetrics::default();
+}
+
+/// Global page reader metrics.
+#[derive(Debug, Default)]
+struct GlobalPageMetrics {
+    /// Total number of pages read.
+    pages_read: AtomicUsize,
+    /// Total number of pages skipped.
+    pages_skipped: AtomicUsize,
+    /// Total bytes of pages read.
+    total_bytes: AtomicU64,
+    /// Total duration of page reads (in microseconds).
+    total_read_duration_us: AtomicU64,
+}
+
+impl GlobalPageMetrics {
+    /// Adds page reader metrics to the global metrics.
+    fn add_metrics(&self, metrics: &PageReaderMetrics) {
+        self.pages_read
+            .fetch_add(metrics.num_get, Ordering::Relaxed);
+        self.pages_skipped
+            .fetch_add(metrics.num_skip, Ordering::Relaxed);
+        self.total_bytes
+            .fetch_add(metrics.total_bytes, Ordering::Relaxed);
+        self.total_read_duration_us.fetch_add(
+            metrics.total_read_duration.as_micros() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Gets the current metrics values.
+    fn get_metrics(&self) -> (usize, usize, u64, Duration) {
+        let pages_read = self.pages_read.load(Ordering::Relaxed);
+        let pages_skipped = self.pages_skipped.load(Ordering::Relaxed);
+        let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+        let total_read_duration_us = self.total_read_duration_us.load(Ordering::Relaxed);
+        (
+            pages_read,
+            pages_skipped,
+            total_bytes,
+            Duration::from_micros(total_read_duration_us),
+        )
+    }
+
+    /// Resets all metrics to zero.
+    fn reset(&self) {
+        self.pages_read.store(0, Ordering::Relaxed);
+        self.pages_skipped.store(0, Ordering::Relaxed);
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.total_read_duration_us.store(0, Ordering::Relaxed);
+    }
+}
 
 /// A reader that reads all pages from a cache.
 pub(crate) struct RowGroupCachedReader {
@@ -62,6 +121,15 @@ impl Iterator for RowGroupCachedReader {
     }
 }
 
+/// Get the size of a page in bytes.
+fn page_size(page: &Page) -> u64 {
+    match page {
+        Page::DataPage { buf, .. } => buf.len() as u64,
+        Page::DataPageV2 { buf, .. } => buf.len() as u64,
+        Page::DictionaryPage { buf, .. } => buf.len() as u64,
+    }
+}
+
 /// Get [PageMetadata] from `page`.
 ///
 /// The conversion is based on [decode_page()](https://github.com/apache/arrow-rs/blob/1d6feeacebb8d0d659d493b783ba381940973745/parquet/src/file/serialized_reader.rs#L438-L481)
@@ -97,6 +165,8 @@ pub(crate) struct MetricsPageReader<T> {
     reader: T,
     num_get: usize,
     num_skip: usize,
+    total_bytes: u64,
+    total_read_duration: Duration,
 }
 
 impl<T> MetricsPageReader<T> {
@@ -108,14 +178,36 @@ impl<T> MetricsPageReader<T> {
             reader,
             num_get: 0,
             num_skip: 0,
+            total_bytes: 0,
+            total_read_duration: Duration::ZERO,
+        }
+    }
+
+    /// Returns the collected metrics.
+    pub(crate) fn metrics(&self) -> PageReaderMetrics {
+        PageReaderMetrics {
+            row_group: self.row_group,
+            column_idx: self.column_idx,
+            num_get: self.num_get,
+            num_skip: self.num_skip,
+            total_bytes: self.total_bytes,
+            total_read_duration: self.total_read_duration,
         }
     }
 }
 
 impl<T: PageReader> PageReader for MetricsPageReader<T> {
     fn get_next_page(&mut self) -> Result<Option<Page>> {
-        self.num_get += 1;
-        self.reader.get_next_page()
+        let start = Instant::now();
+        let result = self.reader.get_next_page();
+        self.total_read_duration += start.elapsed();
+
+        if let Ok(Some(ref page)) = result {
+            self.num_get += 1;
+            self.total_bytes += page_size(page);
+        }
+
+        result
     }
 
     fn peek_next_page(&mut self) -> Result<Option<PageMetadata>> {
@@ -123,8 +215,15 @@ impl<T: PageReader> PageReader for MetricsPageReader<T> {
     }
 
     fn skip_next_page(&mut self) -> Result<()> {
-        self.num_skip += 1;
-        self.reader.skip_next_page()
+        let start = Instant::now();
+        let result = self.reader.skip_next_page();
+        self.total_read_duration += start.elapsed();
+
+        if result.is_ok() {
+            self.num_skip += 1;
+        }
+
+        result
     }
 }
 
@@ -132,6 +231,31 @@ impl<T: PageReader> Iterator for MetricsPageReader<T> {
     type Item = Result<Page>;
     fn next(&mut self) -> Option<Self::Item> {
         self.get_next_page().transpose()
+    }
+}
+
+/// Metrics collected by MetricsPageReader.
+#[derive(Debug, Clone)]
+pub(crate) struct PageReaderMetrics {
+    pub row_group: usize,
+    pub column_idx: usize,
+    pub num_get: usize,
+    pub num_skip: usize,
+    pub total_bytes: u64,
+    pub total_read_duration: Duration,
+}
+
+/// Gets the global page reader metrics and resets them.
+pub fn get_and_reset_global_page_metrics() -> (usize, usize, u64, Duration) {
+    let metrics = GLOBAL_PAGE_METRICS.get_metrics();
+    GLOBAL_PAGE_METRICS.reset();
+    metrics
+}
+
+impl<T> Drop for MetricsPageReader<T> {
+    fn drop(&mut self) {
+        let metrics = self.metrics();
+        GLOBAL_PAGE_METRICS.add_metrics(&metrics);
     }
 }
 

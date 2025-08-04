@@ -17,6 +17,7 @@ use mito2::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
 use mito2::sst::index::bloom_filter::applier::BloomFilterIndexApplierBuilder;
 use mito2::sst::index::fulltext_index::applier::builder::FulltextIndexApplierBuilder;
 use mito2::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
+use mito2::sst::parquet::get_and_reset_global_page_metrics;
 use mito2::sst::parquet::reader::ParquetReaderBuilder;
 use object_store::services::Fs;
 use object_store::util::with_instrument_layers;
@@ -390,12 +391,19 @@ async fn main() {
             // );
         }
 
+        let (pages_read, pages_skipped, total_page_bytes, total_page_duration) =
+            get_and_reset_global_page_metrics();
+
         common_telemetry::info!(
-            "loop: {}, scan reader done, {} batches, {} rows, total cost {:?}",
+            "loop: {}, scan reader done, {} batches, {} rows, total cost {:?}, page metrics: read={}, skip={}, bytes={}, duration={:?}",
             i,
             total_batches,
             total_rows,
-            start.elapsed()
+            start.elapsed(),
+            pages_read,
+            pages_skipped,
+            total_page_bytes,
+            total_page_duration
         );
     }
 }

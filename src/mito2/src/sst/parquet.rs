@@ -36,6 +36,9 @@ pub mod row_selection;
 pub(crate) mod stats;
 pub mod writer;
 
+// Re-export page reader functions for metrics
+pub use page_reader::get_and_reset_global_page_metrics;
+
 /// Key of metadata in parquet SST.
 pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 

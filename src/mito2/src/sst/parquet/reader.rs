@@ -1077,7 +1077,7 @@ impl RowGroupReaderBuilder {
 
         // common_telemetry::info!("Use row filter, row group {row_group_idx}, before: {before:?}, after: {after:?}, fetch_cost: {fetch_cost:?}, eval_cost: {eval_cost:?}");
 
-        // // If selection is empty, truncate
+        // If selection is empty, truncate
         // if !selects_any(selection.as_ref()) {
         //     selection = Some(RowSelection::from(vec![]));
         // }
