@@ -289,6 +289,7 @@ async fn main() {
         CacheManagerBuilder::default()
             .index_content_size(64 * 1024 * 1024)
             .index_content_page_size(64 * 1024)
+            .page_cache_size(2 * 1024 * 1024)
             .build(),
     );
 
@@ -340,6 +341,7 @@ async fn main() {
             file_handle.clone(),
             object_store.clone(),
         )
+        .cache(CacheStrategy::EnableAll(cache.clone()))
         .projection(projection.clone())
         .predicate(predicate.clone())
         .expected_metadata(Some(region_metadata.clone()));

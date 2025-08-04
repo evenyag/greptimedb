@@ -90,8 +90,9 @@ fn create_region_metadata_from_json(fulltext_granularity: usize) -> Arc<RegionMe
     // - apps.kubernetes.io/pod-index (column_id=10): String with bloom filter
     // - controller-revision-hash (column_id=11): String with bloom filter
     // - helm.sh/chart (column_id=12): String with bloom filter
-    // - timestamp (column_id=13): Timestamp(Nanosecond) - time index
-    // - statefulset.kubernetes.io/pod-name (column_id=14): String
+    // - message_id (column_id=13): Timestamp(Nanosecond) - String with bloom filter
+    // - timestamp (column_id=14): Timestamp(Nanosecond) - time index
+    // - statefulset.kubernetes.io/pod-name (column_id=15): String
 
     // Create region metadata using the consuming builder pattern
     let mut message_metadata = HashMap::new();
@@ -136,7 +137,7 @@ fn create_region_metadata_from_json(fulltext_granularity: usize) -> Arc<RegionMe
             )
             .with_metadata(timestamp_metadata),
             semantic_type: SemanticType::Timestamp,
-            column_id: ColumnId::from(13u32),
+            column_id: ColumnId::from(14u32),
         });
 
     // Add other columns with bloom filter indexes
@@ -152,7 +153,8 @@ fn create_region_metadata_from_json(fulltext_granularity: usize) -> Arc<RegionMe
         ("apps.kubernetes.io/pod-index", 10u32),
         ("controller-revision-hash", 11u32),
         ("helm.sh/chart", 12u32),
-        ("statefulset.kubernetes.io/pod-name", 14u32),
+        ("message_id", 13u32),
+        ("statefulset.kubernetes.io/pod-name", 15u32),
     ];
 
     for (name, id) in bloom_filter_columns {
@@ -299,8 +301,8 @@ async fn main() {
     let write_options = WriteOptions {
         write_buffer_size: ReadableSize::mb(8),
         row_group_size: DEFAULT_ROW_GROUP_SIZE,
-        // 300MB max file size
-        max_file_size: Some(1024 * 1024 * 300),
+        // 600MB max file size
+        max_file_size: Some(1024 * 1024 * 600),
         data_page_row_count,
         data_page_size,
     };

@@ -272,12 +272,14 @@ where
             .name
             .clone()]);
         let seq_col = ColumnPath::new(vec![SEQUENCE_COLUMN_NAME.to_string()]);
+        let message_col = ColumnPath::new(vec!["message".to_string()]);
 
         builder
             .set_column_encoding(seq_col.clone(), Encoding::DELTA_BINARY_PACKED)
             .set_column_dictionary_enabled(seq_col, false)
             .set_column_encoding(ts_col.clone(), Encoding::DELTA_BINARY_PACKED)
             .set_column_dictionary_enabled(ts_col, false)
+            .set_column_dictionary_enabled(message_col, false)
     }
 
     async fn write_next_batch(
