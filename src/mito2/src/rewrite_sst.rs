@@ -159,7 +159,7 @@ fn create_region_metadata_from_json(fulltext_granularity: usize) -> Arc<RegionMe
 
     for (name, id) in bloom_filter_columns {
         let mut metadata = HashMap::new();
-        if id != 14 {
+        if id != 15 {
             // statefulset.kubernetes.io/pod-name doesn't have bloom filter
             metadata.insert(
                 "greptime:skipping_index".to_string(),

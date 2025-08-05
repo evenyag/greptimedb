@@ -254,6 +254,10 @@ pub fn get_and_reset_global_page_metrics() -> (usize, usize, u64, Duration) {
 
 impl<T> Drop for MetricsPageReader<T> {
     fn drop(&mut self) {
+        if self.column_idx != 0 {
+            return;
+        }
+
         let metrics = self.metrics();
         GLOBAL_PAGE_METRICS.add_metrics(&metrics);
     }
