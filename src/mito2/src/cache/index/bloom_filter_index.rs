@@ -16,6 +16,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use api::v1::index::BloomFilterMeta;
+use lazy_static::lazy_static;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::try_join_all;
@@ -28,6 +29,12 @@ use crate::metrics::{CACHE_HIT, CACHE_MISS};
 use crate::sst::file::FileId;
 
 const INDEX_TYPE_BLOOM_FILTER_INDEX: &str = "bloom_filter_index";
+
+lazy_static! {
+    static ref PAR_FETCH: bool = std::env::var("PAR_FETCH")
+        .map(|v| v.parse().unwrap_or(false))
+        .unwrap_or(false);
+}
 
 /// Tag for bloom filter index cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,21 +128,25 @@ impl<R: BloomFilterReader + Send> BloomFilterReader for CachedBloomFilterIndexBl
 
     async fn read_vec(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         common_telemetry::info!("bloom filter read vec from cache, ranges: {}", ranges.len());
-        // let fetch = ranges.iter().map(|range| {
-        //     let inner = &self.inner;
-        //     self.cache.get_or_load(
-        //         (self.file_id, self.column_id, self.tag),
-        //         self.blob_size,
-        //         range.start,
-        //         (range.end - range.start) as u32,
-        //         move |ranges| async move { inner.read_vec(&ranges).await },
-        //     )
-        // });
-        // Ok(try_join_all(fetch)
-        //     .await?
-        //     .into_iter()
-        //     .map(Bytes::from)
-        //     .collect::<Vec<_>>())
+
+        let par_fetch = *PAR_FETCH;
+        if par_fetch {
+            let fetch = ranges.iter().map(|range| {
+                let inner = &self.inner;
+                self.cache.get_or_load(
+                    (self.file_id, self.column_id, self.tag),
+                    self.blob_size,
+                    range.start,
+                    (range.end - range.start) as u32,
+                    move |ranges| async move { inner.read_vec(&ranges).await },
+                )
+            });
+            return Ok(try_join_all(fetch)
+                .await?
+                .into_iter()
+                .map(Bytes::from)
+                .collect::<Vec<_>>());
+        }
 
         let mut pages = Vec::with_capacity(ranges.len());
         for range in ranges {
