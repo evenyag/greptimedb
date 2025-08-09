@@ -14,18 +14,6 @@
 
 //! Memtable implementation for bulk load
 
-use std::sync::{Arc, RwLock};
-
-use mito_codec::key_values::KeyValue;
-use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{ColumnId, SequenceNumber};
-
-use crate::error::Result;
-use crate::memtable::bulk::part::{BulkPart, EncodedBulkPart};
-use crate::memtable::{
-    KeyValues, Memtable, MemtableId, MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
-};
-
 #[allow(unused)]
 pub mod context;
 #[allow(unused)]
@@ -33,10 +21,46 @@ pub mod part;
 pub mod part_reader;
 mod row_group_reader;
 
-#[derive(Debug)]
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+
+use mito_codec::key_values::KeyValue;
+use store_api::metadata::RegionMetadataRef;
+use store_api::storage::{ColumnId, SequenceNumber};
+
+use crate::error::{Result, UnsupportedOperationSnafu};
+use crate::flush::WriteBufferManagerRef;
+use crate::memtable::bulk::part::BulkPart;
+use crate::memtable::stats::WriteMetrics;
+use crate::memtable::{
+    AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable, MemtableId,
+    MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
+    PredicateGroup,
+};
+
 pub struct BulkMemtable {
     id: MemtableId,
-    parts: RwLock<Vec<EncodedBulkPart>>,
+    parts: RwLock<Vec<BulkPart>>,
+    metadata: RegionMetadataRef,
+    alloc_tracker: AllocTracker,
+    max_timestamp: AtomicI64,
+    min_timestamp: AtomicI64,
+    max_sequence: AtomicU64,
+    num_rows: AtomicUsize,
+}
+
+impl std::fmt::Debug for BulkMemtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkMemtable")
+            .field("id", &self.id)
+            .field("num_parts", &self.parts.read().unwrap().len())
+            .field("num_rows", &self.num_rows.load(Ordering::Relaxed))
+            .field("min_timestamp", &self.min_timestamp.load(Ordering::Relaxed))
+            .field("max_timestamp", &self.max_timestamp.load(Ordering::Relaxed))
+            .field("max_sequence", &self.max_sequence.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl Memtable for BulkMemtable {
@@ -45,14 +69,35 @@ impl Memtable for BulkMemtable {
     }
 
     fn write(&self, _kvs: &KeyValues) -> Result<()> {
-        unimplemented!()
+        UnsupportedOperationSnafu {
+            err_msg: "write() is not supported for bulk memtable",
+        }
+        .fail()
     }
 
     fn write_one(&self, _key_value: KeyValue) -> Result<()> {
-        unimplemented!()
+        UnsupportedOperationSnafu {
+            err_msg: "write_one() is not supported for bulk memtable",
+        }
+        .fail()
     }
 
-    fn write_bulk(&self, _fragment: BulkPart) -> Result<()> {
+    fn write_bulk(&self, fragment: BulkPart) -> Result<()> {
+        let local_metrics = WriteMetrics {
+            key_bytes: 0,
+            value_bytes: fragment.estimated_size(),
+            min_ts: fragment.min_ts,
+            max_ts: fragment.max_ts,
+            num_rows: fragment.num_rows(),
+            max_sequence: fragment.sequence,
+        };
+
+        let mut parts = self.parts.write().unwrap();
+        parts.push(fragment);
+
+        // Since this operation should be fast, we do it in parts lock scope.
+        self.update_stats(local_metrics);
+
         Ok(())
     }
 
@@ -68,11 +113,39 @@ impl Memtable for BulkMemtable {
 
     fn ranges(
         &self,
-        _projection: Option<&[ColumnId]>,
-        _predicate: PredicateGroup,
-        _sequence: Option<SequenceNumber>,
+        projection: Option<&[ColumnId]>,
+        predicate: PredicateGroup,
+        sequence: Option<SequenceNumber>,
     ) -> Result<MemtableRanges> {
-        todo!()
+        let parts = self.parts.read().unwrap();
+        let mut ranges = BTreeMap::new();
+
+        for (range_id, part) in parts.iter().enumerate() {
+            // Skip empty parts
+            if part.num_rows() == 0 {
+                continue;
+            }
+
+            let range = MemtableRange::new(
+                std::sync::Arc::new(MemtableRangeContext::new(
+                    self.id,
+                    Box::new(BulkRangeIterBuilder {
+                        part: part.clone(),
+                        projection: projection.map(|p| p.to_vec()),
+                        predicate: predicate.clone(),
+                        sequence,
+                    }),
+                    predicate.clone(),
+                )),
+                part.num_rows(),
+            );
+            ranges.insert(range_id, range);
+        }
+
+        let mut stats = self.stats();
+        stats.num_ranges = ranges.len();
+
+        Ok(MemtableRanges { ranges, stats })
     }
 
     fn is_empty(&self) -> bool {
@@ -80,17 +153,111 @@ impl Memtable for BulkMemtable {
     }
 
     fn freeze(&self) -> Result<()> {
+        self.alloc_tracker.done_allocating();
         Ok(())
     }
 
     fn stats(&self) -> MemtableStats {
-        todo!()
+        let estimated_bytes = self.alloc_tracker.bytes_allocated();
+
+        if estimated_bytes == 0 || self.num_rows.load(Ordering::Relaxed) == 0 {
+            return MemtableStats {
+                estimated_bytes,
+                time_range: None,
+                num_rows: 0,
+                num_ranges: 0,
+                max_sequence: 0,
+                series_count: 0,
+            };
+        }
+
+        let ts_type = self
+            .metadata
+            .time_index_column()
+            .column_schema
+            .data_type
+            .clone()
+            .as_timestamp()
+            .expect("Timestamp column must have timestamp type");
+        let max_timestamp = ts_type.create_timestamp(self.max_timestamp.load(Ordering::Relaxed));
+        let min_timestamp = ts_type.create_timestamp(self.min_timestamp.load(Ordering::Relaxed));
+
+        let num_ranges = self.parts.read().unwrap().len();
+
+        MemtableStats {
+            estimated_bytes,
+            time_range: Some((min_timestamp, max_timestamp)),
+            num_rows: self.num_rows.load(Ordering::Relaxed),
+            num_ranges,
+            max_sequence: self.max_sequence.load(Ordering::Relaxed),
+            series_count: self.estimated_series_count(),
+        }
     }
 
-    fn fork(&self, id: MemtableId, _metadata: &RegionMetadataRef) -> MemtableRef {
+    fn fork(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
         Arc::new(Self {
             id,
             parts: RwLock::new(vec![]),
+            metadata: metadata.clone(),
+            alloc_tracker: AllocTracker::new(self.alloc_tracker.write_buffer_manager()),
+            max_timestamp: AtomicI64::new(i64::MIN),
+            min_timestamp: AtomicI64::new(i64::MAX),
+            max_sequence: AtomicU64::new(0),
+            num_rows: AtomicUsize::new(0),
         })
+    }
+}
+
+impl BulkMemtable {
+    /// Creates a new BulkMemtable
+    pub fn new(
+        id: MemtableId,
+        metadata: RegionMetadataRef,
+        write_buffer_manager: Option<WriteBufferManagerRef>,
+    ) -> Self {
+        Self {
+            id,
+            parts: RwLock::new(vec![]),
+            metadata,
+            alloc_tracker: AllocTracker::new(write_buffer_manager),
+            max_timestamp: AtomicI64::new(i64::MIN),
+            min_timestamp: AtomicI64::new(i64::MAX),
+            max_sequence: AtomicU64::new(0),
+            num_rows: AtomicUsize::new(0),
+        }
+    }
+
+    /// Updates memtable stats.
+    fn update_stats(&self, stats: WriteMetrics) {
+        self.alloc_tracker
+            .on_allocation(stats.key_bytes + stats.value_bytes);
+
+        self.max_timestamp.fetch_max(stats.max_ts, Ordering::SeqCst);
+        self.min_timestamp.fetch_min(stats.min_ts, Ordering::SeqCst);
+        self.max_sequence
+            .fetch_max(stats.max_sequence, Ordering::SeqCst);
+        self.num_rows.fetch_add(stats.num_rows, Ordering::SeqCst);
+    }
+
+    /// Returns the estimated time series count.
+    fn estimated_series_count(&self) -> usize {
+        todo!()
+    }
+}
+
+/// Iterator builder for bulk range
+struct BulkRangeIterBuilder {
+    part: BulkPart,
+    projection: Option<Vec<ColumnId>>,
+    predicate: PredicateGroup,
+    sequence: Option<SequenceNumber>,
+}
+
+impl IterBuilder for BulkRangeIterBuilder {
+    fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+        UnsupportedOperationSnafu {
+            err_msg: "BatchIterator is not supported for bulk memtable",
+        }
+        .fail()
     }
 }
