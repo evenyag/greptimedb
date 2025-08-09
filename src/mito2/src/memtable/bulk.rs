@@ -31,12 +31,14 @@ use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
+use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::BulkPart;
+use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable, MemtableId,
-    MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
-    PredicateGroup,
+    AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, IterBuilder, KeyValues,
+    MemScanMetrics, Memtable, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges,
+    MemtableRef, MemtableStats, PredicateGroup,
 };
 
 pub struct BulkMemtable {
@@ -127,13 +129,14 @@ impl Memtable for BulkMemtable {
             }
 
             let range = MemtableRange::new(
-                std::sync::Arc::new(MemtableRangeContext::new(
+                Arc::new(MemtableRangeContext::new(
                     self.id,
                     Box::new(BulkRangeIterBuilder {
                         part: part.clone(),
                         projection: projection.map(|p| p.to_vec()),
                         predicate: predicate.clone(),
                         sequence,
+                        metadata: self.metadata.clone(),
                     }),
                     predicate.clone(),
                 )),
@@ -241,7 +244,8 @@ impl BulkMemtable {
 
     /// Returns the estimated time series count.
     fn estimated_series_count(&self) -> usize {
-        todo!()
+        let parts = self.parts.read().unwrap();
+        parts.iter().map(|part| part.estimated_series_count()).sum()
     }
 }
 
@@ -251,6 +255,7 @@ struct BulkRangeIterBuilder {
     projection: Option<Vec<ColumnId>>,
     predicate: PredicateGroup,
     sequence: Option<SequenceNumber>,
+    metadata: RegionMetadataRef,
 }
 
 impl IterBuilder for BulkRangeIterBuilder {
@@ -259,5 +264,24 @@ impl IterBuilder for BulkRangeIterBuilder {
             err_msg: "BatchIterator is not supported for bulk memtable",
         }
         .fail()
+    }
+
+    fn is_record_batch(&self) -> bool {
+        true
+    }
+
+    fn build_record_batch(
+        &self,
+        _metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        let context = Arc::new(BulkIterContext::new(
+            self.metadata.clone(),
+            &self.projection.as_ref().map(|p| p.as_slice()),
+            self.predicate.predicate().cloned(),
+        ));
+
+        let iter = BulkPartRecordBatchIter::new(self.part.batch.clone(), context, self.sequence);
+
+        Ok(Box::new(iter))
     }
 }
