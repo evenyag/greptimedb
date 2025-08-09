@@ -285,3 +285,246 @@ impl IterBuilder for BulkRangeIterBuilder {
         Ok(Box::new(iter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    use mito_codec::row_converter::build_primary_key_codec;
+
+    use super::*;
+    use crate::memtable::bulk::part::BulkPartConverter;
+    use crate::read::scan_region::PredicateGroup;
+    use crate::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
+    use crate::test_util::memtable_util::{build_key_values_with_ts_seq_values, metadata_for_test};
+
+    fn create_bulk_part_with_converter(
+        k0: &str,
+        k1: u32,
+        timestamps: Vec<i64>,
+        values: Vec<Option<f64>>,
+        sequence: u64,
+    ) -> Result<BulkPart> {
+        let metadata = metadata_for_test();
+        let capacity = 100;
+        let primary_key_codec = build_primary_key_codec(&metadata);
+        let schema = to_flat_sst_arrow_schema(
+            &metadata,
+            &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+        );
+
+        let mut converter =
+            BulkPartConverter::new(&metadata, schema, capacity, primary_key_codec, true);
+
+        let key_values = build_key_values_with_ts_seq_values(
+            &metadata,
+            k0.to_string(),
+            k1,
+            timestamps.into_iter(),
+            values.into_iter(),
+            sequence,
+        );
+
+        converter.append_key_values(&key_values)?;
+        converter.convert()
+    }
+
+    #[test]
+    fn test_bulk_memtable_write_multiple_parts() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(456, metadata.clone(), None);
+
+        let part1 = create_bulk_part_with_converter(
+            "key1",
+            1,
+            vec![1000, 2000],
+            vec![Some(1.0), Some(2.0)],
+            100,
+        )
+        .unwrap();
+
+        let part2 = create_bulk_part_with_converter(
+            "key2",
+            2,
+            vec![3000, 4000],
+            vec![Some(3.0), Some(4.0)],
+            200,
+        )
+        .unwrap();
+
+        memtable.write_bulk(part1).unwrap();
+        memtable.write_bulk(part2).unwrap();
+
+        let stats = memtable.stats();
+        assert_eq!(4, stats.num_rows);
+        assert_eq!(2, stats.num_ranges);
+        assert_eq!(201, stats.max_sequence);
+
+        let (min_ts, max_ts) = stats.time_range.unwrap();
+        assert_eq!(1000, min_ts.value());
+        assert_eq!(4000, max_ts.value());
+    }
+
+    #[test]
+    fn test_bulk_memtable_write_read() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(999, metadata.clone(), None);
+
+        let test_data = vec![
+            (
+                "key_a",
+                1u32,
+                vec![1000i64, 2000i64],
+                vec![Some(10.5), Some(20.5)],
+                100u64,
+            ),
+            (
+                "key_b",
+                2u32,
+                vec![1500i64, 2500i64],
+                vec![Some(15.5), Some(25.5)],
+                200u64,
+            ),
+            ("key_c", 3u32, vec![3000i64], vec![Some(30.5)], 300u64),
+        ];
+
+        for (k0, k1, timestamps, values, seq) in test_data.iter() {
+            let part =
+                create_bulk_part_with_converter(k0, *k1, timestamps.clone(), values.clone(), *seq)
+                    .unwrap();
+            memtable.write_bulk(part).unwrap();
+        }
+
+        let stats = memtable.stats();
+        assert_eq!(5, stats.num_rows);
+        assert_eq!(3, stats.num_ranges);
+        assert_eq!(300, stats.max_sequence);
+
+        let (min_ts, max_ts) = stats.time_range.unwrap();
+        assert_eq!(1000, min_ts.value());
+        assert_eq!(3000, max_ts.value());
+
+        let predicate_group = PredicateGroup::new(&metadata, &[]);
+        let ranges = memtable.ranges(None, predicate_group, None).unwrap();
+
+        assert_eq!(3, ranges.ranges.len());
+        assert_eq!(5, ranges.stats.num_rows);
+
+        for (_range_id, range) in ranges.ranges.iter() {
+            assert!(range.num_rows() > 0);
+            assert!(range.is_record_batch());
+
+            let record_batch_iter = range.build_record_batch_iter(None).unwrap();
+
+            let mut total_rows = 0;
+            for batch_result in record_batch_iter {
+                let batch = batch_result.unwrap();
+                total_rows += batch.num_rows();
+                assert!(batch.num_rows() > 0);
+                assert_eq!(8, batch.num_columns());
+            }
+            assert_eq!(total_rows, range.num_rows());
+        }
+    }
+
+    #[test]
+    fn test_bulk_memtable_ranges_with_projection() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(111, metadata.clone(), None);
+
+        let bulk_part = create_bulk_part_with_converter(
+            "projection_test",
+            5,
+            vec![5000, 6000, 7000],
+            vec![Some(50.0), Some(60.0), Some(70.0)],
+            500,
+        )
+        .unwrap();
+
+        memtable.write_bulk(bulk_part).unwrap();
+
+        let projection = vec![4u32];
+        let predicate_group = PredicateGroup::new(&metadata, &[]);
+        let ranges = memtable
+            .ranges(Some(&projection), predicate_group, None)
+            .unwrap();
+
+        assert_eq!(1, ranges.ranges.len());
+        let range = ranges.ranges.get(&0).unwrap();
+
+        assert!(range.is_record_batch());
+        let record_batch_iter = range.build_record_batch_iter(None).unwrap();
+
+        let mut total_rows = 0;
+        for batch_result in record_batch_iter {
+            let batch = batch_result.unwrap();
+            assert!(batch.num_rows() > 0);
+            assert_eq!(5, batch.num_columns());
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(3, total_rows);
+    }
+
+    #[test]
+    fn test_bulk_memtable_unsupported_operations() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(111, metadata.clone(), None);
+
+        let key_values = build_key_values_with_ts_seq_values(
+            &metadata,
+            "test".to_string(),
+            1,
+            vec![1000].into_iter(),
+            vec![Some(1.0)].into_iter(),
+            1,
+        );
+
+        let err = memtable.write(&key_values).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        let kv = key_values.iter().next().unwrap();
+        let err = memtable.write_one(kv).unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn test_bulk_memtable_freeze() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(222, metadata.clone(), None);
+
+        let bulk_part = create_bulk_part_with_converter(
+            "freeze_test",
+            10,
+            vec![10000],
+            vec![Some(100.0)],
+            1000,
+        )
+        .unwrap();
+
+        memtable.write_bulk(bulk_part).unwrap();
+        assert_eq!(memtable.freeze().unwrap(), ());
+
+        let stats_after_freeze = memtable.stats();
+        assert_eq!(1, stats_after_freeze.num_rows);
+    }
+
+    #[test]
+    fn test_bulk_memtable_fork() {
+        let metadata = metadata_for_test();
+        let original_memtable = BulkMemtable::new(333, metadata.clone(), None);
+
+        let bulk_part =
+            create_bulk_part_with_converter("fork_test", 15, vec![15000], vec![Some(150.0)], 1500)
+                .unwrap();
+
+        original_memtable.write_bulk(bulk_part).unwrap();
+
+        let forked_memtable = original_memtable.fork(444, &metadata);
+
+        assert_eq!(forked_memtable.id(), 444);
+        assert!(forked_memtable.is_empty());
+        assert_eq!(0, forked_memtable.stats().num_rows);
+
+        assert!(!original_memtable.is_empty());
+        assert_eq!(1, original_memtable.stats().num_rows);
+    }
+}

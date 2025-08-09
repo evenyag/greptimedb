@@ -408,7 +408,10 @@ pub trait IterBuilder: Send + Sync {
     }
 
     /// Returns the record batch iterator to read the range.
-    fn build_record_batch(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedRecordBatchIterator> {
+    fn build_record_batch(
+        &self,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
         let _metrics = metrics;
         UnsupportedOperationSnafu {
             err_msg: "Record batch iterator is not supported by this memtable",
@@ -487,6 +490,20 @@ impl MemtableRange {
 
     pub fn num_rows(&self) -> usize {
         self.num_rows
+    }
+
+    // TODO(yingwen): Support optional FileTimeRange.
+    /// Builds a record batch iterator to read all rows in range.
+    pub fn build_record_batch_iter(
+        &self,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        self.context.builder.build_record_batch(metrics)
+    }
+
+    /// Returns whether the iterator is a record batch iterator.
+    pub fn is_record_batch(&self) -> bool {
+        self.context.builder.is_record_batch()
     }
 }
 
