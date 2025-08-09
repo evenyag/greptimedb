@@ -492,8 +492,10 @@ impl MemtableRange {
         self.num_rows
     }
 
-    // TODO(yingwen): Support optional FileTimeRange.
     /// Builds a record batch iterator to read all rows in range.
+    ///
+    /// This method doesn't take the optional time range because a bulk part is immutable
+    /// so we don't need to filter rows out of the time range.
     pub fn build_record_batch_iter(
         &self,
         metrics: Option<MemScanMetrics>,

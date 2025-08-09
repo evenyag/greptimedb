@@ -98,6 +98,9 @@ impl Memtable for BulkMemtable {
         parts.push(fragment);
 
         // Since this operation should be fast, we do it in parts lock scope.
+        // This ensure the statistics in `ranges()` are correct. What's more,
+        // it guarantees no rows are out of the time range so we don't need to
+        // prune rows by time range again in the iterator of the MemtableRange.
         self.update_stats(local_metrics);
 
         Ok(())
@@ -148,6 +151,7 @@ impl Memtable for BulkMemtable {
         let mut stats = self.stats();
         stats.num_ranges = ranges.len();
 
+        // TODO(yingwen): Supports per range stats.
         Ok(MemtableRanges { ranges, stats })
     }
 
