@@ -24,13 +24,20 @@ use std::time::Instant;
 
 use common_telemetry::debug;
 use common_time::Timestamp;
-use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::array::{
+    ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
+use datatypes::arrow::compute::{max, min};
+use datatypes::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datatypes::arrow::record_batch::RecordBatch;
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
+use serde::de::Unexpected;
 use smallvec::smallvec;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
@@ -40,10 +47,13 @@ use tokio::io::AsyncWrite;
 use tokio_util::compat::{Compat, FuturesAsyncWriteCompatExt};
 
 use crate::access_layer::{FilePathProvider, Metrics, SstInfoArray, TempFileCleaner};
-use crate::error::{InvalidMetadataSnafu, OpenDalSnafu, Result, WriteParquetSnafu};
-use crate::read::{Batch, Source};
+use crate::error::{
+    InvalidMetadataSnafu, OpenDalSnafu, Result, UnexpectedSnafu, WriteParquetSnafu,
+};
+use crate::read::{Batch, FlatSource, Source};
 use crate::sst::file::{FileId, RegionFileId};
 use crate::sst::index::{Indexer, IndexerBuilder};
+use crate::sst::parquet::flat_format::{time_index_column_index, FlatWriteFormat};
 use crate::sst::parquet::format::PrimaryKeyWriteFormat;
 use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
@@ -222,6 +232,27 @@ where
         res
     }
 
+    /// Iterates FlatSource and writes all RecordBatch in flat format to Parquet file.
+    ///
+    /// Returns the [SstInfo] if the SST is written.
+    pub async fn write_all_flat(
+        &mut self,
+        source: FlatSource,
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let res = self
+            .write_all_flat_without_cleaning(source, opts)
+            .await;
+        if res.is_err() {
+            // Clean tmp files explicitly on failure.
+            let file_id = self.current_file;
+            if let Some(cleaner) = &self.file_cleaner {
+                cleaner.clean_by_file_id(file_id).await;
+            }
+        }
+        res
+    }
+
     async fn write_all_without_cleaning(
         &mut self,
         mut source: Source,
@@ -388,6 +419,85 @@ impl SourceStats {
             self.time_range = Some((min_in_batch, max_in_batch));
         }
     }
+
+    fn update_flat(&mut self, record_batch: &RecordBatch) -> Result<()> {
+        if record_batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        self.num_rows += record_batch.num_rows();
+
+        // Get the timestamp column by index
+        let time_index_col_idx = time_index_column_index(record_batch.num_columns());
+        let timestamp_array = record_batch.column(time_index_col_idx);
+
+        if let Some((min_in_batch, max_in_batch)) = timestamp_range_from_array(timestamp_array)? {
+            if let Some(time_range) = &mut self.time_range {
+                time_range.0 = time_range.0.min(min_in_batch);
+                time_range.1 = time_range.1.max(max_in_batch);
+            } else {
+                self.time_range = Some((min_in_batch, max_in_batch));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Gets min and max timestamp from an timestamp array.
+fn timestamp_range_from_array(
+    timestamp_array: &ArrayRef,
+) -> Result<Option<(Timestamp, Timestamp)>> {
+    let (min_ts, max_ts) = match timestamp_array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let array = timestamp_array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            let min_val = min(array).map(Timestamp::new_second);
+            let max_val = max(array).map(Timestamp::new_second);
+            (min_val, max_val)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let array = timestamp_array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            let min_val = min(array).map(Timestamp::new_millisecond);
+            let max_val = max(array).map(Timestamp::new_millisecond);
+            (min_val, max_val)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let array = timestamp_array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            let min_val = min(array).map(Timestamp::new_microsecond);
+            let max_val = max(array).map(Timestamp::new_microsecond);
+            (min_val, max_val)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let array = timestamp_array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            let min_val = min(array).map(Timestamp::new_nanosecond);
+            let max_val = max(array).map(Timestamp::new_nanosecond);
+            (min_val, max_val)
+        }
+        _ => {
+            return UnexpectedSnafu {
+                reason: format!(
+                    "Unexpected data type of time index: {:?}",
+                    timestamp_array.data_type()
+                ),
+            }
+            .fail()
+        }
+    };
+
+    // If min timestamp exists, max timestamp should also exist.
+    Ok(min_ts.zip(max_ts))
 }
 
 /// Workaround for [AsyncArrowWriter] does not provide a method to
