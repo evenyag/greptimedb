@@ -43,6 +43,7 @@ use datafusion_common::arrow::array::UInt8Array;
 use datatypes::arrow;
 use datatypes::arrow::array::{Array, ArrayRef, UInt64Array};
 use datatypes::arrow::compute::SortOptions;
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::arrow::row::{RowConverter, SortField};
 use datatypes::prelude::{ConcreteDataType, DataType, ScalarVector};
 use datatypes::scalars::ScalarVectorBuilder;
@@ -65,7 +66,7 @@ use crate::error::{
     ComputeArrowSnafu, ComputeVectorSnafu, ConvertVectorSnafu, DecodeSnafu, InvalidBatchSnafu,
     Result,
 };
-use crate::memtable::BoxedBatchIterator;
+use crate::memtable::{BoxedBatchIterator, BoxedRecordBatchIterator};
 use crate::read::prune::PruneReader;
 
 /// Storage internal representation of a batch of rows for a primary key (time series).
@@ -989,6 +990,21 @@ impl Source {
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
             Source::PruneReader(reader) => reader.next_batch().await,
+        }
+    }
+}
+
+/// Async [RecordBatch] reader and iterator wrapper for flat format.
+pub enum FlatSource {
+    /// Source from a [BoxedRecordBatchIterator].
+    Iter(BoxedRecordBatchIterator),
+}
+
+impl FlatSource {
+    /// Returns next [RecordBatch] from this data source.
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self {
+            FlatSource::Iter(iter) => iter.next().transpose(),
         }
     }
 }
