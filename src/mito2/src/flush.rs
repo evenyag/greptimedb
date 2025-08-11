@@ -19,9 +19,9 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use either::Either;
-
 use common_telemetry::{debug, error, info, trace};
+use datatypes::arrow::datatypes::SchemaRef;
+use either::Either;
 use snafu::ResultExt;
 use store_api::storage::RegionId;
 use strum::IntoStaticStr;
@@ -34,15 +34,17 @@ use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
-use crate::memtable::{MemtableRanges, MemtableRef};
+use crate::memtable::MemtableRanges;
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
 };
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
+use crate::read::flat_dedup::{DedupIterator, FlatLastRow};
+use crate::read::flat_merge::MergeIterator;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::scan_region::PredicateGroup;
-use crate::read::Source;
+use crate::read::{FlatSource, Source};
 use crate::region::options::{IndexOptions, MergeMode, RegionOptions};
 use crate::region::version::{VersionControlData, VersionControlRef};
 use crate::region::{ManifestContextRef, RegionLeaderState};
@@ -52,7 +54,8 @@ use crate::request::{
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::FileMeta;
-use crate::sst::parquet::WriteOptions;
+use crate::sst::parquet::{WriteOptions, DEFAULT_READ_BATCH_SIZE};
+use crate::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
 use crate::worker::WorkerListener;
 
 /// Global write buffer (memtable) manager.
@@ -355,14 +358,29 @@ impl RegionFlushTask {
             }
 
             let mem_ranges = mem.ranges(None, PredicateGroup::default(), None)?;
-            let (max_sequence, source) =
-                memtable_source(mem_ranges, &version.options, &mut series_count).await?;
+            let (max_sequence, source) = if mem_ranges.is_record_batch() {
+                let batch_schema =
+                    to_flat_sst_arrow_schema(&version.metadata, &FlatSchemaOptions::default());
+                let (max_sequence, source) = memtable_flat_source(
+                    batch_schema,
+                    mem_ranges,
+                    &version.options,
+                    &mut series_count,
+                )?;
+
+                (max_sequence, Either::Right(source))
+            } else {
+                let (max_sequence, source) =
+                    memtable_source(mem_ranges, &version.options, &mut series_count).await?;
+
+                (max_sequence, Either::Left(source))
+            };
 
             // Flush to level 0.
             let write_request = SstWriteRequest {
                 op_type: OperationType::Flush,
                 metadata: version.metadata.clone(),
-                source: Either::Left(source),
+                source,
                 cache_manager: self.cache_manager.clone(),
                 storage: version.options.storage.clone(),
                 max_sequence: Some(max_sequence),
@@ -507,6 +525,45 @@ async fn memtable_source(
         Source::Reader(maybe_dedup)
     };
     Ok((max_sequence, source))
+}
+
+// TODO(yingwen): Flushes into multiple files in parallel.
+/// Returns a [FlatSource] for the given memtable.
+fn memtable_flat_source(
+    schema: SchemaRef,
+    mem_ranges: MemtableRanges,
+    options: &RegionOptions,
+    series_count: &mut usize,
+) -> Result<(u64, FlatSource), Error> {
+    let MemtableRanges { ranges, stats } = mem_ranges;
+    let max_sequence = stats.max_sequence();
+    *series_count += stats.series_count();
+
+    if ranges.len() == 1 {
+        let only_range = ranges.into_values().next().unwrap();
+        let iter = only_range.build_record_batch_iter(None)?;
+        Ok((max_sequence, FlatSource::Iter(iter)))
+    } else {
+        let iters = ranges
+            .into_values()
+            .map(|r| r.build_record_batch_iter(None))
+            .collect::<Result<Vec<_>>>()?;
+        let merge_iter = MergeIterator::new(schema, iters, DEFAULT_READ_BATCH_SIZE)?;
+        let maybe_dedup = if options.append_mode {
+            // No dedup in append mode
+            Box::new(merge_iter) as _
+        } else {
+            // Dedup according to merge mode.
+            match options.merge_mode() {
+                MergeMode::LastRow => {
+                    Box::new(DedupIterator::new(merge_iter, FlatLastRow::new(false))) as _
+                }
+                // TODO(yingwen): dedup last non null
+                MergeMode::LastNonNull => todo!(),
+            }
+        };
+        Ok((max_sequence, FlatSource::Iter(maybe_dedup)))
+    }
 }
 
 /// Manages background flushes of a worker.

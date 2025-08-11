@@ -537,6 +537,14 @@ impl MergeIterator {
     }
 }
 
+impl Iterator for MergeIterator {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
+    }
+}
+
 /// A sync node in the merge iterator.
 struct IterNode {
     /// Index of the node.
@@ -713,13 +721,9 @@ mod tests {
 
     /// Helper function to collect all batches from a MergeIterator.
     fn collect_merge_iterator_batches(
-        mut iter: MergeIterator,
+        iter: MergeIterator,
     ) -> crate::error::Result<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
-        while let Some(batch) = iter.next_batch()? {
-            batches.push(batch);
-        }
-        Ok(batches)
+        iter.collect()
     }
 
     #[test]

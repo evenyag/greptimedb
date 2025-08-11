@@ -149,6 +149,18 @@ pub struct MemtableRanges {
     pub stats: MemtableStats,
 }
 
+impl MemtableRanges {
+    /// Returns whether the iterator is a record batch iterator.
+    ///
+    /// It only checks the first range.
+    pub fn is_record_batch(&self) -> bool {
+        self.ranges
+            .values()
+            .next()
+            .map_or(false, |range| range.is_record_batch())
+    }
+}
+
 /// In memory write buffer.
 pub trait Memtable: Send + Sync + fmt::Debug {
     /// Returns the id of this memtable.
