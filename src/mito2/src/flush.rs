@@ -19,6 +19,8 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use either::Either;
+
 use common_telemetry::{debug, error, info, trace};
 use snafu::ResultExt;
 use store_api::storage::RegionId;
@@ -360,7 +362,7 @@ impl RegionFlushTask {
             let write_request = SstWriteRequest {
                 op_type: OperationType::Flush,
                 metadata: version.metadata.clone(),
-                source,
+                source: Either::Left(source),
                 cache_manager: self.cache_manager.clone(),
                 storage: version.options.storage.clone(),
                 max_sequence: Some(max_sequence),

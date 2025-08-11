@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_base::readable_size::ReadableSize;
+use either::Either;
 use common_telemetry::{debug, info};
 use futures::AsyncWriteExt;
 use object_store::ObjectStore;
@@ -139,8 +140,15 @@ impl WriteCache {
         .await
         .with_file_cleaner(cleaner);
 
+        let source = match write_request.source {
+            Either::Left(source) => source,
+            Either::Right(_flat_source) => {
+                // TODO: Handle FlatSource
+                todo!("FlatSource is not yet supported")
+            }
+        };
         let sst_info = writer
-            .write_all(write_request.source, write_request.max_sequence, write_opts)
+            .write_all(source, write_request.max_sequence, write_opts)
             .await?;
         let mut metrics = writer.into_metrics();
 
@@ -469,7 +477,7 @@ mod tests {
         let write_request = SstWriteRequest {
             op_type: OperationType::Flush,
             metadata,
-            source,
+            source: Either::Left(source),
             storage: None,
             max_sequence: None,
             cache_manager: Default::default(),
@@ -567,7 +575,7 @@ mod tests {
         let write_request = SstWriteRequest {
             op_type: OperationType::Flush,
             metadata,
-            source,
+            source: Either::Left(source),
             storage: None,
             max_sequence: None,
             cache_manager: cache_manager.clone(),
@@ -646,7 +654,7 @@ mod tests {
         let write_request = SstWriteRequest {
             op_type: OperationType::Flush,
             metadata,
-            source,
+            source: Either::Left(source),
             storage: None,
             max_sequence: None,
             cache_manager: cache_manager.clone(),

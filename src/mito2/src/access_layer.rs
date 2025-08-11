@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use either::Either;
 use object_store::services::Fs;
 use object_store::util::{join_dir, with_instrument_layers};
 use object_store::{ErrorKind, ObjectStore, ATOMIC_WRITE_DIR, OLD_ATOMIC_WRITE_DIR};
@@ -30,7 +31,7 @@ use crate::cache::CacheManagerRef;
 use crate::config::{BloomFilterConfig, FulltextIndexConfig, InvertedIndexConfig};
 use crate::error::{CleanDirSnafu, DeleteIndexSnafu, DeleteSstSnafu, OpenDalSnafu, Result};
 use crate::metrics::{COMPACTION_STAGE_ELAPSED, FLUSH_ELAPSED};
-use crate::read::Source;
+use crate::read::{FlatSource, Source};
 use crate::region::options::IndexOptions;
 use crate::sst::file::{FileHandle, FileId, FileMeta, RegionFileId};
 use crate::sst::index::intermediate::IntermediateManager;
@@ -279,8 +280,15 @@ impl AccessLayer {
             )
             .await
             .with_file_cleaner(cleaner);
+            let source = match request.source {
+                Either::Left(source) => source,
+                Either::Right(_flat_source) => {
+                    // TODO: Handle FlatSource
+                    todo!("FlatSource is not yet supported")
+                }
+            };
             let ssts = writer
-                .write_all(request.source, request.max_sequence, write_opts)
+                .write_all(source, request.max_sequence, write_opts)
                 .await?;
             let metrics = writer.into_metrics();
             (ssts, metrics)
@@ -313,7 +321,7 @@ pub enum OperationType {
 pub struct SstWriteRequest {
     pub op_type: OperationType,
     pub metadata: RegionMetadataRef,
-    pub source: Source,
+    pub source: Either<Source, FlatSource>,
     pub cache_manager: CacheManagerRef,
     #[allow(dead_code)]
     pub storage: Option<String>,
