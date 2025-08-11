@@ -37,7 +37,6 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
-use serde::de::Unexpected;
 use smallvec::smallvec;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadataRef;
@@ -57,7 +56,7 @@ use crate::sst::parquet::flat_format::{time_index_column_index, FlatWriteFormat}
 use crate::sst::parquet::format::PrimaryKeyWriteFormat;
 use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::parquet::{SstInfo, WriteOptions, PARQUET_METADATA_KEY};
-use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
+use crate::sst::{FlatSchemaOptions, DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 /// Parquet SST writer.
 pub struct ParquetWriter<F: WriterFactory, I: IndexerBuilder, P: FilePathProvider> {
@@ -240,9 +239,7 @@ where
         source: FlatSource,
         opts: &WriteOptions,
     ) -> Result<SstInfoArray> {
-        let res = self
-            .write_all_flat_without_cleaning(source, opts)
-            .await;
+        let res = self.write_all_flat_without_cleaning(source, opts).await;
         if res.is_err() {
             // Clean tmp files explicitly on failure.
             let file_id = self.current_file;
@@ -280,6 +277,50 @@ where
                         .update(&mut batch)
                         .await;
                     self.metrics.update_index += start.elapsed();
+                    if let Some(max_file_size) = opts.max_file_size
+                        && self.bytes_written.load(Ordering::Relaxed) > max_file_size
+                    {
+                        self.finish_current_file(&mut results, &mut stats).await?;
+                    }
+                }
+                Err(e) => {
+                    if let Some(indexer) = &mut self.current_indexer {
+                        indexer.abort().await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        self.finish_current_file(&mut results, &mut stats).await?;
+
+        // object_store.write will make sure all bytes are written or an error is raised.
+        Ok(results)
+    }
+
+    async fn write_all_flat_without_cleaning(
+        &mut self,
+        mut source: FlatSource,
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let mut results = smallvec![];
+        let flat_format =
+            FlatWriteFormat::new(self.metadata.clone(), &FlatSchemaOptions::default())
+                .with_override_sequence(None);
+        let mut stats = SourceStats::default();
+
+        while let Some(record_batch) = self
+            .write_next_flat_batch(&mut source, &flat_format, opts)
+            .await
+            .transpose()
+        {
+            match record_batch {
+                Ok(batch) => {
+                    stats.update_flat(&batch)?;
+
+                    // TODO: Indexer support is ignored for now, but left as todo for future implementation
+                    // The indexer would need to be updated to handle RecordBatch format
+
                     if let Some(max_file_size) = opts.max_file_size
                         && self.bytes_written.load(Ordering::Relaxed) > max_file_size
                     {
@@ -342,6 +383,30 @@ where
             .context(WriteParquetSnafu)?;
         self.metrics.write_batch += start.elapsed();
         Ok(Some(batch))
+    }
+
+    async fn write_next_flat_batch(
+        &mut self,
+        source: &mut FlatSource,
+        flat_format: &FlatWriteFormat,
+        opts: &WriteOptions,
+    ) -> Result<Option<RecordBatch>> {
+        let start = Instant::now();
+        let Some(record_batch) = source.next_batch().await? else {
+            return Ok(None);
+        };
+        self.metrics.iter_source += start.elapsed();
+
+        let arrow_batch = flat_format.convert_batch(&record_batch)?;
+
+        let start = Instant::now();
+        self.maybe_init_writer(flat_format.arrow_schema(), opts)
+            .await?
+            .write(&arrow_batch)
+            .await
+            .context(WriteParquetSnafu)?;
+        self.metrics.write_batch += start.elapsed();
+        Ok(Some(record_batch))
     }
 
     async fn maybe_init_writer(
