@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, Time};
+use datatypes::arrow::record_batch::RecordBatch;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
@@ -33,11 +34,10 @@ use crate::metrics::{
 };
 use crate::read::range::{RangeBuilderList, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
-use crate::read::{Batch, BoxedBatchStream, ScannerMetrics, Source};
+use crate::read::{Batch, BoxedBatchStream, FlatSource, ScannerMetrics, Source};
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::reader::{ReaderFilterMetrics, ReaderMetrics};
-use datatypes::arrow::record_batch::RecordBatch;
 
 /// Verbose scan metrics for a partition.
 #[derive(Default)]
@@ -647,6 +647,34 @@ pub(crate) fn scan_mem_ranges(
     }
 }
 
+/// Scans memtable ranges at `index` using flat format that returns RecordBatch.
+pub(crate) fn scan_mem_ranges_flat(
+    stream_ctx: Arc<StreamContext>,
+    part_metrics: PartitionMetrics,
+    index: RowGroupIndex,
+) -> impl Stream<Item = Result<RecordBatch>> {
+    try_stream! {
+        let ranges = stream_ctx.input.build_mem_ranges(index);
+        part_metrics.inc_num_mem_ranges(ranges.len());
+        for range in ranges {
+            let build_reader_start = Instant::now();
+            let mem_scan_metrics = Some(MemScanMetrics::default());
+            let mut iter = range.build_record_batch_iter(mem_scan_metrics.clone())?;
+            part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
+
+            while let Some(record_batch) = iter.next().transpose()? {
+                yield record_batch;
+            }
+
+            // Report the memtable scan metrics to partition metrics
+            if let Some(ref metrics) = mem_scan_metrics {
+                let data = metrics.data();
+                part_metrics.report_mem_scan_metrics(&data);
+            }
+        }
+    }
+}
+
 /// Scans file ranges at `index`.
 pub(crate) async fn scan_file_ranges(
     stream_ctx: Arc<StreamContext>,
@@ -742,14 +770,14 @@ pub fn build_file_range_scan_stream_flat(
             let mut reader = range.flat_reader().await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
-            
+
             // TODO: Add compat_batch support for RecordBatch similar to the non-flat version
             // let compat_batch = range.compat_batch();
-            
+
             while let Some(record_batch) = reader.next_batch()? {
                 yield record_batch;
             }
-            
+
             let prune_metrics = reader.metrics();
             reader_metrics.merge_from(&prune_metrics);
         }
