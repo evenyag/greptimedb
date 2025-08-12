@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_base::readable_size::ReadableSize;
-use either::Either;
 use common_telemetry::{debug, info};
+use either::Either;
 use futures::AsyncWriteExt;
 use object_store::ObjectStore;
 use snafu::ResultExt;
