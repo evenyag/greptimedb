@@ -126,6 +126,13 @@ impl Memtable for BulkMemtable {
         let mut ranges = BTreeMap::new();
         let mut range_id = 0;
 
+        // Create context once and reuse it
+        let context = Arc::new(BulkIterContext::new(
+            self.metadata.clone(),
+            &projection,
+            predicate.predicate().cloned(),
+        ));
+
         // Add ranges for regular parts
         {
             let parts = self.parts.read().unwrap();
@@ -140,10 +147,8 @@ impl Memtable for BulkMemtable {
                         self.id,
                         Box::new(BulkRangeIterBuilder {
                             part: part.clone(),
-                            projection: projection.map(|p| p.to_vec()),
-                            predicate: predicate.clone(),
+                            context: context.clone(),
                             sequence,
-                            metadata: self.metadata.clone(),
                         }),
                         predicate.clone(),
                     )),
@@ -168,10 +173,8 @@ impl Memtable for BulkMemtable {
                         self.id,
                         Box::new(EncodedBulkRangeIterBuilder {
                             part: encoded_part.clone(),
-                            projection: projection.map(|p| p.to_vec()),
-                            predicate: predicate.clone(),
+                            context: context.clone(),
                             sequence,
-                            metadata: self.metadata.clone(),
                         }),
                         predicate.clone(),
                     )),
@@ -302,10 +305,8 @@ impl BulkMemtable {
 /// Iterator builder for bulk range
 struct BulkRangeIterBuilder {
     part: BulkPart,
-    projection: Option<Vec<ColumnId>>,
-    predicate: PredicateGroup,
+    context: Arc<BulkIterContext>,
     sequence: Option<SequenceNumber>,
-    metadata: RegionMetadataRef,
 }
 
 impl IterBuilder for BulkRangeIterBuilder {
@@ -324,13 +325,11 @@ impl IterBuilder for BulkRangeIterBuilder {
         &self,
         _metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        let context = Arc::new(BulkIterContext::new(
-            self.metadata.clone(),
-            &self.projection.as_ref().map(|p| p.as_slice()),
-            self.predicate.predicate().cloned(),
-        ));
-
-        let iter = BulkPartRecordBatchIter::new(self.part.batch.clone(), context, self.sequence);
+        let iter = BulkPartRecordBatchIter::new(
+            self.part.batch.clone(),
+            self.context.clone(),
+            self.sequence,
+        );
 
         Ok(Box::new(iter))
     }
@@ -339,10 +338,8 @@ impl IterBuilder for BulkRangeIterBuilder {
 /// Iterator builder for encoded bulk range
 struct EncodedBulkRangeIterBuilder {
     part: EncodedBulkPart,
-    projection: Option<Vec<ColumnId>>,
-    predicate: PredicateGroup,
+    context: Arc<BulkIterContext>,
     sequence: Option<SequenceNumber>,
-    metadata: RegionMetadataRef,
 }
 
 impl IterBuilder for EncodedBulkRangeIterBuilder {
@@ -361,19 +358,11 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
         &self,
         _metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        let context = Arc::new(BulkIterContext::new(
-            self.metadata.clone(),
-            &self.projection.as_ref().map(|p| p.as_slice()),
-            self.predicate.predicate().cloned(),
-        ));
-
-        if let Some(iter) = self.part.read(context, self.sequence)? {
+        if let Some(iter) = self.part.read(self.context.clone(), self.sequence)? {
             Ok(iter)
         } else {
             // Return an empty iterator if no data to read
-            Ok(Box::new(std::iter::empty::<
-                error::Result<arrow::record_batch::RecordBatch>,
-            >()))
+            Ok(Box::new(std::iter::empty()))
         }
     }
 }

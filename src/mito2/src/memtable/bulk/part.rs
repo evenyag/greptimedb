@@ -505,7 +505,7 @@ fn sort_primary_key_record_batch(batch: &RecordBatch) -> Result<RecordBatch> {
     datatypes::arrow::compute::take_record_batch(batch, &indices).context(ComputeArrowSnafu)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncodedBulkPart {
     data: Bytes,
     metadata: BulkPartMeta,
@@ -544,7 +544,7 @@ impl EncodedBulkPart {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BulkPartMeta {
     /// Total rows in part.
     pub num_rows: usize,
