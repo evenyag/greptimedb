@@ -367,6 +367,24 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
     }
 }
 
+struct MemtableCompactor;
+
+impl MemtableCompactor {
+    /// Returns true if the bulk parts should be merged.
+    fn should_merge_parts(parts: &RwLock<Vec<BulkPart>>) -> bool {
+        todo!()
+    }
+
+    /// Merges bulk parts and then encodes the result to an [EncodedBulkPart].
+    fn merge_parts(
+        &mut self,
+        parts: &RwLock<Vec<BulkPart>>,
+        encoded_parts: &RwLock<Vec<EncodedBulkPart>>,
+    ) -> Result<()> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
