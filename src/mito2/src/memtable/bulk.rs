@@ -36,14 +36,15 @@ use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, IterBuilder, KeyValues,
-    MemScanMetrics, Memtable, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges,
-    MemtableRef, MemtableStats, PredicateGroup,
+    AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, EncodedBulkPart, IterBuilder,
+    KeyValues, MemScanMetrics, Memtable, MemtableId, MemtableRange, MemtableRangeContext,
+    MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
 };
 
 pub struct BulkMemtable {
     id: MemtableId,
     parts: RwLock<Vec<BulkPart>>,
+    encoded_parts: RwLock<Vec<EncodedBulkPart>>,
     metadata: RegionMetadataRef,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
@@ -122,30 +123,63 @@ impl Memtable for BulkMemtable {
         predicate: PredicateGroup,
         sequence: Option<SequenceNumber>,
     ) -> Result<MemtableRanges> {
-        let parts = self.parts.read().unwrap();
         let mut ranges = BTreeMap::new();
+        let mut range_id = 0;
 
-        for (range_id, part) in parts.iter().enumerate() {
-            // Skip empty parts
-            if part.num_rows() == 0 {
-                continue;
+        // Add ranges for regular parts
+        {
+            let parts = self.parts.read().unwrap();
+            for part in parts.iter() {
+                // Skip empty parts
+                if part.num_rows() == 0 {
+                    continue;
+                }
+
+                let range = MemtableRange::new(
+                    Arc::new(MemtableRangeContext::new(
+                        self.id,
+                        Box::new(BulkRangeIterBuilder {
+                            part: part.clone(),
+                            projection: projection.map(|p| p.to_vec()),
+                            predicate: predicate.clone(),
+                            sequence,
+                            metadata: self.metadata.clone(),
+                        }),
+                        predicate.clone(),
+                    )),
+                    part.num_rows(),
+                );
+                ranges.insert(range_id, range);
+                range_id += 1;
             }
+        }
 
-            let range = MemtableRange::new(
-                Arc::new(MemtableRangeContext::new(
-                    self.id,
-                    Box::new(BulkRangeIterBuilder {
-                        part: part.clone(),
-                        projection: projection.map(|p| p.to_vec()),
-                        predicate: predicate.clone(),
-                        sequence,
-                        metadata: self.metadata.clone(),
-                    }),
-                    predicate.clone(),
-                )),
-                part.num_rows(),
-            );
-            ranges.insert(range_id, range);
+        // Add ranges for encoded parts
+        {
+            let encoded_parts = self.encoded_parts.read().unwrap();
+            for encoded_part in encoded_parts.iter() {
+                // Skip empty parts
+                if encoded_part.metadata().num_rows == 0 {
+                    continue;
+                }
+
+                let range = MemtableRange::new(
+                    Arc::new(MemtableRangeContext::new(
+                        self.id,
+                        Box::new(EncodedBulkRangeIterBuilder {
+                            part: encoded_part.clone(),
+                            projection: projection.map(|p| p.to_vec()),
+                            predicate: predicate.clone(),
+                            sequence,
+                            metadata: self.metadata.clone(),
+                        }),
+                        predicate.clone(),
+                    )),
+                    encoded_part.metadata().num_rows,
+                );
+                ranges.insert(range_id, range);
+                range_id += 1;
+            }
         }
 
         let mut stats = self.stats();
@@ -156,7 +190,9 @@ impl Memtable for BulkMemtable {
     }
 
     fn is_empty(&self) -> bool {
-        self.parts.read().unwrap().is_empty()
+        let parts_empty = self.parts.read().unwrap().is_empty();
+        let encoded_parts_empty = self.encoded_parts.read().unwrap().is_empty();
+        parts_empty && encoded_parts_empty
     }
 
     fn freeze(&self) -> Result<()> {
@@ -205,6 +241,7 @@ impl Memtable for BulkMemtable {
         Arc::new(Self {
             id,
             parts: RwLock::new(vec![]),
+            encoded_parts: RwLock::new(vec![]),
             metadata: metadata.clone(),
             alloc_tracker: AllocTracker::new(self.alloc_tracker.write_buffer_manager()),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -212,6 +249,14 @@ impl Memtable for BulkMemtable {
             max_sequence: AtomicU64::new(0),
             num_rows: AtomicUsize::new(0),
         })
+    }
+
+    fn should_compact(&self) -> bool {
+        false
+    }
+
+    fn compact(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -225,6 +270,7 @@ impl BulkMemtable {
         Self {
             id,
             parts: RwLock::new(vec![]),
+            encoded_parts: RwLock::new(vec![]),
             metadata,
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -287,6 +333,48 @@ impl IterBuilder for BulkRangeIterBuilder {
         let iter = BulkPartRecordBatchIter::new(self.part.batch.clone(), context, self.sequence);
 
         Ok(Box::new(iter))
+    }
+}
+
+/// Iterator builder for encoded bulk range
+struct EncodedBulkRangeIterBuilder {
+    part: EncodedBulkPart,
+    projection: Option<Vec<ColumnId>>,
+    predicate: PredicateGroup,
+    sequence: Option<SequenceNumber>,
+    metadata: RegionMetadataRef,
+}
+
+impl IterBuilder for EncodedBulkRangeIterBuilder {
+    fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+        UnsupportedOperationSnafu {
+            err_msg: "BatchIterator is not supported for encoded bulk memtable",
+        }
+        .fail()
+    }
+
+    fn is_record_batch(&self) -> bool {
+        true
+    }
+
+    fn build_record_batch(
+        &self,
+        _metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        let context = Arc::new(BulkIterContext::new(
+            self.metadata.clone(),
+            &self.projection.as_ref().map(|p| p.as_slice()),
+            self.predicate.predicate().cloned(),
+        ));
+
+        if let Some(iter) = self.part.read(context, self.sequence)? {
+            Ok(iter)
+        } else {
+            // Return an empty iterator if no data to read
+            Ok(Box::new(std::iter::empty::<
+                error::Result<arrow::record_batch::RecordBatch>,
+            >()))
+        }
     }
 }
 
