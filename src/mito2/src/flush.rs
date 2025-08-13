@@ -32,6 +32,8 @@ use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
+use crate::memtable::time_partition::TimePartitionsRef;
+use crate::memtable::version::SmallMemtableVec;
 use crate::memtable::MemtableRanges;
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
@@ -546,6 +548,10 @@ impl FlushScheduler {
             .region_status
             .entry(region_id)
             .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
+
+        // Always set mem only to false because we need to flush the memtable.
+        flush_status.mem_only = false;
+
         // Checks whether we can flush the region now.
         if flush_status.flushing {
             // There is already a flush job running.
@@ -583,6 +589,51 @@ impl FlushScheduler {
         flush_status.flushing = true;
 
         Ok(())
+    }
+
+    /// Schedules a memtable compact `task` for specific `region`.
+    pub(crate) fn schedule_mem_compact(
+        &mut self,
+        region_id: RegionId,
+        version_control: &VersionControlRef,
+    ) {
+        let version = version_control.current().version;
+        if version.memtables.is_empty() {
+            debug_assert!(!self.region_status.contains_key(&region_id));
+            return;
+        }
+
+        // // Don't increase the counter if a region has nothing to flush.
+        // FLUSH_REQUESTS_TOTAL
+        //     .with_label_values(&[task.reason.as_str()])
+        //     .inc();
+
+        // Add this region to status map.
+        let flush_status = self
+            .region_status
+            .entry(region_id)
+            .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
+        // Checks whether we can flush the region now.
+        if flush_status.flushing {
+            return;
+        }
+
+        // Gets the mutable memtables.
+        let mutable = version.memtables.mutable.clone();
+        // Submit a flush job.
+        let job = compact_memtables(region_id, mutable);
+        if let Err(e) = self.scheduler.schedule(job) {
+            // If scheduler returns error, senders in the job will be dropped and waiters
+            // can get recv errors.
+            error!(e; "Failed to schedule mem compact job for region {}", region_id);
+
+            // Remove from region status if we can't submit the task.
+            self.region_status.remove(&region_id);
+            return;
+        }
+
+        flush_status.flushing = true;
+        flush_status.mem_only = true;
     }
 
     /// Notifies the scheduler that the flush job is finished.
@@ -763,6 +814,24 @@ impl Drop for FlushScheduler {
     }
 }
 
+/// Returns a job to compact memtables.
+fn compact_memtables(region_id: RegionId, mutable: TimePartitionsRef) -> Job {
+    Box::pin(async move {
+        INFLIGHT_FLUSH_COUNT.inc();
+
+        let mut memtables = SmallMemtableVec::new();
+        mutable.list_memtables_to_small_vec(&mut memtables);
+
+        for mem in memtables {
+            if let Err(e) = mem.compact() {
+                error!(e; "Failed to compact table for region {region_id}");
+            }
+        }
+
+        INFLIGHT_FLUSH_COUNT.dec();
+    })
+}
+
 /// Flush status of a region scheduled by the [FlushScheduler].
 ///
 /// Tracks running and pending flush tasks and all pending requests of a region.
@@ -784,6 +853,9 @@ struct FlushStatus {
     pending_writes: Vec<SenderWriteRequest>,
     /// Bulk requests waiting to write after altering the region.
     pending_bulk_writes: Vec<SenderBulkRequest>,
+
+    /// Only compact the memtable.
+    mem_only: bool,
 }
 
 impl FlushStatus {
@@ -796,6 +868,7 @@ impl FlushStatus {
             pending_ddls: Vec::new(),
             pending_writes: Vec::new(),
             pending_bulk_writes: Vec::new(),
+            mem_only: false,
         }
     }
 

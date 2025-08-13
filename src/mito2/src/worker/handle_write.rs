@@ -126,6 +126,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 region_ctx.write_bulk().await;
                 put_rows += region_ctx.put_num;
                 delete_rows += region_ctx.delete_num;
+
+                if region_ctx.should_compact() {
+                    self.flush_scheduler
+                        .schedule_mem_compact(region_ctx.region_id, &region_ctx.version_control);
+                }
             } else {
                 let region_write_task = region_ctxs
                     .into_values()
@@ -134,16 +139,23 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         common_runtime::spawn_global(async move {
                             region_ctx.write_memtable().await;
                             region_ctx.write_bulk().await;
-                            (region_ctx.put_num, region_ctx.delete_num)
+                            (region_ctx.put_num, region_ctx.delete_num, region_ctx)
                         })
                     })
                     .collect::<Vec<_>>();
 
                 for result in futures::future::join_all(region_write_task).await {
                     match result {
-                        Ok((put, delete)) => {
+                        Ok((put, delete, region_ctx)) => {
                             put_rows += put;
                             delete_rows += delete;
+
+                            if region_ctx.should_compact() {
+                                self.flush_scheduler.schedule_mem_compact(
+                                    region_ctx.region_id,
+                                    &region_ctx.version_control,
+                                );
+                            }
                         }
                         Err(e) => {
                             error!(e; "unexpected error when joining region write tasks");

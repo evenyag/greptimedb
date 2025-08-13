@@ -72,11 +72,11 @@ impl Drop for WriteNotify {
 /// Context to keep region metadata and buffer write requests.
 pub(crate) struct RegionWriteCtx {
     /// Id of region to write.
-    region_id: RegionId,
+    pub(crate) region_id: RegionId,
     /// Version of the region while creating the context.
     version: VersionRef,
     /// VersionControl of the region.
-    version_control: VersionControlRef,
+    pub(crate) version_control: VersionControlRef,
     /// Next sequence number to write.
     ///
     /// The context assigns a unique sequence number for each row.
@@ -311,5 +311,9 @@ impl RegionWriteCtx {
 
         self.version_control
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
+    }
+
+    pub(crate) fn should_compact(&self) -> bool {
+        self.version.memtables.mutable.should_compact()
     }
 }
