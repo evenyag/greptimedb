@@ -36,6 +36,7 @@ use crate::read::Batch;
 pub enum ScanBatch {
     Normal(Batch),
     Series(SeriesBatch),
+    RecordBatch(DfRecordBatch),
 }
 
 pub type ScanBatchStream = BoxStream<'static, Result<ScanBatch>>;
@@ -98,6 +99,11 @@ impl ConvertBatchStream {
                         .context(ArrowComputeSnafu)?;
 
                 RecordBatch::try_from_df_record_batch(output_schema, record_batch)
+            }
+            ScanBatch::RecordBatch(df_record_batch) => {
+                let output_schema = self.projection_mapper.output_schema();
+                // FIXME(yingwen): Use the projection mapper to convert it.
+                RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)
             }
         }
     }

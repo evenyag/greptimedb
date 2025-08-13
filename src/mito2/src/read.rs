@@ -1030,6 +1030,9 @@ pub type BoxedBatchReader = Box<dyn BatchReader>;
 /// Pointer to a stream that yields [Batch].
 pub type BoxedBatchStream = BoxStream<'static, Result<Batch>>;
 
+/// Pointer to a stream that yields [RecordBatch].
+pub type BoxedRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
+
 #[async_trait::async_trait]
 impl<T: BatchReader + ?Sized> BatchReader for Box<T> {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {

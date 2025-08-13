@@ -34,7 +34,9 @@ use crate::metrics::{
 };
 use crate::read::range::{RangeBuilderList, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
-use crate::read::{Batch, BoxedBatchStream, FlatSource, ScannerMetrics, Source};
+use crate::read::{
+    Batch, BoxedBatchStream, BoxedRecordBatchStream, FlatSource, ScannerMetrics, Source,
+};
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::reader::{ReaderFilterMetrics, ReaderMetrics};
@@ -648,7 +650,7 @@ pub(crate) fn scan_mem_ranges(
 }
 
 /// Scans memtable ranges at `index` using flat format that returns RecordBatch.
-pub(crate) fn scan_mem_ranges_flat(
+pub(crate) fn scan_flat_mem_ranges(
     stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     index: RowGroupIndex,
@@ -699,7 +701,7 @@ pub(crate) async fn scan_file_ranges(
 }
 
 /// Scans file ranges at `index` using flat reader that returns RecordBatch.
-pub(crate) async fn scan_file_ranges_flat(
+pub(crate) async fn scan_flat_file_ranges(
     stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     index: RowGroupIndex,
@@ -828,4 +830,19 @@ pub(crate) async fn maybe_scan_other_ranges(
         }
         .fail()
     }
+}
+
+pub(crate) async fn maybe_scan_flat_other_ranges(
+    context: &Arc<StreamContext>,
+    index: RowGroupIndex,
+    metrics: &PartitionMetrics,
+) -> Result<BoxedRecordBatchStream> {
+    let _ = context;
+    let _ = index;
+    let _ = metrics;
+
+    crate::error::UnexpectedSnafu {
+        reason: "no other ranges scannable in flat format",
+    }
+    .fail()
 }
