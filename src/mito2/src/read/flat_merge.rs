@@ -285,6 +285,14 @@ impl<T: NodeCmp> MergeAlgo<T> {
     }
 }
 
+impl Iterator for MergeIterator {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
+    }
+}
+
 // TODO(yingwen): Further downcast and store arrays in this struct.
 /// Columns to compare for a [RecordBatch].
 struct SortColumns {
