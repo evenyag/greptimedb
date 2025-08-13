@@ -67,17 +67,11 @@ impl ConvertBatchStream {
     }
 
     fn convert(&mut self, batch: ScanBatch) -> common_recordbatch::error::Result<RecordBatch> {
-        let mapper = self
-            .projection_mapper
-            .as_primary_key()
-            .context(UnexpectedSnafu {
-                reason: "Unexpected format",
-            })
-            .map_err(|e| BoxedError::new(e) as _)
-            .context(ExternalSnafu)?;
-
         match batch {
             ScanBatch::Normal(batch) => {
+                // Safety: Only primary key format returns this batch.
+                let mapper = self.projection_mapper.as_primary_key().unwrap();
+
                 if batch.is_empty() {
                     Ok(mapper.empty_record_batch())
                 } else {
@@ -87,6 +81,8 @@ impl ConvertBatchStream {
             ScanBatch::Series(series) => {
                 self.buffer.clear();
                 self.buffer.reserve(series.batches.len());
+                // Safety: Only primary key format returns this batch.
+                let mapper = self.projection_mapper.as_primary_key().unwrap();
 
                 for batch in series.batches {
                     let record_batch = mapper.convert(&batch, &self.cache_strategy)?;
@@ -101,9 +97,10 @@ impl ConvertBatchStream {
                 RecordBatch::try_from_df_record_batch(output_schema, record_batch)
             }
             ScanBatch::RecordBatch(df_record_batch) => {
-                let output_schema = self.projection_mapper.output_schema();
-                // FIXME(yingwen): Use the projection mapper to convert it.
-                RecordBatch::try_from_df_record_batch(output_schema, df_record_batch)
+                // Safety: Only flat key format returns this batch.
+                let mapper = self.projection_mapper.as_flat().unwrap();
+
+                mapper.convert(&df_record_batch)
             }
         }
     }
