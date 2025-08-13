@@ -581,6 +581,51 @@ impl BulkPartEncoder {
 }
 
 impl BulkPartEncoder {
+    /// Encodes BoxedRecordBatchIterator into EncodedBulkPart with min/max timestamps.
+    pub fn encode_record_batch_iter(
+        &self,
+        iter: BoxedRecordBatchIterator,
+        arrow_schema: SchemaRef,
+        min_timestamp: i64,
+        max_timestamp: i64,
+    ) -> Result<Option<EncodedBulkPart>> {
+        let mut buf = Vec::with_capacity(4096);
+        let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, self.writer_props.clone())
+            .context(EncodeMemtableSnafu)?;
+        let mut total_rows = 0;
+
+        // Process each batch from the iterator
+        for batch_result in iter {
+            let batch = batch_result?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            writer.write(&batch).context(EncodeMemtableSnafu)?;
+            total_rows += batch.num_rows();
+        }
+
+        if total_rows == 0 {
+            return Ok(None);
+        }
+
+        let file_metadata = writer.close().context(EncodeMemtableSnafu)?;
+
+        let buf = Bytes::from(buf);
+        let parquet_metadata = Arc::new(parse_parquet_metadata(file_metadata)?);
+
+        Ok(Some(EncodedBulkPart {
+            data: buf,
+            metadata: BulkPartMeta {
+                num_rows: total_rows,
+                max_timestamp,
+                min_timestamp,
+                parquet_metadata,
+                region_metadata: self.metadata.clone(),
+            },
+        }))
+    }
+
     /// Encodes bulk part to a [EncodedBulkPart], returns the encoded data.
     fn encode_part(&self, part: &BulkPart) -> Result<Option<EncodedBulkPart>> {
         if part.batch.num_rows() == 0 {
