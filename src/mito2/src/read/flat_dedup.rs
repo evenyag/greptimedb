@@ -15,6 +15,7 @@
 //! Dedup implementation for flat format.
 
 use api::v1::OpType;
+use async_stream::try_stream;
 use datatypes::arrow::array::{
     make_comparator, Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder, UInt64Array,
     UInt8Array,
@@ -105,6 +106,15 @@ impl<I: Stream<Item = Result<RecordBatch>> + Unpin, S: RecordBatchDedupStrategy>
         }
 
         self.strategy.finish(&mut self.metrics)
+    }
+
+    /// Converts the reader into a stream.
+    pub fn into_stream(mut self) -> impl Stream<Item = Result<RecordBatch>> {
+        try_stream! {
+            while let Some(batch) = self.fetch_next_batch().await? {
+                yield batch;
+            }
+        }
     }
 }
 
