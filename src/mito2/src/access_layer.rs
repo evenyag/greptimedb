@@ -280,16 +280,16 @@ impl AccessLayer {
             )
             .await
             .with_file_cleaner(cleaner);
-            let source = match request.source {
-                Either::Left(source) => source,
-                Either::Right(_flat_source) => {
-                    // TODO: Handle FlatSource
-                    todo!("FlatSource is not yet supported")
+            let ssts = match request.source {
+                Either::Left(source) => {
+                    writer
+                        .write_all(source, request.max_sequence, write_opts)
+                        .await?
+                }
+                Either::Right(flat_source) => {
+                    writer.write_all_flat(flat_source, write_opts).await?
                 }
             };
-            let ssts = writer
-                .write_all(source, request.max_sequence, write_opts)
-                .await?;
             let metrics = writer.into_metrics();
             (ssts, metrics)
         };
