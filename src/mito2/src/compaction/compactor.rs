@@ -38,8 +38,9 @@ use crate::error::{EmptyRegionDirSnafu, JoinSnafu, ObjectStoreNotFoundSnafu, Res
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::manifest::storage::manifest_compress_type;
+use crate::memtable::MemtableConfig;
 use crate::metrics;
-use crate::read::Source;
+use crate::read::{FlatSource, Source};
 use crate::region::opener::new_manifest_dir;
 use crate::region::options::RegionOptions;
 use crate::region::version::VersionRef;
@@ -318,6 +319,10 @@ impl Compactor for DefaultCompactor {
             let region_id = compaction_region.region_id;
             let cache_manager = compaction_region.cache_manager.clone();
             let storage = compaction_region.region_options.storage.clone();
+            let flat_format = matches!(
+                compaction_region.engine_config.memtable,
+                MemtableConfig::Bulk
+            );
             let index_options = compaction_region
                 .current_version
                 .options
@@ -341,7 +346,7 @@ impl Compactor for DefaultCompactor {
                     .iter()
                     .map(|f| f.file_id().to_string())
                     .join(",");
-                let reader = CompactionSstReaderBuilder {
+                let builder = CompactionSstReaderBuilder {
                     metadata: region_metadata.clone(),
                     sst_layer: sst_layer.clone(),
                     cache: cache_manager.clone(),
@@ -350,15 +355,20 @@ impl Compactor for DefaultCompactor {
                     filter_deleted: output.filter_deleted,
                     time_range: output.output_time_range,
                     merge_mode,
-                }
-                .build_sst_reader()
-                .await?;
+                };
+                let source = if flat_format {
+                    let reader = builder.build_flat_sst_reader().await?;
+                    Either::Right(FlatSource::Stream(reader))
+                } else {
+                    let reader = builder.build_sst_reader().await?;
+                    Either::Left(Source::Reader(reader))
+                };
                 let (sst_infos, metrics) = sst_layer
                     .write_sst(
                         SstWriteRequest {
                             op_type: OperationType::Compact,
                             metadata: region_metadata,
-                            source: Either::Left(Source::Reader(reader)),
+                            source,
                             cache_manager,
                             storage,
                             max_sequence: max_sequence.map(NonZero::get),
