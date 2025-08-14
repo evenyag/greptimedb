@@ -998,6 +998,8 @@ impl Source {
 pub enum FlatSource {
     /// Source from a [BoxedRecordBatchIterator].
     Iter(BoxedRecordBatchIterator),
+    /// Source from a [BoxedRecordBatchStream].
+    Stream(BoxedRecordBatchStream),
 }
 
 impl FlatSource {
@@ -1005,6 +1007,7 @@ impl FlatSource {
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self {
             FlatSource::Iter(iter) => iter.next().transpose(),
+            FlatSource::Stream(stream) => stream.try_next().await,
         }
     }
 }
