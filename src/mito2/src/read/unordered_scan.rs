@@ -229,10 +229,16 @@ impl UnorderedScan {
         }
 
         let metrics = self.partition_metrics(ctx.explain_verbose, partition, metrics_set);
-
-        let batch_stream = self.scan_batch_in_partition(partition, metrics.clone())?;
-
         let input = &self.stream_ctx.input;
+
+        let batch_stream = if input.flat_format {
+            // Use flat scan for bulk memtables
+            self.scan_flat_batch_in_partition(partition, metrics.clone())?
+        } else {
+            // Use regular batch scan for normal memtables
+            self.scan_batch_in_partition(partition, metrics.clone())?
+        };
+
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
             input.mapper.clone(),
@@ -334,7 +340,7 @@ impl UnorderedScan {
         &self,
         partition: usize,
         part_metrics: PartitionMetrics,
-    ) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+    ) -> Result<ScanBatchStream> {
         ensure!(
             partition < self.properties.partitions.len(),
             PartitionOutOfRangeSnafu {
@@ -376,7 +382,7 @@ impl UnorderedScan {
                     }
 
                     let yield_start = Instant::now();
-                    yield record_batch;
+                    yield ScanBatch::RecordBatch(record_batch);
                     metrics.yield_cost += yield_start.elapsed();
 
                     fetch_start = Instant::now();
@@ -388,7 +394,7 @@ impl UnorderedScan {
 
             part_metrics.on_finish();
         };
-        Ok(stream)
+        Ok(Box::pin(stream))
     }
 }
 

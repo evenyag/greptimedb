@@ -253,10 +253,16 @@ impl SeqScan {
         }
 
         let metrics = self.new_partition_metrics(ctx.explain_verbose, metrics_set, partition);
-
-        let batch_stream = self.scan_batch_in_partition(partition, metrics.clone())?;
-
         let input = &self.stream_ctx.input;
+
+        let batch_stream = if input.flat_format {
+            // Use flat scan for bulk memtables
+            self.scan_flat_batch_in_partition(partition, metrics.clone())?
+        } else {
+            // Use regular batch scan for normal memtables
+            self.scan_batch_in_partition(partition, metrics.clone())?
+        };
+
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
             input.mapper.clone(),

@@ -594,6 +594,9 @@ impl EngineInner {
         // Get cache.
         let cache_manager = self.workers.cache_manager();
 
+        // Determine if we should use flat format for bulk memtables
+        let flat_format = matches!(self.config.memtable, crate::memtable::MemtableConfig::Bulk);
+
         let scan_region = ScanRegion::new(
             version,
             region.access_layer.clone(),
@@ -605,7 +608,8 @@ impl EngineInner {
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
-        .with_start_time(query_start);
+        .with_start_time(query_start)
+        .with_flat_format(flat_format);
 
         #[cfg(feature = "enterprise")]
         let scan_region = self.maybe_fill_extension_range_provider(scan_region, region);

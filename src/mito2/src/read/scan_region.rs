@@ -212,6 +212,8 @@ pub(crate) struct ScanRegion {
     /// Whether to filter out the deleted rows.
     /// Usually true for normal read, and false for scan for compaction.
     filter_deleted: bool,
+    /// Whether to use flat format for bulk memtables.
+    flat_format: bool,
     #[cfg(feature = "enterprise")]
     extension_range_provider: Option<BoxedExtensionRangeProvider>,
 }
@@ -236,6 +238,7 @@ impl ScanRegion {
             ignore_bloom_filter: false,
             start_time: None,
             filter_deleted: true,
+            flat_format: false,
             #[cfg(feature = "enterprise")]
             extension_range_provider: None,
         }
@@ -290,6 +293,12 @@ impl ScanRegion {
 
     pub(crate) fn set_filter_deleted(&mut self, filter_deleted: bool) {
         self.filter_deleted = filter_deleted;
+    }
+
+    #[must_use]
+    pub(crate) fn with_flat_format(mut self, flat_format: bool) -> Self {
+        self.flat_format = flat_format;
+        self
     }
 
     #[cfg(feature = "enterprise")]
@@ -471,7 +480,8 @@ impl ScanRegion {
             .with_filter_deleted(self.filter_deleted)
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
-            .with_distribution(self.request.distribution);
+            .with_distribution(self.request.distribution)
+            .with_flat_format(self.flat_format);
 
         #[cfg(feature = "enterprise")]
         let input = if let Some(provider) = self.extension_range_provider {
@@ -673,6 +683,8 @@ pub struct ScanInput {
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
+    /// Whether to use flat format for bulk memtables.
+    pub(crate) flat_format: bool,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -701,6 +713,7 @@ impl ScanInput {
             merge_mode: MergeMode::default(),
             series_row_selector: None,
             distribution: None,
+            flat_format: false,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -842,6 +855,13 @@ impl ScanInput {
         series_row_selector: Option<TimeSeriesRowSelector>,
     ) -> Self {
         self.series_row_selector = series_row_selector;
+        self
+    }
+
+    /// Sets the flat format flag for bulk memtables.
+    #[must_use]
+    pub(crate) fn with_flat_format(mut self, flat_format: bool) -> Self {
+        self.flat_format = flat_format;
         self
     }
 
