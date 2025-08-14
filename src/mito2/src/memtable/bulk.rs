@@ -37,8 +37,8 @@ use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, IterBuilder, KeyValues,
-    MemScanMetrics, Memtable, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges,
-    MemtableRef, MemtableStats, PredicateGroup,
+    MemScanMetrics, Memtable, MemtableBuilder, MemtableId, MemtableRange, MemtableRangeContext,
+    MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
 };
 
 pub struct BulkMemtable {
@@ -287,6 +287,35 @@ impl IterBuilder for BulkRangeIterBuilder {
         let iter = BulkPartRecordBatchIter::new(self.part.batch.clone(), context, self.sequence);
 
         Ok(Box::new(iter))
+    }
+}
+
+/// Builder to build a [BulkMemtable].
+#[derive(Debug, Default)]
+pub struct BulkMemtableBuilder {
+    write_buffer_manager: Option<WriteBufferManagerRef>,
+}
+
+impl BulkMemtableBuilder {
+    /// Creates a new builder with specific `write_buffer_manager`.
+    pub fn new(write_buffer_manager: Option<WriteBufferManagerRef>) -> Self {
+        Self {
+            write_buffer_manager,
+        }
+    }
+}
+
+impl MemtableBuilder for BulkMemtableBuilder {
+    fn build(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef {
+        Arc::new(BulkMemtable::new(
+            id,
+            metadata.clone(),
+            self.write_buffer_manager.clone(),
+        ))
+    }
+
+    fn use_bulk_insert(&self, _metadata: &RegionMetadataRef) -> bool {
+        true
     }
 }
 

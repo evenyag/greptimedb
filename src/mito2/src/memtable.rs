@@ -32,6 +32,7 @@ use store_api::storage::{ColumnId, SequenceNumber};
 use crate::config::MitoConfig;
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
+use crate::memtable::bulk::BulkMemtableBuilder;
 use crate::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtableBuilder};
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
@@ -66,6 +67,7 @@ pub type MemtableId = u32;
 pub enum MemtableConfig {
     PartitionTree(PartitionTreeConfig),
     TimeSeries,
+    Bulk,
 }
 
 impl Default for MemtableConfig {
@@ -157,7 +159,7 @@ impl MemtableRanges {
         self.ranges
             .values()
             .next()
-            .map_or(false, |range| range.is_record_batch())
+            .is_some_and(|range| range.is_record_batch())
     }
 }
 
@@ -372,6 +374,9 @@ impl MemtableBuilderProvider {
                 dedup,
                 merge_mode,
             )),
+            MemtableConfig::Bulk => {
+                Arc::new(BulkMemtableBuilder::new(self.write_buffer_manager.clone()))
+            }
         }
     }
 }
@@ -545,6 +550,13 @@ fork_dictionary_bytes = "512MiB"
         assert_eq!(8192, memtable_config.index_max_keys_per_shard);
         assert_eq!(1024, memtable_config.data_freeze_threshold);
         assert_eq!(ReadableSize::mb(512), memtable_config.fork_dictionary_bytes);
+    }
+
+    #[test]
+    fn test_deserialize_bulk_memtable_config() {
+        let s = r#"type = "bulk""#;
+        let config: MemtableConfig = toml::from_str(s).unwrap();
+        assert!(matches!(config, MemtableConfig::Bulk));
     }
 
     #[test]

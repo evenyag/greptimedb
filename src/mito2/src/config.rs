@@ -596,4 +596,14 @@ fork_dictionary_bytes = "512MiB"
         };
         assert_eq!(1024, config.data_freeze_threshold);
     }
+
+    #[test]
+    fn test_deserialize_bulk_config() {
+        let s = r#"
+[memtable]
+type = "bulk"
+"#;
+        let config: MitoConfig = toml::from_str(s).unwrap();
+        assert!(matches!(config.memtable, MemtableConfig::Bulk));
+    }
 }
