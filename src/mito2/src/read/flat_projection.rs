@@ -126,7 +126,7 @@ impl FlatProjectionMapper {
             })
             .collect();
 
-        let batch_schema = plain_projected_columns(metadata, &format_projection);
+        let batch_schema = flat_projected_columns(metadata, &format_projection);
 
         Ok(FlatProjectionMapper {
             metadata: metadata.clone(),
@@ -198,7 +198,7 @@ impl FlatProjectionMapper {
 }
 
 /// Returns ids and datatypes of columns of the output batch after applying the `projection`.
-pub(crate) fn plain_projected_columns(
+pub(crate) fn flat_projected_columns(
     metadata: &RegionMetadata,
     format_projection: &FormatProjection,
 ) -> Vec<(ColumnId, ConcreteDataType)> {
