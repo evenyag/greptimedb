@@ -928,6 +928,7 @@ impl ScanInput {
                     mapper,
                     flat_format.metadata(),
                     flat_format.format_projection(),
+                    need_convert,
                 )?
                 .map(CompatBatch::Flat)
             } else {

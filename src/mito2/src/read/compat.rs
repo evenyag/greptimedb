@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datatypes::arrow::array::{Array, BinaryArray, BinaryBuilder};
-use datatypes::arrow::datatypes::{Schema, SchemaRef};
+use datatypes::arrow::array::{Array, BinaryArray, BinaryBuilder, DictionaryArray, UInt32Array};
+use datatypes::arrow::datatypes::{Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::DataType;
@@ -34,7 +34,7 @@ use store_api::storage::ColumnId;
 
 use crate::error::{
     CompatReaderSnafu, ComputeArrowSnafu, CreateDefaultSnafu, DecodeSnafu, EncodeSnafu,
-    NewRecordBatchSnafu, Result, UnexpectedSnafu,
+    InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result, UnexpectedSnafu,
 };
 use crate::read::flat_projection::{flat_projected_columns, FlatProjectionMapper};
 use crate::read::projection::{PrimaryKeyProjectionMapper, ProjectionMapper};
@@ -238,6 +238,8 @@ pub(crate) struct FlatCompatBatch {
     arrow_schema: SchemaRef,
     /// Optional primary key adapter.
     compat_pk: FlatCompatPrimaryKey,
+    /// Optional format converter for decoding primary keys.
+    convert_format: Option<FlatConvertFormat>,
 }
 
 impl FlatCompatBatch {
@@ -249,6 +251,7 @@ impl FlatCompatBatch {
         mapper: &FlatProjectionMapper,
         actual: &RegionMetadataRef,
         format_projection: &FormatProjection,
+        convert_format: bool,
     ) -> Result<Option<Self>> {
         let actual_schema = flat_projected_columns(actual, format_projection);
         let expect_schema = mapper.batch_schema();
@@ -308,17 +311,33 @@ impl FlatCompatBatch {
 
         let compat_pk = FlatCompatPrimaryKey::new(mapper.metadata(), actual)?;
 
+        let convert_format = if convert_format {
+            let codec = if let Some(rewriter) = &compat_pk.rewriter {
+                rewriter.old_codec.clone()
+            } else {
+                build_primary_key_codec(actual)
+            };
+            FlatConvertFormat::new(actual.clone(), format_projection, codec)
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             actual_schema,
             index_or_defaults,
             arrow_schema: Arc::new(Schema::new(fields)),
             compat_pk,
+            convert_format,
         }))
     }
 
     /// Make columns of the `batch` compatible.
     #[must_use]
-    pub(crate) fn compat(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    pub(crate) fn compat(&self, mut batch: RecordBatch) -> Result<RecordBatch> {
+        // First, apply format conversion if needed
+        if let Some(convert_format) = &self.convert_format {
+            batch = convert_format.convert(batch)?;
+        }
         let len = batch.num_rows();
         let columns = self
             .index_or_defaults
@@ -903,6 +922,170 @@ impl FlatCompatPrimaryKey {
         columns[primary_key_column_index(batch.num_columns())] = Arc::new(new_pk_dict_array);
 
         RecordBatch::try_new(batch.schema(), columns).context(NewRecordBatchSnafu)
+    }
+}
+
+/// Converts a batch that doesn't have decoded primary key columns into a batch that has decoded
+/// primary key columns in flat format.
+pub(crate) struct FlatConvertFormat {
+    /// Metadata of the region.
+    metadata: RegionMetadataRef,
+    /// Primary key codec to decode primary keys.
+    codec: Arc<dyn PrimaryKeyCodec>,
+    /// Projected primary key column information: (column_id, pk_index).
+    projected_primary_keys: Vec<(ColumnId, usize)>,
+}
+
+impl FlatConvertFormat {
+    /// Creates a new `FlatConvertFormat`.
+    /// Returns `None` if there is no primary key.
+    pub(crate) fn new(
+        metadata: RegionMetadataRef,
+        format_projection: &FormatProjection,
+        codec: Arc<dyn PrimaryKeyCodec>,
+    ) -> Option<Self> {
+        if metadata.primary_key.is_empty() {
+            return None;
+        }
+
+        // Build projected primary keys list maintaining the order of RegionMetadata::primary_key
+        let mut projected_primary_keys = Vec::new();
+        for (pk_index, &column_id) in metadata.primary_key.iter().enumerate() {
+            if format_projection
+                .column_id_to_projected_index
+                .contains_key(&column_id)
+            {
+                projected_primary_keys.push((column_id, pk_index));
+            }
+        }
+
+        Some(Self {
+            metadata,
+            codec,
+            projected_primary_keys,
+        })
+    }
+
+    /// Converts a batch to have decoded primary key columns in flat format.
+    ///
+    /// The primary key array in the batch is a dictionary array. We decode each value which is a
+    /// primary key and reuse the keys array to build a dictionary array for each tag column.
+    /// The decoded columns are inserted in front of other columns.
+    pub(crate) fn convert(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        if self.projected_primary_keys.is_empty() {
+            return Ok(batch);
+        }
+
+        let primary_key_index = primary_key_column_index(batch.num_columns());
+        let pk_dict_array = batch
+            .column(primary_key_index)
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: "Primary key column is not a dictionary array".to_string(),
+            })?;
+
+        let pk_values_array = pk_dict_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: "Primary key values are not binary array".to_string(),
+            })?;
+
+        // Decode all unique primary key values
+        let mut decoded_pk_values = Vec::with_capacity(pk_values_array.len());
+        for i in 0..pk_values_array.len() {
+            if pk_values_array.is_null(i) {
+                decoded_pk_values.push(None);
+            } else {
+                let pk_bytes = pk_values_array.value(i);
+                let decoded = self.codec.decode(pk_bytes).context(DecodeSnafu)?;
+                decoded_pk_values.push(Some(decoded));
+            }
+        }
+
+        // Build decoded tag column arrays
+        let mut decoded_columns = Vec::new();
+        for &(column_id, pk_index) in &self.projected_primary_keys {
+            let tag_column = self.build_tag_column(
+                column_id,
+                pk_index,
+                pk_dict_array.keys(),
+                &decoded_pk_values,
+            )?;
+            decoded_columns.push(tag_column);
+        }
+
+        // Build new columns: decoded tag columns first, then original columns
+        let mut new_columns = Vec::with_capacity(batch.num_columns() + decoded_columns.len());
+        new_columns.extend(decoded_columns);
+        new_columns.extend_from_slice(batch.columns());
+
+        // Build new schema
+        let mut new_fields =
+            Vec::with_capacity(batch.schema().fields().len() + self.projected_primary_keys.len());
+        for &(column_id, _) in &self.projected_primary_keys {
+            let column_metadata = self.metadata.column_by_id(column_id).unwrap();
+            let field = Field::new(
+                &column_metadata.column_schema.name,
+                column_metadata.column_schema.data_type.as_arrow_type(),
+                column_metadata.column_schema.is_nullable(),
+            );
+            new_fields.push(Arc::new(field));
+        }
+        new_fields.extend(batch.schema().fields().iter().cloned());
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+        RecordBatch::try_new(new_schema, new_columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Builds an array for a specific tag column.
+    fn build_tag_column(
+        &self,
+        column_id: ColumnId,
+        pk_index: usize,
+        keys: &UInt32Array,
+        decoded_pk_values: &[Option<CompositeValues>],
+    ) -> Result<Arc<dyn Array>> {
+        let column_metadata =
+            self.metadata
+                .column_by_id(column_id)
+                .with_context(|| InvalidRecordBatchSnafu {
+                    reason: format!("Column {} not found in metadata", column_id),
+                })?;
+
+        // Convert values to arrow array using ConcreteDataType
+        let data_type = &column_metadata.column_schema.data_type;
+        let mut builder = data_type.create_mutable_vector(decoded_pk_values.len());
+
+        for decoded_opt in decoded_pk_values {
+            match decoded_opt {
+                Some(decoded) => {
+                    match decoded {
+                        CompositeValues::Dense(dense) => {
+                            if pk_index < dense.as_slice().len() {
+                                builder.push_value_ref(dense.as_slice()[pk_index].1.as_value_ref());
+                            } else {
+                                builder.push_null();
+                            }
+                        }
+                        CompositeValues::Sparse(sparse) => {
+                            let value = sparse.get_or_null(column_id);
+                            builder.push_value_ref(value.as_value_ref());
+                        }
+                    };
+                }
+                None => builder.push_null(),
+            }
+        }
+
+        let values_vector = builder.to_vector();
+        let values_array = values_vector.to_arrow_array();
+
+        // Create dictionary array using the same keys
+        let dict_array = DictionaryArray::new(keys.clone(), values_array);
+        Ok(Arc::new(dict_array))
     }
 }
 
