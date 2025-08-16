@@ -914,6 +914,7 @@ impl ScanInput {
             .bloom_filter_index_applier(self.bloom_filter_index_applier.clone())
             .fulltext_index_applier(self.fulltext_index_applier.clone())
             .expected_metadata(Some(self.mapper.metadata().clone()))
+            .flat_format(self.flat_format)
             .build_reader_input(reader_metrics)
             .await;
         let (mut file_range_ctx, selection) = match res {

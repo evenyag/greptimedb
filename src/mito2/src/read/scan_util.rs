@@ -34,9 +34,7 @@ use crate::metrics::{
 };
 use crate::read::range::{RangeBuilderList, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
-use crate::read::{
-    Batch, BoxedBatchStream, BoxedRecordBatchStream, ScannerMetrics, Source,
-};
+use crate::read::{Batch, BoxedBatchStream, BoxedRecordBatchStream, ScannerMetrics, Source};
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::reader::{ReaderFilterMetrics, ReaderMetrics};

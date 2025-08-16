@@ -182,6 +182,14 @@ impl ReadFormat {
         }
     }
 
+    /// Sets the sequence number to override.
+    pub(crate) fn set_override_sequence(&mut self, sequence: Option<SequenceNumber>) {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.set_override_sequence(sequence),
+            ReadFormat::Flat(format) => format.set_override_sequence(sequence),
+        }
+    }
+
     /// Gets the arrow schema of the SST file.
     ///
     /// This schema is computed from the region metadata but should be the same
