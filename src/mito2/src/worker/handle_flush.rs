@@ -257,6 +257,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
     /// On region memtable compact job finished.
     pub(crate) async fn handle_mem_compact_finished(&mut self, region_id: RegionId) {
+        info!("Region {} mem compact finished", region_id);
+
         // Notifies other workers. Even the remaining steps of this method fail we still
         // wake up other workers as we have released some memory by flush.
         self.notify_group();

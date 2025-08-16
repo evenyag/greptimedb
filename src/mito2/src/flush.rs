@@ -688,6 +688,8 @@ impl FlushScheduler {
             return;
         }
 
+        info!("Region {} schedule mem compaction", region_id);
+
         // Gets the mutable memtables.
         let mutable = version.memtables.mutable.clone();
         // Submit a flush job.
@@ -793,6 +795,11 @@ impl FlushScheduler {
         if !flush_status.mem_only {
             // We have pending flush.
             if let Some(task) = flush_status.pending_task.take() {
+                info!(
+                    "Region {} schedule pending flush after mem compaction",
+                    region_id
+                );
+
                 // Do the same thing as schedulering a new flush task.
                 // Now we can flush the region directly.
                 if let Err(e) = flush_status.version_control.freeze_mutable() {
