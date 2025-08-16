@@ -601,6 +601,8 @@ impl FlushScheduler {
 
         let version = version_control.current().version;
         if version.memtables.is_empty() {
+            info!("Region {} memtable is empty", region_id);
+
             debug_assert!(!self.region_status.contains_key(&region_id));
             // The region has nothing to flush.
             task.on_success();
@@ -623,6 +625,7 @@ impl FlushScheduler {
 
         // Checks whether we can flush the region now.
         if flush_status.flushing {
+            info!("Region {} is flushing", region_id);
             // There is already a flush job running.
             flush_status.merge_task(task);
             return Ok(());
@@ -631,6 +634,7 @@ impl FlushScheduler {
         // TODO(yingwen): We can merge with pending and execute directly.
         // If there are pending tasks, then we should push it to pending list.
         if flush_status.pending_task.is_some() {
+            info!("Region {} has pending flushing", region_id);
             flush_status.merge_task(task);
             return Ok(());
         }
@@ -643,6 +647,7 @@ impl FlushScheduler {
             self.region_status.remove(&region_id);
             return Err(e);
         }
+        info!("Region {} into flush job", region_id);
         // Submit a flush job.
         let job = task.into_flush_job(version_control);
         if let Err(e) = self.scheduler.schedule(job) {
@@ -787,12 +792,16 @@ impl FlushScheduler {
     /// Notifies the scheduler that the memtable compaction job is finished.
     pub(crate) fn on_mem_compact_finished(&mut self, region_id: RegionId) {
         let Some(flush_status) = self.region_status.get_mut(&region_id) else {
+            info!("Region {} not found after mem compaction", region_id);
             return;
         };
 
+        assert!(flush_status.flushing);
         // This region doesn't have running flush job.
         flush_status.flushing = false;
         if !flush_status.mem_only {
+            info!("Region {} has pending flush", region_id);
+
             // We have pending flush.
             if let Some(task) = flush_status.pending_task.take() {
                 info!(
@@ -824,6 +833,8 @@ impl FlushScheduler {
                 flush_status.flushing = true;
             }
         } else {
+            info!("Region {} schedule next flush", region_id);
+
             // Schedule next flush job.
             if let Err(e) = self.schedule_next_flush() {
                 error!(e; "Flush of region {} is successful, but failed to schedule next flush", region_id);
