@@ -23,10 +23,10 @@ use common_recordbatch::{DfRecordBatch, RecordBatch};
 use datatypes::compute;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 
 use crate::cache::CacheStrategy;
-use crate::error::{Result, UnexpectedSnafu};
+use crate::error::Result;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_util::PartitionMetrics;
 use crate::read::series_scan::SeriesBatch;

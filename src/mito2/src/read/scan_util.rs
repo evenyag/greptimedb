@@ -35,7 +35,7 @@ use crate::metrics::{
 use crate::read::range::{RangeBuilderList, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
 use crate::read::{
-    Batch, BoxedBatchStream, BoxedRecordBatchStream, FlatSource, ScannerMetrics, Source,
+    Batch, BoxedBatchStream, BoxedRecordBatchStream, ScannerMetrics, Source,
 };
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRange;
@@ -760,7 +760,7 @@ pub fn build_file_range_scan_stream(
 
 /// Build the stream of scanning the input [`FileRange`]s using flat reader that returns RecordBatch.
 pub fn build_file_range_scan_stream_flat(
-    stream_ctx: Arc<StreamContext>,
+    _stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,

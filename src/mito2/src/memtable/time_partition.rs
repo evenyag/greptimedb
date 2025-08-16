@@ -328,6 +328,15 @@ impl TimePartitions {
         Ok(())
     }
 
+    /// Returns true if the memtables in the partition need compaction.
+    pub(crate) fn should_compact(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .parts
+            .iter()
+            .any(|part| part.memtable.should_compact())
+    }
+
     // Creates or gets parts with given start timestamp.
     // Acquires the lock to avoid others create the same partition.
     fn get_or_create_time_partition(

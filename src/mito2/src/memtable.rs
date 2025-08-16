@@ -213,6 +213,16 @@ pub trait Memtable: Send + Sync + fmt::Debug {
     ///
     /// A region must freeze the memtable before invoking this method.
     fn fork(&self, id: MemtableId, metadata: &RegionMetadataRef) -> MemtableRef;
+
+    /// Returns whether the memtable should be compacted.
+    fn should_compact(&self) -> bool {
+        false
+    }
+
+    /// Compacts the memtable.
+    fn compact(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub type MemtableRef = Arc<dyn Memtable>;
