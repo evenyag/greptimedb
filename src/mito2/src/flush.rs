@@ -833,6 +833,7 @@ impl FlushScheduler {
                 flush_status.flushing = true;
             }
         } else {
+            flush_status.mem_only = false;
             info!("Region {} schedule next flush", region_id);
 
             // Schedule next flush job.
