@@ -665,6 +665,7 @@ impl FlushScheduler {
         &mut self,
         region_id: RegionId,
         version_control: &VersionControlRef,
+        request_sender: mpsc::Sender<WorkerRequestWithTime>,
     ) {
         let version = version_control.current().version;
         if version.memtables.is_empty() {
@@ -690,7 +691,7 @@ impl FlushScheduler {
         // Gets the mutable memtables.
         let mutable = version.memtables.mutable.clone();
         // Submit a flush job.
-        let job = compact_memtables(region_id, mutable);
+        let job = compact_memtables(region_id, mutable, request_sender);
         if let Err(e) = self.scheduler.schedule(job) {
             // If scheduler returns error, senders in the job will be dropped and waiters
             // can get recv errors.
@@ -778,6 +779,48 @@ impl FlushScheduler {
         // Still tries to schedule a new flush.
         if let Err(e) = self.schedule_next_flush() {
             error!(e; "Failed to schedule next flush after region {} flush is failed", region_id);
+        }
+    }
+
+    /// Notifies the scheduler that the memtable compaction job is finished.
+    pub(crate) fn on_mem_compact_finished(&mut self, region_id: RegionId) {
+        let Some(flush_status) = self.region_status.get_mut(&region_id) else {
+            return;
+        };
+
+        // This region doesn't have running flush job.
+        flush_status.flushing = false;
+        if !flush_status.mem_only {
+            // We have pending flush.
+            if let Some(task) = flush_status.pending_task.take() {
+                // Do the same thing as schedulering a new flush task.
+                // Now we can flush the region directly.
+                if let Err(e) = flush_status.version_control.freeze_mutable() {
+                    error!(e; "Failed to freeze the mutable memtable for region {}", region_id);
+
+                    // Remove from region status if we can't freeze the mutable memtable.
+                    self.region_status.remove(&region_id);
+                    return;
+                }
+                // Submit a flush job.
+                let job = task.into_flush_job(&flush_status.version_control);
+                if let Err(e) = self.scheduler.schedule(job) {
+                    // If scheduler returns error, senders in the job will be dropped and waiters
+                    // can get recv errors.
+                    error!(e; "Failed to schedule flush job for region {}", region_id);
+
+                    // Remove from region status if we can't submit the task.
+                    self.region_status.remove(&region_id);
+                    return;
+                }
+
+                flush_status.flushing = true;
+            }
+        } else {
+            // Schedule next flush job.
+            if let Err(e) = self.schedule_next_flush() {
+                error!(e; "Flush of region {} is successful, but failed to schedule next flush", region_id);
+            }
         }
     }
 
@@ -884,7 +927,11 @@ impl Drop for FlushScheduler {
 }
 
 /// Returns a job to compact memtables.
-fn compact_memtables(region_id: RegionId, mutable: TimePartitionsRef) -> Job {
+fn compact_memtables(
+    region_id: RegionId,
+    mutable: TimePartitionsRef,
+    request_sender: mpsc::Sender<WorkerRequestWithTime>,
+) -> Job {
     Box::pin(async move {
         INFLIGHT_FLUSH_COUNT.inc();
 
@@ -895,6 +942,20 @@ fn compact_memtables(region_id: RegionId, mutable: TimePartitionsRef) -> Job {
             if let Err(e) = mem.compact() {
                 error!(e; "Failed to compact table for region {region_id}");
             }
+        }
+
+        let request = WorkerRequest::Background {
+            region_id: region_id,
+            notify: BackgroundNotify::MemCompactFinished,
+        };
+        if let Err(e) = request_sender
+            .send(WorkerRequestWithTime::new(request))
+            .await
+        {
+            error!(
+                "Failed to notify flush job status for region {}, request: {:?}",
+                region_id, e.0
+            );
         }
 
         INFLIGHT_FLUSH_COUNT.dec();

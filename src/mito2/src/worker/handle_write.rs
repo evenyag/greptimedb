@@ -128,8 +128,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 delete_rows += region_ctx.delete_num;
 
                 if region_ctx.should_compact() {
-                    self.flush_scheduler
-                        .schedule_mem_compact(region_ctx.region_id, &region_ctx.version_control);
+                    self.flush_scheduler.schedule_mem_compact(
+                        region_ctx.region_id,
+                        &region_ctx.version_control,
+                        self.sender.clone(),
+                    );
                 }
             } else {
                 let region_write_task = region_ctxs
@@ -154,6 +157,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                                 self.flush_scheduler.schedule_mem_compact(
                                     region_ctx.region_id,
                                     &region_ctx.version_control,
+                                    self.sender.clone(),
                                 );
                             }
                         }

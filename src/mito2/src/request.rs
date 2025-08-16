@@ -382,7 +382,7 @@ impl WriteRequest {
                 if column.column_schema.is_default_impure() {
                     UnexpectedSnafu {
                         reason: format!(
-                            "unexpected impure default value with region_id: {}, column: {}, default_value: {:?}", 
+                            "unexpected impure default value with region_id: {}, column: {}, default_value: {:?}",
                             self.region_id,
                             column.column_schema.name,
                             column.column_schema.default_constraint(),
@@ -786,6 +786,8 @@ pub(crate) enum BackgroundNotify {
     RegionChange(RegionChangeResult),
     /// Region edit result.
     RegionEdit(RegionEditResult),
+    /// Memtable compact has finished.
+    MemCompactFinished,
 }
 
 /// Notifies a flush job is finished.
