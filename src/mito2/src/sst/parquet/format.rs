@@ -148,11 +148,11 @@ impl ReadFormat {
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
         flat_format: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         if flat_format {
             Self::new_flat(metadata, column_ids)
         } else {
-            Self::new_primary_key(metadata, column_ids)
+            Ok(Self::new_primary_key(metadata, column_ids))
         }
     }
 
@@ -168,8 +168,10 @@ impl ReadFormat {
     pub fn new_flat(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
-    ) -> Self {
-        ReadFormat::Flat(FlatReadFormat::new(metadata, column_ids))
+    ) -> Result<Self> {
+        Ok(ReadFormat::Flat(FlatReadFormat::new(
+            metadata, column_ids, None,
+        )?))
     }
 
     pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyReadFormat> {
@@ -1216,7 +1218,7 @@ mod tests {
             .iter()
             .map(|col| col.column_id)
             .collect();
-        let read_format = ReadFormat::new(metadata, column_ids.iter().copied(), false);
+        let read_format = ReadFormat::new(metadata, column_ids.iter().copied(), false).unwrap();
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![1, 1, 10, 10])), // field1
@@ -1344,19 +1346,19 @@ mod tests {
         // The projection includes all "fixed position" columns: ts(4), __primary_key(5), __sequence(6), __op_type(7)
 
         // Only read tag1 (column_id=3, index=1) + fixed columns
-        let read_format = ReadFormat::new_flat(metadata.clone(), [3].iter().copied());
+        let read_format = ReadFormat::new_flat(metadata.clone(), [3].iter().copied()).unwrap();
         assert_eq!(&[1, 4, 5, 6, 7], read_format.projection_indices());
 
         // Only read field1 (column_id=4, index=2) + fixed columns
-        let read_format = ReadFormat::new_flat(metadata.clone(), [4].iter().copied());
+        let read_format = ReadFormat::new_flat(metadata.clone(), [4].iter().copied()).unwrap();
         assert_eq!(&[2, 4, 5, 6, 7], read_format.projection_indices());
 
         // Only read ts (column_id=5, index=4) + fixed columns (ts is already included in fixed)
-        let read_format = ReadFormat::new_flat(metadata.clone(), [5].iter().copied());
+        let read_format = ReadFormat::new_flat(metadata.clone(), [5].iter().copied()).unwrap();
         assert_eq!(&[4, 5, 6, 7], read_format.projection_indices());
 
         // Read field0(column_id=2, index=3), tag0(column_id=1, index=0), ts(column_id=5, index=4) + fixed columns
-        let read_format = ReadFormat::new_flat(metadata, [2, 1, 5].iter().copied());
+        let read_format = ReadFormat::new_flat(metadata, [2, 1, 5].iter().copied()).unwrap();
         assert_eq!(&[0, 3, 4, 5, 6, 7], read_format.projection_indices());
     }
 
@@ -1366,7 +1368,9 @@ mod tests {
         let mut format = FlatReadFormat::new(
             metadata,
             std::iter::once(1), // Just read tag0
-        );
+            None,
+        )
+        .unwrap();
 
         let num_rows = 4;
         let original_sequence = 100u64;
@@ -1381,7 +1385,7 @@ mod tests {
             RecordBatch::try_new(format.arrow_schema().clone(), test_columns).unwrap();
 
         // Test without override sequence - should return clone
-        let result = format.convert_batch(&record_batch, None).unwrap();
+        let result = format.convert_batch(record_batch.clone(), None).unwrap();
         let sequence_column = result.column(
             crate::sst::parquet::flat_format::sequence_column_index(result.num_columns()),
         );
@@ -1397,7 +1401,7 @@ mod tests {
         format.set_override_sequence(Some(override_sequence));
         let override_sequence_array = format.new_override_sequence_array(num_rows).unwrap();
         let result = format
-            .convert_batch(&record_batch, Some(&override_sequence_array))
+            .convert_batch(record_batch, Some(&override_sequence_array))
             .unwrap();
         let sequence_column = result.column(
             crate::sst::parquet::flat_format::sequence_column_index(result.num_columns()),

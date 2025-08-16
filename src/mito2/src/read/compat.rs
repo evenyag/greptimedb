@@ -41,9 +41,7 @@ use crate::read::projection::{PrimaryKeyProjectionMapper, ProjectionMapper};
 use crate::read::{Batch, BatchColumn, BatchReader};
 use crate::sst::internal_fields;
 use crate::sst::parquet::flat_format::primary_key_column_index;
-use crate::sst::parquet::format::{
-    FormatProjection, PrimaryKeyArray, ReadFormat, FIXED_POS_COLUMN_NUM,
-};
+use crate::sst::parquet::format::{FormatProjection, PrimaryKeyArray, FIXED_POS_COLUMN_NUM};
 
 /// Reader to adapt schema of underlying reader to expected schema.
 pub struct CompatReader<R> {
@@ -184,47 +182,41 @@ pub(crate) fn has_same_columns_and_pk_encoding(
 /// Checks whether the batch from the parquet file needs to be converted to match the flat format.
 ///
 /// * `num_columns` is the number of columns in the parquet file.
-/// * `read_format` is the `ReadFormat` of the parquet file.
-pub(crate) fn need_convert_to_flat(num_columns: usize, read_format: &ReadFormat) -> Result<bool> {
-    if let Some(flat_format) = read_format.as_flat() {
-        // For flat format, compute expected column number:
-        // all columns + internal columns (pk, sequence, op_type) - 1 (time index already counted)
-        let metadata = flat_format.metadata();
-        let expected_columns = metadata.column_metadatas.len() + FIXED_POS_COLUMN_NUM - 1;
+/// * `metadata` is the region metadata (always assumes flat format).
+pub(crate) fn need_convert_to_flat(num_columns: usize, metadata: &RegionMetadata) -> Result<bool> {
+    // For flat format, compute expected column number:
+    // all columns + internal columns (pk, sequence, op_type) - 1 (time index already counted)
+    let expected_columns = metadata.column_metadatas.len() + FIXED_POS_COLUMN_NUM - 1;
 
-        if expected_columns == num_columns {
-            // Same number of columns, no conversion needed
-            Ok(false)
-        } else {
-            ensure!(
-                expected_columns >= num_columns,
-                UnexpectedSnafu {
-                    reason: format!(
-                        "Expected columns {} should be >= actual columns {}",
-                        expected_columns, num_columns
-                    )
-                }
-            );
-
-            // Different number of columns, check if the difference matches primary key count
-            let column_diff = expected_columns - num_columns;
-
-            ensure!(
-                column_diff == metadata.primary_key.len(),
-                UnexpectedSnafu {
-                    reason: format!(
-                        "Column number difference {} does not match primary key count {}",
-                        column_diff,
-                        metadata.primary_key.len()
-                    )
-                }
-            );
-
-            Ok(true)
-        }
-    } else {
-        // For primary key format, we don't need this check
+    if expected_columns == num_columns {
+        // Same number of columns, no conversion needed
         Ok(false)
+    } else {
+        ensure!(
+            expected_columns >= num_columns,
+            UnexpectedSnafu {
+                reason: format!(
+                    "Expected columns {} should be >= actual columns {}",
+                    expected_columns, num_columns
+                )
+            }
+        );
+
+        // Different number of columns, check if the difference matches primary key count
+        let column_diff = expected_columns - num_columns;
+
+        ensure!(
+            column_diff == metadata.primary_key.len(),
+            UnexpectedSnafu {
+                reason: format!(
+                    "Column number difference {} does not match primary key count {}",
+                    column_diff,
+                    metadata.primary_key.len()
+                )
+            }
+        );
+
+        Ok(true)
     }
 }
 
@@ -238,8 +230,6 @@ pub(crate) struct FlatCompatBatch {
     arrow_schema: SchemaRef,
     /// Optional primary key adapter.
     compat_pk: FlatCompatPrimaryKey,
-    /// Optional format converter for decoding primary keys.
-    convert_format: Option<FlatConvertFormat>,
 }
 
 impl FlatCompatBatch {
@@ -251,7 +241,6 @@ impl FlatCompatBatch {
         mapper: &FlatProjectionMapper,
         actual: &RegionMetadataRef,
         format_projection: &FormatProjection,
-        convert_format: bool,
     ) -> Result<Option<Self>> {
         let actual_schema = flat_projected_columns(actual, format_projection);
         let expect_schema = mapper.batch_schema();
@@ -311,33 +300,17 @@ impl FlatCompatBatch {
 
         let compat_pk = FlatCompatPrimaryKey::new(mapper.metadata(), actual)?;
 
-        let convert_format = if convert_format {
-            let codec = if let Some(rewriter) = &compat_pk.rewriter {
-                rewriter.old_codec.clone()
-            } else {
-                build_primary_key_codec(actual)
-            };
-            FlatConvertFormat::new(actual.clone(), format_projection, codec)
-        } else {
-            None
-        };
-
         Ok(Some(Self {
             actual_schema,
             index_or_defaults,
             arrow_schema: Arc::new(Schema::new(fields)),
             compat_pk,
-            convert_format,
         }))
     }
 
     /// Make columns of the `batch` compatible.
     #[must_use]
-    pub(crate) fn compat(&self, mut batch: RecordBatch) -> Result<RecordBatch> {
-        // First, apply format conversion if needed
-        if let Some(convert_format) = &self.convert_format {
-            batch = convert_format.convert(batch)?;
-        }
+    pub(crate) fn compat(&self, batch: RecordBatch) -> Result<RecordBatch> {
         let len = batch.num_rows();
         let columns = self
             .index_or_defaults

@@ -41,7 +41,7 @@ impl BulkIterContext {
         region_metadata: RegionMetadataRef,
         projection: &Option<&[ColumnId]>,
         predicate: Option<Predicate>,
-    ) -> Self {
+    ) -> crate::error::Result<Self> {
         let codec = build_primary_key_codec(&region_metadata);
 
         let simple_filters = predicate
@@ -55,9 +55,9 @@ impl BulkIterContext {
             })
             .collect();
 
-        let read_format = build_read_format(region_metadata, projection, true);
+        let read_format = build_read_format(region_metadata, projection, true)?;
 
-        Self {
+        Ok(Self {
             base: RangeBase {
                 filters: simple_filters,
                 read_format,
@@ -66,7 +66,7 @@ impl BulkIterContext {
                 compat_batch: None,
             },
             predicate,
-        }
+        })
     }
 
     /// Prunes row groups by stats.
@@ -101,9 +101,9 @@ fn build_read_format(
     region_metadata: RegionMetadataRef,
     projection: &Option<&[ColumnId]>,
     flat_format: bool,
-) -> ReadFormat {
+) -> crate::error::Result<ReadFormat> {
     let read_format = if let Some(column_ids) = &projection {
-        ReadFormat::new(region_metadata, column_ids.iter().copied(), flat_format)
+        ReadFormat::new(region_metadata, column_ids.iter().copied(), flat_format)?
     } else {
         // No projection, lists all column ids to read.
         ReadFormat::new(
@@ -113,8 +113,8 @@ fn build_read_format(
                 .iter()
                 .map(|col| col.column_id),
             flat_format,
-        )
+        )?
     };
 
-    read_format
+    Ok(read_format)
 }

@@ -36,12 +36,14 @@ use api::v1::SemanticType;
 use datatypes::arrow::array::{ArrayRef, UInt64Array};
 use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::RecordBatch;
+use mito_codec::row_converter::build_primary_key_codec;
 use parquet::file::metadata::RowGroupMetaData;
 use snafu::ResultExt;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{NewRecordBatchSnafu, Result};
+use crate::read::compat::{need_convert_to_flat, FlatConvertFormat};
 use crate::sst::parquet::format::{FormatProjection, ReadFormat, StatValues};
 use crate::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
 
@@ -134,6 +136,8 @@ pub struct FlatReadFormat {
     column_id_to_sst_index: HashMap<ColumnId, usize>,
     /// Sequence number to override the sequence read from the SST.
     override_sequence: Option<SequenceNumber>,
+    /// Optional format converter for decoding primary keys.
+    convert_format: Option<FlatConvertFormat>,
 }
 
 impl FlatReadFormat {
@@ -141,7 +145,8 @@ impl FlatReadFormat {
     pub fn new(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
-    ) -> FlatReadFormat {
+        parquet_num_columns: Option<usize>,
+    ) -> Result<FlatReadFormat> {
         let arrow_schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
 
         // Creates a map to lookup index.
@@ -153,13 +158,26 @@ impl FlatReadFormat {
             column_ids,
         );
 
-        FlatReadFormat {
+        // Build convert_format if needed
+        let convert_format = if let Some(num_columns) = parquet_num_columns {
+            if need_convert_to_flat(num_columns, &metadata)? {
+                let codec = build_primary_key_codec(&metadata);
+                FlatConvertFormat::new(metadata.clone(), &format_projection, codec)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(FlatReadFormat {
             metadata,
             arrow_schema,
             format_projection,
             column_id_to_sst_index: id_to_index,
             override_sequence: None,
-        }
+            convert_format,
+        })
     }
 
     /// Sets the sequence number to override.
@@ -234,17 +252,24 @@ impl FlatReadFormat {
             .map(|seq| Arc::new(UInt64Array::from_value(seq, length)) as ArrayRef)
     }
 
-    /// Convert a record batch to apply override sequence array.
+    /// Convert a record batch to apply format conversion and override sequence array.
     ///
-    /// Returns a new RecordBatch with the sequence column replaced by the override sequence array.
+    /// First applies FlatConvertFormat if needed to decode primary keys, then applies
+    /// override sequence array if provided.
     #[allow(dead_code)]
     pub(crate) fn convert_batch(
         &self,
-        record_batch: &RecordBatch,
+        mut record_batch: RecordBatch,
         override_sequence_array: Option<&ArrayRef>,
     ) -> Result<RecordBatch> {
+        // First, apply format conversion if needed
+        if let Some(convert_format) = &self.convert_format {
+            record_batch = convert_format.convert(record_batch)?;
+        }
+
+        // Then apply override sequence if provided
         let Some(override_array) = override_sequence_array else {
-            return Ok(record_batch.clone());
+            return Ok(record_batch);
         };
 
         let mut columns = record_batch.columns().to_vec();
@@ -312,10 +337,11 @@ pub(crate) fn sst_column_id_indices(metadata: &RegionMetadata) -> HashMap<Column
 #[cfg(test)]
 impl FlatReadFormat {
     /// Creates a helper with existing `metadata` and all columns.
-    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> FlatReadFormat {
+    pub fn new_with_all_columns(metadata: RegionMetadataRef) -> Result<FlatReadFormat> {
         Self::new(
             Arc::clone(&metadata),
             metadata.column_metadatas.iter().map(|c| c.column_id),
+            None,
         )
     }
 }
