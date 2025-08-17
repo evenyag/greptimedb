@@ -26,7 +26,7 @@ use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use snafu::{ensure, OptionExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
@@ -37,6 +37,7 @@ use tokio::sync::Semaphore;
 
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu, UnexpectedSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
+use crate::read::flat_dedup::{FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::MergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
@@ -48,7 +49,8 @@ use crate::read::scan_util::{
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{
-    scan_util, Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source,
+    flat_dedup, scan_util, Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream,
+    ScannerMetrics, Source,
 };
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
@@ -199,7 +201,7 @@ impl SeqScan {
         stream_ctx: &Arc<StreamContext>,
         partition_ranges: &[PartitionRange],
         part_metrics: &PartitionMetrics,
-    ) -> Result<MergeReader> {
+    ) -> Result<BoxedRecordBatchStream> {
         let mut sources = Vec::new();
         let range_builder_list = Arc::new(RangeBuilderList::new(
             stream_ctx.input.num_memtables(),
@@ -277,7 +279,7 @@ impl SeqScan {
         stream_ctx: &StreamContext,
         sources: Vec<BoxedRecordBatchStream>,
         _semaphore: Option<Arc<Semaphore>>,
-    ) -> Result<MergeReader> {
+    ) -> Result<BoxedRecordBatchStream> {
         // TODO(yingwen): Consider parallel reading for flat sources
 
         let schema = to_flat_sst_arrow_schema(
@@ -286,6 +288,34 @@ impl SeqScan {
         );
 
         let reader = MergeReader::new(schema, sources, DEFAULT_READ_BATCH_SIZE).await?;
+
+        let dedup = !stream_ctx.input.append_mode;
+        let reader = if dedup {
+            match stream_ctx.input.merge_mode {
+                MergeMode::LastRow => Box::pin(
+                    flat_dedup::DedupReader::new(
+                        reader.into_stream().boxed(),
+                        FlatLastRow::new(stream_ctx.input.filter_deleted),
+                    )
+                    .into_stream(),
+                ) as _,
+                MergeMode::LastNonNull => {
+                    let mapper = stream_ctx.input.mapper.as_flat().unwrap();
+                    Box::pin(
+                        flat_dedup::DedupReader::new(
+                            reader.into_stream().boxed(),
+                            FlatLastNonNull::new(
+                                mapper.field_column_start(),
+                                stream_ctx.input.filter_deleted,
+                            ),
+                        )
+                        .into_stream(),
+                    ) as _
+                }
+            }
+        } else {
+            Box::pin(reader.into_stream()) as _
+        };
 
         Ok(reader)
     }
@@ -475,7 +505,7 @@ impl SeqScan {
                     Self::build_flat_reader_from_sources(&stream_ctx, sources, semaphore.clone())
                         .await?;
 
-                while let Some(record_batch) = reader.next_batch().await? {
+                while let Some(record_batch) = reader.try_next().await? {
                     metrics.scan_cost += fetch_start.elapsed();
                     metrics.num_batches += 1;
                     metrics.num_rows += record_batch.num_rows();

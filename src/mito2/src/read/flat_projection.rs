@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::RecordBatch;
@@ -152,6 +153,28 @@ impl FlatProjectionMapper {
     /// from memtables and SSTs.
     pub(crate) fn column_ids(&self) -> &[ColumnId] {
         &self.column_ids
+    }
+
+    /// Returns the field column start index in output batch.
+    pub(crate) fn field_column_start(&self) -> usize {
+        for (idx, column_id) in self
+            .batch_schema
+            .iter()
+            .map(|(column_id, _)| column_id)
+            .enumerate()
+        {
+            if self
+                .metadata
+                .column_by_id(*column_id)
+                .unwrap()
+                .semantic_type
+                == SemanticType::Field
+            {
+                return idx;
+            }
+        }
+
+        self.batch_schema.len()
     }
 
     /// Returns ids of columns of the batch that the mapper expects to convert.

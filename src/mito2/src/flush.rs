@@ -42,7 +42,7 @@ use crate::metrics::{
     INFLIGHT_FLUSH_COUNT,
 };
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
-use crate::read::flat_dedup::{DedupIterator, FlatLastRow};
+use crate::read::flat_dedup::{DedupIterator, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::MergeIterator;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::scan_region::PredicateGroup;
@@ -367,6 +367,7 @@ impl RegionFlushTask {
                     batch_schema,
                     mem_ranges,
                     &version.options,
+                    version.metadata.primary_key.len(),
                     &mut series_count,
                 )?;
 
@@ -541,6 +542,7 @@ fn memtable_flat_source(
     schema: SchemaRef,
     mem_ranges: MemtableRanges,
     options: &RegionOptions,
+    field_column_start: usize,
     series_count: &mut usize,
 ) -> Result<(u64, FlatSource), Error> {
     let MemtableRanges { ranges, stats } = mem_ranges;
@@ -566,8 +568,10 @@ fn memtable_flat_source(
                 MergeMode::LastRow => {
                     Box::new(DedupIterator::new(merge_iter, FlatLastRow::new(false))) as _
                 }
-                // TODO(yingwen): dedup last non null
-                MergeMode::LastNonNull => todo!(),
+                MergeMode::LastNonNull => Box::new(DedupIterator::new(
+                    merge_iter,
+                    FlatLastNonNull::new(field_column_start, false),
+                )) as _,
             }
         };
         Ok((max_sequence, FlatSource::Iter(maybe_dedup)))
