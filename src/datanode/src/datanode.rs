@@ -16,12 +16,13 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common_base::Plugins;
 use common_error::ext::BoxedError;
 use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 use common_meta::cache::{LayeredCacheRegistry, SchemaCacheRef, TableSchemaCacheRef};
+use common_meta::datanode::TopicStatsReporter;
 use common_meta::key::datanode_table::{DatanodeTableManager, DatanodeTableValue};
 use common_meta::key::runtime_switch::RuntimeSwitchManager;
 use common_meta::key::{SchemaMetadataManager, SchemaMetadataManagerRef};
@@ -162,6 +163,7 @@ pub struct DatanodeBuilder {
     meta_client: Option<MetaClientRef>,
     kv_backend: KvBackendRef,
     cache_registry: Option<Arc<LayeredCacheRegistry>>,
+    topic_stats_reporter: Option<Box<dyn TopicStatsReporter>>,
     #[cfg(feature = "enterprise")]
     extension_range_provider_factory: Option<mito2::extension::BoxedExtensionRangeProviderFactory>,
 }
@@ -177,6 +179,7 @@ impl DatanodeBuilder {
             cache_registry: None,
             #[cfg(feature = "enterprise")]
             extension_range_provider_factory: None,
+            topic_stats_reporter: None,
         }
     }
 
@@ -414,6 +417,9 @@ impl DatanodeBuilder {
         for engine in engines {
             region_server.register_engine(engine);
         }
+        if let Some(topic_stats_reporter) = self.topic_stats_reporter.take() {
+            region_server.set_topic_stats_reporter(topic_stats_reporter);
+        }
 
         Ok(region_server)
     }
@@ -527,10 +533,13 @@ impl DatanodeBuilder {
                     None
                 };
 
+                let log_store =
+                    Self::build_kafka_log_store(kafka_config, global_index_collector).await?;
+                self.topic_stats_reporter = Some(log_store.topic_stats_reporter());
                 let builder = MitoEngineBuilder::new(
                     &opts.storage.data_home,
                     config,
-                    Self::build_kafka_log_store(kafka_config, global_index_collector).await?,
+                    log_store,
                     object_store_manager,
                     schema_metadata_manager,
                     plugins,
@@ -661,6 +670,7 @@ async fn open_all_regions(
         ));
     }
 
+    let now = Instant::now();
     let open_regions = region_server
         .handle_batch_open_requests(
             init_regions_parallelism,
@@ -668,6 +678,11 @@ async fn open_all_regions(
             ignore_nonexistent_region,
         )
         .await?;
+    info!(
+        "Opened {} regions in {:?}",
+        open_regions.len(),
+        now.elapsed()
+    );
     if !ignore_nonexistent_region {
         ensure!(
             open_regions.len() == num_regions,
@@ -699,6 +714,8 @@ async fn open_all_regions(
 
     #[cfg(feature = "enterprise")]
     if !follower_regions.is_empty() {
+        use tokio::time::Instant;
+
         info!(
             "going to open {} follower region(s)",
             follower_regions.len()
@@ -719,6 +736,7 @@ async fn open_all_regions(
             ));
         }
 
+        let now = Instant::now();
         let open_regions = region_server
             .handle_batch_open_requests(
                 init_regions_parallelism,
@@ -726,6 +744,11 @@ async fn open_all_regions(
                 ignore_nonexistent_region,
             )
             .await?;
+        info!(
+            "Opened {} follower regions in {:?}",
+            open_regions.len(),
+            now.elapsed()
+        );
 
         if !ignore_nonexistent_region {
             ensure!(

@@ -218,13 +218,13 @@ impl PartitionExpr {
         // Otherwise it will be rejected by the parser.
         let lhs = match &*self.lhs {
             Operand::Column(c) => ParserExpr::Identifier(Ident::new(c.clone())),
-            Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap()),
+            Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap().into()),
             Operand::Expr(e) => e.to_parser_expr(),
         };
 
         let rhs = match &*self.rhs {
             Operand::Column(c) => ParserExpr::Identifier(Ident::new(c.clone())),
-            Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap()),
+            Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap().into()),
             Operand::Expr(e) => e.to_parser_expr(),
         };
 
@@ -250,6 +250,18 @@ impl PartitionExpr {
             RestrictedOp::NotEq => lhs.not_eq(rhs),
         };
         Ok(expr)
+    }
+
+    pub fn lhs(&self) -> &Operand {
+        &self.lhs
+    }
+
+    pub fn rhs(&self) -> &Operand {
+        &self.rhs
+    }
+
+    pub fn op(&self) -> &RestrictedOp {
+        &self.op
     }
 
     pub fn try_as_physical_expr(

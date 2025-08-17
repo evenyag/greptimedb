@@ -89,6 +89,7 @@ uuid.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+common-wal = { workspace = true, features = ["testing"] }
 datafusion.workspace = true
 datafusion-expr.workspace = true
 hex.workspace = true
@@ -96,6 +97,7 @@ http.workspace = true
 itertools.workspace = true
 jsonb.workspace = true
 opentelemetry-proto.workspace = true
+otel-arrow-rust.workspace = true
 partition.workspace = true
 paste.workspace = true
 pipeline.workspace = true

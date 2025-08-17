@@ -35,9 +35,7 @@ use crate::manifest::storage::{
     file_version, is_checkpoint_file, is_delta_file, ManifestObjectStore,
 };
 use crate::metrics::MANIFEST_OP_ELAPSED;
-#[cfg(test)]
-use crate::region::RegionLeaderState;
-use crate::region::RegionRoleState;
+use crate::region::{RegionLeaderState, RegionRoleState};
 
 /// Options for [RegionManifestManager].
 #[derive(Debug, Clone)]
@@ -167,7 +165,9 @@ impl RegionManifestManager {
         // Persist region change.
         let action_list =
             RegionMetaActionList::with_action(RegionMetaAction::Change(RegionChange { metadata }));
-        store.save(version, &action_list.encode()?).await?;
+        // New region is not in staging mode.
+        // TODO(ruihang): add staging mode support if needed.
+        store.save(version, &action_list.encode()?, false).await?;
 
         let checkpointer = Checkpointer::new(region_id, options, store.clone(), MIN_VERSION);
         manifest_version.store(version, Ordering::Relaxed);
@@ -454,7 +454,10 @@ impl RegionManifestManager {
         );
 
         let version = self.increase_version();
-        self.store.save(version, &action_list.encode()?).await?;
+        let is_staging = region_state == RegionRoleState::Leader(RegionLeaderState::Staging);
+        self.store
+            .save(version, &action_list.encode()?, is_staging)
+            .await?;
 
         let mut manifest_builder =
             RegionManifestBuilder::with_checkpoint(Some(self.manifest.as_ref().clone()));
@@ -642,6 +645,36 @@ mod test {
     }
 
     #[tokio::test]
+    async fn manifest_with_partition_expr_roundtrip() {
+        let env = TestEnv::new().await;
+        let expr_json =
+            r#"{"Expr":{"lhs":{"Column":"a"},"op":"GtEq","rhs":{"Value":{"UInt32":10}}}}"#;
+        let mut metadata = basic_region_metadata();
+        metadata.partition_expr = Some(expr_json.to_string());
+        let metadata = Arc::new(metadata);
+        let mut manager = env
+            .create_manifest_manager(CompressionType::Uncompressed, 10, Some(metadata.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // persisted manifest should contain the same partition_expr JSON
+        let manifest = manager.manifest();
+        assert_eq!(manifest.metadata.partition_expr.as_deref(), Some(expr_json));
+
+        manager.stop().await;
+
+        // Reopen and check again
+        let manager = env
+            .create_manifest_manager(CompressionType::Uncompressed, 10, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let manifest = manager.manifest();
+        assert_eq!(manifest.metadata.partition_expr.as_deref(), Some(expr_json));
+    }
+
+    #[tokio::test]
     async fn region_change_add_column() {
         let metadata = Arc::new(basic_region_metadata());
         let env = TestEnv::new().await;
@@ -783,6 +816,6 @@ mod test {
 
         // get manifest size again
         let manifest_size = manager.manifest_usage();
-        assert_eq!(manifest_size, 1204);
+        assert_eq!(manifest_size, 1226);
     }
 }

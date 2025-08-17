@@ -49,7 +49,7 @@ use crate::read::scan_region::PredicateGroup;
 use crate::read::{FlatSource, Source};
 use crate::region::options::{IndexOptions, MergeMode, RegionOptions};
 use crate::region::version::{VersionControlData, VersionControlRef};
-use crate::region::{ManifestContextRef, RegionLeaderState};
+use crate::region::{ManifestContextRef, RegionLeaderState, RegionRoleState};
 use crate::request::{
     BackgroundNotify, FlushFailed, FlushFinished, OptionOutputTx, OutputTx, SenderBulkRequest,
     SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
@@ -450,7 +450,13 @@ impl RegionFlushTask {
         let expected_state = if matches!(self.reason, FlushReason::Downgrading) {
             RegionLeaderState::Downgrading
         } else {
-            RegionLeaderState::Writable
+            // Check if region is in staging mode
+            let current_state = self.manifest_ctx.current_state();
+            if current_state == RegionRoleState::Leader(RegionLeaderState::Staging) {
+                RegionLeaderState::Staging
+            } else {
+                RegionLeaderState::Writable
+            }
         };
         // We will leak files if the manifest update fails, but we ignore them for simplicity. We can
         // add a cleanup job to remove them later.
