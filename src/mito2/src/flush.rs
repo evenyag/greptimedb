@@ -34,8 +34,6 @@ use crate::error::{
     Error, FlushRegionSnafu, RegionClosedSnafu, RegionDroppedSnafu, RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
-use crate::memtable::time_partition::TimePartitionsRef;
-use crate::memtable::version::SmallMemtableVec;
 use crate::memtable::MemtableRanges;
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
@@ -597,15 +595,7 @@ impl FlushScheduler {
 
     /// Returns true if the region already requested flush.
     pub(crate) fn is_flush_requested(&self, region_id: RegionId) -> bool {
-        if let Some(status) = self.region_status.get(&region_id) {
-            if status.mem_only && status.pending_task.is_none() {
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        }
+        self.region_status.contains_key(&region_id)
     }
 
     /// Schedules a flush `task` for specific `region`.
@@ -637,9 +627,6 @@ impl FlushScheduler {
             .region_status
             .entry(region_id)
             .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
-
-        // Always set mem only to false because we need to flush the memtable.
-        flush_status.mem_only = false;
 
         // Checks whether we can flush the region now.
         if flush_status.flushing {
@@ -683,53 +670,53 @@ impl FlushScheduler {
         Ok(())
     }
 
-    /// Schedules a memtable compact `task` for specific `region`.
-    pub(crate) fn schedule_mem_compact(
-        &mut self,
-        region_id: RegionId,
-        version_control: &VersionControlRef,
-        request_sender: mpsc::Sender<WorkerRequestWithTime>,
-    ) {
-        let version = version_control.current().version;
-        if version.memtables.is_empty() {
-            debug_assert!(!self.region_status.contains_key(&region_id));
-            return;
-        }
+    // /// Schedules a memtable compact `task` for specific `region`.
+    // pub(crate) fn schedule_mem_compact(
+    //     &mut self,
+    //     region_id: RegionId,
+    //     version_control: &VersionControlRef,
+    //     request_sender: mpsc::Sender<WorkerRequestWithTime>,
+    // ) {
+    //     let version = version_control.current().version;
+    //     if version.memtables.is_empty() {
+    //         debug_assert!(!self.region_status.contains_key(&region_id));
+    //         return;
+    //     }
 
-        // // Don't increase the counter if a region has nothing to flush.
-        // FLUSH_REQUESTS_TOTAL
-        //     .with_label_values(&[task.reason.as_str()])
-        //     .inc();
+    //     // // Don't increase the counter if a region has nothing to flush.
+    //     // FLUSH_REQUESTS_TOTAL
+    //     //     .with_label_values(&[task.reason.as_str()])
+    //     //     .inc();
 
-        // Add this region to status map.
-        let flush_status = self
-            .region_status
-            .entry(region_id)
-            .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
-        // Checks whether we can flush the region now.
-        if flush_status.flushing {
-            return;
-        }
+    //     // Add this region to status map.
+    //     let flush_status = self
+    //         .region_status
+    //         .entry(region_id)
+    //         .or_insert_with(|| FlushStatus::new(region_id, version_control.clone()));
+    //     // Checks whether we can flush the region now.
+    //     if flush_status.flushing {
+    //         return;
+    //     }
 
-        info!("Region {} schedule mem compaction", region_id);
+    //     info!("Region {} schedule mem compaction", region_id);
 
-        // Gets the mutable memtables.
-        let mutable = version.memtables.mutable.clone();
-        // Submit a flush job.
-        let job = compact_memtables(region_id, mutable, request_sender);
-        if let Err(e) = self.scheduler.schedule(job) {
-            // If scheduler returns error, senders in the job will be dropped and waiters
-            // can get recv errors.
-            error!(e; "Failed to schedule mem compact job for region {}", region_id);
+    //     // Gets the mutable memtables.
+    //     let mutable = version.memtables.mutable.clone();
+    //     // Submit a flush job.
+    //     let job = compact_memtables(region_id, mutable, request_sender);
+    //     if let Err(e) = self.scheduler.schedule(job) {
+    //         // If scheduler returns error, senders in the job will be dropped and waiters
+    //         // can get recv errors.
+    //         error!(e; "Failed to schedule mem compact job for region {}", region_id);
 
-            // Remove from region status if we can't submit the task.
-            self.region_status.remove(&region_id);
-            return;
-        }
+    //         // Remove from region status if we can't submit the task.
+    //         self.region_status.remove(&region_id);
+    //         return;
+    //     }
 
-        flush_status.flushing = true;
-        flush_status.mem_only = true;
-    }
+    //     flush_status.flushing = true;
+    //     flush_status.mem_only = true;
+    // }
 
     /// Notifies the scheduler that the flush job is finished.
     ///
@@ -807,67 +794,67 @@ impl FlushScheduler {
         }
     }
 
-    /// Notifies the scheduler that the memtable compaction job is finished.
-    pub(crate) fn on_mem_compact_finished(&mut self, region_id: RegionId) {
-        let Some(flush_status) = self.region_status.get_mut(&region_id) else {
-            info!("Region {} not found after mem compaction", region_id);
-            return;
-        };
+    // /// Notifies the scheduler that the memtable compaction job is finished.
+    // pub(crate) fn on_mem_compact_finished(&mut self, region_id: RegionId) {
+    //     let Some(flush_status) = self.region_status.get_mut(&region_id) else {
+    //         info!("Region {} not found after mem compaction", region_id);
+    //         return;
+    //     };
 
-        assert!(flush_status.flushing);
-        // This region doesn't have running flush job.
-        flush_status.flushing = false;
-        if !flush_status.mem_only {
-            info!("Region {} has pending flush", region_id);
+    //     assert!(flush_status.flushing);
+    //     // This region doesn't have running flush job.
+    //     flush_status.flushing = false;
+    //     if !flush_status.mem_only {
+    //         info!("Region {} has pending flush", region_id);
 
-            // We have pending flush.
-            if let Some(task) = flush_status.pending_task.take() {
-                info!(
-                    "Region {} schedule pending flush after mem compaction",
-                    region_id
-                );
+    //         // We have pending flush.
+    //         if let Some(task) = flush_status.pending_task.take() {
+    //             info!(
+    //                 "Region {} schedule pending flush after mem compaction",
+    //                 region_id
+    //             );
 
-                // Do the same thing as schedulering a new flush task.
-                // Now we can flush the region directly.
-                if let Err(e) = flush_status.version_control.freeze_mutable() {
-                    error!(e; "Failed to freeze the mutable memtable for region {}", region_id);
+    //             // Do the same thing as schedulering a new flush task.
+    //             // Now we can flush the region directly.
+    //             if let Err(e) = flush_status.version_control.freeze_mutable() {
+    //                 error!(e; "Failed to freeze the mutable memtable for region {}", region_id);
 
-                    // Remove from region status if we can't freeze the mutable memtable.
-                    self.region_status.remove(&region_id);
-                    return;
-                }
-                // Submit a flush job.
-                let job = task.into_flush_job(&flush_status.version_control);
-                if let Err(e) = self.scheduler.schedule(job) {
-                    // If scheduler returns error, senders in the job will be dropped and waiters
-                    // can get recv errors.
-                    error!(e; "Failed to schedule flush job for region {}", region_id);
+    //                 // Remove from region status if we can't freeze the mutable memtable.
+    //                 self.region_status.remove(&region_id);
+    //                 return;
+    //             }
+    //             // Submit a flush job.
+    //             let job = task.into_flush_job(&flush_status.version_control);
+    //             if let Err(e) = self.scheduler.schedule(job) {
+    //                 // If scheduler returns error, senders in the job will be dropped and waiters
+    //                 // can get recv errors.
+    //                 error!(e; "Failed to schedule flush job for region {}", region_id);
 
-                    // Remove from region status if we can't submit the task.
-                    self.region_status.remove(&region_id);
-                    return;
-                }
+    //                 // Remove from region status if we can't submit the task.
+    //                 self.region_status.remove(&region_id);
+    //                 return;
+    //             }
 
-                flush_status.flushing = true;
-            } else {
-                // The region doesn't have any pending flush task.
-                // Safety: The flush status must exist.
-                self.region_status.remove(&region_id).unwrap();
-            }
-        } else {
-            flush_status.mem_only = false;
-            // The region doesn't have any pending flush task.
-            // Safety: The flush status must exist.
-            self.region_status.remove(&region_id).unwrap();
+    //             flush_status.flushing = true;
+    //         } else {
+    //             // The region doesn't have any pending flush task.
+    //             // Safety: The flush status must exist.
+    //             self.region_status.remove(&region_id).unwrap();
+    //         }
+    //     } else {
+    //         flush_status.mem_only = false;
+    //         // The region doesn't have any pending flush task.
+    //         // Safety: The flush status must exist.
+    //         self.region_status.remove(&region_id).unwrap();
 
-            info!("Region {} schedule next flush", region_id);
+    //         info!("Region {} schedule next flush", region_id);
 
-            // Schedule next flush job.
-            if let Err(e) = self.schedule_next_flush() {
-                error!(e; "Flush of region {} is successful, but failed to schedule next flush", region_id);
-            }
-        }
-    }
+    //         // Schedule next flush job.
+    //         if let Err(e) = self.schedule_next_flush() {
+    //             error!(e; "Flush of region {} is successful, but failed to schedule next flush", region_id);
+    //         }
+    //     }
+    // }
 
     /// Notifies the scheduler that the region is dropped.
     pub(crate) fn on_region_dropped(&mut self, region_id: RegionId) {
@@ -971,41 +958,41 @@ impl Drop for FlushScheduler {
     }
 }
 
-/// Returns a job to compact memtables.
-fn compact_memtables(
-    region_id: RegionId,
-    mutable: TimePartitionsRef,
-    request_sender: mpsc::Sender<WorkerRequestWithTime>,
-) -> Job {
-    Box::pin(async move {
-        INFLIGHT_FLUSH_COUNT.inc();
+// /// Returns a job to compact memtables.
+// fn compact_memtables(
+//     region_id: RegionId,
+//     mutable: TimePartitionsRef,
+//     request_sender: mpsc::Sender<WorkerRequestWithTime>,
+// ) -> Job {
+//     Box::pin(async move {
+//         INFLIGHT_FLUSH_COUNT.inc();
 
-        let mut memtables = SmallMemtableVec::new();
-        mutable.list_memtables_to_small_vec(&mut memtables);
+//         let mut memtables = SmallMemtableVec::new();
+//         mutable.list_memtables_to_small_vec(&mut memtables);
 
-        for mem in memtables {
-            if let Err(e) = mem.compact() {
-                error!(e; "Failed to compact table for region {region_id}");
-            }
-        }
+//         for mem in memtables {
+//             if let Err(e) = mem.compact() {
+//                 error!(e; "Failed to compact table for region {region_id}");
+//             }
+//         }
 
-        let request = WorkerRequest::Background {
-            region_id: region_id,
-            notify: BackgroundNotify::MemCompactFinished,
-        };
-        if let Err(e) = request_sender
-            .send(WorkerRequestWithTime::new(request))
-            .await
-        {
-            error!(
-                "Failed to notify flush job status for region {}, request: {:?}",
-                region_id, e.0
-            );
-        }
+//         let request = WorkerRequest::Background {
+//             region_id: region_id,
+//             notify: BackgroundNotify::MemCompactFinished,
+//         };
+//         if let Err(e) = request_sender
+//             .send(WorkerRequestWithTime::new(request))
+//             .await
+//         {
+//             error!(
+//                 "Failed to notify flush job status for region {}, request: {:?}",
+//                 region_id, e.0
+//             );
+//         }
 
-        INFLIGHT_FLUSH_COUNT.dec();
-    })
-}
+//         INFLIGHT_FLUSH_COUNT.dec();
+//     })
+// }
 
 /// Flush status of a region scheduled by the [FlushScheduler].
 ///
@@ -1028,9 +1015,8 @@ struct FlushStatus {
     pending_writes: Vec<SenderWriteRequest>,
     /// Bulk requests waiting to write after altering the region.
     pending_bulk_writes: Vec<SenderBulkRequest>,
-
-    /// Only compact the memtable.
-    mem_only: bool,
+    // /// Only compact the memtable.
+    // mem_only: bool,
 }
 
 impl FlushStatus {
@@ -1043,7 +1029,7 @@ impl FlushStatus {
             pending_ddls: Vec::new(),
             pending_writes: Vec::new(),
             pending_bulk_writes: Vec::new(),
-            mem_only: false,
+            // mem_only: false,
         }
     }
 
@@ -1262,217 +1248,217 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_schedule_mem_compact() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        let mut scheduler = env.mock_flush_scheduler();
-        let mut builder = VersionControlBuilder::new();
-        // Overwrites the empty memtable builder.
-        builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
-        let version_control = Arc::new(builder.build());
-        // Writes data to the memtable so it is not empty.
-        let version_data = version_control.current();
-        write_rows_to_version(&version_data.version, "host0", 0, 10);
+    // #[tokio::test]
+    // async fn test_schedule_mem_compact() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let (tx, _rx) = mpsc::channel(4);
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let mut builder = VersionControlBuilder::new();
+    //     // Overwrites the empty memtable builder.
+    //     builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
+    //     let version_control = Arc::new(builder.build());
+    //     // Writes data to the memtable so it is not empty.
+    //     let version_data = version_control.current();
+    //     write_rows_to_version(&version_data.version, "host0", 0, 10);
 
-        // Schedule mem compact.
-        scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
+    //     // Schedule mem compact.
+    //     scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
 
-        // Should schedule 1 memory compaction job.
-        assert_eq!(1, scheduler.region_status.len());
-        assert_eq!(1, job_scheduler.num_jobs());
+    //     // Should schedule 1 memory compaction job.
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     assert_eq!(1, job_scheduler.num_jobs());
 
-        // Check that the region is marked as flushing and mem_only.
-        let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
-        assert!(flush_status.flushing);
-        assert!(flush_status.mem_only);
-    }
+    //     // Check that the region is marked as flushing and mem_only.
+    //     let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
+    //     assert!(flush_status.flushing);
+    //     assert!(flush_status.mem_only);
+    // }
 
-    #[tokio::test]
-    async fn test_schedule_mem_compact_empty_memtable() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        let mut scheduler = env.mock_flush_scheduler();
-        let builder = VersionControlBuilder::new();
-        let version_control = Arc::new(builder.build());
+    // #[tokio::test]
+    // async fn test_schedule_mem_compact_empty_memtable() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let (tx, _rx) = mpsc::channel(4);
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let builder = VersionControlBuilder::new();
+    //     let version_control = Arc::new(builder.build());
 
-        // Schedule mem compact with empty memtable.
-        scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
+    //     // Schedule mem compact with empty memtable.
+    //     scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
 
-        // Should not schedule any job for empty memtable.
-        assert_eq!(0, scheduler.region_status.len());
-        assert_eq!(0, job_scheduler.num_jobs());
-    }
+    //     // Should not schedule any job for empty memtable.
+    //     assert_eq!(0, scheduler.region_status.len());
+    //     assert_eq!(0, job_scheduler.num_jobs());
+    // }
 
-    #[tokio::test]
-    async fn test_schedule_mem_compact_already_flushing() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        let mut scheduler = env.mock_flush_scheduler();
-        let mut builder = VersionControlBuilder::new();
-        // Overwrites the empty memtable builder.
-        builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
-        let version_control = Arc::new(builder.build());
-        // Writes data to the memtable so it is not empty.
-        let version_data = version_control.current();
-        write_rows_to_version(&version_data.version, "host0", 0, 10);
-        let manifest_ctx = env
-            .mock_manifest_context(version_data.version.metadata.clone())
-            .await;
+    // #[tokio::test]
+    // async fn test_schedule_mem_compact_already_flushing() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let (tx, _rx) = mpsc::channel(4);
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let mut builder = VersionControlBuilder::new();
+    //     // Overwrites the empty memtable builder.
+    //     builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
+    //     let version_control = Arc::new(builder.build());
+    //     // Writes data to the memtable so it is not empty.
+    //     let version_data = version_control.current();
+    //     write_rows_to_version(&version_data.version, "host0", 0, 10);
+    //     let manifest_ctx = env
+    //         .mock_manifest_context(version_data.version.metadata.clone())
+    //         .await;
 
-        // First schedule a regular flush.
-        let task = RegionFlushTask {
-            region_id: builder.region_id(),
-            reason: FlushReason::Others,
-            senders: Vec::new(),
-            request_sender: tx.clone(),
-            access_layer: env.access_layer.clone(),
-            listener: WorkerListener::default(),
-            engine_config: Arc::new(MitoConfig::default()),
-            row_group_size: None,
-            cache_manager: Arc::new(CacheManager::default()),
-            manifest_ctx: manifest_ctx.clone(),
-            index_options: IndexOptions::default(),
-        };
-        scheduler
-            .schedule_flush(builder.region_id(), &version_control, task)
-            .unwrap();
+    //     // First schedule a regular flush.
+    //     let task = RegionFlushTask {
+    //         region_id: builder.region_id(),
+    //         reason: FlushReason::Others,
+    //         senders: Vec::new(),
+    //         request_sender: tx.clone(),
+    //         access_layer: env.access_layer.clone(),
+    //         listener: WorkerListener::default(),
+    //         engine_config: Arc::new(MitoConfig::default()),
+    //         row_group_size: None,
+    //         cache_manager: Arc::new(CacheManager::default()),
+    //         manifest_ctx: manifest_ctx.clone(),
+    //         index_options: IndexOptions::default(),
+    //     };
+    //     scheduler
+    //         .schedule_flush(builder.region_id(), &version_control, task)
+    //         .unwrap();
 
-        // Should schedule 1 flush.
-        assert_eq!(1, scheduler.region_status.len());
-        assert_eq!(1, job_scheduler.num_jobs());
+    //     // Should schedule 1 flush.
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     assert_eq!(1, job_scheduler.num_jobs());
 
-        // Now try to schedule mem compact while already flushing.
-        scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
+    //     // Now try to schedule mem compact while already flushing.
+    //     scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
 
-        // Should not schedule additional job.
-        assert_eq!(1, scheduler.region_status.len());
-        assert_eq!(1, job_scheduler.num_jobs());
-    }
+    //     // Should not schedule additional job.
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     assert_eq!(1, job_scheduler.num_jobs());
+    // }
 
-    #[tokio::test]
-    async fn test_on_mem_compact_finished() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        let mut scheduler = env.mock_flush_scheduler();
-        let mut builder = VersionControlBuilder::new();
-        // Overwrites the empty memtable builder.
-        builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
-        let version_control = Arc::new(builder.build());
-        // Writes data to the memtable so it is not empty.
-        let version_data = version_control.current();
-        write_rows_to_version(&version_data.version, "host0", 0, 10);
+    // #[tokio::test]
+    // async fn test_on_mem_compact_finished() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let (tx, _rx) = mpsc::channel(4);
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let mut builder = VersionControlBuilder::new();
+    //     // Overwrites the empty memtable builder.
+    //     builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
+    //     let version_control = Arc::new(builder.build());
+    //     // Writes data to the memtable so it is not empty.
+    //     let version_data = version_control.current();
+    //     write_rows_to_version(&version_data.version, "host0", 0, 10);
 
-        // Schedule mem compact.
-        scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
-        assert_eq!(1, scheduler.region_status.len());
-        assert!(
-            scheduler
-                .region_status
-                .get(&builder.region_id())
-                .unwrap()
-                .flushing
-        );
-        assert!(
-            scheduler
-                .region_status
-                .get(&builder.region_id())
-                .unwrap()
-                .mem_only
-        );
+    //     // Schedule mem compact.
+    //     scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx);
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     assert!(
+    //         scheduler
+    //             .region_status
+    //             .get(&builder.region_id())
+    //             .unwrap()
+    //             .flushing
+    //     );
+    //     assert!(
+    //         scheduler
+    //             .region_status
+    //             .get(&builder.region_id())
+    //             .unwrap()
+    //             .mem_only
+    //     );
 
-        // Finish mem compact.
-        scheduler.on_mem_compact_finished(builder.region_id());
+    //     // Finish mem compact.
+    //     scheduler.on_mem_compact_finished(builder.region_id());
 
-        // Should clear flushing status and reset mem_only.
-        let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
-        assert!(!flush_status.flushing);
-        assert!(!flush_status.mem_only);
-    }
+    //     // Should clear flushing status and reset mem_only.
+    //     let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
+    //     assert!(!flush_status.flushing);
+    //     assert!(!flush_status.mem_only);
+    // }
 
-    #[tokio::test]
-    async fn test_on_mem_compact_finished_with_pending_flush() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        let mut scheduler = env.mock_flush_scheduler();
-        let mut builder = VersionControlBuilder::new();
-        // Overwrites the empty memtable builder.
-        builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
-        let version_control = Arc::new(builder.build());
-        // Writes data to the memtable so it is not empty.
-        let version_data = version_control.current();
-        write_rows_to_version(&version_data.version, "host0", 0, 10);
-        let manifest_ctx = env
-            .mock_manifest_context(version_data.version.metadata.clone())
-            .await;
+    // #[tokio::test]
+    // async fn test_on_mem_compact_finished_with_pending_flush() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let (tx, _rx) = mpsc::channel(4);
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let mut builder = VersionControlBuilder::new();
+    //     // Overwrites the empty memtable builder.
+    //     builder.set_memtable_builder(Arc::new(TimeSeriesMemtableBuilder::default()));
+    //     let version_control = Arc::new(builder.build());
+    //     // Writes data to the memtable so it is not empty.
+    //     let version_data = version_control.current();
+    //     write_rows_to_version(&version_data.version, "host0", 0, 10);
+    //     let manifest_ctx = env
+    //         .mock_manifest_context(version_data.version.metadata.clone())
+    //         .await;
 
-        // Schedule mem compact.
-        scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx.clone());
-        assert_eq!(1, scheduler.region_status.len());
-        assert!(
-            scheduler
-                .region_status
-                .get(&builder.region_id())
-                .unwrap()
-                .flushing
-        );
-        assert!(
-            scheduler
-                .region_status
-                .get(&builder.region_id())
-                .unwrap()
-                .mem_only
-        );
+    //     // Schedule mem compact.
+    //     scheduler.schedule_mem_compact(builder.region_id(), &version_control, tx.clone());
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     assert!(
+    //         scheduler
+    //             .region_status
+    //             .get(&builder.region_id())
+    //             .unwrap()
+    //             .flushing
+    //     );
+    //     assert!(
+    //         scheduler
+    //             .region_status
+    //             .get(&builder.region_id())
+    //             .unwrap()
+    //             .mem_only
+    //     );
 
-        // Add a pending flush task.
-        let task = RegionFlushTask {
-            region_id: builder.region_id(),
-            reason: FlushReason::Others,
-            senders: Vec::new(),
-            request_sender: tx.clone(),
-            access_layer: env.access_layer.clone(),
-            listener: WorkerListener::default(),
-            engine_config: Arc::new(MitoConfig::default()),
-            row_group_size: None,
-            cache_manager: Arc::new(CacheManager::default()),
-            manifest_ctx: manifest_ctx.clone(),
-            index_options: IndexOptions::default(),
-        };
+    //     // Add a pending flush task.
+    //     let task = RegionFlushTask {
+    //         region_id: builder.region_id(),
+    //         reason: FlushReason::Others,
+    //         senders: Vec::new(),
+    //         request_sender: tx.clone(),
+    //         access_layer: env.access_layer.clone(),
+    //         listener: WorkerListener::default(),
+    //         engine_config: Arc::new(MitoConfig::default()),
+    //         row_group_size: None,
+    //         cache_manager: Arc::new(CacheManager::default()),
+    //         manifest_ctx: manifest_ctx.clone(),
+    //         index_options: IndexOptions::default(),
+    //     };
 
-        // Manually add to pending task to simulate a flush request while mem compacting.
-        let flush_status = scheduler
-            .region_status
-            .get_mut(&builder.region_id())
-            .unwrap();
-        flush_status.mem_only = false; // Simulate pending flush.
-        flush_status.pending_task = Some(task);
+    //     // Manually add to pending task to simulate a flush request while mem compacting.
+    //     let flush_status = scheduler
+    //         .region_status
+    //         .get_mut(&builder.region_id())
+    //         .unwrap();
+    //     flush_status.mem_only = false; // Simulate pending flush.
+    //     flush_status.pending_task = Some(task);
 
-        // Finish mem compact.
-        scheduler.on_mem_compact_finished(builder.region_id());
+    //     // Finish mem compact.
+    //     scheduler.on_mem_compact_finished(builder.region_id());
 
-        // Should schedule the pending flush task.
-        assert_eq!(1, scheduler.region_status.len());
-        let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
-        assert!(flush_status.flushing); // Should be flushing again due to pending task.
-        assert!(flush_status.pending_task.is_none()); // Pending task should be consumed.
-    }
+    //     // Should schedule the pending flush task.
+    //     assert_eq!(1, scheduler.region_status.len());
+    //     let flush_status = scheduler.region_status.get(&builder.region_id()).unwrap();
+    //     assert!(flush_status.flushing); // Should be flushing again due to pending task.
+    //     assert!(flush_status.pending_task.is_none()); // Pending task should be consumed.
+    // }
 
-    #[tokio::test]
-    async fn test_on_mem_compact_finished_region_not_found() {
-        let job_scheduler = Arc::new(VecScheduler::default());
-        let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
-        let mut scheduler = env.mock_flush_scheduler();
-        let builder = VersionControlBuilder::new();
+    // #[tokio::test]
+    // async fn test_on_mem_compact_finished_region_not_found() {
+    //     let job_scheduler = Arc::new(VecScheduler::default());
+    //     let env = SchedulerEnv::new().await.scheduler(job_scheduler.clone());
+    //     let mut scheduler = env.mock_flush_scheduler();
+    //     let builder = VersionControlBuilder::new();
 
-        // Try to finish mem compact for non-existent region.
-        scheduler.on_mem_compact_finished(builder.region_id());
+    //     // Try to finish mem compact for non-existent region.
+    //     scheduler.on_mem_compact_finished(builder.region_id());
 
-        // Should handle gracefully without panic.
-        assert_eq!(0, scheduler.region_status.len());
-    }
+    //     // Should handle gracefully without panic.
+    //     assert_eq!(0, scheduler.region_status.len());
+    // }
 }

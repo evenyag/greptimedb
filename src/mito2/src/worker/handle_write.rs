@@ -127,13 +127,13 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 put_rows += region_ctx.put_num;
                 delete_rows += region_ctx.delete_num;
 
-                if region_ctx.should_compact() {
-                    self.flush_scheduler.schedule_mem_compact(
-                        region_ctx.region_id,
-                        &region_ctx.version_control,
-                        self.sender.clone(),
-                    );
-                }
+                // if region_ctx.should_compact() {
+                //     self.flush_scheduler.schedule_mem_compact(
+                //         region_ctx.region_id,
+                //         &region_ctx.version_control,
+                //         self.sender.clone(),
+                //     );
+                // }
             } else {
                 let region_write_task = region_ctxs
                     .into_values()
@@ -149,17 +149,17 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                 for result in futures::future::join_all(region_write_task).await {
                     match result {
-                        Ok((put, delete, region_ctx)) => {
+                        Ok((put, delete, _region_ctx)) => {
                             put_rows += put;
                             delete_rows += delete;
 
-                            if region_ctx.should_compact() {
-                                self.flush_scheduler.schedule_mem_compact(
-                                    region_ctx.region_id,
-                                    &region_ctx.version_control,
-                                    self.sender.clone(),
-                                );
-                            }
+                            // if region_ctx.should_compact() {
+                            //     self.flush_scheduler.schedule_mem_compact(
+                            //         region_ctx.region_id,
+                            //         &region_ctx.version_control,
+                            //         self.sender.clone(),
+                            //     );
+                            // }
                         }
                         Err(e) => {
                             error!(e; "unexpected error when joining region write tasks");

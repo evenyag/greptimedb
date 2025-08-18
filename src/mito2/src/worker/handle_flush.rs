@@ -267,16 +267,16 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     }
 
     /// On region memtable compact job finished.
-    pub(crate) async fn handle_mem_compact_finished(&mut self, region_id: RegionId) {
-        info!("Region {} mem compact finished", region_id);
+    // pub(crate) async fn handle_mem_compact_finished(&mut self, region_id: RegionId) {
+    //     info!("Region {} mem compact finished", region_id);
 
-        // Notifies other workers. Even the remaining steps of this method fail we still
-        // wake up other workers as we have released some memory by flush.
-        self.notify_group();
+    //     // // Notifies other workers. Even the remaining steps of this method fail we still
+    //     // // wake up other workers as we have released some memory by flush.
+    //     // self.notify_group();
 
-        // Handle pending requests for the region.
-        self.flush_scheduler.on_mem_compact_finished(region_id);
-    }
+    //     // // Handle pending requests for the region.
+    //     // self.flush_scheduler.on_mem_compact_finished(region_id);
+    // }
 
     /// Updates the latest entry id since flush of the region.
     /// **This is only used for remote WAL pruning.**

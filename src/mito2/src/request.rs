@@ -786,8 +786,8 @@ pub(crate) enum BackgroundNotify {
     RegionChange(RegionChangeResult),
     /// Region edit result.
     RegionEdit(RegionEditResult),
-    /// Memtable compact has finished.
-    MemCompactFinished,
+    // /// Memtable compact has finished.
+    // MemCompactFinished,
 }
 
 /// Notifies a flush job is finished.

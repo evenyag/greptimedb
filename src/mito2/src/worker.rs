@@ -991,9 +991,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 self.handle_manifest_region_change_result(req).await
             }
             BackgroundNotify::RegionEdit(req) => self.handle_region_edit_result(req).await,
-            BackgroundNotify::MemCompactFinished => {
-                self.handle_mem_compact_finished(region_id).await
-            }
+            // BackgroundNotify::MemCompactFinished => {
+            //     self.handle_mem_compact_finished(region_id).await
+            // }
         }
     }
 

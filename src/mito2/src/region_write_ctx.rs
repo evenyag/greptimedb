@@ -313,7 +313,7 @@ impl RegionWriteCtx {
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
     }
 
-    pub(crate) fn should_compact(&self) -> bool {
-        self.version.memtables.mutable.should_compact()
-    }
+    // pub(crate) fn should_compact(&self) -> bool {
+    //     self.version.memtables.mutable.should_compact()
+    // }
 }
