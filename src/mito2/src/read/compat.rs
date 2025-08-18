@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datatypes::arrow::array::{Array, BinaryArray, BinaryBuilder, DictionaryArray, UInt32Array};
+use datatypes::arrow::compute::take;
 use datatypes::arrow::datatypes::{Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
@@ -1056,9 +1057,16 @@ impl FlatConvertFormat {
         let values_vector = builder.to_vector();
         let values_array = values_vector.to_arrow_array();
 
-        // Create dictionary array using the same keys
-        let dict_array = DictionaryArray::new(keys.clone(), values_array);
-        Ok(Arc::new(dict_array))
+        // Only create dictionary array for string types, otherwise take values by keys
+        if matches!(data_type, ConcreteDataType::String(_)) {
+            // Create dictionary array using the same keys for string types
+            let dict_array = DictionaryArray::new(keys.clone(), values_array);
+            Ok(Arc::new(dict_array))
+        } else {
+            // For non-string types, take values by keys indices to create a regular array
+            let taken_array = take(&values_array, keys, None).context(ComputeArrowSnafu)?;
+            Ok(taken_array)
+        }
     }
 }
 
