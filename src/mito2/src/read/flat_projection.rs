@@ -20,7 +20,8 @@ use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::error::ExternalSnafu;
 use common_recordbatch::RecordBatch;
-use datatypes::prelude::ConcreteDataType;
+use datatypes::arrow::datatypes::Field;
+use datatypes::prelude::{ConcreteDataType, DataType};
 use datatypes::schema::{Schema, SchemaRef};
 use datatypes::vectors::Helper;
 use snafu::{OptionExt, ResultExt};
@@ -28,6 +29,7 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::error::{InvalidRequestSnafu, Result};
+use crate::sst::internal_fields;
 use crate::sst::parquet::flat_format::sst_column_id_indices;
 use crate::sst::parquet::format::FormatProjection;
 
@@ -181,6 +183,22 @@ impl FlatProjectionMapper {
     #[allow(dead_code)]
     pub(crate) fn batch_schema(&self) -> &[(ColumnId, ConcreteDataType)] {
         &self.batch_schema
+    }
+
+    pub(crate) fn input_arrow_schema(&self) -> datatypes::arrow::datatypes::SchemaRef {
+        let mut new_fields = Vec::with_capacity(self.batch_schema.len() + 3);
+        for (column_id, _) in &self.batch_schema {
+            let column_metadata = self.metadata.column_by_id(*column_id).unwrap();
+            let field = Field::new(
+                &column_metadata.column_schema.name,
+                column_metadata.column_schema.data_type.as_arrow_type(),
+                column_metadata.column_schema.is_nullable(),
+            );
+            new_fields.push(Arc::new(field));
+        }
+        new_fields.extend_from_slice(&internal_fields());
+
+        Arc::new(datatypes::arrow::datatypes::Schema::new(new_fields))
     }
 
     /// Returns the schema of converted [RecordBatch].

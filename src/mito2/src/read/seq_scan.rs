@@ -54,7 +54,6 @@ use crate::read::{
 };
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
 
 /// Scans a region and returns rows in a sorted sequence.
 ///
@@ -282,10 +281,8 @@ impl SeqScan {
     ) -> Result<BoxedRecordBatchStream> {
         // TODO(yingwen): Consider parallel reading for flat sources
 
-        let schema = to_flat_sst_arrow_schema(
-            stream_ctx.input.mapper.metadata(),
-            &FlatSchemaOptions::default(),
-        );
+        let mapper = stream_ctx.input.mapper.as_flat().unwrap();
+        let schema = mapper.input_arrow_schema();
 
         let reader = MergeReader::new(schema, sources, DEFAULT_READ_BATCH_SIZE).await?;
 
@@ -299,19 +296,16 @@ impl SeqScan {
                     )
                     .into_stream(),
                 ) as _,
-                MergeMode::LastNonNull => {
-                    let mapper = stream_ctx.input.mapper.as_flat().unwrap();
-                    Box::pin(
-                        flat_dedup::DedupReader::new(
-                            reader.into_stream().boxed(),
-                            FlatLastNonNull::new(
-                                mapper.field_column_start(),
-                                stream_ctx.input.filter_deleted,
-                            ),
-                        )
-                        .into_stream(),
-                    ) as _
-                }
+                MergeMode::LastNonNull => Box::pin(
+                    flat_dedup::DedupReader::new(
+                        reader.into_stream().boxed(),
+                        FlatLastNonNull::new(
+                            mapper.field_column_start(),
+                            stream_ctx.input.filter_deleted,
+                        ),
+                    )
+                    .into_stream(),
+                ) as _,
             }
         } else {
             Box::pin(reader.into_stream()) as _
