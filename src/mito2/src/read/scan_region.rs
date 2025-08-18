@@ -383,8 +383,10 @@ impl ScanRegion {
 
         // The mapper always computes projected column ids as the schema of SSTs may change.
         let mapper = match &self.request.projection {
-            Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied(), false)?,
-            None => ProjectionMapper::all(&self.version.metadata, false)?,
+            Some(p) => {
+                ProjectionMapper::new(&self.version.metadata, p.iter().copied(), self.flat_format)?
+            }
+            None => ProjectionMapper::all(&self.version.metadata, self.flat_format)?,
         };
 
         let ssts = &self.version.ssts;
@@ -458,11 +460,11 @@ impl ScanRegion {
         let bloom_filter_applier = self.build_bloom_filter_applier();
         let fulltext_index_applier = self.build_fulltext_index_applier();
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters);
-        // The mapper always computes projected column ids as the schema of SSTs may change.
-        let mapper = match &self.request.projection {
-            Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied(), false)?,
-            None => ProjectionMapper::all(&self.version.metadata, false)?,
-        };
+        // // The mapper always computes projected column ids as the schema of SSTs may change.
+        // let mapper = match &self.request.projection {
+        //     Some(p) => ProjectionMapper::new(&self.version.metadata, p.iter().copied(), false)?,
+        //     None => ProjectionMapper::all(&self.version.metadata, false)?,
+        // };
 
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
