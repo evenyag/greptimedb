@@ -29,7 +29,7 @@ use datatypes::arrow::datatypes::SchemaRef;
 use mito_codec::key_values::KeyValue;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::Semaphore;
 
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
@@ -535,6 +535,7 @@ impl MemtableCompactor {
 }
 
 struct MemCompactTask {
+    metadata: RegionMetadataRef,
     parts: Arc<RwLock<BulkParts>>,
 
     /// Cached flat SST arrow schema
@@ -543,13 +544,38 @@ struct MemCompactTask {
     compactor: Arc<Mutex<MemtableCompactor>>,
 }
 
-struct CompactWorker {
-    receiver: Receiver<MemCompactTask>,
+impl MemCompactTask {
+    fn compact(&self) -> Result<()> {
+        let mut compactor = self.compactor.lock().unwrap();
+        compactor.merge_parts(&self.flat_arrow_schema, &self.parts, &self.metadata)?;
+        Ok(())
+    }
 }
 
-impl CompactWorker {
-    fn run(&mut self) {
-        //
+pub struct CompactDispatcher {
+    semaphore: Arc<Semaphore>,
+}
+
+impl CompactDispatcher {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
+    async fn dispatch_compact(&self, task: MemCompactTask) {
+        let semaphore = self.semaphore.clone();
+        common_runtime::spawn_global(async move {
+            let Ok(_permit) = semaphore.acquire().await else {
+                return;
+            };
+
+            common_runtime::spawn_blocking_global(move || {
+                if let Err(e) = task.compact() {
+                    common_telemetry::error!(e; "Failed to compact memtable, region: {}", task.metadata.region_id);
+                }
+            });
+        });
     }
 }
 
