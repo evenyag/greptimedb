@@ -189,11 +189,20 @@ impl FlatProjectionMapper {
         let mut new_fields = Vec::with_capacity(self.batch_schema.len() + 3);
         for (column_id, _) in &self.batch_schema {
             let column_metadata = self.metadata.column_by_id(*column_id).unwrap();
-            let field = Field::new(
-                &column_metadata.column_schema.name,
-                column_metadata.column_schema.data_type.as_arrow_type(),
-                column_metadata.column_schema.is_nullable(),
-            );
+            let field = if column_metadata.semantic_type == SemanticType::Tag {
+                Field::new_dictionary(
+                    &column_metadata.column_schema.name,
+                    datatypes::arrow::datatypes::DataType::UInt32,
+                    column_metadata.column_schema.data_type.as_arrow_type(),
+                    column_metadata.column_schema.is_nullable(),
+                )
+            } else {
+                Field::new(
+                    &column_metadata.column_schema.name,
+                    column_metadata.column_schema.data_type.as_arrow_type(),
+                    column_metadata.column_schema.is_nullable(),
+                )
+            };
             new_fields.push(Arc::new(field));
         }
         new_fields.extend_from_slice(&internal_fields());

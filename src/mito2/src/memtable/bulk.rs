@@ -883,4 +883,82 @@ mod tests {
         // Should not merge when only 6 unmerged parts remain
         assert!(!MemtableCompactor::should_merge_parts(&bulk_parts));
     }
+
+    #[test]
+    fn test_memtable_compactor_merge_parts() {
+        let metadata = metadata_for_test();
+        let arrow_schema = to_flat_sst_arrow_schema(
+            &metadata,
+            &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+        );
+        let bulk_parts = RwLock::new(BulkParts::new());
+
+        // Create and add multiple bulk parts to merge
+        let parts_data = vec![
+            (
+                "key_a",
+                1u32,
+                vec![1000i64, 1100i64],
+                vec![Some(10.0), Some(11.0)],
+                100u64,
+            ),
+            (
+                "key_b",
+                2u32,
+                vec![2000i64, 2100i64],
+                vec![Some(20.0), Some(21.0)],
+                200u64,
+            ),
+            (
+                "key_c",
+                3u32,
+                vec![3000i64, 3100i64],
+                vec![Some(30.0), Some(31.0)],
+                300u64,
+            ),
+        ];
+
+        let expected_total_rows = 6;
+        {
+            let mut parts = bulk_parts.write().unwrap();
+            for (k0, k1, timestamps, values, seq) in parts_data {
+                let part =
+                    create_bulk_part_with_converter(k0, k1, timestamps, values, seq).unwrap();
+                parts.parts.push(BulkPartWrapper {
+                    part,
+                    merging: None,
+                });
+            }
+        }
+
+        // Verify initial state - should have 3 parts, 0 encoded parts
+        {
+            let parts = bulk_parts.read().unwrap();
+            assert_eq!(3, parts.parts.len());
+            assert_eq!(0, parts.encoded_parts.len());
+        }
+
+        // Create compactor and merge parts
+        let mut compactor = MemtableCompactor::new();
+        compactor
+            .merge_parts(&arrow_schema, &bulk_parts, &metadata)
+            .unwrap();
+
+        // Verify the merge results
+        {
+            let parts = bulk_parts.read().unwrap();
+            // All original parts should be removed since they were all unmerged
+            assert_eq!(0, parts.parts.len());
+            // Should have 1 encoded part containing merged data
+            assert_eq!(1, parts.encoded_parts.len());
+
+            let encoded_part = &parts.encoded_parts[0];
+            let encoded_metadata = encoded_part.metadata();
+            assert_eq!(expected_total_rows, encoded_metadata.num_rows);
+
+            // Verify timestamp bounds
+            assert_eq!(1000, encoded_metadata.min_timestamp);
+            assert_eq!(3100, encoded_metadata.max_timestamp);
+        }
+    }
 }
