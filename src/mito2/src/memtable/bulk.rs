@@ -29,6 +29,7 @@ use datatypes::arrow::datatypes::SchemaRef;
 use mito_codec::key_values::KeyValue;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
+use tokio::sync::mpsc::Receiver;
 
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
@@ -65,7 +66,7 @@ impl BulkParts {
 
 pub struct BulkMemtable {
     id: MemtableId,
-    parts: RwLock<BulkParts>,
+    parts: Arc<RwLock<BulkParts>>,
     metadata: RegionMetadataRef,
     alloc_tracker: AllocTracker,
     max_timestamp: AtomicI64,
@@ -75,7 +76,7 @@ pub struct BulkMemtable {
     /// Cached flat SST arrow schema
     flat_arrow_schema: SchemaRef,
     /// Compactor for merging bulk parts
-    compactor: Mutex<MemtableCompactor>,
+    compactor: Arc<Mutex<MemtableCompactor>>,
 }
 
 impl std::fmt::Debug for BulkMemtable {
@@ -130,6 +131,13 @@ impl Memtable for BulkMemtable {
         // it guarantees no rows are out of the time range so we don't need to
         // prune rows by time range again in the iterator of the MemtableRange.
         self.update_stats(local_metrics);
+        drop(bulk_parts);
+
+        if self.should_compact() {
+            if let Err(e) = self.compact() {
+                common_telemetry::error!(e; "Failed to compact table");
+            }
+        }
 
         Ok(())
     }
@@ -273,7 +281,7 @@ impl Memtable for BulkMemtable {
 
         Arc::new(Self {
             id,
-            parts: RwLock::new(BulkParts::new()),
+            parts: Arc::new(RwLock::new(BulkParts::new())),
             metadata: metadata.clone(),
             alloc_tracker: AllocTracker::new(self.alloc_tracker.write_buffer_manager()),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -281,7 +289,7 @@ impl Memtable for BulkMemtable {
             max_sequence: AtomicU64::new(0),
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
-            compactor: Mutex::new(MemtableCompactor::new()),
+            compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
         })
     }
 
@@ -310,7 +318,7 @@ impl BulkMemtable {
 
         Self {
             id,
-            parts: RwLock::new(BulkParts::new()),
+            parts: Arc::new(RwLock::new(BulkParts::new())),
             metadata,
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -318,7 +326,7 @@ impl BulkMemtable {
             max_sequence: AtomicU64::new(0),
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
-            compactor: Mutex::new(MemtableCompactor::new()),
+            compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
         }
     }
 
@@ -523,6 +531,25 @@ impl MemtableCompactor {
         }
 
         Ok(())
+    }
+}
+
+struct MemCompactTask {
+    parts: Arc<RwLock<BulkParts>>,
+
+    /// Cached flat SST arrow schema
+    flat_arrow_schema: SchemaRef,
+    /// Compactor for merging bulk parts
+    compactor: Arc<Mutex<MemtableCompactor>>,
+}
+
+struct CompactWorker {
+    receiver: Receiver<MemCompactTask>,
+}
+
+impl CompactWorker {
+    fn run(&mut self) {
+        //
     }
 }
 
