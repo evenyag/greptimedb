@@ -16,6 +16,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use api::helper::{value_to_grpc_value, ColumnDataTypeWrapper};
 use api::v1::bulk_wal_entry::Body;
@@ -595,24 +596,41 @@ impl BulkPartEncoder {
         let mut total_rows = 0;
 
         // Process each batch from the iterator
+        let mut iter_cost = Duration::default();
+        let mut write_cost = Duration::default();
+        let mut iter_start = Instant::now();
         for batch_result in iter {
+            iter_cost += iter_start.elapsed();
             let batch = batch_result?;
             if batch.num_rows() == 0 {
                 continue;
             }
 
+            let writer_start = Instant::now();
             writer.write(&batch).context(EncodeMemtableSnafu)?;
+            write_cost += writer_start.elapsed();
             total_rows += batch.num_rows();
+            iter_start = Instant::now();
         }
+        iter_cost += iter_start.elapsed();
+        iter_start = Instant::now();
 
         if total_rows == 0 {
             return Ok(None);
         }
 
+        let writer_start = Instant::now();
         let file_metadata = writer.close().context(EncodeMemtableSnafu)?;
+        write_cost += writer_start.elapsed();
 
         let buf = Bytes::from(buf);
         let parquet_metadata = Arc::new(parse_parquet_metadata(file_metadata)?);
+
+        common_telemetry::info!(
+            "Encode record batch iter, iter_cost: {:?}, write_cost: {:?}",
+            iter_cost,
+            write_cost
+        );
 
         Ok(Some(EncodedBulkPart {
             data: buf,
