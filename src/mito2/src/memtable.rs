@@ -32,7 +32,7 @@ use store_api::storage::{ColumnId, SequenceNumber};
 use crate::config::MitoConfig;
 use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
-use crate::memtable::bulk::BulkMemtableBuilder;
+use crate::memtable::bulk::{BulkMemtableBuilder, CompactDispatcher};
 use crate::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtableBuilder};
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
@@ -328,6 +328,7 @@ impl Drop for AllocTracker {
 pub(crate) struct MemtableBuilderProvider {
     write_buffer_manager: Option<WriteBufferManagerRef>,
     config: Arc<MitoConfig>,
+    compact_dispatcher: Arc<CompactDispatcher>,
 }
 
 impl MemtableBuilderProvider {
@@ -335,9 +336,12 @@ impl MemtableBuilderProvider {
         write_buffer_manager: Option<WriteBufferManagerRef>,
         config: Arc<MitoConfig>,
     ) -> Self {
+        let compact_dispatcher =
+            Arc::new(CompactDispatcher::new(config.max_background_compactions));
         Self {
             write_buffer_manager,
             config,
+            compact_dispatcher,
         }
     }
 
@@ -384,9 +388,10 @@ impl MemtableBuilderProvider {
                 dedup,
                 merge_mode,
             )),
-            MemtableConfig::Bulk => {
-                Arc::new(BulkMemtableBuilder::new(self.write_buffer_manager.clone()))
-            }
+            MemtableConfig::Bulk => Arc::new(
+                BulkMemtableBuilder::new(self.write_buffer_manager.clone())
+                    .with_compact_dispatcher(self.compact_dispatcher.clone()),
+            ),
         }
     }
 }

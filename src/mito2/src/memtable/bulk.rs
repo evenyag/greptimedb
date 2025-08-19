@@ -24,6 +24,7 @@ mod row_group_reader;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use datatypes::arrow::datatypes::SchemaRef;
 use mito_codec::key_values::KeyValue;
@@ -77,6 +78,8 @@ pub struct BulkMemtable {
     flat_arrow_schema: SchemaRef,
     /// Compactor for merging bulk parts
     compactor: Arc<Mutex<MemtableCompactor>>,
+    /// Dispatcher for scheduling compaction tasks
+    compact_dispatcher: Option<Arc<CompactDispatcher>>,
 }
 
 impl std::fmt::Debug for BulkMemtable {
@@ -134,9 +137,7 @@ impl Memtable for BulkMemtable {
         drop(bulk_parts);
 
         if self.should_compact() {
-            if let Err(e) = self.compact() {
-                common_telemetry::error!(e; "Failed to compact table");
-            }
+            self.schedule_compact();
         }
 
         Ok(())
@@ -290,6 +291,7 @@ impl Memtable for BulkMemtable {
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
             compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
+            compact_dispatcher: self.compact_dispatcher.clone(),
         })
     }
 
@@ -310,6 +312,7 @@ impl BulkMemtable {
         id: MemtableId,
         metadata: RegionMetadataRef,
         write_buffer_manager: Option<WriteBufferManagerRef>,
+        compact_dispatcher: Option<Arc<CompactDispatcher>>,
     ) -> Self {
         let flat_arrow_schema = to_flat_sst_arrow_schema(
             &metadata,
@@ -327,6 +330,7 @@ impl BulkMemtable {
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
             compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
+            compact_dispatcher,
         }
     }
 
@@ -350,6 +354,25 @@ impl BulkMemtable {
             .iter()
             .map(|part_wrapper| part_wrapper.part.estimated_series_count())
             .sum()
+    }
+
+    /// Schedules a compaction task using the CompactDispatcher.
+    fn schedule_compact(&self) {
+        if let Some(dispatcher) = &self.compact_dispatcher {
+            let task = MemCompactTask {
+                metadata: self.metadata.clone(),
+                parts: self.parts.clone(),
+                flat_arrow_schema: self.flat_arrow_schema.clone(),
+                compactor: self.compactor.clone(),
+            };
+
+            dispatcher.dispatch_compact(task);
+        } else {
+            // Fallback to synchronous compaction if no dispatcher is available
+            if let Err(e) = self.compact() {
+                common_telemetry::error!(e; "Failed to compact table");
+            }
+        }
     }
 }
 
@@ -453,6 +476,7 @@ impl MemtableCompactor {
         bulk_parts: &RwLock<BulkParts>,
         metadata: &RegionMetadataRef,
     ) -> Result<()> {
+        let start = Instant::now();
         // Get current merge id and increment for next merge
         let merge_id = self.next_merge_id;
         self.next_merge_id += 1;
@@ -474,6 +498,7 @@ impl MemtableCompactor {
         if parts_to_merge.is_empty() {
             return Ok(());
         }
+        let num_parts = parts_to_merge.len();
 
         // Calculate timestamp bounds for merged data
         let min_timestamp = parts_to_merge
@@ -520,6 +545,14 @@ impl MemtableCompactor {
             min_timestamp,
             max_timestamp,
         )? {
+            let num_rows = encoded_part.metadata().num_rows;
+            common_telemetry::info!(
+                "BulkMemtable compact {} parts, {} rows, cost: {:?}",
+                num_parts,
+                num_rows,
+                start.elapsed()
+            );
+
             // Add the encoded part and remove the merged parts
             let mut parts = bulk_parts.write().unwrap();
             parts.encoded_parts.push(encoded_part);
@@ -552,6 +585,7 @@ impl MemCompactTask {
     }
 }
 
+#[derive(Debug)]
 pub struct CompactDispatcher {
     semaphore: Arc<Semaphore>,
 }
@@ -563,7 +597,7 @@ impl CompactDispatcher {
         }
     }
 
-    async fn dispatch_compact(&self, task: MemCompactTask) {
+    fn dispatch_compact(&self, task: MemCompactTask) {
         let semaphore = self.semaphore.clone();
         common_runtime::spawn_global(async move {
             let Ok(_permit) = semaphore.acquire().await else {
@@ -589,6 +623,7 @@ struct BulkPartWrapper {
 #[derive(Debug, Default)]
 pub struct BulkMemtableBuilder {
     write_buffer_manager: Option<WriteBufferManagerRef>,
+    compact_dispatcher: Option<Arc<CompactDispatcher>>,
 }
 
 impl BulkMemtableBuilder {
@@ -596,7 +631,14 @@ impl BulkMemtableBuilder {
     pub fn new(write_buffer_manager: Option<WriteBufferManagerRef>) -> Self {
         Self {
             write_buffer_manager,
+            compact_dispatcher: None,
         }
+    }
+
+    /// Sets the compact dispatcher.
+    pub fn with_compact_dispatcher(mut self, compact_dispatcher: Arc<CompactDispatcher>) -> Self {
+        self.compact_dispatcher = Some(compact_dispatcher);
+        self
     }
 }
 
@@ -606,6 +648,7 @@ impl MemtableBuilder for BulkMemtableBuilder {
             id,
             metadata.clone(),
             self.write_buffer_manager.clone(),
+            self.compact_dispatcher.clone(),
         ))
     }
 
@@ -659,7 +702,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_write_multiple_parts() {
         let metadata = metadata_for_test();
-        let memtable = BulkMemtable::new(456, metadata.clone(), None);
+        let memtable = BulkMemtable::new(456, metadata.clone(), None, None);
 
         let part1 = create_bulk_part_with_converter(
             "key1",
@@ -695,7 +738,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_write_read() {
         let metadata = metadata_for_test();
-        let memtable = BulkMemtable::new(999, metadata.clone(), None);
+        let memtable = BulkMemtable::new(999, metadata.clone(), None, None);
 
         let test_data = vec![
             (
@@ -757,7 +800,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_ranges_with_projection() {
         let metadata = metadata_for_test();
-        let memtable = BulkMemtable::new(111, metadata.clone(), None);
+        let memtable = BulkMemtable::new(111, metadata.clone(), None, None);
 
         let bulk_part = create_bulk_part_with_converter(
             "projection_test",
@@ -795,7 +838,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_unsupported_operations() {
         let metadata = metadata_for_test();
-        let memtable = BulkMemtable::new(111, metadata.clone(), None);
+        let memtable = BulkMemtable::new(111, metadata.clone(), None, None);
 
         let key_values = build_key_values_with_ts_seq_values(
             &metadata,
@@ -817,7 +860,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_freeze() {
         let metadata = metadata_for_test();
-        let memtable = BulkMemtable::new(222, metadata.clone(), None);
+        let memtable = BulkMemtable::new(222, metadata.clone(), None, None);
 
         let bulk_part = create_bulk_part_with_converter(
             "freeze_test",
@@ -838,7 +881,7 @@ mod tests {
     #[test]
     fn test_bulk_memtable_fork() {
         let metadata = metadata_for_test();
-        let original_memtable = BulkMemtable::new(333, metadata.clone(), None);
+        let original_memtable = BulkMemtable::new(333, metadata.clone(), None, None);
 
         let bulk_part =
             create_bulk_part_with_converter("fork_test", 15, vec![15000], vec![Some(150.0)], 1500)
