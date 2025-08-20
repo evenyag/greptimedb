@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use api::v1::SemanticType;
 use common_error::ext::BoxedError;
-use common_recordbatch::error::ExternalSnafu;
+use common_recordbatch::error::{ArrowComputeSnafu, ExternalSnafu};
 use common_recordbatch::RecordBatch;
 use datatypes::arrow::datatypes::Field;
 use datatypes::prelude::{ConcreteDataType, DataType};
@@ -236,7 +236,16 @@ impl FlatProjectionMapper {
 
         let mut columns = Vec::with_capacity(self.output_schema.num_columns());
         for index in &self.batch_indices {
-            let array = batch.column(*index).clone();
+            let mut array = batch.column(*index).clone();
+            // Cast dictionary values to the target type.
+            if let datatypes::arrow::datatypes::DataType::Dictionary(_key_type, value_type) =
+                array.data_type()
+            {
+                let casted = datatypes::arrow::compute::cast(&array, value_type)
+                    .context(ArrowComputeSnafu)?;
+                array = casted;
+            }
+
             let vector = Helper::try_into_vector(array)
                 .map_err(BoxedError::new)
                 .context(ExternalSnafu)?;
