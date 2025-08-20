@@ -627,7 +627,8 @@ impl BulkPartEncoder {
         let parquet_metadata = Arc::new(parse_parquet_metadata(file_metadata)?);
 
         common_telemetry::info!(
-            "Encode record batch iter, iter_cost: {:?}, write_cost: {:?}",
+            "Encode record batch iter, total rows: {}, iter_cost: {:?}, write_cost: {:?}",
+            total_rows,
             iter_cost,
             write_cost
         );

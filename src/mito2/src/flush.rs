@@ -358,6 +358,8 @@ impl RegionFlushTask {
             }
 
             let mem_ranges = mem.ranges(None, PredicateGroup::default(), None)?;
+            let num_mem_ranges = mem_ranges.ranges.len();
+            let num_mem_rows = mem_ranges.stats.num_rows();
             let (max_sequence, source) = if mem_ranges.is_record_batch() {
                 let batch_schema =
                     to_flat_sst_arrow_schema(&version.metadata, &FlatSchemaOptions::default());
@@ -399,6 +401,14 @@ impl RegionFlushTask {
                 // No data written.
                 continue;
             }
+
+            common_telemetry::info!(
+                "Region flush one memtable, num_mem_ranges: {}, num_rows: {}, metrics: {:?}",
+                num_mem_ranges,
+                num_mem_rows,
+                metrics
+            );
+
             flush_metrics = flush_metrics.merge(metrics);
 
             file_metas.extend(ssts_written.into_iter().map(|sst_info| {
