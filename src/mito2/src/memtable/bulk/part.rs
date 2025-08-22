@@ -521,6 +521,11 @@ impl EncodedBulkPart {
         &self.metadata
     }
 
+    /// Returns the size of the encoded data in bytes
+    pub(crate) fn size_bytes(&self) -> usize {
+        self.data.len()
+    }
+
     pub(crate) fn read(
         &self,
         context: BulkIterContextRef,

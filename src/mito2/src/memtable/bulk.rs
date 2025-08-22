@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use datatypes::arrow::datatypes::SchemaRef;
 use mito_codec::key_values::KeyValue;
+use rayon::prelude::*;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, SequenceNumber};
 use tokio::sync::Semaphore;
@@ -588,6 +589,11 @@ impl MemtableCompactor {
     }
 
     /// Merges encoded parts and then encodes the result to an [EncodedBulkPart].
+    /// This method implements concurrent merge with the following strategy:
+    /// 1. Sort parts by size
+    /// 2. Group every 16 parts with similar sizes
+    /// 3. Skip parts that are >16x larger than the smallest part
+    /// 4. Process groups concurrently using rayon
     fn merge_encoded_parts(
         &mut self,
         arrow_schema: &SchemaRef,
@@ -595,28 +601,106 @@ impl MemtableCompactor {
         metadata: &RegionMetadataRef,
     ) -> Result<()> {
         let start = Instant::now();
-        // Get current merge id and increment for next merge
+
+        // Get current merge id for all concurrent tasks
         let merge_id = self.next_merge_id;
         self.next_merge_id += 1;
 
-        // Collect unmerged encoded parts and mark them as being merged
-        let parts_to_merge: Vec<EncodedBulkPart> = {
+        // Collect unmerged encoded parts with their sizes and mark them as being merged
+        let mut parts_info: Vec<EncodedPartInfo> = {
             let mut parts = bulk_parts.write().unwrap();
             let mut collected_parts = Vec::new();
 
             for wrapper in &mut parts.encoded_parts {
                 if wrapper.merging.is_none() {
+                    let size = wrapper.part.size_bytes();
                     wrapper.merging = Some(merge_id);
-                    collected_parts.push(wrapper.part.clone());
+
+                    collected_parts.push(EncodedPartInfo {
+                        part: wrapper.part.clone(),
+                        size_bytes: size,
+                    });
                 }
             }
             collected_parts
         };
 
-        if parts_to_merge.is_empty() {
+        if parts_info.is_empty() {
             return Ok(());
         }
-        let num_parts = parts_to_merge.len();
+
+        // Sort parts by size (ascending) using unstable sort for better performance
+        parts_info.sort_unstable_by_key(|info| info.size_bytes);
+
+        // Skip parts that are >16x larger than the smallest part
+        let smallest_size = parts_info[0].size_bytes;
+        let max_allowed_size = smallest_size.saturating_mul(16);
+        let filtered_parts: Vec<_> = parts_info
+            .into_iter()
+            .filter(|info| info.size_bytes <= max_allowed_size)
+            .collect();
+
+        if filtered_parts.is_empty() {
+            return Ok(());
+        }
+
+        // Group parts into chunks of 16 for concurrent processing
+        let part_groups: Vec<Vec<EncodedPartInfo>> = filtered_parts
+            .chunks(16)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        let total_groups = part_groups.len();
+        let total_parts_to_merge: usize = part_groups.iter().map(|group| group.len()).sum();
+
+        // Process each group concurrently using rayon - fail if any task fails
+        let merged_parts = part_groups
+            .into_par_iter()
+            .map(|group| Self::merge_parts_group(group, arrow_schema, metadata))
+            .collect::<Result<Vec<Option<EncodedBulkPart>>>>()?;
+
+        // Collect merged parts.
+        let mut total_output_rows = 0;
+        {
+            let mut parts = bulk_parts.write().unwrap();
+            for encoded_part_opt in merged_parts {
+                if let Some(encoded_part) = encoded_part_opt {
+                    total_output_rows += encoded_part.metadata().num_rows;
+                    parts.encoded_parts.push(EncodedPartWrapper {
+                        part: encoded_part,
+                        merging: None,
+                    });
+                }
+            }
+            // Remove all parts that were merged (all parts with this merge_id)
+            parts
+                .encoded_parts
+                .retain(|wrapper| wrapper.merging != Some(merge_id));
+        }
+
+        common_telemetry::info!(
+            "BulkMemtable concurrent compact {} groups, {} encoded parts -> {} rows, cost: {:?}",
+            total_groups,
+            total_parts_to_merge,
+            total_output_rows,
+            start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    /// Merges a group of encoded parts into a single encoded part
+    fn merge_parts_group(
+        group: Vec<EncodedPartInfo>,
+        arrow_schema: &SchemaRef,
+        metadata: &RegionMetadataRef,
+    ) -> Result<Option<EncodedBulkPart>> {
+        if group.is_empty() {
+            return Ok(None);
+        }
+
+        let parts_to_merge: Vec<EncodedBulkPart> =
+            group.into_iter().map(|info| info.part).collect();
 
         // Calculate timestamp bounds for merged data
         let min_timestamp = parts_to_merge
@@ -644,44 +728,25 @@ impl MemtableCompactor {
             .collect();
 
         if iterators.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // Merge the iterators
+        // TODO(yingwen): Dedup.
         let merged_iter =
             MergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;
         let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
 
         // Encode the merged iterator
         let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE);
-        if let Some(encoded_part) = encoder.encode_record_batch_iter(
+        let encoded_part = encoder.encode_record_batch_iter(
             boxed_iter,
             arrow_schema.clone(),
             min_timestamp,
             max_timestamp,
-        )? {
-            let num_rows = encoded_part.metadata().num_rows;
-            common_telemetry::info!(
-                "BulkMemtable compact {} encoded parts, {} rows, cost: {:?}",
-                num_parts,
-                num_rows,
-                start.elapsed()
-            );
+        )?;
 
-            // Add the encoded part and remove the merged parts
-            let mut parts = bulk_parts.write().unwrap();
-            parts.encoded_parts.push(EncodedPartWrapper {
-                part: encoded_part,
-                merging: None,
-            });
-
-            // Remove parts that were merged
-            parts
-                .encoded_parts
-                .retain(|wrapper| wrapper.merging != Some(merge_id));
-        }
-
-        Ok(())
+        Ok(encoded_part)
     }
 }
 
@@ -751,6 +816,13 @@ struct EncodedPartWrapper {
     part: EncodedBulkPart,
     /// The id of the merge task if the memtable is merging the part.
     merging: Option<u64>,
+}
+
+/// Represents an encoded part with its size for concurrent processing
+#[derive(Clone)]
+struct EncodedPartInfo {
+    part: EncodedBulkPart,
+    size_bytes: usize,
 }
 
 /// Builder to build a [BulkMemtable].
