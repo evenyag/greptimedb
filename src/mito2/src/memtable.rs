@@ -220,7 +220,8 @@ pub trait Memtable: Send + Sync + fmt::Debug {
     }
 
     /// Compacts the memtable.
-    fn compact(&self) -> Result<()> {
+    fn compact(&self, for_flush: bool) -> Result<()> {
+        let _ = for_flush;
         Ok(())
     }
 }

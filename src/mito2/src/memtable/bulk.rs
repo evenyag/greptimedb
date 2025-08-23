@@ -301,8 +301,12 @@ impl Memtable for BulkMemtable {
             || MemtableCompactor::should_merge_encoded_parts(&self.parts)
     }
 
-    fn compact(&self) -> Result<()> {
+    fn compact(&self, for_flush: bool) -> Result<()> {
         let mut compactor = self.compactor.lock().unwrap();
+
+        if for_flush {
+            return Ok(());
+        }
 
         // Try to merge regular parts first
         if MemtableCompactor::should_merge_parts(&self.parts) {
@@ -381,7 +385,7 @@ impl BulkMemtable {
             dispatcher.dispatch_compact(task);
         } else {
             // Fallback to synchronous compaction if no dispatcher is available
-            if let Err(e) = self.compact() {
+            if let Err(e) = self.compact(false) {
                 common_telemetry::error!(e; "Failed to compact table");
             }
         }

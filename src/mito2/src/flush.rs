@@ -361,9 +361,11 @@ impl RegionFlushTask {
             }
 
             // Compact the memtable first, this waits the background compaction to finish.
-            if let Err(e) = mem.compact() {
+            let compact_start = std::time::Instant::now();
+            if let Err(e) = mem.compact(true) {
                 common_telemetry::error!(e; "Failed to compact memtable before flush");
             }
+            let compact_cost = compact_start.elapsed();
 
             let mem_ranges = mem.ranges(None, PredicateGroup::default(), None)?;
             let num_mem_ranges = mem_ranges.ranges.len();
@@ -420,9 +422,10 @@ impl RegionFlushTask {
                 }
 
                 common_telemetry::info!(
-                    "Region flush {} memtables, total_cost: {:?}",
+                    "Region flush {} memtables, flush_cost: {:?}, compact_cost: {:?}",
                     num_sources,
-                    flush_start.elapsed()
+                    flush_start.elapsed(),
+                    compact_cost,
                 );
             } else {
                 let (max_sequence, source) =
