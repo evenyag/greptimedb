@@ -500,104 +500,81 @@ impl MemtableCompactor {
         metadata: &RegionMetadataRef,
     ) -> Result<()> {
         let start = Instant::now();
-        // Get current merge id and increment for next merge
+
+        // Get current merge id for all concurrent tasks
         let merge_id = self.next_merge_id;
         self.next_merge_id += 1;
 
-        // Collect unmerged parts and mark them as being merged
-        let parts_to_merge: Vec<BulkPart> = {
+        // Collect unmerged parts with their row counts and mark them as being merged
+        let mut parts_info: Vec<BulkPartInfo> = {
             let mut parts = bulk_parts.write().unwrap();
             let mut collected_parts = Vec::new();
 
             for wrapper in &mut parts.parts {
                 if wrapper.merging.is_none() {
+                    let num_rows = wrapper.part.num_rows();
                     wrapper.merging = Some(merge_id);
-                    collected_parts.push(wrapper.part.clone());
+
+                    collected_parts.push(BulkPartInfo {
+                        part: wrapper.part.clone(),
+                        num_rows,
+                    });
                 }
             }
             collected_parts
         };
 
-        if parts_to_merge.is_empty() {
+        if parts_info.is_empty() {
             return Ok(());
         }
-        let num_parts = parts_to_merge.len();
 
-        // Calculate timestamp bounds for merged data
-        let min_timestamp = parts_to_merge
-            .iter()
-            .map(|p| p.min_ts)
-            .min()
-            .unwrap_or(i64::MAX);
-        let max_timestamp = parts_to_merge
-            .iter()
-            .map(|p| p.max_ts)
-            .max()
-            .unwrap_or(i64::MIN);
+        // Sort parts by row count (ascending) using unstable sort for better performance
+        parts_info.sort_unstable_by_key(|info| info.num_rows);
 
-        // Create context for reading parts
-        let context = Arc::new(BulkIterContext::new(
-            metadata.clone(),
-            &None, // No column projection for merging
-            None,  // No predicate for merging
-        ));
+        // Group parts into chunks of 16 for concurrent processing
+        let part_groups: Vec<Vec<BulkPartInfo>> =
+            parts_info.chunks(16).map(|chunk| chunk.to_vec()).collect();
 
-        // Create iterators for all parts to merge
-        let iterators: Vec<BoxedRecordBatchIterator> = parts_to_merge
-            .into_iter()
-            .map(|part| {
-                let iter = BulkPartRecordBatchIter::new(
-                    part.batch,
-                    context.clone(),
-                    None, // No sequence filter for merging
-                );
-                Box::new(iter) as BoxedRecordBatchIterator
-            })
-            .collect();
+        let total_groups = part_groups.len();
+        let total_parts_to_merge: usize = part_groups.iter().map(|group| group.len()).sum();
 
-        // Merge the iterators
-        let merged_iter =
-            MergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;
-        let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
+        // Process each group concurrently using rayon - fail if any task fails
+        let merged_parts = part_groups
+            .into_par_iter()
+            .map(|group| Self::merge_bulk_parts_group(group, arrow_schema, metadata))
+            .collect::<Result<Vec<Option<EncodedBulkPart>>>>()?;
 
-        // Encode the merged iterator
-        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE);
-        if let Some(encoded_part) = encoder.encode_record_batch_iter(
-            boxed_iter,
-            arrow_schema.clone(),
-            min_timestamp,
-            max_timestamp,
-        )? {
-            let num_rows = encoded_part.metadata().num_rows;
-            common_telemetry::info!(
-                "BulkMemtable compact {} parts, {} rows, cost: {:?}",
-                num_parts,
-                num_rows,
-                start.elapsed()
-            );
-
-            // Add the encoded part and remove the merged parts
+        // Collect merged parts.
+        let mut total_output_rows = 0;
+        {
             let mut parts = bulk_parts.write().unwrap();
-            parts.encoded_parts.push(EncodedPartWrapper {
-                part: encoded_part,
-                merging: None,
-            });
-
-            // Remove parts that were merged
+            for encoded_part_opt in merged_parts {
+                if let Some(encoded_part) = encoded_part_opt {
+                    total_output_rows += encoded_part.metadata().num_rows;
+                    parts.encoded_parts.push(EncodedPartWrapper {
+                        part: encoded_part,
+                        merging: None,
+                    });
+                }
+            }
+            // Remove all parts that were merged (all parts with this merge_id)
             parts
                 .parts
                 .retain(|wrapper| wrapper.merging != Some(merge_id));
         }
 
+        common_telemetry::info!(
+            "BulkMemtable concurrent compact {} groups, {} parts -> {} rows, cost: {:?}",
+            total_groups,
+            total_parts_to_merge,
+            total_output_rows,
+            start.elapsed()
+        );
+
         Ok(())
     }
 
     /// Merges encoded parts and then encodes the result to an [EncodedBulkPart].
-    /// This method implements concurrent merge with the following strategy:
-    /// 1. Sort parts by size
-    /// 2. Group every 16 parts with similar sizes
-    /// 3. Skip parts that are >16x larger than the smallest part
-    /// 4. Process groups concurrently using rayon
     fn merge_encoded_parts(
         &mut self,
         arrow_schema: &SchemaRef,
@@ -610,20 +587,32 @@ impl MemtableCompactor {
         let merge_id = self.next_merge_id;
         self.next_merge_id += 1;
 
-        // Collect unmerged encoded parts with their sizes and mark them as being merged
-        let mut parts_info: Vec<EncodedPartInfo> = {
+        // Find min size and collect unmerged encoded parts within size threshold
+        let parts_info: Vec<EncodedBulkPart> = {
             let mut parts = bulk_parts.write().unwrap();
+
+            // Find minimum size among unmerged parts
+            let min_size = parts
+                .encoded_parts
+                .iter()
+                .filter(|wrapper| wrapper.merging.is_none())
+                .map(|wrapper| wrapper.part.size_bytes())
+                .min();
+
+            let Some(min_size) = min_size else {
+                return Ok(());
+            };
+
+            let max_allowed_size = min_size.saturating_mul(16);
             let mut collected_parts = Vec::new();
 
             for wrapper in &mut parts.encoded_parts {
                 if wrapper.merging.is_none() {
                     let size = wrapper.part.size_bytes();
-                    wrapper.merging = Some(merge_id);
-
-                    collected_parts.push(EncodedPartInfo {
-                        part: wrapper.part.clone(),
-                        size_bytes: size,
-                    });
+                    if size <= max_allowed_size {
+                        wrapper.merging = Some(merge_id);
+                        collected_parts.push(wrapper.part.clone());
+                    }
                 }
             }
             collected_parts
@@ -633,26 +622,8 @@ impl MemtableCompactor {
             return Ok(());
         }
 
-        // Sort parts by size (ascending) using unstable sort for better performance
-        parts_info.sort_unstable_by_key(|info| info.size_bytes);
-
-        // Skip parts that are >16x larger than the smallest part
-        let smallest_size = parts_info[0].size_bytes;
-        let max_allowed_size = smallest_size.saturating_mul(16);
-        let filtered_parts: Vec<_> = parts_info
-            .into_iter()
-            .filter(|info| info.size_bytes <= max_allowed_size)
-            .collect();
-
-        if filtered_parts.is_empty() {
-            return Ok(());
-        }
-
         // Group parts into chunks of 16 for concurrent processing
-        let part_groups: Vec<Vec<EncodedPartInfo>> = filtered_parts
-            .chunks(16)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let part_groups: Vec<Vec<_>> = parts_info.chunks(16).map(|chunk| chunk.to_vec()).collect();
 
         let total_groups = part_groups.len();
         let total_parts_to_merge: usize = part_groups.iter().map(|group| group.len()).sum();
@@ -695,16 +666,13 @@ impl MemtableCompactor {
 
     /// Merges a group of encoded parts into a single encoded part
     fn merge_parts_group(
-        group: Vec<EncodedPartInfo>,
+        parts_to_merge: Vec<EncodedBulkPart>,
         arrow_schema: &SchemaRef,
         metadata: &RegionMetadataRef,
     ) -> Result<Option<EncodedBulkPart>> {
-        if group.is_empty() {
+        if parts_to_merge.is_empty() {
             return Ok(None);
         }
-
-        let parts_to_merge: Vec<EncodedBulkPart> =
-            group.into_iter().map(|info| info.part).collect();
 
         // Calculate timestamp bounds for merged data
         let min_timestamp = parts_to_merge
@@ -737,6 +705,71 @@ impl MemtableCompactor {
 
         // Merge the iterators
         // TODO(yingwen): Dedup.
+        let merged_iter =
+            MergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;
+        let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
+
+        // Encode the merged iterator
+        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE);
+        let encoded_part = encoder.encode_record_batch_iter(
+            boxed_iter,
+            arrow_schema.clone(),
+            min_timestamp,
+            max_timestamp,
+        )?;
+
+        Ok(encoded_part)
+    }
+
+    /// Merges a group of bulk parts into a single encoded part
+    fn merge_bulk_parts_group(
+        group: Vec<BulkPartInfo>,
+        arrow_schema: &SchemaRef,
+        metadata: &RegionMetadataRef,
+    ) -> Result<Option<EncodedBulkPart>> {
+        if group.is_empty() {
+            return Ok(None);
+        }
+
+        let parts_to_merge: Vec<BulkPart> = group.into_iter().map(|info| info.part).collect();
+
+        // Calculate timestamp bounds for merged data
+        let min_timestamp = parts_to_merge
+            .iter()
+            .map(|p| p.min_ts)
+            .min()
+            .unwrap_or(i64::MAX);
+        let max_timestamp = parts_to_merge
+            .iter()
+            .map(|p| p.max_ts)
+            .max()
+            .unwrap_or(i64::MIN);
+
+        // Create context for reading parts
+        let context = Arc::new(BulkIterContext::new(
+            metadata.clone(),
+            &None, // No column projection for merging
+            None,  // No predicate for merging
+        ));
+
+        // Create iterators for all parts to merge
+        let iterators: Vec<BoxedRecordBatchIterator> = parts_to_merge
+            .into_iter()
+            .map(|part| {
+                let iter = BulkPartRecordBatchIter::new(
+                    part.batch,
+                    context.clone(),
+                    None, // No sequence filter for merging
+                );
+                Box::new(iter) as BoxedRecordBatchIterator
+            })
+            .collect();
+
+        if iterators.is_empty() {
+            return Ok(None);
+        }
+
+        // Merge the iterators
         let merged_iter =
             MergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;
         let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
@@ -822,11 +855,11 @@ struct EncodedPartWrapper {
     merging: Option<u64>,
 }
 
-/// Represents an encoded part with its size for concurrent processing
+/// Represents a bulk part with its row count for concurrent processing
 #[derive(Clone)]
-struct EncodedPartInfo {
-    part: EncodedBulkPart,
-    size_bytes: usize,
+struct BulkPartInfo {
+    part: BulkPart,
+    num_rows: usize,
 }
 
 /// Builder to build a [BulkMemtable].
