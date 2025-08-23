@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use api::v1::{BulkWalEntry, Mutation, OpType, Rows, WalEntry, WriteHint};
 use futures::stream::{FuturesUnordered, StreamExt};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use snafu::ResultExt;
 use store_api::logstore::provider::Provider;
 use store_api::logstore::LogStore;
@@ -228,18 +229,12 @@ impl RegionWriteCtx {
                 self.notifiers[mutations[0].0].err = Some(Arc::new(err));
             }
         } else {
-            let mut tasks = FuturesUnordered::new();
-            for (i, kvs) in mutations {
-                let mutable = mutable.clone();
-                // use tokio runtime to schedule tasks.
-                tasks.push(common_runtime::spawn_blocking_global(move || {
-                    (i, mutable.write(&kvs))
-                }));
-            }
+            let results: Vec<_> = mutations
+                .into_par_iter()
+                .map(|(i, kvs)| (i, mutable.write(&kvs)))
+                .collect();
 
-            while let Some(result) = tasks.next().await {
-                // first unwrap the result from `spawn` above
-                let (i, result) = result.unwrap();
+            for (i, result) in results {
                 if let Err(err) = result {
                     self.notifiers[i].err = Some(Arc::new(err));
                 }
