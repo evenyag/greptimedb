@@ -645,6 +645,7 @@ impl BulkPartEncoder {
         let mut iter_cost = Duration::default();
         let mut write_cost = Duration::default();
         let mut iter_start = Instant::now();
+        let mut raw_size = 0;
         for batch_result in iter {
             iter_cost += iter_start.elapsed();
             let batch = batch_result?;
@@ -652,6 +653,7 @@ impl BulkPartEncoder {
                 continue;
             }
 
+            raw_size += batch.get_array_memory_size();
             let writer_start = Instant::now();
             writer.write(&batch).context(EncodeMemtableSnafu)?;
             write_cost += writer_start.elapsed();
@@ -673,8 +675,10 @@ impl BulkPartEncoder {
         let parquet_metadata = Arc::new(parse_parquet_metadata(file_metadata)?);
 
         common_telemetry::info!(
-            "Encode record batch iter, total rows: {}, iter_cost: {:?}, write_cost: {:?}",
+            "Encode record batch iter, total rows: {}, raw size: {}, encoded size: {}, iter_cost: {:?}, write_cost: {:?}",
             total_rows,
+            raw_size,
+            buf.len(),
             iter_cost,
             write_cost
         );

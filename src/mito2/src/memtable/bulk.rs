@@ -236,6 +236,8 @@ impl Memtable for BulkMemtable {
     }
 
     fn freeze(&self) -> Result<()> {
+        common_telemetry::info!("Freeze memtable {}", self.id);
+
         self.alloc_tracker.done_allocating();
         Ok(())
     }
