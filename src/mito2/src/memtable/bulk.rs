@@ -40,11 +40,12 @@ use crate::memtable::bulk::part::{BulkPart, BulkPartEncoder};
 use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
-    AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, EncodedBulkPart, IterBuilder,
-    KeyValues, MemScanMetrics, Memtable, MemtableBuilder, MemtableId, MemtableRange,
+    AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, EncodedBulkPart, EncodedRange,
+    IterBuilder, KeyValues, MemScanMetrics, Memtable, MemtableBuilder, MemtableId, MemtableRange,
     MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats, PredicateGroup,
 };
 use crate::read::flat_merge::MergeIterator;
+use crate::sst::file::FileId;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 use crate::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
 
@@ -208,6 +209,7 @@ impl Memtable for BulkMemtable {
                     Arc::new(MemtableRangeContext::new(
                         self.id,
                         Box::new(EncodedBulkRangeIterBuilder {
+                            file_id: FileId::random(),
                             part: encoded_part_wrapper.part.clone(),
                             context: context.clone(),
                             sequence,
@@ -423,10 +425,15 @@ impl IterBuilder for BulkRangeIterBuilder {
 
         Ok(Box::new(iter))
     }
+
+    fn encoded_range(&self) -> Option<EncodedRange> {
+        None
+    }
 }
 
 /// Iterator builder for encoded bulk range
 struct EncodedBulkRangeIterBuilder {
+    file_id: FileId,
     part: EncodedBulkPart,
     context: Arc<BulkIterContext>,
     sequence: Option<SequenceNumber>,
@@ -454,6 +461,13 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
             // Return an empty iterator if no data to read
             Ok(Box::new(std::iter::empty()))
         }
+    }
+
+    fn encoded_range(&self) -> Option<EncodedRange> {
+        Some(EncodedRange {
+            data: self.part.data().clone(),
+            sst_info: self.part.to_sst_info(self.file_id),
+        })
     }
 }
 
@@ -710,7 +724,7 @@ impl MemtableCompactor {
         let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
 
         // Encode the merged iterator
-        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE);
+        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE)?;
         let encoded_part = encoder.encode_record_batch_iter(
             boxed_iter,
             arrow_schema.clone(),
@@ -775,7 +789,7 @@ impl MemtableCompactor {
         let boxed_iter: BoxedRecordBatchIterator = Box::new(merged_iter);
 
         // Encode the merged iterator
-        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE);
+        let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE)?;
         let encoded_part = encoder.encode_record_batch_iter(
             boxed_iter,
             arrow_schema.clone(),

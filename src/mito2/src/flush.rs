@@ -37,7 +37,7 @@ use crate::error::{
     RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
-use crate::memtable::MemtableRanges;
+use crate::memtable::{EncodedRange, MemtableRanges};
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
     INFLIGHT_FLUSH_COUNT,
@@ -370,11 +370,12 @@ impl RegionFlushTask {
             let mem_ranges = mem.ranges(None, PredicateGroup::default(), None)?;
             let num_mem_ranges = mem_ranges.ranges.len();
             let num_mem_rows = mem_ranges.stats.num_rows();
+            let memtable_id = mem.id();
             if mem_ranges.is_record_batch() {
                 let flush_start = Instant::now();
                 let batch_schema =
                     to_flat_sst_arrow_schema(&version.metadata, &FlatSchemaOptions::default());
-                let (max_sequence, sources) = memtable_flat_sources(
+                let flat_sources = memtable_flat_sources(
                     batch_schema,
                     mem_ranges,
                     &version.options,
@@ -382,18 +383,34 @@ impl RegionFlushTask {
                     &mut series_count,
                 )?;
 
-                let num_sources = sources.len();
-                let tasks = sources.into_iter().map(|source| {
+                let mut tasks =
+                    Vec::with_capacity(flat_sources.encoded.len() + flat_sources.sources.len());
+                let num_encoded = flat_sources.encoded.len();
+                let max_sequence = flat_sources.max_sequence;
+                for source in flat_sources.sources {
                     let source = Either::Right(source);
                     let write_request = self.new_write_request(version, max_sequence, source);
                     let access_layer = self.access_layer.clone();
                     let write_opts = write_opts.clone();
-                    common_runtime::spawn_global(async move {
+                    let task = common_runtime::spawn_global(async move {
                         access_layer
                             .write_sst(write_request, &write_opts, WriteType::Flush)
                             .await
-                    })
-                });
+                    });
+                    tasks.push(task);
+                }
+                for encoded in flat_sources.encoded {
+                    let access_layer = self.access_layer.clone();
+                    let region_id = version.metadata.region_id;
+                    let task = common_runtime::spawn_global(async move {
+                        let metrics = access_layer
+                            .put_sst(&encoded.data, region_id, &encoded.sst_info)
+                            .await?;
+                        Ok((smallvec![encoded.sst_info], metrics))
+                    });
+                    tasks.push(task);
+                }
+                let num_sources = tasks.len();
                 let results = futures::future::try_join_all(tasks)
                     .await
                     .context(JoinSnafu)?;
@@ -405,10 +422,12 @@ impl RegionFlushTask {
                     }
 
                     common_telemetry::info!(
-                        "Region flush one memtable {}/{}, num_mem_ranges: {}, num_rows: {}, metrics: {:?}",
+                        "Region flush one memtable {} {}/{}, num_mem_ranges: {}, num_encoded: {}, num_rows: {}, metrics: {:?}",
+                        memtable_id,
                         source_idx,
                         num_sources,
                         num_mem_ranges,
+                        num_encoded,
                         num_mem_rows,
                         metrics
                     );
@@ -422,8 +441,9 @@ impl RegionFlushTask {
                 }
 
                 common_telemetry::info!(
-                    "Region flush {} memtables, flush_cost: {:?}, compact_cost: {:?}",
+                    "Region flush {} memtables for {}, flush_cost: {:?}, compact_cost: {:?}",
                     num_sources,
+                    memtable_id,
                     flush_start.elapsed(),
                     compact_cost,
                 );
@@ -612,6 +632,12 @@ async fn memtable_source(
     Ok((max_sequence, source))
 }
 
+struct FlatSources {
+    max_sequence: u64,
+    sources: SmallVec<[FlatSource; 4]>,
+    encoded: SmallVec<[EncodedRange; 4]>,
+}
+
 // TODO(yingwen): Flushes into multiple files in parallel.
 /// Returns the max sequence and [FlatSource] for the given memtable.
 fn memtable_flat_sources(
@@ -620,23 +646,36 @@ fn memtable_flat_sources(
     options: &RegionOptions,
     field_column_start: usize,
     series_count: &mut usize,
-) -> Result<(u64, SmallVec<[FlatSource; 8]>)> {
+) -> Result<FlatSources> {
     let MemtableRanges { ranges, stats } = mem_ranges;
     let max_sequence = stats.max_sequence();
     *series_count += stats.series_count();
+    let mut flat_sources = FlatSources {
+        max_sequence,
+        sources: SmallVec::new(),
+        encoded: SmallVec::new(),
+    };
 
     if ranges.len() == 1 {
         let only_range = ranges.into_values().next().unwrap();
-        let iter = only_range.build_record_batch_iter(None)?;
-        Ok((max_sequence, smallvec![FlatSource::Iter(iter)]))
+        if let Some(encoded) = only_range.encoded() {
+            flat_sources.encoded.push(encoded);
+        } else {
+            let iter = only_range.build_record_batch_iter(None)?;
+            flat_sources.sources.push(FlatSource::Iter(iter));
+        };
     } else {
         let min_flush_rows = stats.num_rows / 8;
         let min_flush_rows = min_flush_rows.max(DEFAULT_ROW_GROUP_SIZE);
         let mut last_iter_rows = 0;
         let num_ranges = ranges.len();
         let mut input_iters = Vec::with_capacity(num_ranges);
-        let mut sources = SmallVec::new();
         for (_range_id, range) in ranges {
+            if let Some(encoded) = range.encoded() {
+                flat_sources.encoded.push(encoded);
+                continue;
+            }
+
             let iter = range.build_record_batch_iter(None)?;
             input_iters.push(iter);
             last_iter_rows += range.num_rows();
@@ -661,12 +700,12 @@ fn memtable_flat_sources(
                     }
                 };
 
-                sources.push(FlatSource::Iter(maybe_dedup));
+                flat_sources.sources.push(FlatSource::Iter(maybe_dedup));
             }
         }
-
-        Ok((max_sequence, sources))
     }
+
+    Ok(flat_sources)
 }
 
 /// Manages background flushes of a worker.

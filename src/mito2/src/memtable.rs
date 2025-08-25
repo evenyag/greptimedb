@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use bulk::part::EncodedBulkPart;
+use bytes::Bytes;
 use common_time::Timestamp;
 use datatypes::arrow::record_batch::RecordBatch;
 use mito_codec::key_values::KeyValue;
@@ -41,6 +42,7 @@ use crate::read::scan_region::PredicateGroup;
 use crate::read::Batch;
 use crate::region::options::{MemtableOptions, MergeMode};
 use crate::sst::file::FileTimeRange;
+use crate::sst::parquet::SstInfo;
 
 mod builder;
 pub mod bulk;
@@ -429,6 +431,15 @@ pub(crate) struct MemScanMetricsData {
     pub(crate) scan_cost: Duration,
 }
 
+/// Encoded range data.
+pub struct EncodedRange {
+    /// Encoded file data.
+    pub data: Bytes,
+    /// Metadata of the encoded range.
+    pub sst_info: SstInfo,
+}
+
+// TODO(yingwen): Change to things like MemRangeReader
 /// Builder to build an iterator to read the range.
 /// The builder should know the projection and the predicate to build the iterator.
 pub trait IterBuilder: Send + Sync {
@@ -450,6 +461,11 @@ pub trait IterBuilder: Send + Sync {
             err_msg: "Record batch iterator is not supported by this memtable",
         }
         .fail()
+    }
+
+    /// Returns the [EncodedRange] if the range is already encoded into SST.
+    fn encoded_range(&self) -> Option<EncodedRange> {
+        None
     }
 }
 
@@ -539,6 +555,11 @@ impl MemtableRange {
     /// Returns whether the iterator is a record batch iterator.
     pub fn is_record_batch(&self) -> bool {
         self.context.builder.is_record_batch()
+    }
+
+    /// Returns the encoded range if the range is encoded.
+    pub(crate) fn encoded(&self) -> Option<EncodedRange> {
+        self.context.builder.encoded_range()
     }
 }
 

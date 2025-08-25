@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use either::Either;
 use object_store::services::Fs;
 use object_store::util::{join_dir, with_instrument_layers};
@@ -41,6 +42,7 @@ use crate::sst::location::{self, region_dir_from_table_dir};
 use crate::sst::parquet::reader::ParquetReaderBuilder;
 use crate::sst::parquet::writer::ParquetWriter;
 use crate::sst::parquet::{SstInfo, WriteOptions};
+use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 pub type AccessLayerRef = Arc<AccessLayer>;
 /// SST write results.
@@ -307,6 +309,36 @@ impl AccessLayer {
         }
 
         Ok((sst_info, metrics))
+    }
+
+    /// Put encoded SST file to the store directly.
+    pub(crate) async fn put_sst(
+        &self,
+        data: &Bytes,
+        region_id: RegionId,
+        sst_info: &SstInfo,
+    ) -> Result<Metrics> {
+        // TODO(yingwen): Support write cache.
+        let start = Instant::now();
+        let cleaner = TempFileCleaner::new(region_id, self.object_store.clone());
+        let path_provider = RegionFilePathFactory::new(self.table_dir.clone(), self.path_type);
+        let sst_file_path =
+            path_provider.build_sst_file_path(RegionFileId::new(region_id, sst_info.file_id));
+        let mut writer = self
+            .object_store
+            .writer_with(&sst_file_path)
+            .chunk(DEFAULT_WRITE_BUFFER_SIZE.as_bytes() as usize)
+            .concurrent(DEFAULT_WRITE_CONCURRENCY)
+            .await
+            .context(OpenDalSnafu)?;
+        if let Err(err) = writer.write(data.clone()).await.context(OpenDalSnafu) {
+            cleaner.clean_by_file_id(sst_info.file_id).await;
+            return Err(err);
+        }
+        let mut metrics = Metrics::new(WriteType::Flush);
+        metrics.write_batch = start.elapsed();
+
+        Ok(metrics)
     }
 }
 
