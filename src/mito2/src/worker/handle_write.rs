@@ -67,6 +67,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             return;
         }
 
+        let num_requests = write_requests.len() + bulk_requests.len();
         // Prepare write context.
         let mut region_ctxs = {
             let _timer = WRITE_STAGE_ELAPSED
@@ -76,8 +77,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         };
 
         // Write to WAL.
-        {
-            let _timer = WRITE_STAGE_ELAPSED
+        let wal_cost = {
+            let timer = WRITE_STAGE_ELAPSED
                 .with_label_values(&["write_wal"])
                 .start_timer();
             let mut wal_writer = self.wal.writer();
@@ -111,12 +112,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     return;
                 }
             }
-        }
+
+            timer.stop_and_record()
+        };
 
         let (mut put_rows, mut delete_rows) = (0, 0);
         // Write to memtables.
-        {
-            let _timer = WRITE_STAGE_ELAPSED
+        let mem_cost = {
+            let timer = WRITE_STAGE_ELAPSED
                 .with_label_values(&["write_memtable"])
                 .start_timer();
             if region_ctxs.len() == 1 {
@@ -167,13 +170,23 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                     }
                 }
             }
-        }
+
+            timer.stop_and_record()
+        };
         WRITE_ROWS_TOTAL
             .with_label_values(&["put"])
             .inc_by(put_rows as u64);
         WRITE_ROWS_TOTAL
             .with_label_values(&["delete"])
             .inc_by(delete_rows as u64);
+
+        common_telemetry::info!(
+            "Write {} requests, {} rows, wal cost: {}s, mem cost: {}s",
+            num_requests,
+            put_rows,
+            wal_cost,
+            mem_cost
+        );
     }
 
     /// Handles all stalled write requests.
