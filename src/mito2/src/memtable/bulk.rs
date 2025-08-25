@@ -624,7 +624,7 @@ impl MemtableCompactor {
                 return Ok(());
             };
 
-            let max_allowed_size = min_size.saturating_mul(16);
+            let max_allowed_size = min_size.saturating_mul(16).min(4 * 1024 * 1024);
             let mut collected_parts = Vec::new();
 
             for wrapper in &mut parts.encoded_parts {
