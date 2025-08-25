@@ -293,7 +293,7 @@ impl Memtable for BulkMemtable {
             max_sequence: AtomicU64::new(0),
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
-            compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
+            compactor: Arc::new(Mutex::new(MemtableCompactor::new(id))),
             compact_dispatcher: self.compact_dispatcher.clone(),
         })
     }
@@ -347,7 +347,7 @@ impl BulkMemtable {
             max_sequence: AtomicU64::new(0),
             num_rows: AtomicUsize::new(0),
             flat_arrow_schema,
-            compactor: Arc::new(Mutex::new(MemtableCompactor::new())),
+            compactor: Arc::new(Mutex::new(MemtableCompactor::new(id))),
             compact_dispatcher,
         }
     }
@@ -472,14 +472,18 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
 }
 
 struct MemtableCompactor {
+    memtable_id: MemtableId,
     /// Next id for a merge task.
     next_merge_id: u64,
 }
 
 impl MemtableCompactor {
     /// Creates a new MemtableCompactor.
-    fn new() -> Self {
-        Self { next_merge_id: 0 }
+    fn new(memtable_id: MemtableId) -> Self {
+        Self {
+            memtable_id,
+            next_merge_id: 0,
+        }
     }
 
     /// Returns true if the bulk parts should be merged.
@@ -578,7 +582,8 @@ impl MemtableCompactor {
         }
 
         common_telemetry::info!(
-            "BulkMemtable concurrent compact {} groups, {} parts -> {} rows, cost: {:?}",
+            "BulkMemtable {} concurrent compact {} groups, {} parts -> {} rows, cost: {:?}",
+            self.memtable_id,
             total_groups,
             total_parts_to_merge,
             total_output_rows,
@@ -668,7 +673,8 @@ impl MemtableCompactor {
         }
 
         common_telemetry::info!(
-            "BulkMemtable concurrent compact {} groups, {} encoded parts -> {} rows, cost: {:?}",
+            "BulkMemtable {} concurrent compact {} groups, {} encoded parts -> {} rows, cost: {:?}",
+            self.memtable_id,
             total_groups,
             total_parts_to_merge,
             total_output_rows,
@@ -1265,7 +1271,7 @@ mod tests {
         }
 
         // Create compactor and merge parts
-        let mut compactor = MemtableCompactor::new();
+        let mut compactor = MemtableCompactor::new(0);
         compactor
             .merge_parts(&arrow_schema, &bulk_parts, &metadata)
             .unwrap();
