@@ -643,6 +643,17 @@ impl MemtableCompactor {
             return Ok(());
         }
 
+        if parts_info.len() == 1 {
+            // Only 1 part, don't have to merge.
+            let mut parts = bulk_parts.write().unwrap();
+            for wrapper in &mut parts.encoded_parts {
+                if wrapper.merging == Some(merge_id) {
+                    wrapper.merging = None;
+                }
+            }
+            return Ok(());
+        }
+
         // Group parts into chunks of 16 for concurrent processing
         let part_groups: Vec<Vec<_>> = parts_info.chunks(16).map(|chunk| chunk.to_vec()).collect();
 
