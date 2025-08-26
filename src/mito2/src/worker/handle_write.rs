@@ -76,6 +76,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             self.prepare_region_write_ctx(write_requests, bulk_requests)
         };
 
+        for region_ctx in region_ctxs.values() {
+            common_telemetry::info!("region ctx encoded length: {}", region_ctx.mutation_size());
+        }
+
         // Write to WAL.
         let wal_cost = {
             let timer = WRITE_STAGE_ELAPSED

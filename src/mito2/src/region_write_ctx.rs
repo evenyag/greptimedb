@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use api::v1::{BulkWalEntry, Mutation, OpType, Rows, WalEntry, WriteHint};
 use futures::stream::{FuturesUnordered, StreamExt};
+use prost::Message;
 use snafu::ResultExt;
 use store_api::logstore::provider::Provider;
 use store_api::logstore::LogStore;
@@ -311,6 +312,10 @@ impl RegionWriteCtx {
 
         self.version_control
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
+    }
+
+    pub(crate) fn mutation_size(&self) -> usize {
+        self.wal_entry.encoded_len()
     }
 
     // pub(crate) fn should_compact(&self) -> bool {
