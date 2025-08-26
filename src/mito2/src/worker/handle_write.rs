@@ -24,6 +24,7 @@ use snafu::ensure;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::logstore::LogStore;
 use store_api::storage::RegionId;
+use tokio::time::Instant;
 
 use crate::error::{InvalidRequestSnafu, RegionStateSnafu, RejectWriteSnafu, Result};
 use crate::flush::FlushReason;
@@ -242,6 +243,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
     // TODO(yingwen): Returns put/delete num
     async fn direct_flush(&self, regions: Vec<(RegionId, RegionWriteCtx)>) {
+        let direct_start = Instant::now();
         for (region_id, mut region_ctx) in regions {
             let Some(region) = self.regions.get_region_or(region_id, &mut region_ctx) else {
                 // No such region.
@@ -262,8 +264,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                 let put_rows = region_ctx.put_num;
                 let delete_rows = region_ctx.delete_num;
-
-                common_telemetry::info!("Direct flush rows, put_rows: {}", put_rows);
 
                 match flush_task
                     .direct_flush_memtables(&version_data, &mutable)
@@ -286,6 +286,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                         return;
                     }
                 }
+
+                common_telemetry::info!(
+                    "Direct flush rows, put_rows: {}, cost: {:?}",
+                    put_rows,
+                    direct_start.elapsed()
+                );
 
                 INFLIGHT_FLUSH_COUNT.dec();
 
