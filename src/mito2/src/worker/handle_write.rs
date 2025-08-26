@@ -26,13 +26,17 @@ use store_api::logstore::LogStore;
 use store_api::storage::RegionId;
 
 use crate::error::{InvalidRequestSnafu, RegionStateSnafu, RejectWriteSnafu, Result};
-use crate::metrics;
+use crate::flush::FlushReason;
 use crate::metrics::{
-    WRITE_REJECT_TOTAL, WRITE_ROWS_TOTAL, WRITE_STAGE_ELAPSED, WRITE_STALL_TOTAL,
+    self, INFLIGHT_FLUSH_COUNT, WRITE_REJECT_TOTAL, WRITE_ROWS_TOTAL, WRITE_STAGE_ELAPSED,
+    WRITE_STALL_TOTAL,
 };
 use crate::region::{RegionLeaderState, RegionRoleState};
 use crate::region_write_ctx::RegionWriteCtx;
-use crate::request::{SenderBulkRequest, SenderWriteRequest, WriteRequest};
+use crate::request::{
+    BackgroundNotify, DirectFlushFinished, SenderBulkRequest, SenderWriteRequest, WorkerRequest,
+    WriteRequest,
+};
 use crate::worker::RegionWorkerLoop;
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -76,9 +80,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             self.prepare_region_write_ctx(write_requests, bulk_requests)
         };
 
-        for region_ctx in region_ctxs.values() {
-            common_telemetry::info!("region ctx encoded length: {}", region_ctx.mutation_size());
-        }
+        let direct_flush_regions: Vec<_> = region_ctxs
+            .extract_if(|_region_id, region_ctx| region_ctx.mutation_size() > 2 * 1024 * 1024)
+            .collect();
+
+        // Flushes directly.
+        self.direct_flush(direct_flush_regions);
 
         // Write to WAL.
         let wal_cost = {
@@ -231,6 +238,61 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             .sub((requests.len() + bulk.len()) as i64);
         self.handle_write_requests(&mut requests, &mut bulk, true)
             .await;
+    }
+
+    // TODO(yingwen): Returns put/delete num
+    fn direct_flush(&self, regions: Vec<(RegionId, RegionWriteCtx)>) {
+        for (region_id, mut region_ctx) in regions {
+            let Some(region) = self.regions.get_region_or(region_id, &mut region_ctx) else {
+                // No such region.
+                continue;
+            };
+
+            let flush_task =
+                self.new_flush_task(&region, FlushReason::Others, None, self.config.clone());
+            let version_data = region.version_control.current();
+
+            // TODO(yingwen): Add a new request to apply edit.
+            common_runtime::spawn_global(async move {
+                INFLIGHT_FLUSH_COUNT.inc();
+
+                let put_rows = region_ctx.put_num;
+                let delete_rows = region_ctx.delete_num;
+                let Some(mutable) = region_ctx.write_for_flush().await else {
+                    return;
+                };
+                match flush_task
+                    .direct_flush_memtables(&version_data, &mutable)
+                    .await
+                {
+                    Ok(edit) => {
+                        let worker_request = WorkerRequest::Background {
+                            region_id,
+                            notify: BackgroundNotify::DirectFlushFinished(DirectFlushFinished {
+                                region_id,
+                                edit,
+                                region_ctx,
+                            }),
+                        };
+
+                        flush_task.send_worker_request(worker_request).await;
+                    }
+                    Err(e) => {
+                        region_ctx.set_error(Arc::new(e));
+                        return;
+                    }
+                }
+
+                INFLIGHT_FLUSH_COUNT.dec();
+
+                WRITE_ROWS_TOTAL
+                    .with_label_values(&["put"])
+                    .inc_by(put_rows as u64);
+                WRITE_ROWS_TOTAL
+                    .with_label_values(&["delete"])
+                    .inc_by(delete_rows as u64);
+            });
+        }
     }
 }
 

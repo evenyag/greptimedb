@@ -25,10 +25,11 @@ use store_api::storage::{RegionId, SequenceNumber};
 
 use crate::error::{Error, Result, WriteGroupSnafu};
 use crate::memtable::bulk::part::BulkPart;
+use crate::memtable::time_partition::TimePartitionsRef;
 use crate::memtable::KeyValues;
 use crate::metrics;
 use crate::region::version::{VersionControlData, VersionControlRef, VersionRef};
-use crate::request::OptionOutputTx;
+use crate::request::{OnFailure, OptionOutputTx};
 use crate::wal::{EntryId, WalWriter};
 
 /// Notifier to notify write result on drop.
@@ -51,6 +52,7 @@ impl WriteNotify {
         }
     }
 
+    // TODO(yingwen): Maybe add a success flag and only notify on success.
     /// Send result to the waiter.
     fn notify_result(&mut self) {
         if let Some(err) = &self.err {
@@ -253,6 +255,56 @@ impl RegionWriteCtx {
             .set_sequence_and_entry_id(self.next_sequence - 1, self.next_entry_id - 1);
     }
 
+    pub(crate) async fn write_for_flush(&mut self) -> Option<TimePartitionsRef> {
+        debug_assert_eq!(self.notifiers.len(), self.wal_entry.mutations.len());
+
+        if self.failed {
+            return None;
+        }
+
+        // Write to a new empty mutable memtable.
+        let time_window = self.version.compaction_time_window;
+        let new_mutable = Arc::new(
+            self.version
+                .memtables
+                .mutable
+                .new_with_part_duration(time_window),
+        );
+        let mutations = mem::take(&mut self.wal_entry.mutations)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, mutation)| {
+                let kvs = KeyValues::new(&self.version.metadata, mutation)?;
+                Some((i, kvs))
+            })
+            .collect::<Vec<_>>();
+
+        if mutations.len() == 1 {
+            if let Err(err) = new_mutable.write(&mutations[0].1) {
+                self.notifiers[mutations[0].0].err = Some(Arc::new(err));
+            }
+        } else {
+            let mut tasks = FuturesUnordered::new();
+            for (i, kvs) in mutations {
+                let mutable = new_mutable.clone();
+                // use tokio runtime to schedule tasks.
+                tasks.push(common_runtime::spawn_blocking_global(move || {
+                    (i, mutable.write(&kvs))
+                }));
+            }
+
+            while let Some(result) = tasks.next().await {
+                // first unwrap the result from `spawn` above
+                let (i, result) = result.unwrap();
+                if let Err(err) = result {
+                    self.notifiers[i].err = Some(Arc::new(err));
+                }
+            }
+        }
+
+        Some(new_mutable)
+    }
+
     pub(crate) fn push_bulk(&mut self, sender: OptionOutputTx, mut bulk: BulkPart) -> bool {
         bulk.sequence = self.next_sequence;
         let entry = match BulkWalEntry::try_from(&bulk) {
@@ -315,10 +367,17 @@ impl RegionWriteCtx {
     }
 
     pub(crate) fn mutation_size(&self) -> usize {
+        // TODO(yingwen): Compute this is costly.
         self.wal_entry.encoded_len()
     }
 
     // pub(crate) fn should_compact(&self) -> bool {
     //     self.version.memtables.mutable.should_compact()
     // }
+}
+
+impl OnFailure for RegionWriteCtx {
+    fn on_failure(&mut self, err: Error) {
+        self.set_error(Arc::new(err));
+    }
 }

@@ -994,6 +994,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             // BackgroundNotify::MemCompactFinished => {
             //     self.handle_mem_compact_finished(region_id).await
             // }
+            BackgroundNotify::DirectFlushFinished(req) => {
+                self.handle_direct_flush_finished(req).await
+            }
         }
     }
 

@@ -44,12 +44,13 @@ use tokio::sync::oneshot::{self, Receiver, Sender};
 
 use crate::error::{
     CompactRegionSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu, Error, FillDefaultSnafu,
-    FlushRegionSnafu, InvalidRequestSnafu, Result, UnexpectedSnafu,
+    FlushRegionSnafu, InvalidRequestSnafu, InvalidSenderSnafu, Result, UnexpectedSnafu,
 };
 use crate::manifest::action::{RegionEdit, TruncateKind};
 use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::MemtableId;
 use crate::metrics::COMPACTION_ELAPSED_TOTAL;
+use crate::region_write_ctx::RegionWriteCtx;
 use crate::wal::entry_distributor::WalEntryReceiver;
 use crate::wal::EntryId;
 
@@ -788,6 +789,8 @@ pub(crate) enum BackgroundNotify {
     RegionEdit(RegionEditResult),
     // /// Memtable compact has finished.
     // MemCompactFinished,
+    /// Direct flush has finished.
+    DirectFlushFinished(DirectFlushFinished),
 }
 
 /// Notifies a flush job is finished.
@@ -932,6 +935,38 @@ pub(crate) struct RegionSyncRequest {
     pub(crate) manifest_version: ManifestVersion,
     /// Returns the latest manifest version and a boolean indicating whether new maniefst is installed.
     pub(crate) sender: Sender<Result<(ManifestVersion, bool)>>,
+}
+
+/// Notifies a direct flush job is finished.
+pub(crate) struct DirectFlushFinished {
+    /// Region id.
+    pub(crate) region_id: RegionId,
+    /// Region edit to apply.
+    pub(crate) edit: RegionEdit,
+    /// Region write context.
+    pub(crate) region_ctx: RegionWriteCtx,
+}
+
+impl std::fmt::Debug for DirectFlushFinished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectFlushFinished")
+            .field("region_id", &self.region_id)
+            .field("edit", &self.edit)
+            .finish()
+    }
+}
+
+impl Drop for DirectFlushFinished {
+    fn drop(&mut self) {
+        let err = InvalidSenderSnafu {}.build();
+        self.region_ctx.set_error(Arc::new(err));
+    }
+}
+
+impl OnFailure for DirectFlushFinished {
+    fn on_failure(&mut self, err: Error) {
+        self.region_ctx.set_error(Arc::new(err));
+    }
 }
 
 #[cfg(test)]

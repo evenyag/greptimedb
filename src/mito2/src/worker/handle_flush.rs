@@ -26,7 +26,7 @@ use crate::config::MitoConfig;
 use crate::error::{RegionNotFoundSnafu, Result};
 use crate::flush::{FlushReason, RegionFlushTask};
 use crate::region::MitoRegionRef;
-use crate::request::{FlushFailed, FlushFinished, OnFailure, OptionOutputTx};
+use crate::request::{DirectFlushFinished, FlushFailed, FlushFinished, OnFailure, OptionOutputTx};
 use crate::worker::RegionWorkerLoop;
 
 impl<S> RegionWorkerLoop<S> {
@@ -264,6 +264,38 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         self.schedule_compaction(&region).await;
 
         self.listener.on_flush_success(region_id);
+    }
+
+    /// On region direct flush job finished.
+    pub(crate) async fn handle_direct_flush_finished(&mut self, mut request: DirectFlushFinished) {
+        let region_id = request.region_id;
+        let region = match self.regions.get_region(region_id) {
+            Some(region) => region,
+            None => {
+                request.on_failure(RegionNotFoundSnafu { region_id }.build());
+                return;
+            }
+        };
+
+        // Check if region is currently in staging mode
+        let is_staging = region.manifest_ctx.current_state()
+            == crate::region::RegionRoleState::Leader(crate::region::RegionLeaderState::Staging);
+
+        if is_staging {
+            info!(
+                "Skipping region metadata update for region {} in staging mode",
+                region_id
+            );
+        } else {
+            region.version_control.apply_edit(
+                request.edit.clone(),
+                &[],
+                region.file_purger.clone(),
+            );
+        }
+
+        // Schedules compaction.
+        self.schedule_compaction(&region).await;
     }
 
     /// On region memtable compact job finished.

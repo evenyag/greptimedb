@@ -37,6 +37,7 @@ use crate::error::{
     RegionTruncatedSnafu, Result,
 };
 use crate::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
+use crate::memtable::time_partition::TimePartitionsRef;
 use crate::memtable::{EncodedRange, MemtableRanges};
 use crate::metrics::{
     FLUSH_BYTES_TOTAL, FLUSH_ELAPSED, FLUSH_FAILURE_TOTAL, FLUSH_REQUESTS_TOTAL,
@@ -534,6 +535,214 @@ impl RegionFlushTask {
         Ok(edit)
     }
 
+    /// Flushes memtables to level 0 SSTs and updates the manifest.
+    /// Returns the [RegionEdit] to apply.
+    pub(crate) async fn direct_flush_memtables(
+        &self,
+        version_data: &VersionControlData,
+        mutable: &TimePartitionsRef,
+    ) -> Result<RegionEdit> {
+        // We must use the immutable memtables list and entry ids from the `version_data`
+        // for consistency as others might already modify the version in the `version_control`.
+        let version = &version_data.version;
+        let timer = FLUSH_ELAPSED
+            .with_label_values(&["flush_memtables"])
+            .start_timer();
+
+        let mut write_opts = WriteOptions {
+            write_buffer_size: self.engine_config.sst_write_buffer_size,
+            ..Default::default()
+        };
+        if let Some(row_group_size) = self.row_group_size {
+            write_opts.row_group_size = row_group_size;
+        }
+
+        let mut memtables = Vec::with_capacity(mutable.num_partitions());
+        mutable.list_memtables(&mut memtables);
+        let mut file_metas = Vec::with_capacity(memtables.len());
+        let mut flushed_bytes = 0;
+        let mut series_count = 0;
+        let mut flush_metrics = Metrics::new(WriteType::Flush);
+        for mem in memtables {
+            if mem.is_empty() {
+                // Skip empty memtables.
+                continue;
+            }
+
+            // Compact the memtable first, this waits the background compaction to finish.
+            let compact_start = std::time::Instant::now();
+            if let Err(e) = mem.compact(true) {
+                common_telemetry::error!(e; "Failed to compact memtable before flush");
+            }
+            let compact_cost = compact_start.elapsed();
+
+            let mem_ranges = mem.ranges(None, PredicateGroup::default(), None)?;
+            let num_mem_ranges = mem_ranges.ranges.len();
+            let num_mem_rows = mem_ranges.stats.num_rows();
+            let memtable_id = mem.id();
+            if mem_ranges.is_record_batch() {
+                let flush_start = Instant::now();
+                let batch_schema =
+                    to_flat_sst_arrow_schema(&version.metadata, &FlatSchemaOptions::default());
+                let flat_sources = memtable_flat_sources(
+                    batch_schema,
+                    mem_ranges,
+                    &version.options,
+                    version.metadata.primary_key.len(),
+                    &mut series_count,
+                )?;
+
+                let mut tasks =
+                    Vec::with_capacity(flat_sources.encoded.len() + flat_sources.sources.len());
+                let num_encoded = flat_sources.encoded.len();
+                let max_sequence = flat_sources.max_sequence;
+                for source in flat_sources.sources {
+                    let source = Either::Right(source);
+                    let write_request = self.new_write_request(version, max_sequence, source);
+                    let access_layer = self.access_layer.clone();
+                    let write_opts = write_opts.clone();
+                    let task = common_runtime::spawn_global(async move {
+                        access_layer
+                            .write_sst(write_request, &write_opts, WriteType::Flush)
+                            .await
+                    });
+                    tasks.push(task);
+                }
+                for encoded in flat_sources.encoded {
+                    let access_layer = self.access_layer.clone();
+                    let region_id = version.metadata.region_id;
+                    let task = common_runtime::spawn_global(async move {
+                        let metrics = access_layer
+                            .put_sst(&encoded.data, region_id, &encoded.sst_info)
+                            .await?;
+                        Ok((smallvec![encoded.sst_info], metrics))
+                    });
+                    tasks.push(task);
+                }
+                let num_sources = tasks.len();
+                let results = futures::future::try_join_all(tasks)
+                    .await
+                    .context(JoinSnafu)?;
+                for (source_idx, result) in results.into_iter().enumerate() {
+                    let (ssts_written, metrics) = result?;
+                    if ssts_written.is_empty() {
+                        // No data written.
+                        continue;
+                    }
+
+                    common_telemetry::info!(
+                        "Region direct flush one memtable {} {}/{}, num_mem_ranges: {}, num_encoded: {}, num_rows: {}, metrics: {:?}",
+                        memtable_id,
+                        source_idx,
+                        num_sources,
+                        num_mem_ranges,
+                        num_encoded,
+                        num_mem_rows,
+                        metrics
+                    );
+
+                    flush_metrics = flush_metrics.merge(metrics);
+
+                    file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                        flushed_bytes += sst_info.file_size;
+                        Self::new_file_meta(self.region_id, max_sequence, sst_info)
+                    }));
+                }
+
+                common_telemetry::info!(
+                    "Region direct flush {} memtables for {}, flush_cost: {:?}, compact_cost: {:?}",
+                    num_sources,
+                    memtable_id,
+                    flush_start.elapsed(),
+                    compact_cost,
+                );
+            } else {
+                let (max_sequence, source) =
+                    memtable_source(mem_ranges, &version.options, &mut series_count).await?;
+
+                // Flush to level 0.
+                let source = Either::Left(source);
+                let write_request = self.new_write_request(version, max_sequence, source);
+
+                let (ssts_written, metrics) = self
+                    .access_layer
+                    .write_sst(write_request, &write_opts, WriteType::Flush)
+                    .await?;
+                if ssts_written.is_empty() {
+                    // No data written.
+                    continue;
+                }
+
+                common_telemetry::info!(
+                    "Region direct flush one memtable, num_mem_ranges: {}, num_rows: {}, metrics: {:?}",
+                    num_mem_ranges,
+                    num_mem_rows,
+                    metrics
+                );
+
+                flush_metrics = flush_metrics.merge(metrics);
+
+                file_metas.extend(ssts_written.into_iter().map(|sst_info| {
+                    flushed_bytes += sst_info.file_size;
+                    Self::new_file_meta(self.region_id, max_sequence, sst_info)
+                }));
+            };
+        }
+
+        if !file_metas.is_empty() {
+            FLUSH_BYTES_TOTAL.inc_by(flushed_bytes);
+        }
+
+        let file_ids: Vec<_> = file_metas.iter().map(|f| f.file_id).collect();
+        info!(
+            "Successfully direct flush memtables, region: {}, reason: {}, files: {:?}, series count: {}, cost: {:?}, metrics: {:?}",
+            self.region_id,
+            self.reason.as_str(),
+            file_ids,
+            series_count,
+            timer.stop_and_record(),
+            flush_metrics,
+        );
+        flush_metrics.observe();
+
+        let edit = RegionEdit {
+            files_to_add: file_metas,
+            files_to_remove: Vec::new(),
+            compaction_time_window: None,
+            // The last entry has been flushed.
+            flushed_entry_id: Some(version_data.last_entry_id),
+            flushed_sequence: Some(version_data.committed_sequence),
+        };
+        info!("Applying {edit:?} to region {}", self.region_id);
+
+        let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit.clone()));
+
+        let expected_state = if matches!(self.reason, FlushReason::Downgrading) {
+            RegionLeaderState::Downgrading
+        } else {
+            // Check if region is in staging mode
+            let current_state = self.manifest_ctx.current_state();
+            if current_state == RegionRoleState::Leader(RegionLeaderState::Staging) {
+                RegionLeaderState::Staging
+            } else {
+                RegionLeaderState::Writable
+            }
+        };
+        // We will leak files if the manifest update fails, but we ignore them for simplicity. We can
+        // add a cleanup job to remove them later.
+        let version = self
+            .manifest_ctx
+            .update_manifest(expected_state, action_list)
+            .await?;
+        info!(
+            "Successfully update manifest version to {version}, region: {}, reason: {}",
+            self.region_id,
+            self.reason.as_str()
+        );
+
+        Ok(edit)
+    }
+
     fn new_file_meta(region_id: RegionId, max_sequence: u64, sst_info: SstInfo) -> FileMeta {
         FileMeta {
             region_id,
@@ -571,7 +780,7 @@ impl RegionFlushTask {
     }
 
     /// Notify flush job status.
-    async fn send_worker_request(&self, request: WorkerRequest) {
+    pub(crate) async fn send_worker_request(&self, request: WorkerRequest) {
         if let Err(e) = self
             .request_sender
             .send(WorkerRequestWithTime::new(request))
