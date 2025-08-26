@@ -271,7 +271,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                             notify: BackgroundNotify::DirectFlushFinished(DirectFlushFinished {
                                 region_id,
                                 edit,
-                                region_ctx,
+                                region_ctx: Some(region_ctx),
                             }),
                         };
 

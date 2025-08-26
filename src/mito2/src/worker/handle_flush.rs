@@ -294,6 +294,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             );
         }
 
+        request.on_success();
+
         // Schedules compaction.
         self.schedule_compaction(&region).await;
     }

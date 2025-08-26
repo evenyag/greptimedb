@@ -944,7 +944,13 @@ pub(crate) struct DirectFlushFinished {
     /// Region edit to apply.
     pub(crate) edit: RegionEdit,
     /// Region write context.
-    pub(crate) region_ctx: RegionWriteCtx,
+    pub(crate) region_ctx: Option<RegionWriteCtx>,
+}
+
+impl DirectFlushFinished {
+    pub(crate) fn on_success(mut self) {
+        self.region_ctx.take();
+    }
 }
 
 impl std::fmt::Debug for DirectFlushFinished {
@@ -958,14 +964,18 @@ impl std::fmt::Debug for DirectFlushFinished {
 
 impl Drop for DirectFlushFinished {
     fn drop(&mut self) {
-        let err = InvalidSenderSnafu {}.build();
-        self.region_ctx.set_error(Arc::new(err));
+        if let Some(mut region_ctx) = self.region_ctx.take() {
+            let err = InvalidSenderSnafu {}.build();
+            region_ctx.set_error(Arc::new(err));
+        }
     }
 }
 
 impl OnFailure for DirectFlushFinished {
     fn on_failure(&mut self, err: Error) {
-        self.region_ctx.set_error(Arc::new(err));
+        if let Some(region_ctx) = &mut self.region_ctx {
+            region_ctx.set_error(Arc::new(err));
+        }
     }
 }
 
