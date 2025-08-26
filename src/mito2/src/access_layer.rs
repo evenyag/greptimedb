@@ -336,6 +336,10 @@ impl AccessLayer {
             cleaner.clean_by_file_id(sst_info.file_id).await;
             return Err(err);
         }
+        if let Err(err) = writer.close().await.context(OpenDalSnafu) {
+            cleaner.clean_by_file_id(sst_info.file_id).await;
+            return Err(err);
+        }
         let mut metrics = Metrics::new(WriteType::Flush);
         metrics.write_batch = start.elapsed();
 
