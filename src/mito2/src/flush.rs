@@ -710,8 +710,8 @@ impl RegionFlushTask {
             files_to_remove: Vec::new(),
             compaction_time_window: None,
             // The last entry has been flushed.
-            flushed_entry_id: Some(version_data.last_entry_id),
-            flushed_sequence: Some(version_data.committed_sequence),
+            flushed_entry_id: None,
+            flushed_sequence: None,
         };
         info!("Applying {edit:?} to region {}", self.region_id);
 

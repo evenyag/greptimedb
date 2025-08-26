@@ -324,6 +324,7 @@ impl AccessLayer {
         let path_provider = RegionFilePathFactory::new(self.table_dir.clone(), self.path_type);
         let sst_file_path =
             path_provider.build_sst_file_path(RegionFileId::new(region_id, sst_info.file_id));
+        common_telemetry::info!("Put sst, file_path: {}", sst_file_path);
         let mut writer = self
             .object_store
             .writer_with(&sst_file_path)

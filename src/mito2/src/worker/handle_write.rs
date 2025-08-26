@@ -258,6 +258,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                 let put_rows = region_ctx.put_num;
                 let delete_rows = region_ctx.delete_num;
+
+                common_telemetry::info!("Direct flush rows, put_rows: {}", put_rows);
+
                 let Some(mutable) = region_ctx.write_for_flush().await else {
                     return;
                 };
