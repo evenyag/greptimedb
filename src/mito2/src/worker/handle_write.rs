@@ -85,7 +85,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             .collect();
 
         // Flushes directly.
-        self.direct_flush(direct_flush_regions);
+        self.direct_flush(direct_flush_regions).await;
 
         // Write to WAL.
         let wal_cost = {
@@ -241,10 +241,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     }
 
     // TODO(yingwen): Returns put/delete num
-    fn direct_flush(&self, regions: Vec<(RegionId, RegionWriteCtx)>) {
+    async fn direct_flush(&self, regions: Vec<(RegionId, RegionWriteCtx)>) {
         for (region_id, mut region_ctx) in regions {
             let Some(region) = self.regions.get_region_or(region_id, &mut region_ctx) else {
                 // No such region.
+                continue;
+            };
+
+            let Some(mutable) = region_ctx.write_for_flush().await else {
                 continue;
             };
 
@@ -261,9 +265,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                 common_telemetry::info!("Direct flush rows, put_rows: {}", put_rows);
 
-                let Some(mutable) = region_ctx.write_for_flush().await else {
-                    return;
-                };
                 match flush_task
                     .direct_flush_memtables(&version_data, &mutable)
                     .await
