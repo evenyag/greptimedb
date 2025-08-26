@@ -543,11 +543,12 @@ impl EncodedBulkPart {
     /// # Returns
     /// Returns a `SstInfo` instance with information derived from this bulk part's metadata
     pub(crate) fn to_sst_info(&self, file_id: FileId) -> SstInfo {
+        let unit = self.metadata.region_metadata.time_index_type().unit();
         SstInfo {
             file_id,
             time_range: (
-                Timestamp::new_millisecond(self.metadata.min_timestamp),
-                Timestamp::new_millisecond(self.metadata.max_timestamp),
+                Timestamp::new(self.metadata.min_timestamp, unit),
+                Timestamp::new(self.metadata.max_timestamp, unit),
             ),
             file_size: self.data.len() as u64,
             num_rows: self.metadata.num_rows,

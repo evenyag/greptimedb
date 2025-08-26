@@ -59,7 +59,7 @@ impl TwcsPicker {
         active_window: Option<i64>,
     ) -> Vec<CompactionOutput> {
         let mut output = vec![];
-        common_telemetry::info!("TwcsPicker, time windows: {}", time_windows.len());
+        // common_telemetry::info!("TwcsPicker, time windows: {}", time_windows.len());
         for (window, files) in time_windows {
             if files.files.is_empty() {
                 continue;
@@ -76,18 +76,18 @@ impl TwcsPicker {
             } else {
                 let run = sorted_runs.last().unwrap();
                 if run.items().len() < self.trigger_file_num {
-                    common_telemetry::info!(
-                        "Window {}, runs: {} < trigger num {}",
-                        window,
-                        run.items().len(),
-                        self.trigger_file_num
-                    );
+                    // common_telemetry::info!(
+                    //     "Window {}, runs: {} < trigger num {}",
+                    //     window,
+                    //     run.items().len(),
+                    //     self.trigger_file_num
+                    // );
                     continue;
                 }
                 // no overlapping files, try merge small files
                 merge_seq_files(run.items(), self.max_output_file_size)
             };
-            common_telemetry::info!("Found {} runs, reduce inputs: {}", found_runs, inputs.len());
+            // common_telemetry::info!("Found {} runs, reduce inputs: {}", found_runs, inputs.len());
 
             if !inputs.is_empty() {
                 log_pick_result(
@@ -162,7 +162,7 @@ impl Picker for TwcsPicker {
     fn pick(&self, compaction_region: &CompactionRegion) -> Option<PickerOutput> {
         let region_id = compaction_region.region_id;
         let levels = compaction_region.current_version.ssts.levels();
-        common_telemetry::info!("Compaction pick {} start", region_id);
+        // common_telemetry::info!("Compaction pick {} start", region_id);
 
         let expired_ssts =
             get_expired_ssts(levels, compaction_region.ttl, Timestamp::current_millis());
@@ -194,11 +194,11 @@ impl Picker for TwcsPicker {
             assign_to_windows(levels.iter().flat_map(LevelMeta::files), time_window_size);
         let outputs = self.build_output(region_id, &mut windows, active_window);
 
-        common_telemetry::info!(
-            "Compaction pick {} outputs, time_window_size: {:?}",
-            outputs.len(),
-            time_window_size
-        );
+        // common_telemetry::info!(
+        //     "Compaction pick {} outputs, time_window_size: {:?}",
+        //     outputs.len(),
+        //     time_window_size
+        // );
 
         if outputs.is_empty() && expired_ssts.is_empty() {
             return None;
