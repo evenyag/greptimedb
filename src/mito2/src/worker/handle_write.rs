@@ -16,6 +16,7 @@
 
 use std::collections::{hash_map, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::v1::OpType;
 use common_telemetry::{debug, error};
@@ -250,9 +251,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 continue;
             };
 
+            let write_start = Instant::now();
             let Some(mutable) = region_ctx.write_for_flush().await else {
                 continue;
             };
+            let write_cost = write_start.elapsed();
 
             let flush_task =
                 self.new_flush_task(&region, FlushReason::Others, None, self.config.clone());
@@ -288,9 +291,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 }
 
                 common_telemetry::info!(
-                    "Direct flush rows, put_rows: {}, cost: {:?}",
+                    "Direct flush rows, put_rows: {}, cost: {:?}, write memtable cost: {:?}",
                     put_rows,
-                    direct_start.elapsed()
+                    direct_start.elapsed(),
+                    write_cost,
                 );
 
                 INFLIGHT_FLUSH_COUNT.dec();
