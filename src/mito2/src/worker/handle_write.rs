@@ -251,12 +251,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 continue;
             };
 
-            let write_start = Instant::now();
-            let Some(mutable) = region_ctx.write_for_flush().await else {
-                continue;
-            };
-            let write_cost = write_start.elapsed();
-
             let flush_task =
                 self.new_flush_task(&region, FlushReason::Others, None, self.config.clone());
             let version_data = region.version_control.current();
@@ -267,6 +261,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                 let put_rows = region_ctx.put_num;
                 let delete_rows = region_ctx.delete_num;
+
+                let write_start = Instant::now();
+                let Some(mutable) = region_ctx.write_for_flush().await else {
+                    return;
+                };
+                let write_cost = write_start.elapsed();
 
                 match flush_task
                     .direct_flush_memtables(&version_data, &mutable)
