@@ -580,6 +580,15 @@ impl RegionFlushTask {
             let num_mem_ranges = mem_ranges.ranges.len();
             let num_mem_rows = mem_ranges.stats.num_rows();
             let memtable_id = mem.id();
+
+            common_telemetry::info!(
+                "Region direct flush one memtable {} start, num_mem_ranges: {}, num_rows: {}, is_record_batch: {:?}",
+                memtable_id,
+                num_mem_ranges,
+                num_mem_rows,
+                mem_ranges.is_record_batch()
+            );
+
             if mem_ranges.is_record_batch() {
                 let flush_start = Instant::now();
                 let batch_schema =
@@ -864,6 +873,12 @@ fn memtable_flat_sources(
         sources: SmallVec::new(),
         encoded: SmallVec::new(),
     };
+
+    common_telemetry::info!(
+        "Memtable flat sources, num_ranges: {}, series: {}",
+        ranges.len(),
+        *series_count
+    );
 
     if ranges.len() == 1 {
         let only_range = ranges.into_values().next().unwrap();

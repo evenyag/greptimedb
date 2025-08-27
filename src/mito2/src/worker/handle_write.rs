@@ -192,13 +192,13 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             .with_label_values(&["delete"])
             .inc_by(delete_rows as u64);
 
-        common_telemetry::info!(
-            "Write {} requests, {} rows, wal cost: {}s, mem cost: {}s",
-            num_requests,
-            put_rows,
-            wal_cost,
-            mem_cost
-        );
+        // common_telemetry::info!(
+        //     "Write {} requests, {} rows, wal cost: {}s, mem cost: {}s",
+        //     num_requests,
+        //     put_rows,
+        //     wal_cost,
+        //     mem_cost
+        // );
     }
 
     /// Handles all stalled write requests.
