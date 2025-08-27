@@ -874,12 +874,6 @@ fn memtable_flat_sources(
         encoded: SmallVec::new(),
     };
 
-    common_telemetry::info!(
-        "Memtable flat sources, num_ranges: {}, series: {}",
-        ranges.len(),
-        *series_count
-    );
-
     if ranges.len() == 1 {
         let only_range = ranges.into_values().next().unwrap();
         if let Some(encoded) = only_range.encoded() {
@@ -925,7 +919,31 @@ fn memtable_flat_sources(
                 };
 
                 flat_sources.sources.push(FlatSource::Iter(maybe_dedup));
+                last_iter_rows = 0;
             }
+        }
+
+        // Handle remaining iters.
+        if !input_iters.is_empty() {
+            let merge_iter =
+                MergeIterator::new(schema.clone(), input_iters, DEFAULT_READ_BATCH_SIZE)?;
+            let maybe_dedup = if options.append_mode {
+                // No dedup in append mode
+                Box::new(merge_iter) as _
+            } else {
+                // Dedup according to merge mode.
+                match options.merge_mode() {
+                    MergeMode::LastRow => {
+                        Box::new(DedupIterator::new(merge_iter, FlatLastRow::new(false))) as _
+                    }
+                    MergeMode::LastNonNull => Box::new(DedupIterator::new(
+                        merge_iter,
+                        FlatLastNonNull::new(field_column_start, false),
+                    )) as _,
+                }
+            };
+
+            flat_sources.sources.push(FlatSource::Iter(maybe_dedup));
         }
     }
 
