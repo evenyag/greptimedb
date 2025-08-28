@@ -145,6 +145,7 @@ impl BulkPartRecordBatchIter {
     /// Applies projection to the RecordBatch if needed.
     fn apply_projection(&self, record_batch: RecordBatch) -> error::Result<RecordBatch> {
         let projection_indices = self.context.read_format().projection_indices();
+        common_telemetry::info!("apply projection: {:?}", projection_indices);
         if projection_indices.len() == record_batch.num_columns() {
             return Ok(record_batch);
         }

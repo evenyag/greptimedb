@@ -161,6 +161,8 @@ impl Memtable for BulkMemtable {
         predicate: PredicateGroup,
         sequence: Option<SequenceNumber>,
     ) -> Result<MemtableRanges> {
+        common_telemetry::info!("bulk memtable ranges, projection: {:?}", projection);
+
         let mut ranges = BTreeMap::new();
         let mut range_id = 0;
 
