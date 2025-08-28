@@ -92,21 +92,6 @@ impl FlatProjectionMapper {
             column_schemas.push(metadata.schema.column_schemas()[*idx].clone());
         }
 
-        if is_empty_projection {
-            // If projection is empty, we don't output any column.
-            return Ok(FlatProjectionMapper {
-                metadata: metadata.clone(),
-                output_schema: Arc::new(Schema::new(vec![])),
-                column_ids,
-                batch_schema: vec![],
-                is_empty_projection,
-                batch_indices: vec![],
-            });
-        }
-
-        // Safety: Columns come from existing schema.
-        let output_schema = Arc::new(Schema::new(column_schemas));
-
         // Creates a map to lookup index.
         let id_to_index = sst_column_id_indices(metadata);
         // TODO(yingwen): Support different flat schema options.
@@ -116,6 +101,23 @@ impl FlatProjectionMapper {
             metadata.column_metadatas.len() + 3,
             column_ids.iter().copied(),
         );
+
+        let batch_schema = plain_projected_columns(metadata, &format_projection);
+
+        if is_empty_projection {
+            // If projection is empty, we don't output any column.
+            return Ok(FlatProjectionMapper {
+                metadata: metadata.clone(),
+                output_schema: Arc::new(Schema::new(vec![])),
+                column_ids,
+                batch_schema,
+                is_empty_projection,
+                batch_indices: vec![],
+            });
+        }
+
+        // Safety: Columns come from existing schema.
+        let output_schema = Arc::new(Schema::new(column_schemas));
 
         let batch_indices: Vec<_> = column_ids
             .iter()
@@ -128,8 +130,6 @@ impl FlatProjectionMapper {
                     .unwrap()
             })
             .collect();
-
-        let batch_schema = plain_projected_columns(metadata, &format_projection);
 
         Ok(FlatProjectionMapper {
             metadata: metadata.clone(),
