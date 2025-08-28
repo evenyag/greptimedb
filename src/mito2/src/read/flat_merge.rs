@@ -76,12 +76,6 @@ impl BatchBuilder {
 
     /// Append a new batch in `stream_idx`
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) {
-        assert_eq!(
-            self.schema,
-            batch.schema(),
-            "stream {stream_idx} has a different schema"
-        );
-
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
