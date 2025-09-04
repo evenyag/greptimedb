@@ -24,6 +24,7 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::StreamExt;
 use smallvec::{smallvec, SmallVec};
@@ -495,6 +496,12 @@ impl SeriesBatch {
     }
 }
 
+/// Batches of multiple same series.
+#[derive(Default)]
+pub struct FlatSeriesBatch {
+    pub batches: SmallVec<[RecordBatch; 4]>,
+}
+
 /// List of senders.
 struct SenderList {
     senders: Vec<Option<Sender<Result<SeriesBatch>>>>,
@@ -626,4 +633,116 @@ fn new_partition_metrics(
 
     metrics_list.set(partition, metrics.clone());
     metrics
+}
+
+/// A divider to split flat record batches by time series.
+///
+/// It only ensures rows of the same series are returned in the same [FlatSeriesBatch].
+/// However, a [FlatSeriesBatch] may contain rows from multiple series.
+#[derive(Default)]
+struct FlatSeriesBatchDivider {
+    buffer: FlatSeriesBatch,
+}
+
+impl FlatSeriesBatchDivider {
+    /// Pushes a record batch into the divider.
+    ///
+    /// Returns a [FlatSeriesBatch] if the series in the buffer is exhausted.
+    fn push(&mut self, batch: RecordBatch) -> Option<FlatSeriesBatch> {
+        use crate::sst::parquet::flat_format::primary_key_column_index;
+        use crate::sst::parquet::format::PrimaryKeyArray;
+
+        // if buffer is empty
+        if self.buffer.batches.is_empty() {
+            self.buffer.batches.push(batch);
+            return None;
+        }
+
+        // Get primary key column from the incoming batch
+        let pk_column_idx = primary_key_column_index(batch.num_columns());
+        let pk_column = batch.column(pk_column_idx);
+        let pk_array = pk_column
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .unwrap();
+
+        // Get the last primary key of the incoming batch
+        let last_batch_pk = primary_key_at(pk_array, pk_array.len() - 1);
+
+        // Get the last primary key of the buffer
+        let buffer_last_batch = self.buffer.batches.last().unwrap();
+        let buffer_pk_column_idx = primary_key_column_index(buffer_last_batch.num_columns());
+        let buffer_pk_column = buffer_last_batch.column(buffer_pk_column_idx);
+        let buffer_pk_array = buffer_pk_column
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .unwrap();
+        let buffer_last_pk = primary_key_at(buffer_pk_array, buffer_pk_array.len() - 1);
+
+        // if last primary key of the batch is the same as last primary key of the buffer
+        if last_batch_pk == buffer_last_pk {
+            self.buffer.batches.push(batch);
+            return None;
+        }
+
+        // Find the offset where the primary key changes
+        let keys = pk_array.keys();
+        let pk_indices = keys.values();
+        let first_key = pk_indices[0];
+        let mut change_offset = pk_array.len(); // default to end if no change found
+
+        for (i, &key) in pk_indices.iter().enumerate() {
+            if key != first_key {
+                change_offset = i;
+                break;
+            }
+        }
+
+        // Slice the batch at the change offset
+        let (first_part, remaining_part) = if change_offset < pk_array.len() {
+            let first_part = batch.slice(0, change_offset);
+            let remaining_part = batch.slice(change_offset, batch.num_rows() - change_offset);
+            (Some(first_part), Some(remaining_part))
+        } else {
+            (Some(batch), None)
+        };
+
+        // Create the result from current buffer + first part of new batch
+        let mut result = std::mem::take(&mut self.buffer);
+        if let Some(first_part) = first_part {
+            result.batches.push(first_part);
+        }
+
+        // Push remaining part to the buffer if it exists
+        if let Some(remaining_part) = remaining_part {
+            self.buffer.batches.push(remaining_part);
+        }
+
+        Some(result)
+    }
+
+    /// Returns the final [FlatSeriesBatch].
+    fn finish(&mut self) -> Option<FlatSeriesBatch> {
+        if self.buffer.batches.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buffer))
+        }
+    }
+}
+
+/// Helper function to extract primary key bytes at a specific index from PrimaryKeyArray
+fn primary_key_at(
+    primary_key: &crate::sst::parquet::format::PrimaryKeyArray,
+    index: usize,
+) -> &[u8] {
+    use datatypes::arrow::array::BinaryArray;
+
+    let key = primary_key.keys().value(index);
+    let binary_values = primary_key
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    binary_values.value(key as usize)
 }
