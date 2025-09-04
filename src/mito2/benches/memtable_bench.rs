@@ -24,9 +24,11 @@ use datatypes::schema::ColumnSchema;
 use mito2::memtable::bulk::context::BulkIterContext;
 use mito2::memtable::bulk::part::BulkPartConverter;
 use mito2::memtable::bulk::part_reader::BulkPartRecordBatchIter;
+use mito2::memtable::bulk::{BulkMemtableBuilder, CompactDispatcher};
 use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
-use mito2::memtable::{KeyValues, Memtable};
+use mito2::memtable::{KeyValues, Memtable, MemtableBuilder};
+use mito2::read::scan_region::PredicateGroup;
 use mito2::region::options::MergeMode;
 use mito2::sst::{to_flat_sst_arrow_schema, FlatSchemaOptions};
 use mito2::test_util::memtable_util::{self, region_metadata_to_row_schema};
@@ -46,7 +48,7 @@ fn write_rows(c: &mut Criterion) {
     let timestamps = (0..100).collect::<Vec<_>>();
 
     // Note that this test only generate one time series.
-    let mut group = c.benchmark_group("write");
+    let mut group = c.benchmark_group("write_rows");
     group.bench_function("partition_tree", |b| {
         let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
         let memtable = PartitionTreeMemtable::new(
@@ -68,6 +70,37 @@ fn write_rows(c: &mut Criterion) {
             memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
         b.iter(|| {
             memtable.write(&kvs).unwrap();
+        });
+    });
+    group.bench_function("bulk", |b| {
+        let builder = BulkMemtableBuilder::new(None);
+        let memtable = builder.build(1, &metadata);
+        let kvs =
+            memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
+        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
+        let schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
+        b.iter(|| {
+            let mut converter =
+                BulkPartConverter::new(&metadata, schema.clone(), 100, codec.clone(), true);
+            converter.append_key_values(&kvs).unwrap();
+            let bulk_part = converter.convert().unwrap();
+            memtable.write_bulk(bulk_part).unwrap();
+        });
+    });
+    group.bench_function("bulk_with_compact_dispatcher", |b| {
+        let compact_dispatcher = Arc::new(CompactDispatcher::new(4));
+        let builder = BulkMemtableBuilder::new(None).with_compact_dispatcher(compact_dispatcher);
+        let memtable = builder.build(1, &metadata);
+        let kvs =
+            memtable_util::build_key_values(&metadata, "hello".to_string(), 42, &timestamps, 1);
+        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
+        let schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
+        b.iter(|| {
+            let mut converter =
+                BulkPartConverter::new(&metadata, schema.clone(), 100, codec.clone(), true);
+            converter.append_key_values(&kvs).unwrap();
+            let bulk_part = converter.convert().unwrap();
+            memtable.write_bulk(bulk_part).unwrap();
         });
     });
 }
@@ -145,6 +178,31 @@ fn filter_1_host(c: &mut Criterion) {
             let iter = memtable.iter(None, Some(predicate.clone()), None).unwrap();
             for batch in iter {
                 let _batch = batch.unwrap();
+            }
+        });
+    });
+    group.bench_function("bulk", |b| {
+        let builder = BulkMemtableBuilder::new(None);
+        let memtable = builder.build(1, &metadata);
+        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
+        let schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
+        for kvs in generator.iter() {
+            let mut converter =
+                BulkPartConverter::new(&metadata, schema.clone(), 4000, codec.clone(), true);
+            converter.append_key_values(&kvs).unwrap();
+            let bulk_part = converter.convert().unwrap();
+            memtable.write_bulk(bulk_part).unwrap();
+        }
+        let predicate = generator.random_host_filter();
+        let predicate_group = PredicateGroup::new(&metadata, predicate.exprs());
+
+        b.iter(|| {
+            let ranges = memtable.ranges(None, predicate_group.clone(), None).unwrap();
+            for (_range_id, range) in ranges.ranges {
+                let iter = range.build_record_batch_iter(None).unwrap();
+                for batch in iter {
+                    let _batch = batch.unwrap();
+                }
             }
         });
     });
