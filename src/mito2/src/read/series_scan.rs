@@ -24,6 +24,7 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datatypes::arrow::array::BinaryArray;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
@@ -809,23 +810,28 @@ impl FlatSeriesBatchDivider {
         // Find the offset where the primary key changes
         let keys = pk_array.keys();
         let pk_indices = keys.values();
-        let first_key = pk_indices[0];
-        let mut change_offset = pk_array.len(); // default to end if no change found
-
+        let pk_values = pk_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let mut change_offset = 0;
         for (i, &key) in pk_indices.iter().enumerate() {
-            if key != first_key {
+            let batch_pk = pk_values.value(key as usize);
+
+            if buffer_last_pk != batch_pk {
                 change_offset = i;
                 break;
             }
         }
 
         // Slice the batch at the change offset
-        let (first_part, remaining_part) = if change_offset < pk_array.len() {
+        let (first_part, remaining_part) = if change_offset > 0 {
             let first_part = batch.slice(0, change_offset);
             let remaining_part = batch.slice(change_offset, batch.num_rows() - change_offset);
             (Some(first_part), Some(remaining_part))
         } else {
-            (Some(batch), None)
+            (None, Some(batch))
         };
 
         // Create the result from current buffer + first part of new batch
@@ -866,4 +872,288 @@ fn primary_key_at(
         .downcast_ref::<BinaryArray>()
         .unwrap();
     binary_values.value(key as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use api::v1::OpType;
+    use datatypes::arrow::array::{
+        ArrayRef, BinaryDictionaryBuilder, Int64Array, StringDictionaryBuilder,
+        TimestampMillisecondArray, UInt64Array, UInt8Array,
+    };
+    use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt32Type};
+    use datatypes::arrow::record_batch::RecordBatch;
+
+    use super::*;
+
+    fn new_test_record_batch(
+        primary_keys: &[&[u8]],
+        timestamps: &[i64],
+        sequences: &[u64],
+        op_types: &[OpType],
+        fields: &[u64],
+    ) -> RecordBatch {
+        let num_rows = timestamps.len();
+        debug_assert_eq!(sequences.len(), num_rows);
+        debug_assert_eq!(op_types.len(), num_rows);
+        debug_assert_eq!(fields.len(), num_rows);
+        debug_assert_eq!(primary_keys.len(), num_rows);
+
+        let columns: Vec<ArrayRef> = vec![
+            build_test_pk_string_dict_array(primary_keys),
+            Arc::new(Int64Array::from_iter(
+                fields.iter().map(|v| Some(*v as i64)),
+            )),
+            Arc::new(TimestampMillisecondArray::from_iter_values(
+                timestamps.iter().copied(),
+            )),
+            build_test_pk_array(primary_keys),
+            Arc::new(UInt64Array::from_iter_values(sequences.iter().copied())),
+            Arc::new(UInt8Array::from_iter_values(
+                op_types.iter().map(|v| *v as u8),
+            )),
+        ];
+
+        RecordBatch::try_new(build_test_flat_schema(), columns).unwrap()
+    }
+
+    fn build_test_pk_string_dict_array(primary_keys: &[&[u8]]) -> ArrayRef {
+        let mut builder = StringDictionaryBuilder::<UInt32Type>::new();
+        for &pk in primary_keys {
+            let pk_str = std::str::from_utf8(pk).unwrap();
+            builder.append(pk_str).unwrap();
+        }
+        Arc::new(builder.finish())
+    }
+
+    fn build_test_pk_array(primary_keys: &[&[u8]]) -> ArrayRef {
+        let mut builder = BinaryDictionaryBuilder::<UInt32Type>::new();
+        for &pk in primary_keys {
+            builder.append(pk).unwrap();
+        }
+        Arc::new(builder.finish())
+    }
+
+    fn build_test_flat_schema() -> SchemaRef {
+        let fields = vec![
+            Field::new(
+                "k0",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Field::new("field0", DataType::Int64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "__primary_key",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
+                false,
+            ),
+            Field::new("__sequence", DataType::UInt64, false),
+            Field::new("__op_type", DataType::UInt8, false),
+        ];
+        Arc::new(Schema::new(fields))
+    }
+
+    mod flat_series_batch_divider_tests {
+        use super::*;
+
+        #[test]
+        fn test_empty_buffer_first_push() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[1000, 2000],
+                &[1, 2],
+                &[OpType::Put, OpType::Put],
+                &[10, 20],
+            );
+
+            let result = divider.push(batch);
+            assert!(result.is_none());
+            assert_eq!(divider.buffer.batches.len(), 1);
+        }
+
+        #[test]
+        fn test_same_series_accumulation() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch1 = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[1000, 2000],
+                &[1, 2],
+                &[OpType::Put, OpType::Put],
+                &[10, 20],
+            );
+
+            let batch2 = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[3000, 4000],
+                &[3, 4],
+                &[OpType::Put, OpType::Put],
+                &[30, 40],
+            );
+
+            divider.push(batch1);
+            let result = divider.push(batch2);
+
+            assert!(result.is_none());
+            assert_eq!(divider.buffer.batches.len(), 2);
+        }
+
+        #[test]
+        fn test_series_boundary_detection() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch1 = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[1000, 2000],
+                &[1, 2],
+                &[OpType::Put, OpType::Put],
+                &[10, 20],
+            );
+
+            let batch2 = new_test_record_batch(
+                &[b"series2", b"series2"],
+                &[3000, 4000],
+                &[3, 4],
+                &[OpType::Put, OpType::Put],
+                &[30, 40],
+            );
+
+            divider.push(batch1);
+            let result = divider.push(batch2);
+
+            assert!(result.is_some());
+            let series_batch = result.unwrap();
+            assert_eq!(series_batch.batches.len(), 1);
+
+            assert_eq!(divider.buffer.batches.len(), 1);
+        }
+
+        #[test]
+        fn test_series_boundary_within_batch() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch1 = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[1000, 2000],
+                &[1, 2],
+                &[OpType::Put, OpType::Put],
+                &[10, 20],
+            );
+
+            let batch2 = new_test_record_batch(
+                &[b"series1", b"series2"],
+                &[3000, 4000],
+                &[3, 4],
+                &[OpType::Put, OpType::Put],
+                &[30, 40],
+            );
+
+            divider.push(batch1);
+            let result = divider.push(batch2);
+
+            assert!(result.is_some());
+            let series_batch = result.unwrap();
+            assert_eq!(series_batch.batches.len(), 2);
+            assert_eq!(series_batch.batches[1].num_rows(), 1);
+
+            assert_eq!(divider.buffer.batches.len(), 1);
+            assert_eq!(divider.buffer.batches[0].num_rows(), 1);
+        }
+
+        #[test]
+        fn test_finish_with_data() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch = new_test_record_batch(
+                &[b"series1", b"series1"],
+                &[1000, 2000],
+                &[1, 2],
+                &[OpType::Put, OpType::Put],
+                &[10, 20],
+            );
+
+            divider.push(batch);
+            let result = divider.finish();
+
+            assert!(result.is_some());
+            let series_batch = result.unwrap();
+            assert_eq!(series_batch.batches.len(), 1);
+            assert!(divider.buffer.batches.is_empty());
+        }
+
+        #[test]
+        fn test_finish_with_empty_buffer() {
+            let mut divider = FlatSeriesBatchDivider::default();
+            let result = divider.finish();
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_complex_series_splitting() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch1 = new_test_record_batch(&[b"series1"], &[1000], &[1], &[OpType::Put], &[10]);
+
+            let batch2 = new_test_record_batch(
+                &[b"series1", b"series2", b"series2", b"series3"],
+                &[2000, 3000, 4000, 5000],
+                &[2, 3, 4, 5],
+                &[OpType::Put, OpType::Put, OpType::Put, OpType::Put],
+                &[20, 30, 40, 50],
+            );
+
+            divider.push(batch1);
+            let result1 = divider.push(batch2);
+
+            assert!(result1.is_some());
+            let series_batch = result1.unwrap();
+            assert_eq!(series_batch.batches.len(), 2);
+
+            let total_rows: usize = series_batch.batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(total_rows, 2);
+
+            let final_result = divider.finish();
+            assert!(final_result.is_some());
+            let final_batch = final_result.unwrap();
+            assert_eq!(final_batch.batches.len(), 1);
+            assert_eq!(final_batch.batches[0].num_rows(), 3);
+        }
+
+        #[test]
+        fn test_multiple_series_changes_in_single_batch() {
+            let mut divider = FlatSeriesBatchDivider::default();
+
+            let batch1 = new_test_record_batch(&[b"series1"], &[1000], &[1], &[OpType::Put], &[10]);
+
+            let batch2 = new_test_record_batch(
+                &[b"series2", b"series3"],
+                &[2000, 3000],
+                &[2, 3],
+                &[OpType::Put, OpType::Put],
+                &[20, 30],
+            );
+
+            divider.push(batch1);
+            let result = divider.push(batch2);
+
+            assert!(result.is_some());
+            let series_batch = result.unwrap();
+            assert_eq!(series_batch.batches.len(), 1);
+            assert_eq!(series_batch.batches.len(), 1);
+            assert_eq!(series_batch.batches[0].num_rows(), 1);
+
+            let series_batch = divider.finish().unwrap();
+            assert_eq!(series_batch.batches.len(), 1);
+            assert_eq!(series_batch.batches[0].num_rows(), 2);
+        }
+    }
 }

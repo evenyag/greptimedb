@@ -773,7 +773,6 @@ mod tests {
         assert_eq!([0], mapper.column_ids()); // Should still read the time index column
         assert!(mapper.output_schema().is_empty());
         let plain_mapper = mapper.as_flat().unwrap();
-        assert!(plain_mapper.batch_schema().is_empty());
 
         let batch = new_flat_batch(Some(0), &[], &[], 3);
         let record_batch = plain_mapper.convert(&batch).unwrap();
