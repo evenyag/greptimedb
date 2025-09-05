@@ -29,7 +29,7 @@ use crate::cache::CacheStrategy;
 use crate::error::Result;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_util::PartitionMetrics;
-use crate::read::series_scan::SeriesBatch;
+use crate::read::series_scan::{SeriesBatch, PrimaryKeySeriesBatch};
 use crate::read::Batch;
 
 /// All kinds of [`Batch`]es to produce in scanner.
@@ -79,22 +79,37 @@ impl ConvertBatchStream {
                 }
             }
             ScanBatch::Series(series) => {
-                self.buffer.clear();
-                self.buffer.reserve(series.batches.len());
-                // Safety: Only primary key format returns this batch.
-                let mapper = self.projection_mapper.as_primary_key().unwrap();
+                match series {
+                    SeriesBatch::PrimaryKey(primary_key_batch) => {
+                        self.buffer.clear();
+                        self.buffer.reserve(primary_key_batch.batches.len());
+                        // Safety: Only primary key format returns this batch.
+                        let mapper = self.projection_mapper.as_primary_key().unwrap();
 
-                for batch in series.batches {
-                    let record_batch = mapper.convert(&batch, &self.cache_strategy)?;
-                    self.buffer.push(record_batch.into_df_record_batch());
+                        for batch in primary_key_batch.batches {
+                            let record_batch = mapper.convert(&batch, &self.cache_strategy)?;
+                            self.buffer.push(record_batch.into_df_record_batch());
+                        }
+
+                        let output_schema = mapper.output_schema();
+                        let record_batch =
+                            compute::concat_batches(output_schema.arrow_schema(), &self.buffer)
+                                .context(ArrowComputeSnafu)?;
+
+                        RecordBatch::try_from_df_record_batch(output_schema, record_batch)
+                    }
+                    SeriesBatch::Flat(flat_batch) => {
+                        // Safety: Only flat format returns this batch.
+                        let mapper = self.projection_mapper.as_flat().unwrap();
+
+                        let output_schema = mapper.output_schema();
+                        let record_batch =
+                            compute::concat_batches(output_schema.arrow_schema(), &flat_batch.batches)
+                                .context(ArrowComputeSnafu)?;
+
+                        mapper.convert(&record_batch)
+                    }
                 }
-
-                let output_schema = mapper.output_schema();
-                let record_batch =
-                    compute::concat_batches(output_schema.arrow_schema(), &self.buffer)
-                        .context(ArrowComputeSnafu)?;
-
-                RecordBatch::try_from_df_record_batch(output_schema, record_batch)
             }
             ScanBatch::RecordBatch(df_record_batch) => {
                 // Safety: Only flat key format returns this batch.

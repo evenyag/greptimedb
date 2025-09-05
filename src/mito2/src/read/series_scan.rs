@@ -156,8 +156,16 @@ impl SeriesScan {
                 metrics.scan_cost += fetch_start.elapsed();
                 fetch_start = Instant::now();
 
-                metrics.num_batches += series.batches.len();
-                metrics.num_rows += series.batches.iter().map(|x| x.num_rows()).sum::<usize>();
+                match &series {
+                    SeriesBatch::PrimaryKey(primary_key_batch) => {
+                        metrics.num_batches += primary_key_batch.batches.len();
+                        metrics.num_rows += primary_key_batch.batches.iter().map(|x| x.num_rows()).sum::<usize>();
+                    }
+                    SeriesBatch::Flat(flat_batch) => {
+                        metrics.num_batches += flat_batch.batches.len();
+                        metrics.num_rows += flat_batch.batches.iter().map(|x| x.num_rows()).sum::<usize>();
+                    }
+                }
 
                 let yield_start = Instant::now();
                 yield ScanBatch::Series(series);
@@ -422,7 +430,7 @@ impl SeriesDistributor {
         let mut metrics = SeriesDistributorMetrics::default();
         let mut fetch_start = Instant::now();
 
-        let mut current_series = SeriesBatch::default();
+        let mut current_series = PrimaryKeySeriesBatch::default();
         while let Some(batch) = reader.next_batch().await? {
             metrics.scan_cost += fetch_start.elapsed();
             fetch_start = Instant::now();
@@ -445,15 +453,15 @@ impl SeriesDistributor {
             }
 
             // We find a new series, send the current one.
-            let to_send = std::mem::replace(&mut current_series, SeriesBatch::single(batch));
+            let to_send = std::mem::replace(&mut current_series, PrimaryKeySeriesBatch::single(batch));
             let yield_start = Instant::now();
-            self.senders.send_batch(to_send).await?;
+            self.senders.send_batch(SeriesBatch::PrimaryKey(to_send)).await?;
             metrics.yield_cost += yield_start.elapsed();
         }
 
         if !current_series.is_empty() {
             let yield_start = Instant::now();
-            self.senders.send_batch(current_series).await?;
+            self.senders.send_batch(SeriesBatch::PrimaryKey(current_series)).await?;
             metrics.yield_cost += yield_start.elapsed();
         }
 
@@ -468,14 +476,14 @@ impl SeriesDistributor {
     }
 }
 
-/// Batches of the same series.
+/// Batches of the same series in primary key format.
 #[derive(Default)]
-pub struct SeriesBatch {
+pub struct PrimaryKeySeriesBatch {
     pub batches: SmallVec<[Batch; 4]>,
 }
 
-impl SeriesBatch {
-    /// Creates a new [SeriesBatch] from a single [Batch].
+impl PrimaryKeySeriesBatch {
+    /// Creates a new [PrimaryKeySeriesBatch] from a single [Batch].
     fn single(batch: Batch) -> Self {
         Self {
             batches: smallvec![batch],
@@ -496,8 +504,15 @@ impl SeriesBatch {
     }
 }
 
-/// Batches of multiple same series.
-#[derive(Default)]
+/// Batches of the same series.
+#[derive(Debug)]
+pub enum SeriesBatch {
+    PrimaryKey(PrimaryKeySeriesBatch),
+    Flat(FlatSeriesBatch),
+}
+
+/// Batches of the same series in flat format.
+#[derive(Default, Debug)]
 pub struct FlatSeriesBatch {
     pub batches: SmallVec<[RecordBatch; 4]>,
 }
