@@ -29,7 +29,7 @@ use crate::cache::CacheStrategy;
 use crate::error::Result;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_util::PartitionMetrics;
-use crate::read::series_scan::{SeriesBatch, PrimaryKeySeriesBatch};
+use crate::read::series_scan::{PrimaryKeySeriesBatch, SeriesBatch};
 use crate::read::Batch;
 
 /// All kinds of [`Batch`]es to produce in scanner.
@@ -103,9 +103,11 @@ impl ConvertBatchStream {
                         let mapper = self.projection_mapper.as_flat().unwrap();
 
                         let output_schema = mapper.output_schema();
-                        let record_batch =
-                            compute::concat_batches(output_schema.arrow_schema(), &flat_batch.batches)
-                                .context(ArrowComputeSnafu)?;
+                        let record_batch = compute::concat_batches(
+                            output_schema.arrow_schema(),
+                            &flat_batch.batches,
+                        )
+                        .context(ArrowComputeSnafu)?;
 
                         mapper.convert(&record_batch)
                     }

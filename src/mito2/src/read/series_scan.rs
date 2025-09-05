@@ -453,15 +453,20 @@ impl SeriesDistributor {
             }
 
             // We find a new series, send the current one.
-            let to_send = std::mem::replace(&mut current_series, PrimaryKeySeriesBatch::single(batch));
+            let to_send =
+                std::mem::replace(&mut current_series, PrimaryKeySeriesBatch::single(batch));
             let yield_start = Instant::now();
-            self.senders.send_batch(SeriesBatch::PrimaryKey(to_send)).await?;
+            self.senders
+                .send_batch(SeriesBatch::PrimaryKey(to_send))
+                .await?;
             metrics.yield_cost += yield_start.elapsed();
         }
 
         if !current_series.is_empty() {
             let yield_start = Instant::now();
-            self.senders.send_batch(SeriesBatch::PrimaryKey(current_series)).await?;
+            self.senders
+                .send_batch(SeriesBatch::PrimaryKey(current_series))
+                .await?;
             metrics.yield_cost += yield_start.elapsed();
         }
 

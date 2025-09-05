@@ -197,7 +197,9 @@ fn filter_1_host(c: &mut Criterion) {
         let predicate_group = PredicateGroup::new(&metadata, predicate.exprs());
 
         b.iter(|| {
-            let ranges = memtable.ranges(None, predicate_group.clone(), None).unwrap();
+            let ranges = memtable
+                .ranges(None, predicate_group.clone(), None)
+                .unwrap();
             for (_range_id, range) in ranges.ranges {
                 let iter = range.build_record_batch_iter(None).unwrap();
                 for batch in iter {
