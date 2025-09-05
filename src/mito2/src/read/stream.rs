@@ -29,7 +29,7 @@ use crate::cache::CacheStrategy;
 use crate::error::Result;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_util::PartitionMetrics;
-use crate::read::series_scan::{PrimaryKeySeriesBatch, SeriesBatch};
+use crate::read::series_scan::SeriesBatch;
 use crate::read::Batch;
 
 /// All kinds of [`Batch`]es to produce in scanner.

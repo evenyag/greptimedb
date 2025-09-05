@@ -26,7 +26,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use smallvec::{smallvec, SmallVec};
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::RegionMetadataRef;
@@ -44,7 +44,7 @@ use crate::error::{
 use crate::read::range::RangeBuilderList;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics};
-use crate::read::seq_scan::{build_sources, SeqScan};
+use crate::read::seq_scan::{build_flat_sources, build_sources, SeqScan};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{Batch, ScannerMetrics};
 
@@ -156,16 +156,8 @@ impl SeriesScan {
                 metrics.scan_cost += fetch_start.elapsed();
                 fetch_start = Instant::now();
 
-                match &series {
-                    SeriesBatch::PrimaryKey(primary_key_batch) => {
-                        metrics.num_batches += primary_key_batch.batches.len();
-                        metrics.num_rows += primary_key_batch.batches.iter().map(|x| x.num_rows()).sum::<usize>();
-                    }
-                    SeriesBatch::Flat(flat_batch) => {
-                        metrics.num_batches += flat_batch.batches.len();
-                        metrics.num_rows += flat_batch.batches.iter().map(|x| x.num_rows()).sum::<usize>();
-                    }
-                }
+                metrics.num_batches += series.num_batches();
+                metrics.num_rows += series.num_rows();
 
                 let yield_start = Instant::now();
                 yield ScanBatch::Series(series);
@@ -386,9 +378,98 @@ struct SeriesDistributor {
 impl SeriesDistributor {
     /// Executes the distributor.
     async fn execute(&mut self) {
-        if let Err(e) = self.scan_partitions().await {
+        let result = if self.stream_ctx.input.flat_format {
+            self.scan_partitions_flat().await
+        } else {
+            self.scan_partitions().await
+        };
+
+        if let Err(e) = result {
             self.senders.send_error(e).await;
         }
+    }
+
+    /// Scans all parts in flat format using FlatSeriesBatchDivider.
+    async fn scan_partitions_flat(&mut self) -> Result<()> {
+        let part_metrics = new_partition_metrics(
+            &self.stream_ctx,
+            false,
+            &self.metrics_set,
+            self.partitions.len(),
+            &self.metrics_list,
+        );
+        part_metrics.on_first_poll();
+
+        let range_builder_list = Arc::new(RangeBuilderList::new(
+            self.stream_ctx.input.num_memtables(),
+            self.stream_ctx.input.num_files(),
+        ));
+        // Scans all parts.
+        let mut sources = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            sources.reserve(partition.len());
+            for part_range in partition {
+                build_flat_sources(
+                    &self.stream_ctx,
+                    part_range,
+                    false,
+                    &part_metrics,
+                    range_builder_list.clone(),
+                    &mut sources,
+                )
+                .await?;
+            }
+        }
+
+        // Builds a flat reader that merge sources from all parts.
+        let mut reader = SeqScan::build_flat_reader_from_sources(
+            &self.stream_ctx,
+            sources,
+            self.semaphore.clone(),
+        )
+        .await?;
+        let mut metrics = SeriesDistributorMetrics::default();
+        let mut fetch_start = Instant::now();
+
+        let mut divider = FlatSeriesBatchDivider::default();
+        while let Some(record_batch) = reader.try_next().await? {
+            metrics.scan_cost += fetch_start.elapsed();
+            fetch_start = Instant::now();
+            metrics.num_batches += 1;
+            metrics.num_rows += record_batch.num_rows();
+
+            debug_assert!(record_batch.num_rows() > 0);
+            if record_batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Use divider to split series
+            if let Some(series_batch) = divider.push(record_batch) {
+                let yield_start = Instant::now();
+                self.senders
+                    .send_batch(SeriesBatch::Flat(series_batch))
+                    .await?;
+                metrics.yield_cost += yield_start.elapsed();
+            }
+        }
+
+        // Send any remaining batch in the divider
+        if let Some(series_batch) = divider.finish() {
+            let yield_start = Instant::now();
+            self.senders
+                .send_batch(SeriesBatch::Flat(series_batch))
+                .await?;
+            metrics.yield_cost += yield_start.elapsed();
+        }
+
+        metrics.scan_cost += fetch_start.elapsed();
+        metrics.num_series_send_timeout = self.senders.num_timeout;
+        metrics.num_series_send_full = self.senders.num_full;
+        part_metrics.set_distributor_metrics(&metrics);
+
+        part_metrics.on_finish();
+
+        Ok(())
     }
 
     /// Scans all parts.
@@ -482,7 +563,7 @@ impl SeriesDistributor {
 }
 
 /// Batches of the same series in primary key format.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct PrimaryKeySeriesBatch {
     pub batches: SmallVec<[Batch; 4]>,
 }
@@ -514,6 +595,26 @@ impl PrimaryKeySeriesBatch {
 pub enum SeriesBatch {
     PrimaryKey(PrimaryKeySeriesBatch),
     Flat(FlatSeriesBatch),
+}
+
+impl SeriesBatch {
+    /// Returns the number of batches.
+    pub fn num_batches(&self) -> usize {
+        match self {
+            SeriesBatch::PrimaryKey(primary_key_batch) => primary_key_batch.batches.len(),
+            SeriesBatch::Flat(flat_batch) => flat_batch.batches.len(),
+        }
+    }
+
+    /// Returns the total number of rows across all batches.
+    pub fn num_rows(&self) -> usize {
+        match self {
+            SeriesBatch::PrimaryKey(primary_key_batch) => {
+                primary_key_batch.batches.iter().map(|x| x.num_rows()).sum()
+            }
+            SeriesBatch::Flat(flat_batch) => flat_batch.batches.iter().map(|x| x.num_rows()).sum(),
+        }
+    }
 }
 
 /// Batches of the same series in flat format.
