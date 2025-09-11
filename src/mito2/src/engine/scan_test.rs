@@ -17,7 +17,8 @@ use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_recordbatch::RecordBatches;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use futures::TryStreamExt;
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
+use futures::{StreamExt, TryStreamExt};
 use store_api::region_engine::{PrepareRequest, RegionEngine, RegionScanner};
 use store_api::region_request::RegionRequest;
 use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution};
@@ -342,6 +343,144 @@ async fn test_series_scan() {
 | 3601  | 3601.0  | 1970-01-01T01:00:01 |
 | 5     | 5.0     | 1970-01-01T00:00:05 |
 | 7202  | 7202.0  | 1970-01-01T02:00:02 |
++-------+---------+---------------------+";
+    check_result(expected);
+}
+
+#[tokio::test]
+async fn test_series_scan_multi_parts() {
+    let mut env = TestEnv::with_prefix("test_series_scan_multi_parts").await;
+    let engine = env.create_engine(MitoConfig::default()).await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new()
+        .insert_option("compaction.type", "twcs")
+        .insert_option("compaction.twcs.time_window", "1h")
+        .build();
+    let column_schemas = test_util::rows_schema(&request);
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let put_flush_rows = async |start, end| {
+        let rows = Rows {
+            schema: column_schemas.clone(),
+            rows: test_util::build_rows(start, end),
+        };
+        test_util::put_rows(&engine, region_id, rows).await;
+        test_util::flush_region(&engine, region_id, None).await;
+    };
+    // generates 8 SST files
+    put_flush_rows(0, 500).await;
+    put_flush_rows(4000, 4500).await;
+    put_flush_rows(8000, 8500).await;
+    put_flush_rows(12000, 12500).await;
+    put_flush_rows(16000, 16500).await;
+    put_flush_rows(20000, 20500).await;
+    put_flush_rows(24000, 24500).await;
+    put_flush_rows(28000, 28500).await;
+    // Put to memtable.
+    let rows = Rows {
+        schema: column_schemas.clone(),
+        rows: test_util::build_rows(7300, 7400),
+    };
+    test_util::put_rows(&engine, region_id, rows).await;
+
+    let request = ScanRequest {
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+        ..Default::default()
+    };
+    let scanner = engine.scanner(region_id, request).await.unwrap();
+    let Scanner::Series(mut scanner) = scanner else {
+        panic!("Scanner should be series scan");
+    };
+    let raw_ranges: Vec<_> = scanner
+        .properties()
+        .partitions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let mut new_ranges = Vec::with_capacity(8);
+    for range in raw_ranges {
+        new_ranges.push(vec![range]);
+    }
+    let num_partitions = new_ranges.len();
+    scanner
+        .prepare(PrepareRequest {
+            ranges: Some(new_ranges),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let metrics_set = ExecutionPlanMetricsSet::default();
+    let mut schema = None;
+    let streams: Vec<_> = (0..num_partitions)
+        .map(|partition| {
+            let stream = scanner
+                .scan_partition(&Default::default(), &metrics_set, partition)
+                .unwrap();
+            if schema.is_none() {
+                schema = Some(stream.schema().clone());
+            }
+            stream
+        })
+        .collect();
+    let mut builder = RecordBatchReceiverStreamBuilder::new(
+        schema
+            .as_ref()
+            .map(|schema| schema.arrow_schema().clone())
+            .unwrap(),
+        streams.len(),
+    );
+    for mut stream in streams {
+        let output = builder.tx();
+
+        builder.spawn(async move {
+            // Transfer batches from inner stream to the output tx
+            // immediately.
+            while let Some(item) = stream.next().await {
+                let item = item.unwrap();
+
+                // If send fails, plan being torn down, there is no
+                // place to send the error and no reason to continue.
+                if output.send(Ok(item.into_df_record_batch())).await.is_err() {
+                    common_telemetry::debug!(
+                        "Stopping execution: output is gone, plan cancelling",
+                    );
+                    return Ok(());
+                }
+            }
+
+            Ok(())
+        });
+    }
+    let mut stream = builder.build();
+    let mut partition_batches = Vec::new();
+    while let Some(rb) = stream.try_next().await.unwrap() {
+        let rb =
+            common_recordbatch::RecordBatch::try_from_df_record_batch(schema.clone().unwrap(), rb)
+                .unwrap();
+        partition_batches.push(rb);
+    }
+
+    let check_result = |expected| {
+        let batches =
+            RecordBatches::try_new(schema.clone().unwrap(), partition_batches.clone()).unwrap();
+        assert_eq!(expected, batches.pretty_print().unwrap());
+    };
+
+    // Output series order is 0, 1, 2, 3, 3600, 3601, 3602, 4, 5, 7200, 7201, 7202
+    let expected = "\
++-------+---------+---------------------+
+| tag_0 | field_0 | ts                  |
++-------+---------+---------------------+
+| 0     | 0.0     | 1970-01-01T00:00:00 |
+| 3     | 3.0     | 1970-01-01T00:00:03 |
+| 3602  | 3602.0  | 1970-01-01T01:00:02 |
+| 7200  | 7200.0  | 1970-01-01T02:00:00 |
 +-------+---------+---------------------+";
     check_result(expected);
 }
