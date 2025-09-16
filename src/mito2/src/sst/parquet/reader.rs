@@ -27,6 +27,7 @@ use datatypes::arrow::array::ArrayRef;
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
+use datatypes::timestamp::timestamp_array_to_primitive;
 use mito_codec::row_converter::build_primary_key_codec;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
@@ -56,6 +57,7 @@ use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplierRef;
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplierRef;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 use crate::sst::parquet::file_range::{FileRangeContext, FileRangeContextRef};
+use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::row_group::InMemoryRowGroup;
@@ -1355,6 +1357,8 @@ pub(crate) struct FlatRowGroupReader {
     reader: ParquetRecordBatchReader,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Buffered batches to return.
+    batches: VecDeque<RecordBatch>,
 }
 
 impl FlatRowGroupReader {
@@ -1369,11 +1373,30 @@ impl FlatRowGroupReader {
             context,
             reader,
             override_sequence,
+            batches: VecDeque::new(),
         }
     }
 
     /// Returns the next RecordBatch.
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if let Some(batch) = self.batches.pop_front() {
+            return Ok(Some(batch));
+        }
+
+        while self.batches.is_empty() {
+            let Some(record_batch) = self.read_next_batch()? else {
+                return Ok(None);
+            };
+
+            self.split_batch(record_batch);
+        }
+
+        let batch = self.batches.pop_front();
+        Ok(batch)
+    }
+
+    /// Returns the next RecordBatch from the reader.
+    pub(crate) fn read_next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.reader.next() {
             Some(batch_result) => {
                 let record_batch = batch_result.context(ArrowReaderSnafu {
@@ -1393,6 +1416,42 @@ impl FlatRowGroupReader {
                 Ok(Some(record_batch))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Splits the batch by timestamps.
+    ///
+    /// # Panics
+    /// Panics if the timestamp array is invalid.
+    pub(crate) fn split_batch(&mut self, record_batch: RecordBatch) {
+        let batch_rows = record_batch.num_rows();
+        if batch_rows == 0 {
+            return;
+        }
+        if batch_rows < 2 {
+            self.batches.push_back(record_batch);
+            return;
+        }
+
+        let time_index_pos = time_index_column_index(record_batch.num_columns());
+        let timestamps = record_batch.column(time_index_pos);
+        let (ts_values, _unit) = timestamp_array_to_primitive(timestamps).unwrap();
+        let mut offsets = Vec::with_capacity(16);
+        offsets.push(0);
+        let values = ts_values.values();
+        for (i, &value) in values.iter().take(batch_rows - 1).enumerate() {
+            if value > values[i + 1] {
+                offsets.push(i + 1);
+            }
+        }
+        offsets.push(values.len());
+
+        // Splits the batch by offsets.
+        for (i, &start) in offsets[..offsets.len() - 1].iter().enumerate() {
+            let end = offsets[i + 1];
+            let rows_in_batch = end - start;
+            self.batches
+                .push_back(record_batch.slice(start, rows_in_batch));
         }
     }
 }
