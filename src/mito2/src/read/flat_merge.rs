@@ -124,7 +124,16 @@ impl BatchBuilder {
                     .iter()
                     .map(|(_, batch)| batch.column(column_idx).as_ref())
                     .collect();
-                interleave(&arrays, &self.indices).context(ComputeArrowSnafu)
+                interleave(&arrays, &self.indices)
+                    .context(ComputeArrowSnafu)
+                    .inspect_err(|_e| {
+                        let schemas: Vec<_> = self
+                            .batches
+                            .iter()
+                            .map(|(_, batch)| batch.schema_ref())
+                            .collect();
+                        common_telemetry::error!("Different schema, schemas: {:?}", schemas);
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
 
