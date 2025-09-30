@@ -46,7 +46,9 @@ use store_api::region_engine::{
     RegionStatistic, SetRegionRoleStateResponse, SetRegionRoleStateSuccess,
     SettableRegionRoleState, SyncManifestResponse,
 };
-use store_api::region_request::{BatchRegionDdlRequest, RegionOpenRequest, RegionRequest};
+use store_api::region_request::{
+    BatchRegionDdlRequest, RegionCompactRequest, RegionOpenRequest, RegionRequest,
+};
 use store_api::storage::{RegionId, ScanRequest, SequenceNumber};
 
 use crate::config::EngineConfig;
@@ -211,6 +213,19 @@ impl RegionEngine for MetricEngine {
             }
             RegionRequest::Compact(_) => {
                 if self.inner.is_physical_region(region_id) {
+                    let metadata_region_id = utils::to_metadata_region_id(region_id);
+                    if let Err(e) = self
+                        .inner
+                        .mito
+                        .handle_request(
+                            metadata_region_id,
+                            RegionRequest::Compact(RegionCompactRequest::default()),
+                        )
+                        .await
+                    {
+                        common_telemetry::error!(e; "Failed to flush region {metadata_region_id}");
+                    }
+
                     self.inner
                         .mito
                         .handle_request(region_id, request)
