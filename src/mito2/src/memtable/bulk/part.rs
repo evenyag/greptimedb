@@ -69,7 +69,7 @@ use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::{PrimaryKeyArray, PrimaryKeyArrayBuilder, ReadFormat};
 use crate::sst::parquet::helper::parse_parquet_metadata;
 use crate::sst::parquet::{PARQUET_METADATA_KEY, SstInfo};
-use crate::sst::to_sst_arrow_schema;
+use crate::sst::{SeriesEstimator, to_sst_arrow_schema};
 
 const INIT_DICT_VALUE_CAPACITY: usize = 8;
 
@@ -558,6 +558,7 @@ impl EncodedBulkPart {
             num_row_groups: self.metadata.parquet_metadata.num_row_groups() as u64,
             file_metadata: Some(self.metadata.parquet_metadata.clone()),
             index_metadata: IndexOutput::default(),
+            num_series: self.metadata.num_series,
         }
     }
 
@@ -597,6 +598,8 @@ pub struct BulkPartMeta {
     pub parquet_metadata: Arc<ParquetMetaData>,
     /// Part region schema.
     pub region_metadata: RegionMetadataRef,
+    /// Number of series.
+    pub num_series: u64,
 }
 
 /// Metrics for encoding a part.
@@ -664,6 +667,7 @@ impl BulkPartEncoder {
         let mut writer = ArrowWriter::try_new(&mut buf, arrow_schema, self.writer_props.clone())
             .context(EncodeMemtableSnafu)?;
         let mut total_rows = 0;
+        let mut series_estimator = SeriesEstimator::default();
 
         // Process each batch from the iterator
         let mut iter_start = Instant::now();
@@ -674,6 +678,7 @@ impl BulkPartEncoder {
                 continue;
             }
 
+            series_estimator.update_flat(&batch);
             metrics.raw_size += record_batch_estimated_size(&batch);
             let write_start = Instant::now();
             writer.write(&batch).context(EncodeMemtableSnafu)?;
@@ -696,6 +701,7 @@ impl BulkPartEncoder {
 
         let buf = Bytes::from(buf);
         let parquet_metadata = Arc::new(parse_parquet_metadata(file_metadata)?);
+        let num_series = series_estimator.finish() as u64;
 
         Ok(Some(EncodedBulkPart {
             data: buf,
@@ -705,6 +711,7 @@ impl BulkPartEncoder {
                 min_timestamp,
                 parquet_metadata,
                 region_metadata: self.metadata.clone(),
+                num_series,
             },
         }))
     }
@@ -737,6 +744,7 @@ impl BulkPartEncoder {
                 min_timestamp: part.min_timestamp,
                 parquet_metadata,
                 region_metadata: self.metadata.clone(),
+                num_series: part.estimated_series_count() as u64,
             },
         }))
     }
