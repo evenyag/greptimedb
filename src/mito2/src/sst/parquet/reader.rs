@@ -1435,34 +1435,41 @@ impl FlatRowGroupReader {
     /// # Panics
     /// Panics if the timestamp array is invalid.
     pub(crate) fn split_batch(&mut self, record_batch: RecordBatch) {
-        let batch_rows = record_batch.num_rows();
-        if batch_rows == 0 {
-            return;
-        }
-        if batch_rows < 2 {
-            self.batches.push_back(record_batch);
-            return;
-        }
+        split_record_batch(record_batch, &mut self.batches)
+    }
+}
 
-        let time_index_pos = time_index_column_index(record_batch.num_columns());
-        let timestamps = record_batch.column(time_index_pos);
-        let (ts_values, _unit) = timestamp_array_to_primitive(timestamps).unwrap();
-        let mut offsets = Vec::with_capacity(16);
-        offsets.push(0);
-        let values = ts_values.values();
-        for (i, &value) in values.iter().take(batch_rows - 1).enumerate() {
-            if value > values[i + 1] {
-                offsets.push(i + 1);
-            }
-        }
-        offsets.push(values.len());
+/// Splits the batch by timestamps.
+///
+/// # Panics
+/// Panics if the timestamp array is invalid.
+pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeque<RecordBatch>) {
+    let batch_rows = record_batch.num_rows();
+    if batch_rows == 0 {
+        return;
+    }
+    if batch_rows < 2 {
+        batches.push_back(record_batch);
+        return;
+    }
 
-        // Splits the batch by offsets.
-        for (i, &start) in offsets[..offsets.len() - 1].iter().enumerate() {
-            let end = offsets[i + 1];
-            let rows_in_batch = end - start;
-            self.batches
-                .push_back(record_batch.slice(start, rows_in_batch));
+    let time_index_pos = time_index_column_index(record_batch.num_columns());
+    let timestamps = record_batch.column(time_index_pos);
+    let (ts_values, _unit) = timestamp_array_to_primitive(timestamps).unwrap();
+    let mut offsets = Vec::with_capacity(16);
+    offsets.push(0);
+    let values = ts_values.values();
+    for (i, &value) in values.iter().take(batch_rows - 1).enumerate() {
+        if value > values[i + 1] {
+            offsets.push(i + 1);
         }
+    }
+    offsets.push(values.len());
+
+    // Splits the batch by offsets.
+    for (i, &start) in offsets[..offsets.len() - 1].iter().enumerate() {
+        let end = offsets[i + 1];
+        let rows_in_batch = end - start;
+        batches.push_back(record_batch.slice(start, rows_in_batch));
     }
 }
