@@ -30,7 +30,7 @@ use crate::error::{self, ComputeArrowSnafu, DecodeArrowRowGroupSnafu};
 use crate::memtable::bulk::context::{BulkIterContext, BulkIterContextRef};
 use crate::memtable::bulk::row_group_reader::MemtableRowGroupReaderBuilder;
 use crate::sst::parquet::flat_format::sequence_column_index;
-use crate::sst::parquet::reader::{MaybeFilter, RowGroupReaderContext, split_record_batch};
+use crate::sst::parquet::reader::{MaybeFilter, RowGroupReaderContext};
 
 /// Iterator for reading data inside a bulk part.
 pub struct EncodedBulkPartIter {
@@ -40,8 +40,6 @@ pub struct EncodedBulkPartIter {
     builder: MemtableRowGroupReaderBuilder,
     /// Sequence number filter.
     sequence: Option<Scalar<UInt64Array>>,
-    /// Buffer for split batches.
-    batches: VecDeque<RecordBatch>,
 }
 
 impl EncodedBulkPartIter {
@@ -74,17 +72,11 @@ impl EncodedBulkPartIter {
             current_reader: init_reader,
             builder,
             sequence,
-            batches: VecDeque::new(),
         })
     }
 
     /// Fetches next non-empty record batch.
     pub(crate) fn next_record_batch(&mut self) -> error::Result<Option<RecordBatch>> {
-        // First, check if we have buffered split batches
-        if let Some(batch) = self.batches.pop_front() {
-            return Ok(Some(batch));
-        }
-
         let Some(current) = &mut self.current_reader else {
             // All row group exhausted.
             return Ok(None);
@@ -93,11 +85,7 @@ impl EncodedBulkPartIter {
         for batch in current {
             let batch = batch.context(DecodeArrowRowGroupSnafu)?;
             if let Some(batch) = apply_combined_filters(&self.context, &self.sequence, batch)? {
-                // Split the batch and buffer the results
-                split_record_batch(batch, &mut self.batches);
-                if let Some(batch) = self.batches.pop_front() {
-                    return Ok(Some(batch));
-                }
+                return Ok(Some(batch));
             }
         }
 
@@ -109,11 +97,7 @@ impl EncodedBulkPartIter {
             for batch in current {
                 let batch = batch.context(DecodeArrowRowGroupSnafu)?;
                 if let Some(batch) = apply_combined_filters(&self.context, &self.sequence, batch)? {
-                    // Split the batch and buffer the results
-                    split_record_batch(batch, &mut self.batches);
-                    if let Some(batch) = self.batches.pop_front() {
-                        return Ok(Some(batch));
-                    }
+                    return Ok(Some(batch));
                 }
             }
         }
@@ -138,8 +122,6 @@ pub struct BulkPartRecordBatchIter {
     context: BulkIterContextRef,
     /// Sequence number filter.
     sequence: Option<Scalar<UInt64Array>>,
-    /// Buffer for split batches.
-    batches: VecDeque<RecordBatch>,
 }
 
 impl BulkPartRecordBatchIter {
@@ -157,7 +139,6 @@ impl BulkPartRecordBatchIter {
             record_batch: Some(record_batch),
             context,
             sequence,
-            batches: VecDeque::new(),
         }
     }
 
@@ -191,22 +172,9 @@ impl Iterator for BulkPartRecordBatchIter {
     type Item = error::Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // First, check if we have buffered split batches
-        if let Some(batch) = self.batches.pop_front() {
-            return Some(Ok(batch));
-        }
-
         let record_batch = self.record_batch.take()?;
 
-        match self.process_batch(record_batch) {
-            Ok(Some(batch)) => {
-                // Split the batch and buffer the results
-                split_record_batch(batch, &mut self.batches);
-                self.batches.pop_front().map(Ok)
-            }
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
-        }
+        self.process_batch(record_batch).transpose()
     }
 }
 
