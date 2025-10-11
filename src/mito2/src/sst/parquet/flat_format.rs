@@ -602,6 +602,13 @@ impl FlatConvertFormat {
                 reason: "Primary key values are not binary array".to_string(),
             })?;
 
+        common_telemetry::info!(
+            "FlatConvertFormat convert batch, rows: {}, pk_values: {}, ptr: {:p}",
+            batch.num_rows(),
+            pk_values_array.len(),
+            pk_values_array.value_data().as_ptr()
+        );
+
         // Decodes all primary key values
         let mut decoded_pk_values = Vec::with_capacity(pk_values_array.len());
         for i in 0..pk_values_array.len() {

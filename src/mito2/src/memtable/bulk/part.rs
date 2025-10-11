@@ -575,6 +575,12 @@ impl EncodedBulkPart {
             return Ok(None);
         }
 
+        // common_telemetry::info!(
+        //     "Read EncodedBulkPart, row_groups_to_read: {}, num_series: {}",
+        //     row_groups_to_read.len(),
+        //     self.metadata.num_series
+        // );
+
         let iter = EncodedBulkPartIter::try_new(
             context,
             row_groups_to_read,
