@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use datatypes::arrow::datatypes::SchemaRef;
+use lazy_static::lazy_static;
 use mito_codec::key_values::KeyValue;
 use rayon::prelude::*;
 use store_api::metadata::RegionMetadataRef;
@@ -51,6 +52,17 @@ use crate::sst::parquet::format::FIXED_POS_COLUMN_NUM;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 
+lazy_static! {
+    /// The threshold for triggering merge of parts in BulkParts.
+    /// Can be set via the environment variable "BULK_MEMTABLE_MERGE_COUNT".
+    pub static ref MERGE_COUNT: usize = {
+        std::env::var("BULK_MERGE_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8)
+    };
+}
+
 /// All parts in a bulk memtable.
 #[derive(Default)]
 struct BulkParts {
@@ -74,8 +86,8 @@ impl BulkParts {
     /// Returns true if the bulk parts should be merged.
     fn should_merge_bulk_parts(&self) -> bool {
         let unmerged_count = self.parts.iter().filter(|wrapper| !wrapper.merging).count();
-        // If the total number of unmerged parts is >= 8, start a merge task.
-        unmerged_count >= 8
+        // If the total number of unmerged parts is >= MERGE_COUNT, start a merge task.
+        unmerged_count >= *MERGE_COUNT
     }
 
     /// Returns true if the encoded parts should be merged.
@@ -85,8 +97,8 @@ impl BulkParts {
             .iter()
             .filter(|wrapper| !wrapper.merging)
             .count();
-        // If the total number of unmerged encoded parts is >= 8, start a merge task.
-        unmerged_count >= 8
+        // If the total number of unmerged encoded parts is >= MERGE_COUNT, start a merge task.
+        unmerged_count >= *MERGE_COUNT
     }
 
     /// Collects unmerged parts and marks them as being merged.
