@@ -756,6 +756,11 @@ fn memtable_flat_sources(
         sources: SmallVec::new(),
         encoded: SmallVec::new(),
     };
+    let num_ranges = ranges.len();
+    let parallelism = std::env::var("FLUSH_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
 
     if ranges.len() == 1 {
         let only_range = ranges.into_values().next().unwrap();
@@ -766,7 +771,7 @@ fn memtable_flat_sources(
             flat_sources.sources.push(FlatSource::Iter(iter));
         };
     } else {
-        let min_flush_rows = stats.num_rows / 8;
+        let min_flush_rows = stats.num_rows / parallelism;
         let min_flush_rows = min_flush_rows.max(DEFAULT_ROW_GROUP_SIZE);
         let mut last_iter_rows = 0;
         let num_ranges = ranges.len();
@@ -801,6 +806,12 @@ fn memtable_flat_sources(
             flat_sources.sources.push(FlatSource::Iter(maybe_dedup));
         }
     }
+
+    common_telemetry::info!(
+        "flush memtable {num_ranges} ranges, flat sources: {}, parallelism: {parallelism}, num_rows: {}",
+        flat_sources.sources.len(),
+        stats.num_rows,
+    );
 
     Ok(flat_sources)
 }
