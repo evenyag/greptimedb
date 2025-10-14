@@ -85,6 +85,10 @@ impl BulkParts {
 
     /// Returns true if the bulk parts should be merged.
     fn should_merge_bulk_parts(&self) -> bool {
+        if *MERGE_COUNT == 0 {
+            return false;
+        }
+
         let unmerged_count = self.parts.iter().filter(|wrapper| !wrapper.merging).count();
         // If the total number of unmerged parts is >= MERGE_COUNT, start a merge task.
         unmerged_count >= *MERGE_COUNT
@@ -92,6 +96,10 @@ impl BulkParts {
 
     /// Returns true if the encoded parts should be merged.
     fn should_merge_encoded_parts(&self) -> bool {
+        if *MERGE_COUNT == 0 {
+            return false;
+        }
+
         let unmerged_count = self
             .encoded_parts
             .iter()
@@ -533,6 +541,8 @@ impl BulkMemtable {
         append_mode: bool,
         merge_mode: MergeMode,
     ) -> Self {
+        common_telemetry::info!("BulkMemtable created, merge count: {}", *MERGE_COUNT);
+
         let flat_arrow_schema = to_flat_sst_arrow_schema(
             &metadata,
             &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
