@@ -600,8 +600,6 @@ impl BulkMemtable {
 
     /// Schedules a compaction task using the CompactDispatcher.
     fn schedule_compact(&self) {
-        common_telemetry::info!("schedule compact");
-
         if let Some(dispatcher) = &self.compact_dispatcher {
             let task = MemCompactTask {
                 metadata: self.metadata.clone(),
