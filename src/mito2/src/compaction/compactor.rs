@@ -324,8 +324,9 @@ impl Compactor for DefaultCompactor {
         let mut compacted_inputs =
             Vec::with_capacity(picker_output.outputs.iter().map(|o| o.inputs.len()).sum());
         let internal_parallelism = compaction_region.max_parallelism.max(1);
+        let total_outputs = picker_output.outputs.len();
 
-        for output in picker_output.outputs.drain(..) {
+        for (output_idx, output) in picker_output.outputs.drain(..).enumerate() {
             compacted_inputs.extend(output.inputs.iter().map(|f| f.meta_ref().clone()));
             let write_opts = WriteOptions {
                 write_buffer_size: compaction_region.engine_config.sst_write_buffer_size,
@@ -443,8 +444,8 @@ impl Compactor for DefaultCompactor {
                 let output_file_names =
                     output_files.iter().map(|f| f.file_id.to_string()).join(",");
                 info!(
-                    "Region {} compaction inputs: [{}], outputs: [{}], flat_format: {}, metrics: {:?}",
-                    region_id, input_file_names, output_file_names, flat_format, metrics
+                    "Region {} compaction inputs: [{}], outputs: [{}], flat_format: {}, metrics: {:?}, progress: {}/{}",
+                    region_id, input_file_names, output_file_names, flat_format, metrics, output_idx + 1, total_outputs
                 );
                 metrics.observe();
                 Ok(output_files)
