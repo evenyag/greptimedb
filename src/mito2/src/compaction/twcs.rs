@@ -113,6 +113,13 @@ impl TwcsPicker {
             } else {
                 let run = sorted_runs.last().unwrap();
                 if run.items().len() < self.trigger_file_num {
+                    info!(
+                        "No enough items to compact, skipping compaction for region: {}, window: {}, items: {}",
+                        region_id,
+                        window,
+                        run.items().len(),
+                    );
+
                     continue;
                 }
                 // no overlapping files, try merge small files
