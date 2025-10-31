@@ -69,6 +69,10 @@ impl TwcsPicker {
         let mut output = vec![];
         for (window, files) in time_windows {
             if files.files.is_empty() {
+                info!(
+                    "Compaction skips empty time window for region {}, window: {}",
+                    region_id, window
+                );
                 continue;
             }
             let mut files_to_merge: Vec<_> = files.files().cloned().collect();
@@ -152,7 +156,7 @@ impl TwcsPicker {
                     .collect::<Vec<_>>();
 
                 common_telemetry::info!(
-                    "process runs for compaction empty inputs, region: {}, window: {}, found_runs: {}, window_files: {:?}",
+                    "Process runs for compaction empty inputs, region: {}, window: {}, found_runs: {}, window_files: {:?}",
                     region_id,
                     window,
                     found_runs,
