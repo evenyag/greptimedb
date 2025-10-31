@@ -58,6 +58,14 @@ impl TwcsPicker {
         time_windows: &mut BTreeMap<i64, Window>,
         active_window: Option<i64>,
     ) -> Vec<CompactionOutput> {
+        if !time_windows.is_empty() {
+            info!(
+                "Build compaction output for region {}, num_windows: {}",
+                region_id,
+                time_windows.len()
+            );
+        }
+
         let mut output = vec![];
         for (window, files) in time_windows {
             if files.files.is_empty() {
@@ -88,6 +96,11 @@ impl TwcsPicker {
             // because after compaction there will be no overlapping files.
             let filter_deleted = !files.overlapping && found_runs <= 2 && !self.append_mode;
             if found_runs == 0 {
+                info!(
+                    "No runs found, skipping compaction for region: {}, window: {}",
+                    region_id, window,
+                );
+
                 return output;
             }
 
@@ -119,6 +132,32 @@ impl TwcsPicker {
                     filter_deleted,
                     output_time_range: None, // we do not enforce output time range in twcs compactions.
                 });
+            } else {
+                let window_files = files
+                    .files()
+                    .map(|f| {
+                        let range = f.range();
+                        let start = range.0.to_iso8601_string();
+                        let end = range.1.to_iso8601_string();
+                        let num_rows = f.num_rows();
+                        format!(
+                            "FileGroup{{id: {:?}, range: ({}, {}), size: {}, num rows: {} }}",
+                            f.file_ids(),
+                            start,
+                            end,
+                            ReadableSize(f.size() as u64),
+                            num_rows
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                common_telemetry::info!(
+                    "process runs for compaction empty inputs, region: {}, window: {}, found_runs: {}, window_files: {:?}",
+                    region_id,
+                    window,
+                    found_runs,
+                    window_files,
+                );
             }
         }
         output
@@ -207,6 +246,11 @@ impl Picker for TwcsPicker {
         let outputs = self.build_output(region_id, &mut windows, active_window);
 
         if outputs.is_empty() && expired_ssts.is_empty() {
+            info!(
+                "Compaction pick result is empty for region: {}, compaction window: {}",
+                region_id, time_window_size
+            );
+
             return None;
         }
 
