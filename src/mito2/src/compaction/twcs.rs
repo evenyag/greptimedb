@@ -105,7 +105,7 @@ impl TwcsPicker {
                     region_id, window,
                 );
 
-                return output;
+                continue;
             }
 
             let inputs = if found_runs > 1 {
