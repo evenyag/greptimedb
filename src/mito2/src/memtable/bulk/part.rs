@@ -27,7 +27,6 @@ use common_recordbatch::DfRecordBatch as RecordBatch;
 use common_time::Timestamp;
 use common_time::timestamp::TimeUnit;
 use datatypes::arrow;
-use smallvec::SmallVec;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryBuilder, BinaryDictionaryBuilder, DictionaryArray, StringBuilder,
     StringDictionaryBuilder, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -50,6 +49,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::AsBytes;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
+use smallvec::SmallVec;
 use snafu::{OptionExt, ResultExt, Snafu};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
@@ -761,6 +761,7 @@ impl EncodedBulkPart {
     }
 }
 
+// TODO(yingwen): max_sequence
 #[derive(Debug, Clone)]
 pub struct BulkPartMeta {
     /// Total rows in part.
@@ -1033,10 +1034,7 @@ impl MultiBulkPart {
 
     /// Returns the estimated memory size of all batches.
     pub(crate) fn estimated_size(&self) -> usize {
-        self.batches
-            .iter()
-            .map(|batch| record_batch_estimated_size(batch))
-            .sum()
+        self.batches.iter().map(record_batch_estimated_size).sum()
     }
 
     /// Reads data from this part with the given context and filters.

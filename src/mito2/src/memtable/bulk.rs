@@ -37,7 +37,7 @@ use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::{
-    BulkPart, BulkPartEncodeMetrics, BulkPartEncoder, UnorderedPart,
+    BulkPart, BulkPartEncodeMetrics, BulkPartEncoder, MultiBulkPart, UnorderedPart,
 };
 use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use crate::memtable::stats::WriteMetrics;
@@ -52,6 +52,14 @@ use crate::region::options::MergeMode;
 use crate::sst::parquet::format::FIXED_POS_COLUMN_NUM;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
+
+/// Result of merging parts - either a MultiBulkPart or an EncodedBulkPart
+enum MergedPart {
+    /// Merged part stored as MultiBulkPart (when rows < DEFAULT_ROW_GROUP_SIZE)
+    Multi(MultiBulkPart),
+    /// Merged part stored as EncodedBulkPart (when rows >= DEFAULT_ROW_GROUP_SIZE)
+    Encoded(EncodedBulkPart),
+}
 
 /// All parts in a bulk memtable.
 #[derive(Default)]
@@ -107,10 +115,17 @@ impl BulkParts {
         for wrapper in &mut self.parts {
             if !wrapper.merging {
                 wrapper.merging = true;
-                collected_parts.push(PartToMerge::Bulk {
-                    part: wrapper.part.clone(),
-                    file_id: wrapper.file_id,
-                });
+                let part_to_merge = match &wrapper.part {
+                    BulkPartVariant::Single(part) => PartToMerge::Bulk {
+                        part: part.clone(),
+                        file_id: wrapper.file_id,
+                    },
+                    BulkPartVariant::Multi(part) => PartToMerge::Multi {
+                        part: part.clone(),
+                        file_id: wrapper.file_id,
+                    },
+                };
+                collected_parts.push(part_to_merge);
             }
         }
         collected_parts
@@ -158,17 +173,29 @@ impl BulkParts {
         merge_encoded: bool,
     ) -> usize
     where
-        I: IntoIterator<Item = EncodedBulkPart>,
+        I: IntoIterator<Item = MergedPart>,
     {
         let mut total_output_rows = 0;
 
-        for encoded_part in merged_parts {
-            total_output_rows += encoded_part.metadata().num_rows;
-            self.encoded_parts.push(EncodedPartWrapper {
-                part: encoded_part,
-                file_id: FileId::random(),
-                merging: false,
-            });
+        for merged_part in merged_parts {
+            match merged_part {
+                MergedPart::Encoded(encoded_part) => {
+                    total_output_rows += encoded_part.metadata().num_rows;
+                    self.encoded_parts.push(EncodedPartWrapper {
+                        part: encoded_part,
+                        file_id: FileId::random(),
+                        merging: false,
+                    });
+                }
+                MergedPart::Multi(multi_part) => {
+                    total_output_rows += multi_part.num_rows();
+                    self.parts.push(BulkPartWrapper {
+                        part: BulkPartVariant::Multi(multi_part),
+                        file_id: FileId::random(),
+                        merging: false,
+                    });
+                }
+            }
         }
 
         if merge_encoded {
@@ -317,7 +344,7 @@ impl Memtable for BulkMemtable {
                     && let Some(bulk_part) = bulk_parts.unordered_part.to_bulk_part()?
                 {
                     bulk_parts.parts.push(BulkPartWrapper {
-                        part: bulk_part,
+                        part: BulkPartVariant::Single(bulk_part),
                         file_id: FileId::random(),
                         merging: false,
                     });
@@ -325,7 +352,7 @@ impl Memtable for BulkMemtable {
                 }
             } else {
                 bulk_parts.parts.push(BulkPartWrapper {
-                    part: fragment,
+                    part: BulkPartVariant::Single(fragment),
                     file_id: FileId::random(),
                     merging: false,
                 });
@@ -406,17 +433,27 @@ impl Memtable for BulkMemtable {
                     continue;
                 }
 
+                let num_rows = part_wrapper.part.num_rows();
+                let iter_builder: Box<dyn IterBuilder> = match &part_wrapper.part {
+                    BulkPartVariant::Single(part) => Box::new(BulkRangeIterBuilder {
+                        part: part.clone(),
+                        context: context.clone(),
+                        sequence,
+                    }),
+                    BulkPartVariant::Multi(part) => Box::new(MultiBulkRangeIterBuilder {
+                        part: part.clone(),
+                        context: context.clone(),
+                        sequence,
+                    }),
+                };
+
                 let range = MemtableRange::new(
                     Arc::new(MemtableRangeContext::new(
                         self.id,
-                        Box::new(BulkRangeIterBuilder {
-                            part: part_wrapper.part.clone(),
-                            context: context.clone(),
-                            sequence,
-                        }),
+                        iter_builder,
                         predicate.clone(),
                     )),
-                    part_wrapper.part.num_rows(),
+                    num_rows,
                 );
                 ranges.insert(range_id, range);
                 range_id += 1;
@@ -674,6 +711,13 @@ struct BulkRangeIterBuilder {
     sequence: Option<SequenceRange>,
 }
 
+/// Iterator builder for multi bulk range
+struct MultiBulkRangeIterBuilder {
+    part: MultiBulkPart,
+    context: Arc<BulkIterContext>,
+    sequence: Option<SequenceRange>,
+}
+
 impl IterBuilder for BulkRangeIterBuilder {
     fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
         UnsupportedOperationSnafu {
@@ -700,6 +744,37 @@ impl IterBuilder for BulkRangeIterBuilder {
         );
 
         Ok(Box::new(iter))
+    }
+
+    fn encoded_range(&self) -> Option<EncodedRange> {
+        None
+    }
+}
+
+impl IterBuilder for MultiBulkRangeIterBuilder {
+    fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+        UnsupportedOperationSnafu {
+            err_msg: "BatchIterator is not supported for multi bulk memtable",
+        }
+        .fail()
+    }
+
+    fn is_record_batch(&self) -> bool {
+        true
+    }
+
+    fn build_record_batch(
+        &self,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        self.part
+            .read(self.context.clone(), self.sequence, metrics)?
+            .ok_or_else(|| {
+                UnsupportedOperationSnafu {
+                    err_msg: "Failed to create iterator for multi bulk part",
+                }
+                .build()
+            })
     }
 
     fn encoded_range(&self) -> Option<EncodedRange> {
@@ -750,8 +825,35 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
     }
 }
 
+/// Enum to hold different types of bulk parts
+#[derive(Clone)]
+enum BulkPartVariant {
+    /// A single bulk part
+    Single(BulkPart),
+    /// Multiple bulk parts combined
+    Multi(MultiBulkPart),
+}
+
+impl BulkPartVariant {
+    /// Returns the number of rows in this variant
+    fn num_rows(&self) -> usize {
+        match self {
+            BulkPartVariant::Single(part) => part.num_rows(),
+            BulkPartVariant::Multi(part) => part.num_rows(),
+        }
+    }
+
+    /// Returns the estimated series count
+    fn estimated_series_count(&self) -> usize {
+        match self {
+            BulkPartVariant::Single(part) => part.estimated_series_count(),
+            BulkPartVariant::Multi(part) => part.series_count(),
+        }
+    }
+}
+
 struct BulkPartWrapper {
-    part: BulkPart,
+    part: BulkPartVariant,
     /// The unique file id for this part in memtable.
     file_id: FileId,
     /// Whether this part is currently being merged.
@@ -771,6 +873,11 @@ struct EncodedPartWrapper {
 enum PartToMerge {
     /// Raw bulk part.
     Bulk { part: BulkPart, file_id: FileId },
+    /// Multiple bulk parts.
+    Multi {
+        part: MultiBulkPart,
+        file_id: FileId,
+    },
     /// Encoded bulk part.
     Encoded {
         part: EncodedBulkPart,
@@ -783,6 +890,7 @@ impl PartToMerge {
     fn file_id(&self) -> FileId {
         match self {
             PartToMerge::Bulk { file_id, .. } => *file_id,
+            PartToMerge::Multi { file_id, .. } => *file_id,
             PartToMerge::Encoded { file_id, .. } => *file_id,
         }
     }
@@ -791,6 +899,7 @@ impl PartToMerge {
     fn min_timestamp(&self) -> i64 {
         match self {
             PartToMerge::Bulk { part, .. } => part.min_timestamp,
+            PartToMerge::Multi { part, .. } => part.min_timestamp(),
             PartToMerge::Encoded { part, .. } => part.metadata().min_timestamp,
         }
     }
@@ -799,6 +908,7 @@ impl PartToMerge {
     fn max_timestamp(&self) -> i64 {
         match self {
             PartToMerge::Bulk { part, .. } => part.max_timestamp,
+            PartToMerge::Multi { part, .. } => part.max_timestamp(),
             PartToMerge::Encoded { part, .. } => part.metadata().max_timestamp,
         }
     }
@@ -807,7 +917,27 @@ impl PartToMerge {
     fn num_rows(&self) -> usize {
         match self {
             PartToMerge::Bulk { part, .. } => part.num_rows(),
+            PartToMerge::Multi { part, .. } => part.num_rows(),
             PartToMerge::Encoded { part, .. } => part.metadata().num_rows,
+        }
+    }
+
+    /// Gets the maximum sequence number in this part if available.
+    /// Returns None for EncodedBulkPart as sequence is not stored in metadata.
+    fn max_sequence(&self) -> Option<u64> {
+        match self {
+            PartToMerge::Bulk { part, .. } => Some(part.sequence),
+            PartToMerge::Multi { part, .. } => Some(part.max_sequence()),
+            PartToMerge::Encoded { .. } => None,
+        }
+    }
+
+    /// Gets the estimated series count in this part.
+    fn series_count(&self) -> usize {
+        match self {
+            PartToMerge::Bulk { part, .. } => part.estimated_series_count(),
+            PartToMerge::Multi { part, .. } => part.series_count(),
+            PartToMerge::Encoded { part, .. } => part.metadata().num_series as usize,
         }
     }
 
@@ -828,6 +958,7 @@ impl PartToMerge {
                 );
                 Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
             }
+            PartToMerge::Multi { part, .. } => part.read(context, None, None),
             PartToMerge::Encoded { part, .. } => part.read(context, None, None),
         }
     }
@@ -883,7 +1014,7 @@ impl MemtableCompactor {
         let merged_parts = part_groups
             .into_par_iter()
             .map(|group| Self::merge_parts_group(group, arrow_schema, metadata, dedup, merge_mode))
-            .collect::<Result<Vec<Option<EncodedBulkPart>>>>()?;
+            .collect::<Result<Vec<Option<MergedPart>>>>()?;
 
         // Installs merged parts.
         let total_output_rows = {
@@ -948,7 +1079,7 @@ impl MemtableCompactor {
         let merged_parts = part_groups
             .into_par_iter()
             .map(|group| Self::merge_parts_group(group, arrow_schema, metadata, dedup, merge_mode))
-            .collect::<Result<Vec<Option<EncodedBulkPart>>>>()?;
+            .collect::<Result<Vec<Option<MergedPart>>>>()?;
 
         // Installs merged parts using iterator and get total output rows
         let total_output_rows = {
@@ -972,19 +1103,19 @@ impl MemtableCompactor {
         Ok(())
     }
 
-    /// Merges a group of parts into a single encoded part.
+    /// Merges a group of parts into a single part (either MultiBulkPart or EncodedBulkPart).
     fn merge_parts_group(
         parts_to_merge: Vec<PartToMerge>,
         arrow_schema: &SchemaRef,
         metadata: &RegionMetadataRef,
         dedup: bool,
         merge_mode: MergeMode,
-    ) -> Result<Option<EncodedBulkPart>> {
+    ) -> Result<Option<MergedPart>> {
         if parts_to_merge.is_empty() {
             return Ok(None);
         }
 
-        // Calculates timestamp bounds for merged data
+        // Calculates timestamp bounds and statistics for merged data
         let min_timestamp = parts_to_merge
             .iter()
             .map(|p| p.min_timestamp())
@@ -995,6 +1126,21 @@ impl MemtableCompactor {
             .map(|p| p.max_timestamp())
             .max()
             .unwrap_or(i64::MIN);
+
+        // Collects statistics from parts before creating iterators
+        let estimated_total_rows: usize = parts_to_merge.iter().map(|p| p.num_rows()).sum();
+        // Max sequence may not be available for all parts (e.g., EncodedBulkPart)
+        let estimated_max_sequence = parts_to_merge
+            .iter()
+            .filter_map(|p| p.max_sequence())
+            .max()
+            .unwrap_or(0);
+        // TODO(yingwen): Add max sequence to EncodedBulkPart.
+        let estimated_series_count = parts_to_merge
+            .iter()
+            .map(|p| p.series_count())
+            .max()
+            .unwrap_or(0);
 
         let context = Arc::new(BulkIterContext::new(
             metadata.clone(),
@@ -1043,7 +1189,40 @@ impl MemtableCompactor {
             Box::new(merged_iter)
         };
 
-        // Encodes the merged iterator
+        // If estimated total rows is less than DEFAULT_ROW_GROUP_SIZE, collect into MultiBulkPart
+        // Note: actual row count after dedup may be less than estimated
+        if estimated_total_rows < DEFAULT_ROW_GROUP_SIZE {
+            let mut batches = Vec::new();
+            let mut actual_total_rows = 0;
+
+            for batch_result in boxed_iter {
+                let batch = batch_result?;
+                actual_total_rows += batch.num_rows();
+                batches.push(batch);
+            }
+
+            if actual_total_rows == 0 {
+                return Ok(None);
+            }
+
+            let multi_part = MultiBulkPart::new(
+                batches,
+                min_timestamp,
+                max_timestamp,
+                estimated_max_sequence,
+                estimated_series_count,
+            );
+
+            common_telemetry::trace!(
+                "merge_parts_group created MultiBulkPart: rows={}, batches={}",
+                actual_total_rows,
+                multi_part.num_batches()
+            );
+
+            return Ok(Some(MergedPart::Multi(multi_part)));
+        }
+
+        // Otherwise, encode as EncodedBulkPart directly from iterator
         let encoder = BulkPartEncoder::new(metadata.clone(), DEFAULT_ROW_GROUP_SIZE)?;
         let mut metrics = BulkPartEncodeMetrics::default();
         let encoded_part = encoder.encode_record_batch_iter(
@@ -1056,7 +1235,7 @@ impl MemtableCompactor {
 
         common_telemetry::trace!("merge_parts_group metrics: {:?}", metrics);
 
-        Ok(encoded_part)
+        Ok(encoded_part.map(MergedPart::Encoded))
     }
 }
 
