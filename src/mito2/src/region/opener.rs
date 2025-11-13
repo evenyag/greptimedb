@@ -263,11 +263,11 @@ impl RegionOpener {
         let sst_format = if let Some(format) = options.sst_format {
             format
         } else if config.default_experimental_flat_format {
-            options.sst_format = Some(FormatType::Flat);
+            // options.sst_format = Some(FormatType::Flat);
             FormatType::Flat
         } else {
             // Default to PrimaryKeyParquet for newly created regions
-            options.sst_format = Some(FormatType::PrimaryKey);
+            // options.sst_format = Some(FormatType::PrimaryKey);
             FormatType::PrimaryKey
         };
         // Create a manifest manager for this region and writes regions to the manifest file.

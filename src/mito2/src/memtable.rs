@@ -450,6 +450,17 @@ impl MemtableBuilderProvider {
         dedup: bool,
         merge_mode: MergeMode,
     ) -> MemtableBuilderRef {
+        if self.config.default_experimental_flat_format {
+            return Arc::new(
+                BulkMemtableBuilder::new(
+                    self.write_buffer_manager.clone(),
+                    !dedup, // append_mode: true if not dedup, false if dedup
+                    merge_mode,
+                )
+                .with_compact_dispatcher(self.compact_dispatcher.clone()),
+            );
+        }
+
         match &self.config.memtable {
             MemtableConfig::PartitionTree(config) => {
                 let mut config = config.clone();
