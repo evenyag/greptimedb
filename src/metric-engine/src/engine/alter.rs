@@ -21,7 +21,7 @@ use extract_new_columns::extract_new_columns;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::metadata::ColumnMetadata;
 use store_api::metric_engine_consts::ALTER_PHYSICAL_EXTENSION_KEY;
-use store_api::region_request::{AffectedRows, AlterKind, RegionAlterRequest};
+use store_api::region_request::{AffectedRows, AlterKind, RegionAlterRequest, SetRegionOption};
 use store_api::storage::RegionId;
 use validate::validate_alter_region_requests;
 
@@ -30,7 +30,10 @@ use crate::error::{
     LogicalRegionNotFoundSnafu, PhysicalRegionNotFoundSnafu, Result, SerializeColumnMetadataSnafu,
     UnexpectedRequestSnafu,
 };
-use crate::utils::{append_manifest_info, encode_manifest_info_to_extensions, to_data_region_id};
+use crate::utils::{
+    append_manifest_info, encode_manifest_info_to_extensions, to_data_region_id,
+    to_metadata_region_id,
+};
 
 impl MetricEngineInner {
     pub async fn alter_regions(
@@ -51,7 +54,19 @@ impl MetricEngineInner {
                 }
             );
             let (region_id, request) = requests.pop().unwrap();
-            self.alter_physical_region(region_id, request).await?;
+            self.alter_physical_region(region_id, request.clone())
+                .await?;
+
+            let metadata_region_id = to_metadata_region_id(region_id);
+            if let AlterKind::SetRegionOptions { options } = &request.kind {
+                if options.len() == 1 {
+                    let opt = &options[0];
+                    if let SetRegionOption::Format(_) = &opt {
+                        self.alter_physical_region(metadata_region_id, request)
+                            .await?;
+                    }
+                }
+            }
         } else {
             // Fast path for single logical region alter request
             if requests.len() == 1 {
