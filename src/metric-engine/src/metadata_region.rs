@@ -23,6 +23,7 @@ use api::v1::{ColumnDataType, ColumnSchema, Rows, SemanticType};
 use async_stream::try_stream;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+use common_base::AffectedRows;
 use common_base::readable_size::ReadableSize;
 use common_recordbatch::{RecordBatch, SendableRecordBatchStream};
 use datafusion::prelude::{col, lit};
@@ -39,15 +40,19 @@ use store_api::metric_engine_consts::{
     METADATA_SCHEMA_VALUE_COLUMN_NAME,
 };
 use store_api::region_engine::RegionEngine;
-use store_api::region_request::{RegionDeleteRequest, RegionPutRequest};
+use store_api::region_request::{
+    AlterKind, RegionAlterRequest, RegionDeleteRequest, RegionPutRequest, RegionRequest,
+    SetRegionOption,
+};
 use store_api::storage::{RegionId, ScanRequest};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::error::{
     CacheGetSnafu, CollectRecordBatchStreamSnafu, DecodeColumnValueSnafu,
-    DeserializeColumnMetadataSnafu, LogicalRegionNotFoundSnafu, MitoReadOperationSnafu,
-    MitoWriteOperationSnafu, ParseRegionIdSnafu, Result,
+    DeserializeColumnMetadataSnafu, ForbiddenPhysicalAlterSnafu, LogicalRegionNotFoundSnafu,
+    MitoReadOperationSnafu, MitoWriteOperationSnafu, ParseRegionIdSnafu, Result,
 };
+use crate::metrics::FORBIDDEN_OPERATION_COUNT;
 use crate::utils;
 
 const REGION_PREFIX: &str = "__region_";
@@ -239,6 +244,44 @@ impl MetadataRegion {
         }
 
         Ok(regions)
+    }
+
+    pub async fn alter_region_options(
+        &self,
+        region_id: RegionId,
+        request: RegionAlterRequest,
+    ) -> Result<AffectedRows> {
+        if let AlterKind::SetRegionOptions { options } = &request.kind {
+            let region_id = utils::to_metadata_region_id(region_id);
+            common_telemetry::info!(
+                "Alter metadata region, metadata region: {}, options: {:?}",
+                region_id,
+                options
+            );
+
+            if options.len() == 1 {
+                let opt = &options[0];
+                if let SetRegionOption::Format(_) = &opt {
+                    common_telemetry::info!(
+                        "Set option for metadata region, metadata region: {}",
+                        region_id,
+                    );
+                    return self
+                        .mito
+                        .handle_request(region_id, RegionRequest::Alter(request))
+                        .await
+                        .context(MitoWriteOperationSnafu)
+                        .map(|result| result.affected_rows);
+                }
+            }
+        }
+
+        common_telemetry::info!(
+            "Metric region received alter request {request:?} on physical metadata region {region_id:?}"
+        );
+        FORBIDDEN_OPERATION_COUNT.inc();
+
+        ForbiddenPhysicalAlterSnafu.fail()
     }
 }
 

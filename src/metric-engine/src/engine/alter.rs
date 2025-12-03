@@ -54,19 +54,10 @@ impl MetricEngineInner {
                 }
             );
             let (region_id, request) = requests.pop().unwrap();
-            self.alter_physical_region(region_id, request.clone())
+            self.alter_physical_data_region(region_id, request.clone())
                 .await?;
-
-            let metadata_region_id = to_metadata_region_id(region_id);
-            if let AlterKind::SetRegionOptions { options } = &request.kind {
-                if options.len() == 1 {
-                    let opt = &options[0];
-                    if let SetRegionOption::Format(_) = &opt {
-                        self.alter_physical_region(metadata_region_id, request)
-                            .await?;
-                    }
-                }
-            }
+            self.alter_physical_metadata_region(region_id, request)
+                .await?;
         } else {
             // Fast path for single logical region alter request
             if requests.len() == 1 {
@@ -220,12 +211,23 @@ impl MetricEngineInner {
         Ok(0)
     }
 
-    async fn alter_physical_region(
+    async fn alter_physical_data_region(
         &self,
         region_id: RegionId,
         request: RegionAlterRequest,
     ) -> Result<()> {
         self.data_region
+            .alter_region_options(region_id, request)
+            .await?;
+        Ok(())
+    }
+
+    async fn alter_physical_metadata_region(
+        &self,
+        region_id: RegionId,
+        request: RegionAlterRequest,
+    ) -> Result<()> {
+        self.metadata_region
             .alter_region_options(region_id, request)
             .await?;
         Ok(())
@@ -262,7 +264,7 @@ mod test {
         let request = alter_logical_region_request(&["tag1"]);
 
         let result = engine_inner
-            .alter_physical_region(physical_region_id, request.clone())
+            .alter_physical_data_region(physical_region_id, request.clone())
             .await;
         assert!(result.is_err());
         assert_eq!(
@@ -277,7 +279,7 @@ mod test {
             },
         };
         let result = engine_inner
-            .alter_physical_region(physical_region_id, alter_region_option_request.clone())
+            .alter_physical_data_region(physical_region_id, alter_region_option_request.clone())
             .await;
         assert!(result.is_ok());
 
