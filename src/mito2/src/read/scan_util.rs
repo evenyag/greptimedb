@@ -797,7 +797,8 @@ pub(crate) fn scan_mem_ranges(
         for range in ranges {
             let build_reader_start = Instant::now();
             let mem_scan_metrics = Some(MemScanMetrics::default());
-            let iter = range.build_prune_iter(time_range, mem_scan_metrics.clone())?;
+            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
+            let iter = range.build_prune_iter(time_range, key_range, mem_scan_metrics.clone())?;
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
             let mut source = Source::Iter(iter);
@@ -993,7 +994,8 @@ pub fn build_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let reader = range.reader(stream_ctx.input.series_row_selector, fetch_metrics.as_deref()).await?;
+            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
+            let reader = range.reader(stream_ctx.input.series_row_selector, key_range, fetch_metrics.as_deref()).await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
             let compat_batch = range.compat_batch();
@@ -1036,7 +1038,8 @@ pub fn build_flat_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let mut reader = range.flat_reader(fetch_metrics.as_deref()).await?;
+            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
+            let mut reader = range.flat_reader(key_range, fetch_metrics.as_deref()).await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 

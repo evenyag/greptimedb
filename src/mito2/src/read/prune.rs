@@ -17,17 +17,18 @@ use std::sync::Arc;
 
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::Timestamp;
-use datatypes::arrow::array::BooleanArray;
+use datatypes::arrow::array::{Array, BinaryArray, BooleanArray};
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use snafu::ResultExt;
 
 use crate::error::{RecordBatchSnafu, Result};
-use crate::memtable::BoxedBatchIterator;
+use crate::memtable::{BoxedBatchIterator, PrimaryKeyRange};
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRangeContextRef;
+use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics, RowGroupReader};
 
 pub enum Source {
@@ -51,6 +52,8 @@ pub struct PruneReader {
     metrics: ReaderMetrics,
     /// Whether to skip field filters for this row group.
     skip_fields: bool,
+    /// Primary key range for filtering.
+    key_range: PrimaryKeyRange,
 }
 
 impl PruneReader {
@@ -58,12 +61,14 @@ impl PruneReader {
         ctx: FileRangeContextRef,
         reader: RowGroupReader,
         skip_fields: bool,
+        key_range: PrimaryKeyRange,
     ) -> Self {
         Self {
             context: ctx,
             source: Source::RowGroup(reader),
             metrics: Default::default(),
             skip_fields,
+            key_range,
         }
     }
 
@@ -71,12 +76,14 @@ impl PruneReader {
         ctx: FileRangeContextRef,
         reader: RowGroupLastRowCachedReader,
         skip_fields: bool,
+        key_range: PrimaryKeyRange,
     ) -> Self {
         Self {
             context: ctx,
             source: Source::LastRow(reader),
             metrics: Default::default(),
             skip_fields,
+            key_range,
         }
     }
 
@@ -116,8 +123,16 @@ impl PruneReader {
         Ok(None)
     }
 
-    /// Prunes batches by the pushed down predicate.
+    /// Prunes batches by the key range and pushed down predicate.
     fn prune(&mut self, batch: Batch) -> Result<Option<Batch>> {
+        // Check key range first (efficient batch-level rejection).
+        // Each Batch represents a single primary key.
+        if !self.key_range.contains(batch.primary_key()) {
+            let num_rows_filtered = batch.num_rows();
+            self.metrics.filter_metrics.rows_precise_filtered += num_rows_filtered;
+            return Ok(None);
+        }
+
         // fast path
         if self.context.filters().is_empty() {
             return Ok(Some(batch));
@@ -142,32 +157,43 @@ impl PruneReader {
     }
 }
 
-/// An iterator that prunes batches by time range.
+/// An iterator that prunes batches by time range and key range.
 pub(crate) struct PruneTimeIterator {
     iter: BoxedBatchIterator,
     time_range: FileTimeRange,
     /// Precise time filters.
     time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+    /// Primary key range for filtering.
+    key_range: PrimaryKeyRange,
 }
 
 impl PruneTimeIterator {
-    /// Creates a new `PruneTimeIterator` with the given iterator and time range.
+    /// Creates a new `PruneTimeIterator` with the given iterator, time range, and key range.
     pub(crate) fn new(
         iter: BoxedBatchIterator,
         time_range: FileTimeRange,
         time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+        key_range: PrimaryKeyRange,
     ) -> Self {
         Self {
             iter,
             time_range,
             time_filters,
+            key_range,
         }
     }
 
-    /// Prune batch by time range.
+    /// Prune batch by key range and time range.
     fn prune(&self, batch: Batch) -> Result<Batch> {
         if batch.is_empty() {
             return Ok(batch);
+        }
+
+        // Apply key range filter first (can reject entire batch).
+        // Each Batch represents rows for a single primary key.
+        if !self.key_range.contains(batch.primary_key()) {
+            // Skip this batch - key is out of range.
+            return Ok(Batch::empty());
         }
 
         // fast path, the batch is within the time range.
@@ -266,6 +292,8 @@ pub struct FlatPruneReader {
     metrics: ReaderMetrics,
     /// Whether to skip field filters for this row group.
     skip_fields: bool,
+    /// Primary key range for filtering.
+    key_range: PrimaryKeyRange,
 }
 
 impl FlatPruneReader {
@@ -273,12 +301,14 @@ impl FlatPruneReader {
         ctx: FileRangeContextRef,
         reader: FlatRowGroupReader,
         skip_fields: bool,
+        key_range: PrimaryKeyRange,
     ) -> Self {
         Self {
             context: ctx,
             source: FlatSource::RowGroup(reader),
             metrics: Default::default(),
             skip_fields,
+            key_range,
         }
     }
 
@@ -312,8 +342,14 @@ impl FlatPruneReader {
         Ok(None)
     }
 
-    /// Prunes batches by the pushed down predicate and returns RecordBatch.
+    /// Prunes batches by the key range and pushed down predicate and returns RecordBatch.
     fn prune_flat(&mut self, record_batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        // Apply key range filter first
+        let record_batch = match self.filter_by_key_range(record_batch)? {
+            Some(filtered) => filtered,
+            None => return Ok(None),
+        };
+
         // fast path
         if self.context.filters().is_empty() {
             return Ok(Some(record_batch));
@@ -335,6 +371,53 @@ impl FlatPruneReader {
 
         if filtered_batch.num_rows() > 0 {
             Ok(Some(filtered_batch))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Filters RecordBatch by key range by iterating through the __primary_key column.
+    fn filter_by_key_range(&mut self, batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        // Short circuit if range is unbounded
+        if self.key_range.is_unbounded() {
+            return Ok(Some(batch));
+        }
+
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            return Ok(Some(batch));
+        }
+
+        let pk_col_idx =
+            crate::sst::parquet::flat_format::primary_key_column_index(batch.num_columns());
+        let pk_column = batch.column(pk_col_idx);
+        let dict_array = pk_column
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .unwrap();
+        let values_array = dict_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        let mut mask = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            // Primary key array is not null.
+            let dict_index = dict_array.keys().value(i) as usize;
+            let key = values_array.value(dict_index);
+            mask.push(self.key_range.contains(key));
+        }
+
+        let mask_array = BooleanArray::from(mask);
+        let filtered = datatypes::arrow::compute::filter_record_batch(&batch, &mask_array)
+            .context(crate::error::ComputeArrowSnafu)?;
+
+        let filtered_count = num_rows - filtered.num_rows();
+        self.metrics.filter_metrics.rows_precise_filtered += filtered_count;
+
+        if filtered.num_rows() > 0 {
+            Ok(Some(filtered))
         } else {
             Ok(None)
         }
@@ -361,6 +444,7 @@ mod tests {
                 Timestamp::new_millisecond(1000),
             ),
             None,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert!(actual.is_empty());
@@ -400,6 +484,7 @@ mod tests {
                 Timestamp::new_millisecond(15),
             ),
             None,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -424,6 +509,7 @@ mod tests {
                 Timestamp::new_millisecond(20),
             ),
             None,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -455,6 +541,7 @@ mod tests {
                 Timestamp::new_millisecond(18),
             ),
             None,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -532,6 +619,7 @@ mod tests {
                 Timestamp::new_millisecond(20),
             ),
             time_filters,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -588,6 +676,7 @@ mod tests {
                 Timestamp::new_millisecond(18),
             ),
             time_filters,
+            PrimaryKeyRange::unbounded(),
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(

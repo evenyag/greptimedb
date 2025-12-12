@@ -1469,10 +1469,12 @@ impl ParquetReader {
                 .await?;
             // Compute skip_fields once for this row group
             let skip_fields = context.should_skip_fields(row_group_idx);
+            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
             ReaderState::Readable(PruneReader::new_with_row_group_reader(
                 context.clone(),
                 RowGroupReader::new(context.clone(), parquet_reader),
                 skip_fields,
+                key_range,
             ))
         } else {
             ReaderState::Exhausted(ReaderMetrics::default())

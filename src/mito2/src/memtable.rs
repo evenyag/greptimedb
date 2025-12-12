@@ -135,6 +135,50 @@ impl RangesOptions {
     }
 }
 
+/// Primary key range for filtering [start, end)
+#[derive(Debug, Clone)]
+pub struct PrimaryKeyRange {
+    /// Start of range (inclusive), None means no lower bound
+    pub start: Option<Vec<u8>>,
+    /// End of range (exclusive), None means no upper bound
+    pub end: Option<Vec<u8>>,
+}
+
+impl PrimaryKeyRange {
+    /// Creates a new range
+    pub fn new(start: Option<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
+        Self { start, end }
+    }
+
+    /// Creates an unbounded range (no filtering)
+    pub fn unbounded() -> Self {
+        Self {
+            start: None,
+            end: None,
+        }
+    }
+
+    /// Returns true if the range is unbounded (no filtering needed)
+    pub fn is_unbounded(&self) -> bool {
+        self.start.is_none() && self.end.is_none()
+    }
+
+    /// Returns true if the given key is within the range [start, end)
+    pub fn contains(&self, key: &[u8]) -> bool {
+        if let Some(start) = &self.start
+            && key < start.as_slice()
+        {
+            return false;
+        }
+        if let Some(end) = &self.end
+            && key >= end.as_slice()
+        {
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MemtableStats {
     /// The estimated bytes allocated by this memtable from heap.
@@ -588,11 +632,12 @@ impl MemtableRange {
     }
 
     /// Builds an iterator to read the range.
-    /// Filters the result by the specific time range, this ensures memtable won't return
-    /// rows out of the time range when new rows are inserted.
+    /// Filters the result by the specific time range and key range, this ensures memtable won't return
+    /// rows out of the time range or key range when new rows are inserted.
     pub fn build_prune_iter(
         &self,
         time_range: FileTimeRange,
+        key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedBatchIterator> {
         let iter = self.context.builder.build(metrics)?;
@@ -601,6 +646,7 @@ impl MemtableRange {
             iter,
             time_range,
             time_filters,
+            key_range,
         )))
     }
 
