@@ -39,6 +39,7 @@ use crate::error::{
     ComputeArrowSnafu, DataTypeMismatchSnafu, DecodeSnafu, DecodeStatsSnafu, RecordBatchSnafu,
     Result, StatsNotPresentSnafu,
 };
+use crate::memtable::PrimaryKeyRange;
 use crate::read::Batch;
 use crate::read::compat::CompatBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
@@ -172,6 +173,7 @@ impl FileRange {
     pub(crate) async fn reader(
         &self,
         selector: Option<TimeSeriesRowSelector>,
+        key_range: PrimaryKeyRange,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<PruneReader>> {
         if !self.in_dynamic_filter_range() {
@@ -217,13 +219,14 @@ impl FileRange {
                 self.context.reader_builder.cache_strategy().clone(),
                 RowGroupReader::new(self.context.clone(), parquet_reader),
             );
-            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
+            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields, key_range)
         } else {
             // Row group contains DELETE, fallback to default reader.
             PruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 RowGroupReader::new(self.context.clone(), parquet_reader),
                 skip_fields,
+                key_range,
             )
         };
 
@@ -233,6 +236,7 @@ impl FileRange {
     /// Creates a flat reader that returns RecordBatch.
     pub(crate) async fn flat_reader(
         &self,
+        key_range: PrimaryKeyRange,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<FlatPruneReader>> {
         if !self.in_dynamic_filter_range() {
@@ -256,6 +260,7 @@ impl FileRange {
             self.context.clone(),
             flat_row_group_reader,
             skip_fields,
+            key_range,
         );
 
         Ok(Some(flat_prune_reader))
