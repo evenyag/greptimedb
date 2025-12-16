@@ -49,7 +49,7 @@ use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SCAN_CHANNEL_SIZE
 use crate::error::{InvalidPartitionExprSnafu, InvalidRequestSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
-use crate::memtable::{MemtableRange, RangesOptions};
+use crate::memtable::{MemtableRange, PrimaryKeyRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
 use crate::read::projection::ProjectionMapper;
@@ -856,6 +856,8 @@ pub struct ScanInput {
     pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Primary key ranges for filtering.
+    pub(crate) key_ranges: Vec<PrimaryKeyRange>,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -892,6 +894,7 @@ impl ScanInput {
             distribution: None,
             flat_format: false,
             compaction: false,
+            key_ranges: Vec::new(),
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -1067,6 +1070,14 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_compaction(mut self, compaction: bool) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// Sets the primary key ranges for filtering.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn with_key_ranges(mut self, key_ranges: Vec<PrimaryKeyRange>) -> Self {
+        self.key_ranges = key_ranges;
         self
     }
 
