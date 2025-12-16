@@ -120,6 +120,7 @@ impl UnorderedScan {
                         part_metrics.clone(),
                         *index,
                         range_meta.time_range,
+                        crate::memtable::PrimaryKeyRange::unbounded(),
                     );
                     for await batch in stream {
                         yield batch?;
@@ -131,6 +132,7 @@ impl UnorderedScan {
                         *index,
                         "unordered_scan_files",
                         range_builder_list.clone(),
+                        crate::memtable::PrimaryKeyRange::unbounded(),
                     ).await?;
                     for await batch in stream {
                         yield batch?;
@@ -172,6 +174,7 @@ impl UnorderedScan {
                         stream_ctx.clone(),
                         part_metrics.clone(),
                         *index,
+                        crate::memtable::PrimaryKeyRange::unbounded(),
                     );
                     for await record_batch in stream {
                         yield record_batch?;
@@ -183,6 +186,7 @@ impl UnorderedScan {
                         *index,
                         "unordered_scan_files",
                         range_builder_list.clone(),
+                        crate::memtable::PrimaryKeyRange::unbounded(),
                     ).await?;
                     for await record_batch in stream {
                         yield record_batch?;

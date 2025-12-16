@@ -1057,6 +1057,7 @@ pub(crate) fn scan_mem_ranges(
     part_metrics: PartitionMetrics,
     index: RowGroupIndex,
     time_range: FileTimeRange,
+    key_range: crate::memtable::PrimaryKeyRange,
 ) -> impl Stream<Item = Result<Batch>> {
     try_stream! {
         let ranges = stream_ctx.input.build_mem_ranges(index);
@@ -1064,8 +1065,7 @@ pub(crate) fn scan_mem_ranges(
         for range in ranges {
             let build_reader_start = Instant::now();
             let mem_scan_metrics = Some(MemScanMetrics::default());
-            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
-            let iter = range.build_prune_iter(time_range, key_range, mem_scan_metrics.clone())?;
+            let iter = range.build_prune_iter(time_range, key_range.clone(), mem_scan_metrics.clone())?;
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
             let mut source = Source::Iter(iter);
@@ -1095,6 +1095,7 @@ pub(crate) fn scan_flat_mem_ranges(
     stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     index: RowGroupIndex,
+    key_range: crate::memtable::PrimaryKeyRange,
 ) -> impl Stream<Item = Result<RecordBatch>> {
     try_stream! {
         let ranges = stream_ctx.input.build_mem_ranges(index);
@@ -1103,7 +1104,7 @@ pub(crate) fn scan_flat_mem_ranges(
             let build_reader_start = Instant::now();
             let mem_scan_metrics = Some(MemScanMetrics::default());
             let mut iter = range.build_record_batch_iter(
-                crate::memtable::PrimaryKeyRange::unbounded(),
+                key_range.clone(),
                 mem_scan_metrics.clone(),
             )?;
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
@@ -1216,6 +1217,7 @@ pub(crate) async fn scan_file_ranges(
     index: RowGroupIndex,
     read_type: &'static str,
     range_builder: Arc<RangeBuilderList>,
+    key_range: crate::memtable::PrimaryKeyRange,
 ) -> Result<impl Stream<Item = Result<Batch>>> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
@@ -1250,6 +1252,7 @@ pub(crate) async fn scan_file_ranges(
         part_metrics,
         read_type,
         ranges,
+        key_range,
         init_per_file_metrics,
     ))
 }
@@ -1269,6 +1272,7 @@ pub(crate) async fn scan_flat_file_ranges(
     index: RowGroupIndex,
     read_type: &'static str,
     range_builder: Arc<RangeBuilderList>,
+    key_range: crate::memtable::PrimaryKeyRange,
 ) -> Result<impl Stream<Item = Result<RecordBatch>>> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
@@ -1303,6 +1307,7 @@ pub(crate) async fn scan_flat_file_ranges(
         part_metrics,
         read_type,
         ranges,
+        key_range,
         init_per_file_metrics,
     ))
 }
@@ -1317,6 +1322,7 @@ pub fn build_file_range_scan_stream(
     part_metrics: PartitionMetrics,
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,
+    key_range: crate::memtable::PrimaryKeyRange,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
 ) -> impl Stream<Item = Result<Batch>> {
     try_stream! {
@@ -1331,17 +1337,11 @@ pub fn build_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
-            let Some(reader) = range.reader(stream_ctx.input.series_row_selector, key_range, fetch_metrics.as_deref()).await? else {
+            let Some(reader) = range.reader(stream_ctx.input.series_row_selector, key_range.clone(), fetch_metrics.as_deref()).await? else {
                 continue;
             };
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
-
-            // If the row group was pruned by key range, skip this range
-            let Some(reader) = reader else {
-                continue;
-            };
 
             let compat_batch = range.compat_batch();
             let mut source = Source::PruneReader(reader);
@@ -1388,6 +1388,7 @@ pub fn build_flat_file_range_scan_stream(
     part_metrics: PartitionMetrics,
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,
+    key_range: crate::memtable::PrimaryKeyRange,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
 ) -> impl Stream<Item = Result<RecordBatch>> {
     try_stream! {
@@ -1402,8 +1403,7 @@ pub fn build_flat_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let key_range = crate::memtable::PrimaryKeyRange::unbounded();
-            let reader = range.flat_reader(key_range, fetch_metrics.as_deref()).await?;
+            let reader = range.flat_reader(key_range.clone(), fetch_metrics.as_deref()).await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 

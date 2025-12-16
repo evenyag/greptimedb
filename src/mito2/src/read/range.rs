@@ -92,6 +92,14 @@ impl RangeMeta {
         }
     }
 
+    /// Returns the primary key range for this range meta from the ScanInput.
+    pub(crate) fn get_key_range(&self, input: &ScanInput) -> crate::memtable::PrimaryKeyRange {
+        match self.key_range_index {
+            Some(idx) => input.key_ranges[idx].clone(),
+            None => crate::memtable::PrimaryKeyRange::unbounded(),
+        }
+    }
+
     /// Creates a list of ranges from the `input` for seq scan.
     /// If `input.compaction` is true, it doesn't split the ranges.
     pub(crate) fn seq_scan_ranges(input: &ScanInput) -> Vec<RangeMeta> {
