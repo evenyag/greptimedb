@@ -1102,7 +1102,10 @@ pub(crate) fn scan_flat_mem_ranges(
         for range in ranges {
             let build_reader_start = Instant::now();
             let mem_scan_metrics = Some(MemScanMetrics::default());
-            let mut iter = range.build_record_batch_iter(mem_scan_metrics.clone())?;
+            let mut iter = range.build_record_batch_iter(
+                crate::memtable::PrimaryKeyRange::unbounded(),
+                mem_scan_metrics.clone(),
+            )?;
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
             while let Some(record_batch) = iter.next().transpose()? {
@@ -1334,6 +1337,12 @@ pub fn build_file_range_scan_stream(
             };
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
+
+            // If the row group was pruned by key range, skip this range
+            let Some(reader) = reader else {
+                continue;
+            };
+
             let compat_batch = range.compat_batch();
             let mut source = Source::PruneReader(reader);
             while let Some(mut batch) = source.next_batch().await? {
@@ -1394,9 +1403,14 @@ pub fn build_flat_file_range_scan_stream(
         for range in ranges {
             let build_reader_start = Instant::now();
             let key_range = crate::memtable::PrimaryKeyRange::unbounded();
-            let Some(mut reader) = range.flat_reader(key_range, fetch_metrics.as_deref()).await? else { continue };
+            let reader = range.flat_reader(key_range, fetch_metrics.as_deref()).await?;
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
+
+            // If the row group was pruned by key range, skip this range
+            let Some(mut reader) = reader else {
+                continue;
+            };
 
             let may_compat = range
                 .compat_batch()
