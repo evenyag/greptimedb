@@ -41,7 +41,9 @@ use crate::read::compat::CompatBatch;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::prune::{FlatPruneReader, PruneReader};
 use crate::sst::file::FileHandle;
-use crate::sst::parquet::flat_format::{DecodedPrimaryKeys, decode_primary_keys};
+use crate::sst::parquet::flat_format::{
+    DecodedPrimaryKeys, decode_primary_keys, primary_key_column_index,
+};
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
@@ -72,6 +74,69 @@ pub(crate) fn row_group_contains_delete(
         .map(|min_op_type| min_op_type == OpType::Delete as i32)
         .ok()
         .context(DecodeStatsSnafu { file_path })
+}
+
+/// Checks if a row group's primary key range overlaps with the given key range.
+///
+/// Returns `Ok(true)` if the row group should be kept (overlaps with key range),
+/// `Ok(false)` if it can be pruned (no overlap).
+///
+/// If statistics are not available, conservatively returns `Ok(true)` to keep the row group.
+///
+/// The row group is pruned if:
+/// - `min_pk >= key_range.end` (entire row group is beyond the end of range)
+/// - `max_pk < key_range.start` (entire row group is before the start of range)
+pub(crate) fn row_group_matches_key_range(
+    parquet_meta: &ParquetMetaData,
+    row_group_index: usize,
+    key_range: &PrimaryKeyRange,
+    _file_path: &str,
+) -> Result<bool> {
+    // If key range is unbounded, keep all row groups
+    if key_range.is_unbounded() {
+        return Ok(true);
+    }
+
+    let row_group_metadata = &parquet_meta.row_groups()[row_group_index];
+    let num_columns = row_group_metadata.columns().len();
+
+    // Get __primary_key column index using helper function
+    let pk_column_index = primary_key_column_index(num_columns);
+    let column_metadata = &row_group_metadata.columns()[pk_column_index];
+
+    // If statistics are not available, conservatively keep the row group
+    let Some(stats) = column_metadata.statistics() else {
+        return Ok(true);
+    };
+
+    // Get min/max primary keys from statistics (may be truncated)
+    let min_pk = match stats.min_bytes_opt() {
+        Some(min) => min,
+        None => return Ok(true), // No min stat, keep row group
+    };
+    let max_pk = match stats.max_bytes_opt() {
+        Some(max) => max,
+        None => return Ok(true), // No max stat, keep row group
+    };
+
+    // Check if row group range [min_pk, max_pk] overlaps with key_range [start, end)
+    // Prune if: min_pk >= end OR max_pk < start
+
+    // Check upper bound: if key_range.end is set and min_pk >= end, prune
+    if let Some(end) = &key_range.end
+        && min_pk >= end.as_slice()
+    {
+        return Ok(false); // Entire row group is >= end, prune
+    }
+
+    // Check lower bound: if key_range.start is set and max_pk < start, prune
+    if let Some(start) = &key_range.start
+        && max_pk < start.as_slice()
+    {
+        return Ok(false); // Entire row group is < start, prune
+    }
+
+    Ok(true) // Row group overlaps with key range
 }
 
 /// A range of a parquet SST. Now it is a row group.
@@ -116,12 +181,27 @@ impl FileRange {
     }
 
     /// Returns a reader to read the [FileRange].
+    /// Returns `None` if the row group can be pruned by the key range.
     pub(crate) async fn reader(
         &self,
         selector: Option<TimeSeriesRowSelector>,
         key_range: PrimaryKeyRange,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<PruneReader> {
+    ) -> Result<Option<PruneReader>> {
+        // Early return if row group can be pruned by key range
+        if !key_range.is_unbounded() {
+            let should_keep = row_group_matches_key_range(
+                self.context.reader_builder.parquet_metadata(),
+                self.row_group_idx,
+                &key_range,
+                self.context.file_path(),
+            )?;
+
+            if !should_keep {
+                return Ok(None); // Row group is completely outside key range
+            }
+        }
+
         let parquet_reader = self
             .context
             .reader_builder
@@ -173,15 +253,30 @@ impl FileRange {
             )
         };
 
-        Ok(prune_reader)
+        Ok(Some(prune_reader))
     }
 
     /// Creates a flat reader that returns RecordBatch.
+    /// Returns `None` if the row group can be pruned by the key range.
     pub(crate) async fn flat_reader(
         &self,
         key_range: PrimaryKeyRange,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<FlatPruneReader> {
+    ) -> Result<Option<FlatPruneReader>> {
+        // Early return if row group can be pruned by key range
+        if !key_range.is_unbounded() {
+            let should_keep = row_group_matches_key_range(
+                self.context.reader_builder.parquet_metadata(),
+                self.row_group_idx,
+                &key_range,
+                self.context.file_path(),
+            )?;
+
+            if !should_keep {
+                return Ok(None); // Row group is completely outside key range
+            }
+        }
+
         let parquet_reader = self
             .context
             .reader_builder
@@ -203,7 +298,7 @@ impl FileRange {
             key_range,
         );
 
-        Ok(flat_prune_reader)
+        Ok(Some(flat_prune_reader))
     }
 
     /// Returns the helper to compat batches.

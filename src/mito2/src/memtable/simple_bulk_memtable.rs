@@ -35,7 +35,8 @@ use crate::memtable::stats::WriteMetrics;
 use crate::memtable::time_series::Series;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable, MemtableId,
-    MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats, RangesOptions,
+    MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
+    PrimaryKeyRange, RangesOptions,
 };
 use crate::metrics::MEMTABLE_ACTIVE_SERIES_COUNT;
 use crate::read::Batch;
@@ -224,7 +225,9 @@ impl Memtable for SimpleBulkMemtable {
         _predicate: Option<table::predicate::Predicate>,
         sequence: Option<store_api::storage::SequenceRange>,
     ) -> error::Result<BoxedBatchIterator> {
-        let iter = self.create_iter(projection, sequence)?.build(None)?;
+        let iter = self
+            .create_iter(projection, sequence)?
+            .build(PrimaryKeyRange::unbounded(), None)?;
 
         if self.merge_mode == MergeMode::LastNonNull {
             let iter = LastNonNullIter::new(iter);
@@ -358,7 +361,12 @@ pub struct BatchRangeBuilder {
 }
 
 impl IterBuilder for BatchRangeBuilder {
-    fn build(&self, metrics: Option<MemScanMetrics>) -> error::Result<BoxedBatchIterator> {
+    fn build(
+        &self,
+        _key_range: PrimaryKeyRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> error::Result<BoxedBatchIterator> {
+        // No pruning support for SimpleBulkMemtable
         let batch = self.batch.clone();
         if let Some(metrics) = metrics {
             let inner = crate::memtable::MemScanMetricsData {
@@ -692,7 +700,11 @@ mod tests {
         let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
         assert_eq!(ranges.ranges.len(), 1);
         let range = ranges.ranges.into_values().next().unwrap();
-        let mut reader = range.context.builder.build(None).unwrap();
+        let mut reader = range
+            .context
+            .builder
+            .build(PrimaryKeyRange::unbounded(), None)
+            .unwrap();
 
         let mut num_rows = 0;
         while let Some(b) = reader.next().transpose().unwrap() {

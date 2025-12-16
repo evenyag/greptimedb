@@ -255,7 +255,11 @@ pub struct MemtableRanges {
 }
 
 impl IterBuilder for MemtableRanges {
-    fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+    fn build(
+        &self,
+        _key_range: PrimaryKeyRange,
+        _metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedBatchIterator> {
         UnsupportedOperationSnafu {
             err_msg: "MemtableRanges does not support build iterator",
         }
@@ -560,7 +564,12 @@ pub struct EncodedRange {
 /// The builder should know the projection and the predicate to build the iterator.
 pub trait IterBuilder: Send + Sync {
     /// Returns the iterator to read the range.
-    fn build(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator>;
+    /// The key_range is used to prune data that falls outside the primary key range.
+    fn build(
+        &self,
+        key_range: PrimaryKeyRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedBatchIterator>;
 
     /// Returns whether the iterator is a record batch iterator.
     fn is_record_batch(&self) -> bool {
@@ -568,10 +577,13 @@ pub trait IterBuilder: Send + Sync {
     }
 
     /// Returns the record batch iterator to read the range.
+    /// The key_range is used to prune data that falls outside the primary key range.
     fn build_record_batch(
         &self,
+        key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
+        let _key_range = key_range;
         let _metrics = metrics;
         UnsupportedOperationSnafu {
             err_msg: "Record batch iterator is not supported by this memtable",
@@ -640,7 +652,8 @@ impl MemtableRange {
         key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedBatchIterator> {
-        let iter = self.context.builder.build(metrics)?;
+        // Pass key_range to builder for pruning
+        let iter = self.context.builder.build(key_range.clone(), metrics)?;
         let time_filters = self.context.predicate.time_filters();
         Ok(Box::new(PruneTimeIterator::new(
             iter,
@@ -652,18 +665,20 @@ impl MemtableRange {
 
     /// Builds an iterator to read all rows in range.
     pub fn build_iter(&self) -> Result<BoxedBatchIterator> {
-        self.context.builder.build(None)
+        self.context.builder.build(PrimaryKeyRange::unbounded(), None)
     }
 
     /// Builds a record batch iterator to read all rows in range.
     ///
     /// This method doesn't take the optional time range because a bulk part is immutable
     /// so we don't need to filter rows out of the time range.
+    /// The key_range is used to prune data that falls outside the primary key range.
     pub fn build_record_batch_iter(
         &self,
+        key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        self.context.builder.build_record_batch(metrics)
+        self.context.builder.build_record_batch(key_range, metrics)
     }
 
     /// Returns whether the iterator is a record batch iterator.

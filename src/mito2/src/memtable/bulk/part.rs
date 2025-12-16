@@ -66,7 +66,7 @@ use crate::error::{
 use crate::memtable::bulk::context::BulkIterContextRef;
 use crate::memtable::bulk::part_reader::EncodedBulkPartIter;
 use crate::memtable::time_series::{ValueBuilder, Values};
-use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics};
+use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics, PrimaryKeyRange};
 use crate::sst::index::IndexOutput;
 use crate::sst::parquet::file_range::{PreFilterMode, row_group_contains_delete};
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -994,14 +994,30 @@ impl EncodedBulkPart {
         context: BulkIterContextRef,
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> Result<Option<BoxedRecordBatchIterator>> {
         // Compute skip_fields for row group pruning using the same approach as compute_skip_fields in reader.rs.
         let skip_fields_for_pruning =
             Self::compute_skip_fields(context.pre_filter_mode(), &self.metadata.parquet_metadata);
 
         // use predicate to find row groups to read.
-        let row_groups_to_read =
+        let mut row_groups_to_read =
             context.row_groups_to_read(&self.metadata.parquet_metadata, skip_fields_for_pruning);
+
+        // Further filter row groups by key range
+        if !key_range.is_unbounded() {
+            use crate::sst::parquet::file_range::row_group_matches_key_range;
+
+            row_groups_to_read.retain(|&rg_idx| {
+                row_group_matches_key_range(
+                    &self.metadata.parquet_metadata,
+                    rg_idx,
+                    &key_range,
+                    "", // No file path for in-memory parts
+                )
+                .unwrap_or(true) // Keep row group if check fails
+            });
+        }
 
         if row_groups_to_read.is_empty() {
             // All row groups are filtered.
@@ -1841,6 +1857,7 @@ mod tests {
                 ),
                 None,
                 None,
+                PrimaryKeyRange::unbounded(),
             )
             .unwrap()
             .expect("expect at least one row group");
@@ -1900,7 +1917,7 @@ mod tests {
             .unwrap(),
         );
         let mut reader = part
-            .read(context, None, None)
+            .read(context, None, None, PrimaryKeyRange::unbounded())
             .unwrap()
             .expect("expect at least one row group");
         let mut total_rows_read = 0;
@@ -1933,7 +1950,10 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(part.read(context, None, None).unwrap().is_none());
+        assert!(part
+            .read(context, None, None, PrimaryKeyRange::unbounded())
+            .unwrap()
+            .is_none());
 
         check_prune_row_group(&part, None, 310);
 
