@@ -189,7 +189,7 @@ impl SeqScan {
             partition_ranges.len(),
             sources.len()
         );
-        Self::build_reader_from_sources(stream_ctx, sources, None, None).await
+        Self::build_reader_from_sources(stream_ctx, sources, None, None, false).await
     }
 
     /// Builds a merge reader that reads all flat ranges.
@@ -223,7 +223,7 @@ impl SeqScan {
             partition_ranges.len(),
             sources.len()
         );
-        Self::build_flat_reader_from_sources(stream_ctx, sources, None, None).await
+        Self::build_flat_reader_from_sources(stream_ctx, sources, None, None, false).await
     }
 
     /// Builds a reader to read sources. If `semaphore` is provided, reads sources in parallel
@@ -234,8 +234,9 @@ impl SeqScan {
         mut sources: Vec<Source>,
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
+        skip_parallel_sources: bool,
     ) -> Result<BoxedBatchReader> {
-        if let Some(semaphore) = semaphore.as_ref() {
+        if !skip_parallel_sources && let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
                 sources = stream_ctx
@@ -285,8 +286,9 @@ impl SeqScan {
         mut sources: Vec<BoxedRecordBatchStream>,
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
+        skip_parallel_sources: bool,
     ) -> Result<BoxedRecordBatchStream> {
-        if let Some(semaphore) = semaphore.as_ref() {
+        if !skip_parallel_sources && let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
                 sources = stream_ctx
@@ -420,10 +422,13 @@ impl SeqScan {
                     file_scan_semaphore.clone(),
                 ).await?;
 
+                let range_meta = &stream_ctx.ranges[part_range.identifier];
+                let skip_parallel = range_meta.key_range_index.is_some();
+
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
                 let mut reader =
-                    Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics))
+                    Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics), skip_parallel)
                         .await?;
                 #[cfg(debug_assertions)]
                 let mut checker = crate::read::BatchChecker::default()
@@ -516,10 +521,13 @@ impl SeqScan {
                     file_scan_semaphore.clone(),
                 ).await?;
 
+                let range_meta = &stream_ctx.ranges[part_range.identifier];
+                let skip_parallel = range_meta.key_range_index.is_some();
+
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
                 let mut reader =
-                    Self::build_flat_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics))
+                    Self::build_flat_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics), skip_parallel)
                         .await?;
 
                 while let Some(record_batch) = reader.try_next().await? {
@@ -711,6 +719,7 @@ pub(crate) async fn build_sources(
 ) -> Result<()> {
     // Gets range meta.
     let range_meta = &stream_ctx.ranges[part_range.identifier];
+    let key_range = range_meta.get_key_range(&stream_ctx.input);
     #[cfg(debug_assertions)]
     if compaction {
         // Compaction expects input sources are not been split.
@@ -747,6 +756,7 @@ pub(crate) async fn build_sources(
                 part_metrics.clone(),
                 *index,
                 range_meta.time_range,
+                key_range.clone(),
             );
             ordered_sources[position] = Some(Source::Stream(Box::pin(stream) as _));
         } else if stream_ctx.is_file_range_index(*index) {
@@ -757,6 +767,7 @@ pub(crate) async fn build_sources(
                 let range_builder_list = range_builder_list.clone();
                 let semaphore = Arc::clone(semaphore_ref);
                 let row_group_index = *index;
+                let key_range_clone = key_range.clone();
                 file_scan_tasks.push(async move {
                     let _permit = semaphore.acquire().await.unwrap();
                     let stream = scan_file_ranges(
@@ -765,6 +776,7 @@ pub(crate) async fn build_sources(
                         row_group_index,
                         read_type,
                         range_builder_list,
+                        key_range_clone,
                     )
                     .await?;
                     Ok((position, Source::Stream(Box::pin(stream) as _)))
@@ -777,6 +789,7 @@ pub(crate) async fn build_sources(
                     *index,
                     read_type,
                     range_builder_list.clone(),
+                    key_range.clone(),
                 )
                 .await?;
                 ordered_sources[position] = Some(Source::Stream(Box::pin(stream) as _));
@@ -813,6 +826,7 @@ pub(crate) async fn build_flat_sources(
 ) -> Result<()> {
     // Gets range meta.
     let range_meta = &stream_ctx.ranges[part_range.identifier];
+    let key_range = range_meta.get_key_range(&stream_ctx.input);
     #[cfg(debug_assertions)]
     if compaction {
         // Compaction expects input sources are not been split.
@@ -845,7 +859,12 @@ pub(crate) async fn build_flat_sources(
 
     for (position, index) in range_meta.row_group_indices.iter().enumerate() {
         if stream_ctx.is_mem_range_index(*index) {
-            let stream = scan_flat_mem_ranges(stream_ctx.clone(), part_metrics.clone(), *index);
+            let stream = scan_flat_mem_ranges(
+                stream_ctx.clone(),
+                part_metrics.clone(),
+                *index,
+                key_range.clone(),
+            );
             ordered_sources[position] = Some(Box::pin(stream) as _);
         } else if stream_ctx.is_file_range_index(*index) {
             if let Some(semaphore_ref) = semaphore.as_ref() {
@@ -855,6 +874,7 @@ pub(crate) async fn build_flat_sources(
                 let range_builder_list = range_builder_list.clone();
                 let semaphore = Arc::clone(semaphore_ref);
                 let row_group_index = *index;
+                let key_range_clone = key_range.clone();
                 file_scan_tasks.push(async move {
                     let _permit = semaphore.acquire().await.unwrap();
                     let stream = scan_flat_file_ranges(
@@ -863,6 +883,7 @@ pub(crate) async fn build_flat_sources(
                         row_group_index,
                         read_type,
                         range_builder_list,
+                        key_range_clone,
                     )
                     .await?;
                     Ok((position, Box::pin(stream) as _))
@@ -875,6 +896,7 @@ pub(crate) async fn build_flat_sources(
                     *index,
                     read_type,
                     range_builder_list.clone(),
+                    key_range.clone(),
                 )
                 .await?;
                 ordered_sources[position] = Some(Box::pin(stream) as _);

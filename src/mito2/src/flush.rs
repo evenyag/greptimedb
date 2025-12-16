@@ -770,10 +770,8 @@ fn memtable_flat_sources(
         if let Some(encoded) = only_range.encoded() {
             flat_sources.encoded.push(encoded);
         } else {
-            let iter = only_range.build_record_batch_iter(
-                crate::memtable::PrimaryKeyRange::unbounded(),
-                None,
-            )?;
+            let iter = only_range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)?;
             // Dedup according to append mode and merge mode.
             // Even single range may have duplicate rows.
             let iter = maybe_dedup_one(options, field_column_start, iter);
@@ -791,10 +789,8 @@ fn memtable_flat_sources(
                 continue;
             }
 
-            let iter = range.build_record_batch_iter(
-                crate::memtable::PrimaryKeyRange::unbounded(),
-                None,
-            )?;
+            let iter = range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)?;
             input_iters.push(iter);
             last_iter_rows += range.num_rows();
 

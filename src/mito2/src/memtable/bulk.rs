@@ -724,8 +724,9 @@ impl BulkRangeIterBuilder {
     /// Checks if a bulk part overlaps with the key range using first/last row.
     /// Parts are sorted by primary key.
     fn check_part_overlaps_range(&self, key_range: &PrimaryKeyRange) -> Result<bool> {
-        use crate::sst::parquet::flat_format::primary_key_column_index;
         use datatypes::arrow::array::AsArray;
+
+        use crate::sst::parquet::flat_format::primary_key_column_index;
 
         let batch = &self.part.batch;
         if batch.num_rows() == 0 {
@@ -796,9 +797,9 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
         key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        if let Some(iter) = self
-            .part
-            .read(self.context.clone(), self.sequence, metrics, key_range)?
+        if let Some(iter) =
+            self.part
+                .read(self.context.clone(), self.sequence, metrics, key_range)?
         {
             Ok(iter)
         } else {
@@ -1352,7 +1353,9 @@ mod tests {
             assert!(range.num_rows() > 0);
             assert!(range.is_record_batch());
 
-            let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+            let record_batch_iter = range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+                .unwrap();
 
             let mut total_rows = 0;
             for batch_result in record_batch_iter {
@@ -1395,7 +1398,9 @@ mod tests {
         let range = ranges.ranges.get(&0).unwrap();
 
         assert!(range.is_record_batch());
-        let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+        let record_batch_iter = range
+            .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+            .unwrap();
 
         let mut total_rows = 0;
         for batch_result in record_batch_iter {
@@ -1555,7 +1560,9 @@ mod tests {
         assert_eq!(1, ranges.ranges.len());
         let range = ranges.ranges.get(&0).unwrap();
 
-        let mut record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+        let mut record_batch_iter = range
+            .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+            .unwrap();
         assert!(record_batch_iter.next().is_none());
     }
 
@@ -1598,7 +1605,9 @@ mod tests {
             assert!(range.num_rows() > 0);
             assert!(range.is_record_batch());
 
-            let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+            let record_batch_iter = range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+                .unwrap();
             let mut total_rows = 0;
             for batch_result in record_batch_iter {
                 let batch = batch_result.unwrap();
@@ -1680,7 +1689,9 @@ mod tests {
         let mut total_rows_read = 0;
         for (_range_id, range) in ranges.ranges.iter() {
             assert!(range.is_record_batch());
-            let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+            let record_batch_iter = range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+                .unwrap();
 
             for batch_result in record_batch_iter {
                 let batch = batch_result.unwrap();
@@ -1765,7 +1776,9 @@ mod tests {
 
         let mut total_rows_read = 0;
         for (_range_id, range) in ranges.ranges.iter() {
-            let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+            let record_batch_iter = range
+                .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+                .unwrap();
             for batch_result in record_batch_iter {
                 let batch = batch_result.unwrap();
                 total_rows_read += batch.num_rows();
@@ -1822,7 +1835,9 @@ mod tests {
 
         // Verify data is sorted correctly in the range
         let range = ranges.ranges.get(&0).unwrap();
-        let record_batch_iter = range.build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None).unwrap();
+        let record_batch_iter = range
+            .build_record_batch_iter(crate::memtable::PrimaryKeyRange::unbounded(), None)
+            .unwrap();
 
         let mut total_rows = 0;
         for batch_result in record_batch_iter {

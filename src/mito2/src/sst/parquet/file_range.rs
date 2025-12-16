@@ -242,7 +242,12 @@ impl FileRange {
                 self.context.reader_builder.cache_strategy().clone(),
                 RowGroupReader::new(self.context.clone(), parquet_reader),
             );
-            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields, key_range)
+            PruneReader::new_with_last_row_reader(
+                self.context.clone(),
+                reader,
+                skip_fields,
+                key_range,
+            )
         } else {
             // Row group contains DELETE, fallback to default reader.
             PruneReader::new_with_row_group_reader(

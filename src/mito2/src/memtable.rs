@@ -665,7 +665,9 @@ impl MemtableRange {
 
     /// Builds an iterator to read all rows in range.
     pub fn build_iter(&self) -> Result<BoxedBatchIterator> {
-        self.context.builder.build(PrimaryKeyRange::unbounded(), None)
+        self.context
+            .builder
+            .build(PrimaryKeyRange::unbounded(), None)
     }
 
     /// Builds a record batch iterator to read all rows in range.
