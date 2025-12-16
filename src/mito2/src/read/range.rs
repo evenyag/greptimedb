@@ -67,6 +67,8 @@ pub(crate) struct RangeMeta {
     pub(crate) row_group_indices: SmallVec<[RowGroupIndex; 2]>,
     /// Estimated number of rows in the range. This can be 0 if the statistics are not available.
     pub(crate) num_rows: usize,
+    /// Optional index into the key_ranges vector in ScanInput.
+    pub(crate) key_range_index: Option<usize>,
 }
 
 impl RangeMeta {
@@ -105,7 +107,13 @@ impl RangeMeta {
             // We don't split ranges in compaction or TimeSeriesDistribution::PerSeries.
             return ranges;
         }
-        maybe_split_ranges_for_seq_scan(ranges)
+
+        // Split ranges by key_ranges if available, otherwise use row group splitting
+        if !input.key_ranges.is_empty() {
+            split_ranges_by_key_ranges(ranges, input.key_ranges.len())
+        } else {
+            maybe_split_ranges_for_seq_scan(ranges)
+        }
     }
 
     /// Creates a list of ranges from the `input` for unordered scan.
@@ -140,6 +148,7 @@ impl RangeMeta {
                 .iter()
                 .all(|idx| !other.row_group_indices.contains(idx))
         );
+        debug_assert_eq!(self.key_range_index, other.key_range_index);
 
         self.time_range = (
             self.time_range.0.min(other.time_range.0),
@@ -175,6 +184,7 @@ impl RangeMeta {
                         row_group_index: row_group_index as i64,
                     }],
                     num_rows,
+                    key_range_index: self.key_range_index,
                 });
             }
         } else {
@@ -202,6 +212,7 @@ impl RangeMeta {
                         row_group_index: row_group_index as i64,
                     }],
                     num_rows,
+                    key_range_index: None,
                 });
             }
         }
@@ -238,6 +249,7 @@ impl RangeMeta {
                             row_group_index: row_group_index as i64,
                         }],
                         num_rows: num_rows as usize,
+                        key_range_index: None,
                     });
                 }
             } else if file.meta_ref().num_row_groups > 0 {
@@ -254,6 +266,7 @@ impl RangeMeta {
                             row_group_index: row_group_index as i64,
                         }],
                         num_rows: DEFAULT_ROW_GROUP_SIZE,
+                        key_range_index: None,
                     });
                 }
             } else {
@@ -270,6 +283,7 @@ impl RangeMeta {
                     }],
                     // This may be 0.
                     num_rows: file.meta_ref().num_rows as usize,
+                    key_range_index: None,
                 });
             }
         }
@@ -293,6 +307,7 @@ impl RangeMeta {
                     row_group_index: ALL_ROW_GROUPS,
                 }],
                 num_rows: stats.num_rows(),
+                key_range_index: None,
             });
         }
     }
@@ -316,6 +331,7 @@ impl RangeMeta {
                     row_group_index: ALL_ROW_GROUPS,
                 }],
                 num_rows: file.meta_ref().num_rows as usize,
+                key_range_index: None,
             });
         }
     }
@@ -335,6 +351,7 @@ impl RangeMeta {
                     row_group_index: ALL_ROW_GROUPS,
                 }],
                 num_rows: range.num_rows() as usize,
+                key_range_index: None,
             });
         }
     }
@@ -384,6 +401,29 @@ fn maybe_split_ranges_for_seq_scan(ranges: Vec<RangeMeta>) -> Vec<RangeMeta> {
     let mut new_ranges = Vec::with_capacity(ranges.len());
     for range in ranges {
         range.maybe_split(&mut new_ranges);
+    }
+
+    new_ranges
+}
+
+/// Splits each range by the number of key ranges.
+/// Each split range will have an index pointing to the corresponding key_range.
+fn split_ranges_by_key_ranges(ranges: Vec<RangeMeta>, num_key_ranges: usize) -> Vec<RangeMeta> {
+    if num_key_ranges == 0 {
+        return ranges;
+    }
+
+    let mut new_ranges = Vec::with_capacity(ranges.len() * num_key_ranges);
+    for range in ranges {
+        for key_range_index in 0..num_key_ranges {
+            new_ranges.push(RangeMeta {
+                time_range: range.time_range,
+                indices: range.indices.clone(),
+                row_group_indices: range.row_group_indices.clone(),
+                num_rows: range.num_rows / num_key_ranges,
+                key_range_index: Some(key_range_index),
+            });
+        }
     }
 
     new_ranges
@@ -551,6 +591,7 @@ mod tests {
                         row_group_index: 0
                     }],
                     num_rows: 1,
+                    key_range_index: None,
                 }
             })
             .collect();
@@ -624,6 +665,7 @@ mod tests {
                 }
             ],
             num_rows: 5,
+            key_range_index: None,
         };
         let right = RangeMeta {
             time_range: (Timestamp::new_second(800), Timestamp::new_second(1200)),
@@ -642,6 +684,7 @@ mod tests {
                 }
             ],
             num_rows: 4,
+            key_range_index: None,
         };
         left.merge(right);
 
@@ -678,6 +721,7 @@ mod tests {
                     },
                 ],
                 num_rows: 9,
+                key_range_index: None,
             }
         );
     }
@@ -695,6 +739,7 @@ mod tests {
                 row_group_index: ALL_ROW_GROUPS,
             }],
             num_rows: 5,
+            key_range_index: None,
         };
 
         assert!(range.can_split_preserve_order());
@@ -715,6 +760,7 @@ mod tests {
                         row_group_index: 0
                     },],
                     num_rows: 2,
+                    key_range_index: None,
                 },
                 RangeMeta {
                     time_range: (Timestamp::new_second(1000), Timestamp::new_second(2000)),
@@ -727,6 +773,7 @@ mod tests {
                         row_group_index: 1
                     }],
                     num_rows: 2,
+                    key_range_index: None,
                 }
             ]
         );
@@ -757,6 +804,7 @@ mod tests {
                 }
             ],
             num_rows: 5,
+            key_range_index: None,
         };
 
         assert!(!range.can_split_preserve_order());
@@ -779,6 +827,7 @@ mod tests {
                     row_group_index: 0,
                 },],
                 num_rows: 4,
+                key_range_index: None,
             },
             RangeMeta {
                 time_range: (Timestamp::new_second(1000), Timestamp::new_second(2000)),
@@ -791,6 +840,7 @@ mod tests {
                     row_group_index: ALL_ROW_GROUPS,
                 },],
                 num_rows: 4,
+                key_range_index: None,
             },
             RangeMeta {
                 time_range: (Timestamp::new_second(3000), Timestamp::new_second(4000)),
@@ -815,6 +865,7 @@ mod tests {
                     }
                 ],
                 num_rows: 5,
+                key_range_index: None,
             },
         ];
         let output = maybe_split_ranges_for_seq_scan(ranges);
@@ -832,6 +883,7 @@ mod tests {
                         row_group_index: 0
                     },],
                     num_rows: 4,
+                    key_range_index: None,
                 },
                 RangeMeta {
                     time_range: (Timestamp::new_second(1000), Timestamp::new_second(2000)),
@@ -844,6 +896,7 @@ mod tests {
                         row_group_index: 0
                     },],
                     num_rows: 2,
+                    key_range_index: None,
                 },
                 RangeMeta {
                     time_range: (Timestamp::new_second(1000), Timestamp::new_second(2000)),
@@ -856,6 +909,7 @@ mod tests {
                         row_group_index: 1
                     }],
                     num_rows: 2,
+                    key_range_index: None,
                 },
                 RangeMeta {
                     time_range: (Timestamp::new_second(3000), Timestamp::new_second(4000)),
@@ -880,6 +934,7 @@ mod tests {
                         }
                     ],
                     num_rows: 5,
+                    key_range_index: None,
                 },
             ]
         )
