@@ -496,6 +496,7 @@ impl SeriesDistributor {
             sources,
             self.semaphore.clone(),
             Some(&part_metrics),
+            false,
         )
         .await?;
         let mut metrics = SeriesDistributorMetrics::default();
@@ -602,6 +603,7 @@ impl SeriesDistributor {
             sources,
             self.semaphore.clone(),
             Some(&part_metrics),
+            false,
         )
         .await?;
         let mut metrics = SeriesDistributorMetrics::default();

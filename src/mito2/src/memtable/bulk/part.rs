@@ -1607,10 +1607,11 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(part
-            .read(context, None, None, PrimaryKeyRange::unbounded())
-            .unwrap()
-            .is_none());
+        assert!(
+            part.read(context, None, None, PrimaryKeyRange::unbounded())
+                .unwrap()
+                .is_none()
+        );
 
         check_prune_row_group(&part, None, 310);
 
