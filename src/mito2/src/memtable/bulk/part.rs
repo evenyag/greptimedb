@@ -158,9 +158,9 @@ impl BulkPart {
         record_batch_estimated_size(&self.batch)
     }
 
-    /// Returns the estimated series count in this BulkPart.
-    /// This is calculated from the dictionary values count of the PrimaryKeyArray.
-    pub fn estimated_series_count(&self) -> usize {
+    /// Returns the number of dictionary values in the PrimaryKeyArray.
+    /// Note: This is NOT necessarily the accurate series count, just the dictionary size.
+    pub fn primary_key_dict_values_count(&self) -> usize {
         let pk_column_idx = primary_key_column_index(self.batch.num_columns());
         let pk_column = self.batch.column(pk_column_idx);
         if let Some(dict_array) = pk_column.as_any().downcast_ref::<PrimaryKeyArray>() {
@@ -1191,7 +1191,7 @@ impl BulkPartEncoder {
                 min_timestamp: part.min_timestamp,
                 parquet_metadata,
                 region_metadata: self.metadata.clone(),
-                num_series: part.estimated_series_count() as u64,
+                num_series: part.primary_key_dict_values_count() as u64,
             },
         }))
     }

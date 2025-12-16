@@ -1404,6 +1404,7 @@ mod tests {
                 None,
                 append_mode,
                 MergeMode::LastRow,
+                None,
             );
             memtable.write_bulk(part.clone()).unwrap();
             memtable.ranges(None, RangesOptions::for_flush()).unwrap()

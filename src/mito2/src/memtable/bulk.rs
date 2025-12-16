@@ -20,6 +20,7 @@ pub mod context;
 pub mod part;
 pub mod part_reader;
 mod row_group_reader;
+mod series;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -62,18 +63,34 @@ struct BulkParts {
     parts: Vec<BulkPartWrapper>,
     /// Parts encoded as parquets.
     encoded_parts: Vec<EncodedPartWrapper>,
+    /// Series set for grouping parts by primary key.
+    /// None for Default, always Some in actual usage.
+    series_set: Option<series::SeriesSet>,
 }
 
 impl BulkParts {
-    /// Total number of parts (raw + encoded + unordered).
+    /// Total number of parts (raw + encoded + unordered + series_set).
     fn num_parts(&self) -> usize {
         let unordered_count = if self.unordered_part.is_empty() { 0 } else { 1 };
-        self.parts.len() + self.encoded_parts.len() + unordered_count
+        let series_set_count = self
+            .series_set
+            .as_ref()
+            .map(|s| if s.is_empty() { 0 } else { 1 })
+            .unwrap_or(0);
+        self.parts.len() + self.encoded_parts.len() + unordered_count + series_set_count
     }
 
     /// Returns true if there is no part.
     fn is_empty(&self) -> bool {
-        self.unordered_part.is_empty() && self.parts.is_empty() && self.encoded_parts.is_empty()
+        let series_set_empty = self
+            .series_set
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true);
+        self.unordered_part.is_empty()
+            && self.parts.is_empty()
+            && self.encoded_parts.is_empty()
+            && series_set_empty
     }
 
     /// Returns true if the bulk parts should be merged.
@@ -262,6 +279,8 @@ pub struct BulkMemtable {
     append_mode: bool,
     /// Mode to handle duplicate rows while merging
     merge_mode: MergeMode,
+    /// Optional threshold for number of series in SeriesSet
+    series_num_threshold: Option<usize>,
 }
 
 impl std::fmt::Debug for BulkMemtable {
@@ -308,27 +327,44 @@ impl Memtable for BulkMemtable {
         {
             let mut bulk_parts = self.parts.write().unwrap();
 
-            // Routes small parts to unordered_part based on threshold
-            if bulk_parts.unordered_part.should_accept(fragment.num_rows()) {
-                bulk_parts.unordered_part.push(fragment);
+            // Try to route to SeriesSet first (if threshold is enabled and part is single-series)
+            let should_use_series_set = if let Some(threshold) = self.series_num_threshold {
+                bulk_parts.series_set.as_ref().is_some_and(|s| {
+                    s.series_count() < threshold && fragment.primary_key_dict_values_count() == 1
+                })
+            } else {
+                false
+            };
 
-                // Compacts unordered_part if threshold is reached
-                if bulk_parts.should_compact_unordered_part()
-                    && let Some(bulk_part) = bulk_parts.unordered_part.to_bulk_part()?
-                {
+            if should_use_series_set {
+                // Store in series_set
+                if let Some(ref series_set) = bulk_parts.series_set {
+                    // This should not fail since we checked single-series condition
+                    let _ = series_set.push(fragment);
+                }
+            } else {
+                // Routes small parts to unordered_part based on threshold
+                if bulk_parts.unordered_part.should_accept(fragment.num_rows()) {
+                    bulk_parts.unordered_part.push(fragment);
+
+                    // Compacts unordered_part if threshold is reached
+                    if bulk_parts.should_compact_unordered_part()
+                        && let Some(bulk_part) = bulk_parts.unordered_part.to_bulk_part()?
+                    {
+                        bulk_parts.parts.push(BulkPartWrapper {
+                            part: bulk_part,
+                            file_id: FileId::random(),
+                            merging: false,
+                        });
+                        bulk_parts.unordered_part.clear();
+                    }
+                } else {
                     bulk_parts.parts.push(BulkPartWrapper {
-                        part: bulk_part,
+                        part: fragment,
                         file_id: FileId::random(),
                         merging: false,
                     });
-                    bulk_parts.unordered_part.clear();
                 }
-            } else {
-                bulk_parts.parts.push(BulkPartWrapper {
-                    part: fragment,
-                    file_id: FileId::random(),
-                    merging: false,
-                });
             }
 
             // Since this operation should be fast, we do it in parts lock scope.
@@ -388,6 +424,26 @@ impl Memtable for BulkMemtable {
                         self.id,
                         Box::new(BulkRangeIterBuilder {
                             part: unordered_bulk_part,
+                            context: context.clone(),
+                            sequence,
+                        }),
+                        predicate.clone(),
+                    )),
+                    num_rows,
+                );
+                ranges.insert(range_id, range);
+                range_id += 1;
+            }
+
+            // Adds range for series set if not empty
+            if let Some(ref series_set) = bulk_parts.series_set
+                && !series_set.is_empty() {
+                let num_rows = series_set.total_rows();
+                let range = MemtableRange::new(
+                    Arc::new(MemtableRangeContext::new(
+                        self.id,
+                        Box::new(SeriesSetRangeIterBuilder {
+                            series_set: series_set.clone(),
                             context: context.clone(),
                             sequence,
                         }),
@@ -508,6 +564,27 @@ impl Memtable for BulkMemtable {
             &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
         );
 
+        // Determine if we should enable SeriesSet threshold in the new memtable.
+        // If current memtable has exceeded threshold, disable threshold in fork.
+        let series_num_threshold = if let Some(threshold) = self.series_num_threshold {
+            let bulk_parts = self.parts.read().unwrap();
+            if let Some(ref series_set) = bulk_parts.series_set {
+                if series_set.series_count() >= threshold {
+                    // Already exceeded threshold - disable threshold in fork
+                    None
+                } else {
+                    // Still under threshold - preserve setting
+                    Some(threshold)
+                }
+            } else {
+                // No series_set, keep the threshold setting
+                Some(threshold)
+            }
+        } else {
+            // Threshold not set in parent, keep disabled
+            None
+        };
+
         Arc::new(Self {
             id,
             parts: Arc::new(RwLock::new(BulkParts::default())),
@@ -522,6 +599,7 @@ impl Memtable for BulkMemtable {
             compact_dispatcher: self.compact_dispatcher.clone(),
             append_mode: self.append_mode,
             merge_mode: self.merge_mode,
+            series_num_threshold,
         })
     }
 
@@ -569,6 +647,7 @@ impl BulkMemtable {
         compact_dispatcher: Option<Arc<CompactDispatcher>>,
         append_mode: bool,
         merge_mode: MergeMode,
+        series_num_threshold: Option<usize>,
     ) -> Self {
         let flat_arrow_schema = to_flat_sst_arrow_schema(
             &metadata,
@@ -578,7 +657,12 @@ impl BulkMemtable {
         let region_id = metadata.region_id;
         Self {
             id,
-            parts: Arc::new(RwLock::new(BulkParts::default())),
+            parts: Arc::new(RwLock::new(BulkParts {
+                unordered_part: part::UnorderedPart::default(),
+                parts: vec![],
+                encoded_parts: vec![],
+                series_set: Some(series::SeriesSet::new(metadata.clone())),
+            })),
             metadata,
             alloc_tracker: AllocTracker::new(write_buffer_manager),
             max_timestamp: AtomicI64::new(i64::MIN),
@@ -590,6 +674,7 @@ impl BulkMemtable {
             compact_dispatcher,
             append_mode,
             merge_mode,
+            series_num_threshold,
         }
     }
 
@@ -632,11 +717,17 @@ impl BulkMemtable {
     /// Returns the estimated time series count.
     fn estimated_series_count(&self) -> usize {
         let bulk_parts = self.parts.read().unwrap();
-        bulk_parts
+        let parts_count: usize = bulk_parts
             .parts
             .iter()
-            .map(|part_wrapper| part_wrapper.part.estimated_series_count())
-            .sum()
+            .map(|part_wrapper| part_wrapper.part.primary_key_dict_values_count())
+            .sum();
+        let series_set_count = bulk_parts
+            .series_set
+            .as_ref()
+            .map(|s| s.series_count())
+            .unwrap_or(0);
+        parts_count + series_set_count
     }
 
     /// Returns whether the memtable should be compacted.
@@ -690,7 +781,7 @@ impl IterBuilder for BulkRangeIterBuilder {
         &self,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        let series_count = self.part.estimated_series_count();
+        let series_count = self.part.primary_key_dict_values_count();
         let iter = BulkPartRecordBatchIter::new(
             self.part.batch.clone(),
             self.context.clone(),
@@ -747,6 +838,42 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
             data: self.part.data().clone(),
             sst_info: self.part.to_sst_info(self.file_id),
         })
+    }
+}
+
+/// Iterator builder for series set range
+struct SeriesSetRangeIterBuilder {
+    series_set: series::SeriesSet,
+    context: Arc<BulkIterContext>,
+    sequence: Option<SequenceRange>,
+}
+
+impl IterBuilder for SeriesSetRangeIterBuilder {
+    fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+        UnsupportedOperationSnafu {
+            err_msg: "BatchIterator is not supported for series set",
+        }
+        .fail()
+    }
+
+    fn is_record_batch(&self) -> bool {
+        true
+    }
+
+    fn build_record_batch(
+        &self,
+        _metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedRecordBatchIterator> {
+        if let Some(iter) = self.series_set.iter(self.context.clone(), self.sequence)? {
+            Ok(iter)
+        } else {
+            // Return an empty iterator if no data to read
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    fn encoded_range(&self) -> Option<EncodedRange> {
+        None
     }
 }
 
@@ -818,7 +945,7 @@ impl PartToMerge {
     ) -> Result<Option<BoxedRecordBatchIterator>> {
         match self {
             PartToMerge::Bulk { part, .. } => {
-                let series_count = part.estimated_series_count();
+                let series_count = part.primary_key_dict_values_count();
                 let iter = BulkPartRecordBatchIter::new(
                     part.batch,
                     context,
@@ -1145,6 +1272,7 @@ pub struct BulkMemtableBuilder {
     compact_dispatcher: Option<Arc<CompactDispatcher>>,
     append_mode: bool,
     merge_mode: MergeMode,
+    series_num_threshold: Option<usize>,
 }
 
 impl BulkMemtableBuilder {
@@ -1159,12 +1287,19 @@ impl BulkMemtableBuilder {
             compact_dispatcher: None,
             append_mode,
             merge_mode,
+            series_num_threshold: None,
         }
     }
 
     /// Sets the compact dispatcher.
     pub fn with_compact_dispatcher(mut self, compact_dispatcher: Arc<CompactDispatcher>) -> Self {
         self.compact_dispatcher = Some(compact_dispatcher);
+        self
+    }
+
+    /// Sets the series number threshold.
+    pub fn with_series_num_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.series_num_threshold = threshold;
         self
     }
 }
@@ -1178,6 +1313,7 @@ impl MemtableBuilder for BulkMemtableBuilder {
             self.compact_dispatcher.clone(),
             self.append_mode,
             self.merge_mode,
+            self.series_num_threshold,
         ))
     }
 
@@ -1232,7 +1368,7 @@ mod tests {
     fn test_bulk_memtable_write_read() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow, None);
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
@@ -1302,7 +1438,7 @@ mod tests {
     fn test_bulk_memtable_ranges_with_projection() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow, None);
 
         let bulk_part = create_bulk_part_with_converter(
             "projection_test",
@@ -1344,7 +1480,7 @@ mod tests {
     fn test_bulk_memtable_unsupported_operations() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow, None);
 
         let key_values = build_key_values_with_ts_seq_values(
             &metadata,
@@ -1367,7 +1503,7 @@ mod tests {
     fn test_bulk_memtable_freeze() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(222, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(222, metadata.clone(), None, None, false, MergeMode::LastRow, None);
 
         let bulk_part = create_bulk_part_with_converter(
             "freeze_test",
@@ -1389,7 +1525,7 @@ mod tests {
     fn test_bulk_memtable_fork() {
         let metadata = metadata_for_test();
         let original_memtable =
-            BulkMemtable::new(333, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(333, metadata.clone(), None, None, false, MergeMode::LastRow, None);
 
         let bulk_part =
             create_bulk_part_with_converter("fork_test", 15, vec![15000], vec![Some(150.0)], 1500)
@@ -1411,7 +1547,7 @@ mod tests {
     fn test_bulk_memtable_ranges_multiple_parts() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(777, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(777, metadata.clone(), None, None, false, MergeMode::LastRow, None);
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
@@ -1461,7 +1597,7 @@ mod tests {
     fn test_bulk_memtable_ranges_with_sequence_filter() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(888, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(888, metadata.clone(), None, None, false, MergeMode::LastRow, None);
 
         let part = create_bulk_part_with_converter(
             "seq_test",
@@ -1496,7 +1632,7 @@ mod tests {
     fn test_bulk_memtable_ranges_with_encoded_parts() {
         let metadata = metadata_for_test();
         let memtable =
-            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow);
+            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow, None);
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
@@ -1552,6 +1688,7 @@ mod tests {
             None,
             false,
             MergeMode::LastRow,
+            None,
         );
 
         // Set smaller thresholds for testing with smaller inputs
@@ -1633,6 +1770,7 @@ mod tests {
             None,
             false,
             MergeMode::LastRow,
+            None,
         );
 
         // Set threshold to 4 rows - parts with < 4 rows go to unordered_part
@@ -1717,6 +1855,7 @@ mod tests {
             None,
             false,
             MergeMode::LastRow,
+            None,
         );
 
         // Set small thresholds
