@@ -28,7 +28,7 @@ use mito2::memtable::bulk::part_reader::BulkPartBatchIter;
 use mito2::memtable::bulk::{BulkMemtable, BulkMemtableConfig};
 use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
-use mito2::memtable::{KeyValues, Memtable, RangesOptions};
+use mito2::memtable::{KeyValues, Memtable, PrimaryKeyRange, RangesOptions};
 use mito2::read::flat_merge::FlatMergeIterator;
 use mito2::read::scan_region::PredicateGroup;
 use mito2::region::options::MergeMode;
@@ -193,7 +193,9 @@ fn filter_1_host(c: &mut Criterion) {
                 .unwrap();
 
             for (_range_id, range) in ranges.ranges.iter() {
-                let iter = range.build_record_batch_iter(None).unwrap();
+                let iter = range
+                    .build_record_batch_iter(PrimaryKeyRange::unbounded(), None)
+                    .unwrap();
                 for batch in iter {
                     let _batch = batch.unwrap();
                 }

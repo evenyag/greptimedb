@@ -21,7 +21,7 @@ use store_api::storage::{ColumnId, SequenceRange};
 use crate::error;
 use crate::memtable::simple_bulk_memtable::{Iter, SimpleBulkMemtable};
 use crate::memtable::time_series::Values;
-use crate::memtable::{BoxedBatchIterator, IterBuilder, MemScanMetrics};
+use crate::memtable::{BoxedBatchIterator, IterBuilder, MemScanMetrics, PrimaryKeyRange};
 use crate::read::dedup::LastNonNullIter;
 use crate::region::options::MergeMode;
 
@@ -65,7 +65,11 @@ pub(crate) struct BatchIterBuilderDeprecated {
 }
 
 impl IterBuilder for BatchIterBuilderDeprecated {
-    fn build(&self, metrics: Option<MemScanMetrics>) -> error::Result<BoxedBatchIterator> {
+    fn build(
+        &self,
+        _key_range: PrimaryKeyRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> error::Result<BoxedBatchIterator> {
         let start_time = Instant::now();
         let Some(values) = self.values.clone() else {
             return Ok(Box::new(Iter { batch: None }));

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, Bound, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::iter;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -53,7 +53,7 @@ use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable,
     MemtableBuilder, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef,
-    MemtableStats, RangesOptions,
+    MemtableStats, PrimaryKeyRange, RangesOptions,
 };
 use crate::metrics::{
     MEMTABLE_ACTIVE_FIELD_BUILDER_COUNT, MEMTABLE_ACTIVE_SERIES_COUNT, READ_ROWS_TOTAL,
@@ -290,6 +290,7 @@ impl Memtable for TimeSeriesMemtable {
             self.merge_mode,
             sequence,
             None,
+            PrimaryKeyRange::unbounded(),
         )?;
 
         if self.merge_mode == MergeMode::LastNonNull {
@@ -471,6 +472,7 @@ impl SeriesSet {
         merge_mode: MergeMode,
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> Result<Iter> {
         let primary_key_schema = primary_key_schema(&self.region_metadata);
         let primary_key_datatypes = self
@@ -491,6 +493,7 @@ impl SeriesSet {
             merge_mode,
             sequence,
             mem_scan_metrics,
+            key_range,
         )
     }
 }
@@ -542,6 +545,7 @@ struct Iter {
     sequence: Option<SequenceRange>,
     metrics: Metrics,
     mem_scan_metrics: Option<MemScanMetrics>,
+    key_range: PrimaryKeyRange,
 }
 
 impl Iter {
@@ -558,6 +562,7 @@ impl Iter {
         merge_mode: MergeMode,
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> Result<Self> {
         let predicate = predicate
             .map(|predicate| {
@@ -582,6 +587,7 @@ impl Iter {
             sequence,
             metrics: Metrics::default(),
             mem_scan_metrics,
+            key_range,
         })
     }
 
@@ -623,12 +629,29 @@ impl Iterator for Iter {
     fn next(&mut self) -> Option<Self::Item> {
         let start = Instant::now();
         let map = self.series.read().unwrap();
-        let range = match &self.last_key {
-            None => map.0.range::<Vec<u8>, _>(..),
-            Some(last_key) => map
-                .0
-                .range::<Vec<u8>, _>((Bound::Excluded(last_key), Bound::Unbounded)),
+
+        // Use BTreeMap::range() for efficient key range filtering
+        use std::collections::Bound;
+
+        // Determine start bound considering both last_key (for pagination) and key_range
+        let start_bound = if let Some(last_key) = &self.last_key {
+            // Always exclude the last key we've seen (for pagination)
+            Bound::Excluded(last_key.clone())
+        } else if let Some(start) = &self.key_range.start {
+            // Start from the key range start
+            Bound::Included(start.clone())
+        } else {
+            Bound::Unbounded
         };
+
+        // Determine end bound from key_range
+        let end_bound = if let Some(end) = &self.key_range.end {
+            Bound::Excluded(end.clone())
+        } else {
+            Bound::Unbounded
+        };
+
+        let range = map.0.range::<Vec<u8>, _>((start_bound, end_bound));
 
         // TODO(hl): maybe yield more than one time series to amortize range overhead.
         for (primary_key, series) in range {
@@ -1275,7 +1298,11 @@ struct TimeSeriesIterBuilder {
 }
 
 impl IterBuilder for TimeSeriesIterBuilder {
-    fn build(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+    fn build(
+        &self,
+        key_range: PrimaryKeyRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedBatchIterator> {
         let iter = self.series_set.iter_series(
             self.projection.clone(),
             self.predicate.clone(),
@@ -1283,6 +1310,7 @@ impl IterBuilder for TimeSeriesIterBuilder {
             self.merge_mode,
             self.sequence,
             metrics,
+            key_range,
         )?;
         if self.merge_mode == MergeMode::LastNonNull {
             let iter = LastNonNullIter::new(iter);

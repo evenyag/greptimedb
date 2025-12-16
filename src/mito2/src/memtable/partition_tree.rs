@@ -44,7 +44,7 @@ use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, IterBuilder, KeyValues, MemScanMetrics, Memtable,
     MemtableBuilder, MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef,
-    MemtableStats, RangesOptions,
+    MemtableStats, PrimaryKeyRange, RangesOptions,
 };
 use crate::region::options::MergeMode;
 
@@ -366,7 +366,12 @@ struct PartitionTreeIterBuilder {
 }
 
 impl IterBuilder for PartitionTreeIterBuilder {
-    fn build(&self, metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
+    fn build(
+        &self,
+        _key_range: PrimaryKeyRange,
+        metrics: Option<MemScanMetrics>,
+    ) -> Result<BoxedBatchIterator> {
+        // No pruning support for PartitionTreeMemtable
         self.tree.read(
             self.projection.as_deref(),
             self.predicate.clone(),
