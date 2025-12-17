@@ -344,6 +344,10 @@ pub(crate) struct Version {
     pub(crate) compaction_time_window: Option<Duration>,
     /// Options of the region.
     pub(crate) options: RegionOptions,
+    /// Primary key ranges collected from the latest SST files.
+    ///
+    /// These ranges are used for splitting queries into multiple ranges for parallel execution.
+    pub(crate) primary_key_ranges: Vec<crate::memtable::PrimaryKeyRange>,
 }
 
 pub(crate) type VersionRef = Arc<Version>;
@@ -358,6 +362,7 @@ pub(crate) struct VersionBuilder {
     truncated_entry_id: Option<EntryId>,
     compaction_time_window: Option<Duration>,
     options: RegionOptions,
+    primary_key_ranges: Vec<crate::memtable::PrimaryKeyRange>,
 }
 
 impl VersionBuilder {
@@ -372,6 +377,7 @@ impl VersionBuilder {
             truncated_entry_id: None,
             compaction_time_window: None,
             options: RegionOptions::default(),
+            primary_key_ranges: Vec::new(),
         }
     }
 
@@ -386,6 +392,7 @@ impl VersionBuilder {
             truncated_entry_id: version.truncated_entry_id,
             compaction_time_window: version.compaction_time_window,
             options: version.options.clone(),
+            primary_key_ranges: version.primary_key_ranges.clone(),
         }
     }
 
@@ -489,6 +496,15 @@ impl VersionBuilder {
         self
     }
 
+    /// Sets primary key ranges.
+    pub(crate) fn primary_key_ranges(
+        mut self,
+        primary_key_ranges: Vec<crate::memtable::PrimaryKeyRange>,
+    ) -> Self {
+        self.primary_key_ranges = primary_key_ranges;
+        self
+    }
+
     /// Builds a new [Version] from the builder.
     /// It overwrites the window size by compaction option.
     pub(crate) fn build(self) -> Version {
@@ -515,6 +531,7 @@ impl VersionBuilder {
             truncated_entry_id: self.truncated_entry_id,
             compaction_time_window,
             options: self.options,
+            primary_key_ranges: self.primary_key_ranges,
         }
     }
 }
