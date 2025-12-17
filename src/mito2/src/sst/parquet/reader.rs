@@ -620,6 +620,10 @@ impl ParquetReaderBuilder {
         if !self.file_handle.meta_ref().inverted_index_available() {
             return false;
         }
+        common_telemetry::info!(
+            "file: {}, apply index start",
+            self.file_handle.file_id().file_id(),
+        );
 
         let mut pruned = false;
         // If skip_fields is true, only apply the first applier (for tags).
