@@ -653,11 +653,22 @@ impl ParquetReaderBuilder {
                 )
                 .await;
             let selection = match apply_res {
-                Ok(apply_output) => RowGroupSelection::from_inverted_index_apply_output(
-                    row_group_size,
-                    num_row_groups,
-                    apply_output,
-                ),
+                Ok(apply_output) => {
+                    common_telemetry::info!(
+                        "file: {}, matched segment ids: {:?}",
+                        self.file_handle.file_id().file_id(),
+                        apply_output
+                            .matched_segment_ids
+                            .iter_ones()
+                            .collect::<Vec<_>>()
+                    );
+
+                    RowGroupSelection::from_inverted_index_apply_output(
+                        row_group_size,
+                        num_row_groups,
+                        apply_output,
+                    )
+                }
                 Err(err) => {
                     handle_index_error!(err, self.file_handle, INDEX_TYPE_INVERTED);
                     continue;
