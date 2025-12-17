@@ -51,6 +51,7 @@ use crate::error::{
 use crate::manifest::action::RegionManifest;
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::memtable::MemtableBuilderProvider;
+use crate::memtable::PrimaryKeyRange;
 use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
 use crate::metrics::{CACHE_FILL_DOWNLOADED_FILES, CACHE_FILL_PENDING_FILES};
@@ -63,8 +64,10 @@ use crate::region_write_ctx::RegionWriteCtx;
 use crate::request::OptionOutputTx;
 use crate::schedule::scheduler::SchedulerRef;
 use crate::sst::FormatType;
-use crate::sst::file::{RegionFileId, RegionIndexId};
+use crate::sst::file::{FileMeta, RegionFileId, RegionIndexId};
 use crate::sst::file_purger::{FilePurgerRef, create_file_purger};
+use crate::sst::parquet::flat_format::primary_key_column_index;
+use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
@@ -404,6 +407,201 @@ impl RegionOpener {
         }
     }
 
+    /// Collects files from the manifest, sorts by time range, and collects PK ranges from the latest files.
+    ///
+    /// This method:
+    /// 1. Collects all files from the manifest
+    /// 2. Sorts by max timestamp (descending)
+    /// 3. Takes the latest 16 files
+    /// 4. Calls `collect_primary_key_ranges` to extract PK ranges
+    /// 5. Logs the results
+    /// 6. Returns the collected PK ranges
+    async fn collect_and_log_pk_ranges(
+        &self,
+        region_id: RegionId,
+        manifest: &RegionManifest,
+        object_store: &object_store::ObjectStore,
+    ) -> Vec<PrimaryKeyRange> {
+        // Step 1: Collect all files from the manifest
+        let mut all_files: Vec<FileMeta> = manifest
+            .files
+            .values()
+            .cloned()
+            .collect();
+
+        if all_files.is_empty() {
+            debug!("No SST files found for region {}, skipping PK range collection", region_id);
+            return Vec::new();
+        }
+
+        // Step 2: Sort by max timestamp (descending)
+        all_files.sort_by(|a, b| b.time_range.1.cmp(&a.time_range.1));
+
+        // Step 3: Take latest 16 files
+        let latest_files: Vec<FileMeta> = all_files.into_iter().take(16).collect();
+        let num_files = latest_files.len();
+
+        // Step 4: Call the helper function to collect PK ranges
+        match Self::collect_primary_key_ranges(
+            region_id,
+            &self.table_dir,
+            self.path_type,
+            latest_files,
+            object_store,
+        )
+        .await
+        {
+            Ok(pk_ranges) => {
+                info!(
+                    "Collected {} primary key ranges from {} latest files for region {}",
+                    pk_ranges.len(),
+                    num_files,
+                    region_id
+                );
+                pk_ranges
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to collect primary key ranges for region {}: {}",
+                    region_id, e
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Collects primary key ranges from the given SST files by reading their parquet metadata.
+    ///
+    /// This function:
+    /// 1. Collects max primary keys from all row groups in the given files
+    /// 2. Sorts the max keys
+    /// 3. Selects boundaries to create 16 evenly-distributed PrimaryKeyRange instances
+    /// 4. The first range has unbounded start, the last range has unbounded end
+    ///
+    /// Returns a vector of exactly 16 `PrimaryKeyRange` instances (or fewer if insufficient data).
+    async fn collect_primary_key_ranges(
+        region_id: RegionId,
+        table_dir: &str,
+        path_type: PathType,
+        files: Vec<FileMeta>,
+        object_store: &object_store::ObjectStore,
+    ) -> Result<Vec<PrimaryKeyRange>> {
+        let mut max_keys = Vec::new();
+
+        // Step 1: Collect max keys from all row groups
+        for file_meta in files {
+            let file_id = RegionFileId::new(region_id, file_meta.file_id);
+
+            // Build the SST file path
+            let file_path = location::sst_file_path(table_dir, file_id, path_type);
+
+            // Load parquet metadata
+            let metadata_loader = MetadataLoader::new(
+                object_store.clone(),
+                &file_path,
+                file_meta.file_size,
+            );
+
+            let parquet_metadata = match metadata_loader.load().await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    debug!(
+                        "Failed to load parquet metadata for file {}, region {}: {}. Skipping.",
+                        file_meta.file_id, region_id, e
+                    );
+                    continue;
+                }
+            };
+
+            // Extract max keys from each row group
+            for (row_group_idx, row_group) in parquet_metadata.row_groups().iter().enumerate() {
+                let num_columns = row_group.columns().len();
+                let pk_column_index = primary_key_column_index(num_columns);
+
+                if pk_column_index >= num_columns {
+                    debug!(
+                        "Invalid primary key column index {} for file {}, region {}. Skipping row group {}.",
+                        pk_column_index, file_meta.file_id, region_id, row_group_idx
+                    );
+                    continue;
+                }
+
+                let column_metadata = &row_group.columns()[pk_column_index];
+
+                // Get statistics
+                let Some(stats) = column_metadata.statistics() else {
+                    debug!(
+                        "No statistics available for primary key column in file {}, region {}, row group {}. Skipping.",
+                        file_meta.file_id, region_id, row_group_idx
+                    );
+                    continue;
+                };
+
+                // Extract only the max key
+                if let Some(max_pk) = stats.max_bytes_opt() {
+                    max_keys.push(max_pk.to_vec());
+                } else {
+                    debug!(
+                        "No max statistic for primary key in file {}, region {}, row group {}. Skipping.",
+                        file_meta.file_id, region_id, row_group_idx
+                    );
+                }
+            }
+        }
+
+        if max_keys.is_empty() {
+            debug!("No primary key statistics found for region {}", region_id);
+            return Ok(Vec::new());
+        }
+
+        // Step 2: Sort max keys
+        max_keys.sort();
+
+        // Step 3: Select boundaries to create 16 evenly-distributed ranges
+        const NUM_RANGES: usize = 16;
+        let mut pk_ranges = Vec::new();
+
+        if max_keys.len() < NUM_RANGES {
+            // If we have fewer keys than ranges, create one range per key
+            for i in 0..max_keys.len() {
+                let start = if i == 0 {
+                    None // First range has unbounded start
+                } else {
+                    Some(max_keys[i - 1].clone())
+                };
+                let end = if i == max_keys.len() - 1 {
+                    None // Last range has unbounded end
+                } else {
+                    Some(max_keys[i].clone())
+                };
+                pk_ranges.push(PrimaryKeyRange::new(start, end));
+            }
+        } else {
+            // Select boundaries to split evenly into NUM_RANGES
+            for i in 0..NUM_RANGES {
+                let start = if i == 0 {
+                    None // First range has unbounded start
+                } else {
+                    // Use the key at the boundary position
+                    let boundary_idx = (i * max_keys.len()) / NUM_RANGES - 1;
+                    Some(max_keys[boundary_idx].clone())
+                };
+
+                let end = if i == NUM_RANGES - 1 {
+                    None // Last range has unbounded end
+                } else {
+                    // Use the key at the next boundary position
+                    let boundary_idx = ((i + 1) * max_keys.len()) / NUM_RANGES - 1;
+                    Some(max_keys[boundary_idx].clone())
+                };
+
+                pk_ranges.push(PrimaryKeyRange::new(start, end));
+            }
+        }
+
+        Ok(pk_ranges)
+    }
+
     /// Tries to open the region and returns `None` if the region directory is empty.
     async fn maybe_open<S: LogStore>(
         &mut self,
@@ -459,7 +657,7 @@ impl RegionOpener {
         let access_layer = Arc::new(AccessLayer::new(
             self.table_dir.clone(),
             self.path_type,
-            object_store,
+            object_store.clone(),
             self.puffin_manager_factory.clone(),
             self.intermediate_manager.clone(),
         ));
@@ -488,6 +686,11 @@ impl RegionOpener {
             part_duration,
         ));
 
+        // Collect primary key ranges from latest SST files before building version
+        let primary_key_ranges = self
+            .collect_and_log_pk_ranges(region_id, &manifest, &object_store)
+            .await;
+
         // Updates region options by manifest before creating version.
         let version_builder = version_builder_from_manifest(
             &manifest,
@@ -496,7 +699,9 @@ impl RegionOpener {
             mutable,
             region_options,
         );
-        let version = version_builder.build();
+        let version = version_builder
+            .primary_key_ranges(primary_key_ranges)
+            .build();
         let flushed_entry_id = version.flushed_entry_id;
         let version_control = Arc::new(VersionControl::new(version));
 
