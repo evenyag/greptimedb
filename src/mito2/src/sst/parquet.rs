@@ -122,7 +122,9 @@ mod tests {
     use crate::sst::file::{FileHandle, FileMeta, RegionFileId, RegionIndexId};
     use crate::sst::file_purger::NoopFilePurger;
     use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplierBuilder;
+    use crate::sst::index::intermediate::IntermediateManager;
     use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
+    use crate::sst::index::puffin_manager::PuffinManagerFactory;
     use crate::sst::index::{IndexBuildType, Indexer, IndexerBuilder, IndexerBuilderImpl};
     use crate::sst::parquet::format::PrimaryKeyWriteFormat;
     use crate::sst::parquet::reader::{ParquetReader, ParquetReaderBuilder, ReaderMetrics};
@@ -1064,6 +1066,97 @@ mod tests {
         FlatSource::Iter(Box::new(batches.into_iter().map(Ok)))
     }
 
+    /// Builds region metadata for the CPU benchmark test.
+    fn build_cpu_benchmark_region_metadata() -> store_api::metadata::RegionMetadata {
+        use std::collections::HashMap;
+
+        use api::v1::SemanticType;
+        use datatypes::data_type::ConcreteDataType;
+        use datatypes::schema::ColumnSchema;
+        use store_api::codec::PrimaryKeyEncoding;
+        use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+
+        let mut builder =
+            RegionMetadataBuilder::new(store_api::storage::RegionId::from_u64(4398046511104));
+
+        // Tag columns
+        let tag_columns = vec![
+            ("hostname", 0, true), // has inverted index
+            ("region", 1, false),
+            ("datacenter", 2, false),
+            ("rack", 3, false),
+            ("os", 4, false),
+            ("arch", 5, false),
+            ("team", 6, false),
+            ("service", 7, false),
+            ("service_version", 8, false),
+            ("service_environment", 9, false),
+        ];
+
+        for (name, id, has_inverted) in tag_columns {
+            let mut metadata_map = HashMap::new();
+            if has_inverted {
+                metadata_map.insert("greptime:inverted_index".to_string(), "true".to_string());
+            }
+
+            let column_schema = ColumnSchema::new(name, ConcreteDataType::string_datatype(), true)
+                .with_metadata(metadata_map);
+
+            builder.push_column_metadata(ColumnMetadata {
+                column_schema,
+                semantic_type: SemanticType::Tag,
+                column_id: id,
+            });
+        }
+
+        // Field columns
+        let field_columns = vec![
+            ("usage_user", 10),
+            ("usage_system", 11),
+            ("usage_idle", 12),
+            ("usage_nice", 13),
+            ("usage_iowait", 14),
+            ("usage_irq", 15),
+            ("usage_softirq", 16),
+            ("usage_steal", 17),
+            ("usage_guest", 18),
+            ("usage_guest_nice", 19),
+        ];
+
+        for (name, id) in field_columns {
+            let column_schema = ColumnSchema::new(name, ConcreteDataType::int64_datatype(), true);
+
+            builder.push_column_metadata(ColumnMetadata {
+                column_schema,
+                semantic_type: SemanticType::Field,
+                column_id: id,
+            });
+        }
+
+        // Time index column
+        let mut time_metadata = HashMap::new();
+        time_metadata.insert("greptime:time_index".to_string(), "true".to_string());
+
+        let time_column = ColumnSchema::new(
+            "ts",
+            ConcreteDataType::timestamp_nanosecond_datatype(),
+            false,
+        )
+        .with_metadata(time_metadata);
+
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: time_column,
+            semantic_type: SemanticType::Timestamp,
+            column_id: 20,
+        });
+
+        // Set primary key: [region, hostname, datacenter, rack, os, arch, team, service, service_version, service_environment]
+        builder.primary_key(vec![1, 0, 2, 3, 4, 5, 6, 7, 8, 9]);
+        builder.primary_key_encoding(PrimaryKeyEncoding::Dense);
+
+        builder.build().unwrap()
+    }
+
     #[tokio::test]
     async fn test_write_flat_with_index() {
         let mut env = TestEnv::new().await;
@@ -1237,5 +1330,269 @@ mod tests {
             // Override batch should match expected batch
             assert_eq!(*override_batch, expected_batch);
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_external_parquet_and_write_with_index() {
+        use async_stream::try_stream;
+        use object_store::ObjectStore;
+        use smallvec::smallvec;
+        use snafu::ResultExt;
+
+        use crate::error::ArrowReaderSnafu;
+        use crate::read::FlatSource;
+        use crate::sst::file::{ColumnIndexMetadata, IndexType};
+        use crate::sst::parquet::reader::{ParquetReaderBuilder, ReaderMetrics};
+
+        common_telemetry::init_default_ut_logging();
+
+        // Create ObjectStore with root set to /
+        let builder = object_store::services::Fs::default().root("/");
+        let read_store = ObjectStore::new(builder).unwrap().finish();
+
+        let output_dir = "/Users/evenyag/Documents/test/bulk/output";
+        let input_dir = "/Users/evenyag/Documents/test/bulk";
+        let file_path = RegionFilePathFactory::new(output_dir.to_string(), PathType::Bare);
+        let row_group_size = DEFAULT_ROW_GROUP_SIZE;
+
+        // Parse file metadata from JSON
+        let external_file_id = FileId::parse_str("264ccc3d-cc09-451e-b937-6221876bc6ba").unwrap();
+        let external_region_id = store_api::storage::RegionId::from_u64(4398046511104);
+
+        // Create FileHandle with the actual file metadata from JSON
+        let external_handle = FileHandle::new(
+            FileMeta {
+                region_id: external_region_id,
+                file_id: external_file_id,
+                time_range: (
+                    Timestamp::new_nanosecond(1686640080000000000),
+                    Timestamp::new_nanosecond(1686657590000000000),
+                ),
+                level: 1,
+                file_size: 62218019,
+                max_row_group_uncompressed_size: 0,
+                available_indexes: smallvec![IndexType::InvertedIndex],
+                indexes: vec![ColumnIndexMetadata {
+                    column_id: 0,
+                    created_indexes: smallvec![IndexType::InvertedIndex],
+                }],
+                index_file_size: 114123,
+                index_version: 0,
+                num_rows: 7005000,
+                num_row_groups: 69,
+                sequence: std::num::NonZero::new(86400000),
+                partition_expr: None,
+                num_series: 4000,
+            },
+            Arc::new(NoopFilePurger),
+        );
+
+        // Use ParquetReaderBuilder to build reader input
+        let reader_builder = ParquetReaderBuilder::new(
+            input_dir.to_string(),
+            PathType::Bare,
+            external_handle.clone(),
+            read_store.clone(),
+        )
+        .flat_format(true);
+
+        let mut metrics = ReaderMetrics::default();
+        let (context, mut selection) = reader_builder
+            .build_reader_input(&mut metrics)
+            .await
+            .unwrap();
+        let context = Arc::new(context);
+        let file_path_for_error = context.file_path().to_string();
+
+        // Create a stream from the row groups using try_stream macro
+        let stream = try_stream! {
+            while let Some((row_group_idx, row_selection)) = selection.pop_first() {
+                let mut parquet_reader = context
+                    .reader_builder()
+                    .build(row_group_idx, Some(row_selection), None)
+                    .await?;
+
+                // Yield all record batches from this row group
+                while let Some(record_batch_result) = parquet_reader.next() {
+                    let record_batch = record_batch_result.context(ArrowReaderSnafu {
+                        path: file_path_for_error.clone(),
+                    })?;
+                    yield record_batch;
+                }
+            }
+        };
+
+        // Create flat source from the stream
+        let flat_source = FlatSource::Stream(Box::pin(stream));
+
+        let write_opts = WriteOptions {
+            row_group_size,
+            ..Default::default()
+        };
+
+        let write_store = read_store;
+        let metadata = Arc::new(build_cpu_benchmark_region_metadata());
+
+        let index_aux_path = "/Users/evenyag/Documents/test/bulk/output/aux";
+        let puffin_manager_factory = PuffinManagerFactory::new(index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+        let intermediate_manager = IntermediateManager::init_fs(index_aux_path).await.unwrap();
+        let puffin_manager = puffin_manager_factory.build(write_store.clone(), file_path.clone());
+
+        let indexer_builder = IndexerBuilderImpl {
+            build_type: IndexBuildType::Flush,
+            metadata: metadata.clone(),
+            row_group_size,
+            puffin_manager,
+            write_cache_enabled: false,
+            intermediate_manager,
+            index_options: IndexOptions {
+                inverted_index: InvertedIndexOptions {
+                    segment_row_count: 1024,
+                    ..Default::default()
+                },
+            },
+            inverted_index_config: Default::default(),
+            fulltext_index_config: Default::default(),
+            bloom_filter_index_config: Default::default(),
+        };
+
+        let mut write_metrics = Metrics::new(WriteType::Flush);
+        let mut writer = ParquetWriter::new_with_object_store(
+            write_store.clone(),
+            metadata.clone(),
+            IndexConfig::default(),
+            indexer_builder,
+            file_path.clone(),
+            &mut write_metrics,
+        )
+        .await;
+
+        let info = writer
+            .write_all_flat(flat_source, &write_opts)
+            .await
+            .unwrap()
+            .remove(0);
+
+        assert!(info.num_rows > 0);
+        assert!(info.file_size > 0);
+        assert!(info.index_metadata.file_size > 0);
+        assert!(info.index_metadata.inverted_index.index_size > 0);
+        assert_eq!(info.index_metadata.inverted_index.row_count, info.num_rows);
+        // hostname (column 0) should have inverted index
+        assert_eq!(info.index_metadata.inverted_index.columns, vec![0]);
+
+        let region_file_id = RegionFileId::new(metadata.region_id, info.file_id);
+        let sst_file_path = location::sst_file_path(output_dir, region_file_id, PathType::Bare);
+        let index_file_path = location::index_file_path(
+            output_dir,
+            RegionIndexId::new(region_file_id, 0),
+            PathType::Bare,
+        );
+
+        println!(
+            "Successfully wrote {} rows with inverted index",
+            info.num_rows
+        );
+        println!("Output SST file: {}", sst_file_path);
+        println!("Output index file: {}", index_file_path);
+        println!("File size: {} bytes", info.file_size);
+        println!(
+            "Index size: {} bytes",
+            info.index_metadata.inverted_index.index_size
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_external_parquet_filter() {
+        use object_store::ObjectStore;
+        use smallvec::smallvec;
+
+        use crate::sst::file::{ColumnIndexMetadata, IndexType};
+        use crate::sst::parquet::reader::{ParquetReaderBuilder, ReaderMetrics};
+
+        common_telemetry::init_default_ut_logging();
+
+        // Create ObjectStore with root set to /
+        let builder = object_store::services::Fs::default().root("/");
+        let read_store = ObjectStore::new(builder).unwrap().finish();
+
+        let input_dir = "/Users/evenyag/Documents/test/bulk/output/";
+
+        // Parse file metadata from JSON
+        let external_file_id = FileId::parse_str("cae27413-891f-4c4d-b89f-a013bfcd6439").unwrap();
+        let external_region_id = store_api::storage::RegionId::from_u64(4398046511104);
+
+        // Build region metadata
+        let metadata = Arc::new(build_cpu_benchmark_region_metadata());
+
+        // Create FileHandle with the actual file metadata from JSON
+        let external_handle = FileHandle::new(
+            FileMeta {
+                region_id: external_region_id,
+                file_id: external_file_id,
+                time_range: (
+                    Timestamp::new_nanosecond(1686640080000000000),
+                    Timestamp::new_nanosecond(1686657590000000000),
+                ),
+                level: 1,
+                file_size: 62021648,
+                max_row_group_uncompressed_size: 0,
+                available_indexes: smallvec![IndexType::InvertedIndex],
+                indexes: vec![ColumnIndexMetadata {
+                    column_id: 0,
+                    created_indexes: smallvec![IndexType::InvertedIndex],
+                }],
+                index_file_size: 110066,
+                // index_file_size: 114123,
+                index_version: 0,
+                num_rows: 7005000,
+                num_row_groups: 69,
+                sequence: std::num::NonZero::new(86400000),
+                partition_expr: None,
+                num_series: 4000,
+            },
+            Arc::new(NoopFilePurger),
+        );
+
+        // Build inverted index applier for hostname='host_1003'
+        let filters = vec![col("hostname").eq(lit("host_1003"))];
+
+        let index_aux_path = "/Users/evenyag/Documents/test/bulk/output/aux";
+        let puffin_manager_factory = PuffinManagerFactory::new(index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+
+        let inverted_index_applier = InvertedIndexApplierBuilder::new(
+            input_dir.to_string(),
+            PathType::Bare,
+            read_store.clone(),
+            metadata.as_ref(),
+            HashSet::from_iter([0]), // hostname is column 0
+            puffin_manager_factory.clone(),
+        )
+        .build(&filters)
+        .unwrap()
+        .map(Arc::new);
+
+        // Use ParquetReaderBuilder to build reader input
+        let reader_builder = ParquetReaderBuilder::new(
+            input_dir.to_string(),
+            PathType::Bare,
+            external_handle.clone(),
+            read_store.clone(),
+        )
+        .flat_format(true)
+        .inverted_index_appliers([inverted_index_applier, None]);
+
+        let mut metrics = ReaderMetrics::default();
+        let (_context, selection) = reader_builder
+            .build_reader_input(&mut metrics)
+            .await
+            .unwrap();
+        common_telemetry::info!("selection len: {}", selection.row_group_count());
+        common_telemetry::info!("metrics: {:?}", metrics);
+        assert!(!selection.is_empty());
     }
 }
