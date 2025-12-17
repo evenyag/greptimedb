@@ -349,7 +349,12 @@ impl ScanRegion {
 
     /// Scan sequentially.
     pub(crate) async fn seq_scan(self) -> Result<SeqScan> {
-        let input = self.scan_input().await?.with_compaction(false);
+        let key_ranges = self.version.primary_key_ranges.clone();
+        let input = self
+            .scan_input()
+            .await?
+            .with_compaction(false)
+            .with_key_ranges(key_ranges);
         Ok(SeqScan::new(input))
     }
 
