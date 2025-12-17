@@ -328,7 +328,7 @@ impl Drop for BulkPartRecordBatchIter {
 ///
 /// # Panics
 /// Panics if the format is not flat.
-fn apply_combined_filters(
+pub(crate) fn apply_combined_filters(
     context: &BulkIterContext,
     sequence: &Option<SequenceRange>,
     record_batch: RecordBatch,

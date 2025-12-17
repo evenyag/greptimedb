@@ -41,6 +41,7 @@ use crate::memtable::bulk::part::{
     BulkPart, BulkPartEncodeMetrics, BulkPartEncoder, UnorderedPart,
 };
 use crate::memtable::bulk::part_reader::BulkPartRecordBatchIter;
+use crate::memtable::bulk::series::SeriesSet;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, EncodedBulkPart, EncodedRange,
@@ -65,7 +66,7 @@ struct BulkParts {
     encoded_parts: Vec<EncodedPartWrapper>,
     /// Series set for grouping parts by primary key.
     /// None for Default, always Some in actual usage.
-    series_set: Option<series::SeriesSet>,
+    series_set: Option<SeriesSet>,
 }
 
 impl BulkParts {
@@ -437,7 +438,8 @@ impl Memtable for BulkMemtable {
 
             // Adds range for series set if not empty
             if let Some(ref series_set) = bulk_parts.series_set
-                && !series_set.is_empty() {
+                && !series_set.is_empty()
+            {
                 let num_rows = series_set.total_rows();
                 let range = MemtableRange::new(
                     Arc::new(MemtableRangeContext::new(
@@ -661,7 +663,7 @@ impl BulkMemtable {
                 unordered_part: part::UnorderedPart::default(),
                 parts: vec![],
                 encoded_parts: vec![],
-                series_set: Some(series::SeriesSet::new(metadata.clone())),
+                series_set: Some(SeriesSet::new(metadata.clone())),
             })),
             metadata,
             alloc_tracker: AllocTracker::new(write_buffer_manager),
@@ -843,7 +845,7 @@ impl IterBuilder for EncodedBulkRangeIterBuilder {
 
 /// Iterator builder for series set range
 struct SeriesSetRangeIterBuilder {
-    series_set: series::SeriesSet,
+    series_set: SeriesSet,
     context: Arc<BulkIterContext>,
     sequence: Option<SequenceRange>,
 }
@@ -862,9 +864,12 @@ impl IterBuilder for SeriesSetRangeIterBuilder {
 
     fn build_record_batch(
         &self,
-        _metrics: Option<MemScanMetrics>,
+        metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        if let Some(iter) = self.series_set.iter(self.context.clone(), self.sequence)? {
+        if let Some(iter) = self
+            .series_set
+            .iter(self.context.clone(), self.sequence, metrics)?
+        {
             Ok(iter)
         } else {
             // Return an empty iterator if no data to read
@@ -1367,8 +1372,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_write_read() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            999,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
@@ -1437,8 +1449,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_ranges_with_projection() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            111,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
 
         let bulk_part = create_bulk_part_with_converter(
             "projection_test",
@@ -1479,8 +1498,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_unsupported_operations() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(111, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            111,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
 
         let key_values = build_key_values_with_ts_seq_values(
             &metadata,
@@ -1502,8 +1528,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_freeze() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(222, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            222,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
 
         let bulk_part = create_bulk_part_with_converter(
             "freeze_test",
@@ -1524,8 +1557,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_fork() {
         let metadata = metadata_for_test();
-        let original_memtable =
-            BulkMemtable::new(333, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let original_memtable = BulkMemtable::new(
+            333,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
 
         let bulk_part =
             create_bulk_part_with_converter("fork_test", 15, vec![15000], vec![Some(150.0)], 1500)
@@ -1546,8 +1586,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_ranges_multiple_parts() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(777, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            777,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
@@ -1596,8 +1643,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_ranges_with_sequence_filter() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(888, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            888,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
 
         let part = create_bulk_part_with_converter(
             "seq_test",
@@ -1631,8 +1685,15 @@ mod tests {
     #[test]
     fn test_bulk_memtable_ranges_with_encoded_parts() {
         let metadata = metadata_for_test();
-        let memtable =
-            BulkMemtable::new(999, metadata.clone(), None, None, false, MergeMode::LastRow, None);
+        let memtable = BulkMemtable::new(
+            999,
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+            None,
+        );
         // Disable unordered_part for this test
         memtable.set_unordered_part_threshold(0);
 
