@@ -922,6 +922,13 @@ impl ParquetReaderBuilder {
     ) {
         apply_selection_and_update_metrics(output, &result, metrics, index_type);
 
+        common_telemetry::info!(
+            "apply index result, file_id: {}, predicate_key: {:?}, metrics: {:?}",
+            file_id,
+            predicate_key,
+            metrics
+        );
+
         if let Some(index_result_cache) = &self.cache_strategy.index_result_cache() {
             index_result_cache.put(predicate_key.clone(), file_id, Arc::new(result));
         }
