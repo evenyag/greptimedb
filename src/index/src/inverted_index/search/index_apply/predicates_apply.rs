@@ -77,11 +77,18 @@ impl IndexApplier for PredicatesIndexApplier {
             };
             let fst_offset = meta.base_offset + meta.relative_fst_offset as u64;
             let fst_size = meta.fst_size as u64;
+            common_telemetry::info!(
+                "apply index for {}, offset: {}, size: {}",
+                name,
+                fst_offset,
+                fst_size
+            );
             appliers.push((fst_applier, meta));
             fst_ranges.push(fst_offset..fst_offset + fst_size);
         }
 
         if fst_ranges.is_empty() {
+            common_telemetry::info!("apply index fst_ranges empty");
             output.matched_segment_ids = Self::bitmap_full_range(&metadata);
             return Ok(output);
         }
@@ -95,10 +102,12 @@ impl IndexApplier for PredicatesIndexApplier {
 
         let mut mapper = ParallelFstValuesMapper::new(reader);
         let mut bm_vec = mapper.map_values_vec(&value_and_meta_vec, metrics).await?;
+        common_telemetry::info!("apply index for bm_vec length: {}", bm_vec.len());
 
         let mut bitmap = bm_vec.pop().unwrap(); // SAFETY: `fst_ranges` is not empty
         for bm in bm_vec {
             if bm.count_ones() == 0 {
+                common_telemetry::info!("apply index bit map all zeros");
                 break;
             }
 
