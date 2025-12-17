@@ -61,10 +61,11 @@ impl<'a> ParallelFstValuesMapper<'a> {
         }
 
         if fetch_ranges.is_empty() {
+            common_telemetry::info!("fetch ranges empty");
             return Ok(vec![Bitmap::new_bitvec()]);
         }
 
-        common_telemetry::debug!("fetch ranges: {:?}", fetch_ranges);
+        common_telemetry::info!("{} fetch ranges: {:?}", fetch_ranges.len(), fetch_ranges);
         let mut bitmaps = self.reader.bitmap_deque(&fetch_ranges, metrics).await?;
         let mut output = Vec::with_capacity(groups.len());
 
