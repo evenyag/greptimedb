@@ -291,6 +291,7 @@ impl SeqScan {
         if !skip_parallel_sources && let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
+                common_telemetry::info!("Create parallel flat sources, sources: {}", sources.len());
                 sources = stream_ctx
                     .input
                     .create_parallel_flat_sources(sources, semaphore.clone())?;
