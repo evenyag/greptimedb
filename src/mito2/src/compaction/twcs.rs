@@ -107,9 +107,25 @@ impl TwcsPicker {
                 merge_seq_files(run.items(), self.max_output_file_size)
             };
 
+            info!(
+                "Picking compaction window {} for region {}, found_runs: {}, inputs file group num: {}",
+                window,
+                region_id,
+                found_runs,
+                inputs.len()
+            );
+
             // Limits the number of input files.
             let total_input_files: usize = inputs.iter().map(|fg| fg.num_files()).sum();
             if total_input_files > DEFAULT_MAX_INPUT_FILE_NUM {
+                info!(
+                    "Compaction for region {} need to handle limit: {}, current total: {}, fg_sizes: {:?}",
+                    region_id,
+                    DEFAULT_MAX_INPUT_FILE_NUM,
+                    total_input_files,
+                    inputs.iter().map(|fg| fg.num_files()).collect::<Vec<_>>(),
+                );
+
                 // Sorts file groups by size first.
                 inputs.sort_unstable_by_key(|fg| fg.size());
                 let mut num_picked_files = 0;
