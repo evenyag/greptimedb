@@ -1373,7 +1373,7 @@ impl MultiBulkPart {
             return Ok(None);
         }
 
-        let iter = crate::memtable::bulk::part_reader::MultiBulkPartIter::new(
+        let iter = crate::memtable::bulk::part_reader::BulkPartBatchIter::new(
             self.batches.iter().cloned().collect(),
             context,
             sequence,
