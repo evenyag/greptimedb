@@ -401,11 +401,23 @@ impl FlatPruneReader {
             .downcast_ref::<BinaryArray>()
             .unwrap();
 
+        let get_key = |idx: usize| -> &[u8] {
+            let dict_index = dict_array.keys().value(idx) as usize;
+            values_array.value(dict_index)
+        };
+
+        let first_key = get_key(0);
+        let last_key = get_key(num_rows - 1);
+
+        // Fast path: if both first and last keys are in range, return the whole batch.
+        if self.key_range.contains(first_key) && self.key_range.contains(last_key) {
+            return Ok(Some(batch));
+        }
+
+        // Slow path: iterate through rows to filter.
         let mut mask = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            // Primary key array is not null.
-            let dict_index = dict_array.keys().value(i) as usize;
-            let key = values_array.value(dict_index);
+            let key = get_key(i);
             mask.push(self.key_range.contains(key));
         }
 
