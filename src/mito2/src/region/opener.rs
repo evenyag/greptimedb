@@ -68,6 +68,7 @@ use crate::sst::file::{FileMeta, RegionFileId, RegionIndexId};
 use crate::sst::file_purger::{FilePurgerRef, create_file_purger};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::reader::MetadataCacheMetrics;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
@@ -507,7 +508,8 @@ impl RegionOpener {
                 file_meta.file_size,
             );
 
-            let parquet_metadata = match metadata_loader.load().await {
+            let mut cache_metrics = MetadataCacheMetrics::default();
+            let parquet_metadata = match metadata_loader.load(&mut cache_metrics).await {
                 Ok(meta) => meta,
                 Err(e) => {
                     debug!(
