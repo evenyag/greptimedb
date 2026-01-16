@@ -463,6 +463,15 @@ impl RegionOpener {
                     num_files,
                     region_id
                 );
+                // Log each range in hex format
+                for (i, range) in pk_ranges.iter().enumerate() {
+                    let start_hex = range.start.as_ref().map(hex::encode).unwrap_or_else(|| "unbounded".to_string());
+                    let end_hex = range.end.as_ref().map(hex::encode).unwrap_or_else(|| "unbounded".to_string());
+                    debug!(
+                        "Region {} PK range {}: [{}, {})",
+                        region_id, i, start_hex, end_hex
+                    );
+                }
                 pk_ranges
             }
             Err(e) => {

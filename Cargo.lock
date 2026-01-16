@@ -8065,6 +8065,7 @@ dependencies = [
  "either",
  "futures",
  "greptime-proto",
+ "hex",
  "humantime-serde",
  "index",
  "itertools 0.14.0",
