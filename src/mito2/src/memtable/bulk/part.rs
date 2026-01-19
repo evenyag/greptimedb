@@ -1077,6 +1077,7 @@ impl EncodedBulkPart {
             row_groups_to_read,
             sequence,
             mem_scan_metrics,
+            key_range,
         )?;
         Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
     }
@@ -1383,6 +1384,7 @@ impl MultiBulkPart {
         context: BulkIterContextRef,
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> Result<Option<BoxedRecordBatchIterator>> {
         if self.batches.is_empty() {
             return Ok(None);
@@ -1394,6 +1396,7 @@ impl MultiBulkPart {
             sequence,
             self.series_count,
             mem_scan_metrics,
+            key_range,
         );
         Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
     }

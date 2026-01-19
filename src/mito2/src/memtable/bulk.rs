@@ -824,6 +824,7 @@ impl IterBuilder for BulkRangeIterBuilder {
             self.sequence,
             series_count,
             metrics,
+            key_range,
         );
 
         Ok(Box::new(iter))
@@ -855,9 +856,8 @@ impl IterBuilder for MultiBulkRangeIterBuilder {
         key_range: PrimaryKeyRange,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        // TODO(yingwen): Support key_range.
         self.part
-            .read(self.context.clone(), self.sequence, metrics)?
+            .read(self.context.clone(), self.sequence, metrics, key_range)?
             .ok_or_else(|| {
                 UnsupportedOperationSnafu {
                     err_msg: "Failed to create iterator for multi bulk part",
@@ -1089,12 +1089,15 @@ impl PartToMerge {
                     context,
                     None, // No sequence filter for merging
                     series_count,
-                    None, // No metrics for merging
+                    None,                         // No metrics for merging
+                    PrimaryKeyRange::unbounded(), // No key range filter for merging
                 );
                 Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
             }
             // TODO(yingwen): support key range.
-            PartToMerge::Multi { part, .. } => part.read(context, None, None),
+            PartToMerge::Multi { part, .. } => {
+                part.read(context, None, None, PrimaryKeyRange::unbounded())
+            }
             PartToMerge::Encoded { part, .. } => {
                 part.read(context, None, None, PrimaryKeyRange::unbounded())
             }

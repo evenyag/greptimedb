@@ -537,6 +537,7 @@ fn flat_merge_iterator_bench(c: &mut Criterion) {
                             None, // No sequence filter
                             1024, // 1024 hosts per part
                             None, // No mem_scan_metrics
+                            PrimaryKeyRange::unbounded(),
                         );
                         iters.push(Box::new(iter) as _);
                     }
@@ -600,6 +601,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                 None, // No sequence filter
                 4096, // 4096 hosts
                 None, // No mem_scan_metrics
+                PrimaryKeyRange::unbounded(),
             );
 
             // Consume all batches
@@ -630,6 +632,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                 None, // No sequence filter
                 4096, // 4096 hosts
                 None, // No mem_scan_metrics
+                PrimaryKeyRange::unbounded(),
             );
 
             // Consume all batches
