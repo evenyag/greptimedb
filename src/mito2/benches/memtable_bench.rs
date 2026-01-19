@@ -27,7 +27,7 @@ use mito2::memtable::bulk::part::BulkPartConverter;
 use mito2::memtable::bulk::part_reader::BulkPartRecordBatchIter;
 use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable};
 use mito2::memtable::time_series::TimeSeriesMemtable;
-use mito2::memtable::{KeyValues, Memtable};
+use mito2::memtable::{KeyValues, Memtable, PrimaryKeyRange};
 use mito2::read::flat_merge::FlatMergeIterator;
 use mito2::region::options::MergeMode;
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
@@ -479,6 +479,7 @@ fn flat_merge_iterator_bench(c: &mut Criterion) {
                             None, // No sequence filter
                             1024, // 1024 hosts per part
                             None, // No mem_scan_metrics
+                            PrimaryKeyRange::unbounded(),
                         );
                         iters.push(Box::new(iter) as _);
                     }
@@ -542,6 +543,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                 None, // No sequence filter
                 4096, // 4096 hosts
                 None, // No mem_scan_metrics
+                PrimaryKeyRange::unbounded(),
             );
 
             // Consume all batches
@@ -572,6 +574,7 @@ fn bulk_part_record_batch_iter_filter(c: &mut Criterion) {
                 None, // No sequence filter
                 4096, // 4096 hosts
                 None, // No mem_scan_metrics
+                PrimaryKeyRange::unbounded(),
             );
 
             // Consume all batches

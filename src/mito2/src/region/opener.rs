@@ -50,10 +50,9 @@ use crate::error::{
 };
 use crate::manifest::action::RegionManifest;
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
-use crate::memtable::MemtableBuilderProvider;
-use crate::memtable::PrimaryKeyRange;
 use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
+use crate::memtable::{MemtableBuilderProvider, PrimaryKeyRange};
 use crate::metrics::{CACHE_FILL_DOWNLOADED_FILES, CACHE_FILL_PENDING_FILES};
 use crate::region::options::RegionOptions;
 use crate::region::version::{VersionBuilder, VersionControl, VersionControlRef};
@@ -66,13 +65,13 @@ use crate::schedule::scheduler::SchedulerRef;
 use crate::sst::FormatType;
 use crate::sst::file::{FileMeta, RegionFileId, RegionIndexId};
 use crate::sst::file_purger::{FilePurgerRef, create_file_purger};
-use crate::sst::parquet::flat_format::primary_key_column_index;
-use crate::sst::parquet::metadata::MetadataLoader;
-use crate::sst::parquet::reader::MetadataCacheMetrics;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::sst::location::{self, region_dir_from_table_dir};
+use crate::sst::parquet::flat_format::primary_key_column_index;
+use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::reader::MetadataCacheMetrics;
 use crate::time_provider::TimeProviderRef;
 use crate::wal::entry_reader::WalEntryReader;
 use crate::wal::{EntryId, Wal};
@@ -427,14 +426,13 @@ impl RegionOpener {
         const NUM_FILES_TO_CONSIDER: usize = 64;
 
         // Step 1: Collect all files from the manifest
-        let mut all_files: Vec<FileMeta> = manifest
-            .files
-            .values()
-            .cloned()
-            .collect();
+        let mut all_files: Vec<FileMeta> = manifest.files.values().cloned().collect();
 
         if all_files.is_empty() {
-            debug!("No SST files found for region {}, skipping PK range collection", region_id);
+            debug!(
+                "No SST files found for region {}, skipping PK range collection",
+                region_id
+            );
             return Vec::new();
         }
 
@@ -442,7 +440,8 @@ impl RegionOpener {
         all_files.sort_by(|a, b| b.time_range.1.cmp(&a.time_range.1));
 
         // Step 3: Take latest files
-        let latest_files: Vec<FileMeta> = all_files.into_iter().take(NUM_FILES_TO_CONSIDER).collect();
+        let latest_files: Vec<FileMeta> =
+            all_files.into_iter().take(NUM_FILES_TO_CONSIDER).collect();
         let num_files = latest_files.len();
 
         // Step 4: Call the helper function to collect PK ranges from the file with max row groups
@@ -464,8 +463,16 @@ impl RegionOpener {
                 );
                 // Log each range in hex format
                 for (i, range) in pk_ranges.iter().enumerate() {
-                    let start_hex = range.start.as_ref().map(hex::encode).unwrap_or_else(|| "unbounded".to_string());
-                    let end_hex = range.end.as_ref().map(hex::encode).unwrap_or_else(|| "unbounded".to_string());
+                    let start_hex = range
+                        .start
+                        .as_ref()
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "unbounded".to_string());
+                    let end_hex = range
+                        .end
+                        .as_ref()
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "unbounded".to_string());
                     debug!(
                         "Region {} PK range {}: [{}, {})",
                         region_id, i, start_hex, end_hex
@@ -510,11 +517,8 @@ impl RegionOpener {
             let file_id = RegionFileId::new(region_id, file_meta.file_id);
             let file_path = location::sst_file_path(table_dir, file_id, path_type);
 
-            let metadata_loader = MetadataLoader::new(
-                object_store.clone(),
-                &file_path,
-                file_meta.file_size,
-            );
+            let metadata_loader =
+                MetadataLoader::new(object_store.clone(), &file_path, file_meta.file_size);
 
             let mut cache_metrics = MetadataCacheMetrics::default();
             let parquet_metadata = match metadata_loader.load(&mut cache_metrics).await {

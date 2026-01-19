@@ -1076,6 +1076,7 @@ impl EncodedBulkPart {
             row_groups_to_read,
             sequence,
             mem_scan_metrics,
+            key_range,
         )?;
         Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
     }

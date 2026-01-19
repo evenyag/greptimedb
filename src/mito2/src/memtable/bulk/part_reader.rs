@@ -26,10 +26,11 @@ use crate::error::{self, ComputeArrowSnafu, DecodeArrowRowGroupSnafu};
 use crate::memtable::bulk::context::{BulkIterContext, BulkIterContextRef};
 use crate::memtable::bulk::part::EncodedBulkPart;
 use crate::memtable::bulk::row_group_reader::MemtableRowGroupReaderBuilder;
-use crate::memtable::{MemScanMetrics, MemScanMetricsData};
+use crate::memtable::{MemScanMetrics, MemScanMetricsData, PrimaryKeyRange};
 use crate::metrics::{READ_ROWS_TOTAL, READ_STAGE_ELAPSED};
 use crate::sst::parquet::file_range::PreFilterMode;
-use crate::sst::parquet::flat_format::sequence_column_index;
+use crate::sst::parquet::flat_format::{primary_key_column_index, sequence_column_index};
+use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::reader::RowGroupReaderContext;
 
 /// Iterator for reading data inside a bulk part.
@@ -46,6 +47,8 @@ pub struct EncodedBulkPartIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Primary key range for filtering.
+    key_range: PrimaryKeyRange,
 }
 
 impl EncodedBulkPartIter {
@@ -56,6 +59,7 @@ impl EncodedBulkPartIter {
         mut row_groups_to_read: VecDeque<usize>,
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> error::Result<Self> {
         assert!(context.read_format().as_flat().is_some());
 
@@ -91,6 +95,7 @@ impl EncodedBulkPartIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            key_range,
         })
     }
 
@@ -117,6 +122,7 @@ impl EncodedBulkPartIter {
                 &self.sequence,
                 batch,
                 self.current_skip_fields,
+                &self.key_range,
             )? {
                 // Update metrics
                 self.metrics.num_batches += 1;
@@ -143,6 +149,7 @@ impl EncodedBulkPartIter {
                     &self.sequence,
                     batch,
                     self.current_skip_fields,
+                    &self.key_range,
                 )? {
                     // Update metrics
                     self.metrics.num_batches += 1;
@@ -208,6 +215,8 @@ pub struct BulkPartRecordBatchIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Primary key range for filtering.
+    key_range: PrimaryKeyRange,
 }
 
 impl BulkPartRecordBatchIter {
@@ -218,6 +227,7 @@ impl BulkPartRecordBatchIter {
         sequence: Option<SequenceRange>,
         series_count: usize,
         mem_scan_metrics: Option<MemScanMetrics>,
+        key_range: PrimaryKeyRange,
     ) -> Self {
         assert!(context.read_format().as_flat().is_some());
 
@@ -230,6 +240,7 @@ impl BulkPartRecordBatchIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            key_range,
         }
     }
 
@@ -256,15 +267,20 @@ impl BulkPartRecordBatchIter {
 
         // Apply projection first.
         let projected_batch = self.apply_projection(record_batch)?;
-        // Apply combined filtering (both predicate and sequence filters)
+        // Apply combined filtering (key range, predicate, and sequence filters)
         // For BulkPartRecordBatchIter, we don't have row group information.
         let skip_fields = match self.context.pre_filter_mode() {
             PreFilterMode::All => false,
             PreFilterMode::SkipFields => true,
             PreFilterMode::SkipFieldsOnDelete => true,
         };
-        let Some(filtered_batch) =
-            apply_combined_filters(&self.context, &self.sequence, projected_batch, skip_fields)?
+        let Some(filtered_batch) = apply_combined_filters(
+            &self.context,
+            &self.sequence,
+            projected_batch,
+            skip_fields,
+            &self.key_range,
+        )?
         else {
             self.metrics.scan_cost += start.elapsed();
             return Ok(None);
@@ -323,7 +339,7 @@ impl Drop for BulkPartRecordBatchIter {
     }
 }
 
-/// Applies both predicate filtering and sequence filtering in a single pass.
+/// Applies key range, predicate, and sequence filtering in a single pass.
 /// Returns None if the filtered batch is empty.
 ///
 /// # Panics
@@ -333,6 +349,7 @@ fn apply_combined_filters(
     sequence: &Option<SequenceRange>,
     record_batch: RecordBatch,
     skip_fields: bool,
+    key_range: &PrimaryKeyRange,
 ) -> error::Result<Option<RecordBatch>> {
     // Converts the format to the flat format first.
     let format = context.read_format().as_flat().unwrap();
@@ -341,7 +358,18 @@ fn apply_combined_filters(
     let num_rows = record_batch.num_rows();
     let mut combined_filter = None;
 
-    // First, apply predicate filters using the shared method.
+    // First, apply key range filter.
+    if !key_range.is_unbounded() {
+        let key_range_filter = compute_key_range_filter(&record_batch, key_range)?;
+        if let Some(filter) = key_range_filter {
+            combined_filter = Some(filter);
+        } else {
+            // Entire batch is outside key range
+            return Ok(None);
+        }
+    }
+
+    // Apply predicate filters using the shared method.
     if !context.base.filters.is_empty() {
         let predicate_mask = context
             .base
@@ -350,7 +378,17 @@ fn apply_combined_filters(
         let Some(mask) = predicate_mask else {
             return Ok(None);
         };
-        combined_filter = Some(BooleanArray::from(mask));
+        let predicate_filter = BooleanArray::from(mask);
+        // Combine with existing filter using AND operation
+        combined_filter = match combined_filter {
+            None => Some(predicate_filter),
+            Some(existing_filter) => {
+                let and_result =
+                    datatypes::arrow::compute::and(&existing_filter, &predicate_filter)
+                        .context(ComputeArrowSnafu)?;
+                Some(and_result)
+            }
+        };
     }
 
     // Filters rows by the given `sequence`. Only preserves rows with sequence less than or equal to `sequence`.
@@ -388,6 +426,65 @@ fn apply_combined_filters(
             .context(ComputeArrowSnafu)?;
 
     Ok(Some(filtered_batch))
+}
+
+/// Computes a boolean filter array for rows that fall within the key range.
+/// Returns None if the entire batch is outside the key range.
+/// Returns Some(filter) if filtering is needed, where filter is a BooleanArray.
+fn compute_key_range_filter(
+    record_batch: &RecordBatch,
+    key_range: &PrimaryKeyRange,
+) -> error::Result<Option<BooleanArray>> {
+    use datatypes::arrow_array::BinaryArray;
+
+    let num_rows = record_batch.num_rows();
+    if num_rows == 0 {
+        return Ok(Some(BooleanArray::from(vec![true; 0])));
+    }
+
+    let pk_col_idx = primary_key_column_index(record_batch.num_columns());
+    let pk_column = record_batch.column(pk_col_idx);
+    let dict_array = pk_column
+        .as_any()
+        .downcast_ref::<PrimaryKeyArray>()
+        .unwrap();
+    let values_array = dict_array
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+
+    let get_key = |idx: usize| -> &[u8] {
+        let dict_index = dict_array.keys().value(idx) as usize;
+        values_array.value(dict_index)
+    };
+
+    let first_key = get_key(0);
+    let last_key = get_key(num_rows - 1);
+
+    // Fast path: if both first and last keys are in range, return the whole batch.
+    if key_range.contains(first_key) && key_range.contains(last_key) {
+        // Return a filter that accepts all rows
+        return Ok(Some(BooleanArray::from(vec![true; num_rows])));
+    }
+
+    // Slow path: iterate through rows to filter.
+    let mut mask = Vec::with_capacity(num_rows);
+    let mut any_in_range = false;
+    for i in 0..num_rows {
+        let key = get_key(i);
+        let in_range = key_range.contains(key);
+        if in_range {
+            any_in_range = true;
+        }
+        mask.push(in_range);
+    }
+
+    if !any_in_range {
+        return Ok(None);
+    }
+
+    Ok(Some(BooleanArray::from(mask)))
 }
 
 #[cfg(test)]
@@ -501,8 +598,14 @@ mod tests {
             .unwrap(),
         );
         // Iterates all rows.
-        let iter =
-            BulkPartRecordBatchIter::new(record_batch.clone(), context.clone(), None, 0, None);
+        let iter = BulkPartRecordBatchIter::new(
+            record_batch.clone(),
+            context.clone(),
+            None,
+            0,
+            None,
+            PrimaryKeyRange::unbounded(),
+        );
         let result: Vec<_> = iter.map(|rb| rb.unwrap()).collect();
         assert_eq!(1, result.len());
         assert_eq!(3, result[0].num_rows());
@@ -515,6 +618,7 @@ mod tests {
             Some(SequenceRange::LtEq { max: 2 }),
             0,
             None,
+            PrimaryKeyRange::unbounded(),
         );
         let result: Vec<_> = iter.map(|rb| rb.unwrap()).collect();
         assert_eq!(1, result.len());
@@ -535,8 +639,14 @@ mod tests {
             .unwrap(),
         );
         // Creates iter with projection and predicate.
-        let iter =
-            BulkPartRecordBatchIter::new(record_batch.clone(), context.clone(), None, 0, None);
+        let iter = BulkPartRecordBatchIter::new(
+            record_batch.clone(),
+            context.clone(),
+            None,
+            0,
+            None,
+            PrimaryKeyRange::unbounded(),
+        );
         let result: Vec<_> = iter.map(|rb| rb.unwrap()).collect();
         assert_eq!(1, result.len());
         assert_eq!(1, result[0].num_rows());

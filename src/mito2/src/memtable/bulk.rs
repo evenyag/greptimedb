@@ -708,6 +708,7 @@ impl IterBuilder for BulkRangeIterBuilder {
             self.sequence,
             series_count,
             metrics,
+            key_range,
         );
 
         Ok(Box::new(iter))
@@ -896,7 +897,8 @@ impl PartToMerge {
                     context,
                     None, // No sequence filter for merging
                     series_count,
-                    None, // No metrics for merging
+                    None,                         // No metrics for merging
+                    PrimaryKeyRange::unbounded(), // No key range filter for merging
                 );
                 Ok(Some(Box::new(iter) as BoxedRecordBatchIterator))
             }
