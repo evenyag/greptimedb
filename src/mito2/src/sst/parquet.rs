@@ -24,15 +24,18 @@ use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 use crate::sst::file::FileTimeRange;
 use crate::sst::index::IndexOutput;
 
+pub(crate) mod async_reader;
 pub(crate) mod file_range;
 pub mod flat_format;
 pub mod format;
 pub(crate) mod helper;
 pub(crate) mod metadata;
+pub(crate) mod prewhere;
 pub mod reader;
 pub mod row_group;
 pub mod row_selection;
 pub(crate) mod stats;
+pub(crate) mod tag_decode;
 pub mod writer;
 
 /// Key of metadata in parquet SST.

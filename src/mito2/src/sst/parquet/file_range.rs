@@ -15,7 +15,6 @@
 //! Structs and functions for reading ranges from a parquet file. A file range
 //! is usually a row group in a parquet file.
 
-use std::collections::HashMap;
 use std::ops::BitAnd;
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ use api::v1::{OpType, SemanticType};
 use common_telemetry::error;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
-use datatypes::arrow::array::{ArrayRef, BooleanArray};
+use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
@@ -32,11 +31,11 @@ use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::file::metadata::ParquetMetaData;
 use snafu::{OptionExt, ResultExt};
-use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{ColumnId, TimeSeriesRowSelector};
+use store_api::storage::TimeSeriesRowSelector;
 use table::predicate::Predicate;
 
+use crate::config::PrewhereConfig;
 use crate::error::{
     ComputeArrowSnafu, DataTypeMismatchSnafu, DecodeSnafu, DecodeStatsSnafu,
     EvalPartitionFilterSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu,
@@ -48,15 +47,15 @@ use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::prune::{FlatPruneReader, PruneReader};
 use crate::sst::file::FileHandle;
-use crate::sst::parquet::flat_format::{
-    DecodedPrimaryKeys, decode_primary_keys, time_index_column_index,
-};
+use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
-    FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
+    FlatRowGroupReader, MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReader,
+    RowGroupReaderBuilder, SimpleFilterContext,
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
+use crate::sst::parquet::tag_decode::{TagDecodeState, maybe_decode_tag_column};
 
 /// Checks if a row group contains delete operations by examining the min value of op_type column.
 ///
@@ -181,6 +180,8 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
+        // Compute skip_fields once for this row group
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
         let parquet_reader = self
             .context
             .reader_builder
@@ -188,6 +189,13 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    filters: self.context.filters(),
+                    physical_filters: self.context.physical_filters(),
+                    read_format: self.context.read_format(),
+                    skip_fields,
+                    prewhere_config: self.context.prewhere_config(),
+                },
             )
             .await?;
 
@@ -209,9 +217,6 @@ impl FileRange {
             // No selector provided, use RowGroupReader
             false
         };
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let prune_reader = if use_last_row_reader {
             // Row group is PUT only, use LastRowReader to skip unnecessary rows.
@@ -242,6 +247,8 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
+        // Compute skip_fields once for this row group
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
         let parquet_reader = self
             .context
             .reader_builder
@@ -249,11 +256,15 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    filters: self.context.filters(),
+                    physical_filters: self.context.physical_filters(),
+                    read_format: self.context.read_format(),
+                    skip_fields,
+                    prewhere_config: self.context.prewhere_config(),
+                },
             )
             .await?;
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let flat_row_group_reader = FlatRowGroupReader::new(self.context.clone(), parquet_reader);
         let flat_prune_reader = FlatPruneReader::new_with_row_group_reader(
@@ -300,14 +311,14 @@ impl FileRangeContext {
         }
     }
 
-    /// Returns the path of the file to read.
-    pub(crate) fn file_path(&self) -> &str {
-        self.reader_builder.file_path()
-    }
-
     /// Returns filters pushed down.
     pub(crate) fn filters(&self) -> &[SimpleFilterContext] {
         &self.base.filters
+    }
+
+    /// Returns physical filters pushed down.
+    pub(crate) fn physical_filters(&self) -> &[PhysicalFilterContext] {
+        &self.base.physical_filters
     }
 
     /// Returns true if a partition filter is configured.
@@ -380,6 +391,12 @@ impl FileRangeContext {
     pub(crate) fn memory_size(&self) -> usize {
         crate::cache::cache_size::parquet_meta_size(self.reader_builder.parquet_metadata())
     }
+
+    /// Returns the prewhere configuration.
+    #[allow(dead_code)]
+    pub(crate) fn prewhere_config(&self) -> &PrewhereConfig {
+        &self.base.prewhere_config
+    }
 }
 
 /// Mode to pre-filter columns in a range.
@@ -406,6 +423,8 @@ pub(crate) struct PartitionFilterContext {
 pub(crate) struct RangeBase {
     /// Filters pushed down.
     pub(crate) filters: Vec<SimpleFilterContext>,
+    /// Physical filters pushed down (used in prewhere).
+    pub(crate) physical_filters: Vec<PhysicalFilterContext>,
     /// Dynamic filter physical exprs.
     pub(crate) dyn_filters: Arc<Vec<DynamicFilterPhysicalExpr>>,
     /// Helper to read the SST.
@@ -423,20 +442,9 @@ pub(crate) struct RangeBase {
     pub(crate) pre_filter_mode: PreFilterMode,
     /// Partition filter.
     pub(crate) partition_filter: Option<PartitionFilterContext>,
-}
-
-pub(crate) struct TagDecodeState {
-    decoded_pks: Option<DecodedPrimaryKeys>,
-    decoded_tag_cache: HashMap<ColumnId, ArrayRef>,
-}
-
-impl TagDecodeState {
-    pub(crate) fn new() -> Self {
-        Self {
-            decoded_pks: None,
-            decoded_tag_cache: HashMap::new(),
-        }
-    }
+    /// Prewhere configuration for optimizing reads.
+    #[allow(dead_code)]
+    pub(crate) prewhere_config: PrewhereConfig,
 }
 
 impl RangeBase {
@@ -653,9 +661,13 @@ impl RangeBase {
                 // Column not found in projection, it may be a tag column.
                 let column_id = filter_ctx.column_id();
 
-                if let Some(tag_column) =
-                    self.maybe_decode_tag_column(metadata, column_id, input, tag_decode_state)?
-                {
+                if let Some(tag_column) = maybe_decode_tag_column(
+                    metadata,
+                    column_id,
+                    input,
+                    tag_decode_state,
+                    self.codec.as_ref(),
+                )? {
                     let result = filter
                         .evaluate_array(&tag_column)
                         .context(RecordBatchSnafu)?;
@@ -671,51 +683,6 @@ impl RangeBase {
         }
 
         Ok(Some(mask))
-    }
-
-    /// Returns the decoded tag column for `column_id`, or `None` if it's not a tag.
-    fn maybe_decode_tag_column(
-        &self,
-        metadata: &RegionMetadataRef,
-        column_id: ColumnId,
-        input: &RecordBatch,
-        tag_decode_state: &mut TagDecodeState,
-    ) -> Result<Option<ArrayRef>> {
-        let Some(pk_index) = metadata.primary_key_index(column_id) else {
-            return Ok(None);
-        };
-
-        if let Some(cached_column) = tag_decode_state.decoded_tag_cache.get(&column_id) {
-            return Ok(Some(cached_column.clone()));
-        }
-
-        if tag_decode_state.decoded_pks.is_none() {
-            tag_decode_state.decoded_pks = Some(decode_primary_keys(self.codec.as_ref(), input)?);
-        }
-
-        let pk_index = if self.codec.encoding() == PrimaryKeyEncoding::Sparse {
-            None
-        } else {
-            Some(pk_index)
-        };
-        let Some(column_index) = metadata.column_index_by_id(column_id) else {
-            return Ok(None);
-        };
-        let Some(decoded) = tag_decode_state.decoded_pks.as_ref() else {
-            return Ok(None);
-        };
-
-        let column_metadata = &metadata.column_metadatas[column_index];
-        let tag_column = decoded.get_tag_column(
-            column_id,
-            pk_index,
-            &column_metadata.column_schema.data_type,
-        )?;
-        tag_decode_state
-            .decoded_tag_cache
-            .insert(column_id, tag_column.clone());
-
-        Ok(Some(tag_column))
     }
 
     /// Evaluates the partition filter against the input `RecordBatch`.
@@ -866,9 +833,13 @@ impl RangeBase {
                 continue;
             }
 
-            if let Some(tag_column) =
-                self.maybe_decode_tag_column(metadata, column_id, input, tag_decode_state)?
-            {
+            if let Some(tag_column) = maybe_decode_tag_column(
+                metadata,
+                column_id,
+                input,
+                tag_decode_state,
+                self.codec.as_ref(),
+            )? {
                 columns.push(tag_column);
                 continue;
             }

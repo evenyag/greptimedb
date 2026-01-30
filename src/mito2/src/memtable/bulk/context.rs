@@ -90,6 +90,7 @@ impl BulkIterContext {
         Ok(Self {
             base: RangeBase {
                 filters: simple_filters,
+                physical_filters: Vec::new(),
                 dyn_filters,
                 read_format,
                 prune_schema: region_metadata.schema.clone(),
@@ -100,6 +101,7 @@ impl BulkIterContext {
                 compaction_projection_mapper: None,
                 pre_filter_mode,
                 partition_filter: None,
+                prewhere_config: crate::config::PrewhereConfig::default(),
             },
             predicate,
         })
