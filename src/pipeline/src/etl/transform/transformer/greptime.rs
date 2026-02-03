@@ -609,7 +609,7 @@ fn resolve_value(
     let index = schema_info.index.get(&column_name).copied();
 
     let value_data = match value {
-        VrlValue::Null => None,
+        VrlValue::Null => return Ok(()),
 
         VrlValue::Integer(v) => {
             // safe unwrap after type matched
