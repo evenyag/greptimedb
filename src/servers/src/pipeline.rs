@@ -135,17 +135,11 @@ async fn run_custom_pipeline(
             let mut schema_info = SchemaInfo::default();
             schema_info
                 .schema
-                .push(time_index_column_schema(ts_name, timeunit).into());
+                .push(time_index_column_schema(ts_name, timeunit));
 
             schema_info
         }
     };
-
-    let table = handler
-        .get_table(&table_name, query_ctx)
-        .await
-        .context(CatalogSnafu)?;
-    schema_info.set_table(table);
 
     for pipeline_map in pipeline_maps {
         let result = pipeline
@@ -200,7 +194,7 @@ async fn run_custom_pipeline(
             RowInsertRequest {
                 rows: Some(Rows {
                     rows,
-                    schema: schema_info.column_schemas()?,
+                    schema: schema_info.schema.clone(),
                 }),
                 table_name: table_name.clone(),
             },

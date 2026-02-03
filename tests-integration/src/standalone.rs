@@ -48,9 +48,9 @@ use flow::{FlownodeBuilder, FrontendClient, GrpcQueryHandlerWithBoxedError};
 use frontend::frontend::Frontend;
 use frontend::instance::builder::FrontendBuilder;
 use frontend::instance::{Instance, StandaloneDatanodeManager};
-use frontend::server::Services;
 use meta_srv::metasrv::{FLOW_ID_SEQ, TABLE_ID_SEQ};
 use servers::grpc::GrpcOptions;
+use servers::server::ServerHandlers;
 use snafu::ResultExt;
 use standalone::StandaloneRepartitionProcedureFactory;
 use standalone::options::StandaloneOptions;
@@ -252,7 +252,7 @@ impl GreptimeDbStandaloneBuilder {
             procedure_executor.clone(),
             Arc::new(ProcessManager::new(server_addr, None)),
         )
-        .with_plugin(plugins.clone())
+        .with_plugin(plugins)
         .try_build()
         .await
         .unwrap();
@@ -285,14 +285,13 @@ impl GreptimeDbStandaloneBuilder {
 
         test_util::prepare_another_catalog_and_schema(&instance).await;
 
-        let servers = Services::new(opts.clone(), instance.clone(), plugins)
-            .build()
-            .unwrap();
-        let frontend = Frontend {
+        let mut frontend = Frontend {
             instance,
-            servers,
+            servers: ServerHandlers::default(),
             heartbeat_task: None,
         };
+
+        frontend.start().await.unwrap();
 
         GreptimeDbStandalone {
             frontend: Arc::new(frontend),

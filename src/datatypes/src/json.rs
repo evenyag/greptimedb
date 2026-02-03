@@ -816,7 +816,7 @@ mod tests {
         let result = encode_by_struct(&json_struct, json);
         assert_eq!(
             result.unwrap_err().to_string(),
-            r#"Cannot cast value bar to "<Number>""#
+            "Cannot cast value bar to Number(I64)"
         );
 
         let json = json!({

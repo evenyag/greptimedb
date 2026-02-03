@@ -9801,7 +9801,6 @@ dependencies = [
  "ahash 0.8.12",
  "api",
  "arrow 57.0.0",
- "arrow-schema 57.0.0",
  "async-trait",
  "catalog",
  "chrono",

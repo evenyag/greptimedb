@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
@@ -148,8 +147,6 @@ pub trait Server: Send + Sync {
     fn bind_addr(&self) -> Option<SocketAddr> {
         None
     }
-
-    fn as_any(&self) -> &dyn Any;
 }
 
 struct AcceptTask {
