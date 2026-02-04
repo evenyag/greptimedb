@@ -200,6 +200,65 @@ fn filter_1_host(c: &mut Criterion) {
             }
         });
     });
+
+    // Benchmark with fewer rows and no encoded parts
+    // 4000 hosts * 100 iterations (1000 seconds) = 400,000 rows
+    let generator_small =
+        CpuDataGenerator::new(metadata.clone(), 4000, start_sec, start_sec + 1000);
+    group.bench_function("bulk_no_encoded_part", |b| {
+        // Create BulkMemtable with high thresholds to prevent encoding
+        let config = BulkMemtableConfig {
+            encode_row_threshold: 1_000_000,
+            encode_bytes_threshold: 1024 * 1024 * 1024, // 1GB
+            ..BulkMemtableConfig::default()
+        };
+        let memtable = BulkMemtable::new(
+            1,
+            config,
+            metadata.clone(),
+            None,  // write_buffer_manager
+            None,  // compact_dispatcher
+            false, // append_mode
+            MergeMode::LastRow,
+        );
+
+        // Write data using BulkPartConverter
+        let schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
+        let codec = Arc::new(DensePrimaryKeyCodec::new(&metadata));
+
+        for kvs in generator_small.iter() {
+            let mut converter = BulkPartConverter::new(
+                &metadata,
+                schema.clone(),
+                kvs.num_rows(),
+                codec.clone(),
+                true, // store_pk_columns
+            );
+            converter.append_key_values(&kvs).unwrap();
+            let bulk_part = converter.convert().unwrap();
+            memtable.write_bulk(bulk_part).unwrap();
+        }
+
+        // Create predicate for filtering
+        let filter_exprs = generator_small.random_host_filter_exprs();
+        let predicate = PredicateGroup::new(&metadata, &filter_exprs).unwrap();
+
+        b.iter(|| {
+            let ranges = memtable
+                .ranges(
+                    None, // No projection
+                    RangesOptions::default().with_predicate(predicate.clone()),
+                )
+                .unwrap();
+
+            for (_range_id, range) in ranges.ranges.iter() {
+                let iter = range.build_record_batch_iter(None).unwrap();
+                for batch in iter {
+                    let _batch = batch.unwrap();
+                }
+            }
+        });
+    });
 }
 
 struct Host {
