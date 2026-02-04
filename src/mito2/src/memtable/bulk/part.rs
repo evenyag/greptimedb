@@ -56,7 +56,7 @@ use snafu::{OptionExt, ResultExt, Snafu};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
-use store_api::storage::{FileId, RegionId, SequenceNumber, SequenceRange};
+use store_api::storage::{ColumnId, FileId, RegionId, SequenceNumber, SequenceRange};
 use table::predicate::Predicate;
 
 use crate::error::{
@@ -66,6 +66,7 @@ use crate::error::{
 };
 use crate::memtable::bulk::context::BulkIterContextRef;
 use crate::memtable::bulk::part_reader::EncodedBulkPartIter;
+use crate::memtable::bulk::stats::MultiBulkPartStats;
 use crate::memtable::time_series::{ValueBuilder, Values};
 use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics, MemtableStats};
 use crate::sst::index::IndexOutput;
@@ -1259,6 +1260,8 @@ impl BulkPartEncoder {
 pub struct MultiBulkPart {
     /// Ordered record batches. SmallVec optimized for up to 4 batches inline.
     batches: SmallVec<[RecordBatch; 4]>,
+    /// Per-batch column statistics for pruning.
+    stats: MultiBulkPartStats,
     /// Total rows across all batches.
     total_rows: usize,
     /// Max timestamp in part.
@@ -1273,14 +1276,17 @@ pub struct MultiBulkPart {
 
 impl MultiBulkPart {
     /// Creates a new MultiBulkPart from a single BulkPart.
-    pub fn from_bulk_part(part: BulkPart) -> Self {
+    pub fn from_bulk_part(part: BulkPart, metadata: &RegionMetadataRef) -> Self {
         let num_rows = part.num_rows();
         let series_count = part.estimated_series_count();
         let mut batches = SmallVec::new();
         batches.push(part.batch);
 
+        let stats = MultiBulkPartStats::compute(&batches, metadata);
+
         Self {
             batches,
+            stats,
             total_rows: num_rows,
             max_timestamp: part.max_timestamp,
             min_timestamp: part.min_timestamp,
@@ -1297,6 +1303,7 @@ impl MultiBulkPart {
     /// * `max_timestamp` - Maximum timestamp across all batches
     /// * `max_sequence` - Maximum sequence number across all batches
     /// * `series_count` - Number of series in the batches
+    /// * `metadata` - Region metadata for computing column statistics
     ///
     /// # Panics
     /// Panics if batches is empty.
@@ -1306,19 +1313,27 @@ impl MultiBulkPart {
         max_timestamp: i64,
         max_sequence: SequenceNumber,
         series_count: usize,
+        metadata: &RegionMetadataRef,
     ) -> Self {
         assert!(!batches.is_empty(), "batches must not be empty");
 
         let total_rows = batches.iter().map(|b| b.num_rows()).sum();
+        let stats = MultiBulkPartStats::compute(&batches, metadata);
 
         Self {
             batches: SmallVec::from_vec(batches),
+            stats,
             total_rows,
             max_timestamp,
             min_timestamp,
             max_sequence,
             series_count,
         }
+    }
+
+    /// Returns the batch statistics.
+    pub fn stats(&self) -> &MultiBulkPartStats {
+        &self.stats
     }
 
     /// Returns the total number of rows across all batches.
@@ -1372,8 +1387,28 @@ impl MultiBulkPart {
             return Ok(None);
         }
 
+        // Determine skip_fields based on pre_filter_mode
+        let skip_fields = match context.pre_filter_mode() {
+            PreFilterMode::All => false,
+            PreFilterMode::SkipFields | PreFilterMode::SkipFieldsOnDelete => true,
+        };
+
+        // Prune batches using statistics
+        let batches_to_read = context.batches_to_read(&self.stats, self.batches.len(), skip_fields);
+
+        if batches_to_read.is_empty() {
+            // All batches are filtered.
+            return Ok(None);
+        }
+
+        // Collect only the batches that passed pruning
+        let selected_batches: Vec<RecordBatch> = batches_to_read
+            .iter()
+            .map(|&idx| self.batches[idx].clone())
+            .collect();
+
         let iter = crate::memtable::bulk::part_reader::BulkPartBatchIter::new(
-            self.batches.iter().cloned().collect(),
+            selected_batches,
             context,
             sequence,
             self.series_count,

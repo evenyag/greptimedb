@@ -133,6 +133,35 @@ impl BulkIterContext {
         }
     }
 
+    /// Prunes batches by stats.
+    /// Returns indices of batches that should be read.
+    pub(crate) fn batches_to_read(
+        &self,
+        stats: &crate::memtable::bulk::stats::MultiBulkPartStats,
+        num_batches: usize,
+        skip_fields: bool,
+    ) -> VecDeque<usize> {
+        let region_meta = self.base.read_format.metadata();
+        let pruning_stats =
+            crate::memtable::bulk::stats::BatchPruningStats::new(stats, region_meta.clone(), skip_fields);
+
+        if let Some(predicate) = self.predicate.as_ref() {
+            predicate
+                .prune_with_stats(&pruning_stats, region_meta.schema.arrow_schema())
+                .iter()
+                .zip(0..num_batches)
+                .filter_map(|(selected, batch_idx)| {
+                    if !*selected {
+                        return None;
+                    }
+                    Some(batch_idx)
+                })
+                .collect::<VecDeque<_>>()
+        } else {
+            (0..num_batches).collect()
+        }
+    }
+
     pub(crate) fn read_format(&self) -> &ReadFormat {
         &self.base.read_format
     }

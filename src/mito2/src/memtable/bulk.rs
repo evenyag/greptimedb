@@ -20,6 +20,7 @@ pub mod context;
 pub mod part;
 pub mod part_reader;
 mod row_group_reader;
+pub mod stats;
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -1244,6 +1245,7 @@ impl MemtableCompactor {
                 max_timestamp,
                 max_sequence,
                 estimated_series_count,
+                metadata,
             );
 
             common_telemetry::trace!(
