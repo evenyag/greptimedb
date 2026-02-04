@@ -202,7 +202,6 @@ impl ObjbenchCommand {
             src_handle.clone(),
             object_store.clone(),
         )
-        .expected_metadata(Some(region_meta.clone()))
         .build()
         .await
         .map_err(|e| {

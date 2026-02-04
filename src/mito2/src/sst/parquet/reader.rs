@@ -38,7 +38,6 @@ use parquet::arrow::{FieldLevels, ProjectionMask, parquet_to_arrow_field_levels}
 use parquet::file::metadata::{KeyValue, PageIndexPolicy, ParquetMetaData};
 use partition::expr::PartitionExpr;
 use snafu::{OptionExt, ResultExt};
-use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, FileId};
@@ -56,7 +55,7 @@ use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
     READ_ROWS_TOTAL, READ_STAGE_ELAPSED,
 };
-use crate::read::flat_projection::CompactionProjectionMapper;
+use crate::read::projection_schema_plan::ProjectionSchemaPlan;
 use crate::read::prune::{PruneReader, Source};
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileHandle;
@@ -119,11 +118,6 @@ pub struct ParquetReaderBuilder {
     object_store: ObjectStore,
     /// Predicate to push down.
     predicate: Option<Predicate>,
-    /// Metadata of columns to read.
-    ///
-    /// `None` reads all columns. Due to schema change, the projection
-    /// can contain columns not in the parquet file.
-    projection: Option<Vec<ColumnId>>,
     /// Strategy to cache SST data.
     cache_strategy: CacheStrategy,
     /// Index appliers.
@@ -136,11 +130,9 @@ pub struct ParquetReaderBuilder {
     /// Over-fetched k for vector index scan.
     #[cfg(feature = "vector_index")]
     vector_index_k: Option<usize>,
-    /// Expected metadata of the region while reading the SST.
-    /// This is usually the latest metadata of the region. The reader use
-    /// it get the correct column id of a column by name.
-    expected_metadata: Option<RegionMetadataRef>,
-    /// Whether to use flat format for reading.
+    /// Projection/schema plan computed from the expected metadata.
+    projection_plan: Option<Arc<ProjectionSchemaPlan>>,
+    /// Hint for whether to use flat format when building a fallback plan.
     flat_format: bool,
     /// Whether this reader is for compaction.
     compaction: bool,
@@ -165,7 +157,6 @@ impl ParquetReaderBuilder {
             file_handle,
             object_store,
             predicate: None,
-            projection: None,
             cache_strategy: CacheStrategy::Disabled,
             inverted_index_appliers: [None, None],
             bloom_filter_index_appliers: [None, None],
@@ -174,7 +165,7 @@ impl ParquetReaderBuilder {
             vector_index_applier: None,
             #[cfg(feature = "vector_index")]
             vector_index_k: None,
-            expected_metadata: None,
+            projection_plan: None,
             flat_format: false,
             compaction: false,
             pre_filter_mode: PreFilterMode::All,
@@ -187,15 +178,6 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn predicate(mut self, predicate: Option<Predicate>) -> ParquetReaderBuilder {
         self.predicate = predicate;
-        self
-    }
-
-    /// Attaches the projection to the builder.
-    ///
-    /// The reader only applies the projection to fields.
-    #[must_use]
-    pub fn projection(mut self, projection: Option<Vec<ColumnId>>) -> ParquetReaderBuilder {
-        self.projection = projection;
         self
     }
 
@@ -249,14 +231,14 @@ impl ParquetReaderBuilder {
         self
     }
 
-    /// Attaches the expected metadata to the builder.
+    /// Attaches the projection/schema plan to the builder.
     #[must_use]
-    pub fn expected_metadata(mut self, expected_metadata: Option<RegionMetadataRef>) -> Self {
-        self.expected_metadata = expected_metadata;
+    pub(crate) fn projection_plan(mut self, plan: Option<Arc<ProjectionSchemaPlan>>) -> Self {
+        self.projection_plan = plan;
         self
     }
 
-    /// Sets the flat format flag.
+    /// Sets the flat format hint (used when no projection plan is provided).
     #[must_use]
     pub fn flat_format(mut self, flat_format: bool) -> Self {
         self.flat_format = flat_format;
@@ -339,10 +321,15 @@ impl ParquetReaderBuilder {
         let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
         // Gets the metadata stored in the SST.
         let region_meta = Arc::new(Self::get_region_metadata(&file_path, key_value_meta)?);
-        let region_partition_expr = self
-            .expected_metadata
-            .as_ref()
-            .and_then(|meta| meta.partition_expr.as_ref());
+        let projection_plan = match &self.projection_plan {
+            Some(plan) => Arc::clone(plan),
+            None => Arc::new(ProjectionSchemaPlan::new_all(
+                region_meta.clone(),
+                self.flat_format,
+            )?),
+        };
+        let expected_metadata = projection_plan.expected_metadata();
+        let region_partition_expr = expected_metadata.partition_expr.as_ref();
         let (_, is_same_region_partition) = Self::is_same_region_partition(
             region_partition_expr.as_ref().map(|expr| expr.as_str()),
             self.file_handle.meta_ref().partition_expr.as_ref(),
@@ -360,42 +347,18 @@ impl ParquetReaderBuilder {
         //
         // This is applied after row-group filtering to align batches with flat output schema
         // before compat handling.
-        let compaction_projection_mapper = if self.compaction
-            && !is_same_region_partition
-            && self.flat_format
-            && region_meta.primary_key_encoding == PrimaryKeyEncoding::Sparse
-        {
-            Some(CompactionProjectionMapper::try_new(&region_meta)?)
-        } else {
-            None
-        };
+        let compaction_projection_mapper = projection_plan.compaction_projection_mapper(
+            &region_meta,
+            self.compaction,
+            is_same_region_partition,
+        )?;
 
-        let mut read_format = if let Some(column_ids) = &self.projection {
-            ReadFormat::new(
-                region_meta.clone(),
-                Some(column_ids),
-                self.flat_format,
-                Some(parquet_meta.file_metadata().schema_descr().num_columns()),
-                &file_path,
-                skip_auto_convert,
-            )?
-        } else {
-            // Lists all column ids to read, we always use the expected metadata if possible.
-            let expected_meta = self.expected_metadata.as_ref().unwrap_or(&region_meta);
-            let column_ids: Vec<_> = expected_meta
-                .column_metadatas
-                .iter()
-                .map(|col| col.column_id)
-                .collect();
-            ReadFormat::new(
-                region_meta.clone(),
-                Some(&column_ids),
-                self.flat_format,
-                Some(parquet_meta.file_metadata().schema_descr().num_columns()),
-                &file_path,
-                skip_auto_convert,
-            )?
-        };
+        let mut read_format = projection_plan.build_read_format(
+            region_meta.clone(),
+            Some(parquet_meta.file_metadata().schema_descr().num_columns()),
+            &file_path,
+            skip_auto_convert,
+        )?;
         if self.decode_primary_key_values {
             read_format.set_decode_primary_key_values(true);
         }
@@ -417,7 +380,12 @@ impl ParquetReaderBuilder {
             parquet_to_arrow_field_levels(parquet_schema_desc, projection_mask.clone(), hint)
                 .context(ReadDataPartSnafu)?;
         let selection = self
-            .row_groups_to_read(&read_format, &parquet_meta, &mut metrics.filter_metrics)
+            .row_groups_to_read(
+                expected_metadata,
+                &read_format,
+                &parquet_meta,
+                &mut metrics.filter_metrics,
+            )
             .await;
 
         // Trigger background download if metadata had a cache miss and selection is not empty
@@ -436,11 +404,7 @@ impl ParquetReaderBuilder {
             );
         }
 
-        let prune_schema = self
-            .expected_metadata
-            .as_ref()
-            .map(|meta| meta.schema.clone())
-            .unwrap_or_else(|| region_meta.schema.clone());
+        let prune_schema = expected_metadata.schema.clone();
 
         let reader_builder = RowGroupReaderBuilder {
             file_handle: self.file_handle.clone(),
@@ -457,11 +421,7 @@ impl ParquetReaderBuilder {
                 .exprs()
                 .iter()
                 .filter_map(|expr| {
-                    SimpleFilterContext::new_opt(
-                        &region_meta,
-                        self.expected_metadata.as_deref(),
-                        expr,
-                    )
+                    SimpleFilterContext::new_opt(&region_meta, Some(expected_metadata), expr)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -476,7 +436,8 @@ impl ParquetReaderBuilder {
 
         let codec = build_primary_key_codec(read_format.metadata());
 
-        let partition_filter = self.build_partition_filter(&read_format, &prune_schema)?;
+        let partition_filter =
+            self.build_partition_filter(expected_metadata, &read_format, &prune_schema)?;
 
         let context = FileRangeContext::new(
             reader_builder,
@@ -484,7 +445,7 @@ impl ParquetReaderBuilder {
                 filters,
                 dyn_filters,
                 read_format,
-                expected_metadata: self.expected_metadata.clone(),
+                expected_metadata: Some(expected_metadata.clone()),
                 prune_schema,
                 codec,
                 compat_batch: None,
@@ -516,13 +477,11 @@ impl ParquetReaderBuilder {
     /// and build a partition filter if they differ.
     fn build_partition_filter(
         &self,
+        expected_metadata: &RegionMetadataRef,
         read_format: &ReadFormat,
         prune_schema: &Arc<datatypes::schema::Schema>,
     ) -> Result<Option<PartitionFilterContext>> {
-        let region_partition_expr_str = self
-            .expected_metadata
-            .as_ref()
-            .and_then(|meta| meta.partition_expr.as_ref());
+        let region_partition_expr_str = expected_metadata.partition_expr.as_ref();
         let file_partition_expr_ref = self.file_handle.meta_ref().partition_expr.as_ref();
 
         let (region_partition_expr, is_same_region_partition) = Self::is_same_region_partition(
@@ -659,6 +618,7 @@ impl ParquetReaderBuilder {
     )]
     async fn row_groups_to_read(
         &self,
+        expected_metadata: &RegionMetadataRef,
         read_format: &ReadFormat,
         parquet_meta: &ParquetMetaData,
         metrics: &mut ReaderFilterMetrics,
@@ -685,6 +645,7 @@ impl ParquetReaderBuilder {
         let skip_fields = self.compute_skip_fields(parquet_meta);
 
         self.prune_row_groups_by_minmax(
+            expected_metadata,
             read_format,
             parquet_meta,
             &mut output,
@@ -1139,6 +1100,7 @@ impl ParquetReaderBuilder {
     /// Prunes row groups by min-max index.
     fn prune_row_groups_by_minmax(
         &self,
+        expected_metadata: &RegionMetadataRef,
         read_format: &ReadFormat,
         parquet_meta: &ParquetMetaData,
         output: &mut RowGroupSelection,
@@ -1151,19 +1113,14 @@ impl ParquetReaderBuilder {
 
         let row_groups_before = output.row_group_count();
 
-        let region_meta = read_format.metadata();
         let row_groups = parquet_meta.row_groups();
         let stats = RowGroupPruningStats::new(
             row_groups,
             read_format,
-            self.expected_metadata.clone(),
+            Some(expected_metadata.clone()),
             skip_fields,
         );
-        let prune_schema = self
-            .expected_metadata
-            .as_ref()
-            .map(|meta| meta.schema.arrow_schema())
-            .unwrap_or_else(|| region_meta.schema.arrow_schema());
+        let prune_schema = expected_metadata.schema.arrow_schema();
 
         // Here we use the schema of the SST to build the physical expression. If the column
         // in the SST doesn't have the same column id as the column in the expected metadata,

@@ -81,7 +81,7 @@ impl UnorderedScan {
     /// Scans the region and returns a stream.
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     pub(crate) async fn build_stream(&self) -> Result<SendableRecordBatchStream, BoxedError> {
         let metrics_set = ExecutionPlanMetricsSet::new();
@@ -229,7 +229,7 @@ impl UnorderedScan {
         metrics_set: &ExecutionPlanMetricsSet,
     ) -> PartitionMetrics {
         let part_metrics = PartitionMetrics::new(
-            self.stream_ctx.input.mapper.metadata().region_id,
+            self.stream_ctx.input.expected_metadata().region_id,
             partition,
             "UnorderedScan",
             self.stream_ctx.query_start,
@@ -243,7 +243,7 @@ impl UnorderedScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -274,13 +274,13 @@ impl UnorderedScan {
 
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper.clone(),
+            input.mapper().clone(),
             input.cache_strategy.clone(),
             metrics,
         );
 
         Ok(Box::pin(RecordBatchStreamWrapper::new(
-            input.mapper.output_schema(),
+            input.output_schema(),
             Box::pin(record_batch_stream),
         )))
     }
@@ -288,7 +288,7 @@ impl UnorderedScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -323,7 +323,7 @@ impl UnorderedScan {
             for part_range in part_ranges {
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
-                let _mapper = &stream_ctx.input.mapper;
+                let _mapper = stream_ctx.input.mapper();
                 #[cfg(debug_assertions)]
                 let mut checker = crate::read::BatchChecker::default()
                     .with_start(Some(part_range.start))
@@ -382,7 +382,7 @@ impl UnorderedScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -461,11 +461,11 @@ impl RegionScanner for UnorderedScan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.stream_ctx.input.mapper.output_schema()
+        self.stream_ctx.input.output_schema()
     }
 
     fn metadata(&self) -> RegionMetadataRef {
-        self.stream_ctx.input.mapper.metadata().clone()
+        self.stream_ctx.input.expected_metadata().clone()
     }
 
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
@@ -505,7 +505,7 @@ impl DisplayAs for UnorderedScan {
         write!(
             f,
             "UnorderedScan: region={}, ",
-            self.stream_ctx.input.mapper.metadata().region_id
+            self.stream_ctx.input.expected_metadata().region_id
         )?;
         match t {
             DisplayFormatType::Default | DisplayFormatType::TreeRender => {

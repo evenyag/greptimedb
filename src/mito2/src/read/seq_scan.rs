@@ -100,7 +100,7 @@ impl SeqScan {
     /// partitioned scan, use [`RegionScanner::scan_partition`].
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     pub fn build_stream(&self) -> Result<SendableRecordBatchStream, BoxedError> {
         let metrics_set = ExecutionPlanMetricsSet::new();
@@ -199,7 +199,7 @@ impl SeqScan {
 
         common_telemetry::debug!(
             "Build reader to read all parts, region_id: {}, num_part_ranges: {}, num_sources: {}",
-            stream_ctx.input.mapper.metadata().region_id,
+            stream_ctx.input.expected_metadata().region_id,
             partition_ranges.len(),
             sources.len()
         );
@@ -233,7 +233,7 @@ impl SeqScan {
 
         common_telemetry::debug!(
             "Build flat reader to read all parts, region_id: {}, num_part_ranges: {}, num_sources: {}",
-            stream_ctx.input.mapper.metadata().region_id,
+            stream_ctx.input.expected_metadata().region_id,
             partition_ranges.len(),
             sources.len()
         );
@@ -309,7 +309,7 @@ impl SeqScan {
             }
         }
 
-        let mapper = stream_ctx.input.mapper.as_flat().unwrap();
+        let mapper = stream_ctx.input.mapper().as_flat().unwrap();
         let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
 
         let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
@@ -376,13 +376,13 @@ impl SeqScan {
         };
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper.clone(),
+            input.mapper().clone(),
             input.cache_strategy.clone(),
             metrics,
         );
 
         Ok(Box::pin(RecordBatchStreamWrapper::new(
-            input.mapper.output_schema(),
+            input.output_schema(),
             Box::pin(record_batch_stream),
         )))
     }
@@ -390,7 +390,7 @@ impl SeqScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -431,7 +431,7 @@ impl SeqScan {
             // build part cost.
             let mut fetch_start = Instant::now();
 
-            let _mapper = stream_ctx.input.mapper.as_primary_key().context(UnexpectedSnafu {
+            let _mapper = stream_ctx.input.mapper().as_primary_key().context(UnexpectedSnafu {
                 reason: "Unexpected format",
             })?;
             // Scans each part.
@@ -509,7 +509,7 @@ impl SeqScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -624,7 +624,7 @@ impl SeqScan {
         partition: usize,
     ) -> PartitionMetrics {
         let metrics = PartitionMetrics::new(
-            self.stream_ctx.input.mapper.metadata().region_id,
+            self.stream_ctx.input.expected_metadata().region_id,
             partition,
             get_scanner_type(self.stream_ctx.input.compaction),
             self.stream_ctx.query_start,
@@ -684,11 +684,11 @@ impl RegionScanner for SeqScan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.stream_ctx.input.mapper.output_schema()
+        self.stream_ctx.input.output_schema()
     }
 
     fn metadata(&self) -> RegionMetadataRef {
-        self.stream_ctx.input.mapper.metadata().clone()
+        self.stream_ctx.input.expected_metadata().clone()
     }
 
     fn scan_partition(
@@ -728,7 +728,7 @@ impl DisplayAs for SeqScan {
         write!(
             f,
             "SeqScan: region={}, ",
-            self.stream_ctx.input.mapper.metadata().region_id
+            self.stream_ctx.input.expected_metadata().region_id
         )?;
         match t {
             // TODO(LFC): Implement all the "TreeRender" display format.

@@ -102,7 +102,7 @@ impl SeriesScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -126,13 +126,13 @@ impl SeriesScan {
         let input = &self.stream_ctx.input;
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper.clone(),
+            input.mapper().clone(),
             input.cache_strategy.clone(),
             metrics,
         );
 
         Ok(Box::pin(RecordBatchStreamWrapper::new(
-            input.mapper.output_schema(),
+            input.output_schema(),
             Box::pin(record_batch_stream),
         )))
     }
@@ -140,7 +140,7 @@ impl SeriesScan {
     #[tracing::instrument(
         skip_all,
         fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
+            region_id = %self.stream_ctx.input.expected_metadata().region_id,
             partition = partition
         )
     )]
@@ -207,7 +207,7 @@ impl SeriesScan {
     /// Starts the distributor if the receiver list is empty.
     #[tracing::instrument(
         skip(self, metrics_set, metrics_list),
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     fn maybe_start_distributor(
         &self,
@@ -229,7 +229,7 @@ impl SeriesScan {
             metrics_set: metrics_set.clone(),
             metrics_list: metrics_list.clone(),
         };
-        let region_id = distributor.stream_ctx.input.mapper.metadata().region_id;
+        let region_id = distributor.stream_ctx.input.expected_metadata().region_id;
         let span = tracing::info_span!("SeriesScan::distributor", region_id = %region_id);
         common_runtime::spawn_global(
             async move {
@@ -244,7 +244,7 @@ impl SeriesScan {
     /// Scans the region and returns a stream.
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     pub(crate) async fn build_stream(&self) -> Result<SendableRecordBatchStream, BoxedError> {
         let part_num = self.properties.num_partitions();
@@ -329,11 +329,11 @@ impl RegionScanner for SeriesScan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.stream_ctx.input.mapper.output_schema()
+        self.stream_ctx.input.output_schema()
     }
 
     fn metadata(&self) -> RegionMetadataRef {
-        self.stream_ctx.input.mapper.metadata().clone()
+        self.stream_ctx.input.expected_metadata().clone()
     }
 
     fn scan_partition(
@@ -373,7 +373,7 @@ impl DisplayAs for SeriesScan {
         write!(
             f,
             "SeriesScan: region={}, ",
-            self.stream_ctx.input.mapper.metadata().region_id
+            self.stream_ctx.input.expected_metadata().region_id
         )?;
         match t {
             DisplayFormatType::Default | DisplayFormatType::TreeRender => {
@@ -428,7 +428,7 @@ impl SeriesDistributor {
     /// Executes the distributor.
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     async fn execute(&mut self) {
         let result = if self.stream_ctx.input.flat_format {
@@ -445,7 +445,7 @@ impl SeriesDistributor {
     /// Scans all parts in flat format using FlatSeriesBatchDivider.
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     async fn scan_partitions_flat(&mut self) -> Result<()> {
         // Initialize reference counts for all partition ranges.
@@ -551,7 +551,7 @@ impl SeriesDistributor {
     /// Scans all parts.
     #[tracing::instrument(
         skip_all,
-        fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
+        fields(region_id = %self.stream_ctx.input.expected_metadata().region_id)
     )]
     async fn scan_partitions(&mut self) -> Result<()> {
         // Initialize reference counts for all partition ranges.
@@ -842,7 +842,7 @@ fn new_partition_metrics(
     metrics_list: &PartitionMetricsList,
 ) -> PartitionMetrics {
     let metrics = PartitionMetrics::new(
-        stream_ctx.input.mapper.metadata().region_id,
+        stream_ctx.input.expected_metadata().region_id,
         partition,
         "SeriesScan",
         stream_ctx.query_start,

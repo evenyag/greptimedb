@@ -33,7 +33,7 @@ use datafusion_expr::utils::expr_to_columns;
 use futures::StreamExt;
 use partition::expr::PartitionExpr;
 use smallvec::SmallVec;
-use snafu::{OptionExt as _, ResultExt};
+use snafu::ResultExt;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
 use store_api::storage::{
@@ -46,13 +46,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheStrategy;
 use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SCAN_CHANNEL_SIZE};
-use crate::error::{InvalidPartitionExprSnafu, InvalidRequestSnafu, Result};
+use crate::error::{InvalidPartitionExprSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
-use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
 use crate::read::projection::ProjectionMapper;
+use crate::read::projection_schema_plan::ProjectionSchemaPlan;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_scan::SeriesScan;
@@ -410,27 +410,13 @@ impl ScanRegion {
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
         let flat_format = self.use_flat_format();
 
-        let read_column_ids = match &self.request.projection {
-            Some(p) => self.build_read_column_ids(p, &predicate)?,
-            None => self
-                .version
-                .metadata
-                .column_metadatas
-                .iter()
-                .map(|col| col.column_id)
-                .collect(),
-        };
-
-        // The mapper always computes projected column ids as the schema of SSTs may change.
-        let mapper = match &self.request.projection {
-            Some(p) => ProjectionMapper::new_with_read_columns(
-                &self.version.metadata,
-                p.iter().copied(),
-                flat_format,
-                read_column_ids.clone(),
-            )?,
-            None => ProjectionMapper::all(&self.version.metadata, flat_format)?,
-        };
+        let plan = ProjectionSchemaPlan::new_from_request(
+            self.version.metadata.clone(),
+            flat_format,
+            self.request.projection.clone(),
+            &self.request.filters,
+            &predicate,
+        )?;
 
         let ssts = &self.version.ssts;
         let mut files = Vec::new();
@@ -476,7 +462,7 @@ impl ScanRegion {
                 continue;
             }
             let ranges_in_memtable = m.ranges(
-                Some(read_column_ids.as_slice()),
+                Some(plan.read_column_ids()),
                 RangesOptions::default()
                     .with_predicate(predicate.clone())
                     .with_sequence(SequenceRange::new(
@@ -532,7 +518,7 @@ impl ScanRegion {
             self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
         }
 
-        let input = ScanInput::new(self.access_layer, mapper)
+        let input = ScanInput::new(self.access_layer, plan)
             .with_time_range(Some(time_range))
             .with_predicate(predicate)
             .with_memtables(mem_range_builders)
@@ -582,72 +568,6 @@ impl ScanRegion {
             .expect("Time index must have timestamp-compatible type")
             .unit();
         build_time_range_predicate(&time_index.column_schema.name, unit, &self.request.filters)
-    }
-
-    /// Return all columns id to read according to the projection and filters.
-    fn build_read_column_ids(
-        &self,
-        projection: &[usize],
-        predicate: &PredicateGroup,
-    ) -> Result<Vec<ColumnId>> {
-        let metadata = &self.version.metadata;
-        // use Vec for read_column_ids to keep the order of columns.
-        let mut read_column_ids = Vec::new();
-        let mut seen = HashSet::new();
-
-        for idx in projection {
-            let column =
-                metadata
-                    .column_metadatas
-                    .get(*idx)
-                    .with_context(|| InvalidRequestSnafu {
-                        region_id: metadata.region_id,
-                        reason: format!("projection index {} is out of bound", idx),
-                    })?;
-            seen.insert(column.column_id);
-            // keep the projection order
-            read_column_ids.push(column.column_id);
-        }
-
-        if projection.is_empty() {
-            let time_index = metadata.time_index_column().column_id;
-            if seen.insert(time_index) {
-                read_column_ids.push(time_index);
-            }
-        }
-
-        let mut extra_names = HashSet::new();
-        let mut columns = HashSet::new();
-
-        for expr in &self.request.filters {
-            columns.clear();
-            if expr_to_columns(expr, &mut columns).is_err() {
-                continue;
-            }
-            extra_names.extend(columns.iter().map(|column| column.name.clone()));
-        }
-
-        if let Some(expr) = predicate.region_partition_expr() {
-            expr.collect_column_names(&mut extra_names);
-        }
-
-        if !extra_names.is_empty() {
-            for column in &metadata.column_metadatas {
-                if extra_names.contains(column.column_schema.name.as_str())
-                    && !seen.contains(&column.column_id)
-                {
-                    read_column_ids.push(column.column_id);
-                }
-                extra_names.remove(column.column_schema.name.as_str());
-            }
-            if !extra_names.is_empty() {
-                warn!(
-                    "Some columns in filters are not found in region {}: {:?}",
-                    metadata.region_id, extra_names
-                );
-            }
-        }
-        Ok(read_column_ids)
     }
 
     /// Partitions filters into two groups: non-field filters and field filters.
@@ -806,12 +726,8 @@ fn file_in_range(file: &FileHandle, predicate: &TimestampRange) -> bool {
 pub struct ScanInput {
     /// Region SST access layer.
     access_layer: AccessLayerRef,
-    /// Maps projected Batches to RecordBatches.
-    pub(crate) mapper: Arc<ProjectionMapper>,
-    /// Column ids to read from memtables and SSTs.
-    /// Notice this is different from the columns in `mapper` which are projected columns.
-    /// But this read columns might also include non-projected columns needed for filtering.
-    pub(crate) read_column_ids: Vec<ColumnId>,
+    /// Projection + schema computation plan.
+    pub(crate) projection_plan: Arc<ProjectionSchemaPlan>,
     /// Time range filter for time index.
     time_range: Option<TimestampRange>,
     /// Predicate to push down.
@@ -863,11 +779,13 @@ pub struct ScanInput {
 impl ScanInput {
     /// Creates a new [ScanInput].
     #[must_use]
-    pub(crate) fn new(access_layer: AccessLayerRef, mapper: ProjectionMapper) -> ScanInput {
+    pub(crate) fn new(
+        access_layer: AccessLayerRef,
+        projection_plan: ProjectionSchemaPlan,
+    ) -> ScanInput {
         ScanInput {
             access_layer,
-            read_column_ids: mapper.column_ids().to_vec(),
-            mapper: Arc::new(mapper),
+            projection_plan: Arc::new(projection_plan),
             time_range: None,
             predicate: PredicateGroup::default(),
             region_partition_expr: None,
@@ -895,6 +813,26 @@ impl ScanInput {
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
+    }
+
+    /// Returns the projection mapper.
+    pub(crate) fn mapper(&self) -> &Arc<ProjectionMapper> {
+        self.projection_plan.mapper()
+    }
+
+    /// Returns the expected metadata.
+    pub(crate) fn expected_metadata(&self) -> &RegionMetadataRef {
+        self.projection_plan.expected_metadata()
+    }
+
+    /// Returns column ids to read from memtables and SSTs.
+    pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
+        self.projection_plan.read_column_ids()
+    }
+
+    /// Returns output schema for the final projected batch.
+    pub(crate) fn output_schema(&self) -> datatypes::schema::SchemaRef {
+        self.mapper().output_schema()
     }
 
     /// Sets time range filter for time index.
@@ -1143,12 +1081,12 @@ impl ScanInput {
     ) -> Result<FileRangeBuilder> {
         let predicate = self.predicate_for_file(file);
         let filter_mode = pre_filter_mode(self.append_mode, self.merge_mode);
-        let decode_pk_values = !self.compaction && self.mapper.has_tags();
+        let decode_pk_values = !self.compaction && self.mapper().has_tags();
         let reader = self
             .access_layer
             .read_sst(file.clone())
             .predicate(predicate)
-            .projection(Some(self.read_column_ids.clone()))
+            .projection_plan(Some(self.projection_plan.clone()))
             .cache(self.cache_strategy.clone())
             .inverted_index_appliers(self.inverted_index_appliers.clone())
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
@@ -1161,8 +1099,6 @@ impl ScanInput {
             reader
         };
         let res = reader
-            .expected_metadata(Some(self.mapper.metadata().clone()))
-            .flat_format(self.flat_format)
             .compaction(self.compaction)
             .pre_filter_mode(filter_mode)
             .decode_primary_key_values(decode_pk_values)
@@ -1180,31 +1116,10 @@ impl ScanInput {
             }
         };
 
-        let need_compat = !compat::has_same_columns_and_pk_encoding(
-            self.mapper.metadata(),
-            file_range_ctx.read_format().metadata(),
-        );
-        if need_compat {
-            // They have different schema. We need to adapt the batch first so the
-            // mapper can convert it.
-            let compat = if let Some(flat_format) = file_range_ctx.read_format().as_flat() {
-                let mapper = self.mapper.as_flat().unwrap();
-                FlatCompatBatch::try_new(
-                    mapper,
-                    flat_format.metadata(),
-                    flat_format.format_projection(),
-                    self.compaction,
-                )?
-                .map(CompatBatch::Flat)
-            } else {
-                let compact_batch = PrimaryKeyCompatBatch::new(
-                    &self.mapper,
-                    file_range_ctx.read_format().metadata().clone(),
-                )?;
-                Some(CompatBatch::PrimaryKey(compact_batch))
-            };
-            file_range_ctx.set_compat_batch(compat);
-        }
+        let compat = self
+            .projection_plan
+            .compat_for_read_format(file_range_ctx.read_format(), self.compaction)?;
+        file_range_ctx.set_compat_batch(compat);
         Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
     }
 
@@ -1362,7 +1277,7 @@ impl ScanInput {
     }
 
     pub fn region_metadata(&self) -> &RegionMetadataRef {
-        self.mapper.metadata()
+        self.expected_metadata()
     }
 }
 
@@ -1561,7 +1476,7 @@ impl StreamContext {
 
         impl fmt::Debug for InputWrapper<'_> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                let output_schema = self.input.mapper.output_schema();
+                let output_schema = self.input.mapper().output_schema();
                 if !output_schema.is_empty() {
                     let names: Vec<_> = output_schema
                         .column_schemas()
@@ -1708,109 +1623,5 @@ impl PredicateGroup {
         } else {
             None
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use datafusion_expr::{col, lit};
-    use store_api::storage::ScanRequest;
-
-    use super::*;
-    use crate::memtable::time_partition::TimePartitions;
-    use crate::region::version::VersionBuilder;
-    use crate::test_util::memtable_util::{EmptyMemtableBuilder, metadata_with_primary_key};
-    use crate::test_util::scheduler_util::SchedulerEnv;
-
-    fn new_version(metadata: RegionMetadataRef) -> VersionRef {
-        let mutable = Arc::new(TimePartitions::new(
-            metadata.clone(),
-            Arc::new(EmptyMemtableBuilder::default()),
-            0,
-            None,
-        ));
-        Arc::new(VersionBuilder::new(metadata, mutable).build())
-    }
-
-    #[tokio::test]
-    async fn test_build_read_column_ids_includes_filters() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![4]),
-            filters: vec![
-                col("v0").gt(lit(1)),
-                col("ts").gt(lit(0)),
-                col("k0").eq(lit("foo")),
-            ],
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        assert_eq!(vec![4, 0, 2, 3], read_ids);
-    }
-
-    #[tokio::test]
-    async fn test_build_read_column_ids_empty_projection() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![]),
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        // Empty projection should still read the time index column (id 2 in this test schema).
-        assert_eq!(vec![2], read_ids);
-    }
-
-    #[tokio::test]
-    async fn test_build_read_column_ids_keeps_projection_order() {
-        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
-        let version = new_version(metadata.clone());
-        let env = SchedulerEnv::new().await;
-        let request = ScanRequest {
-            projection: Some(vec![4, 1]),
-            filters: vec![col("v0").gt(lit(1))],
-            ..Default::default()
-        };
-        let scan_region = ScanRegion::new(
-            version,
-            env.access_layer.clone(),
-            request,
-            CacheStrategy::Disabled,
-        );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
-        let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
-            .unwrap();
-        // Projection order preserved, extra columns appended in schema order.
-        assert_eq!(vec![4, 1, 3], read_ids);
     }
 }

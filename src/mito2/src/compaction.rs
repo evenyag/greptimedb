@@ -58,7 +58,7 @@ use crate::error::{
     TimeRangePredicateOverflowSnafu, TimeoutSnafu,
 };
 use crate::metrics::{COMPACTION_STAGE_ELAPSED, INFLIGHT_COMPACTION_COUNT};
-use crate::read::projection::ProjectionMapper;
+use crate::read::projection_schema_plan::ProjectionSchemaPlan;
 use crate::read::scan_region::{PredicateGroup, ScanInput};
 use crate::read::seq_scan::SeqScan;
 use crate::read::{BoxedBatchReader, BoxedRecordBatchStream};
@@ -740,8 +740,8 @@ impl CompactionSstReaderBuilder<'_> {
     }
 
     fn build_scan_input(self, flat_format: bool) -> Result<ScanInput> {
-        let mapper = ProjectionMapper::all(&self.metadata, flat_format)?;
-        let mut scan_input = ScanInput::new(self.sst_layer, mapper)
+        let plan = ProjectionSchemaPlan::new_all(self.metadata.clone(), flat_format)?;
+        let mut scan_input = ScanInput::new(self.sst_layer, plan)
             .with_files(self.inputs.to_vec())
             .with_append_mode(self.append_mode)
             // We use special cache strategy for compaction.
