@@ -26,14 +26,15 @@ use parquet::file::metadata::RowGroupMetaData;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 
-use crate::sst::parquet::format::{ReadFormat, StatValues};
+use crate::read::projection_schema_plan::FileProjectionSchema;
+use crate::sst::parquet::format::StatValues;
 
 /// Statistics for pruning row groups.
 pub(crate) struct RowGroupPruningStats<'a, T> {
     /// Metadata of SST row groups.
     row_groups: &'a [T],
     /// Helper to read the SST.
-    read_format: &'a ReadFormat,
+    file_projection_schema: &'a FileProjectionSchema,
     /// The metadata of the region.
     /// It contains the schema a query expects to read. If it is not None, we use it instead
     /// of the metadata in the SST to get the column id of a column as the SST may have
@@ -47,13 +48,13 @@ impl<'a, T> RowGroupPruningStats<'a, T> {
     /// Creates a new statistics to prune specific `row_groups`.
     pub(crate) fn new(
         row_groups: &'a [T],
-        read_format: &'a ReadFormat,
+        file_projection_schema: &'a FileProjectionSchema,
         expected_metadata: Option<RegionMetadataRef>,
         skip_fields: bool,
     ) -> Self {
         Self {
             row_groups,
-            read_format,
+            file_projection_schema,
             expected_metadata,
             skip_fields,
         }
@@ -66,7 +67,7 @@ impl<'a, T> RowGroupPruningStats<'a, T> {
         let metadata = self
             .expected_metadata
             .as_ref()
-            .unwrap_or_else(|| self.read_format.metadata());
+            .unwrap_or_else(|| self.file_projection_schema.metadata());
         let col = metadata.column_by_name(name)?;
 
         // Skip field columns when skip_fields is enabled
@@ -112,7 +113,10 @@ impl<T: Borrow<RowGroupMetaData>> RowGroupPruningStats<'_, T> {
 impl<T: Borrow<RowGroupMetaData>> PruningStatistics for RowGroupPruningStats<'_, T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.column_id_to_prune(&column.name)?;
-        match self.read_format.min_values(self.row_groups, column_id) {
+        match self
+            .file_projection_schema
+            .min_values(self.row_groups, column_id)
+        {
             StatValues::Values(values) => Some(values),
             StatValues::NoColumn => self.compat_default_value(&column.name),
             StatValues::NoStats => None,
@@ -121,7 +125,10 @@ impl<T: Borrow<RowGroupMetaData>> PruningStatistics for RowGroupPruningStats<'_,
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.column_id_to_prune(&column.name)?;
-        match self.read_format.max_values(self.row_groups, column_id) {
+        match self
+            .file_projection_schema
+            .max_values(self.row_groups, column_id)
+        {
             StatValues::Values(values) => Some(values),
             StatValues::NoColumn => self.compat_default_value(&column.name),
             StatValues::NoStats => None,
@@ -134,7 +141,10 @@ impl<T: Borrow<RowGroupMetaData>> PruningStatistics for RowGroupPruningStats<'_,
 
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let column_id = self.column_id_to_prune(&column.name)?;
-        match self.read_format.null_counts(self.row_groups, column_id) {
+        match self
+            .file_projection_schema
+            .null_counts(self.row_groups, column_id)
+        {
             StatValues::Values(values) => Some(values),
             StatValues::NoColumn => self.compat_null_count(&column.name),
             StatValues::NoStats => None,

@@ -74,7 +74,8 @@ use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
     row_group_contains_delete,
 };
-use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
+use crate::read::projection_schema_plan::FileProjectionSchema;
+use crate::sst::parquet::format::need_override_sequence;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::row_group::{InMemoryRowGroup, ParquetFetchMetrics};
 use crate::sst::parquet::row_selection::RowGroupSelection;
@@ -362,24 +363,23 @@ impl ParquetReaderBuilder {
             self.decode_primary_key_values,
             override_sequence,
         )?;
-        let read_format = file_projection_schema.read_format();
 
         // Computes the projection mask.
         let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
-        let indices = read_format.projection_indices();
+        let indices = file_projection_schema.projection_indices();
         // Now we assumes we don't have nested schemas.
         // TODO(yingwen): Revisit this if we introduce nested types such as JSON type.
         let projection_mask = ProjectionMask::roots(parquet_schema_desc, indices.iter().copied());
 
         // Computes the field levels.
-        let hint = Some(read_format.arrow_schema().fields());
+        let hint = Some(file_projection_schema.arrow_schema().fields());
         let field_levels =
             parquet_to_arrow_field_levels(parquet_schema_desc, projection_mask.clone(), hint)
                 .context(ReadDataPartSnafu)?;
         let selection = self
             .row_groups_to_read(
                 expected_metadata,
-                &read_format,
+                &file_projection_schema,
                 &parquet_meta,
                 &mut metrics.filter_metrics,
             )
@@ -431,10 +431,10 @@ impl ParquetReaderBuilder {
             Arc::new(vec![])
         };
 
-        let codec = build_primary_key_codec(read_format.metadata());
+        let codec = build_primary_key_codec(file_projection_schema.metadata());
 
         let partition_filter =
-            self.build_partition_filter(expected_metadata, &read_format, &prune_schema)?;
+            self.build_partition_filter(expected_metadata, &file_projection_schema, &prune_schema)?;
 
         let context = FileRangeContext::new(
             reader_builder,
@@ -472,7 +472,7 @@ impl ParquetReaderBuilder {
     fn build_partition_filter(
         &self,
         expected_metadata: &RegionMetadataRef,
-        read_format: &ReadFormat,
+        file_projection_schema: &FileProjectionSchema,
         prune_schema: &Arc<datatypes::schema::Schema>,
     ) -> Result<Option<PartitionFilterContext>> {
         let region_partition_expr_str = expected_metadata.partition_expr.as_ref();
@@ -496,7 +496,7 @@ impl ParquetReaderBuilder {
         region_partition_expr.collect_column_names(&mut referenced_columns);
 
         // Build a partition_schema containing only referenced columns.
-        let is_flat = read_format.as_flat().is_some();
+        let is_flat = file_projection_schema.is_flat();
         let partition_schema = Arc::new(datatypes::schema::Schema::new(
             prune_schema
                 .column_schemas()
@@ -504,7 +504,8 @@ impl ParquetReaderBuilder {
                 .filter(|col| referenced_columns.contains(&col.name))
                 .map(|col| {
                     if is_flat
-                        && let Some(column_meta) = read_format.metadata().column_by_name(&col.name)
+                        && let Some(column_meta) =
+                            file_projection_schema.metadata().column_by_name(&col.name)
                         && column_meta.semantic_type == SemanticType::Tag
                         && col.data_type.is_string()
                     {
@@ -613,7 +614,7 @@ impl ParquetReaderBuilder {
     async fn row_groups_to_read(
         &self,
         expected_metadata: &RegionMetadataRef,
-        read_format: &ReadFormat,
+        file_projection_schema: &FileProjectionSchema,
         parquet_meta: &ParquetMetaData,
         metrics: &mut ReaderFilterMetrics,
     ) -> RowGroupSelection {
@@ -640,7 +641,7 @@ impl ParquetReaderBuilder {
 
         self.prune_row_groups_by_minmax(
             expected_metadata,
-            read_format,
+            file_projection_schema,
             parquet_meta,
             &mut output,
             metrics,
@@ -1095,7 +1096,7 @@ impl ParquetReaderBuilder {
     fn prune_row_groups_by_minmax(
         &self,
         expected_metadata: &RegionMetadataRef,
-        read_format: &ReadFormat,
+        file_projection_schema: &FileProjectionSchema,
         parquet_meta: &ParquetMetaData,
         output: &mut RowGroupSelection,
         metrics: &mut ReaderFilterMetrics,
@@ -1110,7 +1111,7 @@ impl ParquetReaderBuilder {
         let row_groups = parquet_meta.row_groups();
         let stats = RowGroupPruningStats::new(
             row_groups,
-            read_format,
+            file_projection_schema,
             Some(expected_metadata.clone()),
             skip_fields,
         );
@@ -1888,7 +1889,7 @@ impl ParquetReader {
 
     /// Returns the metadata of the SST.
     pub fn metadata(&self) -> &RegionMetadataRef {
-        self.context.read_format().metadata()
+        self.context.file_projection_schema().metadata()
     }
 
     pub fn parquet_metadata(&self) -> Arc<ParquetMetaData> {
@@ -1904,7 +1905,7 @@ pub(crate) trait RowGroupReaderContext: Send {
         result: std::result::Result<Option<RecordBatch>, ArrowError>,
     ) -> Result<Option<RecordBatch>>;
 
-    fn read_format(&self) -> &ReadFormat;
+    fn file_projection_schema(&self) -> &FileProjectionSchema;
 }
 
 impl RowGroupReaderContext for FileRangeContextRef {
@@ -1917,8 +1918,8 @@ impl RowGroupReaderContext for FileRangeContextRef {
         })
     }
 
-    fn read_format(&self) -> &ReadFormat {
-        self.as_ref().read_format()
+    fn file_projection_schema(&self) -> &FileProjectionSchema {
+        self.as_ref().file_projection_schema()
     }
 }
 
@@ -1954,9 +1955,9 @@ where
     pub(crate) fn create(context: T, reader: ParquetRecordBatchReader) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
-            .read_format()
+            .file_projection_schema()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
-        assert!(context.read_format().as_primary_key().is_some());
+        assert!(context.file_projection_schema().is_primary_key());
 
         Self {
             context,
@@ -1972,9 +1973,9 @@ where
         &self.metrics
     }
 
-    /// Gets [ReadFormat] of underlying reader.
-    pub(crate) fn read_format(&self) -> &ReadFormat {
-        self.context.read_format()
+    /// Gets [FileProjectionSchema] of underlying reader.
+    pub(crate) fn file_projection_schema(&self) -> &FileProjectionSchema {
+        self.context.file_projection_schema()
     }
 
     /// Tries to fetch next [RecordBatch] from the reader.
@@ -2000,15 +2001,11 @@ where
             self.metrics.num_record_batches += 1;
 
             // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
-            self.context
-                .read_format()
-                .as_primary_key()
-                .unwrap()
-                .convert_record_batch(
-                    &record_batch,
-                    self.override_sequence.as_ref(),
-                    &mut self.batches,
-                )?;
+            self.context.file_projection_schema().convert_primary_key_record_batch(
+                &record_batch,
+                self.override_sequence.as_ref(),
+                &mut self.batches,
+            )?;
             self.metrics.num_batches += self.batches.len();
         }
         let batch = self.batches.pop_front();
@@ -2043,7 +2040,7 @@ impl FlatRowGroupReader {
     pub(crate) fn new(context: FileRangeContextRef, reader: ParquetRecordBatchReader) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
-            .read_format()
+            .file_projection_schema()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
 
         Self {
@@ -2062,9 +2059,10 @@ impl FlatRowGroupReader {
                 })?;
 
                 // Safety: Only flat format use FlatRowGroupReader.
-                let flat_format = self.context.read_format().as_flat().unwrap();
-                let record_batch =
-                    flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
+                let record_batch = self
+                    .context
+                    .file_projection_schema()
+                    .convert_flat_record_batch(record_batch, self.override_sequence.as_ref())?;
                 Ok(Some(record_batch))
             }
             None => Ok(None),

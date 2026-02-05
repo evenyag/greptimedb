@@ -27,8 +27,8 @@ use snafu::ResultExt;
 use crate::error;
 use crate::error::ReadDataPartSnafu;
 use crate::memtable::bulk::context::BulkIterContextRef;
+use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::RowGroupReaderContext;
 use crate::sst::parquet::row_group::{ColumnChunkIterator, RowGroupBase};
 
@@ -113,8 +113,8 @@ impl RowGroupReaderContext for BulkIterContextRef {
         result.context(error::DecodeArrowRowGroupSnafu)
     }
 
-    fn read_format(&self) -> &ReadFormat {
-        self.as_ref().read_format()
+    fn file_projection_schema(&self) -> &FileProjectionSchema {
+        self.as_ref().file_projection_schema()
     }
 }
 
@@ -133,7 +133,7 @@ impl MemtableRowGroupReaderBuilder {
         data: Bytes,
     ) -> error::Result<Self> {
         let parquet_schema_desc = parquet_metadata.file_metadata().schema_descr();
-        let hint = Some(context.read_format().arrow_schema().fields());
+        let hint = Some(context.file_projection_schema().arrow_schema().fields());
         let field_levels =
             parquet_to_arrow_field_levels(parquet_schema_desc, projection.clone(), hint)
                 .context(ReadDataPartSnafu)?;

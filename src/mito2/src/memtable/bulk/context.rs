@@ -26,7 +26,6 @@ use table::predicate::Predicate;
 use crate::error::Result;
 use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
-use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::SimpleFilterContext;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 
@@ -104,12 +103,12 @@ impl BulkIterContext {
         file_meta: &Arc<ParquetMetaData>,
         skip_fields: bool,
     ) -> VecDeque<usize> {
-        let region_meta = self.base.file_projection_schema.read_format().metadata();
+        let region_meta = self.base.file_projection_schema.metadata();
         let row_groups = file_meta.row_groups();
         // expected_metadata is set to None since we always expect region metadata of memtable is up-to-date.
         let stats = RowGroupPruningStats::new(
             row_groups,
-            self.base.file_projection_schema.read_format(),
+            &self.base.file_projection_schema,
             Some(self.base.file_projection_schema.expected_metadata().clone()),
             skip_fields,
         );
@@ -130,8 +129,8 @@ impl BulkIterContext {
         }
     }
 
-    pub(crate) fn read_format(&self) -> &ReadFormat {
-        self.base.file_projection_schema.read_format()
+    pub(crate) fn file_projection_schema(&self) -> &FileProjectionSchema {
+        &self.base.file_projection_schema
     }
 
     /// Returns the pre-filter mode.
@@ -143,7 +142,6 @@ impl BulkIterContext {
     pub(crate) fn region_id(&self) -> store_api::storage::RegionId {
         self.base
             .file_projection_schema
-            .read_format()
             .metadata()
             .region_id
     }

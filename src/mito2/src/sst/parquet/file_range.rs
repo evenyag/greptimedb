@@ -31,7 +31,7 @@ use datatypes::schema::Schema;
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::file::metadata::ParquetMetaData;
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, TimeSeriesRowSelector};
@@ -52,7 +52,6 @@ use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
     DecodedPrimaryKeys, decode_primary_keys, time_index_column_index,
 };
-use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
 };
@@ -139,11 +138,11 @@ impl FileRange {
             .reader_builder
             .parquet_metadata()
             .row_group(self.row_group_idx);
-        let read_format = self.context.read_format();
+        let file_projection_schema = self.context.file_projection_schema();
         let prune_schema = &self.context.base.prune_schema;
         let stats = RowGroupPruningStats::new(
             std::slice::from_ref(curr_row_group),
-            read_format,
+            file_projection_schema,
             Some(
                 self.context
                     .base
@@ -323,8 +322,8 @@ impl FileRangeContext {
     }
 
     /// Returns the format helper.
-    pub(crate) fn read_format(&self) -> &ReadFormat {
-        self.base.file_projection_schema.read_format()
+    pub(crate) fn file_projection_schema(&self) -> &FileProjectionSchema {
+        &self.base.file_projection_schema
     }
 
     /// Returns the reader builder.
@@ -455,7 +454,7 @@ impl RangeBase {
         mut input: Batch,
         skip_fields: bool,
     ) -> Result<Option<Batch>> {
-        let read_format = self.file_projection_schema.read_format();
+        let file_projection_schema = &self.file_projection_schema;
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
         // Run filter one by one and combine them result
@@ -483,7 +482,7 @@ impl RangeBase {
                     let pk_value = match pk_values {
                         CompositeValues::Dense(v) => {
                             // Safety: this is a primary key
-                            let pk_index = read_format
+                            let pk_index = file_projection_schema
                                 .metadata()
                                 .primary_key_index(filter_ctx.column_id())
                                 .unwrap();
@@ -514,10 +513,8 @@ impl RangeBase {
                         continue;
                     }
                     // Safety: Input is Batch so we are using primary key format.
-                    let Some(field_index) = read_format
-                        .as_primary_key()
-                        .unwrap()
-                        .field_index_by_id(filter_ctx.column_id())
+                    let Some(field_index) =
+                        file_projection_schema.primary_key_field_index_by_id(filter_ctx.column_id())
                     else {
                         continue;
                     };
@@ -616,14 +613,13 @@ impl RangeBase {
     ) -> Result<Option<BooleanBuffer>> {
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
-        let flat_format = self
-            .file_projection_schema
-            .read_format()
-            .as_flat()
-            .context(crate::error::UnexpectedSnafu {
+        ensure!(
+            self.file_projection_schema.is_flat(),
+            crate::error::UnexpectedSnafu {
                 reason: "Expected flat format for precise_filter_flat",
-            })?;
-        let metadata = flat_format.metadata();
+            }
+        );
+        let metadata = self.file_projection_schema.metadata();
 
         // Run filter one by one and combine them result
         for filter_ctx in &self.filters {
@@ -643,7 +639,9 @@ impl RangeBase {
             // Get the column directly by its projected index.
             // If the column is missing and it's not a tag/time column, this filter is skipped.
             // Assumes the projection indices align with the input batch schema.
-            let column_idx = flat_format.projected_index_by_id(filter_ctx.column_id());
+            let column_idx =
+                self.file_projection_schema
+                    .flat_projected_index_by_id(filter_ctx.column_id());
             if let Some(idx) = column_idx {
                 let column = &input.columns().get(idx).unwrap();
                 let result = filter.evaluate_array(column).context(RecordBatchSnafu)?;
@@ -763,7 +761,7 @@ impl RangeBase {
         }
 
         for field in arrow_schema.fields() {
-            let metadata = self.file_projection_schema.read_format().metadata();
+            let metadata = self.file_projection_schema.metadata();
             let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
 
             // Partition pruning schema should be a subset of the input batch schema.
@@ -796,11 +794,9 @@ impl RangeBase {
             } else if metadata.time_index_column().column_id == column_id {
                 // 2. Check if it's the timestamp column.
                 columns.push(input.timestamps().to_arrow_array());
-            } else if let Some(field_index) = self
-                .file_projection_schema
-                .read_format()
-                .as_primary_key()
-                .and_then(|f| f.field_index_by_id(column_id))
+            } else if let Some(field_index) =
+                self.file_projection_schema
+                    .primary_key_field_index_by_id(column_id)
             {
                 // 3. Check if it's a field column.
                 columns.push(input.fields()[field_index].data.to_arrow_array());
@@ -833,14 +829,13 @@ impl RangeBase {
         let arrow_schema = schema.arrow_schema();
         let mut columns = Vec::with_capacity(arrow_schema.fields().len());
 
-        let flat_format = self
-            .file_projection_schema
-            .read_format()
-            .as_flat()
-            .context(crate::error::UnexpectedSnafu {
+        ensure!(
+            self.file_projection_schema.is_flat(),
+            crate::error::UnexpectedSnafu {
                 reason: "Expected flat format for precise_filter_flat",
-            })?;
-        let metadata = flat_format.metadata();
+            }
+        );
+        let metadata = self.file_projection_schema.metadata();
 
         for field in arrow_schema.fields() {
             let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
@@ -856,7 +851,7 @@ impl RangeBase {
                 .fail();
             };
 
-            if let Some(idx) = flat_format.projected_index_by_id(column_id) {
+            if let Some(idx) = self.file_projection_schema.flat_projected_index_by_id(column_id) {
                 columns.push(input.column(idx).clone());
                 continue;
             }

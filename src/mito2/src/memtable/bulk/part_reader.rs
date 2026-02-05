@@ -57,7 +57,7 @@ impl EncodedBulkPartIter {
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> error::Result<Self> {
-        assert!(context.read_format().as_flat().is_some());
+        assert!(context.file_projection_schema().is_flat());
 
         let parquet_meta = encoded_part.metadata().parquet_metadata.clone();
         let data = encoded_part.data().clone();
@@ -65,7 +65,11 @@ impl EncodedBulkPartIter {
 
         let projection_mask = ProjectionMask::roots(
             parquet_meta.file_metadata().schema_descr(),
-            context.read_format().projection_indices().iter().copied(),
+            context
+                .file_projection_schema()
+                .projection_indices()
+                .iter()
+                .copied(),
         );
         let builder =
             MemtableRowGroupReaderBuilder::try_new(&context, projection_mask, parquet_meta, data)?;
@@ -221,7 +225,7 @@ impl BulkPartBatchIter {
         series_count: usize,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Self {
-        assert!(context.read_format().as_flat().is_some());
+        assert!(context.file_projection_schema().is_flat());
 
         Self {
             batches: VecDeque::from(batches),
@@ -260,7 +264,7 @@ impl BulkPartBatchIter {
 
     /// Applies projection to the RecordBatch if needed.
     fn apply_projection(&self, record_batch: RecordBatch) -> error::Result<RecordBatch> {
-        let projection_indices = self.context.read_format().projection_indices();
+        let projection_indices = self.context.file_projection_schema().projection_indices();
         if projection_indices.len() == record_batch.num_columns() {
             return Ok(record_batch);
         }
@@ -356,8 +360,9 @@ fn apply_combined_filters(
     skip_fields: bool,
 ) -> error::Result<Option<RecordBatch>> {
     // Converts the format to the flat format first.
-    let format = context.read_format().as_flat().unwrap();
-    let record_batch = format.convert_batch(record_batch, None)?;
+    let record_batch = context
+        .file_projection_schema()
+        .convert_flat_record_batch(record_batch, None)?;
 
     let num_rows = record_batch.num_rows();
     let mut combined_filter = None;

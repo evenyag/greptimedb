@@ -30,7 +30,7 @@ use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBa
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_region::PredicateGroup;
-use crate::sst::parquet::format::ReadFormat;
+use crate::sst::parquet::format::{ReadFormat, StatValues};
 
 /// Projection + schema computation plan built from request + expected metadata.
 pub(crate) struct ProjectionSchemaPlan {
@@ -182,6 +182,7 @@ impl ProjectionSchemaPlan {
     }
 
     /// Builds a per-file projection/schema view.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_file(
         self: &Arc<Self>,
         file_meta: RegionMetadataRef,
@@ -259,10 +260,6 @@ impl FileProjectionSchema {
         Ok(Self::new(expected_meta, read_format, None, None))
     }
 
-    pub(crate) fn read_format(&self) -> &ReadFormat {
-        &self.read_format
-    }
-
     pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
         self.compat.as_ref()
     }
@@ -273,6 +270,98 @@ impl FileProjectionSchema {
 
     pub(crate) fn expected_metadata(&self) -> &RegionMetadataRef {
         &self.expected_meta
+    }
+
+    pub(crate) fn metadata(&self) -> &RegionMetadataRef {
+        self.read_format.metadata()
+    }
+
+    pub(crate) fn arrow_schema(&self) -> &datatypes::arrow::datatypes::SchemaRef {
+        self.read_format.arrow_schema()
+    }
+
+    pub(crate) fn projection_indices(&self) -> &[usize] {
+        self.read_format.projection_indices()
+    }
+
+    pub(crate) fn is_flat(&self) -> bool {
+        self.read_format.as_flat().is_some()
+    }
+
+    pub(crate) fn is_primary_key(&self) -> bool {
+        self.read_format.as_primary_key().is_some()
+    }
+
+    pub(crate) fn flat_projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
+        self.read_format
+            .as_flat()
+            .and_then(|format| format.projected_index_by_id(column_id))
+    }
+
+    pub(crate) fn primary_key_field_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
+        self.read_format
+            .as_primary_key()
+            .and_then(|format| format.field_index_by_id(column_id))
+    }
+
+    pub(crate) fn convert_primary_key_record_batch(
+        &self,
+        record_batch: &datatypes::arrow::record_batch::RecordBatch,
+        override_sequence_array: Option<&datatypes::arrow::array::ArrayRef>,
+        batches: &mut std::collections::VecDeque<crate::read::Batch>,
+    ) -> Result<()> {
+        let format = self
+            .read_format
+            .as_primary_key()
+            .context(crate::error::UnexpectedSnafu {
+                reason: "Expected primary key format",
+            })?;
+        format.convert_record_batch(record_batch, override_sequence_array, batches)
+    }
+
+    pub(crate) fn convert_flat_record_batch(
+        &self,
+        record_batch: datatypes::arrow::record_batch::RecordBatch,
+        override_sequence_array: Option<&datatypes::arrow::array::ArrayRef>,
+    ) -> Result<datatypes::arrow::record_batch::RecordBatch> {
+        let format = self
+            .read_format
+            .as_flat()
+            .context(crate::error::UnexpectedSnafu {
+                reason: "Expected flat format",
+            })?;
+        format.convert_batch(record_batch, override_sequence_array)
+    }
+
+    pub(crate) fn new_override_sequence_array(
+        &self,
+        length: usize,
+    ) -> Option<datatypes::arrow::array::ArrayRef> {
+        self.read_format.new_override_sequence_array(length)
+    }
+
+    pub(crate) fn min_values(
+        &self,
+        row_groups: &[impl std::borrow::Borrow<parquet::file::metadata::RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        self.read_format.min_values(row_groups, column_id)
+    }
+
+    pub(crate) fn max_values(
+        &self,
+        row_groups: &[impl std::borrow::Borrow<parquet::file::metadata::RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        self.read_format.max_values(row_groups, column_id)
+    }
+
+    pub(crate) fn null_counts(
+        &self,
+        row_groups: &[impl std::borrow::Borrow<parquet::file::metadata::RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        self.read_format.null_counts(row_groups, column_id)
     }
 }
 
