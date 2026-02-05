@@ -125,11 +125,11 @@ mod tests {
     use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
     use super::*;
-    use crate::read::projection_schema_plan::ProjectionSchemaPlan;
     use crate::access_layer::{FilePathProvider, Metrics, RegionFilePathFactory, WriteType};
     use crate::cache::test_util::assert_parquet_metadata_equal;
     use crate::cache::{CacheManager, CacheStrategy, PageKey};
     use crate::config::IndexConfig;
+    use crate::read::projection_schema_plan::ProjectionSchemaPlan;
     use crate::read::{BatchBuilder, BatchReader, FlatSource};
     use crate::region::options::{IndexOptions, InvertedIndexOptions};
     use crate::sst::file::{FileHandle, FileMeta, RegionFileId, RegionIndexId};

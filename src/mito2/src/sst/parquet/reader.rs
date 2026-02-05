@@ -347,25 +347,22 @@ impl ParquetReaderBuilder {
         //
         // This is applied after row-group filtering to align batches with flat output schema
         // before compat handling.
-        let compaction_projection_mapper = projection_plan.compaction_projection_mapper(
-            &region_meta,
-            self.compaction,
-            is_same_region_partition,
-        )?;
-
-        let mut read_format = projection_plan.build_read_format(
+        let override_sequence = if need_override_sequence(&parquet_meta) {
+            self.file_handle.meta_ref().sequence.map(|x| x.get())
+        } else {
+            None
+        };
+        let file_projection_schema = projection_plan.for_file(
             region_meta.clone(),
             Some(parquet_meta.file_metadata().schema_descr().num_columns()),
             &file_path,
             skip_auto_convert,
+            self.compaction,
+            is_same_region_partition,
+            self.decode_primary_key_values,
+            override_sequence,
         )?;
-        if self.decode_primary_key_values {
-            read_format.set_decode_primary_key_values(true);
-        }
-        if need_override_sequence(&parquet_meta) {
-            read_format
-                .set_override_sequence(self.file_handle.meta_ref().sequence.map(|x| x.get()));
-        }
+        let read_format = file_projection_schema.read_format();
 
         // Computes the projection mask.
         let parquet_schema_desc = parquet_meta.file_metadata().schema_descr();
@@ -444,12 +441,9 @@ impl ParquetReaderBuilder {
             RangeBase {
                 filters,
                 dyn_filters,
-                read_format,
-                expected_metadata: Some(expected_metadata.clone()),
                 prune_schema,
                 codec,
-                compat_batch: None,
-                compaction_projection_mapper,
+                file_projection_schema,
                 pre_filter_mode: self.pre_filter_mode,
                 partition_filter,
             },

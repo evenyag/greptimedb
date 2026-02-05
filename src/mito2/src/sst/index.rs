@@ -67,10 +67,10 @@ use crate::request::{
     WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
+use crate::sst::FormatType;
 use crate::sst::file::{
     ColumnIndexMetadata, FileHandle, FileMeta, IndexType, IndexTypes, RegionFileId, RegionIndexId,
 };
-use crate::sst::FormatType;
 use crate::sst::file_purger::FilePurgerRef;
 use crate::sst::index::fulltext_index::creator::FulltextIndexer;
 use crate::sst::index::intermediate::IntermediateManager;
@@ -798,7 +798,12 @@ impl IndexBuildTask {
             .access_layer
             .read_sst(self.file.clone()) // use the latest file handle instead of creating a new one
             .flat_format(
-                version_control.current().version.options.sst_format.unwrap_or_default()
+                version_control
+                    .current()
+                    .version
+                    .options
+                    .sst_format
+                    .unwrap_or_default()
                     == FormatType::Flat,
             )
             .build()

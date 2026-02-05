@@ -24,8 +24,8 @@ use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
 use crate::error::Result;
+use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
-use crate::sst::parquet::flat_format::FlatReadFormat;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::SimpleFilterContext;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -73,12 +73,9 @@ impl BulkIterContext {
             })
             .collect();
 
-        let read_format = ReadFormat::new(
+        let file_schema = FileProjectionSchema::new_for_memtable(
             region_metadata.clone(),
             projection,
-            true,
-            None,
-            "memtable",
             skip_auto_convert,
         )?;
 
@@ -91,13 +88,9 @@ impl BulkIterContext {
             base: RangeBase {
                 filters: simple_filters,
                 dyn_filters,
-                read_format,
+                file_projection_schema: file_schema,
                 prune_schema: region_metadata.schema.clone(),
-                expected_metadata: Some(region_metadata),
                 codec,
-                // we don't need to compat batch since all batch in memtable have the same schema.
-                compat_batch: None,
-                compaction_projection_mapper: None,
                 pre_filter_mode,
                 partition_filter: None,
             },
@@ -111,11 +104,15 @@ impl BulkIterContext {
         file_meta: &Arc<ParquetMetaData>,
         skip_fields: bool,
     ) -> VecDeque<usize> {
-        let region_meta = self.base.read_format.metadata();
+        let region_meta = self.base.file_projection_schema.read_format().metadata();
         let row_groups = file_meta.row_groups();
         // expected_metadata is set to None since we always expect region metadata of memtable is up-to-date.
-        let stats =
-            RowGroupPruningStats::new(row_groups, &self.base.read_format, None, skip_fields);
+        let stats = RowGroupPruningStats::new(
+            row_groups,
+            self.base.file_projection_schema.read_format(),
+            Some(self.base.file_projection_schema.expected_metadata().clone()),
+            skip_fields,
+        );
         if let Some(predicate) = self.predicate.as_ref() {
             predicate
                 .prune_with_stats(&stats, region_meta.schema.arrow_schema())
@@ -134,7 +131,7 @@ impl BulkIterContext {
     }
 
     pub(crate) fn read_format(&self) -> &ReadFormat {
-        &self.base.read_format
+        self.base.file_projection_schema.read_format()
     }
 
     /// Returns the pre-filter mode.
@@ -144,6 +141,10 @@ impl BulkIterContext {
 
     /// Returns the region id.
     pub(crate) fn region_id(&self) -> store_api::storage::RegionId {
-        self.base.read_format.metadata().region_id
+        self.base
+            .file_projection_schema
+            .read_format()
+            .metadata()
+            .region_id
     }
 }

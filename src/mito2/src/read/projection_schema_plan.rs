@@ -17,8 +17,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::Expr;
+use datafusion_expr::utils::expr_to_columns;
 use snafu::OptionExt;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
@@ -30,14 +30,13 @@ use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBa
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_region::PredicateGroup;
-use crate::sst::parquet::format::{FormatProjection, ReadFormat};
+use crate::sst::parquet::format::ReadFormat;
 
 /// Projection + schema computation plan built from request + expected metadata.
 pub(crate) struct ProjectionSchemaPlan {
     expected_meta: RegionMetadataRef,
     flat_format: bool,
     projection: Option<Vec<usize>>,
-    read_column_ids: Vec<ColumnId>,
     mapper: Arc<ProjectionMapper>,
 }
 
@@ -73,25 +72,18 @@ impl ProjectionSchemaPlan {
             expected_meta,
             flat_format,
             projection,
-            read_column_ids,
             mapper: Arc::new(mapper),
         })
     }
 
     /// Builds a plan that reads all columns.
     pub(crate) fn new_all(expected_meta: RegionMetadataRef, flat_format: bool) -> Result<Self> {
-        let read_column_ids = expected_meta
-            .column_metadatas
-            .iter()
-            .map(|col| col.column_id)
-            .collect();
         let mapper = ProjectionMapper::all(&expected_meta, flat_format)?;
 
         Ok(Self {
             expected_meta,
             flat_format,
             projection: None,
-            read_column_ids,
             mapper: Arc::new(mapper),
         })
     }
@@ -108,7 +100,7 @@ impl ProjectionSchemaPlan {
 
     /// Returns ids of columns to read from memtables and SSTs.
     pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
-        &self.read_column_ids
+        self.mapper.column_ids()
     }
 
     /// Returns the mapper built from expected metadata.
@@ -131,7 +123,7 @@ impl ProjectionSchemaPlan {
     ) -> Result<ReadFormat> {
         ReadFormat::new(
             file_meta,
-            Some(&self.read_column_ids),
+            Some(self.mapper.column_ids()),
             self.flat_format,
             parquet_column_num,
             file_path,
@@ -154,10 +146,7 @@ impl ProjectionSchemaPlan {
         }
 
         let compat = if let Some(flat_format) = read_format.as_flat() {
-            let mapper = self
-                .mapper
-                .as_flat()
-                .expect("flat format mapper missing");
+            let mapper = self.mapper.as_flat().expect("flat format mapper missing");
             FlatCompatBatch::try_new(
                 mapper,
                 flat_format.metadata(),
@@ -201,21 +190,28 @@ impl ProjectionSchemaPlan {
         skip_auto_convert: bool,
         compaction: bool,
         is_same_region_partition: bool,
+        decode_primary_key_values: bool,
+        override_sequence: Option<u64>,
     ) -> Result<FileProjectionSchema> {
-        let read_format = self.build_read_format(
+        let mut read_format = self.build_read_format(
             file_meta.clone(),
             parquet_column_num,
             file_path,
             skip_auto_convert,
         )?;
+        if decode_primary_key_values {
+            read_format.set_decode_primary_key_values(true);
+        }
+        if let Some(sequence) = override_sequence {
+            read_format.set_override_sequence(Some(sequence));
+        }
 
         let compat = self.compat_for_read_format(&read_format, compaction)?;
         let compaction_projection =
             self.compaction_projection_mapper(&file_meta, compaction, is_same_region_partition)?;
 
         Ok(FileProjectionSchema {
-            plan: Arc::clone(self),
-            file_meta,
+            expected_meta: self.expected_meta.clone(),
             read_format,
             compat,
             compaction_projection,
@@ -225,28 +221,46 @@ impl ProjectionSchemaPlan {
 
 /// Per-file projection/schema info.
 pub(crate) struct FileProjectionSchema {
-    plan: Arc<ProjectionSchemaPlan>,
-    file_meta: RegionMetadataRef,
+    expected_meta: RegionMetadataRef,
     read_format: ReadFormat,
     compat: Option<CompatBatch>,
     compaction_projection: Option<CompactionProjectionMapper>,
 }
 
 impl FileProjectionSchema {
+    pub(crate) fn new(
+        expected_meta: RegionMetadataRef,
+        read_format: ReadFormat,
+        compat: Option<CompatBatch>,
+        compaction_projection: Option<CompactionProjectionMapper>,
+    ) -> Self {
+        Self {
+            expected_meta,
+            read_format,
+            compat,
+            compaction_projection,
+        }
+    }
+
+    pub(crate) fn new_for_memtable(
+        expected_meta: RegionMetadataRef,
+        projection: Option<&[ColumnId]>,
+        skip_auto_convert: bool,
+    ) -> Result<Self> {
+        let read_format = ReadFormat::new(
+            expected_meta.clone(),
+            projection,
+            true,
+            None,
+            "memtable",
+            skip_auto_convert,
+        )?;
+
+        Ok(Self::new(expected_meta, read_format, None, None))
+    }
+
     pub(crate) fn read_format(&self) -> &ReadFormat {
         &self.read_format
-    }
-
-    pub(crate) fn projection_indices(&self) -> &[usize] {
-        self.read_format.projection_indices()
-    }
-
-    pub(crate) fn arrow_schema(&self) -> &datatypes::arrow::datatypes::SchemaRef {
-        self.read_format.arrow_schema()
-    }
-
-    pub(crate) fn format_projection(&self) -> Option<&FormatProjection> {
-        self.read_format.as_flat().map(|f| f.format_projection())
     }
 
     pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
@@ -257,24 +271,8 @@ impl FileProjectionSchema {
         self.compaction_projection.as_ref()
     }
 
-    pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
-        self.plan.read_column_ids()
-    }
-
-    pub(crate) fn mapper(&self) -> &Arc<ProjectionMapper> {
-        self.plan.mapper()
-    }
-
-    pub(crate) fn output_schema(&self) -> datatypes::schema::SchemaRef {
-        self.plan.output_schema()
-    }
-
     pub(crate) fn expected_metadata(&self) -> &RegionMetadataRef {
-        self.plan.expected_metadata()
-    }
-
-    pub(crate) fn file_metadata(&self) -> &RegionMetadataRef {
-        &self.file_meta
+        &self.expected_meta
     }
 }
 

@@ -46,6 +46,7 @@ use crate::read::Batch;
 use crate::read::compat::CompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::RowGroupLastRowCachedReader;
+use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::read::prune::{FlatPruneReader, PruneReader};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
@@ -143,7 +144,13 @@ impl FileRange {
         let stats = RowGroupPruningStats::new(
             std::slice::from_ref(curr_row_group),
             read_format,
-            self.context.base.expected_metadata.clone(),
+            Some(
+                self.context
+                    .base
+                    .file_projection_schema
+                    .expected_metadata()
+                    .clone(),
+            ),
             self.compute_skip_fields(),
         );
 
@@ -317,7 +324,7 @@ impl FileRangeContext {
 
     /// Returns the format helper.
     pub(crate) fn read_format(&self) -> &ReadFormat {
-        &self.base.read_format
+        self.base.file_projection_schema.read_format()
     }
 
     /// Returns the reader builder.
@@ -327,17 +334,14 @@ impl FileRangeContext {
 
     /// Returns the helper to compat batches.
     pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
-        self.base.compat_batch.as_ref()
+        self.base.file_projection_schema.compat_batch()
     }
 
     /// Returns the helper to project batches.
     pub(crate) fn compaction_projection_mapper(&self) -> Option<&CompactionProjectionMapper> {
-        self.base.compaction_projection_mapper.as_ref()
-    }
-
-    /// Sets the `CompatBatch` to the context.
-    pub(crate) fn set_compat_batch(&mut self, compat: Option<CompatBatch>) {
-        self.base.compat_batch = compat;
+        self.base
+            .file_projection_schema
+            .compaction_projection_mapper()
     }
 
     /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
@@ -408,17 +412,12 @@ pub(crate) struct RangeBase {
     pub(crate) filters: Vec<SimpleFilterContext>,
     /// Dynamic filter physical exprs.
     pub(crate) dyn_filters: Arc<Vec<DynamicFilterPhysicalExpr>>,
-    /// Helper to read the SST.
-    pub(crate) read_format: ReadFormat,
-    pub(crate) expected_metadata: Option<RegionMetadataRef>,
+    /// Per-file projection/schema info.
+    pub(crate) file_projection_schema: FileProjectionSchema,
     /// Schema used for pruning with dynamic filters.
     pub(crate) prune_schema: Arc<Schema>,
     /// Decoder for primary keys
     pub(crate) codec: Arc<dyn PrimaryKeyCodec>,
-    /// Optional helper to compat batches.
-    pub(crate) compat_batch: Option<CompatBatch>,
-    /// Optional helper to project batches.
-    pub(crate) compaction_projection_mapper: Option<CompactionProjectionMapper>,
     /// Mode to pre-filter columns.
     pub(crate) pre_filter_mode: PreFilterMode,
     /// Partition filter.
@@ -456,6 +455,7 @@ impl RangeBase {
         mut input: Batch,
         skip_fields: bool,
     ) -> Result<Option<Batch>> {
+        let read_format = self.file_projection_schema.read_format();
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
         // Run filter one by one and combine them result
@@ -483,8 +483,7 @@ impl RangeBase {
                     let pk_value = match pk_values {
                         CompositeValues::Dense(v) => {
                             // Safety: this is a primary key
-                            let pk_index = self
-                                .read_format
+                            let pk_index = read_format
                                 .metadata()
                                 .primary_key_index(filter_ctx.column_id())
                                 .unwrap();
@@ -515,8 +514,7 @@ impl RangeBase {
                         continue;
                     }
                     // Safety: Input is Batch so we are using primary key format.
-                    let Some(field_index) = self
-                        .read_format
+                    let Some(field_index) = read_format
                         .as_primary_key()
                         .unwrap()
                         .field_index_by_id(filter_ctx.column_id())
@@ -619,7 +617,8 @@ impl RangeBase {
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
         let flat_format = self
-            .read_format
+            .file_projection_schema
+            .read_format()
             .as_flat()
             .context(crate::error::UnexpectedSnafu {
                 reason: "Expected flat format for precise_filter_flat",
@@ -764,7 +763,7 @@ impl RangeBase {
         }
 
         for field in arrow_schema.fields() {
-            let metadata = self.read_format.metadata();
+            let metadata = self.file_projection_schema.read_format().metadata();
             let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
 
             // Partition pruning schema should be a subset of the input batch schema.
@@ -798,7 +797,8 @@ impl RangeBase {
                 // 2. Check if it's the timestamp column.
                 columns.push(input.timestamps().to_arrow_array());
             } else if let Some(field_index) = self
-                .read_format
+                .file_projection_schema
+                .read_format()
                 .as_primary_key()
                 .and_then(|f| f.field_index_by_id(column_id))
             {
@@ -834,7 +834,8 @@ impl RangeBase {
         let mut columns = Vec::with_capacity(arrow_schema.fields().len());
 
         let flat_format = self
-            .read_format
+            .file_projection_schema
+            .read_format()
             .as_flat()
             .context(crate::error::UnexpectedSnafu {
                 reason: "Expected flat format for precise_filter_flat",

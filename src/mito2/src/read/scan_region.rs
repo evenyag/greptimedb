@@ -37,7 +37,7 @@ use snafu::ResultExt;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
 use store_api::storage::{
-    ColumnId, RegionId, ScanRequest, SequenceRange, TimeSeriesDistribution, TimeSeriesRowSelector,
+    RegionId, ScanRequest, SequenceRange, TimeSeriesDistribution, TimeSeriesRowSelector,
 };
 use table::predicate::{Predicate, build_time_range_predicate};
 use tokio::sync::{Semaphore, mpsc};
@@ -479,9 +479,10 @@ impl ScanRegion {
 
         let region_id = self.region_id();
         debug!(
-            "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}, flat_format: {}",
+            "Scan region {}, request: {:?}, projection: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}, flat_format: {}",
             region_id,
             self.request,
+            plan.projection(),
             time_range,
             mem_range_builders.len(),
             files.len(),
@@ -825,14 +826,9 @@ impl ScanInput {
         self.projection_plan.expected_metadata()
     }
 
-    /// Returns column ids to read from memtables and SSTs.
-    pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
-        self.projection_plan.read_column_ids()
-    }
-
     /// Returns output schema for the final projected batch.
     pub(crate) fn output_schema(&self) -> datatypes::schema::SchemaRef {
-        self.mapper().output_schema()
+        self.projection_plan.output_schema()
     }
 
     /// Sets time range filter for time index.
@@ -1104,7 +1100,7 @@ impl ScanInput {
             .decode_primary_key_values(decode_pk_values)
             .build_reader_input(reader_metrics)
             .await;
-        let (mut file_range_ctx, selection) = match res {
+        let (file_range_ctx, selection) = match res {
             Ok(x) => x,
             Err(e) => {
                 if e.is_object_not_found() && self.ignore_file_not_found {
@@ -1116,10 +1112,6 @@ impl ScanInput {
             }
         };
 
-        let compat = self
-            .projection_plan
-            .compat_for_read_format(file_range_ctx.read_format(), self.compaction)?;
-        file_range_ctx.set_compat_batch(compat);
         Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
     }
 
