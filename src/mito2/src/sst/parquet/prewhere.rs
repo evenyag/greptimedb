@@ -27,12 +27,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use api::v1::SemanticType;
-use datatypes::arrow::array::{ArrayRef, BooleanArray};
+use datatypes::arrow::array::{ArrayRef, BooleanArray, BooleanBufferBuilder};
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::compute::{concat, filter};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use futures::{Stream, StreamExt};
+use mito_codec::row_converter::{PrimaryKeyCodec, build_primary_key_codec};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::async_reader::ParquetRecordBatchStream;
@@ -40,8 +41,6 @@ use parquet::schema::types::SchemaDescriptor;
 use snafu::{IntoError, ResultExt};
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
-
-use mito_codec::row_converter::{build_primary_key_codec, PrimaryKeyCodec};
 
 use crate::config::PrewhereConfig;
 use crate::error::{ComputeArrowSnafu, ReadParquetSnafu, RecordBatchSnafu, Result};
@@ -111,11 +110,9 @@ impl PrewhereContext {
                 .keys()
                 .copied()
                 .collect(),
-            ReadFormat::PrimaryKey(pk) => pk
-                .field_id_to_projected_index()
-                .keys()
-                .copied()
-                .collect(),
+            ReadFormat::PrimaryKey(pk) => {
+                pk.field_id_to_projected_index().keys().copied().collect()
+            }
         };
 
         // Prewhere columns that are also in output projection.
@@ -141,6 +138,12 @@ impl PrewhereContext {
             all_projected_ids.len(),
             config,
         ) {
+            common_telemetry::info!(
+                "Don't use prewhere, prewhere columns: {:?}, output columns: {:?}, remaining columns: {:?}",
+                prewhere_column_ids,
+                output_column_ids,
+                remaining_column_ids
+            );
             return None;
         }
 
@@ -156,6 +159,15 @@ impl PrewhereContext {
             .iter()
             .filter_map(|id| id_to_index.get(id).copied())
             .collect();
+
+        common_telemetry::info!(
+            "Use prewhere, prewhere columns: {:?}, output columns: {:?}, remaining columns: {:?}, full_projection_indices: {:?}, prewhere_cache_sst_indices: {:?}",
+            prewhere_column_ids,
+            output_column_ids,
+            remaining_column_ids,
+            full_projection_indices,
+            prewhere_cache_sst_indices,
+        );
 
         // Compute projection masks and indices.
         let (
@@ -178,6 +190,14 @@ impl PrewhereContext {
                 &full_index_pos,
                 None,
             );
+
+        common_telemetry::info!(
+            "Use prewhere compute mask, full_projection_indices: {:?}, prewhere_cache_sst_indices: {:?}, prewhere_indices_in_full_batch: {:?}, remaining_indices_in_full_batch: {:?}",
+            full_projection_indices,
+            prewhere_cache_sst_indices,
+            prewhere_indices_in_full_batch,
+            remaining_indices_in_full_batch,
+        );
 
         Some(Self {
             prewhere_projection_mask,
@@ -202,7 +222,6 @@ impl PrewhereContext {
     pub fn prewhere_cache_indices_in_batch(&self) -> &[usize] {
         &self.prewhere_cache_indices_in_batch
     }
-
 }
 
 /// Result of the prewhere phase.
@@ -315,44 +334,6 @@ fn compute_projection_mask_and_indices(
     (mask, cache_indices_in_batch, indices_in_full_batch)
 }
 
-/// Converts a boolean buffer (filter mask) to a RowSelection.
-///
-/// The input buffer indicates which rows passed the filter (true = pass).
-/// The output RowSelection can be used to skip rows that didn't pass.
-pub fn boolean_buffer_to_row_selection(mask: &BooleanBuffer) -> RowSelection {
-    if mask.is_empty() {
-        return RowSelection::from(vec![]);
-    }
-
-    let mut selectors = Vec::new();
-    let mut current_selected = mask.value(0);
-    let mut count = 1;
-
-    for i in 1..mask.len() {
-        let selected = mask.value(i);
-        if selected == current_selected {
-            count += 1;
-        } else {
-            selectors.push(if current_selected {
-                parquet::arrow::arrow_reader::RowSelector::select(count)
-            } else {
-                parquet::arrow::arrow_reader::RowSelector::skip(count)
-            });
-            current_selected = selected;
-            count = 1;
-        }
-    }
-
-    // Push the last segment.
-    selectors.push(if current_selected {
-        parquet::arrow::arrow_reader::RowSelector::select(count)
-    } else {
-        parquet::arrow::arrow_reader::RowSelector::skip(count)
-    });
-
-    RowSelection::from(selectors)
-}
-
 /// Applies filters to a record batch and returns the combined filter mask.
 ///
 /// Returns `None` if the entire batch is filtered out.
@@ -382,11 +363,10 @@ pub fn apply_filters_to_batch(
         // Find the column in the batch.
         let column_idx = match read_format {
             ReadFormat::Flat(flat) => flat.projected_index_by_id(filter_ctx.column_id()),
-            ReadFormat::PrimaryKey(pk) => {
-                pk.field_id_to_projected_index()
-                    .get(&filter_ctx.column_id())
-                    .copied()
-            }
+            ReadFormat::PrimaryKey(pk) => pk
+                .field_id_to_projected_index()
+                .get(&filter_ctx.column_id())
+                .copied(),
         };
 
         if let Some(idx) = column_idx
@@ -406,7 +386,9 @@ pub fn apply_filters_to_batch(
                 &mut tag_decode_state,
                 &mut pk_codec,
             )? {
-                let result = filter.evaluate_array(&tag_column).context(RecordBatchSnafu)?;
+                let result = filter
+                    .evaluate_array(&tag_column)
+                    .context(RecordBatchSnafu)?;
                 mask = mask.bitand(&result);
             }
         } else if filter_ctx.semantic_type() == SemanticType::Timestamp {
@@ -468,8 +450,8 @@ pub async fn execute_prewhere(
 
     // Collect all batches and build the combined filter mask
     let mut all_cached_columns: Vec<Vec<ArrayRef>> = Vec::new();
-    let mut combined_mask: Option<BooleanBuffer> = None;
-    let mut _total_rows = 0usize;
+    let mut filter_arrays: Vec<BooleanArray> = Vec::new();
+    let mut mask_builder = BooleanBufferBuilder::new(0);
     let cache_indices = prewhere_ctx.prewhere_cache_indices_in_batch();
 
     while let Some(batch_result) = prewhere_stream.next().await {
@@ -481,10 +463,11 @@ pub async fn execute_prewhere(
         if num_rows == 0 {
             continue;
         }
-        _total_rows += num_rows;
-
         // Apply filters to get the mask for this batch
-        let batch_mask = apply_filters_to_batch(&batch, filters, read_format, skip_fields)?;
+        let batch_mask = match apply_filters_to_batch(&batch, filters, read_format, skip_fields)? {
+            Some(mask) => mask,
+            None => BooleanBuffer::new_unset(num_rows),
+        };
 
         // Cache the columns from this batch
         if !cache_indices.is_empty() {
@@ -497,46 +480,26 @@ pub async fn execute_prewhere(
             all_cached_columns.push(batch_columns);
         }
 
-        // Combine the masks
-        match (&mut combined_mask, batch_mask) {
-            (None, Some(mask)) => {
-                combined_mask = Some(mask);
-            }
-            (Some(existing), Some(mask)) => {
-                // Concatenate the masks
-                let mut values = Vec::with_capacity(existing.len() + mask.len());
-                for i in 0..existing.len() {
-                    values.push(existing.value(i));
-                }
-                for i in 0..mask.len() {
-                    values.push(mask.value(i));
-                }
-                *existing = BooleanBuffer::from(values);
-            }
-            (_, None) => {
-                // Entire batch is filtered out, set all bits to false
-                let false_mask = BooleanBuffer::new_unset(num_rows);
-                match &mut combined_mask {
-                    None => combined_mask = Some(false_mask),
-                    Some(existing) => {
-                        let mut values = Vec::with_capacity(existing.len() + num_rows);
-                        for i in 0..existing.len() {
-                            values.push(existing.value(i));
-                        }
-                        values.extend(std::iter::repeat_n(false, num_rows));
-                        *existing = BooleanBuffer::from(values);
-                    }
-                }
-            }
+        for i in 0..batch_mask.len() {
+            mask_builder.append(batch_mask.value(i));
         }
+
+        filter_arrays.push(BooleanArray::from(batch_mask));
     }
 
-    // If no data was read, return None
-    let Some(filter_mask) = combined_mask else {
+    if filter_arrays.is_empty() {
         return Ok(None);
     };
 
+    let filter_mask: BooleanBuffer = mask_builder.into();
     let rows_selected = filter_mask.count_set_bits();
+
+    common_telemetry::info!(
+        "Prewhere execute, row group: {}, rows selected: {}",
+        row_group_idx,
+        rows_selected
+    );
+
     if rows_selected == 0 {
         return Ok(None);
     }
@@ -545,7 +508,7 @@ pub async fn execute_prewhere(
     let cached_columns = flatten_cached_columns(all_cached_columns);
 
     // Convert the filter mask to a row selection
-    let prewhere_selection = boolean_buffer_to_row_selection(&filter_mask);
+    let prewhere_selection = RowSelection::from_filters(&filter_arrays);
 
     // Intersect with the original row selection if present
     let refined_selection = match row_selection {
@@ -574,6 +537,7 @@ fn flatten_cached_columns(batches: Vec<Vec<ArrayRef>>) -> Vec<ArrayRef> {
     let num_columns = batches[0].len();
     let mut result = Vec::with_capacity(num_columns);
 
+    // FIXME(yingwen): Avoid concatenating arrays.
     for col_idx in 0..num_columns {
         let arrays: Vec<&dyn datatypes::arrow::array::Array> = batches
             .iter()
@@ -604,7 +568,10 @@ impl PrewhereColumnMapper {
         let mut prewhere_to_full = HashMap::new();
         let mut remaining_to_full = HashMap::new();
 
-        for (local_idx, &full_idx) in prewhere_ctx.prewhere_indices_in_full_batch.iter().enumerate()
+        for (local_idx, &full_idx) in prewhere_ctx
+            .prewhere_indices_in_full_batch
+            .iter()
+            .enumerate()
         {
             prewhere_to_full.insert(local_idx, full_idx);
         }
@@ -659,12 +626,10 @@ impl Stream for PrewhereAwareStream {
             PrewhereAwareStream::Passthrough { stream, file_path } => {
                 match Pin::new(stream).poll_next(cx) {
                     Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(Ok(batch))),
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(
-                        ReadParquetSnafu {
-                            path: file_path.clone(),
-                        }
-                        .into_error(e),
-                    ))),
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ReadParquetSnafu {
+                        path: file_path.clone(),
+                    }
+                    .into_error(e)))),
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => Poll::Pending,
                 }
@@ -710,12 +675,10 @@ impl Stream for PrewhereAwareStream {
                         .context(ComputeArrowSnafu);
                     Poll::Ready(Some(batch))
                 }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(
-                    ReadParquetSnafu {
-                        path: file_path.clone(),
-                    }
-                    .into_error(e),
-                ))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ReadParquetSnafu {
+                    path: file_path.clone(),
+                }
+                .into_error(e)))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
@@ -786,36 +749,6 @@ fn maybe_decode_tag_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_boolean_buffer_to_row_selection_empty() {
-        let buffer = BooleanBuffer::new_unset(0);
-        let selection = boolean_buffer_to_row_selection(&buffer);
-        assert_eq!(selection.row_count(), 0);
-    }
-
-    #[test]
-    fn test_boolean_buffer_to_row_selection_all_true() {
-        let buffer = BooleanBuffer::new_set(10);
-        let selection = boolean_buffer_to_row_selection(&buffer);
-        assert_eq!(selection.row_count(), 10);
-    }
-
-    #[test]
-    fn test_boolean_buffer_to_row_selection_all_false() {
-        let buffer = BooleanBuffer::new_unset(10);
-        let selection = boolean_buffer_to_row_selection(&buffer);
-        assert_eq!(selection.row_count(), 0);
-    }
-
-    #[test]
-    fn test_boolean_buffer_to_row_selection_mixed() {
-        // Create a buffer with pattern: true, true, false, false, true.
-        let values = vec![true, true, false, false, true];
-        let buffer = BooleanBuffer::from(values);
-        let selection = boolean_buffer_to_row_selection(&buffer);
-        assert_eq!(selection.row_count(), 3);
-    }
 
     #[test]
     fn test_should_use_prewhere() {
