@@ -43,8 +43,6 @@ use crate::error::{
     UnexpectedSnafu,
 };
 use crate::read::Batch;
-use crate::read::compat::CompatBatch;
-use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::read::prune::{FlatPruneReader, PruneReader};
@@ -271,14 +269,8 @@ impl FileRange {
         Ok(Some(flat_prune_reader))
     }
 
-    /// Returns the helper to compat batches.
-    pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
-        self.context.compat_batch()
-    }
-
-    /// Returns the helper to project batches.
-    pub(crate) fn compaction_projection_mapper(&self) -> Option<&CompactionProjectionMapper> {
-        self.context.compaction_projection_mapper()
+    pub(crate) fn file_projection_schema(&self) -> &FileProjectionSchema {
+        self.context.file_projection_schema()
     }
 
     /// Returns the file handle of the file range.
@@ -330,19 +322,6 @@ impl FileRangeContext {
     pub(crate) fn reader_builder(&self) -> &RowGroupReaderBuilder {
         &self.reader_builder
     }
-
-    /// Returns the helper to compat batches.
-    pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
-        self.base.file_projection_schema.compat_batch()
-    }
-
-    /// Returns the helper to project batches.
-    pub(crate) fn compaction_projection_mapper(&self) -> Option<&CompactionProjectionMapper> {
-        self.base
-            .file_projection_schema
-            .compaction_projection_mapper()
-    }
-
     /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
     /// Return the filtered batch. If the entire batch is filtered out, return None.
     /// If a partition expr filter is configured, it is also applied.

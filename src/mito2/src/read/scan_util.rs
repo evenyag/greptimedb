@@ -29,10 +29,9 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
-use snafu::OptionExt;
 use store_api::storage::RegionId;
 
-use crate::error::{Result, UnexpectedSnafu};
+use crate::error::Result;
 use crate::memtable::MemScanMetrics;
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
@@ -1403,12 +1402,10 @@ pub fn build_file_range_scan_stream(
             };
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
-            let compat_batch = range.compat_batch();
+            let file_projection_schema = range.file_projection_schema();
             let mut source = Source::PruneReader(reader);
             while let Some(mut batch) = source.next_batch().await? {
-                if let Some(compact_batch) = compat_batch {
-                    batch = compact_batch.as_primary_key().unwrap().compat_batch(batch)?;
-                }
+                batch = file_projection_schema.apply_primary_key_compat(batch)?;
                 yield batch;
             }
             if let Source::PruneReader(reader) = source {
@@ -1466,30 +1463,12 @@ pub fn build_flat_file_range_scan_stream(
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 
-            let may_compat = range
-                .compat_batch()
-                .map(|compat| {
-                    compat.as_flat().context(UnexpectedSnafu {
-                        reason: "Invalid compat for flat format",
-                    })
-                })
-                .transpose()?;
-
-            let mapper = range.compaction_projection_mapper();
+            let file_projection_schema = range.file_projection_schema();
             while let Some(record_batch) = reader.next_batch()? {
-                let record_batch = if let Some(mapper) = mapper {
-                    let batch = mapper.project(record_batch)?;
-                    batch
-                } else {
-                    record_batch
-                };
-
-                if let Some(flat_compat) = may_compat {
-                    let batch = flat_compat.compat(record_batch)?;
-                    yield batch;
-                } else {
-                    yield record_batch;
-                }
+                let record_batch =
+                    file_projection_schema.apply_compaction_projection(record_batch)?;
+                let record_batch = file_projection_schema.apply_flat_compat(record_batch)?;
+                yield record_batch;
             }
 
             let prune_metrics = reader.metrics();

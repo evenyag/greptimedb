@@ -27,6 +27,7 @@ use tracing::warn;
 
 use crate::error::{InvalidRequestSnafu, Result};
 use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::read::Batch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_region::PredicateGroup;
@@ -260,14 +261,6 @@ impl FileProjectionSchema {
         Ok(Self::new(expected_meta, read_format, None, None))
     }
 
-    pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
-        self.compat.as_ref()
-    }
-
-    pub(crate) fn compaction_projection_mapper(&self) -> Option<&CompactionProjectionMapper> {
-        self.compaction_projection.as_ref()
-    }
-
     pub(crate) fn expected_metadata(&self) -> &RegionMetadataRef {
         &self.expected_meta
     }
@@ -362,6 +355,41 @@ impl FileProjectionSchema {
         column_id: ColumnId,
     ) -> StatValues {
         self.read_format.null_counts(row_groups, column_id)
+    }
+
+    pub(crate) fn apply_primary_key_compat(&self, batch: crate::read::Batch) -> Result<Batch> {
+        let Some(compat) = self.compat.as_ref() else {
+            return Ok(batch);
+        };
+        let primary_key = compat
+            .as_primary_key()
+            .context(crate::error::UnexpectedSnafu {
+                reason: "Invalid compat for primary key format",
+            })?;
+        primary_key.compat_batch(batch)
+    }
+
+    pub(crate) fn apply_flat_compat(
+        &self,
+        record_batch: datatypes::arrow::record_batch::RecordBatch,
+    ) -> Result<datatypes::arrow::record_batch::RecordBatch> {
+        let Some(compat) = self.compat.as_ref() else {
+            return Ok(record_batch);
+        };
+        let flat_compat = compat.as_flat().context(crate::error::UnexpectedSnafu {
+            reason: "Invalid compat for flat format",
+        })?;
+        flat_compat.compat(record_batch)
+    }
+
+    pub(crate) fn apply_compaction_projection(
+        &self,
+        record_batch: datatypes::arrow::record_batch::RecordBatch,
+    ) -> Result<datatypes::arrow::record_batch::RecordBatch> {
+        let Some(mapper) = self.compaction_projection.as_ref() else {
+            return Ok(record_batch);
+        };
+        mapper.project(record_batch)
     }
 }
 
