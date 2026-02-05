@@ -51,7 +51,6 @@ use crate::error::{InvalidPartitionExprSnafu, Result};
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
-use crate::read::projection::ProjectionMapper;
 use crate::read::projection_schema_plan::ProjectionSchemaPlan;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::seq_scan::SeqScan;
@@ -816,11 +815,6 @@ impl ScanInput {
         }
     }
 
-    /// Returns the projection mapper.
-    pub(crate) fn mapper(&self) -> &Arc<ProjectionMapper> {
-        self.projection_plan.mapper()
-    }
-
     /// Returns the expected metadata.
     pub(crate) fn expected_metadata(&self) -> &RegionMetadataRef {
         self.projection_plan.expected_metadata()
@@ -1077,7 +1071,7 @@ impl ScanInput {
     ) -> Result<FileRangeBuilder> {
         let predicate = self.predicate_for_file(file);
         let filter_mode = pre_filter_mode(self.append_mode, self.merge_mode);
-        let decode_pk_values = !self.compaction && self.mapper().has_tags();
+        let decode_pk_values = !self.compaction && self.projection_plan.has_tags();
         let reader = self
             .access_layer
             .read_sst(file.clone())
@@ -1468,7 +1462,7 @@ impl StreamContext {
 
         impl fmt::Debug for InputWrapper<'_> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                let output_schema = self.input.mapper().output_schema();
+                let output_schema = self.input.output_schema();
                 if !output_schema.is_empty() {
                     let names: Vec<_> = output_schema
                         .column_schemas()

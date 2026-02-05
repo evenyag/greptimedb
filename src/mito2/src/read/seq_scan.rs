@@ -27,7 +27,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
-use snafu::{OptionExt, ensure};
+use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
     PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
@@ -35,7 +35,7 @@ use store_api::region_engine::{
 use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
-use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu, UnexpectedSnafu};
+use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
@@ -309,8 +309,10 @@ impl SeqScan {
             }
         }
 
-        let mapper = stream_ctx.input.mapper().as_flat().unwrap();
-        let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
+        let schema = stream_ctx
+            .input
+            .projection_plan
+            .flat_input_arrow_schema(stream_ctx.input.compaction);
 
         let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
         let reader =
@@ -333,7 +335,7 @@ impl SeqScan {
                     FlatDedupReader::new(
                         reader.into_stream().boxed(),
                         FlatLastNonNull::new(
-                            mapper.field_column_start(),
+                            stream_ctx.input.projection_plan.flat_field_column_start(),
                             stream_ctx.input.filter_deleted,
                         ),
                         dedup_metrics_reporter,
@@ -376,7 +378,7 @@ impl SeqScan {
         };
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper().clone(),
+            input.projection_plan.clone(),
             input.cache_strategy.clone(),
             metrics,
         );
@@ -431,9 +433,8 @@ impl SeqScan {
             // build part cost.
             let mut fetch_start = Instant::now();
 
-            let _mapper = stream_ctx.input.mapper().as_primary_key().context(UnexpectedSnafu {
-                reason: "Unexpected format",
-            })?;
+            stream_ctx.input.projection_plan.ensure_primary_key_format()?;
+            let region_id = stream_ctx.input.expected_metadata().region_id;
             // Scans each part.
             for part_range in partition_ranges {
                 let mut sources = Vec::new();
@@ -475,7 +476,7 @@ impl SeqScan {
                     #[cfg(debug_assertions)]
                     checker.ensure_part_range_batch(
                         "SeqScan",
-                        _mapper.metadata().region_id,
+                        region_id,
                         partition,
                         part_range,
                         &batch,

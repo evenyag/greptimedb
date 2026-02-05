@@ -274,7 +274,7 @@ impl UnorderedScan {
 
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper().clone(),
+            input.projection_plan.clone(),
             input.cache_strategy.clone(),
             metrics,
         );
@@ -323,7 +323,7 @@ impl UnorderedScan {
             for part_range in part_ranges {
                 let mut metrics = ScannerMetrics::default();
                 let mut fetch_start = Instant::now();
-                let _mapper = stream_ctx.input.mapper();
+                let region_id = stream_ctx.input.expected_metadata().region_id;
                 #[cfg(debug_assertions)]
                 let mut checker = crate::read::BatchChecker::default()
                     .with_start(Some(part_range.start))
@@ -349,7 +349,7 @@ impl UnorderedScan {
                     #[cfg(debug_assertions)]
                     checker.ensure_part_range_batch(
                         "UnorderedScan",
-                        _mapper.metadata().region_id,
+                        region_id,
                         partition,
                         part_range,
                         &batch,

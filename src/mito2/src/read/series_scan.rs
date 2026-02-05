@@ -126,7 +126,7 @@ impl SeriesScan {
         let input = &self.stream_ctx.input;
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
-            input.mapper().clone(),
+            input.projection_plan.clone(),
             input.cache_strategy.clone(),
             metrics,
         );

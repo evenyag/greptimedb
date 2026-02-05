@@ -25,13 +25,15 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use tracing::warn;
 
-use crate::error::{InvalidRequestSnafu, Result};
-use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::cache::CacheStrategy;
+use crate::error::{InvalidRequestSnafu, Result, UnexpectedSnafu};
 use crate::read::Batch;
+use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_region::PredicateGroup;
 use crate::sst::parquet::format::{ReadFormat, StatValues};
+use common_recordbatch::RecordBatch;
 
 /// Projection + schema computation plan built from request + expected metadata.
 pub(crate) struct ProjectionSchemaPlan {
@@ -105,13 +107,57 @@ impl ProjectionSchemaPlan {
     }
 
     /// Returns the mapper built from expected metadata.
-    pub(crate) fn mapper(&self) -> &Arc<ProjectionMapper> {
-        &self.mapper
-    }
-
     /// Returns the output schema for the final projected batch.
     pub(crate) fn output_schema(&self) -> datatypes::schema::SchemaRef {
         self.mapper.output_schema()
+    }
+
+    pub(crate) fn has_tags(&self) -> bool {
+        self.mapper.has_tags()
+    }
+
+    pub(crate) fn empty_record_batch(&self) -> RecordBatch {
+        self.mapper.empty_record_batch()
+    }
+
+    pub(crate) fn convert_primary_key_batch(
+        &self,
+        batch: &Batch,
+        cache_strategy: &CacheStrategy,
+    ) -> common_recordbatch::error::Result<RecordBatch> {
+        let mapper = self
+            .mapper
+            .as_primary_key()
+            .expect("Primary key mapper required");
+        mapper.convert(batch, cache_strategy)
+    }
+
+    pub(crate) fn convert_flat_batch(
+        &self,
+        batch: &datatypes::arrow::record_batch::RecordBatch,
+    ) -> common_recordbatch::error::Result<RecordBatch> {
+        let mapper = self.mapper.as_flat().expect("Flat mapper required");
+        mapper.convert(batch)
+    }
+
+    pub(crate) fn flat_input_arrow_schema(
+        &self,
+        compaction: bool,
+    ) -> datatypes::arrow::datatypes::SchemaRef {
+        let mapper = self.mapper.as_flat().expect("Flat mapper required");
+        mapper.input_arrow_schema(compaction)
+    }
+
+    pub(crate) fn flat_field_column_start(&self) -> usize {
+        let mapper = self.mapper.as_flat().expect("Flat mapper required");
+        mapper.field_column_start()
+    }
+
+    pub(crate) fn ensure_primary_key_format(&self) -> Result<()> {
+        self.mapper.as_primary_key().context(UnexpectedSnafu {
+            reason: "Unexpected format",
+        })?;
+        Ok(())
     }
 
     /// Builds a read format for a specific file metadata.
@@ -165,7 +211,7 @@ impl ProjectionSchemaPlan {
     }
 
     /// Computes compaction projection mapper for a file.
-    pub(crate) fn compaction_projection_mapper(
+    fn compaction_projection_mapper(
         &self,
         file_meta: &RegionMetadataRef,
         compaction: bool,
