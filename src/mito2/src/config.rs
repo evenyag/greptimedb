@@ -175,6 +175,9 @@ pub struct MitoConfig {
     pub default_experimental_flat_format: bool,
 
     pub gc: GcConfig,
+
+    /// Prewhere optimization config for parquet reader.
+    pub prewhere: PrewhereConfig,
 }
 
 impl Default for MitoConfig {
@@ -223,6 +226,7 @@ impl Default for MitoConfig {
             min_compaction_interval: Duration::from_secs(0),
             default_experimental_flat_format: false,
             gc: GcConfig::default(),
+            prewhere: PrewhereConfig::default(),
         };
 
         // Adjust buffer and cache size according to system memory if we can.
@@ -690,6 +694,44 @@ impl VectorIndexConfig {
             MemoryThreshold::Unlimited => None,
             MemoryThreshold::Size(size) => Some(size.as_bytes() as usize),
         }
+    }
+}
+
+/// Configuration for prewhere optimization in parquet reader.
+///
+/// Prewhere optimization reduces I/O by:
+/// 1. Reading only filter columns first (prewhere phase)
+/// 2. Applying filters to get a refined row selection
+/// 3. Reading remaining columns with the refined selection
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct PrewhereConfig {
+    /// Whether prewhere optimization is enabled (default: true).
+    pub enabled: bool,
+    /// Maximum ratio of prewhere columns to total columns (in percent) to enable optimization.
+    /// If prewhere columns exceed this ratio, the optimization is skipped.
+    /// Default: 50 (50%).
+    pub column_ratio_threshold_percent: u32,
+    /// Minimum number of remaining columns required to enable optimization.
+    /// If remaining columns are less than this, the optimization is skipped.
+    /// Default: 2.
+    pub min_remaining_columns: usize,
+}
+
+impl Default for PrewhereConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            column_ratio_threshold_percent: 50,
+            min_remaining_columns: 2,
+        }
+    }
+}
+
+impl PrewhereConfig {
+    /// Returns the column ratio threshold as a fraction (0.0 to 1.0).
+    pub fn column_ratio_threshold(&self) -> f64 {
+        self.column_ratio_threshold_percent as f64 / 100.0
     }
 }
 

@@ -37,6 +37,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, TimeSeriesRowSelector};
 use table::predicate::Predicate;
 
+use crate::config::PrewhereConfig;
 use crate::error::{
     ComputeArrowSnafu, DataTypeMismatchSnafu, DecodeSnafu, DecodeStatsSnafu,
     EvalPartitionFilterSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu,
@@ -53,7 +54,8 @@ use crate::sst::parquet::flat_format::{
 };
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
-    FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
+    FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReader, RowGroupReaderBuilder,
+    SimpleFilterContext,
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -181,6 +183,8 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
+        // Compute skip_fields once for this row group
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
         let parquet_reader = self
             .context
             .reader_builder
@@ -188,6 +192,12 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    filters: self.context.filters(),
+                    read_format: self.context.read_format(),
+                    skip_fields,
+                    prewhere_config: self.context.prewhere_config(),
+                },
             )
             .await?;
 
@@ -209,9 +219,6 @@ impl FileRange {
             // No selector provided, use RowGroupReader
             false
         };
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let prune_reader = if use_last_row_reader {
             // Row group is PUT only, use LastRowReader to skip unnecessary rows.
@@ -242,6 +249,8 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
+        // Compute skip_fields once for this row group
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
         let parquet_reader = self
             .context
             .reader_builder
@@ -249,11 +258,14 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    filters: self.context.filters(),
+                    read_format: self.context.read_format(),
+                    skip_fields,
+                    prewhere_config: self.context.prewhere_config(),
+                },
             )
             .await?;
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let flat_row_group_reader = FlatRowGroupReader::new(self.context.clone(), parquet_reader);
         let flat_prune_reader = FlatPruneReader::new_with_row_group_reader(
@@ -298,11 +310,6 @@ impl FileRangeContext {
             reader_builder,
             base,
         }
-    }
-
-    /// Returns the path of the file to read.
-    pub(crate) fn file_path(&self) -> &str {
-        self.reader_builder.file_path()
     }
 
     /// Returns filters pushed down.
@@ -380,6 +387,12 @@ impl FileRangeContext {
     pub(crate) fn memory_size(&self) -> usize {
         crate::cache::cache_size::parquet_meta_size(self.reader_builder.parquet_metadata())
     }
+
+    /// Returns the prewhere configuration.
+    #[allow(dead_code)]
+    pub(crate) fn prewhere_config(&self) -> &PrewhereConfig {
+        &self.base.prewhere_config
+    }
 }
 
 /// Mode to pre-filter columns in a range.
@@ -423,6 +436,9 @@ pub(crate) struct RangeBase {
     pub(crate) pre_filter_mode: PreFilterMode,
     /// Partition filter.
     pub(crate) partition_filter: Option<PartitionFilterContext>,
+    /// Prewhere configuration for optimizing reads.
+    #[allow(dead_code)]
+    pub(crate) prewhere_config: PrewhereConfig,
 }
 
 pub(crate) struct TagDecodeState {

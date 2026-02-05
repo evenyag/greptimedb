@@ -30,6 +30,7 @@ pub mod flat_format;
 pub mod format;
 pub(crate) mod helper;
 pub(crate) mod metadata;
+pub(crate) mod prewhere;
 pub mod reader;
 pub mod row_group;
 pub mod row_selection;

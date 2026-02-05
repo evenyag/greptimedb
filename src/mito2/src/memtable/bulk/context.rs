@@ -100,6 +100,7 @@ impl BulkIterContext {
                 compaction_projection_mapper: None,
                 pre_filter_mode,
                 partition_filter: None,
+                prewhere_config: crate::config::PrewhereConfig::default(),
             },
             predicate,
         })
