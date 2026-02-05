@@ -23,6 +23,7 @@ use common_memory_manager;
 use common_runtime::JoinError;
 use common_time::Timestamp;
 use common_time::timestamp::TimeUnit;
+use datafusion_common::DataFusionError;
 use datatypes::arrow::error::ArrowError;
 use datatypes::prelude::ConcreteDataType;
 use object_store::ErrorKind;
@@ -186,6 +187,14 @@ pub enum Error {
         path: String,
         #[snafu(source)]
         error: parquet::errors::ParquetError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("DataFusion error"))]
+    Datafusion {
+        #[snafu(source)]
+        error: DataFusionError,
         #[snafu(implicit)]
         location: Location,
     },
@@ -1380,6 +1389,7 @@ impl ErrorExt for Error {
             InconsistentTimestampLength { .. } => StatusCode::InvalidArguments,
 
             TooManyFilesToRead { .. } | TooManyGcJobs { .. } => StatusCode::RateLimited,
+            Datafusion { .. } => StatusCode::InvalidArguments,
         }
     }
 

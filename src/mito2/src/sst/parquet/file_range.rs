@@ -30,6 +30,7 @@ use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::Schema;
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use parquet::arrow::arrow_reader::RowSelection;
+use parquet::arrow::parquet_to_arrow_field_levels;
 use parquet::file::metadata::ParquetMetaData;
 use snafu::{OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
@@ -39,8 +40,8 @@ use table::predicate::Predicate;
 
 use crate::error::{
     ComputeArrowSnafu, DataTypeMismatchSnafu, DecodeSnafu, DecodeStatsSnafu,
-    EvalPartitionFilterSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu,
-    UnexpectedSnafu,
+    EvalPartitionFilterSnafu, NewRecordBatchSnafu, ReadDataPartSnafu, RecordBatchSnafu, Result,
+    StatsNotPresentSnafu, UnexpectedSnafu,
 };
 use crate::read::Batch;
 use crate::read::compat::CompatBatch;
@@ -55,6 +56,7 @@ use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
 };
+use crate::sst::parquet::row_filter::{FilterExpr, RowFilter, build_row_filters};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 
@@ -181,13 +183,16 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
-        let parquet_reader = self
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
+        let row_filters = self.context.build_row_filters(skip_fields)?;
+        let (parquet_reader, rows_precise_filtered) = self
             .context
             .reader_builder
             .build(
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                &row_filters,
             )
             .await?;
 
@@ -210,9 +215,6 @@ impl FileRange {
             false
         };
 
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
-
         let prune_reader = if use_last_row_reader {
             // Row group is PUT only, use LastRowReader to skip unnecessary rows.
             let reader = RowGroupLastRowCachedReader::new(
@@ -221,13 +223,19 @@ impl FileRange {
                 self.context.reader_builder.cache_strategy().clone(),
                 RowGroupReader::new(self.context.clone(), parquet_reader),
             );
-            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
+            PruneReader::new_with_last_row_reader(
+                self.context.clone(),
+                reader,
+                skip_fields,
+                rows_precise_filtered,
+            )
         } else {
             // Row group contains DELETE, fallback to default reader.
             PruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 RowGroupReader::new(self.context.clone(), parquet_reader),
                 skip_fields,
+                rows_precise_filtered,
             )
         };
 
@@ -242,24 +250,26 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
-        let parquet_reader = self
+        // Compute skip_fields once for this row group
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
+        let row_filters = self.context.build_row_filters(skip_fields)?;
+        let (parquet_reader, rows_precise_filtered) = self
             .context
             .reader_builder
             .build(
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                &row_filters,
             )
             .await?;
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let flat_row_group_reader = FlatRowGroupReader::new(self.context.clone(), parquet_reader);
         let flat_prune_reader = FlatPruneReader::new_with_row_group_reader(
             self.context.clone(),
             flat_row_group_reader,
             skip_fields,
+            rows_precise_filtered,
         );
 
         Ok(Some(flat_prune_reader))
@@ -335,6 +345,61 @@ impl FileRangeContext {
         self.base.compaction_projection_mapper.as_ref()
     }
 
+    /// Returns row filter predicate exprs.
+    pub(crate) fn row_filter_exprs(&self) -> &[FilterExpr] {
+        &self.base.row_filter_exprs
+    }
+
+    /// Returns expected metadata if any.
+    pub(crate) fn expected_metadata(&self) -> Option<&RegionMetadataRef> {
+        self.base.expected_metadata.as_ref()
+    }
+
+    /// Returns primary key codec.
+    pub(crate) fn primary_key_codec(&self) -> &Arc<dyn PrimaryKeyCodec> {
+        &self.base.codec
+    }
+
+    /// Builds row filters for the current context.
+    pub(crate) fn build_row_filters(&self, skip_fields: bool) -> Result<Vec<RowFilter>> {
+        if self.base.row_filter_exprs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let predicates = build_row_filters(
+            &self.base.row_filter_exprs,
+            &self.base.read_format,
+            self.base.expected_metadata.as_ref(),
+            self.reader_builder.parquet_metadata(),
+            self.base.codec.clone(),
+            skip_fields,
+            true,
+        )?;
+
+        let parquet_schema_desc = self
+            .reader_builder
+            .parquet_metadata()
+            .file_metadata()
+            .schema_descr();
+        let hint = Some(self.base.read_format.arrow_schema().fields());
+
+        let mut row_filters = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            let field_levels = parquet_to_arrow_field_levels(
+                parquet_schema_desc,
+                predicate.projection().clone(),
+                hint.clone(),
+            )
+            .context(ReadDataPartSnafu)?;
+            row_filters.push(RowFilter {
+                predicate: std::sync::Mutex::new(predicate),
+                field_levels,
+            });
+        }
+
+        Ok(row_filters)
+    }
+
     /// Sets the `CompatBatch` to the context.
     pub(crate) fn set_compat_batch(&mut self, compat: Option<CompatBatch>) {
         self.base.compat_batch = compat;
@@ -408,6 +473,8 @@ pub(crate) struct RangeBase {
     pub(crate) filters: Vec<SimpleFilterContext>,
     /// Dynamic filter physical exprs.
     pub(crate) dyn_filters: Arc<Vec<DynamicFilterPhysicalExpr>>,
+    /// Row filter predicate exprs (physical).
+    pub(crate) row_filter_exprs: Vec<FilterExpr>,
     /// Helper to read the SST.
     pub(crate) read_format: ReadFormat,
     pub(crate) expected_metadata: Option<RegionMetadataRef>,

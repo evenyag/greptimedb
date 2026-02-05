@@ -25,16 +25,20 @@ use async_trait::async_trait;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::{debug, tracing, warn};
 use datafusion_expr::Expr;
-use datatypes::arrow::array::ArrayRef;
+use datatypes::arrow::array::{Array, ArrayRef};
 use datatypes::arrow::datatypes::Field;
 use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::compute::prep_null_mask_filter;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::DataType;
 use mito_codec::row_converter::build_primary_key_codec;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowSelection};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ParquetRecordBatchReader, RowGroups, RowSelection,
+};
 use parquet::arrow::{FieldLevels, ProjectionMask, parquet_to_arrow_field_levels};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::{KeyValue, PageIndexPolicy, ParquetMetaData};
 use partition::expr::PartitionExpr;
 use snafu::{OptionExt, ResultExt};
@@ -49,7 +53,7 @@ use crate::cache::index::result_cache::PredicateKey;
 #[cfg(feature = "vector_index")]
 use crate::error::ApplyVectorIndexSnafu;
 use crate::error::{
-    ArrowReaderSnafu, InvalidMetadataSnafu, InvalidParquetSnafu, ReadDataPartSnafu,
+    ArrowReaderSnafu, ExternalSnafu, InvalidMetadataSnafu, InvalidParquetSnafu, ReadDataPartSnafu,
     ReadParquetSnafu, Result, SerializePartitionExprSnafu,
 };
 use crate::metrics::{
@@ -77,6 +81,7 @@ use crate::sst::parquet::file_range::{
 };
 use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
 use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::row_filter::{FilterExpr, RowFilter};
 use crate::sst::parquet::row_group::{InMemoryRowGroup, ParquetFetchMetrics};
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -478,11 +483,32 @@ impl ParquetReaderBuilder {
 
         let partition_filter = self.build_partition_filter(&read_format, &prune_schema)?;
 
+        let mut row_filter_exprs = Vec::new();
+        if let Some(predicate) = &self.predicate {
+            let exprs = Predicate::new(predicate.exprs().to_vec())
+                .to_physical_exprs(prune_schema.arrow_schema())
+                .map_err(common_error::ext::BoxedError::new)
+                .context(ExternalSnafu {
+                    context: "build row filter predicates",
+                })?;
+            row_filter_exprs.extend(exprs.into_iter().map(|expr| FilterExpr {
+                expr,
+                schema: prune_schema.arrow_schema().clone(),
+            }));
+        }
+        if let Some(partition_filter) = &partition_filter {
+            row_filter_exprs.push(FilterExpr {
+                expr: partition_filter.region_partition_physical_expr.clone(),
+                schema: partition_filter.partition_schema.arrow_schema().clone(),
+            });
+        }
+
         let context = FileRangeContext::new(
             reader_builder,
             RangeBase {
                 filters,
                 dyn_filters,
+                row_filter_exprs,
                 read_format,
                 expected_metadata: self.expected_metadata.clone(),
                 prune_schema,
@@ -1635,8 +1661,15 @@ impl RowGroupReaderBuilder {
         row_group_idx: usize,
         row_selection: Option<RowSelection>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<ParquetRecordBatchReader> {
+        row_filters: &[RowFilter],
+    ) -> Result<(ParquetRecordBatchReader, usize)> {
         let fetch_start = Instant::now();
+
+        let mut projection = self.projection.clone();
+        for filter in row_filters {
+            let mask = filter.predicate.lock().unwrap().projection().clone();
+            projection.union(&mask);
+        }
 
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
@@ -1649,7 +1682,7 @@ impl RowGroupReaderBuilder {
         );
         // Fetches data into memory.
         row_group
-            .fetch(&self.projection, row_selection.as_ref(), fetch_metrics)
+            .fetch(&projection, row_selection.as_ref(), fetch_metrics)
             .await
             .context(ReadParquetSnafu {
                 path: &self.file_path,
@@ -1660,18 +1693,90 @@ impl RowGroupReaderBuilder {
             metrics.data.lock().unwrap().total_fetch_elapsed += fetch_start.elapsed();
         }
 
+        let mut selection = row_selection;
+        let mut rows_precise_filtered = 0usize;
+        let mut input_rows = selection
+            .as_ref()
+            .map(|s| s.row_count())
+            .unwrap_or(row_group.num_rows() as usize);
+
+        for filter in row_filters {
+            if !selects_any(selection.as_ref()) {
+                break;
+            }
+
+            let reader = ParquetRecordBatchReader::try_new_with_row_groups(
+                &filter.field_levels,
+                &row_group,
+                DEFAULT_READ_BATCH_SIZE,
+                selection.clone(),
+            )
+            .context(ReadParquetSnafu {
+                path: &self.file_path,
+            })?;
+
+            let mut predicate = filter.predicate.lock().unwrap();
+            let new_selection = evaluate_predicate(reader, selection, &mut *predicate).context(
+                ReadParquetSnafu {
+                    path: &self.file_path,
+                },
+            )?;
+
+            let output_rows = new_selection.row_count();
+            rows_precise_filtered += input_rows.saturating_sub(output_rows);
+            input_rows = output_rows;
+            selection = Some(new_selection);
+        }
+
         // Builds the parquet reader.
         // Now the row selection is None.
-        ParquetRecordBatchReader::try_new_with_row_groups(
+        let reader = ParquetRecordBatchReader::try_new_with_row_groups(
             &self.field_levels,
             &row_group,
             DEFAULT_READ_BATCH_SIZE,
-            row_selection,
+            selection,
         )
         .context(ReadParquetSnafu {
             path: &self.file_path,
-        })
+        })?;
+
+        Ok((reader, rows_precise_filtered))
     }
+}
+
+/// Returns `true` if `selection` is `None` or selects some rows.
+pub(crate) fn selects_any(selection: Option<&RowSelection>) -> bool {
+    selection.map(|x| x.selects_any()).unwrap_or(true)
+}
+
+/// Evaluates an [`ArrowPredicate`], returning a [`RowSelection`] indicating which rows to return.
+pub(crate) fn evaluate_predicate(
+    reader: ParquetRecordBatchReader,
+    input_selection: Option<RowSelection>,
+    predicate: &mut dyn ArrowPredicate,
+) -> parquet::errors::Result<RowSelection> {
+    let mut filters = vec![];
+    for maybe_batch in reader {
+        let maybe_batch = maybe_batch?;
+        let input_rows = maybe_batch.num_rows();
+        let filter = predicate.evaluate(maybe_batch)?;
+        if filter.len() != input_rows {
+            return Err(ParquetError::ArrowError(format!(
+                "ArrowPredicate returned {} rows, expected {input_rows}",
+                filter.len()
+            )));
+        }
+        match filter.null_count() {
+            0 => filters.push(filter),
+            _ => filters.push(prep_null_mask_filter(&filter)),
+        };
+    }
+
+    let raw = RowSelection::from_filters(&filters);
+    Ok(match input_selection {
+        Some(selection) => selection.and_then(&raw),
+        None => raw,
+    })
 }
 
 /// The state of a [ParquetReader].
@@ -1828,22 +1933,24 @@ impl BatchReader for ParquetReader {
 
         // No more items in current row group, reads next row group.
         while let Some((row_group_idx, row_selection)) = self.selection.pop_first() {
-            let parquet_reader = self
+            let skip_fields = self.context.should_skip_fields(row_group_idx);
+            let row_filters = self.context.build_row_filters(skip_fields)?;
+            let (parquet_reader, rows_precise_filtered) = self
                 .context
                 .reader_builder()
                 .build(
                     row_group_idx,
                     Some(row_selection),
                     Some(&self.fetch_metrics),
+                    &row_filters,
                 )
                 .await?;
 
             // Resets the parquet reader.
-            // Compute skip_fields for this row group
-            let skip_fields = self.context.should_skip_fields(row_group_idx);
             reader.reset_source(
                 Source::RowGroup(RowGroupReader::new(self.context.clone(), parquet_reader)),
                 skip_fields,
+                rows_precise_filtered,
             );
             if let Some(batch) = reader.next_batch().await? {
                 return Ok(Some(batch));
@@ -1901,16 +2008,24 @@ impl ParquetReader {
         let fetch_metrics = ParquetFetchMetrics::default();
         // No more items in current row group, reads next row group.
         let reader_state = if let Some((row_group_idx, row_selection)) = selection.pop_first() {
-            let parquet_reader = context
-                .reader_builder()
-                .build(row_group_idx, Some(row_selection), Some(&fetch_metrics))
-                .await?;
             // Compute skip_fields once for this row group
             let skip_fields = context.should_skip_fields(row_group_idx);
+            let row_filters = context.build_row_filters(skip_fields)?;
+            let parquet_reader = context
+                .reader_builder()
+                .build(
+                    row_group_idx,
+                    Some(row_selection),
+                    Some(&fetch_metrics),
+                    &row_filters,
+                )
+                .await?;
+            let (parquet_reader, rows_precise_filtered) = parquet_reader;
             ReaderState::Readable(PruneReader::new_with_row_group_reader(
                 context.clone(),
                 RowGroupReader::new(context.clone(), parquet_reader),
                 skip_fields,
+                rows_precise_filtered,
             ))
         } else {
             ReaderState::Exhausted(ReaderMetrics::default())

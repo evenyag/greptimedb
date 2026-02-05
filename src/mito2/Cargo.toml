@@ -45,6 +45,7 @@ crossbeam-utils.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
+datafusion-physical-expr.workspace = true
 datatypes.workspace = true
 dashmap.workspace = true
 dotenv.workspace = true

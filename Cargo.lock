@@ -8060,6 +8060,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-physical-expr",
  "datatypes",
  "dotenv",
  "either",

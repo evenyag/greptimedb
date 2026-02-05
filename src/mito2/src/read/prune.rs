@@ -45,44 +45,47 @@ impl Source {
 }
 
 pub struct PruneReader {
-    /// Context for file ranges.
-    context: FileRangeContextRef,
     source: Source,
     metrics: ReaderMetrics,
-    /// Whether to skip field filters for this row group.
-    skip_fields: bool,
+    /// Rows filtered by row filter during parquet decode for this row group.
+    rows_precise_filtered: usize,
 }
 
 impl PruneReader {
     pub(crate) fn new_with_row_group_reader(
-        ctx: FileRangeContextRef,
+        _ctx: FileRangeContextRef,
         reader: RowGroupReader,
-        skip_fields: bool,
+        _skip_fields: bool,
+        rows_precise_filtered: usize,
     ) -> Self {
         Self {
-            context: ctx,
             source: Source::RowGroup(reader),
             metrics: Default::default(),
-            skip_fields,
+            rows_precise_filtered,
         }
     }
 
     pub(crate) fn new_with_last_row_reader(
-        ctx: FileRangeContextRef,
+        _ctx: FileRangeContextRef,
         reader: RowGroupLastRowCachedReader,
-        skip_fields: bool,
+        _skip_fields: bool,
+        rows_precise_filtered: usize,
     ) -> Self {
         Self {
-            context: ctx,
             source: Source::LastRow(reader),
             metrics: Default::default(),
-            skip_fields,
+            rows_precise_filtered,
         }
     }
 
-    pub(crate) fn reset_source(&mut self, source: Source, skip_fields: bool) {
+    pub(crate) fn reset_source(
+        &mut self,
+        source: Source,
+        _skip_fields: bool,
+        rows_precise_filtered: usize,
+    ) {
         self.source = source;
-        self.skip_fields = skip_fields;
+        self.rows_precise_filtered = rows_precise_filtered;
     }
 
     /// Merge metrics with the inner reader and return the merged metrics.
@@ -104,41 +107,17 @@ impl PruneReader {
 
     pub(crate) async fn next_batch(&mut self) -> Result<Option<Batch>> {
         while let Some(b) = self.source.next_batch().await? {
-            match self.prune(b)? {
-                Some(b) => {
-                    return Ok(Some(b));
-                }
-                None => {
-                    continue;
-                }
+            if self.rows_precise_filtered > 0 {
+                self.metrics.filter_metrics.rows_precise_filtered += self.rows_precise_filtered;
+                self.rows_precise_filtered = 0;
             }
+            return Ok(Some(b));
+        }
+        if self.rows_precise_filtered > 0 {
+            self.metrics.filter_metrics.rows_precise_filtered += self.rows_precise_filtered;
+            self.rows_precise_filtered = 0;
         }
         Ok(None)
-    }
-
-    /// Prunes batches by the pushed down predicate.
-    fn prune(&mut self, batch: Batch) -> Result<Option<Batch>> {
-        // fast path
-        if self.context.filters().is_empty() && !self.context.has_partition_filter() {
-            return Ok(Some(batch));
-        }
-
-        let num_rows_before_filter = batch.num_rows();
-        let Some(batch_filtered) = self.context.precise_filter(batch, self.skip_fields)? else {
-            // the entire batch is filtered out
-            self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
-            return Ok(None);
-        };
-
-        // update metric
-        let filtered_rows = num_rows_before_filter - batch_filtered.num_rows();
-        self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
-
-        if !batch_filtered.is_empty() {
-            Ok(Some(batch_filtered))
-        } else {
-            Ok(None)
-        }
     }
 }
 
@@ -260,25 +239,23 @@ impl FlatSource {
 
 /// A flat format reader that returns RecordBatch instead of Batch.
 pub struct FlatPruneReader {
-    /// Context for file ranges.
-    context: FileRangeContextRef,
     source: FlatSource,
     metrics: ReaderMetrics,
-    /// Whether to skip field filters for this row group.
-    skip_fields: bool,
+    /// Rows filtered by row filter during parquet decode for this row group.
+    rows_precise_filtered: usize,
 }
 
 impl FlatPruneReader {
     pub(crate) fn new_with_row_group_reader(
-        ctx: FileRangeContextRef,
+        _ctx: FileRangeContextRef,
         reader: FlatRowGroupReader,
-        skip_fields: bool,
+        _skip_fields: bool,
+        rows_precise_filtered: usize,
     ) -> Self {
         Self {
-            context: ctx,
             source: FlatSource::RowGroup(reader),
             metrics: Default::default(),
-            skip_fields,
+            rows_precise_filtered,
         }
     }
 
@@ -295,49 +272,22 @@ impl FlatPruneReader {
             self.metrics.scan_cost += start.elapsed();
             batch
         } {
+            if self.rows_precise_filtered > 0 {
+                self.metrics.filter_metrics.rows_precise_filtered += self.rows_precise_filtered;
+                self.rows_precise_filtered = 0;
+            }
             // Update metrics for the received batch
             self.metrics.num_rows += record_batch.num_rows();
             self.metrics.num_batches += 1;
 
-            match self.prune_flat(record_batch)? {
-                Some(filtered_batch) => {
-                    return Ok(Some(filtered_batch));
-                }
-                None => {
-                    continue;
-                }
-            }
+            return Ok(Some(record_batch));
+        }
+        if self.rows_precise_filtered > 0 {
+            self.metrics.filter_metrics.rows_precise_filtered += self.rows_precise_filtered;
+            self.rows_precise_filtered = 0;
         }
 
         Ok(None)
-    }
-
-    /// Prunes batches by the pushed down predicate and returns RecordBatch.
-    fn prune_flat(&mut self, record_batch: RecordBatch) -> Result<Option<RecordBatch>> {
-        // fast path
-        if self.context.filters().is_empty() && !self.context.has_partition_filter() {
-            return Ok(Some(record_batch));
-        }
-
-        let num_rows_before_filter = record_batch.num_rows();
-        let Some(filtered_batch) = self
-            .context
-            .precise_filter_flat(record_batch, self.skip_fields)?
-        else {
-            // the entire batch is filtered out
-            self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
-            return Ok(None);
-        };
-
-        // update metric
-        let filtered_rows = num_rows_before_filter - filtered_batch.num_rows();
-        self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
-
-        if filtered_batch.num_rows() > 0 {
-            Ok(Some(filtered_batch))
-        } else {
-            Ok(None)
-        }
     }
 }
 

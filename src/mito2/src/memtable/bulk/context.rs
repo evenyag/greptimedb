@@ -91,6 +91,7 @@ impl BulkIterContext {
             base: RangeBase {
                 filters: simple_filters,
                 dyn_filters,
+                row_filter_exprs: Vec::new(),
                 read_format,
                 prune_schema: region_metadata.schema.clone(),
                 expected_metadata: Some(region_metadata),
