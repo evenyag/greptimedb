@@ -469,6 +469,10 @@ impl ParquetReaderBuilder {
                     self.expected_metadata.as_deref(),
                     expr,
                 ) {
+                    common_telemetry::info!(
+                        "Build simple filter for parquet reader, expr: {}",
+                        expr
+                    );
                     simple_filters.push(filter);
                     continue;
                 }
@@ -482,9 +486,9 @@ impl ParquetReaderBuilder {
                         "Build physical filter for parquet reader, expr: {}",
                         expr
                     );
-
                     physical_filters.push(filter);
                 }
+                common_telemetry::info!("Can't build filter for parquet reader, expr: {}", expr);
             }
             (simple_filters, physical_filters)
         } else {

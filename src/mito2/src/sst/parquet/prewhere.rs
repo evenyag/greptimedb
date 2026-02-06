@@ -281,7 +281,12 @@ pub fn apply_filters_to_batch(
     read_format: &ReadFormat,
     skip_fields: bool,
 ) -> Result<Option<BooleanBuffer>> {
-    common_telemetry::info!("Prewhere apply filters, skip fields: {}", skip_fields);
+    common_telemetry::info!(
+        "Prewhere apply filters, skip fields: {}, num filters: {}, num physical filters: {}",
+        skip_fields,
+        filters.len(),
+        physical_filters.len(),
+    );
     let mut mask = BooleanBuffer::new_set(batch.num_rows());
     let metadata = read_format.metadata();
     let mut tag_decode_state = TagDecodeState::new();
