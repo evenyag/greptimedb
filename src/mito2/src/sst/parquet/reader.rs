@@ -1919,7 +1919,13 @@ impl PhysicalFilterContext {
         read_format: &ReadFormat,
         expr: &Expr,
     ) -> Option<Self> {
+        common_telemetry::info!("Try to build physical filter for {}", expr);
         let column_name = Self::single_column_name(expr)?;
+        common_telemetry::info!(
+            "Try to build physical filter for {}, single column: {}",
+            expr,
+            column_name
+        );
 
         let (column_metadata, column_in_sst) = match expected_meta {
             Some(meta) => {
@@ -1952,11 +1958,28 @@ impl PhysicalFilterContext {
             field
         };
         let schema = Arc::new(ArrowSchema::new(vec![field]));
-        let physical_expr = Predicate::to_physical_expr(expr, &schema).ok()?;
+        common_telemetry::info!(
+            "Try to build physical filter for {}, schema: {:?}",
+            expr,
+            schema
+        );
+        let physical_expr = Predicate::to_physical_expr(expr, &schema)
+            .inspect_err(|e| {
+                common_telemetry::error!(
+                    e; "Can't build physical filter for {}, schema: {:?}",
+                    expr,
+                    schema
+                );
+            })
+            .ok()?;
 
         let filter = if column_in_sst {
             MaybePhysicalFilter::Filter(physical_expr)
         } else {
+            common_telemetry::info!(
+                "Try to build physical filter for {}, column not in sst",
+                expr
+            );
             let default_value = column_metadata
                 .column_schema
                 .create_default()
@@ -1995,6 +2018,11 @@ impl PhysicalFilterContext {
             return None;
         }
         if columns.len() != 1 {
+            common_telemetry::info!(
+                "single column, filter for {}, multiple columns: {:?}",
+                expr,
+                columns
+            );
             return None;
         }
         columns.iter().next().map(|column| column.name.clone())
