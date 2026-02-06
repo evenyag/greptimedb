@@ -276,6 +276,11 @@ pub fn apply_filters_to_batch(
             continue;
         }
 
+        common_telemetry::info!(
+            "Prewhere apply simple filter for column: {}",
+            filter_ctx.column_name(),
+        ):
+
         if filter_ctx.semantic_type() == SemanticType::Tag {
             if let Some(tag_column) = maybe_decode_tag_column(
                 metadata,
@@ -341,7 +346,7 @@ pub fn apply_filters_to_batch(
         };
 
         common_telemetry::info!(
-            "Prewhere apply filter for column: {}, expr: {:?}",
+            "Prewhere apply physical filter for column: {}, expr: {:?}",
             filter_ctx.column_name(),
             filter
         );
