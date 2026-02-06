@@ -1941,22 +1941,32 @@ impl PhysicalFilterContext {
 
         let field =
             if let Some((_, field)) = read_format.arrow_schema().column_with_name(&column_name) {
+                common_telemetry::info!(
+                    "Try to build physical filter for {}, column {} in schema",
+                    expr,
+                    column_name
+                );
                 field.clone()
             } else {
-                Field::try_from(&column_metadata.column_schema).ok()?
+                common_telemetry::info!(
+                    "Try to build physical filter for {}, column {} not in schema",
+                    expr,
+                    column_name
+                );
+                let field = Field::try_from(&column_metadata.column_schema).ok()?;
+                if column_metadata.semantic_type == SemanticType::Tag
+                    && column_metadata.column_schema.data_type.is_string()
+                {
+                    tag_maybe_to_dictionary_field(
+                        &column_metadata.column_schema.data_type,
+                        &Arc::new(field),
+                    )
+                    .as_ref()
+                    .clone()
+                } else {
+                    field
+                }
             };
-        let field = if column_metadata.semantic_type == SemanticType::Tag
-            && column_metadata.column_schema.data_type.is_string()
-        {
-            tag_maybe_to_dictionary_field(
-                &column_metadata.column_schema.data_type,
-                &Arc::new(field),
-            )
-            .as_ref()
-            .clone()
-        } else {
-            field
-        };
         let schema = Arc::new(ArrowSchema::new(vec![field]));
         common_telemetry::info!(
             "Try to build physical filter for {}, schema: {:?}",
