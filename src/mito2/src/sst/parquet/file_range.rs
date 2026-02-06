@@ -50,8 +50,8 @@ use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
-    FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReader, RowGroupReaderBuilder,
-    SimpleFilterContext,
+    FlatRowGroupReader, MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReader,
+    RowGroupReaderBuilder, SimpleFilterContext,
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -191,6 +191,7 @@ impl FileRange {
                 fetch_metrics,
                 RowGroupBuildContext {
                     filters: self.context.filters(),
+                    physical_filters: self.context.physical_filters(),
                     read_format: self.context.read_format(),
                     skip_fields,
                     prewhere_config: self.context.prewhere_config(),
@@ -257,6 +258,7 @@ impl FileRange {
                 fetch_metrics,
                 RowGroupBuildContext {
                     filters: self.context.filters(),
+                    physical_filters: self.context.physical_filters(),
                     read_format: self.context.read_format(),
                     skip_fields,
                     prewhere_config: self.context.prewhere_config(),
@@ -312,6 +314,11 @@ impl FileRangeContext {
     /// Returns filters pushed down.
     pub(crate) fn filters(&self) -> &[SimpleFilterContext] {
         &self.base.filters
+    }
+
+    /// Returns physical filters pushed down.
+    pub(crate) fn physical_filters(&self) -> &[PhysicalFilterContext] {
+        &self.base.physical_filters
     }
 
     /// Returns true if a partition filter is configured.
@@ -416,6 +423,8 @@ pub(crate) struct PartitionFilterContext {
 pub(crate) struct RangeBase {
     /// Filters pushed down.
     pub(crate) filters: Vec<SimpleFilterContext>,
+    /// Physical filters pushed down (used in prewhere).
+    pub(crate) physical_filters: Vec<PhysicalFilterContext>,
     /// Dynamic filter physical exprs.
     pub(crate) dyn_filters: Arc<Vec<DynamicFilterPhysicalExpr>>,
     /// Helper to read the SST.

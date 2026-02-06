@@ -34,14 +34,20 @@ use mito_codec::row_converter::{PrimaryKeyCodec, build_primary_key_codec};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::schema::types::SchemaDescriptor;
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use store_api::storage::ColumnId;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 
 use crate::config::PrewhereConfig;
-use crate::error::{ReadParquetSnafu, RecordBatchSnafu, Result};
+use crate::error::{
+    EvalPartitionFilterSnafu, NewRecordBatchSnafu, ReadParquetSnafu, RecordBatchSnafu, Result,
+    UnexpectedSnafu,
+};
 use crate::sst::parquet::format::ReadFormat;
-use crate::sst::parquet::reader::{MaybeFilter, RowGroupReaderBuilder, SimpleFilterContext};
+use crate::sst::parquet::reader::{
+    MaybeFilter, MaybePhysicalFilter, PhysicalFilterContext, RowGroupReaderBuilder,
+    SimpleFilterContext,
+};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::tag_decode::{TagDecodeState, maybe_decode_tag_column};
 
@@ -60,6 +66,7 @@ impl PrewhereContext {
     /// all columns are filter columns, or heuristics suggest it's not beneficial).
     pub fn compute(
         filters: &[SimpleFilterContext],
+        physical_filters: &[PhysicalFilterContext],
         read_format: &ReadFormat,
         parquet_schema: &SchemaDescriptor,
         config: &PrewhereConfig,
@@ -78,6 +85,32 @@ impl PrewhereContext {
         for filter_ctx in filters {
             let filter = match filter_ctx.filter() {
                 MaybeFilter::Filter(f) => f,
+                _ => continue,
+            };
+
+            if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+                continue;
+            }
+
+            if metadata.column_by_id(filter_ctx.column_id()).is_none() {
+                continue;
+            }
+
+            prewhere_column_ids.insert(filter_ctx.column_id());
+            prewhere_column_names.insert(filter.column_name().to_string());
+
+            if filter_ctx.semantic_type() == SemanticType::Tag
+                && arrow_schema
+                    .column_with_name(filter.column_name())
+                    .is_none()
+            {
+                needs_primary_key = true;
+            }
+        }
+
+        for filter_ctx in physical_filters {
+            let filter = match filter_ctx.filter() {
+                MaybePhysicalFilter::Filter(_) => filter_ctx,
                 _ => continue,
             };
 
@@ -214,6 +247,7 @@ fn compute_projection_mask(
 pub fn apply_filters_to_batch(
     batch: &RecordBatch,
     filters: &[SimpleFilterContext],
+    physical_filters: &[PhysicalFilterContext],
     read_format: &ReadFormat,
     skip_fields: bool,
 ) -> Result<Option<BooleanBuffer>> {
@@ -267,6 +301,63 @@ pub fn apply_filters_to_batch(
         }
     }
 
+    for filter_ctx in physical_filters {
+        let filter = match filter_ctx.filter() {
+            MaybePhysicalFilter::Filter(f) => f,
+            MaybePhysicalFilter::Matched => continue,
+            MaybePhysicalFilter::Pruned => return Ok(None),
+        };
+
+        // Skip field filters if requested.
+        if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+            continue;
+        }
+
+        let column =
+            if let Some((idx, _)) = batch.schema().column_with_name(filter_ctx.column_name()) {
+                Some(batch.column(idx).clone())
+            } else if filter_ctx.semantic_type() == SemanticType::Tag {
+                maybe_decode_tag_column(
+                    metadata,
+                    filter_ctx.column_id(),
+                    batch,
+                    &mut tag_decode_state,
+                    pk_codec
+                        .get_or_insert_with(|| build_primary_key_codec(metadata))
+                        .as_ref(),
+                )?
+            } else {
+                None
+            };
+
+        let Some(column) = column else {
+            warn!(
+                "Filter column '{}' not found in record batch, skip filter. column_id={}, semantic_type={:?}",
+                filter_ctx.column_name(),
+                filter_ctx.column_id(),
+                filter_ctx.semantic_type()
+            );
+            continue;
+        };
+
+        let record_batch = RecordBatch::try_new(filter_ctx.schema().clone(), vec![column.clone()])
+            .context(NewRecordBatchSnafu)?;
+        let evaluated = filter
+            .evaluate(&record_batch)
+            .context(EvalPartitionFilterSnafu)?;
+        let array = evaluated
+            .into_array(record_batch.num_rows())
+            .context(EvalPartitionFilterSnafu)?;
+        let boolean_array =
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context(UnexpectedSnafu {
+                    reason: "Failed to downcast physical filter result to BooleanArray".to_string(),
+                })?;
+        mask = mask.bitand(boolean_array.values());
+    }
+
     if mask.count_set_bits() == 0 {
         return Ok(None);
     }
@@ -301,6 +392,7 @@ pub async fn execute_prewhere(
     row_selection: Option<RowSelection>,
     prewhere_ctx: &PrewhereContext,
     filters: &[SimpleFilterContext],
+    physical_filters: &[PhysicalFilterContext],
     read_format: &ReadFormat,
     skip_fields: bool,
     fetch_metrics: Option<&ParquetFetchMetrics>,
@@ -329,7 +421,13 @@ pub async fn execute_prewhere(
             continue;
         }
         // Apply filters to get the mask for this batch
-        let batch_mask = match apply_filters_to_batch(&batch, filters, read_format, skip_fields)? {
+        let batch_mask = match apply_filters_to_batch(
+            &batch,
+            filters,
+            physical_filters,
+            read_format,
+            skip_fields,
+        )? {
             Some(mask) => mask,
             None => BooleanBuffer::new_unset(num_rows),
         };

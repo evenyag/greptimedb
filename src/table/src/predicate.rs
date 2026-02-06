@@ -128,6 +128,22 @@ impl Predicate {
             .collect::<Vec<_>>())
     }
 
+    /// Builds a single physical expr according to provided schema.
+    pub fn to_physical_expr(
+        expr: &Expr,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> error::Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = schema
+            .clone()
+            .to_dfschema_ref()
+            .context(error::DatafusionSnafu)?;
+
+        let execution_props = &ExecutionProps::new();
+
+        create_physical_expr(expr, df_schema.as_ref(), execution_props)
+            .context(error::DatafusionSnafu)
+    }
+
     /// Evaluates the predicate against the `stats`.
     /// Returns a vector of boolean values, among which `false` means the row group can be skipped.
     pub fn prune_with_stats<S: PruningStatistics>(
