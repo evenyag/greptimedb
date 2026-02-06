@@ -83,16 +83,19 @@ impl PrewhereContext {
         let metadata = read_format.metadata();
         let arrow_schema = read_format.arrow_schema();
         for filter_ctx in filters {
+            common_telemetry::info!("Prewhere compute filter {}", filter_ctx.column_id());
             let filter = match filter_ctx.filter() {
                 MaybeFilter::Filter(f) => f,
                 _ => continue,
             };
 
             if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+                common_telemetry::info!("Prewhere skip field {}", filter.column_name());
                 continue;
             }
 
             if metadata.column_by_id(filter_ctx.column_id()).is_none() {
+                common_telemetry::info!("Prewhere no column {}", filter_ctx.column_id());
                 continue;
             }
 
@@ -104,21 +107,38 @@ impl PrewhereContext {
                     .column_with_name(filter.column_name())
                     .is_none()
             {
+                common_telemetry::info!(
+                    "Prewhere context simple filter {} need primary key",
+                    filter.column_name()
+                );
+
                 needs_primary_key = true;
             }
         }
 
         for filter_ctx in physical_filters {
+            common_telemetry::info!(
+                "Prewhere compute physical filter {}",
+                filter_ctx.column_name()
+            );
             let filter = match filter_ctx.filter() {
                 MaybePhysicalFilter::Filter(_) => filter_ctx,
                 _ => continue,
             };
 
             if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+                common_telemetry::info!(
+                    "Prewhere compute physical filter {} skip field",
+                    filter_ctx.column_name()
+                );
                 continue;
             }
 
             if metadata.column_by_id(filter_ctx.column_id()).is_none() {
+                common_telemetry::info!(
+                    "Prewhere compute physical filter {} no column",
+                    filter_ctx.column_name()
+                );
                 continue;
             }
 
@@ -130,6 +150,10 @@ impl PrewhereContext {
                     .column_with_name(filter.column_name())
                     .is_none()
             {
+                common_telemetry::info!(
+                    "Prewhere compute physical filter {} need primary key",
+                    filter_ctx.column_name()
+                );
                 needs_primary_key = true;
             }
         }
@@ -155,10 +179,16 @@ impl PrewhereContext {
             .filter(|id| prewhere_column_ids.contains(id))
             .count();
 
+        common_telemetry::info!(
+            "Prewhere compute columns: {:?}, schema: {:?}",
+            prewhere_column_names,
+            arrow_schema
+        );
         let (prewhere_projection_mask, prewhere_count) =
             compute_projection_mask(&prewhere_column_names, arrow_schema, parquet_schema);
 
         if prewhere_count == 0 {
+            common_telemetry::info!("Prewhere compute 0 prewhere count");
             return None;
         }
 
@@ -251,12 +281,14 @@ pub fn apply_filters_to_batch(
     read_format: &ReadFormat,
     skip_fields: bool,
 ) -> Result<Option<BooleanBuffer>> {
+    common_telemetry::info!("Prewhere apply filters, skip fields: {}", skip_fields);
     let mut mask = BooleanBuffer::new_set(batch.num_rows());
     let metadata = read_format.metadata();
     let mut tag_decode_state = TagDecodeState::new();
     let mut pk_codec: Option<Arc<dyn PrimaryKeyCodec>> = None;
 
     for filter_ctx in filters {
+        common_telemetry::info!("Prewhere apply filter {}", filter_ctx.column_id());
         let filter = match filter_ctx.filter() {
             MaybeFilter::Filter(f) => f,
             MaybeFilter::Matched => continue,
@@ -265,6 +297,7 @@ pub fn apply_filters_to_batch(
 
         // Skip field filters if requested.
         if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+            common_telemetry::info!("Prewhere apply skip fields {}", filter_ctx.column_id());
             continue;
         }
 
@@ -307,6 +340,10 @@ pub fn apply_filters_to_batch(
     }
 
     for filter_ctx in physical_filters {
+        common_telemetry::info!(
+            "Prewhere apply physical filter {}",
+            filter_ctx.column_name()
+        );
         let filter = match filter_ctx.filter() {
             MaybePhysicalFilter::Filter(f) => f,
             MaybePhysicalFilter::Matched => continue,
