@@ -24,9 +24,9 @@ use api::v1::SemanticType;
 use async_trait::async_trait;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::{debug, tracing, warn};
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
-use datafusion::physical_plan::PhysicalExpr;
 use datatypes::arrow::array::{Array, ArrayRef, BooleanArray};
 use datatypes::arrow::datatypes::{Field, Schema as ArrowSchema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -478,6 +478,11 @@ impl ParquetReaderBuilder {
                     &read_format,
                     expr,
                 ) {
+                    common_telemetry::info!(
+                        "Build physical filter for parquet reader, expr: {}",
+                        expr
+                    );
+
                     physical_filters.push(filter);
                 }
             }
@@ -1933,9 +1938,12 @@ impl PhysicalFilterContext {
         let field = if column_metadata.semantic_type == SemanticType::Tag
             && column_metadata.column_schema.data_type.is_string()
         {
-            tag_maybe_to_dictionary_field(&column_metadata.column_schema.data_type, &Arc::new(field))
-                .as_ref()
-                .clone()
+            tag_maybe_to_dictionary_field(
+                &column_metadata.column_schema.data_type,
+                &Arc::new(field),
+            )
+            .as_ref()
+            .clone()
         } else {
             field
         };

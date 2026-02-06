@@ -340,6 +340,12 @@ pub fn apply_filters_to_batch(
             continue;
         };
 
+        common_telemetry::info!(
+            "Prewhere apply filter for column: {}, expr: {:?}",
+            filter_ctx.column_name(),
+            filter
+        );
+
         let record_batch = RecordBatch::try_new(filter_ctx.schema().clone(), vec![column.clone()])
             .context(NewRecordBatchSnafu)?;
         let evaluated = filter
@@ -444,6 +450,12 @@ pub async fn execute_prewhere(
     if rows_selected == 0 {
         return Ok(None);
     }
+
+    common_telemetry::info!(
+        "Prewhere selected: {} for row group {}",
+        rows_selected,
+        row_group_idx
+    );
 
     // Convert the filter mask to a row selection
     let prewhere_selection = RowSelection::from_filters(&filter_arrays);
