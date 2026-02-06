@@ -35,6 +35,7 @@ pub mod reader;
 pub mod row_group;
 pub mod row_selection;
 pub(crate) mod stats;
+pub(crate) mod tag_decode;
 pub mod writer;
 
 /// Key of metadata in parquet SST.

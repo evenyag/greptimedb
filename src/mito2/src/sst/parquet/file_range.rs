@@ -15,7 +15,6 @@
 //! Structs and functions for reading ranges from a parquet file. A file range
 //! is usually a row group in a parquet file.
 
-use std::collections::HashMap;
 use std::ops::BitAnd;
 use std::sync::Arc;
 
@@ -23,7 +22,7 @@ use api::v1::{OpType, SemanticType};
 use common_telemetry::error;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
-use datatypes::arrow::array::{ArrayRef, BooleanArray};
+use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
@@ -32,9 +31,8 @@ use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::file::metadata::ParquetMetaData;
 use snafu::{OptionExt, ResultExt};
-use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::{ColumnId, TimeSeriesRowSelector};
+use store_api::storage::TimeSeriesRowSelector;
 use table::predicate::Predicate;
 
 use crate::config::PrewhereConfig;
@@ -49,9 +47,7 @@ use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::RowGroupLastRowCachedReader;
 use crate::read::prune::{FlatPruneReader, PruneReader};
 use crate::sst::file::FileHandle;
-use crate::sst::parquet::flat_format::{
-    DecodedPrimaryKeys, decode_primary_keys, time_index_column_index,
-};
+use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReader, RowGroupReaderBuilder,
@@ -59,6 +55,7 @@ use crate::sst::parquet::reader::{
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
+use crate::sst::parquet::tag_decode::{TagDecodeState, maybe_decode_tag_column};
 
 /// Checks if a row group contains delete operations by examining the min value of op_type column.
 ///
@@ -441,20 +438,6 @@ pub(crate) struct RangeBase {
     pub(crate) prewhere_config: PrewhereConfig,
 }
 
-pub(crate) struct TagDecodeState {
-    decoded_pks: Option<DecodedPrimaryKeys>,
-    decoded_tag_cache: HashMap<ColumnId, ArrayRef>,
-}
-
-impl TagDecodeState {
-    pub(crate) fn new() -> Self {
-        Self {
-            decoded_pks: None,
-            decoded_tag_cache: HashMap::new(),
-        }
-    }
-}
-
 impl RangeBase {
     /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
     /// Return the filtered batch. If the entire batch is filtered out, return None.
@@ -669,9 +652,13 @@ impl RangeBase {
                 // Column not found in projection, it may be a tag column.
                 let column_id = filter_ctx.column_id();
 
-                if let Some(tag_column) =
-                    self.maybe_decode_tag_column(metadata, column_id, input, tag_decode_state)?
-                {
+                if let Some(tag_column) = maybe_decode_tag_column(
+                    metadata,
+                    column_id,
+                    input,
+                    tag_decode_state,
+                    self.codec.as_ref(),
+                )? {
                     let result = filter
                         .evaluate_array(&tag_column)
                         .context(RecordBatchSnafu)?;
@@ -687,51 +674,6 @@ impl RangeBase {
         }
 
         Ok(Some(mask))
-    }
-
-    /// Returns the decoded tag column for `column_id`, or `None` if it's not a tag.
-    fn maybe_decode_tag_column(
-        &self,
-        metadata: &RegionMetadataRef,
-        column_id: ColumnId,
-        input: &RecordBatch,
-        tag_decode_state: &mut TagDecodeState,
-    ) -> Result<Option<ArrayRef>> {
-        let Some(pk_index) = metadata.primary_key_index(column_id) else {
-            return Ok(None);
-        };
-
-        if let Some(cached_column) = tag_decode_state.decoded_tag_cache.get(&column_id) {
-            return Ok(Some(cached_column.clone()));
-        }
-
-        if tag_decode_state.decoded_pks.is_none() {
-            tag_decode_state.decoded_pks = Some(decode_primary_keys(self.codec.as_ref(), input)?);
-        }
-
-        let pk_index = if self.codec.encoding() == PrimaryKeyEncoding::Sparse {
-            None
-        } else {
-            Some(pk_index)
-        };
-        let Some(column_index) = metadata.column_index_by_id(column_id) else {
-            return Ok(None);
-        };
-        let Some(decoded) = tag_decode_state.decoded_pks.as_ref() else {
-            return Ok(None);
-        };
-
-        let column_metadata = &metadata.column_metadatas[column_index];
-        let tag_column = decoded.get_tag_column(
-            column_id,
-            pk_index,
-            &column_metadata.column_schema.data_type,
-        )?;
-        tag_decode_state
-            .decoded_tag_cache
-            .insert(column_id, tag_column.clone());
-
-        Ok(Some(tag_column))
     }
 
     /// Evaluates the partition filter against the input `RecordBatch`.
@@ -882,9 +824,13 @@ impl RangeBase {
                 continue;
             }
 
-            if let Some(tag_column) =
-                self.maybe_decode_tag_column(metadata, column_id, input, tag_decode_state)?
-            {
+            if let Some(tag_column) = maybe_decode_tag_column(
+                metadata,
+                column_id,
+                input,
+                tag_decode_state,
+                self.codec.as_ref(),
+            )? {
                 columns.push(tag_column);
                 continue;
             }

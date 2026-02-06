@@ -549,7 +549,15 @@ pub(crate) fn decode_primary_keys(
     codec: &dyn PrimaryKeyCodec,
     batch: &RecordBatch,
 ) -> Result<DecodedPrimaryKeys> {
-    let primary_key_index = primary_key_column_index(batch.num_columns());
+    let Some((primary_key_index, _)) = batch
+        .schema()
+        .column_with_name(store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME)
+    else {
+        return InvalidRecordBatchSnafu {
+            reason: "Primary key column not found in record batch schema".to_string(),
+        }
+        .fail();
+    };
     let pk_dict_array = batch
         .column(primary_key_index)
         .as_any()
