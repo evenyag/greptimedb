@@ -734,6 +734,15 @@ impl RegionScanner for SeqScan {
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
         self.properties.prepare(request);
 
+        for (i, ranges) in self.properties.partitions.iter().enumerate() {
+            common_telemetry::info!(
+                "SeqScan prepare partition {}, region_id: {}, ranges: {:?}",
+                i,
+                self.stream_ctx.input.region_metadata().region_id,
+                ranges
+            );
+        }
+
         self.check_scan_limit().map_err(BoxedError::new)?;
 
         Ok(())
