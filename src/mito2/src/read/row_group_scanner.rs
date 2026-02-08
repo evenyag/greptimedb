@@ -369,7 +369,7 @@ impl RowGroupScanner {
                 worker_id
             );
         } else {
-            common_telemetry::info!(
+            common_telemetry::debug!(
                 "RowGroupScanner worker {} finished, {} row groups with repeated cache misses: {:?}",
                 worker_id,
                 repeated_misses.len(),
