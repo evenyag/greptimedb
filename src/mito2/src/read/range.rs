@@ -106,7 +106,13 @@ impl RangeMeta {
         #[cfg(feature = "enterprise")]
         Self::push_extension_ranges(input, &mut ranges);
 
+        common_telemetry::info!("Seq scan ranges num before group: {}", ranges.len());
         let ranges = group_ranges_for_seq_scan(ranges);
+        common_telemetry::info!(
+            "Seq scan ranges after group: {}, ranges: {:?}",
+            ranges.len(),
+            ranges
+        );
         if input.compaction || input.distribution == Some(TimeSeriesDistribution::PerSeries) {
             // We don't split ranges in compaction or TimeSeriesDistribution::PerSeries.
             return ranges;

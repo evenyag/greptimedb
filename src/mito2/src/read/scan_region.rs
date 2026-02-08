@@ -1447,7 +1447,7 @@ impl StreamContext {
         let ranges = RangeMeta::seq_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
 
-        common_telemetry::info!("SeqScan ctx, ranges: {:?}", ranges);
+        common_telemetry::info!("SeqScan ctx, ranges num: {}", ranges.len());
 
         Self {
             input,
