@@ -140,6 +140,7 @@ impl UnorderedScan {
                         "unordered_scan_files",
                         partition_pruner.clone(),
                         crate::memtable::PrimaryKeyRange::unbounded(),
+                        None,
                     ).await?;
                     for await batch in stream {
                         yield batch?;
@@ -194,6 +195,7 @@ impl UnorderedScan {
                         "unordered_scan_files",
                         partition_pruner.clone(),
                         crate::memtable::PrimaryKeyRange::unbounded(),
+                        None,
                     ).await?;
                     for await record_batch in stream {
                         yield record_batch?;

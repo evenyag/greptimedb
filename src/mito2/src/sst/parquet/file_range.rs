@@ -370,6 +370,106 @@ impl FileRange {
         Ok(Some(flat_prune_reader))
     }
 
+    /// Returns a reader backed by cached row group data from the [RowGroupScanner].
+    /// Returns `None` if the row group can be pruned by dynamic filters or key range.
+    pub(crate) async fn cached_reader(
+        &self,
+        row_group_scanner: &crate::read::row_group_scanner::RowGroupScanner,
+        key_range: PrimaryKeyRange,
+        fetch_metrics: Option<std::sync::Arc<ParquetFetchMetrics>>,
+    ) -> Result<Option<PruneReader>> {
+        if !self.in_dynamic_filter_range() {
+            return Ok(None);
+        }
+
+        // Early return if row group can be pruned by key range statistics.
+        if !key_range.is_unbounded() {
+            let should_keep = row_group_matches_key_range(
+                self.context.reader_builder.parquet_metadata(),
+                self.row_group_idx,
+                &key_range,
+                self.context.file_path(),
+            )?;
+            if !should_keep {
+                return Ok(None);
+            }
+        }
+
+        let file_id = self.file_handle().file_id().file_id();
+        let cached = row_group_scanner
+            .get_or_scan(self, file_id, self.row_group_idx, false, fetch_metrics)
+            .await?;
+
+        let batches = match cached {
+            crate::read::row_group_scanner::CachedRowGroupData::Batches(b) => b,
+            crate::read::row_group_scanner::CachedRowGroupData::RecordBatches(_) => {
+                // Should not happen for non-flat path.
+                return Ok(None);
+            }
+        };
+
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
+        let cached_reader = crate::read::prune::CachedBatchReader::new(batches);
+        let prune_reader = PruneReader::new_with_cached_reader(
+            self.context.clone(),
+            cached_reader,
+            skip_fields,
+            key_range,
+        );
+
+        Ok(Some(prune_reader))
+    }
+
+    /// Returns a flat reader backed by cached row group data from the [RowGroupScanner].
+    /// Returns `None` if the row group can be pruned by dynamic filters or key range.
+    pub(crate) async fn cached_flat_reader(
+        &self,
+        row_group_scanner: &crate::read::row_group_scanner::RowGroupScanner,
+        key_range: PrimaryKeyRange,
+        fetch_metrics: Option<std::sync::Arc<ParquetFetchMetrics>>,
+    ) -> Result<Option<FlatPruneReader>> {
+        if !self.in_dynamic_filter_range() {
+            return Ok(None);
+        }
+
+        // Early return if row group can be pruned by key range statistics.
+        if !key_range.is_unbounded() {
+            let should_keep = row_group_matches_key_range(
+                self.context.reader_builder.parquet_metadata(),
+                self.row_group_idx,
+                &key_range,
+                self.context.file_path(),
+            )?;
+            if !should_keep {
+                return Ok(None);
+            }
+        }
+
+        let file_id = self.file_handle().file_id().file_id();
+        let cached = row_group_scanner
+            .get_or_scan(self, file_id, self.row_group_idx, true, fetch_metrics)
+            .await?;
+
+        let batches = match cached {
+            crate::read::row_group_scanner::CachedRowGroupData::RecordBatches(b) => b,
+            crate::read::row_group_scanner::CachedRowGroupData::Batches(_) => {
+                // Should not happen for flat path.
+                return Ok(None);
+            }
+        };
+
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
+        let cached_reader = crate::read::prune::CachedFlatBatchReader::new(batches);
+        let flat_prune_reader = FlatPruneReader::new_with_cached_reader(
+            self.context.clone(),
+            cached_reader,
+            skip_fields,
+            key_range,
+        );
+
+        Ok(Some(flat_prune_reader))
+    }
+
     /// Returns the helper to compat batches.
     pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
         self.context.compat_batch()

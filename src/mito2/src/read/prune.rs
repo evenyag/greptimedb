@@ -34,6 +34,7 @@ use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics, RowGroupRea
 pub enum Source {
     RowGroup(RowGroupReader),
     LastRow(RowGroupLastRowCachedReader),
+    Cached(CachedBatchReader),
 }
 
 impl Source {
@@ -41,6 +42,32 @@ impl Source {
         match self {
             Source::RowGroup(r) => r.next_batch().await,
             Source::LastRow(r) => r.next_batch().await,
+            Source::Cached(r) => Ok(r.next_batch()),
+        }
+    }
+}
+
+/// A simple reader that iterates over cached `Vec<Batch>`.
+pub(crate) struct CachedBatchReader {
+    batches: Arc<Vec<Batch>>,
+    position: usize,
+}
+
+impl CachedBatchReader {
+    pub(crate) fn new(batches: Arc<Vec<Batch>>) -> Self {
+        Self {
+            batches,
+            position: 0,
+        }
+    }
+
+    fn next_batch(&mut self) -> Option<Batch> {
+        if self.position < self.batches.len() {
+            let batch = self.batches[self.position].clone();
+            self.position += 1;
+            Some(batch)
+        } else {
+            None
         }
     }
 }
@@ -87,6 +114,21 @@ impl PruneReader {
         }
     }
 
+    pub(crate) fn new_with_cached_reader(
+        ctx: FileRangeContextRef,
+        reader: CachedBatchReader,
+        skip_fields: bool,
+        key_range: PrimaryKeyRange,
+    ) -> Self {
+        Self {
+            context: ctx,
+            source: Source::Cached(reader),
+            metrics: Default::default(),
+            skip_fields,
+            key_range,
+        }
+    }
+
     pub(crate) fn reset_source(&mut self, source: Source, skip_fields: bool) {
         self.source = source;
         self.skip_fields = skip_fields;
@@ -103,6 +145,9 @@ impl PruneReader {
                 if let Some(inner_metrics) = r.metrics() {
                     metrics.merge_from(inner_metrics);
                 }
+            }
+            Source::Cached(_) => {
+                // Cached source doesn't have inner reader metrics.
             }
         }
 
@@ -274,12 +319,39 @@ impl Iterator for PruneTimeIterator {
 
 pub enum FlatSource {
     RowGroup(FlatRowGroupReader),
+    Cached(CachedFlatBatchReader),
 }
 
 impl FlatSource {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self {
             FlatSource::RowGroup(r) => r.next_batch(),
+            FlatSource::Cached(r) => Ok(r.next_batch()),
+        }
+    }
+}
+
+/// A simple reader that iterates over cached `Vec<RecordBatch>`.
+pub(crate) struct CachedFlatBatchReader {
+    batches: Arc<Vec<RecordBatch>>,
+    position: usize,
+}
+
+impl CachedFlatBatchReader {
+    pub(crate) fn new(batches: Arc<Vec<RecordBatch>>) -> Self {
+        Self {
+            batches,
+            position: 0,
+        }
+    }
+
+    fn next_batch(&mut self) -> Option<RecordBatch> {
+        if self.position < self.batches.len() {
+            let batch = self.batches[self.position].clone();
+            self.position += 1;
+            Some(batch)
+        } else {
+            None
         }
     }
 }
@@ -297,6 +369,21 @@ pub struct FlatPruneReader {
 }
 
 impl FlatPruneReader {
+    pub(crate) fn new_with_cached_reader(
+        ctx: FileRangeContextRef,
+        reader: CachedFlatBatchReader,
+        skip_fields: bool,
+        key_range: PrimaryKeyRange,
+    ) -> Self {
+        Self {
+            context: ctx,
+            source: FlatSource::Cached(reader),
+            metrics: Default::default(),
+            skip_fields,
+            key_range,
+        }
+    }
+
     pub(crate) fn new_with_row_group_reader(
         ctx: FileRangeContextRef,
         reader: FlatRowGroupReader,

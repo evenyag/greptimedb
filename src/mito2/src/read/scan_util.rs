@@ -42,6 +42,7 @@ use crate::read::dedup::{DedupMetrics, DedupMetricsReport};
 use crate::read::merge::{MergeMetrics, MergeMetricsReport};
 use crate::read::pruner::PartitionPruner;
 use crate::read::range::{RangeMeta, RowGroupIndex};
+use crate::read::row_group_scanner::RowGroupScanner;
 use crate::read::scan_region::StreamContext;
 use crate::read::{Batch, BoxedBatchStream, BoxedRecordBatchStream, ScannerMetrics, Source};
 use crate::sst::file::{FileTimeRange, RegionFileId};
@@ -1289,6 +1290,7 @@ pub(crate) async fn scan_file_ranges(
     read_type: &'static str,
     partition_pruner: Arc<PartitionPruner>,
     key_range: crate::memtable::PrimaryKeyRange,
+    row_group_scanner: Option<Arc<RowGroupScanner>>,
 ) -> Result<impl Stream<Item = Result<Batch>>> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
@@ -1325,6 +1327,7 @@ pub(crate) async fn scan_file_ranges(
         ranges,
         key_range,
         init_per_file_metrics,
+        row_group_scanner,
     ))
 }
 
@@ -1344,6 +1347,7 @@ pub(crate) async fn scan_flat_file_ranges(
     read_type: &'static str,
     partition_pruner: Arc<PartitionPruner>,
     key_range: crate::memtable::PrimaryKeyRange,
+    row_group_scanner: Option<Arc<RowGroupScanner>>,
 ) -> Result<impl Stream<Item = Result<RecordBatch>>> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
@@ -1380,6 +1384,7 @@ pub(crate) async fn scan_flat_file_ranges(
         ranges,
         key_range,
         init_per_file_metrics,
+        row_group_scanner,
     ))
 }
 
@@ -1395,6 +1400,7 @@ pub fn build_file_range_scan_stream(
     ranges: SmallVec<[FileRange; 2]>,
     key_range: crate::memtable::PrimaryKeyRange,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
+    row_group_scanner: Option<Arc<RowGroupScanner>>,
 ) -> impl Stream<Item = Result<Batch>> {
     try_stream! {
         let fetch_metrics = if part_metrics.explain_verbose() {
@@ -1408,8 +1414,14 @@ pub fn build_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            // If the row group was pruned by key range, skip this range
-            let Some(reader) = range.reader(stream_ctx.input.series_row_selector, key_range.clone(), fetch_metrics.as_deref()).await? else {
+            // If the row group was pruned by key range, skip this range.
+            // Use cached reader when row_group_scanner is available.
+            let reader = if let Some(scanner) = &row_group_scanner {
+                range.cached_reader(scanner, key_range.clone(), fetch_metrics.clone()).await?
+            } else {
+                range.reader(stream_ctx.input.series_row_selector, key_range.clone(), fetch_metrics.as_deref()).await?
+            };
+            let Some(reader) = reader else {
                 continue;
             };
             let build_cost = build_reader_start.elapsed();
@@ -1462,6 +1474,7 @@ pub fn build_flat_file_range_scan_stream(
     ranges: SmallVec<[FileRange; 2]>,
     key_range: crate::memtable::PrimaryKeyRange,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
+    row_group_scanner: Option<Arc<RowGroupScanner>>,
 ) -> impl Stream<Item = Result<RecordBatch>> {
     try_stream! {
         let fetch_metrics = if part_metrics.explain_verbose() {
@@ -1475,7 +1488,12 @@ pub fn build_flat_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let reader = range.flat_reader(key_range.clone(), fetch_metrics.as_deref()).await?;
+            // Use cached reader when row_group_scanner is available.
+            let reader = if let Some(scanner) = &row_group_scanner {
+                range.cached_flat_reader(scanner, key_range.clone(), fetch_metrics.clone()).await?
+            } else {
+                range.flat_reader(key_range.clone(), fetch_metrics.as_deref()).await?
+            };
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 

@@ -464,6 +464,7 @@ impl SeriesSet {
     }
 
     /// Iterates all series in [SeriesSet].
+    #[allow(clippy::too_many_arguments)]
     fn iter_series(
         &self,
         projection: HashSet<ColumnId>,

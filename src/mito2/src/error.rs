@@ -1204,6 +1204,13 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Failed to scan row group"))]
+    ScanRowGroup {
+        source: Arc<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1389,6 +1396,8 @@ impl ErrorExt for Error {
             TooManyFilesToRead { .. } | TooManyGcJobs { .. } => StatusCode::RateLimited,
 
             PruneFile { source, .. } => source.status_code(),
+
+            ScanRowGroup { source, .. } => source.status_code(),
         }
     }
 

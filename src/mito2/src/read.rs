@@ -25,6 +25,7 @@ pub mod plain_batch;
 pub mod projection;
 pub(crate) mod prune;
 pub(crate) mod pruner;
+pub(crate) mod row_group_scanner;
 pub mod range;
 pub mod scan_region;
 pub mod scan_util;

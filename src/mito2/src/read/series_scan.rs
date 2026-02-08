@@ -485,6 +485,7 @@ impl SeriesDistributor {
                     partition_pruner.clone(),
                     &mut sources,
                     self.semaphore.clone(),
+                    None,
                 )
                 .await?;
             }
@@ -592,6 +593,7 @@ impl SeriesDistributor {
                     partition_pruner.clone(),
                     &mut sources,
                     self.semaphore.clone(),
+                    None,
                 )
                 .await?;
             }
