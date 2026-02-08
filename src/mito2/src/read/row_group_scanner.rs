@@ -16,6 +16,7 @@
 //! key ranges that need the same row group within a single SeqScan instance.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use datatypes::arrow::record_batch::RecordBatch;
@@ -33,10 +34,16 @@ use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
 /// Cache key: identifies a single row group within a single SST file.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RowGroupKey {
     file_id: FileId,
     row_group_idx: usize,
+}
+
+impl fmt::Display for RowGroupKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.file_id, self.row_group_idx)
+    }
 }
 
 /// Cached row group scan result stored in the LRU cache.
@@ -264,6 +271,7 @@ impl RowGroupScanner {
         mut rx: mpsc::Receiver<RowGroupScanRequest>,
         inner: Arc<RowGroupScannerInner>,
     ) {
+        let mut miss_counts: HashMap<RowGroupKey, usize> = HashMap::new();
         while let Some(request) = rx.recv().await {
             let RowGroupScanRequest {
                 file_range,
@@ -301,6 +309,7 @@ impl RowGroupScanner {
 
             // Perform the actual scan (outside any lock).
             part_metrics.inc_rg_cache_miss(1);
+            *miss_counts.entry(key.clone()).or_default() += 1;
             let result = Self::read_row_group(&file_range, flat, fetch_metrics.as_deref()).await;
 
             // Insert into cache and notify all waiters.
@@ -324,6 +333,14 @@ impl RowGroupScanner {
             }
         }
 
-        common_telemetry::debug!("RowGroupScanner worker {} finished", worker_id,);
+        if miss_counts.is_empty() {
+            common_telemetry::debug!("RowGroupScanner worker {} finished, no cache misses", worker_id);
+        } else {
+            common_telemetry::debug!(
+                "RowGroupScanner worker {} finished, cache_misses: {:?}",
+                worker_id,
+                miss_counts,
+            );
+        }
     }
 }
