@@ -359,16 +359,21 @@ impl RowGroupScanner {
             }
         }
 
-        if miss_counts.is_empty() {
+        let repeated_misses: HashMap<_, _> = miss_counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .collect();
+        if repeated_misses.is_empty() {
             common_telemetry::debug!(
-                "RowGroupScanner worker {} finished, no cache misses",
+                "RowGroupScanner worker {} finished, no repeated cache misses",
                 worker_id
             );
         } else {
             common_telemetry::info!(
-                "RowGroupScanner worker {} finished, cache_misses: {:?}",
+                "RowGroupScanner worker {} finished, {} row groups with repeated cache misses: {:?}",
                 worker_id,
-                miss_counts,
+                repeated_misses.len(),
+                repeated_misses,
             );
         }
     }
