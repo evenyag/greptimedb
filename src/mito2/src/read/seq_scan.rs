@@ -376,13 +376,13 @@ impl SeqScan {
         metrics_set: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<SendableRecordBatchStream> {
-        if ctx.explain_verbose {
-            common_telemetry::info!(
-                "SeqScan partition {}, region_id: {}",
-                partition,
-                self.stream_ctx.input.region_metadata().region_id
-            );
-        }
+        let partition_ranges = self.properties.partitions.get(partition);
+        common_telemetry::info!(
+            "SeqScan partition {}, region_id: {}, ranges: {:?}",
+            partition,
+            self.stream_ctx.input.region_metadata().region_id,
+            partition_ranges
+        );
 
         let metrics = self.new_partition_metrics(ctx.explain_verbose, metrics_set, partition);
         let input = &self.stream_ctx.input;
