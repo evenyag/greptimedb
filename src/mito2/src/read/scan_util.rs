@@ -171,6 +171,14 @@ pub(crate) struct ScanMetricsSet {
     rows_vector_selected: usize,
     /// Number of rows filtered by precise filter.
     rows_precise_filtered: usize,
+    /// Number of rows filtered by key range.
+    rows_key_range_filtered: usize,
+    /// Number of row groups filtered by key range.
+    rg_key_range_filtered: usize,
+    /// Number of row group cache hits in the row group scanner.
+    rg_cache_hit: usize,
+    /// Number of row group cache misses in the row group scanner.
+    rg_cache_miss: usize,
     /// Number of index result cache hits for fulltext index.
     fulltext_index_cache_hit: usize,
     /// Number of index result cache misses for fulltext index.
@@ -303,6 +311,10 @@ impl fmt::Debug for ScanMetricsSet {
             rows_vector_filtered,
             rows_vector_selected,
             rows_precise_filtered,
+            rows_key_range_filtered,
+            rg_key_range_filtered,
+            rg_cache_hit,
+            rg_cache_miss,
             fulltext_index_cache_hit,
             fulltext_index_cache_miss,
             inverted_index_cache_hit,
@@ -403,6 +415,18 @@ impl fmt::Debug for ScanMetricsSet {
         }
         if *rows_precise_filtered > 0 {
             write!(f, ", \"rows_precise_filtered\":{rows_precise_filtered}")?;
+        }
+        if *rows_key_range_filtered > 0 {
+            write!(f, ", \"rows_key_range_filtered\":{rows_key_range_filtered}")?;
+        }
+        if *rg_key_range_filtered > 0 {
+            write!(f, ", \"rg_key_range_filtered\":{rg_key_range_filtered}")?;
+        }
+        if *rg_cache_hit > 0 {
+            write!(f, ", \"rg_cache_hit\":{rg_cache_hit}")?;
+        }
+        if *rg_cache_miss > 0 {
+            write!(f, ", \"rg_cache_miss\":{rg_cache_miss}")?;
         }
         if *fulltext_index_cache_hit > 0 {
             write!(
@@ -634,6 +658,8 @@ impl ScanMetricsSet {
                     rows_vector_filtered,
                     rows_vector_selected,
                     rows_precise_filtered,
+                    rows_key_range_filtered,
+                    rg_key_range_filtered,
                     fulltext_index_cache_hit,
                     fulltext_index_cache_miss,
                     inverted_index_cache_hit,
@@ -674,6 +700,8 @@ impl ScanMetricsSet {
         self.rows_vector_filtered += *rows_vector_filtered;
         self.rows_vector_selected += *rows_vector_selected;
         self.rows_precise_filtered += *rows_precise_filtered;
+        self.rows_key_range_filtered += *rows_key_range_filtered;
+        self.rg_key_range_filtered += *rg_key_range_filtered;
 
         self.fulltext_index_cache_hit += *fulltext_index_cache_hit;
         self.fulltext_index_cache_miss += *fulltext_index_cache_miss;
@@ -811,6 +839,12 @@ impl ScanMetricsSet {
         PRECISE_FILTER_ROWS_TOTAL
             .with_label_values(&["parquet"])
             .inc_by(self.rows_precise_filtered as u64);
+        PRECISE_FILTER_ROWS_TOTAL
+            .with_label_values(&["key_range"])
+            .inc_by(self.rows_key_range_filtered as u64);
+        READ_ROW_GROUPS_TOTAL
+            .with_label_values(&["key_range_filtered"])
+            .inc_by(self.rg_key_range_filtered as u64);
         READ_ROWS_IN_ROW_GROUP_TOTAL
             .with_label_values(&["before_filtering"])
             .inc_by(self.rows_before_filter as u64);
@@ -998,6 +1032,18 @@ impl PartitionMetrics {
     pub fn inc_num_file_ranges(&self, num: usize) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.num_file_ranges += num;
+    }
+
+    /// Increments the row group cache hit counter.
+    pub(crate) fn inc_rg_cache_hit(&self, num: usize) {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.rg_cache_hit += num;
+    }
+
+    /// Increments the row group cache miss counter.
+    pub(crate) fn inc_rg_cache_miss(&self, num: usize) {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.rg_cache_miss += num;
     }
 
     fn record_elapsed_compute(&self, duration: Duration) {
@@ -1417,11 +1463,12 @@ pub fn build_file_range_scan_stream(
             // If the row group was pruned by key range, skip this range.
             // Use cached reader when row_group_scanner is available.
             let reader = if let Some(scanner) = &row_group_scanner {
-                range.cached_reader(scanner, key_range.clone(), fetch_metrics.clone()).await?
+                range.cached_reader(scanner, key_range.clone(), fetch_metrics.clone(), &part_metrics).await?
             } else {
                 range.reader(stream_ctx.input.series_row_selector, key_range.clone(), fetch_metrics.as_deref()).await?
             };
             let Some(reader) = reader else {
+                reader_metrics.filter_metrics.rg_key_range_filtered += 1;
                 continue;
             };
             let build_cost = build_reader_start.elapsed();
@@ -1490,7 +1537,7 @@ pub fn build_flat_file_range_scan_stream(
             let build_reader_start = Instant::now();
             // Use cached reader when row_group_scanner is available.
             let reader = if let Some(scanner) = &row_group_scanner {
-                range.cached_flat_reader(scanner, key_range.clone(), fetch_metrics.clone()).await?
+                range.cached_flat_reader(scanner, key_range.clone(), fetch_metrics.clone(), &part_metrics).await?
             } else {
                 range.flat_reader(key_range.clone(), fetch_metrics.as_deref()).await?
             };
@@ -1499,6 +1546,7 @@ pub fn build_flat_file_range_scan_stream(
 
             // If the row group was pruned by key range, skip this range
             let Some(mut reader) = reader else {
+                reader_metrics.filter_metrics.rg_key_range_filtered += 1;
                 continue;
             };
 

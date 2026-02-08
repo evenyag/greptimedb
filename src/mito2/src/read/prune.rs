@@ -174,7 +174,7 @@ impl PruneReader {
         // Each Batch represents a single primary key.
         if !self.key_range.contains(batch.primary_key()) {
             let num_rows_filtered = batch.num_rows();
-            self.metrics.filter_metrics.rows_precise_filtered += num_rows_filtered;
+            self.metrics.filter_metrics.rows_key_range_filtered += num_rows_filtered;
             return Ok(None);
         }
 
@@ -513,7 +513,7 @@ impl FlatPruneReader {
             .context(crate::error::ComputeArrowSnafu)?;
 
         let filtered_count = num_rows - filtered.num_rows();
-        self.metrics.filter_metrics.rows_precise_filtered += filtered_count;
+        self.metrics.filter_metrics.rows_key_range_filtered += filtered_count;
 
         if filtered.num_rows() > 0 {
             Ok(Some(filtered))

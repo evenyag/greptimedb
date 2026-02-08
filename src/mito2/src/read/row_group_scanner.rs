@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::memtable::PrimaryKeyRange;
 use crate::read::Batch;
+use crate::read::scan_util::PartitionMetrics;
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
@@ -92,6 +93,8 @@ struct RowGroupScanRequest {
     flat: bool,
     /// Fetch metrics for verbose mode.
     fetch_metrics: Option<Arc<ParquetFetchMetrics>>,
+    /// Partition metrics for tracking cache hits/misses.
+    part_metrics: PartitionMetrics,
     /// Response channel.
     response_tx: oneshot::Sender<Result<CachedRowGroupData>>,
 }
@@ -152,6 +155,7 @@ impl RowGroupScanner {
         row_group_idx: usize,
         flat: bool,
         fetch_metrics: Option<Arc<ParquetFetchMetrics>>,
+        part_metrics: &PartitionMetrics,
     ) -> Result<CachedRowGroupData> {
         let key = RowGroupKey {
             file_id,
@@ -160,6 +164,7 @@ impl RowGroupScanner {
 
         // Fast path: check cache.
         if let Some(cached) = self.inner.cache.get(&key) {
+            part_metrics.inc_rg_cache_hit(1);
             return Ok(cached);
         }
 
@@ -172,11 +177,13 @@ impl RowGroupScanner {
             row_group_idx,
             flat,
             fetch_metrics,
+            part_metrics: part_metrics.clone(),
             response_tx,
         };
 
         if self.worker_senders[worker_idx].send(request).await.is_err() {
             // Worker channel closed, fall back to direct scan.
+            part_metrics.inc_rg_cache_miss(1);
             return self
                 .scan_directly(file_range, file_id, row_group_idx, flat, None)
                 .await;
@@ -186,6 +193,7 @@ impl RowGroupScanner {
             Ok(result) => result,
             Err(_) => {
                 // Channel closed, fall back to direct scan.
+                part_metrics.inc_rg_cache_miss(1);
                 self.scan_directly(file_range, file_id, row_group_idx, flat, None)
                     .await
             }
@@ -263,6 +271,7 @@ impl RowGroupScanner {
                 row_group_idx,
                 flat,
                 fetch_metrics,
+                part_metrics,
                 response_tx,
             } = request;
 
@@ -273,6 +282,7 @@ impl RowGroupScanner {
 
             // Check cache first.
             if let Some(cached) = inner.cache.get(&key) {
+                part_metrics.inc_rg_cache_hit(1);
                 let _ = response_tx.send(Ok(cached));
                 continue;
             }
@@ -290,8 +300,8 @@ impl RowGroupScanner {
             }
 
             // Perform the actual scan (outside any lock).
-            let result =
-                Self::read_row_group(&file_range, flat, fetch_metrics.as_deref()).await;
+            part_metrics.inc_rg_cache_miss(1);
+            let result = Self::read_row_group(&file_range, flat, fetch_metrics.as_deref()).await;
 
             // Insert into cache and notify all waiters.
             let mut waiters = inner.waiter_shards[worker_id].lock().unwrap();
@@ -307,17 +317,13 @@ impl RowGroupScanner {
                 Err(e) => {
                     let arc_error = Arc::new(e);
                     for waiter in waiter_list {
-                        let _ = waiter.send(
-                            Err(arc_error.clone()).context(crate::error::ScanRowGroupSnafu),
-                        );
+                        let _ = waiter
+                            .send(Err(arc_error.clone()).context(crate::error::ScanRowGroupSnafu));
                     }
                 }
             }
         }
 
-        common_telemetry::debug!(
-            "RowGroupScanner worker {} finished",
-            worker_id,
-        );
+        common_telemetry::debug!("RowGroupScanner worker {} finished", worker_id,);
     }
 }

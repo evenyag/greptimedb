@@ -377,6 +377,7 @@ impl FileRange {
         row_group_scanner: &crate::read::row_group_scanner::RowGroupScanner,
         key_range: PrimaryKeyRange,
         fetch_metrics: Option<std::sync::Arc<ParquetFetchMetrics>>,
+        part_metrics: &crate::read::scan_util::PartitionMetrics,
     ) -> Result<Option<PruneReader>> {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -397,7 +398,14 @@ impl FileRange {
 
         let file_id = self.file_handle().file_id().file_id();
         let cached = row_group_scanner
-            .get_or_scan(self, file_id, self.row_group_idx, false, fetch_metrics)
+            .get_or_scan(
+                self,
+                file_id,
+                self.row_group_idx,
+                false,
+                fetch_metrics,
+                part_metrics,
+            )
             .await?;
 
         let batches = match cached {
@@ -427,6 +435,7 @@ impl FileRange {
         row_group_scanner: &crate::read::row_group_scanner::RowGroupScanner,
         key_range: PrimaryKeyRange,
         fetch_metrics: Option<std::sync::Arc<ParquetFetchMetrics>>,
+        part_metrics: &crate::read::scan_util::PartitionMetrics,
     ) -> Result<Option<FlatPruneReader>> {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -447,7 +456,14 @@ impl FileRange {
 
         let file_id = self.file_handle().file_id().file_id();
         let cached = row_group_scanner
-            .get_or_scan(self, file_id, self.row_group_idx, true, fetch_metrics)
+            .get_or_scan(
+                self,
+                file_id,
+                self.row_group_idx,
+                true,
+                fetch_metrics,
+                part_metrics,
+            )
             .await?;
 
         let batches = match cached {

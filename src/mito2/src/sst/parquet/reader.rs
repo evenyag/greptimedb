@@ -1282,6 +1282,10 @@ pub(crate) struct ReaderFilterMetrics {
     pub(crate) rows_vector_selected: usize,
     /// Number of rows filtered by precise filter.
     pub(crate) rows_precise_filtered: usize,
+    /// Number of rows filtered by key range.
+    pub(crate) rows_key_range_filtered: usize,
+    /// Number of row groups filtered by key range.
+    pub(crate) rg_key_range_filtered: usize,
 
     /// Number of index result cache hits for fulltext index.
     pub(crate) fulltext_index_cache_hit: usize,
@@ -1328,6 +1332,8 @@ impl ReaderFilterMetrics {
         self.rows_vector_filtered += other.rows_vector_filtered;
         self.rows_vector_selected += other.rows_vector_selected;
         self.rows_precise_filtered += other.rows_precise_filtered;
+        self.rows_key_range_filtered += other.rows_key_range_filtered;
+        self.rg_key_range_filtered += other.rg_key_range_filtered;
 
         self.fulltext_index_cache_hit += other.fulltext_index_cache_hit;
         self.fulltext_index_cache_miss += other.fulltext_index_cache_miss;
@@ -1382,6 +1388,12 @@ impl ReaderFilterMetrics {
         PRECISE_FILTER_ROWS_TOTAL
             .with_label_values(&["parquet"])
             .inc_by(self.rows_precise_filtered as u64);
+        PRECISE_FILTER_ROWS_TOTAL
+            .with_label_values(&["key_range"])
+            .inc_by(self.rows_key_range_filtered as u64);
+        READ_ROW_GROUPS_TOTAL
+            .with_label_values(&["key_range_filtered"])
+            .inc_by(self.rg_key_range_filtered as u64);
         READ_ROWS_IN_ROW_GROUP_TOTAL
             .with_label_values(&["before_filtering"])
             .inc_by(self.rows_total as u64);
