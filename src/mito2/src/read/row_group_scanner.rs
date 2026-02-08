@@ -224,6 +224,12 @@ impl RowGroupScanner {
         let data = Self::read_row_group(file_range, flat, fetch_metrics.as_deref()).await?;
 
         // Cache the result.
+        common_telemetry::info!(
+            "Scan directly, put row group into cache, file_id: {}, row_group_idx: {}, memory_size: {}",
+            file_id,
+            row_group_idx,
+            data.memory_size()
+        );
         self.inner.cache.insert(key, data.clone());
 
         Ok(data)
@@ -318,6 +324,12 @@ impl RowGroupScanner {
 
             match result {
                 Ok(data) => {
+                    common_telemetry::info!(
+                        "Put row group into cache, file_id: {}, row_group_idx: {}, memory_size: {}",
+                        file_id,
+                        row_group_idx,
+                        data.memory_size()
+                    );
                     inner.cache.insert(key, data.clone());
                     for waiter in waiter_list {
                         let _ = waiter.send(Ok(data.clone()));
