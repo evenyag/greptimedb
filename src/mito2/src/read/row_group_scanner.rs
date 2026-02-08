@@ -109,11 +109,24 @@ struct RowGroupScanRequest {
 /// Default cache capacity in bytes (256 MB).
 const DEFAULT_CACHE_CAPACITY: u64 = 256 * 1024 * 1024;
 
+/// Environment variable to override row group cache capacity in bytes.
+const ROW_GROUP_CACHE_CAPACITY_ENV: &str = "GREPTIME_ROW_GROUP_CACHE_CAPACITY";
+
+/// Returns the row group cache capacity from the environment variable or the default.
+fn row_group_cache_capacity() -> u64 {
+    std::env::var(ROW_GROUP_CACHE_CAPACITY_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_CAPACITY)
+}
+
 impl RowGroupScanner {
     /// Creates a new RowGroupScanner with the given number of workers.
     pub(crate) fn new(num_workers: usize) -> Self {
+        let capacity = row_group_cache_capacity();
+        common_telemetry::info!("Row group cache capacity: {} bytes", capacity);
         let cache: RowGroupCache = Cache::builder()
-            .max_capacity(DEFAULT_CACHE_CAPACITY)
+            .max_capacity(capacity)
             .weigher(|_key: &RowGroupKey, value: &CachedRowGroupData| -> u32 {
                 // Approximate weight in bytes, capped at u32::MAX.
                 let size = value.memory_size();
