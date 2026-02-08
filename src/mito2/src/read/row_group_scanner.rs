@@ -325,7 +325,7 @@ impl RowGroupScanner {
 
             match result {
                 Ok(data) => {
-                    common_telemetry::info!(
+                    common_telemetry::debug!(
                         "Put row group into cache, file_id: {}, row_group_idx: {}, memory_size: {}",
                         file_id,
                         row_group_idx,
