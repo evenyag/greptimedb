@@ -334,9 +334,12 @@ impl RowGroupScanner {
         }
 
         if miss_counts.is_empty() {
-            common_telemetry::debug!("RowGroupScanner worker {} finished, no cache misses", worker_id);
-        } else {
             common_telemetry::debug!(
+                "RowGroupScanner worker {} finished, no cache misses",
+                worker_id
+            );
+        } else {
+            common_telemetry::info!(
                 "RowGroupScanner worker {} finished, cache_misses: {:?}",
                 worker_id,
                 miss_counts,
