@@ -175,7 +175,7 @@ impl RowGroupScanner {
             return Ok(cached);
         }
 
-        let worker_idx = self.get_worker_idx(file_id);
+        let worker_idx = self.get_worker_idx(file_id, row_group_idx);
 
         let (response_tx, response_rx) = oneshot::channel();
         let request = RowGroupScanRequest {
@@ -266,8 +266,9 @@ impl RowGroupScanner {
         }
     }
 
-    fn get_worker_idx(&self, file_id: FileId) -> usize {
-        let file_id_hash = Uuid::from(file_id).as_u128() as usize;
+    fn get_worker_idx(&self, file_id: FileId, row_group_idx: usize) -> usize {
+        let mut file_id_hash = Uuid::from(file_id).as_u128() as usize;
+        file_id_hash = file_id_hash.wrapping_add(row_group_idx);
         file_id_hash % self.inner.num_workers
     }
 
