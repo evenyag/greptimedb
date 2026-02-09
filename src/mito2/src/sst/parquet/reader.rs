@@ -1697,6 +1697,7 @@ impl RowGroupReaderBuilder {
             return Ok(stream);
         };
 
+        let prewhere_start = Instant::now();
         let prewhere_result = execute_prewhere(
             self,
             row_group_idx,
@@ -1709,11 +1710,13 @@ impl RowGroupReaderBuilder {
             fetch_metrics,
         )
         .await?;
+        if let Some(metrics) = fetch_metrics {
+            let mut data = metrics.data.lock().unwrap();
+            data.prewhere_elapsed += prewhere_start.elapsed();
+            data.prewhere_filtered_rows += prewhere_result.filtered_rows();
+        }
 
-        let refined_selection = match prewhere_result {
-            Some(result) => Some(result.refined_selection().clone()),
-            None => Some(RowSelection::from(vec![])),
-        };
+        let refined_selection = Some(prewhere_result.refined_selection().clone());
 
         let remaining_stream = self
             .build_with_projection(

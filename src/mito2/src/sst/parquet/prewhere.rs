@@ -185,17 +185,27 @@ impl PrewhereContext {
 pub struct PrewhereResult {
     /// Refined row selection after applying filters.
     refined_selection: RowSelection,
+    /// Number of rows filtered out by prewhere.
+    filtered_rows: usize,
 }
 
 impl PrewhereResult {
     /// Creates a new prewhere result.
-    pub fn new(refined_selection: RowSelection) -> Self {
-        Self { refined_selection }
+    pub fn new(refined_selection: RowSelection, filtered_rows: usize) -> Self {
+        Self {
+            refined_selection,
+            filtered_rows,
+        }
     }
 
     /// Returns the refined row selection.
     pub fn refined_selection(&self) -> &RowSelection {
         &self.refined_selection
+    }
+
+    /// Returns the number of rows filtered out by prewhere.
+    pub fn filtered_rows(&self) -> usize {
+        self.filtered_rows
     }
 }
 
@@ -382,8 +392,7 @@ pub fn apply_filters_to_batch(
 /// * `fetch_metrics` - Optional metrics for tracking fetch operations
 ///
 /// # Returns
-/// * `Ok(Some(PrewhereResult))` - If rows pass the filter
-/// * `Ok(None)` - If all rows are filtered out
+/// * `Ok(PrewhereResult)` - Refined selection with prewhere metrics
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_prewhere(
     reader_builder: &RowGroupReaderBuilder,
@@ -395,7 +404,7 @@ pub async fn execute_prewhere(
     read_format: &ReadFormat,
     skip_fields: bool,
     fetch_metrics: Option<&ParquetFetchMetrics>,
-) -> Result<Option<PrewhereResult>> {
+) -> Result<PrewhereResult> {
     // Phase 1: Read prewhere columns
     let mut prewhere_stream = reader_builder
         .build_with_projection(
@@ -408,6 +417,7 @@ pub async fn execute_prewhere(
 
     // Collect all batches and build the combined filter mask
     let mut filter_arrays: Vec<BooleanArray> = Vec::new();
+    let mut rows_before_filter = 0usize;
     let mut rows_selected = 0usize;
 
     while let Some(batch_result) = prewhere_stream.next().await {
@@ -419,6 +429,7 @@ pub async fn execute_prewhere(
         if num_rows == 0 {
             continue;
         }
+        rows_before_filter += num_rows;
         // Apply filters to get the mask for this batch
         let batch_mask = match apply_filters_to_batch(
             &batch,
@@ -436,24 +447,21 @@ pub async fn execute_prewhere(
         filter_arrays.push(BooleanArray::from(batch_mask));
     }
 
-    if filter_arrays.is_empty() {
-        return Ok(None);
+    let filtered_rows = rows_before_filter.saturating_sub(rows_selected);
+    let refined_selection = if filter_arrays.is_empty() || rows_selected == 0 {
+        RowSelection::from(vec![])
+    } else {
+        // Convert the filter mask to a row selection.
+        let prewhere_selection = RowSelection::from_filters(&filter_arrays);
+
+        // Intersect with the original row selection if present.
+        match row_selection {
+            Some(original) => original.and_then(&prewhere_selection),
+            None => prewhere_selection,
+        }
     };
 
-    if rows_selected == 0 {
-        return Ok(None);
-    }
-
-    // Convert the filter mask to a row selection
-    let prewhere_selection = RowSelection::from_filters(&filter_arrays);
-
-    // Intersect with the original row selection if present
-    let refined_selection = match row_selection {
-        Some(original) => original.and_then(&prewhere_selection),
-        None => prewhere_selection,
-    };
-
-    Ok(Some(PrewhereResult::new(refined_selection)))
+    Ok(PrewhereResult::new(refined_selection, filtered_rows))
 }
 
 #[cfg(test)]
