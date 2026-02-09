@@ -469,10 +469,6 @@ impl ParquetReaderBuilder {
                     self.expected_metadata.as_deref(),
                     expr,
                 ) {
-                    common_telemetry::info!(
-                        "Build simple filter for parquet reader, expr: {}",
-                        expr
-                    );
                     simple_filters.push(filter);
                     continue;
                 }
@@ -482,13 +478,8 @@ impl ParquetReaderBuilder {
                     &read_format,
                     expr,
                 ) {
-                    common_telemetry::info!(
-                        "Build physical filter for parquet reader, expr: {}",
-                        expr
-                    );
                     physical_filters.push(filter);
                 }
-                common_telemetry::info!("Can't build filter for parquet reader, expr: {}", expr);
             }
             (simple_filters, physical_filters)
         } else {
@@ -1919,14 +1910,7 @@ impl PhysicalFilterContext {
         read_format: &ReadFormat,
         expr: &Expr,
     ) -> Option<Self> {
-        common_telemetry::info!("Try to build physical filter for {}", expr);
         let column_name = Self::single_column_name(expr)?;
-        common_telemetry::info!(
-            "Try to build physical filter for {}, single column: {}",
-            expr,
-            column_name
-        );
-
         let (column_metadata, column_in_sst) = match expected_meta {
             Some(meta) => {
                 let column = meta.column_by_name(&column_name)?;
@@ -1941,18 +1925,8 @@ impl PhysicalFilterContext {
 
         let field =
             if let Some((_, field)) = read_format.arrow_schema().column_with_name(&column_name) {
-                common_telemetry::info!(
-                    "Try to build physical filter for {}, column {} in schema",
-                    expr,
-                    column_name
-                );
                 field.clone()
             } else {
-                common_telemetry::info!(
-                    "Try to build physical filter for {}, column {} not in schema",
-                    expr,
-                    column_name
-                );
                 let field = Field::try_from(&column_metadata.column_schema).ok()?;
                 if column_metadata.semantic_type == SemanticType::Tag
                     && column_metadata.column_schema.data_type.is_string()
@@ -1968,15 +1942,10 @@ impl PhysicalFilterContext {
                 }
             };
         let schema = Arc::new(ArrowSchema::new(vec![field]));
-        common_telemetry::info!(
-            "Try to build physical filter for {}, schema: {:?}",
-            expr,
-            schema
-        );
         let physical_expr = Predicate::to_physical_expr(expr, &schema)
             .inspect_err(|e| {
                 common_telemetry::error!(
-                    e; "Can't build physical filter for {}, schema: {:?}",
+                    e; "Unable to build physical filter for {}, schema: {:?}",
                     expr,
                     schema
                 );
@@ -1986,10 +1955,6 @@ impl PhysicalFilterContext {
         let filter = if column_in_sst {
             MaybePhysicalFilter::Filter(physical_expr)
         } else {
-            common_telemetry::info!(
-                "Try to build physical filter for {}, column not in sst",
-                expr
-            );
             let default_value = column_metadata
                 .column_schema
                 .create_default()
@@ -2028,11 +1993,6 @@ impl PhysicalFilterContext {
             return None;
         }
         if columns.len() != 1 {
-            common_telemetry::info!(
-                "single column, filter for {}, multiple columns: {:?}",
-                expr,
-                columns
-            );
             return None;
         }
         columns.iter().next().map(|column| column.name.clone())
