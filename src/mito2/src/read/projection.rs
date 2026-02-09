@@ -99,24 +99,9 @@ impl ProjectionMapper {
         }
     }
 
-    /// Returns the metadata that created the mapper.
-    pub(crate) fn metadata(&self) -> &RegionMetadataRef {
-        match self {
-            ProjectionMapper::PrimaryKey(m) => m.metadata(),
-            ProjectionMapper::Flat(m) => m.metadata(),
-        }
-    }
-
-    /// Returns true if the projection includes any tag columns.
-    pub(crate) fn has_tags(&self) -> bool {
-        match self {
-            ProjectionMapper::PrimaryKey(m) => m.has_tags(),
-            ProjectionMapper::Flat(_) => false,
-        }
-    }
-
     /// Returns ids of projected columns that we need to read
     /// from memtables and SSTs.
+    #[cfg(test)]
     pub(crate) fn column_ids(&self) -> &[ColumnId] {
         match self {
             ProjectionMapper::PrimaryKey(m) => m.column_ids(),
@@ -125,6 +110,7 @@ impl ProjectionMapper {
     }
 
     /// Returns the schema of converted [RecordBatch].
+    #[cfg(test)]
     pub(crate) fn output_schema(&self) -> SchemaRef {
         match self {
             ProjectionMapper::PrimaryKey(m) => m.output_schema(),

@@ -492,8 +492,8 @@ impl RangeBase {
                         continue;
                     }
                     // Safety: Input is Batch so we are using primary key format.
-                    let Some(field_index) =
-                        file_projection_schema.primary_key_field_index_by_id(filter_ctx.column_id())
+                    let Some(field_index) = file_projection_schema
+                        .primary_key_field_index_by_id(filter_ctx.column_id())
                     else {
                         continue;
                     };
@@ -618,9 +618,9 @@ impl RangeBase {
             // Get the column directly by its projected index.
             // If the column is missing and it's not a tag/time column, this filter is skipped.
             // Assumes the projection indices align with the input batch schema.
-            let column_idx =
-                self.file_projection_schema
-                    .flat_projected_index_by_id(filter_ctx.column_id());
+            let column_idx = self
+                .file_projection_schema
+                .flat_projected_index_by_id(filter_ctx.column_id());
             if let Some(idx) = column_idx {
                 let column = &input.columns().get(idx).unwrap();
                 let result = filter.evaluate_array(column).context(RecordBatchSnafu)?;
@@ -773,9 +773,9 @@ impl RangeBase {
             } else if metadata.time_index_column().column_id == column_id {
                 // 2. Check if it's the timestamp column.
                 columns.push(input.timestamps().to_arrow_array());
-            } else if let Some(field_index) =
-                self.file_projection_schema
-                    .primary_key_field_index_by_id(column_id)
+            } else if let Some(field_index) = self
+                .file_projection_schema
+                .primary_key_field_index_by_id(column_id)
             {
                 // 3. Check if it's a field column.
                 columns.push(input.fields()[field_index].data.to_arrow_array());
@@ -830,7 +830,10 @@ impl RangeBase {
                 .fail();
             };
 
-            if let Some(idx) = self.file_projection_schema.flat_projected_index_by_id(column_id) {
+            if let Some(idx) = self
+                .file_projection_schema
+                .flat_projected_index_by_id(column_id)
+            {
                 columns.push(input.column(idx).clone());
                 continue;
             }

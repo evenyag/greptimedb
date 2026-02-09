@@ -140,9 +140,6 @@ impl BulkIterContext {
 
     /// Returns the region id.
     pub(crate) fn region_id(&self) -> store_api::storage::RegionId {
-        self.base
-            .file_projection_schema
-            .metadata()
-            .region_id
+        self.base.file_projection_schema.metadata().region_id
     }
 }

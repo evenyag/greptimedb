@@ -88,32 +88,6 @@ impl<R: BatchReader> BatchReader for CompatReader<R> {
     }
 }
 
-/// Helper to adapt schema of the batch to an expected schema.
-pub(crate) enum CompatBatch {
-    /// Adapter for primary key format.
-    PrimaryKey(PrimaryKeyCompatBatch),
-    /// Adapter for flat format.
-    Flat(FlatCompatBatch),
-}
-
-impl CompatBatch {
-    /// Returns the inner primary key batch adapter if this is a PrimaryKey format.
-    pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyCompatBatch> {
-        match self {
-            CompatBatch::PrimaryKey(batch) => Some(batch),
-            _ => None,
-        }
-    }
-
-    /// Returns the inner flat batch adapter if this is a Flat format.
-    pub(crate) fn as_flat(&self) -> Option<&FlatCompatBatch> {
-        match self {
-            CompatBatch::Flat(batch) => Some(batch),
-            _ => None,
-        }
-    }
-}
-
 /// A helper struct to adapt schema of the batch to an expected schema.
 pub(crate) struct PrimaryKeyCompatBatch {
     /// Optional primary key adapter.
@@ -125,15 +99,12 @@ pub(crate) struct PrimaryKeyCompatBatch {
 }
 
 impl PrimaryKeyCompatBatch {
-    /// Creates a new [CompatBatch].
-    /// - `mapper` is built from the metadata users expect to see.
-    /// - `reader_meta` is the metadata of the input reader.
-    pub(crate) fn new(mapper: &ProjectionMapper, reader_meta: RegionMetadataRef) -> Result<Self> {
+    pub(crate) fn new_with_primary_key_mapper(
+        mapper: &PrimaryKeyProjectionMapper,
+        reader_meta: RegionMetadataRef,
+    ) -> Result<Self> {
         let rewrite_pk = may_rewrite_primary_key(mapper.metadata(), &reader_meta);
         let compat_pk = may_compat_primary_key(mapper.metadata(), &reader_meta)?;
-        let mapper = mapper.as_primary_key().context(UnexpectedSnafu {
-            reason: "Unexpected format",
-        })?;
         let compat_fields = may_compat_fields(mapper, &reader_meta)?;
 
         Ok(Self {
@@ -141,6 +112,16 @@ impl PrimaryKeyCompatBatch {
             compat_pk,
             compat_fields,
         })
+    }
+
+    /// Creates a new [CompatBatch].
+    /// - `mapper` is built from the metadata users expect to see.
+    /// - `reader_meta` is the metadata of the input reader.
+    pub(crate) fn new(mapper: &ProjectionMapper, reader_meta: RegionMetadataRef) -> Result<Self> {
+        let mapper = mapper.as_primary_key().context(UnexpectedSnafu {
+            reason: "Unexpected format",
+        })?;
+        Self::new_with_primary_key_mapper(mapper, reader_meta)
     }
 
     /// Adapts the `batch` to the expected schema.

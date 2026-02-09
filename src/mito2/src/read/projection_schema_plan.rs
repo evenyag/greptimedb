@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use common_recordbatch::RecordBatch;
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
 use snafu::OptionExt;
@@ -28,19 +29,72 @@ use tracing::warn;
 use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, Result, UnexpectedSnafu};
 use crate::read::Batch;
-use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
-use crate::read::flat_projection::CompactionProjectionMapper;
-use crate::read::projection::ProjectionMapper;
+use crate::read::compat::{self, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::read::flat_projection::{CompactionProjectionMapper, FlatProjectionMapper};
+use crate::read::projection::PrimaryKeyProjectionMapper;
 use crate::read::scan_region::PredicateGroup;
 use crate::sst::parquet::format::{ReadFormat, StatValues};
-use common_recordbatch::RecordBatch;
 
 /// Projection + schema computation plan built from request + expected metadata.
 pub(crate) struct ProjectionSchemaPlan {
     expected_meta: RegionMetadataRef,
     flat_format: bool,
     projection: Option<Vec<usize>>,
-    mapper: Arc<ProjectionMapper>,
+    mapper: Arc<PlanProjectionMapper>,
+}
+
+enum PlanProjectionMapper {
+    PrimaryKey(PrimaryKeyProjectionMapper),
+    Flat(FlatProjectionMapper),
+}
+
+impl PlanProjectionMapper {
+    fn column_ids(&self) -> &[ColumnId] {
+        match self {
+            PlanProjectionMapper::PrimaryKey(mapper) => mapper.column_ids(),
+            PlanProjectionMapper::Flat(mapper) => mapper.column_ids(),
+        }
+    }
+
+    fn output_schema(&self) -> datatypes::schema::SchemaRef {
+        match self {
+            PlanProjectionMapper::PrimaryKey(mapper) => mapper.output_schema(),
+            PlanProjectionMapper::Flat(mapper) => mapper.output_schema(),
+        }
+    }
+
+    fn has_tags(&self) -> bool {
+        match self {
+            PlanProjectionMapper::PrimaryKey(mapper) => mapper.has_tags(),
+            PlanProjectionMapper::Flat(_) => false,
+        }
+    }
+
+    fn empty_record_batch(&self) -> RecordBatch {
+        match self {
+            PlanProjectionMapper::PrimaryKey(mapper) => mapper.empty_record_batch(),
+            PlanProjectionMapper::Flat(mapper) => mapper.empty_record_batch(),
+        }
+    }
+
+    fn as_primary_key(&self) -> Option<&PrimaryKeyProjectionMapper> {
+        match self {
+            PlanProjectionMapper::PrimaryKey(mapper) => Some(mapper),
+            PlanProjectionMapper::Flat(_) => None,
+        }
+    }
+
+    fn as_flat(&self) -> Option<&FlatProjectionMapper> {
+        match self {
+            PlanProjectionMapper::PrimaryKey(_) => None,
+            PlanProjectionMapper::Flat(mapper) => Some(mapper),
+        }
+    }
+}
+
+pub(crate) enum FileCompatBatch {
+    PrimaryKey(PrimaryKeyCompatBatch),
+    Flat(FlatCompatBatch),
 }
 
 impl ProjectionSchemaPlan {
@@ -62,13 +116,32 @@ impl ProjectionSchemaPlan {
         };
 
         let mapper = match &projection {
-            Some(p) => ProjectionMapper::new_with_read_columns(
-                &expected_meta,
-                p.iter().copied(),
-                flat_format,
-                read_column_ids.clone(),
-            )?,
-            None => ProjectionMapper::all(&expected_meta, flat_format)?,
+            Some(p) => {
+                if flat_format {
+                    PlanProjectionMapper::Flat(FlatProjectionMapper::new_with_read_columns(
+                        &expected_meta,
+                        p.clone(),
+                        read_column_ids.clone(),
+                    )?)
+                } else {
+                    PlanProjectionMapper::PrimaryKey(
+                        PrimaryKeyProjectionMapper::new_with_read_columns(
+                            &expected_meta,
+                            p.clone(),
+                            read_column_ids.clone(),
+                        )?,
+                    )
+                }
+            }
+            None => {
+                if flat_format {
+                    PlanProjectionMapper::Flat(FlatProjectionMapper::all(&expected_meta)?)
+                } else {
+                    PlanProjectionMapper::PrimaryKey(PrimaryKeyProjectionMapper::all(
+                        &expected_meta,
+                    )?)
+                }
+            }
         };
 
         Ok(Self {
@@ -81,7 +154,11 @@ impl ProjectionSchemaPlan {
 
     /// Builds a plan that reads all columns.
     pub(crate) fn new_all(expected_meta: RegionMetadataRef, flat_format: bool) -> Result<Self> {
-        let mapper = ProjectionMapper::all(&expected_meta, flat_format)?;
+        let mapper = if flat_format {
+            PlanProjectionMapper::Flat(FlatProjectionMapper::all(&expected_meta)?)
+        } else {
+            PlanProjectionMapper::PrimaryKey(PrimaryKeyProjectionMapper::all(&expected_meta)?)
+        };
 
         Ok(Self {
             expected_meta,
@@ -179,11 +256,11 @@ impl ProjectionSchemaPlan {
     }
 
     /// Computes compat batch for a read format and current plan.
-    pub(crate) fn compat_for_read_format(
+    fn compat_for_read_format(
         &self,
         read_format: &ReadFormat,
         compaction: bool,
-    ) -> Result<Option<CompatBatch>> {
+    ) -> Result<Option<FileCompatBatch>> {
         let need_compat = !compat::has_same_columns_and_pk_encoding(
             self.expected_meta.as_ref(),
             read_format.metadata(),
@@ -200,11 +277,17 @@ impl ProjectionSchemaPlan {
                 flat_format.format_projection(),
                 compaction,
             )?
-            .map(CompatBatch::Flat)
+            .map(FileCompatBatch::Flat)
         } else {
-            let compact_batch =
-                PrimaryKeyCompatBatch::new(self.mapper.as_ref(), read_format.metadata().clone())?;
-            Some(CompatBatch::PrimaryKey(compact_batch))
+            let mapper = self
+                .mapper
+                .as_primary_key()
+                .expect("primary key mapper missing");
+            let compact_batch = PrimaryKeyCompatBatch::new_with_primary_key_mapper(
+                mapper,
+                read_format.metadata().clone(),
+            )?;
+            Some(FileCompatBatch::PrimaryKey(compact_batch))
         };
 
         Ok(compat)
@@ -271,15 +354,15 @@ impl ProjectionSchemaPlan {
 pub(crate) struct FileProjectionSchema {
     expected_meta: RegionMetadataRef,
     read_format: ReadFormat,
-    compat: Option<CompatBatch>,
+    compat: Option<FileCompatBatch>,
     compaction_projection: Option<CompactionProjectionMapper>,
 }
 
 impl FileProjectionSchema {
-    pub(crate) fn new(
+    fn new(
         expected_meta: RegionMetadataRef,
         read_format: ReadFormat,
-        compat: Option<CompatBatch>,
+        compat: Option<FileCompatBatch>,
         compaction_projection: Option<CompactionProjectionMapper>,
     ) -> Self {
         Self {
@@ -407,11 +490,15 @@ impl FileProjectionSchema {
         let Some(compat) = self.compat.as_ref() else {
             return Ok(batch);
         };
-        let primary_key = compat
-            .as_primary_key()
-            .context(crate::error::UnexpectedSnafu {
-                reason: "Invalid compat for primary key format",
-            })?;
+        let primary_key = match compat {
+            FileCompatBatch::PrimaryKey(primary_key) => primary_key,
+            FileCompatBatch::Flat(_) => {
+                return UnexpectedSnafu {
+                    reason: "Invalid compat for primary key format",
+                }
+                .fail();
+            }
+        };
         primary_key.compat_batch(batch)
     }
 
@@ -422,9 +509,15 @@ impl FileProjectionSchema {
         let Some(compat) = self.compat.as_ref() else {
             return Ok(record_batch);
         };
-        let flat_compat = compat.as_flat().context(crate::error::UnexpectedSnafu {
-            reason: "Invalid compat for flat format",
-        })?;
+        let flat_compat = match compat {
+            FileCompatBatch::Flat(flat_compat) => flat_compat,
+            FileCompatBatch::PrimaryKey(_) => {
+                return UnexpectedSnafu {
+                    reason: "Invalid compat for flat format",
+                }
+                .fail();
+            }
+        };
         flat_compat.compat(record_batch)
     }
 

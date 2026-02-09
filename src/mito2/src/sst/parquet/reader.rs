@@ -55,7 +55,7 @@ use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
     READ_ROWS_TOTAL, READ_STAGE_ELAPSED,
 };
-use crate::read::projection_schema_plan::ProjectionSchemaPlan;
+use crate::read::projection_schema_plan::{FileProjectionSchema, ProjectionSchemaPlan};
 use crate::read::prune::{PruneReader, Source};
 use crate::read::{Batch, BatchReader};
 use crate::sst::file::FileHandle;
@@ -74,7 +74,6 @@ use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
     row_group_contains_delete,
 };
-use crate::read::projection_schema_plan::FileProjectionSchema;
 use crate::sst::parquet::format::need_override_sequence;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::row_group::{InMemoryRowGroup, ParquetFetchMetrics};
@@ -2001,11 +2000,13 @@ where
             self.metrics.num_record_batches += 1;
 
             // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
-            self.context.file_projection_schema().convert_primary_key_record_batch(
-                &record_batch,
-                self.override_sequence.as_ref(),
-                &mut self.batches,
-            )?;
+            self.context
+                .file_projection_schema()
+                .convert_primary_key_record_batch(
+                    &record_batch,
+                    self.override_sequence.as_ref(),
+                    &mut self.batches,
+                )?;
             self.metrics.num_batches += self.batches.len();
         }
         let batch = self.batches.pop_front();
