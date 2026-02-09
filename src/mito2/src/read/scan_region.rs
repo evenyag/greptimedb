@@ -189,15 +189,15 @@ impl Scanner {
 ///     +build() SendableRecordBatchStream
 /// }
 /// class ScanInput {
-///     -ProjectionMapper mapper
+///     -ProjectionSchemaPlan projection_plan
 ///     -Option~TimeRange~ time_range
 ///     -Option~Predicate~ predicate
 ///     -Vec~MemtableRef~ memtables
 ///     -Vec~FileHandle~ files
 /// }
-/// class ProjectionMapper {
+/// class ProjectionSchemaPlan {
 ///     ~output_schema() SchemaRef
-///     ~convert(Batch) RecordBatch
+///     ~for_file(...) FileProjectionSchema
 /// }
 /// ScanRegion -- Scanner
 /// ScanRegion o-- ScanRequest
@@ -206,7 +206,7 @@ impl Scanner {
 /// SeqScan o-- ScanInput
 /// UnorderedScan o-- ScanInput
 /// Scanner -- SendableRecordBatchStream
-/// ScanInput o-- ProjectionMapper
+/// ScanInput o-- ProjectionSchemaPlan
 /// SeqScan -- SendableRecordBatchStream
 /// UnorderedScan -- SendableRecordBatchStream
 /// ```
