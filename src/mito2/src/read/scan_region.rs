@@ -45,7 +45,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheStrategy;
-use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SCAN_CHANNEL_SIZE};
+use crate::config::{
+    PrewhereConfig, DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SCAN_CHANNEL_SIZE,
+};
 use crate::error::{InvalidPartitionExprSnafu, InvalidRequestSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
@@ -232,6 +234,8 @@ pub(crate) struct ScanRegion {
     ignore_bloom_filter: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
+    /// Prewhere config.
+    prewhere_config: PrewhereConfig,
     /// Whether to filter out the deleted rows.
     /// Usually true for normal read, and false for scan for compaction.
     filter_deleted: bool,
@@ -258,6 +262,7 @@ impl ScanRegion {
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
             start_time: None,
+            prewhere_config: PrewhereConfig::default(),
             filter_deleted: true,
             #[cfg(feature = "enterprise")]
             extension_range_provider: None,
@@ -308,6 +313,12 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_start_time(mut self, now: Instant) -> Self {
         self.start_time = Some(now);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_prewhere_config(mut self, config: PrewhereConfig) -> Self {
+        self.prewhere_config = config;
         self
     }
 
@@ -549,7 +560,8 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
-            .with_flat_format(flat_format);
+            .with_flat_format(flat_format)
+            .with_prewhere_config(self.prewhere_config.clone());
         #[cfg(feature = "vector_index")]
         let input = input
             .with_vector_index_applier(vector_index_applier)
@@ -856,6 +868,8 @@ pub struct ScanInput {
     pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Prewhere config.
+    pub(crate) prewhere_config: PrewhereConfig,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -892,6 +906,7 @@ impl ScanInput {
             distribution: None,
             flat_format: false,
             compaction: false,
+            prewhere_config: PrewhereConfig::default(),
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -1013,6 +1028,13 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_start_time(mut self, now: Option<Instant>) -> Self {
         self.query_start = now;
+        self
+    }
+
+    /// Sets prewhere config.
+    #[must_use]
+    pub(crate) fn with_prewhere_config(mut self, config: PrewhereConfig) -> Self {
+        self.prewhere_config = config;
         self
     }
 
@@ -1152,7 +1174,8 @@ impl ScanInput {
             .cache(self.cache_strategy.clone())
             .inverted_index_appliers(self.inverted_index_appliers.clone())
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
-            .fulltext_index_appliers(self.fulltext_index_appliers.clone());
+            .fulltext_index_appliers(self.fulltext_index_appliers.clone())
+            .prewhere_config(self.prewhere_config.clone());
         #[cfg(feature = "vector_index")]
         let reader = {
             let mut reader = reader;

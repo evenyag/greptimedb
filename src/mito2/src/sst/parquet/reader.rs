@@ -155,6 +155,8 @@ pub struct ParquetReaderBuilder {
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
+    /// Prewhere config.
+    prewhere_config: PrewhereConfig,
 }
 
 impl ParquetReaderBuilder {
@@ -186,6 +188,7 @@ impl ParquetReaderBuilder {
             pre_filter_mode: PreFilterMode::All,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
+            prewhere_config: PrewhereConfig::default(),
         }
     }
 
@@ -293,6 +296,13 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn page_index_policy(mut self, page_index_policy: PageIndexPolicy) -> Self {
         self.page_index_policy = page_index_policy;
+        self
+    }
+
+    /// Sets the prewhere config.
+    #[must_use]
+    pub fn prewhere_config(mut self, config: PrewhereConfig) -> ParquetReaderBuilder {
+        self.prewhere_config = config;
         self
     }
 
@@ -510,7 +520,7 @@ impl ParquetReaderBuilder {
                 compaction_projection_mapper,
                 pre_filter_mode: self.pre_filter_mode,
                 partition_filter,
-                prewhere_config: PrewhereConfig::default(),
+                prewhere_config: self.prewhere_config.clone(),
             },
         );
 

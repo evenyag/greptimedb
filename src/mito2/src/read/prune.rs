@@ -51,6 +51,9 @@ pub struct PruneReader {
     metrics: ReaderMetrics,
     /// Whether to skip field filters for this row group.
     skip_fields: bool,
+    /// Whether prewhere optimization is enabled. If true, filtering is already
+    /// done during row group building so `prune()` is skipped.
+    prewhere_enabled: bool,
 }
 
 impl PruneReader {
@@ -59,11 +62,13 @@ impl PruneReader {
         reader: RowGroupReader,
         skip_fields: bool,
     ) -> Self {
+        let prewhere_enabled = ctx.prewhere_config().enabled;
         Self {
             context: ctx,
             source: Source::RowGroup(reader),
             metrics: Default::default(),
             skip_fields,
+            prewhere_enabled,
         }
     }
 
@@ -72,11 +77,13 @@ impl PruneReader {
         reader: RowGroupLastRowCachedReader,
         skip_fields: bool,
     ) -> Self {
+        let prewhere_enabled = ctx.prewhere_config().enabled;
         Self {
             context: ctx,
             source: Source::LastRow(reader),
             metrics: Default::default(),
             skip_fields,
+            prewhere_enabled,
         }
     }
 
@@ -118,6 +125,12 @@ impl PruneReader {
 
     /// Prunes batches by the pushed down predicate.
     fn prune(&mut self, batch: Batch) -> Result<Option<Batch>> {
+        // Skip pruning if prewhere is enabled, as filtering is already done.
+        // But we still need to prune if there are partition filters.
+        if self.prewhere_enabled && !self.context.has_partition_filter() {
+            return Ok(Some(batch));
+        }
+
         // fast path
         if self.context.filters().is_empty() && !self.context.has_partition_filter() {
             return Ok(Some(batch));
@@ -266,6 +279,9 @@ pub struct FlatPruneReader {
     metrics: ReaderMetrics,
     /// Whether to skip field filters for this row group.
     skip_fields: bool,
+    /// Whether prewhere optimization is enabled. If true, filtering is already
+    /// done during row group building so `prune_flat()` is skipped.
+    prewhere_enabled: bool,
 }
 
 impl FlatPruneReader {
@@ -274,11 +290,13 @@ impl FlatPruneReader {
         reader: FlatRowGroupReader,
         skip_fields: bool,
     ) -> Self {
+        let prewhere_enabled = ctx.prewhere_config().enabled;
         Self {
             context: ctx,
             source: FlatSource::RowGroup(reader),
             metrics: Default::default(),
             skip_fields,
+            prewhere_enabled,
         }
     }
 
@@ -315,6 +333,12 @@ impl FlatPruneReader {
 
     /// Prunes batches by the pushed down predicate and returns RecordBatch.
     fn prune_flat(&mut self, record_batch: RecordBatch) -> Result<Option<RecordBatch>> {
+        // Skip pruning if prewhere is enabled, as filtering is already done.
+        // But we still need to prune if there are partition filters.
+        if self.prewhere_enabled && !self.context.has_partition_filter() {
+            return Ok(Some(record_batch));
+        }
+
         // fast path
         if self.context.filters().is_empty() && !self.context.has_partition_filter() {
             return Ok(Some(record_batch));
