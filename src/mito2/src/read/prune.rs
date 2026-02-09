@@ -62,7 +62,7 @@ impl PruneReader {
         reader: RowGroupReader,
         skip_fields: bool,
     ) -> Self {
-        let prewhere_enabled = ctx.prewhere_config().enabled;
+        let prewhere_enabled = ctx.prewhere_config().enable;
         Self {
             context: ctx,
             source: Source::RowGroup(reader),
@@ -77,7 +77,7 @@ impl PruneReader {
         reader: RowGroupLastRowCachedReader,
         skip_fields: bool,
     ) -> Self {
-        let prewhere_enabled = ctx.prewhere_config().enabled;
+        let prewhere_enabled = ctx.prewhere_config().enable;
         Self {
             context: ctx,
             source: Source::LastRow(reader),
@@ -290,7 +290,7 @@ impl FlatPruneReader {
         reader: FlatRowGroupReader,
         skip_fields: bool,
     ) -> Self {
-        let prewhere_enabled = ctx.prewhere_config().enabled;
+        let prewhere_enabled = ctx.prewhere_config().enable;
         Self {
             context: ctx,
             source: FlatSource::RowGroup(reader),

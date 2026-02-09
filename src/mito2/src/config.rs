@@ -707,7 +707,7 @@ impl VectorIndexConfig {
 #[serde(default)]
 pub struct PrewhereConfig {
     /// Whether prewhere optimization is enabled (default: true).
-    pub enabled: bool,
+    pub enable: bool,
     /// Maximum ratio of prewhere columns to total columns (in percent) to enable optimization.
     /// If prewhere columns exceed this ratio, the optimization is skipped.
     /// Default: 50 (50%).
@@ -721,7 +721,7 @@ pub struct PrewhereConfig {
 impl Default for PrewhereConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enable: true,
             column_ratio_threshold_percent: 50,
             min_remaining_columns: 2,
         }

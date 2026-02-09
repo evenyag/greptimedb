@@ -51,8 +51,8 @@ pub struct ParquetFetchMetricsData {
     pub total_fetch_elapsed: std::time::Duration,
     /// Number of rows filtered out by prewhere.
     pub prewhere_filtered_rows: usize,
-    /// Elapsed time executing prewhere.
-    pub prewhere_elapsed: Duration,
+    /// Cost executing prewhere.
+    pub prewhere_cost: Duration,
 }
 
 impl ParquetFetchMetricsData {
@@ -60,7 +60,7 @@ impl ParquetFetchMetricsData {
     fn is_empty(&self) -> bool {
         self.total_fetch_elapsed.is_zero()
             && self.prewhere_filtered_rows == 0
-            && self.prewhere_elapsed.is_zero()
+            && self.prewhere_cost.is_zero()
     }
 }
 
@@ -92,7 +92,7 @@ impl std::fmt::Debug for ParquetFetchMetrics {
             store_fetch_elapsed,
             total_fetch_elapsed,
             prewhere_filtered_rows,
-            prewhere_elapsed,
+            prewhere_cost,
         } = *data;
 
         write!(f, "{{")?;
@@ -154,8 +154,8 @@ impl std::fmt::Debug for ParquetFetchMetrics {
         if prewhere_filtered_rows > 0 {
             write!(f, ", \"prewhere_filtered_rows\":{}", prewhere_filtered_rows)?;
         }
-        if !prewhere_elapsed.is_zero() {
-            write!(f, ", \"prewhere_elapsed\":\"{:?}\"", prewhere_elapsed)?;
+        if !prewhere_cost.is_zero() {
+            write!(f, ", \"prewhere_cost\":\"{:?}\"", prewhere_cost)?;
         }
 
         write!(f, "}}")
@@ -185,7 +185,7 @@ impl ParquetFetchMetrics {
             store_fetch_elapsed,
             total_fetch_elapsed,
             prewhere_filtered_rows,
-            prewhere_elapsed,
+            prewhere_cost,
         } = *other.data.lock().unwrap();
 
         let mut data = self.data.lock().unwrap();
@@ -203,7 +203,7 @@ impl ParquetFetchMetrics {
         data.store_fetch_elapsed += store_fetch_elapsed;
         data.total_fetch_elapsed += total_fetch_elapsed;
         data.prewhere_filtered_rows += prewhere_filtered_rows;
-        data.prewhere_elapsed += prewhere_elapsed;
+        data.prewhere_cost += prewhere_cost;
     }
 }
 

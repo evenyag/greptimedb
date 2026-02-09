@@ -72,7 +72,7 @@ impl PrewhereContext {
         config: &PrewhereConfig,
         skip_fields: bool,
     ) -> Option<Self> {
-        if !config.enabled {
+        if !config.enable {
             return None;
         }
 
@@ -491,11 +491,11 @@ mod tests {
     #[test]
     fn test_should_use_prewhere_disabled() {
         let config = PrewhereConfig {
-            enabled: false,
+            enable: false,
             ..Default::default()
         };
 
         // Even good conditions should return false when disabled.
-        assert!(!config.enabled);
+        assert!(!config.enable);
     }
 }

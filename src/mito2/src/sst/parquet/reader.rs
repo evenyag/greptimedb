@@ -1712,7 +1712,7 @@ impl RowGroupReaderBuilder {
         .await?;
         if let Some(metrics) = fetch_metrics {
             let mut data = metrics.data.lock().unwrap();
-            data.prewhere_elapsed += prewhere_start.elapsed();
+            data.prewhere_cost += prewhere_start.elapsed();
             data.prewhere_filtered_rows += prewhere_result.filtered_rows();
         }
 
