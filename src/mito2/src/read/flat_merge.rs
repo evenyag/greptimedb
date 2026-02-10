@@ -30,7 +30,7 @@ use futures::{Stream, TryStreamExt};
 use snafu::ResultExt;
 use store_api::storage::SequenceNumber;
 
-use crate::error::{ComputeArrowSnafu, Result};
+use crate::error::{ComputeArrowSnafu, JoinSnafu, Result};
 use crate::memtable::BoxedRecordBatchIterator;
 use crate::metrics::READ_STAGE_ELAPSED;
 use crate::read::BoxedRecordBatchStream;
@@ -581,9 +581,9 @@ impl FlatMergeReader {
         let start = Instant::now();
         let metrics = MergeMetrics::default();
         let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
-        // Initialize nodes and the buffer in parallel.
-        let initialized = try_join_all(iters.into_iter().enumerate().map(
-            |(node_index, iter)| async move {
+        // Initialize nodes and the buffer in parallel by spawning tasks.
+        let initialized = try_join_all(iters.into_iter().enumerate().map(|(node_index, iter)| {
+            common_runtime::spawn_global(async move {
                 let mut node = StreamNode {
                     node_index,
                     iter,
@@ -591,12 +591,14 @@ impl FlatMergeReader {
                 };
                 let batch = node.advance_batch().await?;
                 Ok::<_, crate::error::Error>((node, batch))
-            },
-        ))
-        .await?;
+            })
+        }))
+        .await
+        .context(JoinSnafu)?;
 
         let mut nodes = Vec::with_capacity(initialized.len());
-        for (node, batch) in initialized {
+        for initialized_node in initialized {
+            let (node, batch) = initialized_node?;
             if let Some(batch) = batch {
                 in_progress.push_batch(node.node_index, batch);
                 nodes.push(node);
