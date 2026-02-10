@@ -25,6 +25,7 @@ use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::arrow_array::BinaryArray;
 use datatypes::timestamp::timestamp_array_to_primitive;
+use futures::future::try_join_all;
 use futures::{Stream, TryStreamExt};
 use snafu::ResultExt;
 use store_api::storage::SequenceNumber;
@@ -580,16 +581,24 @@ impl FlatMergeReader {
         let start = Instant::now();
         let metrics = MergeMetrics::default();
         let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
-        let mut nodes = Vec::with_capacity(iters.len());
-        // Initialize nodes and the buffer.
-        for (node_index, iter) in iters.into_iter().enumerate() {
-            let mut node = StreamNode {
-                node_index,
-                iter,
-                cursor: None,
-            };
-            if let Some(batch) = node.advance_batch().await? {
-                in_progress.push_batch(node_index, batch);
+        // Initialize nodes and the buffer in parallel.
+        let initialized = try_join_all(iters.into_iter().enumerate().map(
+            |(node_index, iter)| async move {
+                let mut node = StreamNode {
+                    node_index,
+                    iter,
+                    cursor: None,
+                };
+                let batch = node.advance_batch().await?;
+                Ok::<_, crate::error::Error>((node, batch))
+            },
+        ))
+        .await?;
+
+        let mut nodes = Vec::with_capacity(initialized.len());
+        for (node, batch) in initialized {
+            if let Some(batch) = batch {
+                in_progress.push_batch(node.node_index, batch);
                 nodes.push(node);
             }
         }
