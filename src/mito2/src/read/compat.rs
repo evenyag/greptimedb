@@ -43,8 +43,7 @@ use crate::error::{
     DecodeSnafu, EncodeSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result,
     UnsupportedOperationSnafu,
 };
-use crate::read::flat_projection::{FlatProjectionMapper, flat_projected_columns};
-use crate::read::projection::PrimaryKeyProjectionMapper;
+use crate::read::flat_projection::flat_projected_columns;
 use crate::read::{Batch, BatchColumn};
 #[cfg(test)]
 use crate::read::BatchReader;
@@ -64,17 +63,26 @@ pub struct CompatReader<R> {
 #[cfg(test)]
 impl<R> CompatReader<R> {
     /// Creates a new compat reader.
-    /// - `mapper` is built from the metadata users expect to see.
+    /// - `expect_meta` is the metadata users expect to see.
+    /// - `read_column_ids` are the projected read columns.
+    /// - `batch_fields` are the projected field schema in [Batch]es.
     /// - `reader_meta` is the metadata of the input reader.
     /// - `reader` is the input reader.
     pub fn new(
-        mapper: &PrimaryKeyProjectionMapper,
+        expect_meta: &RegionMetadataRef,
+        read_column_ids: &[ColumnId],
+        batch_fields: &[(ColumnId, ConcreteDataType)],
         reader_meta: RegionMetadataRef,
         reader: R,
     ) -> Result<CompatReader<R>> {
         Ok(CompatReader {
             reader,
-            compat: PrimaryKeyCompatBatch::new_with_primary_key_mapper(mapper, reader_meta)?,
+            compat: PrimaryKeyCompatBatch::new_with_projection(
+                expect_meta,
+                read_column_ids,
+                batch_fields,
+                reader_meta,
+            )?,
         })
     }
 }
@@ -104,13 +112,16 @@ pub(crate) struct PrimaryKeyCompatBatch {
 }
 
 impl PrimaryKeyCompatBatch {
-    pub(crate) fn new_with_primary_key_mapper(
-        mapper: &PrimaryKeyProjectionMapper,
+    pub(crate) fn new_with_projection(
+        expect_meta: &RegionMetadataRef,
+        read_column_ids: &[ColumnId],
+        batch_fields: &[(ColumnId, ConcreteDataType)],
         reader_meta: RegionMetadataRef,
     ) -> Result<Self> {
-        let rewrite_pk = may_rewrite_primary_key(mapper.metadata(), &reader_meta);
-        let compat_pk = may_compat_primary_key(mapper.metadata(), &reader_meta)?;
-        let compat_fields = may_compat_fields(mapper, &reader_meta)?;
+        let rewrite_pk = may_rewrite_primary_key(expect_meta, &reader_meta);
+        let compat_pk = may_compat_primary_key(expect_meta, &reader_meta)?;
+        let compat_fields =
+            may_compat_fields(expect_meta, read_column_ids, batch_fields, &reader_meta)?;
 
         Ok(Self {
             rewrite_pk,
@@ -175,18 +186,19 @@ pub(crate) struct FlatCompatBatch {
 impl FlatCompatBatch {
     /// Creates a [FlatCompatBatch].
     ///
-    /// - `mapper` is built from the metadata users expect to see.
+    /// - `expect_meta` is the metadata users expect to see.
+    /// - `expect_schema` is the expected projected schema in flat format.
     /// - `actual` is the [RegionMetadata] of the input parquet.
     /// - `format_projection` is the projection of the read format for the input parquet.
     /// - `compaction` indicates whether the reader is for compaction.
     pub(crate) fn try_new(
-        mapper: &FlatProjectionMapper,
+        expect_meta: &RegionMetadataRef,
+        expect_schema: &[(ColumnId, ConcreteDataType)],
         actual: &RegionMetadataRef,
         format_projection: &FormatProjection,
         compaction: bool,
     ) -> Result<Option<Self>> {
         let actual_schema = flat_projected_columns(actual, format_projection);
-        let expect_schema = mapper.batch_schema();
         if expect_schema == actual_schema {
             // Although the SST has a different schema, but the schema after projection is the same
             // as expected schema.
@@ -195,13 +207,13 @@ impl FlatCompatBatch {
 
         if actual.primary_key_encoding == PrimaryKeyEncoding::Sparse && compaction {
             // Special handling for sparse encoding in compaction.
-            return FlatCompatBatch::try_new_compact_sparse(mapper, actual);
+            return FlatCompatBatch::try_new_compact_sparse(expect_meta, actual);
         }
 
         let (index_or_defaults, fields) =
-            Self::compute_index_and_fields(&actual_schema, expect_schema, mapper.metadata())?;
+            Self::compute_index_and_fields(&actual_schema, expect_schema, expect_meta)?;
 
-        let compat_pk = FlatCompatPrimaryKey::new(mapper.metadata(), actual)?;
+        let compat_pk = FlatCompatPrimaryKey::new(expect_meta, actual)?;
 
         Ok(Some(Self {
             index_or_defaults,
@@ -280,13 +292,13 @@ impl FlatCompatBatch {
     }
 
     fn try_new_compact_sparse(
-        mapper: &FlatProjectionMapper,
+        expect_meta: &RegionMetadataRef,
         actual: &RegionMetadataRef,
     ) -> Result<Option<Self>> {
         // Currently, we don't support converting sparse encoding back to dense encoding in
         // flat format.
         ensure!(
-            mapper.metadata().primary_key_encoding == PrimaryKeyEncoding::Sparse,
+            expect_meta.primary_key_encoding == PrimaryKeyEncoding::Sparse,
             UnsupportedOperationSnafu {
                 err_msg: "Flat format doesn't support converting sparse encoding back to dense encoding"
             }
@@ -299,15 +311,14 @@ impl FlatCompatBatch {
             .chain([actual.time_index_column()])
             .map(|col| (col.column_id, col.column_schema.data_type.clone()))
             .collect();
-        let expect_schema: Vec<_> = mapper
-            .metadata()
+        let expect_schema: Vec<_> = expect_meta
             .field_columns()
-            .chain([mapper.metadata().time_index_column()])
+            .chain([expect_meta.time_index_column()])
             .map(|col| (col.column_id, col.column_schema.data_type.clone()))
             .collect();
 
         let (index_or_defaults, fields) =
-            Self::compute_index_and_fields(&actual_schema, &expect_schema, mapper.metadata())?;
+            Self::compute_index_and_fields(&actual_schema, &expect_schema, expect_meta)?;
 
         let compat_pk = FlatCompatPrimaryKey::default();
 
@@ -577,11 +588,12 @@ fn may_compat_primary_key(
 
 /// Creates a [CompatFields] if needed.
 fn may_compat_fields(
-    mapper: &PrimaryKeyProjectionMapper,
+    expect_meta: &RegionMetadataRef,
+    read_column_ids: &[ColumnId],
+    expect_fields: &[(ColumnId, ConcreteDataType)],
     actual: &RegionMetadata,
 ) -> Result<Option<CompatFields>> {
-    let expect_fields = mapper.batch_fields();
-    let actual_fields = Batch::projected_fields(actual, mapper.column_ids());
+    let actual_fields = Batch::projected_fields(actual, read_column_ids);
     if expect_fields == actual_fields {
         return Ok(None);
     }
@@ -607,18 +619,18 @@ fn may_compat_fields(
                     cast_type,
                 })
             } else {
-                // Safety: mapper must have this column.
-                let column = mapper.metadata().column_by_id(*column_id).unwrap();
+                // Safety: expect_fields must come from expect_meta.
+                let column = expect_meta.column_by_id(*column_id).unwrap();
                 // Create a default vector with 1 element for that column.
                 let default_vector = column
                     .column_schema
                     .create_default_vector(1)
                     .context(CreateDefaultSnafu {
-                        region_id: mapper.metadata().region_id,
+                        region_id: expect_meta.region_id,
                         column: &column.column_schema.name,
                     })?
                     .with_context(|| CompatReaderSnafu {
-                        region_id: mapper.metadata().region_id,
+                        region_id: expect_meta.region_id,
                         reason: format!(
                             "column {} does not have a default value to read",
                             column.column_schema.name
@@ -965,10 +977,31 @@ mod tests {
     use store_api::storage::RegionId;
 
     use super::*;
-    use crate::read::flat_projection::FlatProjectionMapper;
-    use crate::sst::parquet::flat_format::FlatReadFormat;
+    use crate::sst::parquet::flat_format::{FlatReadFormat, sst_column_id_indices};
+    use crate::sst::parquet::format::FormatProjection;
     use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
     use crate::test_util::{VecBatchReader, check_reader_result};
+
+    fn pk_projection(
+        expect_meta: &RegionMetadataRef,
+        read_column_ids: Vec<ColumnId>,
+    ) -> (Vec<ColumnId>, Vec<(ColumnId, ConcreteDataType)>) {
+        let batch_fields = Batch::projected_fields(expect_meta, &read_column_ids);
+        (read_column_ids, batch_fields)
+    }
+
+    fn flat_batch_schema_for_read_columns(
+        metadata: &RegionMetadataRef,
+        read_column_ids: &[ColumnId],
+    ) -> Vec<(ColumnId, ConcreteDataType)> {
+        let id_to_index = sst_column_id_indices(metadata);
+        let format_projection = FormatProjection::compute_format_projection(
+            &id_to_index,
+            metadata.column_metadatas.len() + 3,
+            read_column_ids.iter().copied(),
+        );
+        flat_projected_columns(metadata, &format_projection)
+    }
 
     /// Creates a new [RegionMetadata].
     fn new_metadata(
@@ -1185,8 +1218,12 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = PrimaryKeyProjectionMapper::all(&reader_meta).unwrap();
-        assert!(may_compat_fields(&mapper, &reader_meta).unwrap().is_none())
+        let (read_column_ids, batch_fields) = pk_projection(&reader_meta, vec![0, 1, 2]);
+        assert!(
+            may_compat_fields(&reader_meta, &read_column_ids, &batch_fields, &reader_meta)
+                .unwrap()
+                .is_none()
+        )
     }
 
     #[tokio::test]
@@ -1217,7 +1254,7 @@ mod tests {
             ],
             &[1, 3],
         ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![0, 1, 2, 3, 4]);
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1225,7 +1262,9 @@ mod tests {
             new_batch(&k2, &[(2, false)], 1000, 3),
         ]);
 
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, reader_meta, source_reader)
+                .unwrap();
         let k1 = encode_key(&[Some("a"), None]);
         let k2 = encode_key(&[Some("b"), None]);
         check_reader_result(
@@ -1266,7 +1305,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![0, 1, 3, 2, 4]);
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1274,7 +1313,9 @@ mod tests {
             new_batch(&k2, &[(2, false)], 1000, 3),
         ]);
 
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, reader_meta, source_reader)
+                .unwrap();
         check_reader_result(
             &mut compat_reader,
             &[
@@ -1311,7 +1352,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![0, 1, 2]);
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1328,7 +1369,9 @@ mod tests {
 
             batch.with_fields(new_fields).unwrap()
         };
-        let mut compat_reader = CompatReader::new(&mapper, actual_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, actual_meta, source_reader)
+                .unwrap();
         check_reader_result(
             &mut compat_reader,
             &[
@@ -1368,12 +1411,19 @@ mod tests {
             &[1],
         ));
         // tag_1, field_2, field_3
-        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter()).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![1, 3, 2]);
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
 
         let mut compat_reader =
-            CompatReader::new(&mapper, reader_meta.clone(), source_reader).unwrap();
+            CompatReader::new(
+                &expect_meta,
+                &read_column_ids,
+                &batch_fields,
+                reader_meta.clone(),
+                source_reader,
+            )
+            .unwrap();
         check_reader_result(
             &mut compat_reader,
             &[new_batch(&k1, &[(3, true), (2, false)], 1000, 3)],
@@ -1381,11 +1431,13 @@ mod tests {
         .await;
 
         // tag_1, field_4, field_3
-        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter()).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![1, 4, 2]);
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[], 1000, 3)]);
 
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, reader_meta, source_reader)
+                .unwrap();
         check_reader_result(
             &mut compat_reader,
             &[new_batch(&k1, &[(3, true), (4, true)], 1000, 3)],
@@ -1422,16 +1474,13 @@ mod tests {
             &[1],
         ));
         // Output: tag_1, field_3, field_2. Read also includes field_4.
-        let mapper = PrimaryKeyProjectionMapper::new_with_read_columns(
-            &expect_meta,
-            vec![1, 3, 2],
-            vec![1, 3, 2, 4],
-        )
-        .unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![1, 3, 2, 4]);
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
 
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, reader_meta, source_reader)
+                .unwrap();
         check_reader_result(
             &mut compat_reader,
             &[new_batch(&k1, &[(3, true), (2, false), (4, true)], 1000, 3)],
@@ -1472,7 +1521,7 @@ mod tests {
         expect_meta.primary_key_encoding = PrimaryKeyEncoding::Sparse;
         let expect_meta = Arc::new(expect_meta);
 
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
+        let (read_column_ids, batch_fields) = pk_projection(&expect_meta, vec![0, 1, 2, 3, 4]);
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1480,7 +1529,9 @@ mod tests {
             new_batch(&k2, &[(2, false)], 1000, 3),
         ]);
 
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
+        let mut compat_reader =
+            CompatReader::new(&expect_meta, &read_column_ids, &batch_fields, reader_meta, source_reader)
+                .unwrap();
         let k1 = encode_sparse_key(&[(1, Some("a")), (3, None)]);
         let k2 = encode_sparse_key(&[(1, Some("b")), (3, None)]);
         check_reader_result(
@@ -1532,7 +1583,8 @@ mod tests {
             &[1],
         ));
 
-        let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
+        let expect_schema =
+            flat_batch_schema_for_read_columns(&expected_metadata, &[0, 1, 2, 3]);
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
             [0, 1, 2, 3].into_iter(),
@@ -1543,10 +1595,15 @@ mod tests {
         .unwrap();
         let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(
+            &expected_metadata,
+            &expect_schema,
+            &actual_metadata,
+            format_projection,
+            false,
+        )
+        .unwrap()
+        .unwrap();
 
         let mut tag_builder = StringDictionaryBuilder::<UInt32Type>::new();
         tag_builder.append_value("tag1");
@@ -1622,12 +1679,7 @@ mod tests {
         ));
 
         // Output projection: tag_1, field_2. Read also includes field_3.
-        let mapper = FlatProjectionMapper::new_with_read_columns(
-            &expected_metadata,
-            vec![1, 2],
-            vec![1, 2, 3],
-        )
-        .unwrap();
+        let expect_schema = flat_batch_schema_for_read_columns(&expected_metadata, &[1, 2, 3]);
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
             [1, 2, 3].into_iter(),
@@ -1638,10 +1690,15 @@ mod tests {
         .unwrap();
         let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(
+            &expected_metadata,
+            &expect_schema,
+            &actual_metadata,
+            format_projection,
+            false,
+        )
+        .unwrap()
+        .unwrap();
 
         let mut tag_builder = StringDictionaryBuilder::<UInt32Type>::new();
         tag_builder.append_value("tag1");
@@ -1718,7 +1775,8 @@ mod tests {
         expected_metadata.primary_key_encoding = PrimaryKeyEncoding::Sparse;
         let expected_metadata = Arc::new(expected_metadata);
 
-        let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
+        let expect_schema =
+            flat_batch_schema_for_read_columns(&expected_metadata, &[0, 1, 2, 3]);
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
             [0, 1, 2, 3].into_iter(),
@@ -1729,10 +1787,15 @@ mod tests {
         .unwrap();
         let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(
+            &expected_metadata,
+            &expect_schema,
+            &actual_metadata,
+            format_projection,
+            false,
+        )
+        .unwrap()
+        .unwrap();
 
         // Tag array.
         let mut tag1_builder = StringDictionaryBuilder::<UInt32Type>::new();
@@ -1812,7 +1875,7 @@ mod tests {
         expected_metadata.primary_key_encoding = PrimaryKeyEncoding::Sparse;
         let expected_metadata = Arc::new(expected_metadata);
 
-        let mapper = FlatProjectionMapper::all(&expected_metadata).unwrap();
+        let expect_schema = flat_batch_schema_for_read_columns(&expected_metadata, &[0, 2, 3]);
         let read_format = FlatReadFormat::new(
             actual_metadata.clone(),
             [0, 2, 3].into_iter(),
@@ -1823,10 +1886,15 @@ mod tests {
         .unwrap();
         let format_projection = read_format.format_projection();
 
-        let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, true)
-                .unwrap()
-                .unwrap();
+        let compat_batch = FlatCompatBatch::try_new(
+            &expected_metadata,
+            &expect_schema,
+            &actual_metadata,
+            format_projection,
+            true,
+        )
+        .unwrap()
+        .unwrap();
 
         let sparse_k1 = encode_sparse_key(&[]);
         let input_columns: Vec<ArrayRef> = vec![

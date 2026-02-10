@@ -14,13 +14,22 @@
 
 //! Unified projection and schema computation for scan and compaction.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use api::v1::SemanticType;
+use common_error::ext::BoxedError;
 use common_recordbatch::RecordBatch;
+use common_recordbatch::error::ExternalSnafu;
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
-use snafu::OptionExt;
+use datatypes::prelude::{ConcreteDataType, DataType};
+use datatypes::schema::{Schema, SchemaRef};
+use datatypes::value::Value;
+use datatypes::vectors::VectorRef;
+use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec, build_primary_key_codec};
+use snafu::{OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
@@ -30,66 +39,65 @@ use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, Result, UnexpectedSnafu};
 use crate::read::Batch;
 use crate::read::compat::{self, FlatCompatBatch, PrimaryKeyCompatBatch};
-use crate::read::flat_projection::{CompactionProjectionMapper, FlatProjectionMapper};
-use crate::read::projection::PrimaryKeyProjectionMapper;
+use crate::read::flat_projection::{
+    CompactionProjectionMapper, compute_input_arrow_schema, flat_projected_columns,
+    project_flat_vectors,
+};
 use crate::read::scan_region::PredicateGroup;
-use crate::sst::parquet::format::{ReadFormat, StatValues};
+use crate::sst::parquet::flat_format::sst_column_id_indices;
+use crate::sst::parquet::format::{FormatProjection, ReadFormat, StatValues};
+use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
+
+/// Only cache vector when its length `<=` this value.
+const MAX_VECTOR_LENGTH_TO_CACHE: usize = 16384;
 
 /// Projection + schema computation plan built from request + expected metadata.
 pub(crate) struct ProjectionSchemaPlan {
     expected_meta: RegionMetadataRef,
     flat_format: bool,
     projection: Option<Vec<usize>>,
-    mapper: Arc<PlanProjectionMapper>,
+    read_column_ids: Vec<ColumnId>,
+    output_schema: SchemaRef,
+    is_empty_projection: bool,
+    exec: ProjectionExec,
 }
 
-enum PlanProjectionMapper {
-    PrimaryKey(PrimaryKeyProjectionMapper),
-    Flat(FlatProjectionMapper),
+enum ProjectionExec {
+    PrimaryKey(PrimaryKeyProjectionExec),
+    Flat(FlatProjectionExec),
 }
 
-impl PlanProjectionMapper {
-    fn column_ids(&self) -> &[ColumnId] {
-        match self {
-            PlanProjectionMapper::PrimaryKey(mapper) => mapper.column_ids(),
-            PlanProjectionMapper::Flat(mapper) => mapper.column_ids(),
-        }
-    }
+struct PrimaryKeyProjectionExec {
+    /// Maps column in [RecordBatch] to index in [Batch].
+    batch_indices: Vec<BatchIndex>,
+    /// Output record batch contains tags.
+    has_tags: bool,
+    /// Decoder for primary key.
+    codec: Arc<dyn PrimaryKeyCodec>,
+    /// Ids and DataTypes of field columns in the read [Batch].
+    batch_fields: Vec<(ColumnId, ConcreteDataType)>,
+}
 
-    fn output_schema(&self) -> datatypes::schema::SchemaRef {
-        match self {
-            PlanProjectionMapper::PrimaryKey(mapper) => mapper.output_schema(),
-            PlanProjectionMapper::Flat(mapper) => mapper.output_schema(),
-        }
-    }
+struct FlatProjectionExec {
+    /// Ids and DataTypes of columns of the expected batch.
+    ///
+    /// It doesn't contain internal columns but always contains the time index column.
+    batch_schema: Vec<(ColumnId, ConcreteDataType)>,
+    /// The index in flat format [RecordBatch] for each column in the output [RecordBatch].
+    batch_indices: Vec<usize>,
+    /// Precomputed Arrow schema for input batches.
+    input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
+}
 
-    fn has_tags(&self) -> bool {
-        match self {
-            PlanProjectionMapper::PrimaryKey(mapper) => mapper.has_tags(),
-            PlanProjectionMapper::Flat(_) => false,
-        }
-    }
-
-    fn empty_record_batch(&self) -> RecordBatch {
-        match self {
-            PlanProjectionMapper::PrimaryKey(mapper) => mapper.empty_record_batch(),
-            PlanProjectionMapper::Flat(mapper) => mapper.empty_record_batch(),
-        }
-    }
-
-    fn as_primary_key(&self) -> Option<&PrimaryKeyProjectionMapper> {
-        match self {
-            PlanProjectionMapper::PrimaryKey(mapper) => Some(mapper),
-            PlanProjectionMapper::Flat(_) => None,
-        }
-    }
-
-    fn as_flat(&self) -> Option<&FlatProjectionMapper> {
-        match self {
-            PlanProjectionMapper::PrimaryKey(_) => None,
-            PlanProjectionMapper::Flat(mapper) => Some(mapper),
-        }
-    }
+/// Index of a vector in a [Batch].
+#[derive(Debug, Clone, Copy)]
+enum BatchIndex {
+    /// Index in primary keys.
+    Tag((usize, ColumnId)),
+    /// The time index column.
+    Timestamp,
+    /// Index in fields.
+    Field(usize),
 }
 
 pub(crate) enum FileCompatBatch {
@@ -114,57 +122,70 @@ impl ProjectionSchemaPlan {
                 .map(|col| col.column_id)
                 .collect(),
         };
+        let projection_indices = projection
+            .clone()
+            .unwrap_or_else(|| (0..expected_meta.column_metadatas.len()).collect());
 
-        let mapper = match &projection {
-            Some(p) => {
-                if flat_format {
-                    PlanProjectionMapper::Flat(FlatProjectionMapper::new_with_read_columns(
-                        &expected_meta,
-                        p.clone(),
-                        read_column_ids.clone(),
-                    )?)
-                } else {
-                    PlanProjectionMapper::PrimaryKey(
-                        PrimaryKeyProjectionMapper::new_with_read_columns(
-                            &expected_meta,
-                            p.clone(),
-                            read_column_ids.clone(),
-                        )?,
-                    )
-                }
-            }
-            None => {
-                if flat_format {
-                    PlanProjectionMapper::Flat(FlatProjectionMapper::all(&expected_meta)?)
-                } else {
-                    PlanProjectionMapper::PrimaryKey(PrimaryKeyProjectionMapper::all(
-                        &expected_meta,
-                    )?)
-                }
-            }
+        Self::new_impl(
+            expected_meta,
+            flat_format,
+            projection,
+            projection_indices,
+            read_column_ids,
+        )
+    }
+
+    /// Builds a plan that reads all columns.
+    pub(crate) fn new_all(expected_meta: RegionMetadataRef, flat_format: bool) -> Result<Self> {
+        let projection_indices = (0..expected_meta.column_metadatas.len()).collect::<Vec<_>>();
+        let read_column_ids = expected_meta
+            .column_metadatas
+            .iter()
+            .map(|col| col.column_id)
+            .collect();
+        Self::new_impl(
+            expected_meta,
+            flat_format,
+            None,
+            projection_indices,
+            read_column_ids,
+        )
+    }
+
+    fn new_impl(
+        expected_meta: RegionMetadataRef,
+        flat_format: bool,
+        projection: Option<Vec<usize>>,
+        projection_indices: Vec<usize>,
+        read_column_ids: Vec<ColumnId>,
+    ) -> Result<Self> {
+        let is_empty_projection = projection_indices.is_empty();
+        let output_schema = build_output_schema(&expected_meta, &projection_indices)?;
+
+        let exec = if flat_format {
+            ProjectionExec::Flat(build_flat_exec(
+                &expected_meta,
+                &projection_indices,
+                &read_column_ids,
+                is_empty_projection,
+            )?)
+        } else {
+            ProjectionExec::PrimaryKey(build_primary_key_exec(
+                &expected_meta,
+                &projection_indices,
+                &read_column_ids,
+                is_empty_projection,
+            )?)
         };
 
         Ok(Self {
             expected_meta,
             flat_format,
             projection,
-            mapper: Arc::new(mapper),
-        })
-    }
-
-    /// Builds a plan that reads all columns.
-    pub(crate) fn new_all(expected_meta: RegionMetadataRef, flat_format: bool) -> Result<Self> {
-        let mapper = if flat_format {
-            PlanProjectionMapper::Flat(FlatProjectionMapper::all(&expected_meta)?)
-        } else {
-            PlanProjectionMapper::PrimaryKey(PrimaryKeyProjectionMapper::all(&expected_meta)?)
-        };
-
-        Ok(Self {
-            expected_meta,
-            flat_format,
-            projection: None,
-            mapper: Arc::new(mapper),
+            read_column_ids,
+            output_schema,
+            is_empty_projection,
+            exec,
         })
     }
 
@@ -180,21 +201,23 @@ impl ProjectionSchemaPlan {
 
     /// Returns ids of columns to read from memtables and SSTs.
     pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
-        self.mapper.column_ids()
+        &self.read_column_ids
     }
 
-    /// Returns the mapper built from expected metadata.
     /// Returns the output schema for the final projected batch.
-    pub(crate) fn output_schema(&self) -> datatypes::schema::SchemaRef {
-        self.mapper.output_schema()
+    pub(crate) fn output_schema(&self) -> SchemaRef {
+        self.output_schema.clone()
     }
 
     pub(crate) fn has_tags(&self) -> bool {
-        self.mapper.has_tags()
+        match &self.exec {
+            ProjectionExec::PrimaryKey(exec) => exec.has_tags,
+            ProjectionExec::Flat(_) => false,
+        }
     }
 
     pub(crate) fn empty_record_batch(&self) -> RecordBatch {
-        self.mapper.empty_record_batch()
+        RecordBatch::new_empty(self.output_schema.clone())
     }
 
     pub(crate) fn convert_primary_key_batch(
@@ -202,39 +225,137 @@ impl ProjectionSchemaPlan {
         batch: &Batch,
         cache_strategy: &CacheStrategy,
     ) -> common_recordbatch::error::Result<RecordBatch> {
-        let mapper = self
-            .mapper
-            .as_primary_key()
-            .expect("Primary key mapper required");
-        mapper.convert(batch, cache_strategy)
+        let exec = match &self.exec {
+            ProjectionExec::PrimaryKey(exec) => exec,
+            ProjectionExec::Flat(_) => panic!("Primary key mapper required"),
+        };
+
+        if self.is_empty_projection {
+            return RecordBatch::new_with_count(self.output_schema.clone(), batch.num_rows());
+        }
+
+        debug_assert_eq!(exec.batch_fields.len(), batch.fields().len());
+        debug_assert!(
+            exec.batch_fields
+                .iter()
+                .zip(batch.fields())
+                .all(|((id, _), batch_col)| *id == batch_col.column_id)
+        );
+
+        // Skips decoding pk if we don't need to output it.
+        let pk_values = if exec.has_tags {
+            match batch.pk_values() {
+                Some(v) => v.clone(),
+                None => exec
+                    .codec
+                    .decode(batch.primary_key())
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?,
+            }
+        } else {
+            CompositeValues::Dense(vec![])
+        };
+
+        let mut columns = Vec::with_capacity(self.output_schema.num_columns());
+        let num_rows = batch.num_rows();
+        for (index, column_schema) in exec
+            .batch_indices
+            .iter()
+            .zip(self.output_schema.column_schemas())
+        {
+            match index {
+                BatchIndex::Tag((idx, column_id)) => {
+                    let value = match &pk_values {
+                        CompositeValues::Dense(v) => &v[*idx].1,
+                        CompositeValues::Sparse(v) => v.get_or_null(*column_id),
+                    };
+                    let vector = repeated_vector_with_cache(
+                        &column_schema.data_type,
+                        value,
+                        num_rows,
+                        cache_strategy,
+                    )?;
+                    columns.push(vector);
+                }
+                BatchIndex::Timestamp => {
+                    columns.push(batch.timestamps().clone());
+                }
+                BatchIndex::Field(idx) => {
+                    columns.push(batch.fields()[*idx].data.clone());
+                }
+            }
+        }
+
+        RecordBatch::new(self.output_schema.clone(), columns)
     }
 
     pub(crate) fn convert_flat_batch(
         &self,
         batch: &datatypes::arrow::record_batch::RecordBatch,
     ) -> common_recordbatch::error::Result<RecordBatch> {
-        let mapper = self.mapper.as_flat().expect("Flat mapper required");
-        mapper.convert(batch)
+        let exec = match &self.exec {
+            ProjectionExec::PrimaryKey(_) => panic!("Flat mapper required"),
+            ProjectionExec::Flat(exec) => exec,
+        };
+
+        if self.is_empty_projection {
+            return RecordBatch::new_with_count(self.output_schema.clone(), batch.num_rows());
+        }
+
+        let columns = project_flat_vectors(batch, &exec.batch_indices, self.output_schema.num_columns())?;
+        RecordBatch::new(self.output_schema.clone(), columns)
     }
 
     pub(crate) fn flat_input_arrow_schema(
         &self,
         compaction: bool,
     ) -> datatypes::arrow::datatypes::SchemaRef {
-        let mapper = self.mapper.as_flat().expect("Flat mapper required");
-        mapper.input_arrow_schema(compaction)
+        let exec = match &self.exec {
+            ProjectionExec::PrimaryKey(_) => panic!("Flat mapper required"),
+            ProjectionExec::Flat(exec) => exec,
+        };
+
+        if !compaction {
+            exec.input_arrow_schema.clone()
+        } else {
+            // For compaction, we need to build a different schema from encoding.
+            to_flat_sst_arrow_schema(
+                &self.expected_meta,
+                &FlatSchemaOptions::from_encoding(self.expected_meta.primary_key_encoding),
+            )
+        }
     }
 
     pub(crate) fn flat_field_column_start(&self) -> usize {
-        let mapper = self.mapper.as_flat().expect("Flat mapper required");
-        mapper.field_column_start()
+        let exec = match &self.exec {
+            ProjectionExec::PrimaryKey(_) => panic!("Flat mapper required"),
+            ProjectionExec::Flat(exec) => exec,
+        };
+
+        for (idx, column_id) in exec
+            .batch_schema
+            .iter()
+            .map(|(column_id, _)| column_id)
+            .enumerate()
+        {
+            // Safety: We get the column id from the metadata in new().
+            if self.expected_meta.column_by_id(*column_id).unwrap().semantic_type == SemanticType::Field {
+                return idx;
+            }
+        }
+
+        exec.batch_schema.len()
     }
 
     pub(crate) fn ensure_primary_key_format(&self) -> Result<()> {
-        self.mapper.as_primary_key().context(UnexpectedSnafu {
-            reason: "Unexpected format",
-        })?;
-        Ok(())
+        if matches!(self.exec, ProjectionExec::PrimaryKey(_)) {
+            Ok(())
+        } else {
+            UnexpectedSnafu {
+                reason: "Unexpected format",
+            }
+            .fail()
+        }
     }
 
     /// Builds a read format for a specific file metadata.
@@ -247,7 +368,7 @@ impl ProjectionSchemaPlan {
     ) -> Result<ReadFormat> {
         ReadFormat::new(
             file_meta,
-            Some(self.mapper.column_ids()),
+            Some(&self.read_column_ids),
             self.flat_format,
             parquet_column_num,
             file_path,
@@ -270,21 +391,27 @@ impl ProjectionSchemaPlan {
         }
 
         let compat = if let Some(flat_format) = read_format.as_flat() {
-            let mapper = self.mapper.as_flat().expect("flat format mapper missing");
+            let flat_exec = match &self.exec {
+                ProjectionExec::PrimaryKey(_) => panic!("flat format mapper missing"),
+                ProjectionExec::Flat(exec) => exec,
+            };
             FlatCompatBatch::try_new(
-                mapper,
+                &self.expected_meta,
+                &flat_exec.batch_schema,
                 flat_format.metadata(),
                 flat_format.format_projection(),
                 compaction,
             )?
             .map(FileCompatBatch::Flat)
         } else {
-            let mapper = self
-                .mapper
-                .as_primary_key()
-                .expect("primary key mapper missing");
-            let compact_batch = PrimaryKeyCompatBatch::new_with_primary_key_mapper(
-                mapper,
+            let pk_exec = match &self.exec {
+                ProjectionExec::PrimaryKey(exec) => exec,
+                ProjectionExec::Flat(_) => panic!("primary key mapper missing"),
+            };
+            let compact_batch = PrimaryKeyCompatBatch::new_with_projection(
+                &self.expected_meta,
+                &self.read_column_ids,
+                &pk_exec.batch_fields,
                 read_format.metadata().clone(),
             )?;
             Some(FileCompatBatch::PrimaryKey(compact_batch))
@@ -348,6 +475,143 @@ impl ProjectionSchemaPlan {
             compaction_projection,
         })
     }
+}
+
+fn build_output_schema(metadata: &RegionMetadataRef, projection: &[usize]) -> Result<SchemaRef> {
+    if projection.is_empty() {
+        return Ok(Arc::new(Schema::new(vec![])));
+    }
+
+    let mut column_schemas = Vec::with_capacity(projection.len());
+    for idx in projection {
+        column_schemas.push(
+            metadata
+                .schema
+                .column_schemas()
+                .get(*idx)
+                .with_context(|| InvalidRequestSnafu {
+                    region_id: metadata.region_id,
+                    reason: format!("projection index {} is out of bound", idx),
+                })?
+                .clone(),
+        );
+    }
+
+    Ok(Arc::new(Schema::new(column_schemas)))
+}
+
+fn build_primary_key_exec(
+    metadata: &RegionMetadataRef,
+    projection: &[usize],
+    read_column_ids: &[ColumnId],
+    is_empty_projection: bool,
+) -> Result<PrimaryKeyProjectionExec> {
+    let codec = build_primary_key_codec(metadata);
+    let batch_fields = Batch::projected_fields(metadata, read_column_ids);
+
+    let field_id_to_index: HashMap<_, _> = batch_fields
+        .iter()
+        .enumerate()
+        .map(|(index, (column_id, _))| (*column_id, index))
+        .collect();
+
+    let mut batch_indices = Vec::with_capacity(projection.len());
+    let mut has_tags = false;
+    if !is_empty_projection {
+        for idx in projection {
+            let column = &metadata.column_metadatas[*idx];
+            let batch_index = match column.semantic_type {
+                SemanticType::Tag => {
+                    let index = metadata.primary_key_index(column.column_id).unwrap();
+                    has_tags = true;
+                    BatchIndex::Tag((index, column.column_id))
+                }
+                SemanticType::Timestamp => BatchIndex::Timestamp,
+                SemanticType::Field => {
+                    let index = *field_id_to_index.get(&column.column_id).context(
+                        InvalidRequestSnafu {
+                            region_id: metadata.region_id,
+                            reason: format!(
+                                "field column {} is missing in read projection",
+                                column.column_schema.name
+                            ),
+                        },
+                    )?;
+                    BatchIndex::Field(index)
+                }
+            };
+            batch_indices.push(batch_index);
+        }
+    }
+
+    Ok(PrimaryKeyProjectionExec {
+        batch_indices,
+        has_tags,
+        codec,
+        batch_fields,
+    })
+}
+
+fn build_flat_exec(
+    metadata: &RegionMetadataRef,
+    projection: &[usize],
+    read_column_ids: &[ColumnId],
+    is_empty_projection: bool,
+) -> Result<FlatProjectionExec> {
+    let mut output_column_ids = Vec::with_capacity(projection.len());
+    for idx in projection {
+        let column = metadata
+            .column_metadatas
+            .get(*idx)
+            .with_context(|| InvalidRequestSnafu {
+                region_id: metadata.region_id,
+                reason: format!("projection index {} is out of bound", idx),
+            })?;
+        output_column_ids.push(column.column_id);
+    }
+
+    let id_to_index = sst_column_id_indices(metadata);
+    let format_projection = FormatProjection::compute_format_projection(
+        &id_to_index,
+        metadata.column_metadatas.len() + 3,
+        read_column_ids.iter().copied(),
+    );
+
+    let batch_schema = flat_projected_columns(metadata, &format_projection);
+    let input_arrow_schema = compute_input_arrow_schema(metadata, &batch_schema);
+
+    let batch_indices = if is_empty_projection {
+        vec![]
+    } else {
+        output_column_ids
+            .iter()
+            .map(|id| {
+                format_projection
+                    .column_id_to_projected_index
+                    .get(id)
+                    .copied()
+                    .with_context(|| {
+                        let name = metadata
+                            .column_by_id(*id)
+                            .map(|column| column.column_schema.name.clone())
+                            .unwrap_or_else(|| id.to_string());
+                        InvalidRequestSnafu {
+                            region_id: metadata.region_id,
+                            reason: format!(
+                                "output column {} is missing in read projection",
+                                name
+                            ),
+                        }
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    Ok(FlatProjectionExec {
+        batch_schema,
+        batch_indices,
+        input_arrow_schema,
+    })
 }
 
 /// Per-file projection/schema info.
@@ -595,6 +859,49 @@ fn compute_read_column_ids(
     }
 
     Ok(read_column_ids)
+}
+
+/// Gets a vector with repeated values from specific cache or creates a new one.
+fn repeated_vector_with_cache(
+    data_type: &ConcreteDataType,
+    value: &Value,
+    num_rows: usize,
+    cache_strategy: &CacheStrategy,
+) -> common_recordbatch::error::Result<VectorRef> {
+    if let Some(vector) = cache_strategy.get_repeated_vector(data_type, value) {
+        // Tries to get the vector from cache manager. If the vector doesn't
+        // have enough length, creates a new one.
+        match vector.len().cmp(&num_rows) {
+            Ordering::Less => (),
+            Ordering::Equal => return Ok(vector),
+            Ordering::Greater => return Ok(vector.slice(0, num_rows)),
+        }
+    }
+
+    // Creates a new one.
+    let vector = new_repeated_vector(data_type, value, num_rows)?;
+    // Updates cache.
+    if vector.len() <= MAX_VECTOR_LENGTH_TO_CACHE {
+        cache_strategy.put_repeated_vector(value.clone(), vector.clone());
+    }
+
+    Ok(vector)
+}
+
+/// Returns a vector with repeated values.
+fn new_repeated_vector(
+    data_type: &ConcreteDataType,
+    value: &Value,
+    num_rows: usize,
+) -> common_recordbatch::error::Result<VectorRef> {
+    let mut mutable_vector = data_type.create_mutable_vector(1);
+    mutable_vector
+        .try_push_value_ref(&value.as_value_ref())
+        .map_err(BoxedError::new)
+        .context(ExternalSnafu)?;
+    // This requires an additional allocation.
+    let base_vector = mutable_vector.to_vector();
+    Ok(base_vector.replicate(&[num_rows]))
 }
 
 #[cfg(test)]
