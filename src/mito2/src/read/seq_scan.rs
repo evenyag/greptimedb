@@ -22,7 +22,7 @@ use async_stream::try_stream;
 use common_error::ext::BoxedError;
 use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
-use common_telemetry::tracing;
+use common_telemetry::{tracing, warn};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
@@ -55,6 +55,10 @@ use crate::read::{
     Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source, scan_util,
 };
 use crate::region::options::MergeMode;
+use crate::sst::file::FileHandle;
+use crate::sst::parquet::flat_format::primary_key_column_index;
+use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::reader::MetadataCacheMetrics;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 /// Scans a region and returns rows in a sorted sequence.
@@ -80,11 +84,11 @@ impl SeqScan {
     /// Creates a new [SeqScan] with the given input.
     /// If `input.compaction` is true, the scanner will not attempt to split ranges.
     pub(crate) fn new(input: ScanInput) -> Self {
-        let has_key_ranges = !input.key_ranges.is_empty();
         let mut properties = ScannerProperties::default()
             .with_append_mode(input.append_mode)
             .with_total_rows(input.total_rows());
         let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
+        let has_key_ranges = stream_ctx.ranges.iter().any(|range| range.split_slot.is_some());
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
         // Create the shared pruner with number of workers equal to CPU cores.
@@ -376,7 +380,7 @@ impl SeqScan {
         metrics_set: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<SendableRecordBatchStream> {
-        let partition_ranges = self.properties.partitions.get(partition);
+        let _partition_ranges = self.properties.partitions.get(partition);
         // common_telemetry::info!(
         //     "SeqScan partition {}, region_id: {}, ranges: {:?}",
         //     partition,
@@ -470,7 +474,7 @@ impl SeqScan {
                 ).await?;
 
                 let range_meta = &stream_ctx.ranges[part_range.identifier];
-                let skip_parallel = range_meta.key_range_index.is_some();
+                let skip_parallel = range_meta.split_slot.is_some();
 
                 let mut reader =
                     Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics), skip_parallel)
@@ -590,7 +594,7 @@ impl SeqScan {
                 ).await?;
 
                 let range_meta = &stream_ctx.ranges[part_range.identifier];
-                let skip_parallel = range_meta.key_range_index.is_some();
+                let skip_parallel = range_meta.split_slot.is_some();
 
                 let mut reader =
                     Self::build_flat_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics), skip_parallel)
@@ -790,6 +794,124 @@ impl fmt::Debug for SeqScan {
     }
 }
 
+async fn partition_key_range(
+    stream_ctx: &Arc<StreamContext>,
+    range_meta: &RangeMeta,
+) -> crate::memtable::PrimaryKeyRange {
+    let Some(split_slot) = range_meta.split_slot else {
+        return crate::memtable::PrimaryKeyRange::unbounded();
+    };
+    let Some(file) = max_row_group_file(stream_ctx, range_meta) else {
+        return crate::memtable::PrimaryKeyRange::unbounded();
+    };
+    let Ok(split_total) = usize::try_from(file.meta_ref().num_row_groups) else {
+        return crate::memtable::PrimaryKeyRange::unbounded();
+    };
+    if split_total <= 1 || split_slot >= split_total {
+        return crate::memtable::PrimaryKeyRange::unbounded();
+    }
+
+    let metadata = match load_parquet_metadata(stream_ctx, file).await {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            warn!(
+                "Failed to load parquet metadata for key range, region_id: {}, file_id: {}, split_slot: {}, split_total: {}, error: {}",
+                stream_ctx.input.region_metadata().region_id,
+                file.file_id(),
+                split_slot,
+                split_total,
+                err
+            );
+            return crate::memtable::PrimaryKeyRange::unbounded();
+        }
+    };
+
+    key_range_from_metadata(&metadata, split_slot, split_total)
+        .unwrap_or_else(crate::memtable::PrimaryKeyRange::unbounded)
+}
+
+fn max_row_group_file<'a>(
+    stream_ctx: &'a Arc<StreamContext>,
+    range_meta: &RangeMeta,
+) -> Option<&'a FileHandle> {
+    let source_index = range_meta
+        .indices
+        .iter()
+        .filter(|source| source.index >= stream_ctx.input.num_memtables())
+        .max_by_key(|source| source.num_row_groups)?
+        .index;
+    Some(stream_ctx.input.file_from_index(crate::read::range::RowGroupIndex {
+        index: source_index,
+        row_group_index: -1,
+    }))
+}
+
+async fn load_parquet_metadata(
+    stream_ctx: &Arc<StreamContext>,
+    file: &FileHandle,
+) -> Result<Arc<parquet::file::metadata::ParquetMetaData>> {
+    let mut cache_metrics = MetadataCacheMetrics::default();
+    if let Some(metadata) = stream_ctx.input.cache_strategy.get_parquet_meta_data(
+        file.file_id(),
+        &mut cache_metrics,
+        Default::default(),
+    )
+    .await
+    {
+        return Ok(metadata);
+    }
+
+    let file_path = file.file_path(
+        stream_ctx.input.access_layer().table_dir(),
+        stream_ctx.input.access_layer().path_type(),
+    );
+    let mut loader = MetadataLoader::new(
+        stream_ctx.input.access_layer().object_store().clone(),
+        &file_path,
+        file.meta_ref().file_size,
+    );
+    loader.with_page_index_policy(Default::default());
+    let metadata = Arc::new(loader.load(&mut cache_metrics).await?);
+    stream_ctx
+        .input
+        .cache_strategy
+        .put_parquet_meta_data(file.file_id(), metadata.clone());
+    Ok(metadata)
+}
+
+fn key_range_from_metadata(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    split_slot: usize,
+    split_total: usize,
+) -> Option<crate::memtable::PrimaryKeyRange> {
+    let mut boundaries = Vec::with_capacity(split_total.saturating_sub(1));
+    for row_group_idx in 1..split_total {
+        let row_group = metadata.row_groups().get(row_group_idx)?;
+        let pk_column_index = primary_key_column_index(row_group.columns().len());
+        let column = row_group.columns().get(pk_column_index)?;
+        let stats = column.statistics()?;
+        boundaries.push(stats.min_bytes_opt().map(|v| v.to_vec()));
+    }
+
+    let start = if split_slot == 0 {
+        None
+    } else {
+        boundaries.get(split_slot - 1).cloned().flatten()
+    };
+    let end = if split_slot + 1 >= split_total {
+        None
+    } else {
+        boundaries.get(split_slot).cloned().flatten()
+    };
+    if let (Some(start), Some(end)) = (&start, &end)
+        && start >= end
+    {
+        return None;
+    }
+
+    Some(crate::memtable::PrimaryKeyRange::new(start, end))
+}
+
 /// Builds sources for the partition range and push them to the `sources` vector.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_sources(
@@ -804,7 +926,7 @@ pub(crate) async fn build_sources(
 ) -> Result<()> {
     // Gets range meta.
     let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let key_range = range_meta.get_key_range(&stream_ctx.input);
+    let key_range = partition_key_range(stream_ctx, range_meta).await;
     #[cfg(debug_assertions)]
     if compaction {
         // Compaction expects input sources are not been split.
@@ -916,7 +1038,7 @@ pub(crate) async fn build_flat_sources(
 ) -> Result<()> {
     // Gets range meta.
     let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let key_range = range_meta.get_key_range(&stream_ctx.input);
+    let key_range = partition_key_range(stream_ctx, range_meta).await;
     #[cfg(debug_assertions)]
     if compaction {
         // Compaction expects input sources are not been split.
