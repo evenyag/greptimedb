@@ -56,10 +56,10 @@ use crate::read::{
 };
 use crate::region::options::MergeMode;
 use crate::sst::file::FileHandle;
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::reader::MetadataCacheMetrics;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
 /// Scans a region and returns rows in a sorted sequence.
 ///
@@ -88,7 +88,10 @@ impl SeqScan {
             .with_append_mode(input.append_mode)
             .with_total_rows(input.total_rows());
         let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
-        let has_key_ranges = stream_ctx.ranges.iter().any(|range| range.split_slot.is_some());
+        let has_key_ranges = stream_ctx
+            .ranges
+            .iter()
+            .any(|range| range.split_slot.is_some());
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
         // Create the shared pruner with number of workers equal to CPU cores.
@@ -840,10 +843,14 @@ fn max_row_group_file<'a>(
         .filter(|source| source.index >= stream_ctx.input.num_memtables())
         .max_by_key(|source| source.num_row_groups)?
         .index;
-    Some(stream_ctx.input.file_from_index(crate::read::range::RowGroupIndex {
-        index: source_index,
-        row_group_index: -1,
-    }))
+    Some(
+        stream_ctx
+            .input
+            .file_from_index(crate::read::range::RowGroupIndex {
+                index: source_index,
+                row_group_index: -1,
+            }),
+    )
 }
 
 async fn load_parquet_metadata(
@@ -851,12 +858,11 @@ async fn load_parquet_metadata(
     file: &FileHandle,
 ) -> Result<Arc<parquet::file::metadata::ParquetMetaData>> {
     let mut cache_metrics = MetadataCacheMetrics::default();
-    if let Some(metadata) = stream_ctx.input.cache_strategy.get_parquet_meta_data(
-        file.file_id(),
-        &mut cache_metrics,
-        Default::default(),
-    )
-    .await
+    if let Some(metadata) = stream_ctx
+        .input
+        .cache_strategy
+        .get_parquet_meta_data(file.file_id(), &mut cache_metrics, Default::default())
+        .await
     {
         return Ok(metadata);
     }
