@@ -52,6 +52,7 @@ use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::read::filter_plan::FilterPlan;
 use crate::read::projection::ProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::seq_scan::SeqScan;
@@ -503,19 +504,33 @@ impl ScanRegion {
             flat_format,
         );
 
-        let (non_field_filters, field_filters) = self.partition_by_field_filters();
+        // Build unified FilterPlan
+        let mut filter_plan = FilterPlan::new(
+            &self.version.metadata,
+            &self.request.filters,
+            self.version.options.append_mode,
+            self.version.options.merge_mode(),
+        )?;
+
+        // Build index appliers using classified exprs from FilterPlan
+        let non_field_exprs = filter_plan.non_field_exprs().to_vec();
+        let field_exprs = filter_plan.field_exprs().to_vec();
         let inverted_index_appliers = [
-            self.build_invereted_index_applier(&non_field_filters),
-            self.build_invereted_index_applier(&field_filters),
+            self.build_invereted_index_applier(&non_field_exprs),
+            self.build_invereted_index_applier(&field_exprs),
         ];
         let bloom_filter_appliers = [
-            self.build_bloom_filter_applier(&non_field_filters),
-            self.build_bloom_filter_applier(&field_filters),
+            self.build_bloom_filter_applier(&non_field_exprs),
+            self.build_bloom_filter_applier(&field_exprs),
         ];
         let fulltext_index_appliers = [
-            self.build_fulltext_index_applier(&non_field_filters),
-            self.build_fulltext_index_applier(&field_filters),
+            self.build_fulltext_index_applier(&non_field_exprs),
+            self.build_fulltext_index_applier(&field_exprs),
         ];
+        filter_plan.set_inverted_index_appliers(inverted_index_appliers.clone());
+        filter_plan.set_bloom_filter_index_appliers(bloom_filter_appliers.clone());
+        filter_plan.set_fulltext_index_appliers(fulltext_index_appliers.clone());
+        let filter_plan = Arc::new(filter_plan);
         #[cfg(feature = "vector_index")]
         let vector_index_applier = self.build_vector_index_applier();
         #[cfg(feature = "vector_index")]
@@ -535,6 +550,7 @@ impl ScanRegion {
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
             .with_predicate(predicate)
+            .with_filter_plan(filter_plan)
             .with_memtables(mem_range_builders)
             .with_files(files)
             .with_cache(self.cache_strategy)
@@ -648,32 +664,6 @@ impl ScanRegion {
             }
         }
         Ok(read_column_ids)
-    }
-
-    /// Partitions filters into two groups: non-field filters and field filters.
-    /// Returns `(non_field_filters, field_filters)`.
-    fn partition_by_field_filters(&self) -> (Vec<Expr>, Vec<Expr>) {
-        let field_columns = self
-            .version
-            .metadata
-            .field_columns()
-            .map(|col| &col.column_schema.name)
-            .collect::<HashSet<_>>();
-
-        let mut columns = HashSet::new();
-
-        self.request.filters.iter().cloned().partition(|expr| {
-            columns.clear();
-            // `expr_to_columns` won't return error.
-            if expr_to_columns(expr, &mut columns).is_err() {
-                // If we can't extract columns, treat it as non-field filter
-                return true;
-            }
-            // Return true for non-field filters (partition puts true cases in first vec)
-            !columns
-                .iter()
-                .any(|column| field_columns.contains(&column.name))
-        })
     }
 
     /// Use the latest schema to build the inverted index applier.
@@ -818,6 +808,8 @@ pub struct ScanInput {
     pub(crate) predicate: PredicateGroup,
     /// Region partition expr applied at read time.
     region_partition_expr: Option<PartitionExpr>,
+    /// Unified filter plan for prefilter/postfilter decisions.
+    pub(crate) filter_plan: Arc<FilterPlan>,
     /// Memtable range builders for memtables in the time range..
     pub(crate) memtables: Vec<MemRangeBuilder>,
     /// Handles to SST files to scan.
@@ -871,6 +863,7 @@ impl ScanInput {
             time_range: None,
             predicate: PredicateGroup::default(),
             region_partition_expr: None,
+            filter_plan: Arc::new(FilterPlan::default()),
             memtables: Vec::new(),
             files: Vec::new(),
             cache_strategy: CacheStrategy::Disabled,
@@ -909,6 +902,13 @@ impl ScanInput {
     pub(crate) fn with_predicate(mut self, predicate: PredicateGroup) -> Self {
         self.region_partition_expr = predicate.region_partition_expr().cloned();
         self.predicate = predicate;
+        self
+    }
+
+    /// Sets the unified filter plan.
+    #[must_use]
+    pub(crate) fn with_filter_plan(mut self, filter_plan: Arc<FilterPlan>) -> Self {
+        self.filter_plan = filter_plan;
         self
     }
 
@@ -1112,15 +1112,17 @@ impl ScanInput {
 
     fn predicate_for_file(&self, file: &FileHandle) -> Option<Predicate> {
         if self.should_skip_region_partition(file) {
-            self.predicate.predicate_without_region().cloned()
+            self.filter_plan
+                .prefilter_predicate_without_region()
+                .cloned()
         } else {
-            self.predicate.predicate().cloned()
+            self.filter_plan.prefilter_predicate().cloned()
         }
     }
 
     fn should_skip_region_partition(&self, file: &FileHandle) -> bool {
         match (
-            self.region_partition_expr.as_ref(),
+            self.filter_plan.region_partition_expr(),
             file.meta_ref().partition_expr.as_ref(),
         ) {
             (Some(region_expr), Some(file_expr)) => region_expr == file_expr,
@@ -1150,9 +1152,9 @@ impl ScanInput {
             .predicate(predicate)
             .projection(Some(self.read_column_ids.clone()))
             .cache(self.cache_strategy.clone())
-            .inverted_index_appliers(self.inverted_index_appliers.clone())
-            .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
-            .fulltext_index_appliers(self.fulltext_index_appliers.clone());
+            .inverted_index_appliers(self.filter_plan.inverted_index_appliers().clone())
+            .bloom_filter_index_appliers(self.filter_plan.bloom_filter_index_appliers().clone())
+            .fulltext_index_appliers(self.filter_plan.fulltext_index_appliers().clone());
         #[cfg(feature = "vector_index")]
         let reader = {
             let mut reader = reader;
@@ -1341,8 +1343,15 @@ impl ScanInput {
         rows
     }
 
+    #[allow(dead_code)]
     pub(crate) fn predicate_group(&self) -> &PredicateGroup {
         &self.predicate
+    }
+
+    /// Returns the unified filter plan.
+    #[allow(dead_code)]
+    pub(crate) fn filter_plan(&self) -> &Arc<FilterPlan> {
+        &self.filter_plan
     }
 
     /// Returns number of memtables to scan.
@@ -1570,7 +1579,7 @@ impl StreamContext {
                         .collect();
                     write!(f, ", \"projection\": {:?}", names)?;
                 }
-                if let Some(predicate) = &self.input.predicate.predicate()
+                if let Some(predicate) = &self.input.filter_plan.prefilter_predicate()
                     && !predicate.exprs().is_empty()
                 {
                     let exprs: Vec<_> = predicate.exprs().iter().map(|e| e.to_string()).collect();
@@ -1601,6 +1610,7 @@ impl StreamContext {
 
 /// Predicates to evaluate.
 /// It only keeps filters that [SimpleFilterEvaluator] supports.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct PredicateGroup {
     time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
@@ -1612,6 +1622,7 @@ pub struct PredicateGroup {
     region_partition_expr: Option<PartitionExpr>,
 }
 
+#[allow(dead_code)]
 impl PredicateGroup {
     /// Creates a new `PredicateGroup` from exprs according to the metadata.
     pub fn new(metadata: &RegionMetadata, exprs: &[Expr]) -> Result<Self> {

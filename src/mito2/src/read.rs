@@ -16,12 +16,14 @@
 
 pub mod compat;
 pub mod dedup;
+pub(crate) mod filter_plan;
 pub mod flat_dedup;
 pub mod flat_merge;
 pub mod flat_projection;
 pub mod last_row;
 pub mod merge;
 pub mod plain_batch;
+pub(crate) mod postfilter;
 pub mod projection;
 pub(crate) mod prune;
 pub(crate) mod pruner;

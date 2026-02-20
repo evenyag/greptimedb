@@ -41,6 +41,7 @@ use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
+use crate::read::postfilter::PostFilterReader;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};
@@ -282,6 +283,18 @@ impl SeqScan {
         } else {
             Box::new(reader) as _
         };
+
+        // Apply postfilter for field filters after dedup (non-append mode only, not compaction).
+        let reader =
+            if !stream_ctx.input.compaction && stream_ctx.input.filter_plan.needs_postfilter() {
+                Box::new(PostFilterReader::new(
+                    reader,
+                    stream_ctx.input.filter_plan.postfilter_exprs(),
+                    stream_ctx.input.mapper.metadata(),
+                )) as BoxedBatchReader
+            } else {
+                reader
+            };
 
         let reader = match &stream_ctx.input.series_row_selector {
             Some(TimeSeriesRowSelector::LastRow) => Box::new(LastRowReader::new(reader)) as _,
@@ -713,8 +726,8 @@ impl RegionScanner for SeqScan {
         let predicate = self
             .stream_ctx
             .input
-            .predicate_group()
-            .predicate_without_region();
+            .filter_plan
+            .prefilter_predicate_without_region();
         predicate.map(|p| !p.exprs().is_empty()).unwrap_or(false)
     }
 

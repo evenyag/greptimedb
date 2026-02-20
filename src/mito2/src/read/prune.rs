@@ -21,6 +21,7 @@ use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use snafu::ResultExt;
+use store_api::storage::ColumnId;
 
 use crate::error::{RecordBatchSnafu, Result};
 use crate::memtable::BoxedBatchIterator;
@@ -142,12 +143,15 @@ impl PruneReader {
     }
 }
 
-/// An iterator that prunes batches by time range.
+/// An iterator that prunes batches by time range, time filters, and optionally field filters.
 pub(crate) struct PruneTimeIterator {
     iter: BoxedBatchIterator,
     time_range: FileTimeRange,
     /// Precise time filters.
     time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+    /// Field filters for append mode prefiltering.
+    /// Each entry is (column_id, evaluator) to match against Batch fields.
+    field_filters: Option<Arc<Vec<(ColumnId, SimpleFilterEvaluator)>>>,
 }
 
 impl PruneTimeIterator {
@@ -156,11 +160,13 @@ impl PruneTimeIterator {
         iter: BoxedBatchIterator,
         time_range: FileTimeRange,
         time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
+        field_filters: Option<Arc<Vec<(ColumnId, SimpleFilterEvaluator)>>>,
     ) -> Self {
         Self {
             iter,
             time_range,
             time_filters,
+            field_filters,
         }
     }
 
@@ -201,25 +207,44 @@ impl PruneTimeIterator {
         self.prune_by_time_filters(batch, mask)
     }
 
-    /// Prunes the batch by time filters.
+    /// Prunes the batch by time filters and field filters.
     /// Also applies existing mask to the batch if the mask is not empty.
     fn prune_by_time_filters(&self, mut batch: Batch, existing_mask: Vec<bool>) -> Result<Batch> {
+        let mut mask = BooleanBuffer::new_set(batch.num_rows());
+        let mut has_filter = false;
+
+        // Apply time filters
         if let Some(filters) = &self.time_filters {
-            let mut mask = BooleanBuffer::new_set(batch.num_rows());
             for filter in filters.iter() {
                 let result = filter
                     .evaluate_vector(batch.timestamps())
                     .context(RecordBatchSnafu)?;
                 mask = mask.bitand(&result);
             }
+            has_filter = true;
+        }
 
-            if !existing_mask.is_empty() {
-                mask = mask.bitand(&BooleanBuffer::from(existing_mask));
+        // Apply field filters (append mode only)
+        if let Some(filters) = &self.field_filters {
+            for (column_id, evaluator) in filters.iter() {
+                // Find matching field column in batch by column_id
+                if let Some(batch_col) = batch.fields().iter().find(|c| c.column_id == *column_id) {
+                    let result = evaluator
+                        .evaluate_vector(&batch_col.data)
+                        .context(RecordBatchSnafu)?;
+                    mask = mask.bitand(&result);
+                    has_filter = true;
+                }
             }
+        }
 
+        if !existing_mask.is_empty() {
+            mask = mask.bitand(&BooleanBuffer::from(existing_mask));
+            has_filter = true;
+        }
+
+        if has_filter {
             batch.filter(&BooleanArray::from(mask).into())?;
-        } else if !existing_mask.is_empty() {
-            batch.filter(&BooleanArray::from(existing_mask).into())?;
         }
 
         Ok(batch)
@@ -361,6 +386,7 @@ mod tests {
                 Timestamp::new_millisecond(1000),
             ),
             None,
+            None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert!(actual.is_empty());
@@ -400,6 +426,7 @@ mod tests {
                 Timestamp::new_millisecond(15),
             ),
             None,
+            None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -423,6 +450,7 @@ mod tests {
                 Timestamp::new_millisecond(11),
                 Timestamp::new_millisecond(20),
             ),
+            None,
             None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
@@ -454,6 +482,7 @@ mod tests {
                 Timestamp::new_millisecond(10),
                 Timestamp::new_millisecond(18),
             ),
+            None,
             None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
@@ -532,6 +561,7 @@ mod tests {
                 Timestamp::new_millisecond(20),
             ),
             time_filters,
+            None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(
@@ -588,6 +618,7 @@ mod tests {
                 Timestamp::new_millisecond(18),
             ),
             time_filters,
+            None,
         );
         let actual: Vec<_> = iter.map(|batch| batch.unwrap()).collect();
         assert_eq!(

@@ -489,8 +489,8 @@ impl RegionScanner for UnorderedScan {
         let predicate = self
             .stream_ctx
             .input
-            .predicate_group()
-            .predicate_without_region();
+            .filter_plan
+            .prefilter_predicate_without_region();
 
         predicate.map(|p| !p.exprs().is_empty()).unwrap_or(false)
     }

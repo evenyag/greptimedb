@@ -622,6 +622,7 @@ impl MemtableRange {
             iter,
             time_range,
             time_filters,
+            None,
         )))
     }
 
