@@ -72,8 +72,7 @@ use crate::sst::index::inverted_index::applier::{
 #[cfg(feature = "vector_index")]
 use crate::sst::index::vector_index::applier::VectorIndexApplierRef;
 use crate::sst::parquet::file_range::{
-    FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
-    row_group_contains_delete,
+    FileRangeContext, FileRangeContextRef, PartitionFilterContext, RangeBase,
 };
 use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
 use crate::sst::parquet::metadata::MetadataLoader;
@@ -144,8 +143,8 @@ pub struct ParquetReaderBuilder {
     flat_format: bool,
     /// Whether this reader is for compaction.
     compaction: bool,
-    /// Mode to pre-filter columns.
-    pre_filter_mode: PreFilterMode,
+    /// Whether to skip field filters during prefiltering.
+    skip_fields: bool,
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
@@ -177,7 +176,7 @@ impl ParquetReaderBuilder {
             expected_metadata: None,
             flat_format: false,
             compaction: false,
-            pre_filter_mode: PreFilterMode::All,
+            skip_fields: false,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
         }
@@ -270,10 +269,10 @@ impl ParquetReaderBuilder {
         self
     }
 
-    /// Sets the pre-filter mode.
+    /// Sets whether to skip field filters during prefiltering.
     #[must_use]
-    pub(crate) fn pre_filter_mode(mut self, pre_filter_mode: PreFilterMode) -> Self {
-        self.pre_filter_mode = pre_filter_mode;
+    pub(crate) fn skip_fields(mut self, skip_fields: bool) -> Self {
+        self.skip_fields = skip_fields;
         self
     }
 
@@ -489,7 +488,7 @@ impl ParquetReaderBuilder {
                 codec,
                 compat_batch: None,
                 compaction_projection_mapper,
-                pre_filter_mode: self.pre_filter_mode,
+                skip_fields: self.skip_fields,
                 partition_filter,
             },
         );
@@ -682,7 +681,7 @@ impl ParquetReaderBuilder {
         let mut output = RowGroupSelection::new(row_group_size, num_rows as _);
 
         // Compute skip_fields once for all pruning operations
-        let skip_fields = self.compute_skip_fields(parquet_meta);
+        let skip_fields = self.compute_skip_fields();
 
         self.prune_row_groups_by_minmax(
             read_format,
@@ -1117,23 +1116,9 @@ impl ParquetReaderBuilder {
         pruned
     }
 
-    /// Computes whether to skip field columns when building statistics based on PreFilterMode.
-    fn compute_skip_fields(&self, parquet_meta: &ParquetMetaData) -> bool {
-        match self.pre_filter_mode {
-            PreFilterMode::All => false,
-            PreFilterMode::SkipFields => true,
-            PreFilterMode::SkipFieldsOnDelete => {
-                // Check if any row group contains delete op
-                let file_path = self.file_handle.file_path(&self.table_dir, self.path_type);
-                (0..parquet_meta.num_row_groups()).any(|rg_idx| {
-                    row_group_contains_delete(parquet_meta, rg_idx, &file_path)
-                        .inspect_err(|e| {
-                            warn!(e; "Failed to decode min value of op_type, fallback to not skipping fields");
-                        })
-                        .unwrap_or(false)
-                })
-            }
-        }
+    /// Returns whether to skip field columns when building statistics.
+    fn compute_skip_fields(&self) -> bool {
+        self.skip_fields
     }
 
     /// Prunes row groups by min-max index.
@@ -1851,11 +1836,10 @@ impl BatchReader for ParquetReader {
 
             // Resets the parquet reader.
             // Compute skip_fields for this row group
-            let skip_fields = self.context.should_skip_fields(row_group_idx);
-            reader.reset_source(
-                Source::RowGroup(RowGroupReader::new(self.context.clone(), parquet_reader)),
-                skip_fields,
-            );
+            reader.reset_source(Source::RowGroup(RowGroupReader::new(
+                self.context.clone(),
+                parquet_reader,
+            )));
             if let Some(batch) = reader.next_batch().await? {
                 return Ok(Some(batch));
             }
@@ -1916,12 +1900,9 @@ impl ParquetReader {
                 .reader_builder()
                 .build(row_group_idx, Some(row_selection), Some(&fetch_metrics))
                 .await?;
-            // Compute skip_fields once for this row group
-            let skip_fields = context.should_skip_fields(row_group_idx);
             ReaderState::Readable(PruneReader::new_with_row_group_reader(
                 context.clone(),
                 RowGroupReader::new(context.clone(), parquet_reader),
-                skip_fields,
             ))
         } else {
             ReaderState::Exhausted(ReaderMetrics::default())

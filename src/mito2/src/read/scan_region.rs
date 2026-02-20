@@ -73,7 +73,6 @@ use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
 #[cfg(feature = "vector_index")]
 use crate::sst::index::vector_index::applier::{VectorIndexApplier, VectorIndexApplierRef};
-use crate::sst::parquet::file_range::PreFilterMode;
 use crate::sst::parquet::reader::ReaderMetrics;
 
 /// Parallel scan channel size for flat format.
@@ -461,10 +460,7 @@ impl ScanRegion {
         let memtables = self.version.memtables.list_memtables();
         // Skip empty memtables and memtables out of time range.
         let mut mem_range_builders = Vec::new();
-        let filter_mode = pre_filter_mode(
-            self.version.options.append_mode,
-            self.version.options.merge_mode(),
-        );
+        let skip_fields = !self.version.options.append_mode;
 
         for m in memtables {
             // check if memtable is empty by reading stats.
@@ -484,7 +480,7 @@ impl ScanRegion {
                         self.request.memtable_min_sequence,
                         self.request.memtable_max_sequence,
                     ))
-                    .with_pre_filter_mode(filter_mode),
+                    .with_skip_fields(skip_fields),
             )?;
             mem_range_builders.extend(ranges_in_memtable.ranges.into_values().map(|v| {
                 let stats = v.stats().clone();
@@ -1144,7 +1140,7 @@ impl ScanInput {
         reader_metrics: &mut ReaderMetrics,
     ) -> Result<FileRangeBuilder> {
         let predicate = self.predicate_for_file(file);
-        let filter_mode = pre_filter_mode(self.append_mode, self.merge_mode);
+        let skip_fields = self.filter_plan.skip_fields_in_prefilter();
         let decode_pk_values = !self.compaction && self.mapper.has_tags();
         let reader = self
             .access_layer
@@ -1166,7 +1162,7 @@ impl ScanInput {
             .expected_metadata(Some(self.mapper.metadata().clone()))
             .flat_format(self.flat_format)
             .compaction(self.compaction)
-            .pre_filter_mode(filter_mode)
+            .skip_fields(skip_fields)
             .decode_primary_key_values(decode_pk_values)
             .build_reader_input(reader_metrics)
             .await;
@@ -1406,17 +1402,6 @@ impl ScanInput {
 
     pub(crate) fn index_ids(&self) -> Vec<crate::sst::file::RegionIndexId> {
         self.files.iter().map(|file| file.index_id()).collect()
-    }
-}
-
-fn pre_filter_mode(append_mode: bool, merge_mode: MergeMode) -> PreFilterMode {
-    if append_mode {
-        return PreFilterMode::All;
-    }
-
-    match merge_mode {
-        MergeMode::LastRow => PreFilterMode::SkipFieldsOnDelete,
-        MergeMode::LastNonNull => PreFilterMode::SkipFields,
     }
 }
 

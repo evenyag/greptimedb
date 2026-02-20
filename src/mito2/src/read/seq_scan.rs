@@ -41,7 +41,7 @@ use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
-use crate::read::postfilter::PostFilterReader;
+use crate::read::postfilter::{FlatPostFilterStream, PostFilterReader};
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};
@@ -357,6 +357,19 @@ impl SeqScan {
         } else {
             Box::pin(reader.into_stream()) as _
         };
+
+        // Apply postfilter for field filters after dedup (non-append mode only, not compaction).
+        let reader =
+            if !stream_ctx.input.compaction && stream_ctx.input.filter_plan.needs_postfilter() {
+                FlatPostFilterStream::new(
+                    reader,
+                    stream_ctx.input.filter_plan.postfilter_exprs(),
+                    stream_ctx.input.mapper.metadata(),
+                )
+                .into_stream()
+            } else {
+                reader
+            };
 
         Ok(reader)
     }

@@ -25,11 +25,13 @@ use common_recordbatch::filter::SimpleFilterEvaluator;
 use datafusion_expr::Expr;
 use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::buffer::BooleanBuffer;
+use datatypes::arrow::record_batch::RecordBatch;
+use futures::StreamExt;
 use snafu::ResultExt;
 use store_api::storage::ColumnId;
 
-use crate::error::{RecordBatchSnafu, Result};
-use crate::read::{Batch, BatchReader, BoxedBatchReader};
+use crate::error::{ComputeArrowSnafu, RecordBatchSnafu, Result};
+use crate::read::{Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream};
 
 /// A reader that applies field filters to batches after merge/dedup.
 pub struct PostFilterReader {
@@ -106,6 +108,85 @@ impl BatchReader for PostFilterReader {
             // Empty batch after filtering, continue to next
         }
         Ok(None)
+    }
+}
+
+/// A stream wrapper that applies field filters to `RecordBatch`es after merge/dedup
+/// in flat format scans.
+pub struct FlatPostFilterStream {
+    inner: BoxedRecordBatchStream,
+    /// Field filter evaluators, each paired with its column name.
+    field_filters: Vec<(String, SimpleFilterEvaluator)>,
+}
+
+impl FlatPostFilterStream {
+    /// Creates a new `FlatPostFilterStream`.
+    pub fn new(
+        inner: BoxedRecordBatchStream,
+        postfilter_exprs: &[Expr],
+        metadata: &store_api::metadata::RegionMetadata,
+    ) -> Self {
+        let mut field_filters = Vec::new();
+        for expr in postfilter_exprs {
+            if let Some(evaluator) = SimpleFilterEvaluator::try_new(expr)
+                && metadata.column_by_name(evaluator.column_name()).is_some()
+            {
+                field_filters.push((evaluator.column_name().to_string(), evaluator));
+            }
+        }
+
+        Self {
+            inner,
+            field_filters,
+        }
+    }
+
+    /// Converts this into a `BoxedRecordBatchStream`.
+    pub fn into_stream(self) -> BoxedRecordBatchStream {
+        Box::pin(futures::stream::unfold(self, |mut this| async move {
+            loop {
+                let batch = match this.inner.next().await? {
+                    Ok(batch) => batch,
+                    Err(e) => return Some((Err(e), this)),
+                };
+
+                if this.field_filters.is_empty() {
+                    return Some((Ok(batch), this));
+                }
+
+                match this.filter_record_batch(&batch) {
+                    Ok(Some(filtered)) => return Some((Ok(filtered), this)),
+                    Ok(None) => continue, // Batch completely filtered out
+                    Err(e) => return Some((Err(e), this)),
+                }
+            }
+        }))
+    }
+
+    fn filter_record_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+        let mut mask = BooleanBuffer::new_set(batch.num_rows());
+
+        for (col_name, evaluator) in &self.field_filters {
+            if let Ok(col_idx) = batch.schema().index_of(col_name) {
+                let column = batch.column(col_idx);
+                let result = evaluator.evaluate_array(column).context(RecordBatchSnafu)?;
+                mask = mask.bitand(&result);
+            }
+        }
+
+        if mask.count_set_bits() == 0 {
+            return Ok(None);
+        }
+
+        let filtered =
+            datatypes::arrow::compute::filter_record_batch(batch, &BooleanArray::from(mask))
+                .context(ComputeArrowSnafu)?;
+
+        if filtered.num_rows() > 0 {
+            Ok(Some(filtered))
+        } else {
+            Ok(None)
+        }
     }
 }
 

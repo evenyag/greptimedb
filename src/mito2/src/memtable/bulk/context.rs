@@ -24,7 +24,7 @@ use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
 use crate::error::Result;
-use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
+use crate::sst::parquet::file_range::RangeBase;
 use crate::sst::parquet::flat_format::FlatReadFormat;
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::SimpleFilterContext;
@@ -44,21 +44,21 @@ impl BulkIterContext {
         predicate: Option<Predicate>,
         skip_auto_convert: bool,
     ) -> Result<Self> {
-        Self::new_with_pre_filter_mode(
+        Self::new_with_skip_fields(
             region_metadata,
             projection,
             predicate,
             skip_auto_convert,
-            PreFilterMode::All,
+            false,
         )
     }
 
-    pub fn new_with_pre_filter_mode(
+    pub fn new_with_skip_fields(
         region_metadata: RegionMetadataRef,
         projection: Option<&[ColumnId]>,
         predicate: Option<Predicate>,
         skip_auto_convert: bool,
-        pre_filter_mode: PreFilterMode,
+        skip_fields: bool,
     ) -> Result<Self> {
         let codec = build_primary_key_codec(&region_metadata);
 
@@ -98,7 +98,7 @@ impl BulkIterContext {
                 // we don't need to compat batch since all batch in memtable have the same schema.
                 compat_batch: None,
                 compaction_projection_mapper: None,
-                pre_filter_mode,
+                skip_fields,
                 partition_filter: None,
             },
             predicate,
@@ -137,9 +137,9 @@ impl BulkIterContext {
         &self.base.read_format
     }
 
-    /// Returns the pre-filter mode.
-    pub(crate) fn pre_filter_mode(&self) -> PreFilterMode {
-        self.base.pre_filter_mode
+    /// Returns whether to skip field filters during prefiltering.
+    pub(crate) fn skip_fields(&self) -> bool {
+        self.base.skip_fields
     }
 
     /// Returns the region id.

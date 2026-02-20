@@ -44,7 +44,6 @@ use crate::region::options::{MemtableOptions, MergeMode, RegionOptions};
 use crate::sst::FormatType;
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::SstInfo;
-use crate::sst::parquet::file_range::PreFilterMode;
 
 mod builder;
 pub mod bulk;
@@ -77,27 +76,16 @@ pub enum MemtableConfig {
 }
 
 /// Options for querying ranges from a memtable.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RangesOptions {
     /// Whether the ranges are being queried for flush.
     pub for_flush: bool,
-    /// Mode to pre-filter columns in ranges.
-    pub pre_filter_mode: PreFilterMode,
+    /// Whether to skip field filters during prefiltering.
+    pub skip_fields: bool,
     /// Predicate to filter the data.
     pub predicate: PredicateGroup,
     /// Sequence range to filter the data.
     pub sequence: Option<SequenceRange>,
-}
-
-impl Default for RangesOptions {
-    fn default() -> Self {
-        Self {
-            for_flush: false,
-            pre_filter_mode: PreFilterMode::All,
-            predicate: PredicateGroup::default(),
-            sequence: None,
-        }
-    }
 }
 
 impl RangesOptions {
@@ -105,16 +93,16 @@ impl RangesOptions {
     pub fn for_flush() -> Self {
         Self {
             for_flush: true,
-            pre_filter_mode: PreFilterMode::All,
+            skip_fields: false,
             predicate: PredicateGroup::default(),
             sequence: None,
         }
     }
 
-    /// Sets the pre-filter mode.
+    /// Sets whether to skip field filters during prefiltering.
     #[must_use]
-    pub fn with_pre_filter_mode(mut self, pre_filter_mode: PreFilterMode) -> Self {
-        self.pre_filter_mode = pre_filter_mode;
+    pub fn with_skip_fields(mut self, skip_fields: bool) -> Self {
+        self.skip_fields = skip_fields;
         self
     }
 

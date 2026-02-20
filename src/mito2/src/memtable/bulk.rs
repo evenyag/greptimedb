@@ -483,12 +483,12 @@ impl Memtable for BulkMemtable {
         let mut range_id = 0;
 
         // TODO(yingwen): Filter ranges by sequence.
-        let context = Arc::new(BulkIterContext::new_with_pre_filter_mode(
+        let context = Arc::new(BulkIterContext::new_with_skip_fields(
             self.metadata.clone(),
             projection,
             predicate.predicate().cloned(),
             options.for_flush,
-            options.pre_filter_mode,
+            options.skip_fields,
         )?);
 
         // Adds ranges for regular parts and encoded parts
