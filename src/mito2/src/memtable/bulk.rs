@@ -1468,12 +1468,7 @@ mod tests {
         assert_eq!(1000, min_ts.value());
         assert_eq!(3000, max_ts.value());
 
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         assert_eq!(3, ranges.ranges.len());
         let total_rows: usize = ranges.ranges.values().map(|r| r.stats().num_rows()).sum();
@@ -1522,10 +1517,7 @@ mod tests {
 
         let projection = vec![4u32];
         let ranges = memtable
-            .ranges(
-                Some(&projection),
-                RangesOptions::default(),
-            )
+            .ranges(Some(&projection), RangesOptions::default())
             .unwrap();
 
         assert_eq!(1, ranges.ranges.len());
@@ -1670,12 +1662,7 @@ mod tests {
             memtable.write_bulk(part).unwrap();
         }
 
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         assert_eq!(3, ranges.ranges.len());
         let total_rows: usize = ranges.ranges.values().map(|r| r.stats().num_rows()).sum();
@@ -1717,8 +1704,7 @@ mod tests {
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default()
-                    .with_sequence(sequence_filter),
+                RangesOptions::default().with_sequence(sequence_filter),
             )
             .unwrap();
 
@@ -1763,12 +1749,7 @@ mod tests {
 
         memtable.compact(false).unwrap();
 
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         // Should have ranges for both bulk parts and encoded parts
         assert_eq!(3, ranges.ranges.len());
@@ -1846,12 +1827,7 @@ mod tests {
         assert_eq!(10, stats.num_rows);
 
         // Verify we can read all data correctly
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         // Should have at least 1 range (the compacted part)
         assert!(!ranges.ranges.is_empty());
@@ -1936,12 +1912,7 @@ mod tests {
         assert_eq!(13, stats.num_rows); // 3 + 3 + 5 + 2 = 13
 
         // Verify all data can be read
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         let total_rows: usize = ranges.ranges.values().map(|r| r.stats().num_rows()).sum();
         assert_eq!(13, total_rows);
@@ -1992,12 +1963,7 @@ mod tests {
         assert_eq!(3, stats.num_rows);
 
         // Test that ranges() can correctly read from unordered_part
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         // Should have 1 range for the unordered_part
         assert_eq!(1, ranges.ranges.len());
@@ -2184,12 +2150,7 @@ mod tests {
         memtable.compact(false).unwrap();
 
         // Verify we can read from the memtable
-        let ranges = memtable
-            .ranges(
-                None,
-                RangesOptions::default(),
-            )
-            .unwrap();
+        let ranges = memtable.ranges(None, RangesOptions::default()).unwrap();
 
         assert_eq!(1, ranges.ranges.len());
         let expected_rows = merge_threshold * 2; // Each part has 2 rows

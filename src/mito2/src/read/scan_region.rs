@@ -1615,9 +1615,7 @@ mod tests {
             CacheStrategy::Disabled,
         );
         let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection)
-            .unwrap();
+        let read_ids = scan_region.build_read_column_ids(projection).unwrap();
         assert_eq!(vec![4, 0, 2, 3], read_ids);
     }
 
@@ -1637,9 +1635,7 @@ mod tests {
             CacheStrategy::Disabled,
         );
         let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection)
-            .unwrap();
+        let read_ids = scan_region.build_read_column_ids(projection).unwrap();
         // Empty projection should still read the time index column (id 2 in this test schema).
         assert_eq!(vec![2], read_ids);
     }
@@ -1661,9 +1657,7 @@ mod tests {
             CacheStrategy::Disabled,
         );
         let projection = scan_region.request.projection.as_ref().unwrap();
-        let read_ids = scan_region
-            .build_read_column_ids(projection)
-            .unwrap();
+        let read_ids = scan_region.build_read_column_ids(projection).unwrap();
         // Projection order preserved, extra columns appended in schema order.
         assert_eq!(vec![4, 1, 3], read_ids);
     }

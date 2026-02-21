@@ -38,8 +38,8 @@ use crate::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable
 use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
 use crate::read::Batch;
-use crate::read::prune::PruneTimeIterator;
 use crate::read::filter_plan::FilterPlan;
+use crate::read::prune::PruneTimeIterator;
 use crate::region::options::{MemtableOptions, MergeMode, RegionOptions};
 use crate::sst::FormatType;
 use crate::sst::file::FileTimeRange;
