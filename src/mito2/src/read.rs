@@ -16,7 +16,7 @@
 
 pub mod compat;
 pub mod dedup;
-pub(crate) mod filter_plan;
+pub mod filter_plan;
 pub mod flat_dedup;
 pub mod flat_merge;
 pub mod flat_projection;

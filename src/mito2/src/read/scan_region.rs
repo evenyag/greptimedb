@@ -20,21 +20,18 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::SendableRecordBatchStream;
-use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::tracing::Instrument;
 use common_telemetry::{debug, error, tracing, warn};
 use common_time::range::TimestampRange;
-use datafusion_common::Column;
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
 use futures::StreamExt;
 use partition::expr::PartitionExpr;
 use smallvec::SmallVec;
 use snafu::{OptionExt as _, ResultExt};
-use store_api::metadata::{RegionMetadata, RegionMetadataRef};
+use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
 use store_api::storage::{
     ColumnId, RegionId, ScanRequest, SequenceRange, TimeSeriesDistribution, TimeSeriesRowSelector,
@@ -407,11 +404,10 @@ impl ScanRegion {
     async fn scan_input(mut self) -> Result<ScanInput> {
         let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
-        let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
         let flat_format = self.use_flat_format();
 
         let read_column_ids = match &self.request.projection {
-            Some(p) => self.build_read_column_ids(p, &predicate)?,
+            Some(p) => self.build_read_column_ids(p)?,
             None => self
                 .version
                 .metadata
@@ -457,49 +453,6 @@ impl ScanRegion {
             }
         }
 
-        let memtables = self.version.memtables.list_memtables();
-        // Skip empty memtables and memtables out of time range.
-        let mut mem_range_builders = Vec::new();
-        let skip_fields = !self.version.options.append_mode;
-
-        for m in memtables {
-            // check if memtable is empty by reading stats.
-            let Some((start, end)) = m.stats().time_range() else {
-                continue;
-            };
-            // The time range of the memtable is inclusive.
-            let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
-            if !memtable_range.intersects(&time_range) {
-                continue;
-            }
-            let ranges_in_memtable = m.ranges(
-                Some(read_column_ids.as_slice()),
-                RangesOptions::default()
-                    .with_predicate(predicate.clone())
-                    .with_sequence(SequenceRange::new(
-                        self.request.memtable_min_sequence,
-                        self.request.memtable_max_sequence,
-                    ))
-                    .with_skip_fields(skip_fields),
-            )?;
-            mem_range_builders.extend(ranges_in_memtable.ranges.into_values().map(|v| {
-                let stats = v.stats().clone();
-                MemRangeBuilder::new(v, stats)
-            }));
-        }
-
-        let region_id = self.region_id();
-        debug!(
-            "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}, flat_format: {}",
-            region_id,
-            self.request,
-            time_range,
-            mem_range_builders.len(),
-            files.len(),
-            self.version.options.append_mode,
-            flat_format,
-        );
-
         // Build unified FilterPlan
         let mut filter_plan = FilterPlan::new(
             &self.version.metadata,
@@ -527,6 +480,7 @@ impl ScanRegion {
         filter_plan.set_bloom_filter_index_appliers(bloom_filter_appliers.clone());
         filter_plan.set_fulltext_index_appliers(fulltext_index_appliers.clone());
         let filter_plan = Arc::new(filter_plan);
+
         #[cfg(feature = "vector_index")]
         let vector_index_applier = self.build_vector_index_applier();
         #[cfg(feature = "vector_index")]
@@ -538,6 +492,49 @@ impl ScanRegion {
             }
         });
 
+        let memtables = self.version.memtables.list_memtables();
+        // Skip empty memtables and memtables out of time range.
+        let mut mem_range_builders = Vec::new();
+        let skip_fields = !self.version.options.append_mode;
+
+        for m in memtables {
+            // check if memtable is empty by reading stats.
+            let Some((start, end)) = m.stats().time_range() else {
+                continue;
+            };
+            // The time range of the memtable is inclusive.
+            let memtable_range = TimestampRange::new_inclusive(Some(start), Some(end));
+            if !memtable_range.intersects(&time_range) {
+                continue;
+            }
+            let ranges_in_memtable = m.ranges(
+                Some(read_column_ids.as_slice()),
+                RangesOptions::default()
+                    .with_filter_plan(filter_plan.clone())
+                    .with_sequence(SequenceRange::new(
+                        self.request.memtable_min_sequence,
+                        self.request.memtable_max_sequence,
+                    ))
+                    .with_skip_fields(skip_fields),
+            )?;
+            mem_range_builders.extend(ranges_in_memtable.ranges.into_values().map(|v| {
+                let stats = v.stats().clone();
+                MemRangeBuilder::new(v, stats)
+            }));
+        }
+
+        let region_id = self.region_id();
+        debug!(
+            "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}, flat_format: {}",
+            region_id,
+            self.request,
+            time_range,
+            mem_range_builders.len(),
+            files.len(),
+            self.version.options.append_mode,
+            flat_format,
+        );
+
         if flat_format {
             // The batch is already large enough so we use a small channel size here.
             self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
@@ -545,7 +542,6 @@ impl ScanRegion {
 
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
-            .with_predicate(predicate)
             .with_filter_plan(filter_plan)
             .with_memtables(mem_range_builders)
             .with_files(files)
@@ -597,11 +593,7 @@ impl ScanRegion {
     }
 
     /// Return all columns id to read according to the projection and filters.
-    fn build_read_column_ids(
-        &self,
-        projection: &[usize],
-        predicate: &PredicateGroup,
-    ) -> Result<Vec<ColumnId>> {
+    fn build_read_column_ids(&self, projection: &[usize]) -> Result<Vec<ColumnId>> {
         let metadata = &self.version.metadata;
         // use Vec for read_column_ids to keep the order of columns.
         let mut read_column_ids = Vec::new();
@@ -639,8 +631,13 @@ impl ScanRegion {
             extra_names.extend(columns.iter().map(|column| column.name.clone()));
         }
 
-        if let Some(expr) = predicate.region_partition_expr() {
-            expr.collect_column_names(&mut extra_names);
+        // Also include columns referenced by the region partition expr.
+        if let Some(expr_json) = metadata.partition_expr.as_ref()
+            && !expr_json.is_empty()
+            && let Some(partition_expr) = PartitionExpr::from_json_str(expr_json)
+                .context(InvalidPartitionExprSnafu { expr: expr_json })?
+        {
+            partition_expr.collect_column_names(&mut extra_names);
         }
 
         if !extra_names.is_empty() {
@@ -800,10 +797,6 @@ pub struct ScanInput {
     pub(crate) read_column_ids: Vec<ColumnId>,
     /// Time range filter for time index.
     time_range: Option<TimestampRange>,
-    /// Predicate to push down.
-    pub(crate) predicate: PredicateGroup,
-    /// Region partition expr applied at read time.
-    region_partition_expr: Option<PartitionExpr>,
     /// Unified filter plan for prefilter/postfilter decisions.
     pub(crate) filter_plan: Arc<FilterPlan>,
     /// Memtable range builders for memtables in the time range..
@@ -857,8 +850,6 @@ impl ScanInput {
             read_column_ids: mapper.column_ids().to_vec(),
             mapper: Arc::new(mapper),
             time_range: None,
-            predicate: PredicateGroup::default(),
-            region_partition_expr: None,
             filter_plan: Arc::new(FilterPlan::default()),
             memtables: Vec::new(),
             files: Vec::new(),
@@ -890,14 +881,6 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_time_range(mut self, time_range: Option<TimestampRange>) -> Self {
         self.time_range = time_range;
-        self
-    }
-
-    /// Sets predicate to push down.
-    #[must_use]
-    pub(crate) fn with_predicate(mut self, predicate: PredicateGroup) -> Self {
-        self.region_partition_expr = predicate.region_partition_expr().cloned();
-        self.predicate = predicate;
         self
     }
 
@@ -1339,11 +1322,6 @@ impl ScanInput {
         rows
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn predicate_group(&self) -> &PredicateGroup {
-        &self.predicate
-    }
-
     /// Returns the unified filter plan.
     #[allow(dead_code)]
     pub(crate) fn filter_plan(&self) -> &Arc<FilterPlan> {
@@ -1593,120 +1571,6 @@ impl StreamContext {
     }
 }
 
-/// Predicates to evaluate.
-/// It only keeps filters that [SimpleFilterEvaluator] supports.
-#[allow(dead_code)]
-#[derive(Clone, Default)]
-pub struct PredicateGroup {
-    time_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
-    /// Predicate that includes request filters and region partition expr (if any).
-    predicate_all: Option<Predicate>,
-    /// Predicate that only includes request filters.
-    predicate_without_region: Option<Predicate>,
-    /// Region partition expression restored from metadata.
-    region_partition_expr: Option<PartitionExpr>,
-}
-
-#[allow(dead_code)]
-impl PredicateGroup {
-    /// Creates a new `PredicateGroup` from exprs according to the metadata.
-    pub fn new(metadata: &RegionMetadata, exprs: &[Expr]) -> Result<Self> {
-        let mut combined_exprs = exprs.to_vec();
-        let mut region_partition_expr = None;
-
-        if let Some(expr_json) = metadata.partition_expr.as_ref()
-            && !expr_json.is_empty()
-            && let Some(expr) = PartitionExpr::from_json_str(expr_json)
-                .context(InvalidPartitionExprSnafu { expr: expr_json })?
-        {
-            let logical_expr = expr
-                .try_as_logical_expr()
-                .context(InvalidPartitionExprSnafu {
-                    expr: expr_json.clone(),
-                })?;
-
-            combined_exprs.push(logical_expr);
-            region_partition_expr = Some(expr);
-        }
-
-        let mut time_filters = Vec::with_capacity(combined_exprs.len());
-        // Columns in the expr.
-        let mut columns = HashSet::new();
-        for expr in &combined_exprs {
-            columns.clear();
-            let Some(filter) = Self::expr_to_filter(expr, metadata, &mut columns) else {
-                continue;
-            };
-            time_filters.push(filter);
-        }
-        let time_filters = if time_filters.is_empty() {
-            None
-        } else {
-            Some(Arc::new(time_filters))
-        };
-
-        let predicate_all = if combined_exprs.is_empty() {
-            None
-        } else {
-            Some(Predicate::new(combined_exprs))
-        };
-        let predicate_without_region = if exprs.is_empty() {
-            None
-        } else {
-            Some(Predicate::new(exprs.to_vec()))
-        };
-
-        Ok(Self {
-            time_filters,
-            predicate_all,
-            predicate_without_region,
-            region_partition_expr,
-        })
-    }
-
-    /// Returns time filters.
-    pub(crate) fn time_filters(&self) -> Option<Arc<Vec<SimpleFilterEvaluator>>> {
-        self.time_filters.clone()
-    }
-
-    /// Returns predicate of all exprs (including region partition expr if present).
-    pub(crate) fn predicate(&self) -> Option<&Predicate> {
-        self.predicate_all.as_ref()
-    }
-
-    /// Returns predicate that excludes region partition expr.
-    pub(crate) fn predicate_without_region(&self) -> Option<&Predicate> {
-        self.predicate_without_region.as_ref()
-    }
-
-    /// Returns the region partition expr from metadata, if any.
-    pub(crate) fn region_partition_expr(&self) -> Option<&PartitionExpr> {
-        self.region_partition_expr.as_ref()
-    }
-
-    fn expr_to_filter(
-        expr: &Expr,
-        metadata: &RegionMetadata,
-        columns: &mut HashSet<Column>,
-    ) -> Option<SimpleFilterEvaluator> {
-        columns.clear();
-        // `expr_to_columns` won't return error.
-        // We still ignore these expressions for safety.
-        expr_to_columns(expr, columns).ok()?;
-        if columns.len() > 1 {
-            // Simple filter doesn't support multiple columns.
-            return None;
-        }
-        let column = columns.iter().next()?;
-        let column_meta = metadata.column_by_name(&column.name)?;
-        if column_meta.semantic_type == SemanticType::Timestamp {
-            SimpleFilterEvaluator::try_new(expr)
-        } else {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1750,11 +1614,9 @@ mod tests {
             request,
             CacheStrategy::Disabled,
         );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
         let projection = scan_region.request.projection.as_ref().unwrap();
         let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
+            .build_read_column_ids(projection)
             .unwrap();
         assert_eq!(vec![4, 0, 2, 3], read_ids);
     }
@@ -1774,11 +1636,9 @@ mod tests {
             request,
             CacheStrategy::Disabled,
         );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
         let projection = scan_region.request.projection.as_ref().unwrap();
         let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
+            .build_read_column_ids(projection)
             .unwrap();
         // Empty projection should still read the time index column (id 2 in this test schema).
         assert_eq!(vec![2], read_ids);
@@ -1800,11 +1660,9 @@ mod tests {
             request,
             CacheStrategy::Disabled,
         );
-        let predicate =
-            PredicateGroup::new(metadata.as_ref(), &scan_region.request.filters).unwrap();
         let projection = scan_region.request.projection.as_ref().unwrap();
         let read_ids = scan_region
-            .build_read_column_ids(projection, &predicate)
+            .build_read_column_ids(projection)
             .unwrap();
         // Projection order preserved, extra columns appended in schema order.
         assert_eq!(vec![4, 1, 3], read_ids);

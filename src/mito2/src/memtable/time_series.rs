@@ -305,7 +305,7 @@ impl Memtable for TimeSeriesMemtable {
         projection: Option<&[ColumnId]>,
         options: RangesOptions,
     ) -> Result<MemtableRanges> {
-        let predicate = options.predicate;
+        let filter_plan = options.filter_plan;
         let sequence = options.sequence;
         let projection = if let Some(projection) = projection {
             projection.iter().copied().collect()
@@ -318,12 +318,12 @@ impl Memtable for TimeSeriesMemtable {
         let builder = Box::new(TimeSeriesIterBuilder {
             series_set: self.series_set.clone(),
             projection,
-            predicate: predicate.predicate().cloned(),
+            predicate: filter_plan.prefilter_predicate().cloned(),
             dedup: self.dedup,
             merge_mode: self.merge_mode,
             sequence,
         });
-        let context = Arc::new(MemtableRangeContext::new(self.id, builder, predicate));
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder, filter_plan));
 
         let range_stats = self.stats();
         let range = MemtableRange::new(context, range_stats);

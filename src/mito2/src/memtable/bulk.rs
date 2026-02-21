@@ -477,7 +477,7 @@ impl Memtable for BulkMemtable {
         projection: Option<&[ColumnId]>,
         options: RangesOptions,
     ) -> Result<MemtableRanges> {
-        let predicate = options.predicate;
+        let filter_plan = options.filter_plan;
         let sequence = options.sequence;
         let mut ranges = BTreeMap::new();
         let mut range_id = 0;
@@ -486,7 +486,7 @@ impl Memtable for BulkMemtable {
         let context = Arc::new(BulkIterContext::new_with_skip_fields(
             self.metadata.clone(),
             projection,
-            predicate.predicate().cloned(),
+            filter_plan.prefilter_predicate().cloned(),
             options.for_flush,
             options.skip_fields,
         )?);
@@ -508,7 +508,7 @@ impl Memtable for BulkMemtable {
                             context: context.clone(),
                             sequence,
                         }),
-                        predicate.clone(),
+                        filter_plan.clone(),
                     )),
                     part_stats,
                 );
@@ -549,7 +549,7 @@ impl Memtable for BulkMemtable {
                     Arc::new(MemtableRangeContext::new(
                         self.id,
                         iter_builder,
-                        predicate.clone(),
+                        filter_plan.clone(),
                     )),
                     part_stats,
                 );
@@ -1385,7 +1385,6 @@ mod tests {
 
     use super::*;
     use crate::memtable::bulk::part::BulkPartConverter;
-    use crate::read::scan_region::PredicateGroup;
     use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
     use crate::test_util::memtable_util::{build_key_values_with_ts_seq_values, metadata_for_test};
 
@@ -1469,11 +1468,10 @@ mod tests {
         assert_eq!(1000, min_ts.value());
         assert_eq!(3000, max_ts.value());
 
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -1523,11 +1521,10 @@ mod tests {
         memtable.write_bulk(bulk_part).unwrap();
 
         let projection = vec![4u32];
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 Some(&projection),
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -1673,11 +1670,10 @@ mod tests {
             memtable.write_bulk(part).unwrap();
         }
 
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -1717,13 +1713,11 @@ mod tests {
 
         memtable.write_bulk(part).unwrap();
 
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let sequence_filter = Some(SequenceRange::LtEq { max: 400 }); // Filters out rows with sequence > 400
         let ranges = memtable
             .ranges(
                 None,
                 RangesOptions::default()
-                    .with_predicate(predicate_group)
                     .with_sequence(sequence_filter),
             )
             .unwrap();
@@ -1769,11 +1763,10 @@ mod tests {
 
         memtable.compact(false).unwrap();
 
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -1853,11 +1846,10 @@ mod tests {
         assert_eq!(10, stats.num_rows);
 
         // Verify we can read all data correctly
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -1944,11 +1936,10 @@ mod tests {
         assert_eq!(13, stats.num_rows); // 3 + 3 + 5 + 2 = 13
 
         // Verify all data can be read
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -2001,11 +1992,10 @@ mod tests {
         assert_eq!(3, stats.num_rows);
 
         // Test that ranges() can correctly read from unordered_part
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 
@@ -2194,11 +2184,10 @@ mod tests {
         memtable.compact(false).unwrap();
 
         // Verify we can read from the memtable
-        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
         let ranges = memtable
             .ranges(
                 None,
-                RangesOptions::default().with_predicate(predicate_group),
+                RangesOptions::default(),
             )
             .unwrap();
 

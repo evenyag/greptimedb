@@ -233,7 +233,7 @@ impl Memtable for SimpleBulkMemtable {
         projection: Option<&[ColumnId]>,
         options: RangesOptions,
     ) -> error::Result<MemtableRanges> {
-        let predicate = options.predicate;
+        let filter_plan = options.filter_plan;
         let sequence = options.sequence;
         let start_time = Instant::now();
         let projection = Arc::new(self.build_projection(projection));
@@ -301,7 +301,7 @@ impl Memtable for SimpleBulkMemtable {
                         Arc::new(MemtableRangeContext::new(
                             self.id,
                             Box::new(builder),
-                            predicate.clone(),
+                            filter_plan.clone(),
                         )),
                     )
                 })

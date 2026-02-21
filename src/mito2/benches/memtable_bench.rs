@@ -30,7 +30,7 @@ use mito2::memtable::partition_tree::{PartitionTreeConfig, PartitionTreeMemtable
 use mito2::memtable::time_series::TimeSeriesMemtable;
 use mito2::memtable::{KeyValues, Memtable, RangesOptions};
 use mito2::read::flat_merge::FlatMergeIterator;
-use mito2::read::scan_region::PredicateGroup;
+use mito2::read::filter_plan::FilterPlan;
 use mito2::region::options::MergeMode;
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use mito2::test_util::memtable_util::{self, region_metadata_to_row_schema};
@@ -180,15 +180,17 @@ fn filter_1_host(c: &mut Criterion) {
             memtable.write_bulk(bulk_part).unwrap();
         }
 
-        // Create predicate for filtering
+        // Create filter plan for filtering
         let filter_exprs = generator.random_host_filter_exprs();
-        let predicate = PredicateGroup::new(&metadata, &filter_exprs).unwrap();
+        let filter_plan = std::sync::Arc::new(
+            FilterPlan::new(&metadata, &filter_exprs, false, MergeMode::default()).unwrap(),
+        );
 
         b.iter(|| {
             let ranges = memtable
                 .ranges(
                     None, // No projection
-                    RangesOptions::default().with_predicate(predicate.clone()),
+                    RangesOptions::default().with_filter_plan(filter_plan.clone()),
                 )
                 .unwrap();
 

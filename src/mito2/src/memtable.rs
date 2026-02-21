@@ -39,7 +39,7 @@ use crate::memtable::time_series::TimeSeriesMemtableBuilder;
 use crate::metrics::WRITE_BUFFER_BYTES;
 use crate::read::Batch;
 use crate::read::prune::PruneTimeIterator;
-use crate::read::scan_region::PredicateGroup;
+use crate::read::filter_plan::FilterPlan;
 use crate::region::options::{MemtableOptions, MergeMode, RegionOptions};
 use crate::sst::FormatType;
 use crate::sst::file::FileTimeRange;
@@ -82,8 +82,8 @@ pub struct RangesOptions {
     pub for_flush: bool,
     /// Whether to skip field filters during prefiltering.
     pub skip_fields: bool,
-    /// Predicate to filter the data.
-    pub predicate: PredicateGroup,
+    /// Filter plan for prefilter/postfilter decisions.
+    pub filter_plan: Arc<FilterPlan>,
     /// Sequence range to filter the data.
     pub sequence: Option<SequenceRange>,
 }
@@ -94,7 +94,7 @@ impl RangesOptions {
         Self {
             for_flush: true,
             skip_fields: false,
-            predicate: PredicateGroup::default(),
+            filter_plan: Arc::new(FilterPlan::default()),
             sequence: None,
         }
     }
@@ -106,10 +106,10 @@ impl RangesOptions {
         self
     }
 
-    /// Sets the predicate.
+    /// Sets the filter plan.
     #[must_use]
-    pub fn with_predicate(mut self, predicate: PredicateGroup) -> Self {
-        self.predicate = predicate;
+    pub fn with_filter_plan(mut self, filter_plan: Arc<FilterPlan>) -> Self {
+        self.filter_plan = filter_plan;
         self
     }
 
@@ -554,19 +554,19 @@ pub struct MemtableRangeContext {
     id: MemtableId,
     /// Iterator builder.
     builder: BoxedIterBuilder,
-    /// All filters.
-    predicate: PredicateGroup,
+    /// Filter plan for prefilter/postfilter decisions.
+    filter_plan: Arc<FilterPlan>,
 }
 
 pub type MemtableRangeContextRef = Arc<MemtableRangeContext>;
 
 impl MemtableRangeContext {
     /// Creates a new [MemtableRangeContext].
-    pub fn new(id: MemtableId, builder: BoxedIterBuilder, predicate: PredicateGroup) -> Self {
+    pub fn new(id: MemtableId, builder: BoxedIterBuilder, filter_plan: Arc<FilterPlan>) -> Self {
         Self {
             id,
             builder,
-            predicate,
+            filter_plan,
         }
     }
 }
@@ -605,7 +605,7 @@ impl MemtableRange {
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedBatchIterator> {
         let iter = self.context.builder.build(metrics)?;
-        let time_filters = self.context.predicate.time_filters();
+        let time_filters = self.context.filter_plan.time_filters();
         Ok(Box::new(PruneTimeIterator::new(
             iter,
             time_range,

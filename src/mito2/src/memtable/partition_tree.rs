@@ -192,16 +192,16 @@ impl Memtable for PartitionTreeMemtable {
         projection: Option<&[ColumnId]>,
         options: RangesOptions,
     ) -> Result<MemtableRanges> {
-        let predicate = options.predicate;
+        let filter_plan = options.filter_plan;
         let sequence = options.sequence;
         let projection = projection.map(|ids| ids.to_vec());
         let builder = Box::new(PartitionTreeIterBuilder {
             tree: self.tree.clone(),
             projection,
-            predicate: predicate.predicate().cloned(),
+            predicate: filter_plan.prefilter_predicate().cloned(),
             sequence,
         });
-        let context = Arc::new(MemtableRangeContext::new(self.id, builder, predicate));
+        let context = Arc::new(MemtableRangeContext::new(self.id, builder, filter_plan));
 
         let range_stats = self.stats();
         let range = MemtableRange::new(context, range_stats);

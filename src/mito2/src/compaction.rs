@@ -59,7 +59,8 @@ use crate::error::{
 };
 use crate::metrics::{COMPACTION_STAGE_ELAPSED, INFLIGHT_COMPACTION_COUNT};
 use crate::read::projection::ProjectionMapper;
-use crate::read::scan_region::{PredicateGroup, ScanInput};
+use crate::read::filter_plan::FilterPlan;
+use crate::read::scan_region::ScanInput;
 use crate::read::seq_scan::SeqScan;
 use crate::read::{BoxedBatchReader, BoxedRecordBatchStream};
 use crate::region::options::{MergeMode, RegionOptions};
@@ -755,19 +756,26 @@ impl CompactionSstReaderBuilder<'_> {
         // This serves as a workaround of https://github.com/GreptimeTeam/greptimedb/issues/3944
         // by converting time ranges into predicate.
         if let Some(time_range) = self.time_range {
-            scan_input =
-                scan_input.with_predicate(time_range_to_predicate(time_range, &self.metadata)?);
+            let filter_plan = time_range_to_filter_plan(
+                time_range,
+                &self.metadata,
+                self.append_mode,
+                self.merge_mode,
+            )?;
+            scan_input = scan_input.with_filter_plan(Arc::new(filter_plan));
         }
 
         Ok(scan_input)
     }
 }
 
-/// Converts time range to predicates so that rows outside the range will be filtered.
-fn time_range_to_predicate(
+/// Converts time range to a FilterPlan so that rows outside the range will be filtered.
+fn time_range_to_filter_plan(
     range: TimestampRange,
     metadata: &RegionMetadataRef,
-) -> Result<PredicateGroup> {
+    append_mode: bool,
+    merge_mode: MergeMode,
+) -> Result<FilterPlan> {
     let ts_col = metadata.time_index_column();
 
     // safety: time index column's type must be a valid timestamp type.
@@ -801,12 +809,11 @@ fn time_range_to_predicate(
             ]
         }
         (None, None) => {
-            return Ok(PredicateGroup::default());
+            return Ok(FilterPlan::default());
         }
     };
 
-    let predicate = PredicateGroup::new(metadata, &exprs)?;
-    Ok(predicate)
+    FilterPlan::new(metadata, &exprs, append_mode, merge_mode)
 }
 
 fn ts_to_lit(ts: Timestamp, ts_col_unit: TimeUnit) -> Result<Expr> {
