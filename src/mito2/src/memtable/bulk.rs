@@ -488,7 +488,7 @@ impl Memtable for BulkMemtable {
             projection,
             filter_plan.prefilter_predicate().cloned(),
             options.for_flush,
-            options.skip_fields,
+            filter_plan.skip_fields_in_prefilter(),
         )?);
 
         // Adds ranges for regular parts and encoded parts

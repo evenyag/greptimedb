@@ -80,8 +80,6 @@ pub enum MemtableConfig {
 pub struct RangesOptions {
     /// Whether the ranges are being queried for flush.
     pub for_flush: bool,
-    /// Whether to skip field filters during prefiltering.
-    pub skip_fields: bool,
     /// Filter plan for prefilter/postfilter decisions.
     pub filter_plan: Arc<FilterPlan>,
     /// Sequence range to filter the data.
@@ -93,17 +91,9 @@ impl RangesOptions {
     pub fn for_flush() -> Self {
         Self {
             for_flush: true,
-            skip_fields: false,
             filter_plan: Arc::new(FilterPlan::default()),
             sequence: None,
         }
-    }
-
-    /// Sets whether to skip field filters during prefiltering.
-    #[must_use]
-    pub fn with_skip_fields(mut self, skip_fields: bool) -> Self {
-        self.skip_fields = skip_fields;
-        self
     }
 
     /// Sets the filter plan.

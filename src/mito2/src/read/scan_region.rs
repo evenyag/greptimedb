@@ -495,8 +495,6 @@ impl ScanRegion {
         let memtables = self.version.memtables.list_memtables();
         // Skip empty memtables and memtables out of time range.
         let mut mem_range_builders = Vec::new();
-        let skip_fields = !self.version.options.append_mode;
-
         for m in memtables {
             // check if memtable is empty by reading stats.
             let Some((start, end)) = m.stats().time_range() else {
@@ -514,8 +512,7 @@ impl ScanRegion {
                     .with_sequence(SequenceRange::new(
                         self.request.memtable_min_sequence,
                         self.request.memtable_max_sequence,
-                    ))
-                    .with_skip_fields(skip_fields),
+                    )),
             )?;
             mem_range_builders.extend(ranges_in_memtable.ranges.into_values().map(|v| {
                 let stats = v.stats().clone();
