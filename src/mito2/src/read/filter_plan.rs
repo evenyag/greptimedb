@@ -26,6 +26,7 @@ use std::sync::Arc;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
+use datatypes::schema::Schema;
 use partition::expr::PartitionExpr;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadata;
@@ -37,6 +38,7 @@ use crate::region::options::MergeMode;
 use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplierRef;
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplierRef;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
+use crate::sst::parquet::file_range::PartitionFilterContext;
 
 /// Unified filter plan that centralizes all filter decisions into prefilter and postfilter phases.
 #[derive(Default)]
@@ -74,6 +76,9 @@ pub struct FilterPlan {
 
     /// Whether to skip field filters in prefilter (true for non-append mode).
     skip_fields_in_prefilter: bool,
+    /// Partition filter context for postfilter evaluation using physical expressions.
+    /// Set when partition expr references field columns in non-append mode.
+    partition_postfilter: Option<PartitionFilterContext>,
 }
 
 impl FilterPlan {
@@ -150,24 +155,57 @@ impl FilterPlan {
         }
 
         // --- Check if partition expr references field columns ---
+        // If we can't extract columns, conservatively treat it as referencing fields.
         let partition_references_field = if let Some(partition_expr) = &partition_logical_expr {
             let mut partition_cols = HashSet::new();
-            let _ = expr_to_columns(partition_expr, &mut partition_cols);
-            partition_cols
-                .iter()
-                .any(|col| field_column_names.contains(col.name.as_str()))
+            if expr_to_columns(partition_expr, &mut partition_cols).is_err() {
+                true
+            } else {
+                partition_cols
+                    .iter()
+                    .any(|col| field_column_names.contains(col.name.as_str()))
+            }
         } else {
             false
         };
 
         // If partition expr references field columns and we're not in append mode,
-        // it also needs to go in postfilter
-        if !append_mode
+        // build a PartitionFilterContext for postfilter evaluation using physical expressions.
+        // SimpleFilterEvaluator can't handle compound expressions like `a >= 5 AND a < 99`,
+        // so we use DataFusion physical expressions instead.
+        let partition_postfilter = if !append_mode
             && partition_references_field
-            && let Some(partition_expr) = &partition_logical_expr
+            && let Some(partition_expr) = &region_partition_expr
         {
-            postfilter_exprs.push(partition_expr.clone());
-        }
+            // Collect referenced column names
+            let partition_logical = partition_logical_expr.as_ref().unwrap();
+            let mut partition_cols = HashSet::new();
+            let _ = expr_to_columns(partition_logical, &mut partition_cols);
+            let referenced_names: HashSet<&str> =
+                partition_cols.iter().map(|c| c.name.as_str()).collect();
+
+            // Build a minimal schema from metadata for referenced columns
+            let column_schemas: Vec<_> = metadata
+                .column_metadatas
+                .iter()
+                .filter(|col| referenced_names.contains(col.column_schema.name.as_str()))
+                .map(|col| col.column_schema.clone())
+                .collect();
+            let partition_schema = Arc::new(Schema::new(column_schemas));
+
+            let region_partition_physical_expr = partition_expr
+                .try_as_physical_expr(partition_schema.arrow_schema())
+                .context(InvalidPartitionExprSnafu {
+                    expr: format!("{:?}", partition_expr),
+                })?;
+
+            Some(PartitionFilterContext {
+                region_partition_physical_expr,
+                partition_schema,
+            })
+        } else {
+            None
+        };
 
         // --- Build predicates ---
         let skip_fields_in_prefilter = !append_mode;
@@ -220,6 +258,7 @@ impl FilterPlan {
             bloom_filter_index_appliers: [None, None],
             fulltext_index_appliers: [None, None],
             skip_fields_in_prefilter,
+            partition_postfilter,
         })
     }
 
@@ -263,14 +302,20 @@ impl FilterPlan {
         self.prefilter_predicate_without_region.as_ref()
     }
 
-    /// Returns true if postfilter is needed (non-append mode with field filters).
+    /// Returns true if postfilter is needed (non-append mode with field filters or
+    /// field-referencing partition expr).
     pub(crate) fn needs_postfilter(&self) -> bool {
-        !self.postfilter_exprs.is_empty()
+        !self.postfilter_exprs.is_empty() || self.partition_postfilter.is_some()
     }
 
     /// Returns the postfilter exprs for post-dedup evaluation.
     pub(crate) fn postfilter_exprs(&self) -> &[Expr] {
         &self.postfilter_exprs
+    }
+
+    /// Returns the partition filter context for postfilter evaluation.
+    pub(crate) fn partition_postfilter(&self) -> Option<&PartitionFilterContext> {
+        self.partition_postfilter.as_ref()
     }
 
     /// Returns whether to skip field filters in prefilter phase.
@@ -503,9 +548,12 @@ mod tests {
 
         let plan = FilterPlan::new(&metadata, &exprs, false, MergeMode::LastRow).unwrap();
 
-        // The field-referencing partition expr should be in postfilter
+        // The field-referencing partition expr should be handled via partition_postfilter
         assert!(plan.needs_postfilter());
-        assert_eq!(plan.postfilter_exprs().len(), 1);
+        // postfilter_exprs is empty because the partition expr is handled by physical expr
+        assert_eq!(plan.postfilter_exprs().len(), 0);
+        // partition_postfilter should be set
+        assert!(plan.partition_postfilter().is_some());
 
         // Prefilter predicate should NOT include the partition expr (only user exprs)
         let prefilter = plan.prefilter_predicate().unwrap();

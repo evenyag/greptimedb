@@ -28,16 +28,22 @@ use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use snafu::ResultExt;
+use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 
 use crate::error::{ComputeArrowSnafu, RecordBatchSnafu, Result};
 use crate::read::{Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream};
+use crate::sst::parquet::file_range::PartitionFilterContext;
 
 /// A reader that applies field filters to batches after merge/dedup.
 pub struct PostFilterReader {
     inner: BoxedBatchReader,
     /// Field filter evaluators, each paired with its column_id.
     field_filters: Vec<(ColumnId, SimpleFilterEvaluator)>,
+    /// Partition filter context for physical expression evaluation.
+    partition_filter: Option<PartitionFilterContext>,
+    /// Region metadata, needed for building RecordBatch from Batch for partition filter.
+    metadata: RegionMetadataRef,
     /// Number of rows filtered out by this reader.
     rows_filtered: usize,
 }
@@ -47,10 +53,13 @@ impl PostFilterReader {
     ///
     /// `postfilter_exprs` are field-referencing expressions that should be applied
     /// after deduplication. Each is converted to a `SimpleFilterEvaluator` if possible.
+    /// `partition_filter` is an optional partition filter using physical expressions
+    /// for compound filter evaluation.
     pub fn new(
         inner: BoxedBatchReader,
         postfilter_exprs: &[Expr],
-        metadata: &store_api::metadata::RegionMetadata,
+        metadata: RegionMetadataRef,
+        partition_filter: Option<PartitionFilterContext>,
     ) -> Self {
         let mut field_filters = Vec::new();
         for expr in postfilter_exprs {
@@ -65,6 +74,8 @@ impl PostFilterReader {
         Self {
             inner,
             field_filters,
+            partition_filter,
+            metadata,
             rows_filtered: 0,
         }
     }
@@ -80,7 +91,7 @@ impl PostFilterReader {
 impl BatchReader for PostFilterReader {
     async fn next_batch(&mut self) -> Result<Option<Batch>> {
         while let Some(mut batch) = self.inner.next_batch().await? {
-            if self.field_filters.is_empty() {
+            if self.field_filters.is_empty() && self.partition_filter.is_none() {
                 return Ok(Some(batch));
             }
 
@@ -95,6 +106,17 @@ impl BatchReader for PostFilterReader {
                     mask = mask.bitand(&result);
                 }
                 // If the field column is not present in the batch, skip this filter
+            }
+
+            // Apply partition filter using physical expressions
+            if let Some(partition_filter) = &self.partition_filter {
+                let record_batch = partition_filter.build_record_batch_from_batch(
+                    &mut batch,
+                    &self.metadata,
+                    None, // No codec needed: postfilter partition expr only references fields
+                )?;
+                let partition_mask = partition_filter.evaluate(&record_batch)?;
+                mask = mask.bitand(&partition_mask);
             }
 
             batch.filter(&BooleanArray::from(mask).into())?;
@@ -117,6 +139,8 @@ pub struct FlatPostFilterStream {
     inner: BoxedRecordBatchStream,
     /// Field filter evaluators, each paired with its column name.
     field_filters: Vec<(String, SimpleFilterEvaluator)>,
+    /// Partition filter context for physical expression evaluation.
+    partition_filter: Option<PartitionFilterContext>,
 }
 
 impl FlatPostFilterStream {
@@ -125,6 +149,7 @@ impl FlatPostFilterStream {
         inner: BoxedRecordBatchStream,
         postfilter_exprs: &[Expr],
         metadata: &store_api::metadata::RegionMetadata,
+        partition_filter: Option<PartitionFilterContext>,
     ) -> Self {
         let mut field_filters = Vec::new();
         for expr in postfilter_exprs {
@@ -138,6 +163,7 @@ impl FlatPostFilterStream {
         Self {
             inner,
             field_filters,
+            partition_filter,
         }
     }
 
@@ -150,7 +176,7 @@ impl FlatPostFilterStream {
                     Err(e) => return Some((Err(e), this)),
                 };
 
-                if this.field_filters.is_empty() {
+                if this.field_filters.is_empty() && this.partition_filter.is_none() {
                     return Some((Ok(batch), this));
                 }
 
@@ -174,6 +200,13 @@ impl FlatPostFilterStream {
             }
         }
 
+        // Apply partition filter using physical expressions
+        if let Some(partition_filter) = &self.partition_filter {
+            let projected = partition_filter.project_record_batch(batch)?;
+            let partition_mask = partition_filter.evaluate(&projected)?;
+            mask = mask.bitand(&partition_mask);
+        }
+
         if mask.count_set_bits() == 0 {
             return Ok(None);
         }
@@ -192,6 +225,8 @@ impl FlatPostFilterStream {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use api::v1::OpType;
     use datafusion_common::ScalarValue;
     use datafusion_expr::{col, lit};
@@ -260,7 +295,8 @@ mod tests {
             index: 0,
         });
 
-        let mut post_reader = PostFilterReader::new(reader, &[], &metadata);
+        let metadata = Arc::new(metadata);
+        let mut post_reader = PostFilterReader::new(reader, &[], metadata, None);
         let result = post_reader.next_batch().await.unwrap().unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(post_reader.rows_filtered(), 0);
@@ -311,7 +347,8 @@ mod tests {
 
         // Filter: v0 > 15
         let exprs = vec![col("v0").gt(lit(ScalarValue::UInt64(Some(15))))];
-        let mut post_reader = PostFilterReader::new(reader, &exprs, &metadata);
+        let metadata = Arc::new(metadata);
+        let mut post_reader = PostFilterReader::new(reader, &exprs, metadata, None);
         let result = post_reader.next_batch().await.unwrap().unwrap();
         assert_eq!(result.num_rows(), 2); // Only rows with v0=20 and v0=30
         assert_eq!(post_reader.rows_filtered(), 1);

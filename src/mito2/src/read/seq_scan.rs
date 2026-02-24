@@ -289,7 +289,8 @@ impl SeqScan {
             Box::new(PostFilterReader::new(
                 reader,
                 stream_ctx.input.filter_plan.postfilter_exprs(),
-                stream_ctx.input.mapper.metadata(),
+                stream_ctx.input.mapper.metadata().clone(),
+                stream_ctx.input.filter_plan.partition_postfilter().cloned(),
             )) as BoxedBatchReader
         } else {
             reader
@@ -363,6 +364,7 @@ impl SeqScan {
                 reader,
                 stream_ctx.input.filter_plan.postfilter_exprs(),
                 stream_ctx.input.mapper.metadata(),
+                stream_ctx.input.filter_plan.partition_postfilter().cloned(),
             )
             .into_stream()
         } else {

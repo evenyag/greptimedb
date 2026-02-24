@@ -33,7 +33,7 @@ use parquet::arrow::arrow_reader::RowSelection;
 use parquet::file::metadata::ParquetMetaData;
 use snafu::{OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
-use store_api::metadata::RegionMetadataRef;
+use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::{ColumnId, TimeSeriesRowSelector};
 use table::predicate::Predicate;
 
@@ -345,11 +345,128 @@ impl FileRangeContext {
 }
 
 /// Context for partition expression filtering.
+#[derive(Clone)]
 pub(crate) struct PartitionFilterContext {
     pub(crate) region_partition_physical_expr: Arc<dyn PhysicalExpr>,
     /// Schema containing only columns referenced by the partition expression.
     /// This is used to build a minimal RecordBatch for partition filter evaluation.
     pub(crate) partition_schema: Arc<Schema>,
+}
+
+impl PartitionFilterContext {
+    /// Evaluates the partition filter against the input `RecordBatch`.
+    pub(crate) fn evaluate(&self, record_batch: &RecordBatch) -> Result<BooleanBuffer> {
+        let columnar_value = self
+            .region_partition_physical_expr
+            .evaluate(record_batch)
+            .context(EvalPartitionFilterSnafu)?;
+        let array = columnar_value
+            .into_array(record_batch.num_rows())
+            .context(EvalPartitionFilterSnafu)?;
+        let boolean_array =
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context(UnexpectedSnafu {
+                    reason: "Failed to downcast to BooleanArray".to_string(),
+                })?;
+
+        Ok(boolean_array.values().clone())
+    }
+
+    /// Builds a `RecordBatch` from the input `Batch` matching the partition schema.
+    ///
+    /// This is used for partition expression evaluation. The schema should only contain
+    /// the columns referenced by the partition expression to minimize overhead.
+    /// Pass `codec` for tag decoding; `None` if no tags are referenced.
+    pub(crate) fn build_record_batch_from_batch(
+        &self,
+        input: &mut Batch,
+        metadata: &RegionMetadata,
+        codec: Option<&dyn PrimaryKeyCodec>,
+    ) -> Result<RecordBatch> {
+        let arrow_schema = self.partition_schema.arrow_schema();
+        let mut columns = Vec::with_capacity(arrow_schema.fields().len());
+
+        for field in arrow_schema.fields() {
+            let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
+
+            let Some(column_id) = column_id else {
+                return UnexpectedSnafu {
+                    reason: format!(
+                        "Partition pruning schema expects column '{}' but it is missing in \
+                         region metadata",
+                        field.name()
+                    ),
+                }
+                .fail();
+            };
+
+            // 1. Check if it's a tag.
+            if let Some(pk_index) = metadata.primary_key_index(column_id) {
+                let codec = codec.context(UnexpectedSnafu {
+                    reason: "Codec required for tag decoding in partition filter",
+                })?;
+                if input.pk_values().is_none() {
+                    input.set_pk_values(codec.decode(input.primary_key()).context(DecodeSnafu)?);
+                }
+                let pk_values = input.pk_values().unwrap();
+                let value = match pk_values {
+                    CompositeValues::Dense(v) => &v[pk_index].1,
+                    CompositeValues::Sparse(v) => v.get_or_null(column_id),
+                };
+                let concrete_type = ConcreteDataType::from_arrow_type(field.data_type());
+                let arrow_scalar = value
+                    .try_to_scalar_value(&concrete_type)
+                    .context(DataTypeMismatchSnafu)?;
+                let array = arrow_scalar
+                    .to_array_of_size(input.num_rows())
+                    .context(EvalPartitionFilterSnafu)?;
+                columns.push(array);
+            } else if metadata.time_index_column().column_id == column_id {
+                // 2. Check if it's the timestamp column.
+                columns.push(input.timestamps().to_arrow_array());
+            } else if let Some(batch_col) = input.field_col_value(column_id) {
+                // 3. Check if it's a field column.
+                columns.push(batch_col.data.to_arrow_array());
+            } else {
+                return UnexpectedSnafu {
+                    reason: format!(
+                        "Partition pruning schema expects column '{}' (id {}) but it is not \
+                         present in input batch",
+                        field.name(),
+                        column_id
+                    ),
+                }
+                .fail();
+            }
+        }
+
+        RecordBatch::try_new(arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Projects the input `RecordBatch` to match the partition schema by looking up
+    /// columns by name.
+    pub(crate) fn project_record_batch(&self, input: &RecordBatch) -> Result<RecordBatch> {
+        let arrow_schema = self.partition_schema.arrow_schema();
+        let mut columns = Vec::with_capacity(arrow_schema.fields().len());
+
+        for field in arrow_schema.fields() {
+            let idx = input.schema().index_of(field.name()).map_err(|_| {
+                crate::error::UnexpectedSnafu {
+                    reason: format!(
+                        "Partition pruning schema expects column '{}' but it is missing in \
+                         input RecordBatch",
+                        field.name()
+                    ),
+                }
+                .build()
+            })?;
+            columns.push(input.column(idx).clone());
+        }
+
+        RecordBatch::try_new(arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
+    }
 }
 
 /// Common fields for a range to read and filter batches.
@@ -485,9 +602,12 @@ impl RangeBase {
 
         // Apply partition filter
         if let Some(partition_filter) = &self.partition_filter {
-            let record_batch = self
-                .build_record_batch_for_pruning(&mut input, &partition_filter.partition_schema)?;
-            let partition_mask = self.evaluate_partition_filter(&record_batch, partition_filter)?;
+            let record_batch = partition_filter.build_record_batch_from_batch(
+                &mut input,
+                self.read_format.metadata(),
+                Some(self.codec.as_ref()),
+            )?;
+            let partition_mask = partition_filter.evaluate(&record_batch)?;
             mask = mask.bitand(&partition_mask);
         }
 
@@ -519,7 +639,7 @@ impl RangeBase {
                 &partition_filter.partition_schema,
                 &mut tag_decode_state,
             )?;
-            let partition_mask = self.evaluate_partition_filter(&record_batch, partition_filter)?;
+            let partition_mask = partition_filter.evaluate(&record_batch)?;
             mask = mask.bitand(&partition_mask);
         }
 
@@ -647,108 +767,6 @@ impl RangeBase {
             .insert(column_id, tag_column.clone());
 
         Ok(Some(tag_column))
-    }
-
-    /// Evaluates the partition filter against the input `RecordBatch`.
-    fn evaluate_partition_filter(
-        &self,
-        record_batch: &RecordBatch,
-        partition_filter: &PartitionFilterContext,
-    ) -> Result<BooleanBuffer> {
-        let columnar_value = partition_filter
-            .region_partition_physical_expr
-            .evaluate(record_batch)
-            .context(EvalPartitionFilterSnafu)?;
-        let array = columnar_value
-            .into_array(record_batch.num_rows())
-            .context(EvalPartitionFilterSnafu)?;
-        let boolean_array =
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .context(UnexpectedSnafu {
-                    reason: "Failed to downcast to BooleanArray".to_string(),
-                })?;
-
-        Ok(boolean_array.values().clone())
-    }
-
-    /// Builds a `RecordBatch` from the input `Batch` matching the given schema.
-    ///
-    /// This is used for partition expression evaluation. The schema should only contain
-    /// the columns referenced by the partition expression to minimize overhead.
-    fn build_record_batch_for_pruning(
-        &self,
-        input: &mut Batch,
-        schema: &Arc<Schema>,
-    ) -> Result<RecordBatch> {
-        let arrow_schema = schema.arrow_schema();
-        let mut columns = Vec::with_capacity(arrow_schema.fields().len());
-
-        // Decode primary key if necessary.
-        if input.pk_values().is_none() {
-            input.set_pk_values(
-                self.codec
-                    .decode(input.primary_key())
-                    .context(DecodeSnafu)?,
-            );
-        }
-
-        for field in arrow_schema.fields() {
-            let metadata = self.read_format.metadata();
-            let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
-
-            // Partition pruning schema should be a subset of the input batch schema.
-            let Some(column_id) = column_id else {
-                return UnexpectedSnafu {
-                    reason: format!(
-                        "Partition pruning schema expects column '{}' but it is missing in \
-                         region metadata",
-                        field.name()
-                    ),
-                }
-                .fail();
-            };
-
-            // 1. Check if it's a tag.
-            if let Some(pk_index) = metadata.primary_key_index(column_id) {
-                let pk_values = input.pk_values().unwrap();
-                let value = match pk_values {
-                    CompositeValues::Dense(v) => &v[pk_index].1,
-                    CompositeValues::Sparse(v) => v.get_or_null(column_id),
-                };
-                let concrete_type = ConcreteDataType::from_arrow_type(field.data_type());
-                let arrow_scalar = value
-                    .try_to_scalar_value(&concrete_type)
-                    .context(DataTypeMismatchSnafu)?;
-                let array = arrow_scalar
-                    .to_array_of_size(input.num_rows())
-                    .context(EvalPartitionFilterSnafu)?;
-                columns.push(array);
-            } else if metadata.time_index_column().column_id == column_id {
-                // 2. Check if it's the timestamp column.
-                columns.push(input.timestamps().to_arrow_array());
-            } else if let Some(field_index) = self
-                .read_format
-                .as_primary_key()
-                .and_then(|f| f.field_index_by_id(column_id))
-            {
-                // 3. Check if it's a field column.
-                columns.push(input.fields()[field_index].data.to_arrow_array());
-            } else {
-                return UnexpectedSnafu {
-                    reason: format!(
-                        "Partition pruning schema expects column '{}' (id {}) but it is not \
-                         present in input batch",
-                        field.name(),
-                        column_id
-                    ),
-                }
-                .fail();
-            }
-        }
-
-        RecordBatch::try_new(arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
     }
 
     /// Projects the input `RecordBatch` to match the given schema.
