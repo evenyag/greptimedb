@@ -596,11 +596,12 @@ impl MemtableRange {
     ) -> Result<BoxedBatchIterator> {
         let iter = self.context.builder.build(metrics)?;
         let time_filters = self.context.filter_plan.time_filters();
+        let field_filters = self.context.filter_plan.field_filters();
         Ok(Box::new(PruneTimeIterator::new(
             iter,
             time_range,
             time_filters,
-            None,
+            field_filters,
         )))
     }
 

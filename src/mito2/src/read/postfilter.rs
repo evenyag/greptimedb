@@ -70,8 +70,8 @@ impl PostFilterReader {
     }
 
     /// Returns the number of rows filtered out.
-    #[allow(dead_code)]
-    pub fn rows_filtered(&self) -> usize {
+    #[cfg(test)]
+    fn rows_filtered(&self) -> usize {
         self.rows_filtered
     }
 }

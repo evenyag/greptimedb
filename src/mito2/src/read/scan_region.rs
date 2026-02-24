@@ -1319,12 +1319,6 @@ impl ScanInput {
         rows
     }
 
-    /// Returns the unified filter plan.
-    #[allow(dead_code)]
-    pub(crate) fn filter_plan(&self) -> &Arc<FilterPlan> {
-        &self.filter_plan
-    }
-
     /// Returns number of memtables to scan.
     pub(crate) fn num_memtables(&self) -> usize {
         self.memtables.len()

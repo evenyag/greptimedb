@@ -39,7 +39,6 @@ use crate::sst::index::fulltext_index::applier::FulltextIndexApplierRef;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 
 /// Unified filter plan that centralizes all filter decisions into prefilter and postfilter phases.
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct FilterPlan {
     // --- Categorized SimpleFilterEvaluators ---
@@ -53,16 +52,12 @@ pub struct FilterPlan {
     // --- Partition expression ---
     /// Region partition expression.
     region_partition_expr: Option<PartitionExpr>,
-    /// Partition expr as logical Expr (for memtable evaluation).
-    partition_logical_expr: Option<Expr>,
 
     // --- Predicates ---
     /// Predicate for prefilter phase (tag + time + partition expr; also field in append mode).
     prefilter_predicate: Option<Predicate>,
     /// Predicate excluding region partition expr (for files sharing the same partition).
     prefilter_predicate_without_region: Option<Predicate>,
-    /// Predicate for postfilter phase (field filters only, None in append mode).
-    postfilter_predicate: Option<Predicate>,
     /// Field filter exprs for post-dedup evaluation.
     postfilter_exprs: Vec<Expr>,
 
@@ -81,7 +76,6 @@ pub struct FilterPlan {
     skip_fields_in_prefilter: bool,
 }
 
-#[allow(dead_code)]
 impl FilterPlan {
     /// Creates a new `FilterPlan` by classifying filter expressions.
     ///
@@ -200,13 +194,6 @@ impl FilterPlan {
             Some(Predicate::new(exprs.to_vec()))
         };
 
-        // Postfilter predicate
-        let postfilter_predicate = if postfilter_exprs.is_empty() {
-            None
-        } else {
-            Some(Predicate::new(postfilter_exprs.clone()))
-        };
-
         // --- Build filter evaluators ---
         let time_filters = if time_evaluators.is_empty() {
             None
@@ -224,10 +211,8 @@ impl FilterPlan {
             time_filters,
             field_filters,
             region_partition_expr,
-            partition_logical_expr,
             prefilter_predicate,
             prefilter_predicate_without_region,
-            postfilter_predicate,
             postfilter_exprs,
             non_field_exprs: non_field_filter_exprs,
             field_exprs: field_filter_exprs,
@@ -266,12 +251,6 @@ impl FilterPlan {
         self.time_filters.clone()
     }
 
-    /// Returns field filters paired with column IDs for memtable prefiltering in append mode.
-    /// Returns `None` in non-append mode.
-    pub(crate) fn field_filters(&self) -> Option<Arc<Vec<(ColumnId, SimpleFilterEvaluator)>>> {
-        self.field_filters.clone()
-    }
-
     /// Returns the prefilter predicate (all exprs + partition expr).
     /// Used for SST row group pruning.
     pub(crate) fn prefilter_predicate(&self) -> Option<&Predicate> {
@@ -294,11 +273,6 @@ impl FilterPlan {
         &self.postfilter_exprs
     }
 
-    /// Returns the postfilter predicate.
-    pub(crate) fn postfilter_predicate(&self) -> Option<&Predicate> {
-        self.postfilter_predicate.as_ref()
-    }
-
     /// Returns whether to skip field filters in prefilter phase.
     pub(crate) fn skip_fields_in_prefilter(&self) -> bool {
         self.skip_fields_in_prefilter
@@ -307,11 +281,6 @@ impl FilterPlan {
     /// Returns the region partition expression.
     pub(crate) fn region_partition_expr(&self) -> Option<&PartitionExpr> {
         self.region_partition_expr.as_ref()
-    }
-
-    /// Returns the partition logical expr for memtable partition filtering.
-    pub(crate) fn partition_logical_expr(&self) -> Option<&Expr> {
-        self.partition_logical_expr.as_ref()
     }
 
     /// Returns exprs that do NOT reference field columns (for index applier[0]).
@@ -363,6 +332,12 @@ impl FilterPlan {
         appliers: [Option<FulltextIndexApplierRef>; 2],
     ) {
         self.fulltext_index_appliers = appliers;
+    }
+
+    /// Returns field filters paired with column IDs for memtable prefiltering in append mode.
+    /// Returns `None` in non-append mode.
+    pub(crate) fn field_filters(&self) -> Option<Arc<Vec<(ColumnId, SimpleFilterEvaluator)>>> {
+        self.field_filters.clone()
     }
 }
 
