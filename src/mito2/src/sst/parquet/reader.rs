@@ -541,6 +541,22 @@ impl ParquetReaderBuilder {
         let mut referenced_columns = HashSet::new();
         region_partition_expr.collect_column_names(&mut referenced_columns);
 
+        // Don't apply partition filter in prefilter when it references
+        // field columns in non-append mode. It will be applied in postfilter.
+        if self.skip_fields {
+            let field_column_names: HashSet<&str> = read_format
+                .metadata()
+                .field_columns()
+                .map(|col| col.column_schema.name.as_str())
+                .collect();
+            let references_field = referenced_columns
+                .iter()
+                .any(|name| field_column_names.contains(name.as_str()));
+            if references_field {
+                return Ok(None);
+            }
+        }
+
         // Build a partition_schema containing only referenced columns.
         let is_flat = read_format.as_flat().is_some();
         let partition_schema = Arc::new(datatypes::schema::Schema::new(

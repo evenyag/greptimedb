@@ -179,8 +179,12 @@ impl FilterPlan {
         let skip_fields_in_prefilter = !append_mode;
 
         // Prefilter predicate: all exprs + partition expr
+        // Skip partition expr in prefilter if it references field columns
+        // and region is not append-only — field filters must run after dedup.
         let mut prefilter_all_exprs = exprs.to_vec();
-        if let Some(partition_expr) = &partition_logical_expr {
+        if let Some(partition_expr) = &partition_logical_expr
+            && (append_mode || !partition_references_field)
+        {
             prefilter_all_exprs.push(partition_expr.clone());
         }
         let prefilter_predicate = if prefilter_all_exprs.is_empty() {
@@ -470,6 +474,90 @@ mod tests {
         assert_eq!(plan.non_field_exprs().len(), 2);
         // Field exprs: field0
         assert_eq!(plan.field_exprs().len(), 1);
+    }
+
+    /// Creates test metadata with a partition expr that references a field column (field0 >= 5.0).
+    fn test_metadata_with_field_partition_expr() -> RegionMetadata {
+        use partition::expr::{Operand, PartitionExpr as PExpr, RestrictedOp};
+
+        let partition_expr = PExpr::new(
+            Operand::Column("field0".to_string()),
+            RestrictedOp::GtEq,
+            Operand::Value(datatypes::value::Value::Float64(
+                datatypes::value::OrderedFloat(5.0),
+            )),
+        );
+        let json = partition_expr.as_json_str().unwrap();
+
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 1));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 0,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new("tag0", ConcreteDataType::string_datatype(), true),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "field0",
+                    ConcreteDataType::float64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 2,
+            })
+            .primary_key(vec![1])
+            .partition_expr_json(Some(json));
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_filter_plan_non_append_field_partition_expr() {
+        use datafusion_expr::{col, lit};
+
+        let metadata = test_metadata_with_field_partition_expr();
+        let exprs = vec![col("ts").gt_eq(lit(100i64)), col("tag0").eq(lit("foo"))];
+
+        let plan = FilterPlan::new(&metadata, &exprs, false, MergeMode::LastRow).unwrap();
+
+        // The field-referencing partition expr should be in postfilter
+        assert!(plan.needs_postfilter());
+        assert_eq!(plan.postfilter_exprs().len(), 1);
+
+        // Prefilter predicate should NOT include the partition expr (only user exprs)
+        let prefilter = plan.prefilter_predicate().unwrap();
+        // Should have only the 2 user exprs, not the partition expr
+        assert_eq!(prefilter.exprs().len(), 2);
+
+        // Prefilter without region should also have 2 user exprs
+        let prefilter_no_region = plan.prefilter_predicate_without_region().unwrap();
+        assert_eq!(prefilter_no_region.exprs().len(), 2);
+    }
+
+    #[test]
+    fn test_filter_plan_append_field_partition_expr() {
+        use datafusion_expr::{col, lit};
+
+        let metadata = test_metadata_with_field_partition_expr();
+        let exprs = vec![col("ts").gt_eq(lit(100i64)), col("tag0").eq(lit("foo"))];
+
+        let plan = FilterPlan::new(&metadata, &exprs, true, MergeMode::LastRow).unwrap();
+
+        // In append mode, field-referencing partition expr is safe in prefilter
+        assert!(!plan.needs_postfilter());
+        assert!(plan.postfilter_exprs().is_empty());
+
+        // Prefilter predicate should include user exprs + partition expr
+        let prefilter = plan.prefilter_predicate().unwrap();
+        assert_eq!(prefilter.exprs().len(), 3);
     }
 
     #[test]

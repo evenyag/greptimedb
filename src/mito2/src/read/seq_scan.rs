@@ -284,17 +284,16 @@ impl SeqScan {
             Box::new(reader) as _
         };
 
-        // Apply postfilter for field filters after dedup (non-append mode only, not compaction).
-        let reader =
-            if !stream_ctx.input.compaction && stream_ctx.input.filter_plan.needs_postfilter() {
-                Box::new(PostFilterReader::new(
-                    reader,
-                    stream_ctx.input.filter_plan.postfilter_exprs(),
-                    stream_ctx.input.mapper.metadata(),
-                )) as BoxedBatchReader
-            } else {
-                reader
-            };
+        // Apply postfilter for field filters after dedup.
+        let reader = if stream_ctx.input.filter_plan.needs_postfilter() {
+            Box::new(PostFilterReader::new(
+                reader,
+                stream_ctx.input.filter_plan.postfilter_exprs(),
+                stream_ctx.input.mapper.metadata(),
+            )) as BoxedBatchReader
+        } else {
+            reader
+        };
 
         let reader = match &stream_ctx.input.series_row_selector {
             Some(TimeSeriesRowSelector::LastRow) => Box::new(LastRowReader::new(reader)) as _,
@@ -358,18 +357,17 @@ impl SeqScan {
             Box::pin(reader.into_stream()) as _
         };
 
-        // Apply postfilter for field filters after dedup (non-append mode only, not compaction).
-        let reader =
-            if !stream_ctx.input.compaction && stream_ctx.input.filter_plan.needs_postfilter() {
-                FlatPostFilterStream::new(
-                    reader,
-                    stream_ctx.input.filter_plan.postfilter_exprs(),
-                    stream_ctx.input.mapper.metadata(),
-                )
-                .into_stream()
-            } else {
-                reader
-            };
+        // Apply postfilter for field filters after dedup.
+        let reader = if stream_ctx.input.filter_plan.needs_postfilter() {
+            FlatPostFilterStream::new(
+                reader,
+                stream_ctx.input.filter_plan.postfilter_exprs(),
+                stream_ctx.input.mapper.metadata(),
+            )
+            .into_stream()
+        } else {
+            reader
+        };
 
         Ok(reader)
     }
