@@ -30,6 +30,7 @@ use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRangeContextRef;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics, RowGroupReader};
 
+#[allow(dead_code)]
 pub enum Source {
     RowGroup(RowGroupReader),
     LastRow(RowGroupLastRowCachedReader),
@@ -67,6 +68,7 @@ impl PruneReader {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn new_with_last_row_reader(
         ctx: FileRangeContextRef,
         reader: RowGroupLastRowCachedReader,

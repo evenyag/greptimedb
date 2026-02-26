@@ -111,6 +111,7 @@ impl FileRange {
     }
 
     /// Returns true if [FileRange] selects all rows in row group.
+    #[allow(dead_code)]
     fn select_all(&self) -> bool {
         let rows_in_group = self
             .context
@@ -173,6 +174,7 @@ impl FileRange {
     }
 
     /// Returns a reader to read the [FileRange].
+    #[allow(dead_code)]
     pub(crate) async fn reader(
         &self,
         selector: Option<TimeSeriesRowSelector>,

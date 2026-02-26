@@ -37,6 +37,7 @@ use crate::read::Batch;
 use crate::read::flat_projection::FlatProjectionMapper;
 
 /// Only cache vector when its length `<=` this value.
+#[allow(dead_code)]
 const MAX_VECTOR_LENGTH_TO_CACHE: usize = 16384;
 
 /// Wrapper enum for different projection mapper implementations.
@@ -159,6 +160,7 @@ impl ProjectionMapper {
 }
 
 /// Handles projection and converts a projected [Batch] to a projected [RecordBatch].
+#[allow(dead_code)]
 pub struct PrimaryKeyProjectionMapper {
     /// Metadata of the region.
     metadata: RegionMetadataRef,
@@ -178,6 +180,7 @@ pub struct PrimaryKeyProjectionMapper {
     is_empty_projection: bool,
 }
 
+#[allow(dead_code)]
 impl PrimaryKeyProjectionMapper {
     /// Returns a new mapper with projection.
     /// If `projection` is empty, it outputs [RecordBatch] without any column but only a row count.
@@ -413,6 +416,7 @@ pub(crate) fn read_column_ids_from_projection(
 
 /// Index of a vector in a [Batch].
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum BatchIndex {
     /// Index in primary keys.
     Tag((usize, ColumnId)),
@@ -423,6 +427,7 @@ enum BatchIndex {
 }
 
 /// Gets a vector with repeated values from specific cache or creates a new one.
+#[allow(dead_code)]
 fn repeated_vector_with_cache(
     data_type: &ConcreteDataType,
     value: &Value,
@@ -450,6 +455,7 @@ fn repeated_vector_with_cache(
 }
 
 /// Returns a vector with repeated values.
+#[allow(dead_code)]
 fn new_repeated_vector(
     data_type: &ConcreteDataType,
     value: &Value,

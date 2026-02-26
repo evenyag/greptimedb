@@ -124,12 +124,8 @@ impl SeriesScan {
             self.scan_batch_in_partition(ctx, partition, metrics.clone(), metrics_set)?;
 
         let input = &self.stream_ctx.input;
-        let record_batch_stream = ConvertBatchStream::new(
-            batch_stream,
-            input.mapper.clone(),
-            input.cache_strategy.clone(),
-            metrics,
-        );
+        let record_batch_stream =
+            ConvertBatchStream::new(batch_stream, input.mapper.clone(), metrics);
 
         Ok(Box::pin(RecordBatchStreamWrapper::new(
             input.mapper.output_schema(),

@@ -89,6 +89,7 @@ impl<R: BatchReader> BatchReader for CompatReader<R> {
 }
 
 /// Helper to adapt schema of the batch to an expected schema.
+#[allow(dead_code)]
 pub(crate) enum CompatBatch {
     /// Adapter for primary key format.
     PrimaryKey(PrimaryKeyCompatBatch),
@@ -98,6 +99,7 @@ pub(crate) enum CompatBatch {
 
 impl CompatBatch {
     /// Returns the inner primary key batch adapter if this is a PrimaryKey format.
+    #[allow(dead_code)]
     pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyCompatBatch> {
         match self {
             CompatBatch::PrimaryKey(batch) => Some(batch),

@@ -25,16 +25,13 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use snafu::ResultExt;
 
-use crate::cache::CacheStrategy;
 use crate::error::Result;
-use crate::read::Batch;
 use crate::read::projection::ProjectionMapper;
 use crate::read::scan_util::PartitionMetrics;
 use crate::read::series_scan::SeriesBatch;
 
 /// All kinds of [`Batch`]es to produce in scanner.
 pub enum ScanBatch {
-    Normal(Batch),
     Series(SeriesBatch),
     RecordBatch(DfRecordBatch),
 }
@@ -45,7 +42,6 @@ pub type ScanBatchStream = BoxStream<'static, Result<ScanBatch>>;
 pub(crate) struct ConvertBatchStream {
     inner: ScanBatchStream,
     projection_mapper: Arc<ProjectionMapper>,
-    cache_strategy: CacheStrategy,
     partition_metrics: PartitionMetrics,
     buffer: Vec<DfRecordBatch>,
 }
@@ -54,13 +50,11 @@ impl ConvertBatchStream {
     pub(crate) fn new(
         inner: ScanBatchStream,
         projection_mapper: Arc<ProjectionMapper>,
-        cache_strategy: CacheStrategy,
         partition_metrics: PartitionMetrics,
     ) -> Self {
         Self {
             inner,
             projection_mapper,
-            cache_strategy,
             partition_metrics,
             buffer: Vec::new(),
         }
@@ -68,16 +62,6 @@ impl ConvertBatchStream {
 
     fn convert(&mut self, batch: ScanBatch) -> common_recordbatch::error::Result<RecordBatch> {
         match batch {
-            ScanBatch::Normal(batch) => {
-                // Safety: Only primary key format returns this batch.
-                let mapper = self.projection_mapper.as_primary_key().unwrap();
-
-                if batch.is_empty() {
-                    Ok(mapper.empty_record_batch())
-                } else {
-                    mapper.convert(&batch, &self.cache_strategy)
-                }
-            }
             ScanBatch::Series(series) => {
                 self.buffer.clear();
 

@@ -254,12 +254,8 @@ impl SeqScan {
         let input = &self.stream_ctx.input;
 
         let batch_stream = self.scan_flat_batch_in_partition(partition, metrics.clone())?;
-        let record_batch_stream = ConvertBatchStream::new(
-            batch_stream,
-            input.mapper.clone(),
-            input.cache_strategy.clone(),
-            metrics,
-        );
+        let record_batch_stream =
+            ConvertBatchStream::new(batch_stream, input.mapper.clone(), metrics);
 
         Ok(Box::pin(RecordBatchStreamWrapper::new(
             input.mapper.output_schema(),

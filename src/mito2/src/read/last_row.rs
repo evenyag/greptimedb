@@ -76,6 +76,7 @@ impl BatchReader for LastRowReader {
 /// If the last rows for current row group are already cached, this reader returns the cached value.
 /// If cache misses, [RowGroupLastRowReader] reads last rows from row group and updates the cache
 /// upon finish.
+#[allow(dead_code)]
 pub(crate) enum RowGroupLastRowCachedReader {
     /// Cache hit, reads last rows from cached value.
     Hit(LastRowCacheReader),
@@ -83,6 +84,7 @@ pub(crate) enum RowGroupLastRowCachedReader {
     Miss(RowGroupLastRowReader),
 }
 
+#[allow(dead_code)]
 impl RowGroupLastRowCachedReader {
     pub(crate) fn new(
         file_id: FileId,
@@ -178,6 +180,7 @@ pub(crate) struct RowGroupLastRowReader {
     take_index: UInt32Vector,
 }
 
+#[allow(dead_code)]
 impl RowGroupLastRowReader {
     fn new(key: SelectorResultKey, reader: RowGroupReader, cache_strategy: CacheStrategy) -> Self {
         Self {

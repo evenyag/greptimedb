@@ -1636,6 +1636,7 @@ impl RowGroupReaderBuilder {
         &self.parquet_meta
     }
 
+    #[allow(dead_code)]
     pub(crate) fn cache_strategy(&self) -> &CacheStrategy {
         &self.cache_strategy
     }
