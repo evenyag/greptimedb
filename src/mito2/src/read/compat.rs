@@ -1243,7 +1243,7 @@ mod tests {
             ],
             &[1, 3],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta, false).unwrap();
+        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1292,7 +1292,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta, false).unwrap();
+        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1337,7 +1337,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta, false).unwrap();
+        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1394,7 +1394,7 @@ mod tests {
             &[1],
         ));
         // tag_1, field_2, field_3
-        let mapper = ProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter(), false).unwrap();
+        let mapper = ProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter()).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
 
@@ -1407,7 +1407,7 @@ mod tests {
         .await;
 
         // tag_1, field_4, field_3
-        let mapper = ProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter(), false).unwrap();
+        let mapper = ProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter()).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[], 1000, 3)]);
 
@@ -1451,7 +1451,6 @@ mod tests {
         let mapper = ProjectionMapper::new_with_read_columns(
             &expect_meta,
             [1, 3, 2].into_iter(),
-            false,
             vec![1, 3, 2, 4],
         )
         .unwrap();
@@ -1499,7 +1498,7 @@ mod tests {
         expect_meta.primary_key_encoding = PrimaryKeyEncoding::Sparse;
         let expect_meta = Arc::new(expect_meta);
 
-        let mapper = ProjectionMapper::all(&expect_meta, false).unwrap();
+        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[

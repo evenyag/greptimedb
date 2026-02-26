@@ -68,8 +68,7 @@ impl ConvertBatchStream {
                 match series {
                     SeriesBatch::Flat(flat_batch) => {
                         self.buffer.reserve(flat_batch.batches.len());
-                        // Safety: Only flat format returns this batch.
-                        let mapper = self.projection_mapper.as_flat().unwrap();
+                        let mapper = self.projection_mapper.as_flat();
 
                         for batch in flat_batch.batches {
                             let record_batch = mapper.convert(&batch)?;
@@ -89,8 +88,7 @@ impl ConvertBatchStream {
                 ))
             }
             ScanBatch::RecordBatch(df_record_batch) => {
-                // Safety: Only flat format returns this batch.
-                let mapper = self.projection_mapper.as_flat().unwrap();
+                let mapper = self.projection_mapper.as_flat();
 
                 mapper.convert(&df_record_batch)
             }

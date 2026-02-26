@@ -53,51 +53,27 @@ impl ProjectionMapper {
     pub fn new(
         metadata: &RegionMetadataRef,
         projection: impl Iterator<Item = usize> + Clone,
-        flat_format: bool,
     ) -> Result<Self> {
-        if flat_format {
-            Ok(ProjectionMapper::Flat(FlatProjectionMapper::new(
-                metadata, projection,
-            )?))
-        } else {
-            Ok(ProjectionMapper::PrimaryKey(
-                PrimaryKeyProjectionMapper::new(metadata, projection)?,
-            ))
-        }
+        Ok(ProjectionMapper::Flat(FlatProjectionMapper::new(
+            metadata, projection,
+        )?))
     }
 
     /// Returns a new mapper with output projection and explicit read columns.
     pub fn new_with_read_columns(
         metadata: &RegionMetadataRef,
         projection: impl Iterator<Item = usize>,
-        flat_format: bool,
         read_column_ids: Vec<ColumnId>,
     ) -> Result<Self> {
         let projection: Vec<_> = projection.collect();
-        if flat_format {
-            Ok(ProjectionMapper::Flat(
-                FlatProjectionMapper::new_with_read_columns(metadata, projection, read_column_ids)?,
-            ))
-        } else {
-            Ok(ProjectionMapper::PrimaryKey(
-                PrimaryKeyProjectionMapper::new_with_read_columns(
-                    metadata,
-                    projection,
-                    read_column_ids,
-                )?,
-            ))
-        }
+        Ok(ProjectionMapper::Flat(
+            FlatProjectionMapper::new_with_read_columns(metadata, projection, read_column_ids)?,
+        ))
     }
 
     /// Returns a new mapper without projection.
-    pub fn all(metadata: &RegionMetadataRef, flat_format: bool) -> Result<Self> {
-        if flat_format {
-            Ok(ProjectionMapper::Flat(FlatProjectionMapper::all(metadata)?))
-        } else {
-            Ok(ProjectionMapper::PrimaryKey(
-                PrimaryKeyProjectionMapper::all(metadata)?,
-            ))
-        }
+    pub fn all(metadata: &RegionMetadataRef) -> Result<Self> {
+        Ok(ProjectionMapper::Flat(FlatProjectionMapper::all(metadata)?))
     }
 
     /// Returns the metadata that created the mapper.
@@ -110,10 +86,7 @@ impl ProjectionMapper {
 
     /// Returns true if the projection includes any tag columns.
     pub(crate) fn has_tags(&self) -> bool {
-        match self {
-            ProjectionMapper::PrimaryKey(m) => m.has_tags(),
-            ProjectionMapper::Flat(_) => false,
-        }
+        false
     }
 
     /// Returns ids of projected columns that we need to read
@@ -141,11 +114,11 @@ impl ProjectionMapper {
         }
     }
 
-    /// Returns the flat projection mapper or None if this is not a flat mapper.
-    pub fn as_flat(&self) -> Option<&FlatProjectionMapper> {
+    /// Returns the flat projection mapper.
+    pub fn as_flat(&self) -> &FlatProjectionMapper {
         match self {
-            ProjectionMapper::PrimaryKey(_) => None,
-            ProjectionMapper::Flat(m) => Some(m),
+            ProjectionMapper::PrimaryKey(_) => unreachable!("ProjectionMapper is flat-only"),
+            ProjectionMapper::Flat(m) => m,
         }
     }
 
@@ -550,7 +523,7 @@ mod tests {
                 .build(),
         );
         // Create the enum wrapper with default format (primary key)
-        let mapper = ProjectionMapper::all(&metadata, false).unwrap();
+        let mapper = ProjectionMapper::all(&metadata).unwrap();
         assert_eq!([0, 1, 2, 3, 4], mapper.column_ids());
         assert_eq!(
             [
@@ -611,7 +584,7 @@ mod tests {
                 .build(),
         );
         // Columns v1, k0
-        let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter(), false).unwrap();
+        let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter()).unwrap();
         assert_eq!([4, 1], mapper.column_ids());
         assert_eq!(
             [(4, ConcreteDataType::int64_datatype())],
@@ -649,7 +622,6 @@ mod tests {
         let mapper = ProjectionMapper::new_with_read_columns(
             &metadata,
             [4, 1].into_iter(),
-            false,
             vec![4, 1, 3],
         )
         .unwrap();
@@ -683,7 +655,7 @@ mod tests {
                 .build(),
         );
         // Empty projection
-        let mapper = ProjectionMapper::new(&metadata, [].into_iter(), false).unwrap();
+        let mapper = ProjectionMapper::new(&metadata, [].into_iter()).unwrap();
         assert_eq!([0], mapper.column_ids()); // Should still read the time index column
         assert!(mapper.output_schema().is_empty());
         let pk_mapper = mapper.as_primary_key().unwrap();
@@ -815,7 +787,7 @@ mod tests {
                 .num_fields(2)
                 .build(),
         );
-        let mapper = ProjectionMapper::all(&metadata, true).unwrap();
+        let mapper = ProjectionMapper::all(&metadata).unwrap();
         assert_eq!([0, 1, 2, 3, 4], mapper.column_ids());
         assert_eq!(
             [
@@ -825,11 +797,11 @@ mod tests {
                 (4, ConcreteDataType::int64_datatype()),
                 (0, ConcreteDataType::timestamp_millisecond_datatype())
             ],
-            mapper.as_flat().unwrap().batch_schema()
+            mapper.as_flat().batch_schema()
         );
 
         let batch = new_flat_batch(Some(0), &[(1, 1), (2, 2)], &[(3, 3), (4, 4)], 3);
-        let record_batch = mapper.as_flat().unwrap().convert(&batch).unwrap();
+        let record_batch = mapper.as_flat().convert(&batch).unwrap();
         let expect = "\
 +---------------------+----+----+----+----+
 | ts                  | k0 | k1 | v0 | v1 |
@@ -850,7 +822,7 @@ mod tests {
                 .build(),
         );
         // Columns v1, k0
-        let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter(), true).unwrap();
+        let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter()).unwrap();
         assert_eq!([4, 1], mapper.column_ids());
         assert_eq!(
             [
@@ -858,11 +830,11 @@ mod tests {
                 (4, ConcreteDataType::int64_datatype()),
                 (0, ConcreteDataType::timestamp_millisecond_datatype())
             ],
-            mapper.as_flat().unwrap().batch_schema()
+            mapper.as_flat().batch_schema()
         );
 
         let batch = new_flat_batch(None, &[(1, 1)], &[(4, 4)], 3);
-        let record_batch = mapper.as_flat().unwrap().convert(&batch).unwrap();
+        let record_batch = mapper.as_flat().convert(&batch).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |
@@ -886,14 +858,13 @@ mod tests {
         let mapper = ProjectionMapper::new_with_read_columns(
             &metadata,
             [4, 1].into_iter(),
-            true,
             vec![4, 1, 3],
         )
         .unwrap();
         assert_eq!([4, 1, 3], mapper.column_ids());
 
         let batch = new_flat_batch(None, &[(1, 1)], &[(3, 3), (4, 4)], 3);
-        let record_batch = mapper.as_flat().unwrap().convert(&batch).unwrap();
+        let record_batch = mapper.as_flat().convert(&batch).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |
@@ -914,10 +885,10 @@ mod tests {
                 .build(),
         );
         // Empty projection
-        let mapper = ProjectionMapper::new(&metadata, [].into_iter(), true).unwrap();
+        let mapper = ProjectionMapper::new(&metadata, [].into_iter()).unwrap();
         assert_eq!([0], mapper.column_ids()); // Should still read the time index column
         assert!(mapper.output_schema().is_empty());
-        let flat_mapper = mapper.as_flat().unwrap();
+        let flat_mapper = mapper.as_flat();
         assert_eq!(
             [(0, ConcreteDataType::timestamp_millisecond_datatype())],
             flat_mapper.batch_schema()

@@ -396,19 +396,12 @@ impl ScanRegion {
         self.request.distribution == Some(TimeSeriesDistribution::PerSeries)
     }
 
-    /// Returns true if the region use flat format.
-    fn use_flat_format(&self) -> bool {
-        true
-    }
-
     /// Creates a scan input.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     async fn scan_input(mut self) -> Result<ScanInput> {
         let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
-        let flat_format = self.use_flat_format();
-
         let read_column_ids = match &self.request.projection {
             Some(p) => self.build_read_column_ids(p, &predicate)?,
             None => self
@@ -425,10 +418,9 @@ impl ScanRegion {
             Some(p) => ProjectionMapper::new_with_read_columns(
                 &self.version.metadata,
                 p.iter().copied(),
-                flat_format,
                 read_column_ids.clone(),
             )?,
-            None => ProjectionMapper::all(&self.version.metadata, flat_format)?,
+            None => ProjectionMapper::all(&self.version.metadata)?,
         };
 
         let ssts = &self.version.ssts;
@@ -492,14 +484,13 @@ impl ScanRegion {
 
         let region_id = self.region_id();
         debug!(
-            "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}, flat_format: {}",
+            "Scan region {}, request: {:?}, time range: {:?}, memtables: {}, ssts_to_read: {}, append_mode: {}",
             region_id,
             self.request,
             time_range,
             mem_range_builders.len(),
             files.len(),
             self.version.options.append_mode,
-            flat_format,
         );
 
         let (non_field_filters, field_filters) = self.partition_by_field_filters();
@@ -526,10 +517,8 @@ impl ScanRegion {
             }
         });
 
-        if flat_format {
-            // The batch is already large enough so we use a small channel size here.
-            self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
-        }
+        // The batch is already large enough so we use a small channel size here.
+        self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
 
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
@@ -547,8 +536,7 @@ impl ScanRegion {
             .with_filter_deleted(self.filter_deleted)
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
-            .with_distribution(self.request.distribution)
-            .with_flat_format(flat_format);
+            .with_distribution(self.request.distribution);
         #[cfg(feature = "vector_index")]
         let input = input
             .with_vector_index_applier(vector_index_applier)
@@ -851,8 +839,6 @@ pub struct ScanInput {
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
-    /// Whether to use flat format.
-    pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
     #[cfg(feature = "enterprise")]
@@ -889,7 +875,6 @@ impl ScanInput {
             merge_mode: MergeMode::default(),
             series_row_selector: None,
             distribution: None,
-            flat_format: false,
             compaction: false,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
@@ -1055,13 +1040,6 @@ impl ScanInput {
         self
     }
 
-    /// Sets whether to use flat format.
-    #[must_use]
-    pub(crate) fn with_flat_format(mut self, flat_format: bool) -> Self {
-        self.flat_format = flat_format;
-        self
-    }
-
     /// Sets whether this scan is for compaction.
     #[must_use]
     pub(crate) fn with_compaction(mut self, compaction: bool) -> Self {
@@ -1161,7 +1139,7 @@ impl ScanInput {
         };
         let res = reader
             .expected_metadata(Some(self.mapper.metadata().clone()))
-            .flat_format(self.flat_format)
+            .flat_format(true)
             .compaction(self.compaction)
             .pre_filter_mode(filter_mode)
             .decode_primary_key_values(decode_pk_values)
@@ -1187,7 +1165,7 @@ impl ScanInput {
             // They have different schema. We need to adapt the batch first so the
             // mapper can convert it.
             let compat = if let Some(flat_format) = file_range_ctx.read_format().as_flat() {
-                let mapper = self.mapper.as_flat().unwrap();
+                let mapper = self.mapper.as_flat();
                 FlatCompatBatch::try_new(
                     mapper,
                     flat_format.metadata(),
@@ -1586,8 +1564,6 @@ impl StreamContext {
                         .entries(self.input.files.iter().map(|file| FileWrapper { file }))
                         .finish()?;
                 }
-                write!(f, ", \"flat_format\": {}", self.input.flat_format)?;
-
                 #[cfg(feature = "enterprise")]
                 self.format_extension_ranges(f)?;
 

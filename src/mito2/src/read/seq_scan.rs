@@ -195,7 +195,7 @@ impl SeqScan {
             }
         }
 
-        let mapper = stream_ctx.input.mapper.as_flat().unwrap();
+        let mapper = stream_ctx.input.mapper.as_flat();
         let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
 
         let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
