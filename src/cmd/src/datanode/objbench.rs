@@ -27,6 +27,7 @@ use mito2::access_layer::{
 use mito2::cache::{CacheManager, CacheManagerRef};
 use mito2::config::{FulltextIndexConfig, MitoConfig, Mode};
 use mito2::read::Source;
+use mito2::sst::FormatType;
 use mito2::sst::file::{FileHandle, FileMeta};
 use mito2::sst::file_purger::{FilePurger, FilePurgerRef};
 use mito2::sst::index::intermediate::IntermediateManager;
@@ -233,6 +234,7 @@ impl ObjbenchCommand {
             op_type: OperationType::Flush,
             metadata: region_meta,
             source: Either::Left(Source::Reader(Box::new(reader))),
+            sst_write_format: FormatType::PrimaryKey,
             cache_manager,
             storage: None,
             max_sequence: None,

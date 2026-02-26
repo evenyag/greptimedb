@@ -418,12 +418,7 @@ where
         let mut stats = SourceStats::default();
 
         while let Some(record_batch) = self
-            .write_next_flat_batch_as_primary_key(
-                &mut source,
-                &write_format,
-                num_tag_columns,
-                opts,
-            )
+            .write_next_flat_batch_as_primary_key(&mut source, &write_format, num_tag_columns, opts)
             .await
             .transpose()
         {

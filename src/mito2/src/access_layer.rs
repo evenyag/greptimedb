@@ -342,9 +342,7 @@ impl AccessLayer {
                             .write_all_flat_as_primary_key(flat_source, write_opts)
                             .await?
                     }
-                    FormatType::Flat => {
-                        writer.write_all_flat(flat_source, write_opts).await?
-                    }
+                    FormatType::Flat => writer.write_all_flat(flat_source, write_opts).await?,
                 },
             }
         };
