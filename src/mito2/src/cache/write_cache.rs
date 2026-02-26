@@ -250,7 +250,16 @@ impl WriteCache {
                     .write_all(source, write_request.max_sequence, write_opts)
                     .await?
             }
-            either::Right(flat_source) => writer.write_all_flat(flat_source, write_opts).await?,
+            either::Right(flat_source) => match write_request.sst_write_format {
+                crate::sst::FormatType::PrimaryKey => {
+                    writer
+                        .write_all_flat_as_primary_key(flat_source, write_opts)
+                        .await?
+                }
+                crate::sst::FormatType::Flat => {
+                    writer.write_all_flat(flat_source, write_opts).await?
+                }
+            },
         };
 
         // Upload sst file to remote object store.
@@ -514,6 +523,7 @@ mod tests {
             op_type: OperationType::Flush,
             metadata,
             source: either::Left(source),
+            sst_write_format: Default::default(),
             storage: None,
             max_sequence: None,
             cache_manager: Default::default(),
@@ -616,6 +626,7 @@ mod tests {
             op_type: OperationType::Flush,
             metadata,
             source: either::Left(source),
+            sst_write_format: Default::default(),
             storage: None,
             max_sequence: None,
             cache_manager: cache_manager.clone(),
@@ -700,6 +711,7 @@ mod tests {
             op_type: OperationType::Flush,
             metadata,
             source: either::Left(source),
+            sst_write_format: Default::default(),
             storage: None,
             max_sequence: None,
             cache_manager: cache_manager.clone(),

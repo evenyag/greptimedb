@@ -372,6 +372,11 @@ impl DefaultCompactor {
                     op_type: OperationType::Compact,
                     metadata: region_metadata.clone(),
                     source,
+                    sst_write_format: if flat_format {
+                        FormatType::Flat
+                    } else {
+                        FormatType::PrimaryKey
+                    },
                     cache_manager: compaction_region.cache_manager.clone(),
                     storage,
                     max_sequence: max_sequence.map(NonZero::get),

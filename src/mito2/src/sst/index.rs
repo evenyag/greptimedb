@@ -1367,6 +1367,7 @@ mod tests {
             op_type: OperationType::Flush,
             metadata: metadata.clone(),
             source: either::Left(source),
+            sst_write_format: Default::default(),
             storage: None,
             max_sequence: None,
             cache_manager: Default::default(),
