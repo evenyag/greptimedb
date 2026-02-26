@@ -46,12 +46,11 @@ use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream, scan_file_ranges,
-    scan_flat_file_ranges, scan_flat_mem_ranges, scan_mem_ranges, should_split_flat_batches_for_merge,
+    scan_flat_file_ranges, scan_flat_mem_ranges, scan_mem_ranges,
+    should_split_flat_batches_for_merge,
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
-use crate::read::{
-    BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source, scan_util,
-};
+use crate::read::{BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source, scan_util};
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 

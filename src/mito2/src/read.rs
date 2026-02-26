@@ -171,6 +171,7 @@ impl Batch {
     }
 
     /// Create an empty [`Batch`].
+    #[allow(dead_code)]
     pub(crate) fn empty() -> Self {
         Self {
             primary_key: vec![],
@@ -673,6 +674,7 @@ impl Batch {
 
     /// Checks the batch is monotonic by timestamps.
     #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     pub(crate) fn check_monotonic(&self) -> Result<(), String> {
         use std::cmp::Ordering;
         if self.timestamps_native().is_none() {
@@ -715,6 +717,7 @@ impl Batch {
 
     /// Returns Ok if the given batch is behind the current batch.
     #[cfg(debug_assertions)]
+    #[allow(dead_code)]
     pub(crate) fn check_next_batch(&self, other: &Batch) -> Result<(), String> {
         // Checks the primary key
         if self.primary_key() < other.primary_key() {
@@ -793,6 +796,7 @@ impl Batch {
 
 /// A struct to check the batch is monotonic.
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct BatchChecker {
     last_batch: Option<Batch>,
@@ -801,6 +805,7 @@ pub(crate) struct BatchChecker {
 }
 
 #[cfg(debug_assertions)]
+#[allow(dead_code)]
 impl BatchChecker {
     /// Attaches the given start timestamp to the checker.
     pub(crate) fn with_start(mut self, start: Option<Timestamp>) -> Self {
