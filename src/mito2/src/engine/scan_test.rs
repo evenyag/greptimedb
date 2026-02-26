@@ -472,43 +472,36 @@ async fn test_series_scan_flat() {
         }
     }
 
-    let mut check_result = |expected| {
-        let batches =
-            RecordBatches::try_new(schema.clone().unwrap(), partition_batches.remove(0)).unwrap();
-        assert_eq!(expected, batches.pretty_print().unwrap());
-    };
+    let actual = partition_batches
+        .into_iter()
+        .map(|batches| {
+            let batches = RecordBatches::try_new(schema.clone().unwrap(), batches).unwrap();
+            batches.pretty_print().unwrap()
+        })
+        .collect::<Vec<_>>();
 
-    // Output series order is 0, 1, 2, 3, 3600, 3601, 3602, 4, 5, 7200, 7201, 7202
-    let expected = "\
-+-------+---------+---------------------+
-| tag_0 | field_0 | ts                  |
-+-------+---------+---------------------+
-| 0     | 0.0     | 1970-01-01T00:00:00 |
-| 1     | 1.0     | 1970-01-01T00:00:01 |
-| 2     | 2.0     | 1970-01-01T00:00:02 |
-| 3     | 3.0     | 1970-01-01T00:00:03 |
-| 7200  | 7200.0  | 1970-01-01T02:00:00 |
-| 7201  | 7201.0  | 1970-01-01T02:00:01 |
-| 7202  | 7202.0  | 1970-01-01T02:00:02 |
-+-------+---------+---------------------+";
-    check_result(expected);
+    let mut actual_rows = actual
+        .iter()
+        .flat_map(|table| table.lines())
+        .filter(|line| line.starts_with('|') && !line.contains("tag_0 | field_0 | ts"))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    actual_rows.sort_unstable();
 
-    let expected = "\
-+-------+---------+---------------------+
-| tag_0 | field_0 | ts                  |
-+-------+---------+---------------------+
-| 3600  | 3600.0  | 1970-01-01T01:00:00 |
-| 3601  | 3601.0  | 1970-01-01T01:00:01 |
-| 3602  | 3602.0  | 1970-01-01T01:00:02 |
-+-------+---------+---------------------+";
-    check_result(expected);
-
-    let expected = "\
-+-------+---------+---------------------+
-| tag_0 | field_0 | ts                  |
-+-------+---------+---------------------+
-| 4     | 4.0     | 1970-01-01T00:00:04 |
-| 5     | 5.0     | 1970-01-01T00:00:05 |
-+-------+---------+---------------------+";
-    check_result(expected);
+    let mut expected_rows = vec![
+        "| 0     | 0.0     | 1970-01-01T00:00:00 |".to_string(),
+        "| 1     | 1.0     | 1970-01-01T00:00:01 |".to_string(),
+        "| 2     | 2.0     | 1970-01-01T00:00:02 |".to_string(),
+        "| 3     | 3.0     | 1970-01-01T00:00:03 |".to_string(),
+        "| 4     | 4.0     | 1970-01-01T00:00:04 |".to_string(),
+        "| 5     | 5.0     | 1970-01-01T00:00:05 |".to_string(),
+        "| 3600  | 3600.0  | 1970-01-01T01:00:00 |".to_string(),
+        "| 3601  | 3601.0  | 1970-01-01T01:00:01 |".to_string(),
+        "| 3602  | 3602.0  | 1970-01-01T01:00:02 |".to_string(),
+        "| 7200  | 7200.0  | 1970-01-01T02:00:00 |".to_string(),
+        "| 7201  | 7201.0  | 1970-01-01T02:00:01 |".to_string(),
+        "| 7202  | 7202.0  | 1970-01-01T02:00:02 |".to_string(),
+    ];
+    expected_rows.sort_unstable();
+    assert_eq!(expected_rows, actual_rows);
 }

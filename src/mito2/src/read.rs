@@ -22,6 +22,7 @@ pub mod flat_merge;
 pub mod flat_projection;
 pub mod last_row;
 pub mod merge;
+pub(crate) mod partition_range_cache;
 pub mod plain_batch;
 pub mod projection;
 pub(crate) mod prune;

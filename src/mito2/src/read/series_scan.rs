@@ -47,7 +47,7 @@ use crate::error::{
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics};
-use crate::read::seq_scan::{SeqScan, build_flat_sources, build_sources};
+use crate::read::seq_scan::{SeqScan, build_sources};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{Batch, ScannerMetrics};
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -480,28 +480,29 @@ impl SeriesDistributor {
         // build part cost.
         let mut fetch_start = Instant::now();
 
-        // Scans all parts.
-        let mut sources = Vec::with_capacity(self.partitions.len());
+        // Builds one merged stream per partition range, then merges across ranges.
+        let mut range_streams = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
-            sources.reserve(partition.len());
+            range_streams.reserve(partition.len());
             for part_range in partition {
-                build_flat_sources(
+                let plan = SeqScan::build_flat_partition_range_read_plan(
                     &self.stream_ctx,
                     part_range,
                     false,
                     &part_metrics,
                     partition_pruner.clone(),
-                    &mut sources,
+                    self.semaphore.clone(),
                     self.semaphore.clone(),
                 )
                 .await?;
+                range_streams.push(plan.stream);
             }
         }
 
-        // Builds a flat reader that merge sources from all parts.
+        // Merges all partition-range streams.
         let mut reader = SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
-            sources,
+            range_streams,
             self.semaphore.clone(),
             Some(&part_metrics),
         )
