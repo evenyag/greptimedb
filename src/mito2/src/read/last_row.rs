@@ -478,7 +478,9 @@ impl FlatLastTimestampSelector {
             let key = primary_key_at(&batch, end - 1).to_vec();
             let (timestamp, selected_rows) = last_timestamp_rows(&batch, *start, *end);
 
-            if idx == 0 && let Some(mut pending) = self.pending.take() {
+            if idx == 0
+                && let Some(mut pending) = self.pending.take()
+            {
                 if pending.key == key {
                     if timestamp > pending.timestamp {
                         pending.timestamp = timestamp;

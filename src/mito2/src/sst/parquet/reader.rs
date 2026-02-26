@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
+use async_stream::try_stream;
 use async_trait::async_trait;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::{debug, tracing, warn};
@@ -57,8 +58,8 @@ use crate::metrics::{
     READ_ROWS_TOTAL, READ_STAGE_ELAPSED,
 };
 use crate::read::flat_projection::CompactionProjectionMapper;
-use crate::read::prune::{PruneReader, Source};
-use crate::read::{Batch, BatchReader};
+use crate::read::prune::{FlatPruneReader, PruneReader, Source};
+use crate::read::{Batch, BatchReader, BoxedRecordBatchStream};
 use crate::sst::file::FileHandle;
 use crate::sst::index::bloom_filter::applier::{
     BloomFilterIndexApplierRef, BloomFilterIndexApplyMetrics,
@@ -305,6 +306,58 @@ impl ParquetReaderBuilder {
 
         let (context, selection) = self.build_reader_input(&mut metrics).await?;
         ParquetReader::new(Arc::new(context), selection).await
+    }
+
+    /// Builds a flat record batch stream from row-group readers.
+    pub async fn build_flat_record_batch_stream(&self) -> Result<BoxedRecordBatchStream> {
+        let mut metrics = ReaderMetrics::default();
+        let (context, mut selection) = self.build_reader_input(&mut metrics).await?;
+        let context = Arc::new(context);
+        let fetch_metrics = ParquetFetchMetrics::default();
+
+        let stream = try_stream! {
+            let mut reader: Option<FlatPruneReader> = None;
+            loop {
+                if reader.is_none() {
+                    let Some((row_group_idx, row_selection)) = selection.pop_first() else {
+                        break;
+                    };
+                    let parquet_reader = context
+                        .reader_builder()
+                        .build(row_group_idx, Some(row_selection), Some(&fetch_metrics))
+                        .await?;
+                    let skip_fields = context.should_skip_fields(row_group_idx);
+                    reader = Some(FlatPruneReader::new_with_row_group_reader(
+                        context.clone(),
+                        FlatRowGroupReader::new(context.clone(), parquet_reader),
+                        skip_fields,
+                    ));
+                }
+
+                let Some(reader_ref) = reader.as_mut() else {
+                    continue;
+                };
+                if let Some(batch) = reader_ref.next_batch()? {
+                    yield batch;
+                    continue;
+                }
+
+                let Some((row_group_idx, row_selection)) = selection.pop_first() else {
+                    break;
+                };
+                let parquet_reader = context
+                    .reader_builder()
+                    .build(row_group_idx, Some(row_selection), Some(&fetch_metrics))
+                    .await?;
+                let skip_fields = context.should_skip_fields(row_group_idx);
+                reader = Some(FlatPruneReader::new_with_row_group_reader(
+                    context.clone(),
+                    FlatRowGroupReader::new(context.clone(), parquet_reader),
+                    skip_fields,
+                ));
+            }
+        };
+        Ok(Box::pin(stream))
     }
 
     /// Builds a [FileRangeContext] and collects row groups to read.

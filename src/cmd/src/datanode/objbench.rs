@@ -20,13 +20,12 @@ use clap::Parser;
 use colored::Colorize;
 use datanode::config::RegionEngineConfig;
 use datanode::store;
-use either::Either;
 use mito2::access_layer::{
     AccessLayer, AccessLayerRef, Metrics, OperationType, SstWriteRequest, WriteType,
 };
 use mito2::cache::{CacheManager, CacheManagerRef};
 use mito2::config::{FulltextIndexConfig, MitoConfig, Mode};
-use mito2::read::Source;
+use mito2::read::FlatSource;
 use mito2::sst::FormatType;
 use mito2::sst::file::{FileHandle, FileMeta};
 use mito2::sst::file_purger::{FilePurger, FilePurgerRef};
@@ -204,24 +203,25 @@ impl ObjbenchCommand {
         .await?;
         let reader_build_start = Instant::now();
 
-        let reader = ParquetReaderBuilder::new(
+        let source_stream = ParquetReaderBuilder::new(
             table_dir,
             components.path_type,
             src_handle.clone(),
             object_store.clone(),
         )
         .expected_metadata(Some(region_meta.clone()))
-        .build()
+        .flat_format(true)
+        .build_flat_record_batch_stream()
         .await
         .map_err(|e| {
             error::IllegalConfigSnafu {
-                msg: format!("build reader failed: {e:?}"),
+                msg: format!("build flat row-group reader stream failed: {e:?}"),
             }
             .build()
         })?;
 
         let reader_build_elapsed = reader_build_start.elapsed();
-        let total_rows = reader.parquet_metadata().file_metadata().num_rows();
+        let total_rows = num_rows;
         println!("{} Reader built in {:?}", "✓".green(), reader_build_elapsed);
 
         // Build write request
@@ -233,7 +233,7 @@ impl ObjbenchCommand {
         let write_req = SstWriteRequest {
             op_type: OperationType::Flush,
             metadata: region_meta,
-            source: Either::Left(Source::Reader(Box::new(reader))),
+            source: FlatSource::Stream(source_stream),
             sst_write_format: FormatType::PrimaryKey,
             cache_manager,
             storage: None,

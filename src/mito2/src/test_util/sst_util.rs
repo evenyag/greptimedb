@@ -18,7 +18,12 @@ use std::sync::Arc;
 
 use api::v1::{OpType, SemanticType};
 use common_time::Timestamp;
-use datatypes::arrow::array::{BinaryArray, TimestampMillisecondArray, UInt8Array, UInt64Array};
+use datatypes::arrow::array::{
+    ArrayRef, BinaryArray, BinaryDictionaryBuilder, StringDictionaryBuilder,
+    TimestampMillisecondArray, UInt8Array, UInt64Array,
+};
+use datatypes::arrow::datatypes::UInt32Type;
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnSchema, SkippingIndexOptions};
 use datatypes::value::ValueRef;
@@ -32,8 +37,9 @@ use store_api::metric_engine_consts::{
 use store_api::storage::consts::ReservedColumnId;
 use store_api::storage::{FileId, RegionId};
 
-use crate::read::{Batch, BatchBuilder, Source};
+use crate::read::{Batch, BatchBuilder, FlatSource, Source};
 use crate::sst::file::{FileHandle, FileMeta};
+use crate::sst::to_flat_sst_arrow_schema;
 use crate::test_util::{VecBatchReader, new_batch_builder, new_noop_file_purger};
 
 /// Test region id.
@@ -244,6 +250,53 @@ pub fn new_batch_with_custom_sequence(
 
 pub fn new_batch_by_range(tags: &[&str], start: usize, end: usize) -> Batch {
     new_batch_with_custom_sequence(tags, start, end, 1000)
+}
+
+/// Creates a flat format RecordBatch by range for testing.
+pub fn new_flat_record_batch_by_range(tags: &[&str], start: usize, end: usize) -> RecordBatch {
+    assert!(end >= start);
+    let metadata = Arc::new(sst_region_metadata());
+    let flat_schema = to_flat_sst_arrow_schema(
+        &metadata,
+        &crate::sst::FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+    );
+    let num_rows = end - start;
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    let mut tag_0_builder = StringDictionaryBuilder::<UInt32Type>::new();
+    let mut tag_1_builder = StringDictionaryBuilder::<UInt32Type>::new();
+    for _ in 0..num_rows {
+        tag_0_builder.append_value(tags[0]);
+        tag_1_builder.append_value(tags[1]);
+    }
+    columns.push(Arc::new(tag_0_builder.finish()));
+    columns.push(Arc::new(tag_1_builder.finish()));
+
+    let field_values: Vec<u64> = (start..end).map(|v| v as u64).collect();
+    columns.push(Arc::new(UInt64Array::from(field_values)));
+
+    let timestamps: Vec<i64> = (start..end).map(|v| v as i64).collect();
+    columns.push(Arc::new(TimestampMillisecondArray::from(timestamps)));
+
+    let pk = new_primary_key(tags);
+    let mut pk_builder = BinaryDictionaryBuilder::<UInt32Type>::new();
+    for _ in 0..num_rows {
+        pk_builder.append(&pk).unwrap();
+    }
+    columns.push(Arc::new(pk_builder.finish()));
+
+    columns.push(Arc::new(UInt64Array::from_value(1000, num_rows)));
+    columns.push(Arc::new(UInt8Array::from_value(
+        OpType::Put as u8,
+        num_rows,
+    )));
+
+    RecordBatch::try_new(flat_schema, columns).unwrap()
+}
+
+/// Creates a FlatSource from record batches.
+pub fn new_flat_source_from_record_batches(batches: Vec<RecordBatch>) -> FlatSource {
+    FlatSource::Iter(Box::new(batches.into_iter().map(Ok)))
 }
 
 pub fn new_batch_with_binary(tags: &[&str], start: usize, end: usize) -> Batch {

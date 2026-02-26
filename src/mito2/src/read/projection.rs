@@ -619,12 +619,9 @@ mod tests {
                 .build(),
         );
         // Output columns v1, k0. Read also includes v0.
-        let mapper = ProjectionMapper::new_with_read_columns(
-            &metadata,
-            [4, 1].into_iter(),
-            vec![4, 1, 3],
-        )
-        .unwrap();
+        let mapper =
+            ProjectionMapper::new_with_read_columns(&metadata, [4, 1].into_iter(), vec![4, 1, 3])
+                .unwrap();
         assert_eq!([4, 1, 3], mapper.column_ids());
 
         let batch = new_batch(0, &[1, 2], &[(3, 3), (4, 4)], 3);
@@ -855,12 +852,9 @@ mod tests {
                 .build(),
         );
         // Output columns v1, k0. Read also includes v0.
-        let mapper = ProjectionMapper::new_with_read_columns(
-            &metadata,
-            [4, 1].into_iter(),
-            vec![4, 1, 3],
-        )
-        .unwrap();
+        let mapper =
+            ProjectionMapper::new_with_read_columns(&metadata, [4, 1].into_iter(), vec![4, 1, 3])
+                .unwrap();
         assert_eq!([4, 1, 3], mapper.column_ids());
 
         let batch = new_flat_batch(None, &[(1, 1)], &[(3, 3), (4, 4)], 3);

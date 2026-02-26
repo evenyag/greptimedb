@@ -872,7 +872,9 @@ impl SelectorResultValue {
     fn estimated_size(&self) -> usize {
         // We only consider heap size of all batches.
         match &self.result {
-            SelectorResult::PrimaryKey(result) => result.iter().map(|batch| batch.memory_size()).sum(),
+            SelectorResult::PrimaryKey(result) => {
+                result.iter().map(|batch| batch.memory_size()).sum()
+            }
             SelectorResult::Flat(result) => result.iter().map(record_batch_estimated_size).sum(),
         }
     }
