@@ -1382,6 +1382,7 @@ impl ScanInput {
 
     /// Get a boxed [ExtensionRange] by the index in all ranges.
     #[cfg(feature = "enterprise")]
+    #[allow(dead_code)]
     pub(crate) fn extension_range(&self, i: usize) -> &BoxedExtensionRange {
         &self.extension_ranges[i - self.num_memtables() - self.num_files()]
     }

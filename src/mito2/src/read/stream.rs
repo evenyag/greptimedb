@@ -82,16 +82,6 @@ impl ConvertBatchStream {
                 self.buffer.clear();
 
                 match series {
-                    SeriesBatch::PrimaryKey(primary_key_batch) => {
-                        self.buffer.reserve(primary_key_batch.batches.len());
-                        // Safety: Only primary key format returns this batch.
-                        let mapper = self.projection_mapper.as_primary_key().unwrap();
-
-                        for batch in primary_key_batch.batches {
-                            let record_batch = mapper.convert(&batch, &self.cache_strategy)?;
-                            self.buffer.push(record_batch.into_df_record_batch());
-                        }
-                    }
                     SeriesBatch::Flat(flat_batch) => {
                         self.buffer.reserve(flat_batch.batches.len());
                         // Safety: Only flat format returns this batch.

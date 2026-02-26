@@ -1519,6 +1519,7 @@ pub fn build_flat_file_range_scan_stream(
 
 /// Build the stream of scanning the extension range denoted by the [`RowGroupIndex`].
 #[cfg(feature = "enterprise")]
+#[allow(dead_code)]
 pub(crate) async fn scan_extension_range(
     context: Arc<StreamContext>,
     index: RowGroupIndex,
@@ -1535,6 +1536,7 @@ pub(crate) async fn scan_extension_range(
     Ok(stream)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn maybe_scan_other_ranges(
     context: &Arc<StreamContext>,
     index: RowGroupIndex,
