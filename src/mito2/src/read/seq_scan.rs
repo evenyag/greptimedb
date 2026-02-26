@@ -27,7 +27,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
-use snafu::{OptionExt, ensure};
+use snafu::ensure;
 use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
     PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
@@ -35,7 +35,7 @@ use store_api::region_engine::{
 use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
-use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu, UnexpectedSnafu};
+use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
@@ -46,12 +46,11 @@ use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream, scan_file_ranges,
-    scan_flat_file_ranges, scan_flat_mem_ranges, scan_mem_ranges,
-    should_split_flat_batches_for_merge,
+    scan_flat_file_ranges, scan_flat_mem_ranges, scan_mem_ranges, should_split_flat_batches_for_merge,
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{
-    Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source, scan_util,
+    BoxedBatchReader, BoxedRecordBatchStream, ScannerMetrics, Source, scan_util,
 };
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
@@ -114,14 +113,14 @@ impl SeqScan {
         Ok(Box::pin(aggr_stream))
     }
 
-    /// Scan [`Batch`] in all partitions one by one.
+    /// Scans all partitions one by one.
     pub(crate) fn scan_all_partitions(&self) -> Result<ScanBatchStream> {
         let metrics_set = ExecutionPlanMetricsSet::new();
 
         let streams = (0..self.properties.partitions.len())
             .map(|partition| {
                 let metrics = self.new_partition_metrics(false, &metrics_set, partition);
-                self.scan_batch_in_partition(partition, metrics)
+                self.scan_flat_batch_in_partition(partition, metrics)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -184,7 +183,7 @@ impl SeqScan {
         Self::build_flat_reader_from_sources(stream_ctx, sources, None, None).await
     }
 
-    /// Builds a reader to read sources. If `semaphore` is provided, reads sources in parallel
+    /// Builds a flat reader to read sources that returns RecordBatch. If `semaphore` is provided, reads sources in parallel
     /// if possible.
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
     pub(crate) async fn build_reader_from_sources(
@@ -311,13 +310,7 @@ impl SeqScan {
         let metrics = self.new_partition_metrics(ctx.explain_verbose, metrics_set, partition);
         let input = &self.stream_ctx.input;
 
-        let batch_stream = if input.flat_format {
-            // Use flat scan for bulk memtables
-            self.scan_flat_batch_in_partition(partition, metrics.clone())?
-        } else {
-            // Use regular batch scan for normal memtables
-            self.scan_batch_in_partition(partition, metrics.clone())?
-        };
+        let batch_stream = self.scan_flat_batch_in_partition(partition, metrics.clone())?;
         let record_batch_stream = ConvertBatchStream::new(
             batch_stream,
             input.mapper.clone(),
@@ -329,125 +322,6 @@ impl SeqScan {
             input.mapper.output_schema(),
             Box::pin(record_batch_stream),
         )))
-    }
-
-    #[tracing::instrument(
-        skip_all,
-        fields(
-            region_id = %self.stream_ctx.input.mapper.metadata().region_id,
-            partition = partition
-        )
-    )]
-    fn scan_batch_in_partition(
-        &self,
-        partition: usize,
-        part_metrics: PartitionMetrics,
-    ) -> Result<ScanBatchStream> {
-        ensure!(
-            partition < self.properties.partitions.len(),
-            PartitionOutOfRangeSnafu {
-                given: partition,
-                all: self.properties.partitions.len(),
-            }
-        );
-
-        if self.properties.partitions[partition].is_empty() {
-            return Ok(Box::pin(futures::stream::empty()));
-        }
-
-        let stream_ctx = self.stream_ctx.clone();
-        let semaphore = self.new_semaphore();
-        let partition_ranges = self.properties.partitions[partition].clone();
-        let compaction = self.stream_ctx.input.compaction;
-        let distinguish_range = self.properties.distinguish_partition_range;
-        let file_scan_semaphore = if compaction { None } else { semaphore.clone() };
-        let pruner = self.pruner.clone();
-        // Initializes ref counts for the pruner.
-        // If we call scan_batch_in_partition() multiple times but don't read all batches from the stream,
-        // then the ref count won't be decremented.
-        // This is a rare case and keeping all remaining entries still uses less memory than a per partition cache.
-        pruner.add_partition_ranges(&partition_ranges);
-        let partition_pruner = Arc::new(PartitionPruner::new(pruner, &partition_ranges));
-
-        let stream = try_stream! {
-            part_metrics.on_first_poll();
-            // Start fetch time before building sources so scan cost contains
-            // build part cost.
-            let mut fetch_start = Instant::now();
-
-            let _mapper = stream_ctx.input.mapper.as_primary_key().context(UnexpectedSnafu {
-                reason: "Unexpected format",
-            })?;
-            // Scans each part.
-            for part_range in partition_ranges {
-                let mut sources = Vec::new();
-                build_sources(
-                    &stream_ctx,
-                    &part_range,
-                    compaction,
-                    &part_metrics,
-                    partition_pruner.clone(),
-                    &mut sources,
-                    file_scan_semaphore.clone(),
-                ).await?;
-
-                let mut reader =
-                    Self::build_reader_from_sources(&stream_ctx, sources, semaphore.clone(), Some(&part_metrics))
-                        .await?;
-                #[cfg(debug_assertions)]
-                let mut checker = crate::read::BatchChecker::default()
-                    .with_start(Some(part_range.start))
-                    .with_end(Some(part_range.end));
-
-                let mut metrics = ScannerMetrics {
-                    scan_cost: fetch_start.elapsed(),
-                    ..Default::default()
-                };
-                fetch_start = Instant::now();
-
-                while let Some(batch) = reader.next_batch().await? {
-                    metrics.scan_cost += fetch_start.elapsed();
-                    metrics.num_batches += 1;
-                    metrics.num_rows += batch.num_rows();
-
-                    debug_assert!(!batch.is_empty());
-                    if batch.is_empty() {
-                        fetch_start = Instant::now();
-                        continue;
-                    }
-
-                    #[cfg(debug_assertions)]
-                    checker.ensure_part_range_batch(
-                        "SeqScan",
-                        _mapper.metadata().region_id,
-                        partition,
-                        part_range,
-                        &batch,
-                    );
-
-                    let yield_start = Instant::now();
-                    yield ScanBatch::Normal(batch);
-                    metrics.yield_cost += yield_start.elapsed();
-
-                    fetch_start = Instant::now();
-                }
-
-                // Yields an empty part to indicate this range is terminated.
-                // The query engine can use this to optimize some queries.
-                if distinguish_range {
-                    let yield_start = Instant::now();
-                    yield ScanBatch::Normal(Batch::empty());
-                    metrics.yield_cost += yield_start.elapsed();
-                }
-
-                metrics.scan_cost += fetch_start.elapsed();
-                fetch_start = Instant::now();
-                part_metrics.merge_metrics(&metrics);
-            }
-
-            part_metrics.on_finish();
-        };
-        Ok(Box::pin(stream))
     }
 
     #[tracing::instrument(
