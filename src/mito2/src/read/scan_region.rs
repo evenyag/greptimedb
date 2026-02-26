@@ -52,6 +52,7 @@ use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::read::partition_range_cache::ScanRequestFingerprint;
 use crate::read::projection::ProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::seq_scan::SeqScan;
@@ -532,6 +533,7 @@ impl ScanRegion {
             // The batch is already large enough so we use a small channel size here.
             self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
         }
+        let has_tag_filter = self.has_tag_filter();
 
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
@@ -550,6 +552,7 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
+            .with_has_tag_filter(has_tag_filter)
             .with_flat_format(flat_format);
         #[cfg(feature = "vector_index")]
         let input = input
@@ -674,6 +677,31 @@ impl ScanRegion {
             !columns
                 .iter()
                 .any(|column| field_columns.contains(&column.name))
+        })
+    }
+
+    /// Returns true if at least one request filter references a semantic TAG column.
+    fn has_tag_filter(&self) -> bool {
+        let metadata = &self.version.metadata;
+        let tag_names = metadata
+            .column_metadatas
+            .iter()
+            .filter(|col| col.semantic_type == SemanticType::Tag)
+            .map(|col| col.column_schema.name.as_str())
+            .collect::<HashSet<_>>();
+        if tag_names.is_empty() {
+            return false;
+        }
+
+        let mut columns = HashSet::new();
+        self.request.filters.iter().any(|expr| {
+            columns.clear();
+            if expr_to_columns(expr, &mut columns).is_err() {
+                return false;
+            }
+            columns
+                .iter()
+                .any(|column| tag_names.contains(column.name.as_str()))
         })
     }
 
@@ -853,6 +881,8 @@ pub struct ScanInput {
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
+    /// Whether request filters reference semantic TAG columns.
+    pub(crate) has_tag_filter: bool,
     /// Whether to use flat format.
     pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
@@ -891,6 +921,7 @@ impl ScanInput {
             merge_mode: MergeMode::default(),
             series_row_selector: None,
             distribution: None,
+            has_tag_filter: false,
             flat_format: false,
             compaction: false,
             #[cfg(feature = "enterprise")]
@@ -1044,6 +1075,13 @@ impl ScanInput {
         distribution: Option<TimeSeriesDistribution>,
     ) -> Self {
         self.distribution = distribution;
+        self
+    }
+
+    /// Sets whether request filters reference semantic TAG columns.
+    #[must_use]
+    pub(crate) fn with_has_tag_filter(mut self, has_tag_filter: bool) -> Self {
+        self.has_tag_filter = has_tag_filter;
         self
     }
 
@@ -1346,6 +1384,33 @@ impl ScanInput {
         &self.predicate
     }
 
+    /// Returns a fingerprint that can be used in partition-range scan cache key.
+    pub(crate) fn scan_request_fingerprint(&self) -> ScanRequestFingerprint {
+        let filters = self
+            .predicate_group()
+            .predicate_without_region()
+            .map(|predicate| {
+                predicate
+                    .exprs()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        ScanRequestFingerprint {
+            read_column_ids: self.read_column_ids.clone(),
+            filters,
+            series_row_selector: self.series_row_selector.map(|v| v.to_string()),
+            distribution: self.distribution.map(|v| v.to_string()),
+            append_mode: self.append_mode,
+            filter_deleted: self.filter_deleted,
+            merge_mode: merge_mode_name(self.merge_mode),
+            flat_format: self.flat_format,
+            compaction: self.compaction,
+        }
+    }
+
     /// Returns number of memtables to scan.
     pub(crate) fn num_memtables(&self) -> usize {
         self.memtables.len()
@@ -1409,6 +1474,13 @@ fn pre_filter_mode(append_mode: bool, merge_mode: MergeMode) -> PreFilterMode {
     match merge_mode {
         MergeMode::LastRow => PreFilterMode::SkipFieldsOnDelete,
         MergeMode::LastNonNull => PreFilterMode::SkipFields,
+    }
+}
+
+fn merge_mode_name(mode: MergeMode) -> &'static str {
+    match mode {
+        MergeMode::LastRow => "last_row",
+        MergeMode::LastNonNull => "last_non_null",
     }
 }
 
