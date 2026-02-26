@@ -384,6 +384,88 @@ where
         Ok(results)
     }
 
+    /// Iterates FlatSource and writes all RecordBatch in primary key format to Parquet file.
+    ///
+    /// This converts flat RecordBatches (with tag columns) to primary key format (without tag columns)
+    /// before writing. The number of tag columns to strip is determined by the metadata's encoding.
+    ///
+    /// Returns the [SstInfo] if the SST is written.
+    pub async fn write_all_flat_as_primary_key(
+        &mut self,
+        source: FlatSource,
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let res = self
+            .write_all_flat_as_primary_key_without_cleaning(source, opts)
+            .await;
+        if res.is_err() {
+            let file_id = self.current_file;
+            if let Some(cleaner) = &self.file_cleaner {
+                cleaner.clean_by_file_id(file_id).await;
+            }
+        }
+        res
+    }
+
+    async fn write_all_flat_as_primary_key_without_cleaning(
+        &mut self,
+        mut source: FlatSource,
+        opts: &WriteOptions,
+    ) -> Result<SstInfoArray> {
+        let mut results = smallvec![];
+        let write_format = PrimaryKeyWriteFormat::new(self.metadata.clone());
+        let num_tag_columns = self.compute_num_tag_columns();
+        let mut stats = SourceStats::default();
+
+        while let Some(record_batch) = self
+            .write_next_flat_batch_as_primary_key(
+                &mut source,
+                &write_format,
+                num_tag_columns,
+                opts,
+            )
+            .await
+            .transpose()
+        {
+            match record_batch {
+                Ok(batch) => {
+                    stats.update_flat(&batch)?;
+                    let start = Instant::now();
+                    self.current_indexer
+                        .as_mut()
+                        .unwrap()
+                        .update_flat(&batch)
+                        .await;
+                    self.metrics.update_index += start.elapsed();
+                    if let Some(max_file_size) = opts.max_file_size
+                        && self.bytes_written.load(Ordering::Relaxed) > max_file_size
+                    {
+                        self.finish_current_file(&mut results, &mut stats).await?;
+                    }
+                }
+                Err(e) => {
+                    if let Some(indexer) = &mut self.current_indexer {
+                        indexer.abort().await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        self.finish_current_file(&mut results, &mut stats).await?;
+        Ok(results)
+    }
+
+    /// Computes the number of tag columns at the front of a flat RecordBatch.
+    fn compute_num_tag_columns(&self) -> usize {
+        let options = FlatSchemaOptions::from_encoding(self.metadata.primary_key_encoding);
+        if options.raw_pk_columns {
+            self.metadata.primary_key.len()
+        } else {
+            0
+        }
+    }
+
     /// Customizes per-column config according to schema and maybe column cardinality.
     fn customize_column_config(
         builder: WriterPropertiesBuilder,
@@ -447,6 +529,34 @@ where
 
         let start = Instant::now();
         self.maybe_init_writer(flat_format.arrow_schema(), opts)
+            .await?
+            .write(&arrow_batch)
+            .await
+            .context(WriteParquetSnafu)?;
+        self.metrics.write_batch += start.elapsed();
+        Ok(Some(record_batch))
+    }
+
+    /// Reads a flat RecordBatch from the source, converts it to primary key format,
+    /// and writes it to the parquet file. Returns the original flat RecordBatch for
+    /// stats/index updates.
+    async fn write_next_flat_batch_as_primary_key(
+        &mut self,
+        source: &mut FlatSource,
+        write_format: &PrimaryKeyWriteFormat,
+        num_tag_columns: usize,
+        opts: &WriteOptions,
+    ) -> Result<Option<RecordBatch>> {
+        let start = Instant::now();
+        let Some(record_batch) = source.next_batch().await? else {
+            return Ok(None);
+        };
+        self.metrics.iter_source += start.elapsed();
+
+        let arrow_batch = write_format.convert_flat_batch(&record_batch, num_tag_columns)?;
+
+        let start = Instant::now();
+        self.maybe_init_writer(write_format.arrow_schema(), opts)
             .await?
             .write(&arrow_batch)
             .await

@@ -104,6 +104,27 @@ impl PrimaryKeyWriteFormat {
         &self.arrow_schema
     }
 
+    /// Convert a flat `RecordBatch` to a primary key format arrow record batch.
+    ///
+    /// The flat batch has layout: `[tag_columns | field_columns | time_index | __primary_key | __sequence | __op_type]`.
+    /// This strips the tag columns at the front, producing: `[field_columns | time_index | __primary_key | __sequence | __op_type]`.
+    pub(crate) fn convert_flat_batch(
+        &self,
+        batch: &RecordBatch,
+        num_tag_columns: usize,
+    ) -> Result<RecordBatch> {
+        let mut columns: Vec<ArrayRef> = batch.columns()[num_tag_columns..].to_vec();
+
+        if let Some(override_sequence) = self.override_sequence {
+            let num_cols = columns.len();
+            // sequence is at position num_cols - 2 (before op_type)
+            columns[num_cols - 2] =
+                Arc::new(UInt64Array::from(vec![override_sequence; batch.num_rows()]));
+        }
+
+        RecordBatch::try_new(self.arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
+    }
+
     /// Convert `batch` to a arrow record batch to store in parquet.
     pub(crate) fn convert_batch(&self, batch: &Batch) -> Result<RecordBatch> {
         debug_assert_eq!(
