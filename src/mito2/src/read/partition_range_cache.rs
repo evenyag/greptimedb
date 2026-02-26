@@ -16,10 +16,13 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::mem;
 
+use datatypes::arrow::record_batch::RecordBatch;
 use store_api::storage::{ColumnId, FileId, RegionId};
 
 use crate::cache::CacheStrategy;
+use crate::memtable::record_batch_estimated_size;
 
 /// Fingerprint of request-relevant scan options.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,6 +42,7 @@ pub(crate) struct ScanRequestFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PartitionRangeScanCacheKey {
     pub(crate) region_id: RegionId,
+    pub(crate) partition_range_identifier: usize,
     pub(crate) file_ids: Vec<FileId>,
     pub(crate) scan: ScanRequestFingerprint,
 }
@@ -48,6 +52,45 @@ impl PartitionRangeScanCacheKey {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
         hasher.finish()
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + self.file_ids.capacity() * mem::size_of::<FileId>()
+            + self.scan.read_column_ids.capacity() * mem::size_of::<ColumnId>()
+            + self
+                .scan
+                .filters
+                .iter()
+                .map(|filter| filter.capacity())
+                .sum::<usize>()
+            + self
+                .scan
+                .series_row_selector
+                .as_ref()
+                .map_or(0, String::capacity)
+            + self.scan.distribution.as_ref().map_or(0, String::capacity)
+    }
+}
+
+/// Cached result for one partition-range scan.
+pub(crate) struct PartitionRangeScanCacheValue {
+    pub(crate) batches: Vec<RecordBatch>,
+}
+
+impl PartitionRangeScanCacheValue {
+    pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
+        Self { batches }
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + self.batches.capacity() * mem::size_of::<RecordBatch>()
+            + self
+                .batches
+                .iter()
+                .map(record_batch_estimated_size)
+                .sum::<usize>()
     }
 }
 

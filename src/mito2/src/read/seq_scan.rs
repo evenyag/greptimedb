@@ -36,6 +36,7 @@ use store_api::region_engine::{
 use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
+use crate::cache::CacheStrategy;
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu, UnexpectedSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
@@ -43,7 +44,8 @@ use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::partition_range_cache::{
-    FlatPartitionRangeCachePlan, PartitionRangeScanCacheKey, cache_enabled,
+    FlatPartitionRangeCachePlan, PartitionRangeScanCacheKey, PartitionRangeScanCacheValue,
+    cache_enabled,
 };
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
@@ -397,6 +399,37 @@ impl SeqScan {
                 key.digest(),
             );
         }
+
+        let stream = match cache_plan.key.clone() {
+            Some(key) => {
+                if let Some(value) = stream_ctx
+                    .input
+                    .cache_strategy
+                    .get_partition_range_result(&key)
+                {
+                    common_telemetry::debug!(
+                        "Flat partition range cache hit, region: {}, part_range: {:?}, digest: {:x}",
+                        stream_ctx.input.region_metadata().region_id,
+                        part_range,
+                        key.digest(),
+                    );
+                    cached_flat_partition_range_stream(value)
+                } else {
+                    common_telemetry::debug!(
+                        "Flat partition range cache miss, region: {}, part_range: {:?}, digest: {:x}",
+                        stream_ctx.input.region_metadata().region_id,
+                        part_range,
+                        key.digest(),
+                    );
+                    cache_flat_partition_range_stream(
+                        stream,
+                        stream_ctx.input.cache_strategy.clone(),
+                        key,
+                    )
+                }
+            }
+            None => stream,
+        };
 
         Ok(FlatPartitionRangeReadPlan { stream, cache_plan })
     }
@@ -824,6 +857,7 @@ fn build_flat_partition_range_cache_plan(
     let key = if eligible {
         Some(PartitionRangeScanCacheKey {
             region_id: stream_ctx.input.region_metadata().region_id,
+            partition_range_identifier: part_range.identifier,
             file_ids,
             scan: stream_ctx.input.scan_request_fingerprint(),
         })
@@ -855,6 +889,31 @@ fn partition_range_file_ids(
     }
 
     (file_ids, only_file_sources)
+}
+
+fn cached_flat_partition_range_stream(
+    value: Arc<PartitionRangeScanCacheValue>,
+) -> BoxedRecordBatchStream {
+    Box::pin(futures::stream::iter(
+        value.batches.clone().into_iter().map(Ok),
+    ))
+}
+
+fn cache_flat_partition_range_stream(
+    mut stream: BoxedRecordBatchStream,
+    cache_strategy: CacheStrategy,
+    key: PartitionRangeScanCacheKey,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            batches.push(batch.clone());
+            yield batch;
+        }
+
+        let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+        cache_strategy.put_partition_range_result(key, value);
+    })
 }
 
 /// Builds sources for the partition range and push them to the `sources` vector.
