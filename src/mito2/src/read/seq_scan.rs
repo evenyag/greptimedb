@@ -906,20 +906,44 @@ fn cache_flat_partition_range_stream(
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
         let mut batches = Vec::new();
+        let mut num_rows = 0usize;
         while let Some(batch) = stream.try_next().await? {
+            num_rows += batch.num_rows();
             batches.push(batch.clone());
             yield batch;
         }
 
-        let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
-        common_telemetry::info!(
-            "cache_flat_partition_range_stream: caching entry, key_digest: {:x}, key_size: {}, value_size: {}, num_batches: {}",
-            key.digest(),
-            key.estimated_size(),
-            value.estimated_size(),
-            value.batches.len(),
-        );
-        cache_strategy.put_partition_range_result(key, value);
+        if !batches.is_empty() {
+            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+            // Build column info: name and estimated size for each column.
+            let column_info: Vec<String> = if let Some(first_batch) = value.batches.first() {
+                let schema = first_batch.schema();
+                value.batches[0]
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _col)| {
+                        let name = schema.field(i).name();
+                        let col_size: usize = value.batches.iter().map(|b| {
+                            b.column(i).to_data().get_slice_memory_size().unwrap_or(0)
+                        }).sum();
+                        format!("{}:{}", name, col_size)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            common_telemetry::info!(
+                "cache_flat_partition_range_stream: caching entry, key_digest: {:x}, key_size: {}, value_size: {}, num_batches: {}, num_rows: {}, columns: [{}]",
+                key.digest(),
+                key.estimated_size(),
+                value.estimated_size(),
+                value.batches.len(),
+                num_rows,
+                column_info.join(", "),
+            );
+            cache_strategy.put_partition_range_result(key, value);
+        }
     })
 }
 
