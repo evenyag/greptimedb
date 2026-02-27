@@ -164,6 +164,21 @@ fn resolve_projection(
     Ok(None)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn parse_region_id(s: &str) -> error::Result<RegionId> {
     if s.contains(':') {
         let parts: Vec<&str> = s.splitn(2, ':').collect();
@@ -671,21 +686,29 @@ impl ScanbenchCommand {
 
                 scan_futures.push(tokio::spawn(async move {
                     let mut rows = 0u64;
+                    let mut array_mem_size = 0u64;
+                    let mut estimated_size = 0u64;
                     while let Some(batch_result) = stream.next().await {
                         match batch_result {
                             Ok(batch) => {
                                 rows += batch.num_rows() as u64;
+                                let df_batch = batch.df_record_batch();
+                                array_mem_size += df_batch.get_array_memory_size() as u64;
+                                estimated_size +=
+                                    mito2::memtable::record_batch_estimated_size(df_batch) as u64;
                             }
                             Err(e) => {
                                 return Err(BoxedError::new(e));
                             }
                         }
                     }
-                    Ok::<u64, BoxedError>(rows)
+                    Ok::<(u64, u64, u64), BoxedError>((rows, array_mem_size, estimated_size))
                 }));
             }
 
             let mut total_rows = 0u64;
+            let mut total_array_mem_size = 0u64;
+            let mut total_estimated_size = 0u64;
             while let Some(task) = scan_futures.next().await {
                 let result = task
                     .map_err(|e| {
@@ -695,8 +718,11 @@ impl ScanbenchCommand {
                         ))
                     })
                     .context(error::BuildCliSnafu)?;
-                let rows = result.context(error::BuildCliSnafu)?;
+                let (rows, array_mem_size, estimated_size) =
+                    result.context(error::BuildCliSnafu)?;
                 total_rows += rows;
+                total_array_mem_size += array_mem_size;
+                total_estimated_size += estimated_size;
             }
 
             let elapsed = start.elapsed();
@@ -704,11 +730,13 @@ impl ScanbenchCommand {
             total_elapsed_all += elapsed;
 
             println!(
-                "  [iter {}] {} rows in {:?} ({} partitions)",
+                "  [iter {}] {} rows in {:?} ({} partitions), array_mem_size: {}, estimated_size: {}",
                 iteration + 1,
                 total_rows.to_string().cyan(),
                 elapsed,
                 num_partitions,
+                format_bytes(total_array_mem_size),
+                format_bytes(total_estimated_size),
             );
         }
 
