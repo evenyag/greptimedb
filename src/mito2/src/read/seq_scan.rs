@@ -912,6 +912,13 @@ fn cache_flat_partition_range_stream(
         }
 
         let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+        common_telemetry::info!(
+            "cache_flat_partition_range_stream: caching entry, key_digest: {}, key_size: {}, value_size: {}, num_batches: {}",
+            key.digest(),
+            key.estimated_size(),
+            value.estimated_size(),
+            value.batches.len(),
+        );
         cache_strategy.put_partition_range_result(key, value);
     })
 }
