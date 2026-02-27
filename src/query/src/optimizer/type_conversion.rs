@@ -203,6 +203,20 @@ impl TypeConverter {
     }
 }
 
+/// Converts string literals in expressions to proper types (timestamps, booleans)
+/// based on column types in the schema.
+pub fn convert_expr_type(
+    exprs: Vec<Expr>,
+    schema: DFSchemaRef,
+    query_ctx: QueryContextRef,
+) -> Result<Vec<Expr>> {
+    let mut converter = TypeConverter { schema, query_ctx };
+    exprs
+        .into_iter()
+        .map(|e| e.rewrite(&mut converter).map(|x| x.data))
+        .collect()
+}
+
 impl TreeNodeRewriter for TypeConverter {
     type Node = Expr;
 

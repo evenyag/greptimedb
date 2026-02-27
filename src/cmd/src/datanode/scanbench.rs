@@ -42,7 +42,9 @@ use moka::future::CacheBuilder;
 use object_store::manager::ObjectStoreManager;
 use object_store::util::normalize_dir;
 use query::optimizer::parallelize_scan::ParallelizeScan;
+use query::optimizer::type_conversion::convert_expr_type;
 use serde::Deserialize;
+use session::context::QueryContext;
 use snafu::{OptionExt, ResultExt};
 use sqlparser::ast::ExprWithAlias as SqlExprWithAlias;
 use sqlparser::dialect::GenericDialect;
@@ -227,7 +229,7 @@ fn resolve_filters(
         .with_default_features()
         .build();
 
-    filters
+    let exprs: Vec<DfExpr> = filters
         .iter()
         .enumerate()
         .map(|(idx, filter)| {
@@ -264,7 +266,15 @@ fn resolve_filters(
                     .build()
                 })
         })
-        .collect()
+        .collect::<error::Result<Vec<_>>>()?;
+
+    let df_schema_ref = Arc::new(df_schema);
+    convert_expr_type(exprs, df_schema_ref, QueryContext::arc()).map_err(|e| {
+        error::IllegalConfigSnafu {
+            msg: format!("Failed to convert filter expression types: {e}"),
+        }
+        .build()
+    })
 }
 
 fn noop_partition_expr_fetcher() -> mito2::region::opener::PartitionExprFetcherRef {
