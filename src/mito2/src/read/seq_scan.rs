@@ -26,6 +26,8 @@ use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datatypes::arrow::array::DictionaryArray;
+use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
 use snafu::{OptionExt, ensure};
@@ -915,6 +917,26 @@ fn cache_flat_partition_range_stream(
 
         if !batches.is_empty() {
             let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+
+            // Log __primary_key dictionary stats from the first batch.
+            if let Some(first_batch) = value.batches.first() {
+                let schema = first_batch.schema();
+                if let Some((pk_idx, _)) = schema.column_with_name("__primary_key") {
+                    let pk_col = first_batch.column(pk_idx);
+                    if let Some(dict_array) = pk_col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                        let distinct_keys: HashSet<_> = dict_array.keys().iter().flatten().collect();
+                        let num_distinct_keys = distinct_keys.len();
+                        let values_len = dict_array.values().len();
+                        common_telemetry::info!(
+                            "cache_flat_partition_range_stream: __primary_key dict stats, key_digest: {:x}, num_distinct_keys: {}, values_len: {}",
+                            key.digest(),
+                            num_distinct_keys,
+                            values_len,
+                        );
+                    }
+                }
+            }
+
             // Build column info: name and estimated size for each column.
             let column_info: Vec<String> = if let Some(first_batch) = value.batches.first() {
                 let schema = first_batch.schema();
