@@ -522,26 +522,22 @@ mod tests {
                 .num_fields(2)
                 .build(),
         );
-        // Create the enum wrapper with default format (primary key)
-        let mapper = ProjectionMapper::all(&metadata).unwrap();
+        // Create primary key projection mapper
+        let mapper = PrimaryKeyProjectionMapper::all(&metadata).unwrap();
         assert_eq!([0, 1, 2, 3, 4], mapper.column_ids());
         assert_eq!(
             [
                 (3, ConcreteDataType::int64_datatype()),
                 (4, ConcreteDataType::int64_datatype())
             ],
-            mapper.as_primary_key().unwrap().batch_fields()
+            mapper.batch_fields()
         );
 
         // With vector cache.
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
         let batch = new_batch(0, &[1, 2], &[(3, 3), (4, 4)], 3);
-        let record_batch = mapper
-            .as_primary_key()
-            .unwrap()
-            .convert(&batch, &cache)
-            .unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         let expect = "\
 +---------------------+----+----+----+----+
 | ts                  | k0 | k1 | v0 | v1 |
@@ -567,11 +563,7 @@ mod tests {
                 .get_repeated_vector(&ConcreteDataType::int64_datatype(), &Value::Int64(3))
                 .is_none()
         );
-        let record_batch = mapper
-            .as_primary_key()
-            .unwrap()
-            .convert(&batch, &cache)
-            .unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         assert_eq!(expect, print_record_batch(record_batch));
     }
 
@@ -584,21 +576,17 @@ mod tests {
                 .build(),
         );
         // Columns v1, k0
-        let mapper = ProjectionMapper::new(&metadata, [4, 1].into_iter()).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::new(&metadata, [4, 1].into_iter()).unwrap();
         assert_eq!([4, 1], mapper.column_ids());
         assert_eq!(
             [(4, ConcreteDataType::int64_datatype())],
-            mapper.as_primary_key().unwrap().batch_fields()
+            mapper.batch_fields()
         );
 
         let batch = new_batch(0, &[1, 2], &[(4, 4)], 3);
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
-        let record_batch = mapper
-            .as_primary_key()
-            .unwrap()
-            .convert(&batch, &cache)
-            .unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |
@@ -620,18 +608,14 @@ mod tests {
         );
         // Output columns v1, k0. Read also includes v0.
         let mapper =
-            ProjectionMapper::new_with_read_columns(&metadata, [4, 1].into_iter(), vec![4, 1, 3])
+            PrimaryKeyProjectionMapper::new_with_read_columns(&metadata, vec![4, 1], vec![4, 1, 3])
                 .unwrap();
         assert_eq!([4, 1, 3], mapper.column_ids());
 
         let batch = new_batch(0, &[1, 2], &[(3, 3), (4, 4)], 3);
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
-        let record_batch = mapper
-            .as_primary_key()
-            .unwrap()
-            .convert(&batch, &cache)
-            .unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         let expect = "\
 +----+----+
 | v1 | k0 |
@@ -652,19 +636,18 @@ mod tests {
                 .build(),
         );
         // Empty projection
-        let mapper = ProjectionMapper::new(&metadata, [].into_iter()).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::new(&metadata, [].into_iter()).unwrap();
         assert_eq!([0], mapper.column_ids()); // Should still read the time index column
         assert!(mapper.output_schema().is_empty());
-        let pk_mapper = mapper.as_primary_key().unwrap();
-        assert!(pk_mapper.batch_fields().is_empty());
-        assert!(!pk_mapper.has_tags);
-        assert!(pk_mapper.batch_indices.is_empty());
-        assert!(pk_mapper.is_empty_projection);
+        assert!(mapper.batch_fields().is_empty());
+        assert!(!mapper.has_tags);
+        assert!(mapper.batch_indices.is_empty());
+        assert!(mapper.is_empty_projection);
 
         let batch = new_batch(0, &[1, 2], &[], 3);
         let cache = CacheManager::builder().vector_cache_size(1024).build();
         let cache = CacheStrategy::EnableAll(Arc::new(cache));
-        let record_batch = pk_mapper.convert(&batch, &cache).unwrap();
+        let record_batch = mapper.convert(&batch, &cache).unwrap();
         assert_eq!(3, record_batch.num_rows());
         assert_eq!(0, record_batch.num_columns());
         assert!(record_batch.schema.is_empty());

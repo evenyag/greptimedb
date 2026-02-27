@@ -24,15 +24,17 @@ use std::time::{Duration, Instant};
 use async_stream::try_stream;
 use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, Time};
+use datatypes::arrow::array::BooleanArray;
+use datatypes::arrow::compute;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 use store_api::storage::RegionId;
 
-use crate::error::{Result, UnexpectedSnafu};
+use crate::error::{ComputeArrowSnafu, Result, UnexpectedSnafu};
 use crate::memtable::MemScanMetrics;
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
@@ -44,7 +46,7 @@ use crate::read::pruner::PartitionPruner;
 use crate::read::range::{RangeMeta, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
 use crate::read::{BoxedBatchStream, BoxedRecordBatchStream, ScannerMetrics};
-use crate::sst::file::RegionFileId;
+use crate::sst::file::{FileTimeRange, RegionFileId};
 use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplyMetrics;
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplyMetrics;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplyMetrics;
@@ -1126,6 +1128,7 @@ pub(crate) fn scan_flat_mem_ranges(
     stream_ctx: Arc<StreamContext>,
     part_metrics: PartitionMetrics,
     index: RowGroupIndex,
+    time_range: FileTimeRange,
 ) -> impl Stream<Item = Result<RecordBatch>> {
     try_stream! {
         let ranges = stream_ctx.input.build_mem_ranges(index);
@@ -1137,7 +1140,10 @@ pub(crate) fn scan_flat_mem_ranges(
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
             while let Some(record_batch) = iter.next().transpose()? {
-                yield record_batch;
+                let record_batch = prune_record_batch_by_time_range(record_batch, time_range)?;
+                if record_batch.num_rows() > 0 {
+                    yield record_batch;
+                }
             }
 
             // Report the memtable scan metrics to partition metrics
@@ -1147,6 +1153,34 @@ pub(crate) fn scan_flat_mem_ranges(
             }
         }
     }
+}
+
+/// Prunes a record batch by a time range, filtering out rows whose timestamps
+/// fall outside the range. This ensures memtable scans don't return rows that
+/// were inserted after the scan snapshot was taken.
+fn prune_record_batch_by_time_range(
+    record_batch: RecordBatch,
+    time_range: FileTimeRange,
+) -> Result<RecordBatch> {
+    let num_columns = record_batch.num_columns();
+    let ts_index = time_index_column_index(num_columns);
+    let ts_column = record_batch.column(ts_index);
+
+    let (primitives, ts_unit) =
+        timestamp_array_to_primitive(ts_column).context(UnexpectedSnafu {
+            reason: "Failed to convert timestamp array",
+        })?;
+
+    let (start, end) = time_range;
+    let start_native = start.convert_to(ts_unit.into()).unwrap().value();
+    let end_native = end.convert_to(ts_unit.into()).unwrap().value();
+
+    let mask: BooleanArray = primitives
+        .iter()
+        .map(|ts: Option<i64>| ts.map(|v| v >= start_native && v <= end_native))
+        .collect();
+
+    compute::filter_record_batch(&record_batch, &mask).context(ComputeArrowSnafu)
 }
 
 /// Files with row count greater than this threshold can contribute to the estimation.

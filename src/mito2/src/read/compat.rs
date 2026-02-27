@@ -40,11 +40,11 @@ use store_api::storage::ColumnId;
 
 use crate::error::{
     CastVectorSnafu, CompatReaderSnafu, ComputeArrowSnafu, ConvertVectorSnafu, CreateDefaultSnafu,
-    DecodeSnafu, EncodeSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, UnexpectedSnafu,
+    DecodeSnafu, EncodeSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result,
     UnsupportedOperationSnafu,
 };
 use crate::read::flat_projection::{FlatProjectionMapper, flat_projected_columns};
-use crate::read::projection::{PrimaryKeyProjectionMapper, ProjectionMapper};
+use crate::read::projection::PrimaryKeyProjectionMapper;
 use crate::read::{Batch, BatchColumn, BatchReader};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::{FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray};
@@ -64,7 +64,7 @@ impl<R> CompatReader<R> {
     /// - `reader_meta` is the metadata of the input reader.
     /// - `reader` is the input reader.
     pub fn new(
-        mapper: &ProjectionMapper,
+        mapper: &PrimaryKeyProjectionMapper,
         reader_meta: RegionMetadataRef,
         reader: R,
     ) -> Result<CompatReader<R>> {
@@ -130,12 +130,12 @@ impl PrimaryKeyCompatBatch {
     /// Creates a new [CompatBatch].
     /// - `mapper` is built from the metadata users expect to see.
     /// - `reader_meta` is the metadata of the input reader.
-    pub(crate) fn new(mapper: &ProjectionMapper, reader_meta: RegionMetadataRef) -> Result<Self> {
+    pub(crate) fn new(
+        mapper: &PrimaryKeyProjectionMapper,
+        reader_meta: RegionMetadataRef,
+    ) -> Result<Self> {
         let rewrite_pk = may_rewrite_primary_key(mapper.metadata(), &reader_meta);
         let compat_pk = may_compat_primary_key(mapper.metadata(), &reader_meta)?;
-        let mapper = mapper.as_primary_key().context(UnexpectedSnafu {
-            reason: "Unexpected format",
-        })?;
         let compat_fields = may_compat_fields(mapper, &reader_meta)?;
 
         Ok(Self {
@@ -1243,7 +1243,7 @@ mod tests {
             ],
             &[1, 3],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1292,7 +1292,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1337,7 +1337,7 @@ mod tests {
             ],
             &[1],
         ));
-        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[
@@ -1394,7 +1394,7 @@ mod tests {
             &[1],
         ));
         // tag_1, field_2, field_3
-        let mapper = ProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter()).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter()).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
 
@@ -1407,7 +1407,7 @@ mod tests {
         .await;
 
         // tag_1, field_4, field_3
-        let mapper = ProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter()).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter()).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let source_reader = VecBatchReader::new(&[new_batch(&k1, &[], 1000, 3)]);
 
@@ -1448,9 +1448,9 @@ mod tests {
             &[1],
         ));
         // Output: tag_1, field_3, field_2. Read also includes field_4.
-        let mapper = ProjectionMapper::new_with_read_columns(
+        let mapper = PrimaryKeyProjectionMapper::new_with_read_columns(
             &expect_meta,
-            [1, 3, 2].into_iter(),
+            vec![1, 3, 2],
             vec![1, 3, 2, 4],
         )
         .unwrap();
@@ -1498,7 +1498,7 @@ mod tests {
         expect_meta.primary_key_encoding = PrimaryKeyEncoding::Sparse;
         let expect_meta = Arc::new(expect_meta);
 
-        let mapper = ProjectionMapper::all(&expect_meta).unwrap();
+        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
         let k1 = encode_key(&[Some("a")]);
         let k2 = encode_key(&[Some("b")]);
         let source_reader = VecBatchReader::new(&[

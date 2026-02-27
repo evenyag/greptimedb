@@ -1174,8 +1174,14 @@ impl ScanInput {
                 )?
                 .map(CompatBatch::Flat)
             } else {
+                let pk_mapper =
+                    self.mapper
+                        .as_primary_key()
+                        .context(crate::error::UnexpectedSnafu {
+                            reason: "Expected PrimaryKey format for compat batch",
+                        })?;
                 let compact_batch = PrimaryKeyCompatBatch::new(
-                    &self.mapper,
+                    pk_mapper,
                     file_range_ctx.read_format().metadata().clone(),
                 )?;
                 Some(CompatBatch::PrimaryKey(compact_batch))

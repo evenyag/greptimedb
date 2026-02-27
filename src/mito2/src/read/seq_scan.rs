@@ -25,6 +25,7 @@ use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
 use snafu::ensure;
@@ -32,11 +33,13 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::region_engine::{
     PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
 };
+use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
+use crate::read::last_row::FlatLastTimestampSelector;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};
@@ -231,9 +234,39 @@ impl SeqScan {
             Box::pin(reader.into_stream()) as _
         };
 
+        // Apply series row selector (e.g., last row per series).
+        let reader = match &stream_ctx.input.series_row_selector {
+            Some(TimeSeriesRowSelector::LastRow) => {
+                Box::pin(flat_last_row_stream(reader)) as BoxedRecordBatchStream
+            }
+            None => reader,
+        };
+
         Ok(reader)
     }
+}
 
+/// Wraps a sorted record batch stream to select only the last row per series.
+fn flat_last_row_stream(
+    mut source: BoxedRecordBatchStream,
+) -> impl futures::Stream<Item = Result<RecordBatch>> {
+    try_stream! {
+        let mut selector = FlatLastTimestampSelector::default();
+        let mut output = std::collections::VecDeque::new();
+        while let Some(batch) = source.try_next().await? {
+            selector.on_next(batch, &mut output);
+            while let Some(rb) = output.pop_front() {
+                yield rb;
+            }
+        }
+        selector.finish(&mut output);
+        while let Some(rb) = output.pop_front() {
+            yield rb;
+        }
+    }
+}
+
+impl SeqScan {
     /// Scans the given partition when the part list is set properly.
     /// Otherwise the returned stream might not contains any data.
     fn scan_partition_impl(
@@ -552,7 +585,12 @@ pub(crate) async fn build_flat_sources(
 
     for (position, index) in range_meta.row_group_indices.iter().enumerate() {
         if stream_ctx.is_mem_range_index(*index) {
-            let stream = scan_flat_mem_ranges(stream_ctx.clone(), part_metrics.clone(), *index);
+            let stream = scan_flat_mem_ranges(
+                stream_ctx.clone(),
+                part_metrics.clone(),
+                *index,
+                range_meta.time_range,
+            );
             ordered_sources[position] = Some(Box::pin(stream) as _);
         } else if stream_ctx.is_file_range_index(*index) {
             if let Some(semaphore_ref) = semaphore.as_ref() {
