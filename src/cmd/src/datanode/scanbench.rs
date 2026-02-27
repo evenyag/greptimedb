@@ -27,9 +27,11 @@ use common_meta::key::SchemaMetadataManager;
 use common_meta::kv_backend::memory::MemoryKvBackend;
 use common_wal::config::DatanodeWalConfig;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::Expr as DfExpr;
-use datafusion_common::ToDFSchema;
+use datafusion::logical_expr::{BinaryExpr, Expr as DfExpr, ExprSchemable, Operator};
+use datafusion_common::tree_node::{Transformed, TreeNodeRewriter};
+use datafusion_common::{DFSchemaRef, ScalarValue, ToDFSchema};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datatypes::arrow::compute;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use log_store::kafka::log_store::KafkaLogStore;
@@ -42,9 +44,7 @@ use moka::future::CacheBuilder;
 use object_store::manager::ObjectStoreManager;
 use object_store::util::normalize_dir;
 use query::optimizer::parallelize_scan::ParallelizeScan;
-use query::optimizer::type_conversion::convert_expr_type;
 use serde::Deserialize;
-use session::context::QueryContext;
 use snafu::{OptionExt, ResultExt};
 use sqlparser::ast::ExprWithAlias as SqlExprWithAlias;
 use sqlparser::dialect::GenericDialect;
@@ -203,6 +203,85 @@ fn parse_path_type(s: &str) -> error::Result<PathType> {
     }
 }
 
+/// Rewrites literal values in comparison expressions to match the column's arrow type.
+struct LiteralTypeCaster {
+    schema: DFSchemaRef,
+}
+
+impl TreeNodeRewriter for LiteralTypeCaster {
+    type Node = DfExpr;
+
+    fn f_up(&mut self, expr: DfExpr) -> datafusion_common::Result<Transformed<DfExpr>> {
+        let DfExpr::BinaryExpr(BinaryExpr { left, op, right }) = &expr else {
+            return Ok(Transformed::no(expr));
+        };
+
+        if !matches!(
+            op,
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            return Ok(Transformed::no(expr));
+        }
+
+        let (col_expr, lit_expr, col_left) = match (left.as_ref(), right.as_ref()) {
+            (col @ DfExpr::Column(_), lit @ DfExpr::Literal(_, _)) => (col, lit, true),
+            (lit @ DfExpr::Literal(_, _), col @ DfExpr::Column(_)) => (col, lit, false),
+            _ => return Ok(Transformed::no(expr)),
+        };
+
+        let col_type = col_expr.get_type(self.schema.as_ref())?;
+        let DfExpr::Literal(scalar, _) = lit_expr else {
+            unreachable!()
+        };
+
+        if scalar.data_type() == col_type {
+            return Ok(Transformed::no(expr));
+        }
+
+        let lit_array = scalar.to_array()?;
+        let casted = compute::cast(lit_array.as_ref(), &col_type).map_err(|e| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "Failed to cast literal {:?} to {:?}: {}",
+                scalar, col_type, e
+            ))
+        })?;
+        let casted_scalar = ScalarValue::try_from_array(&casted, 0)?;
+
+        let new_lit = DfExpr::Literal(casted_scalar, None);
+        let (new_left, new_right) = if col_left {
+            (left.clone(), Box::new(new_lit))
+        } else {
+            (Box::new(new_lit), right.clone())
+        };
+
+        Ok(Transformed::yes(DfExpr::BinaryExpr(BinaryExpr {
+            left: new_left,
+            op: *op,
+            right: new_right,
+        })))
+    }
+}
+
+fn convert_literal_types(
+    exprs: Vec<DfExpr>,
+    schema: &DFSchemaRef,
+) -> datafusion_common::Result<Vec<DfExpr>> {
+    use datafusion_common::tree_node::TreeNode;
+
+    let mut caster = LiteralTypeCaster {
+        schema: schema.clone(),
+    };
+    exprs
+        .into_iter()
+        .map(|e| e.rewrite(&mut caster).map(|x| x.data))
+        .collect()
+}
+
 fn resolve_filters(
     scan_config: &ScanConfig,
     metadata: &RegionMetadata,
@@ -269,7 +348,7 @@ fn resolve_filters(
         .collect::<error::Result<Vec<_>>>()?;
 
     let df_schema_ref = Arc::new(df_schema);
-    convert_expr_type(exprs, df_schema_ref, QueryContext::arc()).map_err(|e| {
+    convert_literal_types(exprs, &df_schema_ref).map_err(|e| {
         error::IllegalConfigSnafu {
             msg: format!("Failed to convert filter expression types: {e}"),
         }
@@ -683,11 +762,15 @@ impl ScanbenchCommand {
 
 #[cfg(test)]
 mod tests {
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
     use sqlparser::ast::{BinaryOperator, Expr};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+    use store_api::storage::RegionId;
 
-    use super::{ScanConfig, resolve_projection};
+    use super::{ScanConfig, resolve_filters, resolve_projection};
     use crate::error;
 
     #[test]
@@ -760,6 +843,50 @@ mod tests {
             Expr::BinaryOp { op, .. } => assert_eq!(op, BinaryOperator::And),
             other => panic!("expected BinaryOp, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_resolve_filters_uint32_type_conversion() {
+        use api::v1::SemanticType;
+
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 0));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "table_id",
+                    ConcreteDataType::uint32_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 2,
+            })
+            .primary_key(vec![1]);
+        let metadata = builder.build().unwrap();
+
+        let config = ScanConfig {
+            projection: None,
+            projection_names: None,
+            filters: Some(vec!["table_id = 1117".to_string()]),
+            series_row_selector: None,
+        };
+
+        let exprs = resolve_filters(&config, &metadata).unwrap();
+        assert_eq!(exprs.len(), 1);
+        // The expression should contain a UInt32 literal after type conversion.
+        let expr_str = format!("{}", exprs[0]);
+        assert!(
+            expr_str.contains("UInt32(1117)"),
+            "Expected UInt32(1117) in expression, got: {expr_str}"
+        );
     }
 
     #[test]
