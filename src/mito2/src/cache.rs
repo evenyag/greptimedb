@@ -763,11 +763,19 @@ impl CacheManagerBuilder {
         });
         let partition_range_result_cache =
             (self.partition_range_result_cache_size != 0).then(|| {
+                let partition_range_result_cache_size = self.partition_range_result_cache_size;
                 Cache::builder()
                     .max_capacity(self.partition_range_result_cache_size)
                     .weigher(partition_range_result_cache_weight)
-                    .eviction_listener(|k, v, cause| {
+                    .eviction_listener(move |k, v, cause| {
                         let size = partition_range_result_cache_weight(&k, &v);
+                        common_telemetry::info!(
+                            "Partition range result cache evicted, key: {:x}, cause: {:?}, cap: {}, size: {}",
+                            k.digest(),
+                            cause,
+                            partition_range_result_cache_size,
+                            size
+                        );
                         CACHE_BYTES
                             .with_label_values(&[PARTITION_RANGE_RESULT_TYPE])
                             .sub(size.into());
