@@ -477,6 +477,7 @@ impl SeriesDistributor {
         for partition in &self.partitions {
             range_streams.reserve(partition.len());
             for part_range in partition {
+                let plan_start = Instant::now();
                 let plan = SeqScan::build_flat_partition_range_read_plan(
                     &self.stream_ctx,
                     part_range,
@@ -487,6 +488,12 @@ impl SeriesDistributor {
                     self.semaphore.clone(),
                 )
                 .await?;
+                common_telemetry::info!(
+                    "scan_partitions_flat build read plan for part_range {:?}, region: {}, cost: {:?}",
+                    part_range,
+                    self.stream_ctx.input.region_metadata().region_id,
+                    plan_start.elapsed(),
+                );
                 range_streams.push(plan.stream);
             }
         }
