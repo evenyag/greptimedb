@@ -243,6 +243,8 @@ pub(crate) struct ScanMetricsSet {
     num_range_builders: isize,
     /// Peak number of file range builders.
     num_peak_range_builders: isize,
+    /// Total bytes added to the partition range cache during this scan.
+    partition_range_cache_size: usize,
 }
 
 /// Wrapper for file metrics that compares by total cost in reverse order.
@@ -339,6 +341,7 @@ impl fmt::Debug for ScanMetricsSet {
             build_ranges_peak_mem_size,
             num_range_builders: _,
             num_peak_range_builders,
+            partition_range_cache_size,
         } = self;
 
         // Write core metrics
@@ -576,6 +579,13 @@ impl fmt::Debug for ScanMetricsSet {
                 write!(f, "\"{}\": {:?}", file_id, metrics)?;
             }
             write!(f, "}}")?;
+        }
+
+        if *partition_range_cache_size > 0 {
+            write!(
+                f,
+                ", \"partition_range_cache_size\":{partition_range_cache_size}"
+            )?;
         }
 
         write!(
@@ -1080,6 +1090,12 @@ impl PartitionMetrics {
     /// Returns a DedupMetricsReport trait object for reporting dedup metrics.
     pub(crate) fn dedup_metrics_reporter(&self) -> Arc<dyn DedupMetricsReport> {
         self.0.clone()
+    }
+
+    /// Increments the total bytes added to the partition range cache.
+    pub(crate) fn inc_partition_range_cache_size(&self, size: usize) {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.partition_range_cache_size += size;
     }
 }
 

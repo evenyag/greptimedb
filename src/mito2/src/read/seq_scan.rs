@@ -446,6 +446,7 @@ impl SeqScan {
                         stream,
                         stream_ctx.input.cache_strategy.clone(),
                         key,
+                        part_metrics.clone(),
                     )
                 }
             }
@@ -975,6 +976,7 @@ fn cache_flat_partition_range_stream(
     mut stream: BoxedRecordBatchStream,
     cache_strategy: CacheStrategy,
     key: PartitionRangeScanCacheKey,
+    part_metrics: PartitionMetrics,
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
         let mut batches = Vec::new();
@@ -1035,6 +1037,7 @@ fn cache_flat_partition_range_stream(
                 num_rows,
                 column_info.join(", "),
             );
+            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
             cache_strategy.put_partition_range_result(key, value);
         }
     })
