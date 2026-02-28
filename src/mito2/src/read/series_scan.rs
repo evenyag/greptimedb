@@ -497,6 +497,12 @@ impl SeriesDistributor {
                 range_streams.push(plan.stream);
             }
         }
+        common_telemetry::info!(
+            "scan_partitions_flat built {} range_streams, region: {}, total cost: {:?}",
+            range_streams.len(),
+            self.stream_ctx.input.region_metadata().region_id,
+            fetch_start.elapsed(),
+        );
 
         // Merges all partition-range streams.
         let mut reader = SeqScan::build_flat_reader_from_sources(
