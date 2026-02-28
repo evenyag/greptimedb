@@ -40,7 +40,7 @@ use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::error::{
-    Error, InvalidSenderSnafu, PartitionOutOfRangeSnafu, Result, ScanMultiTimesSnafu,
+    Error, InvalidSenderSnafu, JoinSnafu, PartitionOutOfRangeSnafu, Result, ScanMultiTimesSnafu,
     ScanSeriesSnafu, TooManyFilesToReadSnafu,
 };
 use crate::read::pruner::{PartitionPruner, Pruner};
@@ -472,30 +472,42 @@ impl SeriesDistributor {
         // build part cost.
         let mut fetch_start = Instant::now();
 
-        // Builds one merged stream per partition range, then merges across ranges.
-        let mut range_streams = Vec::with_capacity(self.partitions.len());
+        // Builds one merged stream per partition range in parallel, then merges across ranges.
+        let mut tasks = Vec::new();
         for partition in &self.partitions {
-            range_streams.reserve(partition.len());
             for part_range in partition {
-                let plan_start = Instant::now();
-                let plan = SeqScan::build_flat_partition_range_read_plan(
-                    &self.stream_ctx,
-                    part_range,
-                    false,
-                    &part_metrics,
-                    partition_pruner.clone(),
-                    self.semaphore.clone(),
-                    self.semaphore.clone(),
-                )
-                .await?;
-                common_telemetry::info!(
-                    "scan_partitions_flat build read plan for part_range {:?}, region: {}, cost: {:?}",
-                    part_range,
-                    self.stream_ctx.input.region_metadata().region_id,
-                    plan_start.elapsed(),
-                );
-                range_streams.push(plan.stream);
+                let stream_ctx = self.stream_ctx.clone();
+                let part_range = *part_range;
+                let part_metrics = part_metrics.clone();
+                let partition_pruner = partition_pruner.clone();
+                let file_scan_semaphore = self.semaphore.clone();
+                let merge_semaphore = self.semaphore.clone();
+                tasks.push(common_runtime::spawn_global(async move {
+                    let plan_start = Instant::now();
+                    let plan = SeqScan::build_flat_partition_range_read_plan(
+                        &stream_ctx,
+                        &part_range,
+                        false,
+                        &part_metrics,
+                        partition_pruner,
+                        file_scan_semaphore,
+                        merge_semaphore,
+                    )
+                    .await?;
+                    common_telemetry::info!(
+                        "scan_partitions_flat build read plan for part_range {:?}, region: {}, cost: {:?}",
+                        part_range,
+                        stream_ctx.input.region_metadata().region_id,
+                        plan_start.elapsed(),
+                    );
+                    Ok(plan.stream)
+                }));
             }
+        }
+        let mut range_streams = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let stream = task.await.context(JoinSnafu)??;
+            range_streams.push(stream);
         }
         common_telemetry::info!(
             "scan_partitions_flat built {} range_streams, region: {}, total cost: {:?}",

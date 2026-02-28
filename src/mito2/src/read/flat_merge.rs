@@ -631,9 +631,7 @@ impl FlatMergeReader {
         let elapsed = start.elapsed();
         info!(
             "FlatMergeReader init done, num_iters: {}, active_nodes: {}, cost: {:?}",
-            num_iters,
-            num_active_nodes,
-            elapsed,
+            num_iters, num_active_nodes, elapsed,
         );
         reader.metrics.init_cost += elapsed;
         reader.metrics.scan_cost += elapsed;
