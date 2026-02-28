@@ -26,8 +26,9 @@ use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
-use datatypes::arrow::array::DictionaryArray;
+use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
 use datatypes::arrow::datatypes::UInt32Type;
+use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
 use snafu::{OptionExt, ensure};
@@ -63,6 +64,7 @@ use crate::read::{
 };
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::flat_format::primary_key_column_index;
 
 /// Read plan for one flat [`PartitionRange`].
 pub(crate) struct FlatPartitionRangeReadPlan {
@@ -925,6 +927,57 @@ fn cached_flat_partition_range_stream(
     ))
 }
 
+/// Compacts the `__primary_key` dictionary column in a record batch by removing
+/// unreferenced values. This reduces memory usage when caching batches whose
+/// dictionary values array contains entries not referenced by any key.
+///
+/// Only compacts when the values array has more than 4 entries to avoid
+/// unnecessary work for small dictionaries.
+fn compact_pk_dictionary(batch: RecordBatch) -> RecordBatch {
+    let pk_idx = primary_key_column_index(batch.num_columns());
+    let pk_col = match batch
+        .column(pk_idx)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+    {
+        Some(dict) if dict.values().len() > 4 => dict,
+        _ => return batch,
+    };
+
+    let old_values = pk_col
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("primary key dictionary values must be BinaryArray");
+    let keys = pk_col.keys();
+
+    // Single linear pass: since keys are sorted/grouped, we track when the key changes.
+    let mut remap = vec![0u32; old_values.len()];
+    let mut new_values: Vec<&[u8]> = Vec::new();
+    let mut prev_key: Option<u32> = None;
+
+    for key in keys.iter().flatten() {
+        if prev_key != Some(key) {
+            let new_index = new_values.len() as u32;
+            new_values.push(old_values.value(key as usize));
+            remap[key as usize] = new_index;
+            prev_key = Some(key);
+        }
+    }
+
+    if new_values.len() == old_values.len() {
+        return batch; // all values are in use
+    }
+
+    let new_keys = UInt32Array::from_iter(keys.iter().map(|k| k.map(|v| remap[v as usize])));
+    let new_values_array = BinaryArray::from_iter_values(new_values);
+    let new_dict = DictionaryArray::new(new_keys, Arc::new(new_values_array));
+
+    let mut columns: Vec<_> = batch.columns().to_vec();
+    columns[pk_idx] = Arc::new(new_dict);
+    RecordBatch::try_new(batch.schema(), columns).expect("schema should match after compaction")
+}
+
 fn cache_flat_partition_range_stream(
     mut stream: BoxedRecordBatchStream,
     cache_strategy: CacheStrategy,
@@ -934,6 +987,7 @@ fn cache_flat_partition_range_stream(
         let mut batches = Vec::new();
         let mut num_rows = 0usize;
         while let Some(batch) = stream.try_next().await? {
+            let batch = compact_pk_dictionary(batch);
             num_rows += batch.num_rows();
             batches.push(batch.clone());
             yield batch;
