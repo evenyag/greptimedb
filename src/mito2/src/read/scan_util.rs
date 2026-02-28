@@ -1097,6 +1097,11 @@ impl PartitionMetrics {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.partition_range_cache_size += size;
     }
+
+    pub(crate) fn partition_range_cache_size(&self) -> usize {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.partition_range_cache_size
+    }
 }
 
 impl fmt::Debug for PartitionMetrics {

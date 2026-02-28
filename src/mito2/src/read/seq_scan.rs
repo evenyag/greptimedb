@@ -1028,16 +1028,17 @@ fn cache_flat_partition_range_stream(
             } else {
                 Vec::new()
             };
+            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
             common_telemetry::info!(
-                "cache_flat_partition_range_stream: caching entry, key_digest: {:x}, key_size: {}, value_size: {}, num_batches: {}, num_rows: {}, columns: [{}]",
+                "cache_flat_partition_range_stream: caching entry, key_digest: {:x}, key_size: {}, value_size: {}, total_cache_size: {}, num_batches: {}, num_rows: {}, columns: [{}]",
                 key.digest(),
                 key.estimated_size(),
                 value.estimated_size(),
+                part_metrics.partition_range_cache_size(),
                 value.batches.len(),
                 num_rows,
                 column_info.join(", "),
             );
-            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
             cache_strategy.put_partition_range_result(key, value);
         }
     })
