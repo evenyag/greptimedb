@@ -372,6 +372,7 @@ impl SeqScan {
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<FlatPartitionRangeReadPlan> {
+        let sources_start = Instant::now();
         let mut sources = Vec::new();
         build_flat_sources(
             stream_ctx,
@@ -383,7 +384,16 @@ impl SeqScan {
             file_scan_semaphore,
         )
         .await?;
+        let num_sources = sources.len();
+        common_telemetry::info!(
+            "build_flat_partition_range_read_plan build sources, region: {}, part_range: {:?}, num_sources: {}, cost: {:?}",
+            stream_ctx.input.region_metadata().region_id,
+            part_range,
+            num_sources,
+            sources_start.elapsed(),
+        );
 
+        let stream_start = Instant::now();
         let stream = Self::build_flat_reader_from_sources(
             stream_ctx,
             sources,
@@ -391,6 +401,13 @@ impl SeqScan {
             Some(part_metrics),
         )
         .await?;
+        common_telemetry::info!(
+            "build_flat_partition_range_read_plan build stream, region: {}, part_range: {:?}, num_sources: {}, cost: {:?}",
+            stream_ctx.input.region_metadata().region_id,
+            part_range,
+            num_sources,
+            stream_start.elapsed(),
+        );
         let cache_plan = build_flat_partition_range_cache_plan(stream_ctx, part_range);
 
         if let Some(key) = cache_plan.key.as_ref() {
