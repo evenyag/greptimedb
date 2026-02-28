@@ -1040,6 +1040,10 @@ fn cache_flat_partition_range_stream(
                 column_info.join(", "),
             );
             cache_strategy.put_partition_range_result(key, value);
+        } else {
+            part_metrics.inc_partition_range_cache_size(key.estimated_size());
+            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+            cache_strategy.put_partition_range_result(key, value);
         }
     })
 }
