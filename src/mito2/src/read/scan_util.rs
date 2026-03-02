@@ -1243,6 +1243,8 @@ pub(crate) fn should_split_flat_batches_for_merge(
     let mut num_files_to_split = 0;
     let mut num_mem_rows = 0;
     let mut num_mem_series = 0;
+    let mut file_ranges_meta = Vec::with_capacity(range_meta.row_group_indices.len());
+    let mut mem_ranges_meta = Vec::with_capacity(range_meta.row_group_indices.len());
     // Checks each file range, returns early if any range is not splittable.
     // For mem ranges, we collect the total number of rows and series because the number of rows in a
     // mem range may be too small.
@@ -1251,19 +1253,43 @@ pub(crate) fn should_split_flat_batches_for_merge(
             let memtable = &stream_ctx.input.memtables[index.index];
             // Is mem range
             let stats = memtable.stats();
+            mem_ranges_meta.push(format!(
+                "{{row_group_index: {}, num_rows: {}, num_series: {}}}",
+                index.index,
+                stats.num_rows(),
+                stats.series_count()
+            ));
             num_mem_rows += stats.num_rows();
             num_mem_series += stats.series_count();
         } else if stream_ctx.is_file_range_index(*index) {
             // This is a file range.
             let file_index = index.index - stream_ctx.input.num_memtables();
             let file = &stream_ctx.input.files[file_index];
-            if file.meta_ref().num_rows < SPLIT_ROW_THRESHOLD || file.meta_ref().num_series == 0 {
+            let file_meta = file.meta_ref();
+            file_ranges_meta.push(format!(
+                "{{row_group_index: {}, file_id: {}, level: {:?}, num_rows: {}, num_series: {}}}",
+                index.index,
+                file_meta.file_id,
+                file_meta.level,
+                file_meta.num_rows,
+                file_meta.num_series
+            ));
+            if file_meta.num_rows < SPLIT_ROW_THRESHOLD || file_meta.num_series == 0 {
                 // If the file doesn't have enough rows, or the number of series is unavailable, skips it.
                 continue;
             }
-            debug_assert!(file.meta_ref().num_rows > 0);
-            if !can_split_series(file.meta_ref().num_rows, file.meta_ref().num_series) {
+            debug_assert!(file_meta.num_rows > 0);
+            if !can_split_series(file_meta.num_rows, file_meta.num_series) {
                 // We can't split batches in a file.
+                common_telemetry::info!(
+                    "should_split_flat_batches_for_merge: false, file {} can't split series, meta: {:?}, file_ranges_meta: {:?}, mem_ranges_meta: {:?}, NUM_SERIES_THRESHOLD: {}, BATCH_SIZE_THRESHOLD: {}",
+                    file_meta.file_id,
+                    file_meta,
+                    file_ranges_meta,
+                    mem_ranges_meta,
+                    NUM_SERIES_THRESHOLD,
+                    BATCH_SIZE_THRESHOLD,
+                );
                 return false;
             } else {
                 num_files_to_split += 1;
@@ -1272,7 +1298,7 @@ pub(crate) fn should_split_flat_batches_for_merge(
         // Skips non-file and non-mem ranges.
     }
 
-    if num_files_to_split > 0 {
+    let result = if num_files_to_split > 0 {
         // We mainly consider file ranges because they have enough data for sampling.
         true
     } else if num_mem_series > 0 && num_mem_rows > 0 {
@@ -1280,7 +1306,35 @@ pub(crate) fn should_split_flat_batches_for_merge(
         can_split_series(num_mem_rows as u64, num_mem_series as u64)
     } else {
         false
+    };
+
+    if result {
+        common_telemetry::info!(
+            "should_split_flat_batches_for_merge: true, num_indices: {}, num_files_to_split: {}, num_mem_rows: {}, num_mem_series: {}, NUM_SERIES_THRESHOLD: {}, BATCH_SIZE_THRESHOLD: {}, SPLIT_ROW_THRESHOLD: {}",
+            range_meta.row_group_indices.len(),
+            num_files_to_split,
+            num_mem_rows,
+            num_mem_series,
+            NUM_SERIES_THRESHOLD,
+            BATCH_SIZE_THRESHOLD,
+            SPLIT_ROW_THRESHOLD,
+        );
+    } else {
+        common_telemetry::info!(
+            "should_split_flat_batches_for_merge: false, num_indices: {}, num_files_to_split: {}, num_mem_rows: {}, num_mem_series: {}, file_ranges_meta: {:?}, mem_ranges_meta: {:?}, NUM_SERIES_THRESHOLD: {}, BATCH_SIZE_THRESHOLD: {}, SPLIT_ROW_THRESHOLD: {}",
+            range_meta.row_group_indices.len(),
+            num_files_to_split,
+            num_mem_rows,
+            num_mem_series,
+            file_ranges_meta,
+            mem_ranges_meta,
+            NUM_SERIES_THRESHOLD,
+            BATCH_SIZE_THRESHOLD,
+            SPLIT_ROW_THRESHOLD,
+        );
     }
+
+    result
 }
 
 fn can_split_series(num_rows: u64, num_series: u64) -> bool {
