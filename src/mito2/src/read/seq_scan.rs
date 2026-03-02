@@ -374,6 +374,33 @@ impl SeqScan {
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<FlatPartitionRangeReadPlan> {
+        // Check cache before building sources and stream.
+        let cache_plan = build_flat_partition_range_cache_plan(stream_ctx, part_range);
+
+        if let Some(key) = cache_plan.key.as_ref() {
+            common_telemetry::debug!(
+                "Flat partition range cache-eligible, region: {}, part_range: {:?}, digest: {:x}",
+                stream_ctx.input.region_metadata().region_id,
+                part_range,
+                key.digest(),
+            );
+
+            if let Some(value) = stream_ctx
+                .input
+                .cache_strategy
+                .get_partition_range_result(key)
+            {
+                common_telemetry::debug!(
+                    "Flat partition range cache hit, region: {}, part_range: {:?}, digest: {:x}",
+                    stream_ctx.input.region_metadata().region_id,
+                    part_range,
+                    key.digest(),
+                );
+                let stream = cached_flat_partition_range_stream(value);
+                return Ok(FlatPartitionRangeReadPlan { stream, cache_plan });
+            }
+        }
+
         let sources_start = Instant::now();
         let mut sources = Vec::new();
         build_flat_sources(
@@ -410,45 +437,21 @@ impl SeqScan {
             num_sources,
             stream_start.elapsed(),
         );
-        let cache_plan = build_flat_partition_range_cache_plan(stream_ctx, part_range);
-
-        if let Some(key) = cache_plan.key.as_ref() {
-            common_telemetry::debug!(
-                "Flat partition range cache-eligible, region: {}, part_range: {:?}, digest: {:x}",
-                stream_ctx.input.region_metadata().region_id,
-                part_range,
-                key.digest(),
-            );
-        }
 
         let stream = match cache_plan.key.clone() {
             Some(key) => {
-                if let Some(value) = stream_ctx
-                    .input
-                    .cache_strategy
-                    .get_partition_range_result(&key)
-                {
-                    common_telemetry::debug!(
-                        "Flat partition range cache hit, region: {}, part_range: {:?}, digest: {:x}",
-                        stream_ctx.input.region_metadata().region_id,
-                        part_range,
-                        key.digest(),
-                    );
-                    cached_flat_partition_range_stream(value)
-                } else {
-                    common_telemetry::debug!(
-                        "Flat partition range cache miss, region: {}, part_range: {:?}, digest: {:x}",
-                        stream_ctx.input.region_metadata().region_id,
-                        part_range,
-                        key.digest(),
-                    );
-                    cache_flat_partition_range_stream(
-                        stream,
-                        stream_ctx.input.cache_strategy.clone(),
-                        key,
-                        part_metrics.clone(),
-                    )
-                }
+                common_telemetry::debug!(
+                    "Flat partition range cache miss, region: {}, part_range: {:?}, digest: {:x}",
+                    stream_ctx.input.region_metadata().region_id,
+                    part_range,
+                    key.digest(),
+                );
+                cache_flat_partition_range_stream(
+                    stream,
+                    stream_ctx.input.cache_strategy.clone(),
+                    key,
+                    part_metrics.clone(),
+                )
             }
             None => stream,
         };
