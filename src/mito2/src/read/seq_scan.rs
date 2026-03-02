@@ -1255,7 +1255,14 @@ pub(crate) async fn build_flat_sources(
 
     if should_split {
         common_telemetry::debug!(
-            "Splitting record batches, region: {}, sources: {}, part_range: {:?}",
+            "===== Splitting record batches, region: {}, sources: {}, part_range: {:?}",
+            stream_ctx.input.region_metadata().region_id,
+            sources.len(),
+            part_range,
+        );
+    } else {
+        common_telemetry::debug!(
+            "===== DO NOT split record batches, region: {}, sources: {}, part_range: {:?}",
             stream_ctx.input.region_metadata().region_id,
             sources.len(),
             part_range,
