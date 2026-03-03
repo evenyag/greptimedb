@@ -517,11 +517,14 @@ impl SeriesDistributor {
         );
 
         // Merges all partition-range streams.
+        // Each partition range stream is already deduped, so we skip dedup
+        // when merging streams across partition ranges.
         let mut reader = SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             range_streams,
             self.semaphore.clone(),
             Some(&part_metrics),
+            false,
         )
         .await?;
         let mut metrics = SeriesDistributorMetrics::default();
