@@ -1257,12 +1257,13 @@ pub(crate) fn should_split_flat_batches_for_merge(
                 file_meta.num_rows,
                 file_meta.num_series
             ));
-            if file_meta.num_rows < SPLIT_ROW_THRESHOLD || file_meta.num_series == 0 {
+            if file_meta.level == 0 {
+                // Always split level 0 files.
+                num_files_to_split += 1;
+            } else if file_meta.num_rows < SPLIT_ROW_THRESHOLD || file_meta.num_series == 0 {
                 // If the file doesn't have enough rows, or the number of series is unavailable, skips it.
                 continue;
-            }
-            debug_assert!(file_meta.num_rows > 0);
-            if !can_split_series(file_meta.num_rows, file_meta.num_series) {
+            } else if !can_split_series(file_meta.num_rows, file_meta.num_series) {
                 // We can't split batches in a file.
                 common_telemetry::info!(
                     "should_split_flat_batches_for_merge: false, file {} can't split series, meta: {:?}, file_ranges_meta: {:?}, mem_ranges_meta: {:?}, NUM_SERIES_THRESHOLD: {}, BATCH_SIZE_THRESHOLD: {}",
