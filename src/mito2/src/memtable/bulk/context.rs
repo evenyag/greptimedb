@@ -76,7 +76,6 @@ impl BulkIterContext {
         let read_format = ReadFormat::new(
             region_metadata.clone(),
             projection,
-            true,
             None,
             "memtable",
             skip_auto_convert,

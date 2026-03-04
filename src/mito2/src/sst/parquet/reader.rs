@@ -427,7 +427,6 @@ impl ParquetReaderBuilder {
             ReadFormat::new(
                 region_meta.clone(),
                 Some(column_ids),
-                self.flat_format,
                 Some(parquet_meta.file_metadata().schema_descr().num_columns()),
                 &file_path,
                 skip_auto_convert,
@@ -443,15 +442,11 @@ impl ParquetReaderBuilder {
             ReadFormat::new(
                 region_meta.clone(),
                 Some(&column_ids),
-                self.flat_format,
                 Some(parquet_meta.file_metadata().schema_descr().num_columns()),
                 &file_path,
                 skip_auto_convert,
             )?
         };
-        if self.decode_primary_key_values {
-            read_format.set_decode_primary_key_values(true);
-        }
         if need_override_sequence(&parquet_meta) {
             read_format
                 .set_override_sequence(self.file_handle.meta_ref().sequence.map(|x| x.get()));
@@ -596,7 +591,7 @@ impl ParquetReaderBuilder {
         region_partition_expr.collect_column_names(&mut referenced_columns);
 
         // Build a partition_schema containing only referenced columns.
-        let is_flat = read_format.as_flat().is_some();
+        let is_flat = true;
         let partition_schema = Arc::new(datatypes::schema::Schema::new(
             prune_schema
                 .column_schemas()
@@ -2059,7 +2054,7 @@ where
         let override_sequence = context
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
-        assert!(context.read_format().as_primary_key().is_some());
+        // ReadFormat always uses flat format now.
 
         Self {
             context,
@@ -2102,16 +2097,8 @@ where
             };
             self.metrics.num_record_batches += 1;
 
-            // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
-            self.context
-                .read_format()
-                .as_primary_key()
-                .unwrap()
-                .convert_record_batch(
-                    &record_batch,
-                    self.override_sequence.as_ref(),
-                    &mut self.batches,
-                )?;
+            // TODO(migration): RowGroupReaderBase should be removed in favor of FlatRowGroupReader.
+            unimplemented!("PrimaryKeyReadFormat has been removed; use FlatRowGroupReader instead");
             self.metrics.num_batches += self.batches.len();
         }
         let batch = self.batches.pop_front();
@@ -2164,8 +2151,7 @@ impl FlatRowGroupReader {
                     path: self.context.file_path(),
                 })?;
 
-                // Safety: Only flat format use FlatRowGroupReader.
-                let flat_format = self.context.read_format().as_flat().unwrap();
+                let flat_format = self.context.read_format().as_flat();
                 let record_batch =
                     flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
                 Ok(Some(record_batch))

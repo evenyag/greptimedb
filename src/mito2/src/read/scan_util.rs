@@ -1347,14 +1347,7 @@ pub fn build_flat_file_range_scan_stream(
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 
-            let may_compat = range
-                .compat_batch()
-                .map(|compat| {
-                    compat.as_flat().context(UnexpectedSnafu {
-                        reason: "Invalid compat for flat format",
-                    })
-                })
-                .transpose()?;
+            let may_compat = range.compat_batch();
 
             let mapper = range.compaction_projection_mapper();
             while let Some(record_batch) = reader.next_batch()? {

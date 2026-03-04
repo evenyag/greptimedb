@@ -30,7 +30,6 @@ use crate::memtable::{MemScanMetrics, MemScanMetricsData};
 use crate::metrics::{READ_ROWS_TOTAL, READ_STAGE_ELAPSED};
 use crate::sst::parquet::file_range::{PreFilterMode, TagDecodeState};
 use crate::sst::parquet::flat_format::sequence_column_index;
-use crate::sst::parquet::reader::RowGroupReaderContext;
 
 /// Iterator for reading data inside a bulk part.
 pub struct EncodedBulkPartIter {
@@ -57,7 +56,6 @@ impl EncodedBulkPartIter {
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> error::Result<Self> {
-        assert!(context.read_format().as_flat().is_some());
 
         let parquet_meta = encoded_part.metadata().parquet_metadata.clone();
         let data = encoded_part.data().clone();
@@ -221,7 +219,6 @@ impl BulkPartBatchIter {
         series_count: usize,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Self {
-        assert!(context.read_format().as_flat().is_some());
 
         Self {
             batches: VecDeque::from(batches),
@@ -356,7 +353,7 @@ fn apply_combined_filters(
     skip_fields: bool,
 ) -> error::Result<Option<RecordBatch>> {
     // Converts the format to the flat format first.
-    let format = context.read_format().as_flat().unwrap();
+    let format = context.read_format().as_flat();
     let record_batch = format.convert_batch(record_batch, None)?;
 
     let num_rows = record_batch.num_rows();

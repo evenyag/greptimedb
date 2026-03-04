@@ -28,7 +28,7 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::DataType;
 use datatypes::value::Value;
-use datatypes::vectors::{Helper, VectorRef};
+use datatypes::vectors::VectorRef;
 use mito_codec::row_converter::{
     CompositeValues, PrimaryKeyCodec, SortField, build_primary_key_codec,
     build_primary_key_codec_with_fields,
@@ -39,127 +39,13 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
 
 use crate::error::{
-    CastVectorSnafu, CompatReaderSnafu, ComputeArrowSnafu, ConvertVectorSnafu, CreateDefaultSnafu,
-    DecodeSnafu, EncodeSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result,
-    UnsupportedOperationSnafu,
+    CompatReaderSnafu, ComputeArrowSnafu, CreateDefaultSnafu, DecodeSnafu, EncodeSnafu,
+    NewRecordBatchSnafu, RecordBatchSnafu, Result, UnsupportedOperationSnafu,
 };
 use crate::read::flat_projection::{FlatProjectionMapper, flat_projected_columns};
-use crate::read::projection::PrimaryKeyProjectionMapper;
-use crate::read::{Batch, BatchColumn, BatchReader};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::{FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray};
 use crate::sst::{internal_fields, tag_maybe_to_dictionary_field};
-
-/// Reader to adapt schema of underlying reader to expected schema.
-pub struct CompatReader<R> {
-    /// Underlying reader.
-    reader: R,
-    /// Helper to compat batches.
-    compat: PrimaryKeyCompatBatch,
-}
-
-impl<R> CompatReader<R> {
-    /// Creates a new compat reader.
-    /// - `mapper` is built from the metadata users expect to see.
-    /// - `reader_meta` is the metadata of the input reader.
-    /// - `reader` is the input reader.
-    pub fn new(
-        mapper: &PrimaryKeyProjectionMapper,
-        reader_meta: RegionMetadataRef,
-        reader: R,
-    ) -> Result<CompatReader<R>> {
-        Ok(CompatReader {
-            reader,
-            compat: PrimaryKeyCompatBatch::new(mapper, reader_meta)?,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl<R: BatchReader> BatchReader for CompatReader<R> {
-    async fn next_batch(&mut self) -> Result<Option<Batch>> {
-        let Some(mut batch) = self.reader.next_batch().await? else {
-            return Ok(None);
-        };
-
-        batch = self.compat.compat_batch(batch)?;
-
-        Ok(Some(batch))
-    }
-}
-
-/// Helper to adapt schema of the batch to an expected schema.
-#[allow(dead_code)]
-pub(crate) enum CompatBatch {
-    /// Adapter for primary key format.
-    PrimaryKey(PrimaryKeyCompatBatch),
-    /// Adapter for flat format.
-    Flat(FlatCompatBatch),
-}
-
-impl CompatBatch {
-    /// Returns the inner primary key batch adapter if this is a PrimaryKey format.
-    #[allow(dead_code)]
-    pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyCompatBatch> {
-        match self {
-            CompatBatch::PrimaryKey(batch) => Some(batch),
-            _ => None,
-        }
-    }
-
-    /// Returns the inner flat batch adapter if this is a Flat format.
-    pub(crate) fn as_flat(&self) -> Option<&FlatCompatBatch> {
-        match self {
-            CompatBatch::Flat(batch) => Some(batch),
-            _ => None,
-        }
-    }
-}
-
-/// A helper struct to adapt schema of the batch to an expected schema.
-pub(crate) struct PrimaryKeyCompatBatch {
-    /// Optional primary key adapter.
-    rewrite_pk: Option<RewritePrimaryKey>,
-    /// Optional primary key adapter.
-    compat_pk: Option<CompatPrimaryKey>,
-    /// Optional fields adapter.
-    compat_fields: Option<CompatFields>,
-}
-
-impl PrimaryKeyCompatBatch {
-    /// Creates a new [CompatBatch].
-    /// - `mapper` is built from the metadata users expect to see.
-    /// - `reader_meta` is the metadata of the input reader.
-    pub(crate) fn new(
-        mapper: &PrimaryKeyProjectionMapper,
-        reader_meta: RegionMetadataRef,
-    ) -> Result<Self> {
-        let rewrite_pk = may_rewrite_primary_key(mapper.metadata(), &reader_meta);
-        let compat_pk = may_compat_primary_key(mapper.metadata(), &reader_meta)?;
-        let compat_fields = may_compat_fields(mapper, &reader_meta)?;
-
-        Ok(Self {
-            rewrite_pk,
-            compat_pk,
-            compat_fields,
-        })
-    }
-
-    /// Adapts the `batch` to the expected schema.
-    pub(crate) fn compat_batch(&self, mut batch: Batch) -> Result<Batch> {
-        if let Some(rewrite_pk) = &self.rewrite_pk {
-            batch = rewrite_pk.compat(batch)?;
-        }
-        if let Some(compat_pk) = &self.compat_pk {
-            batch = compat_pk.compat(batch)?;
-        }
-        if let Some(compat_fields) = &self.compat_fields {
-            batch = compat_fields.compat(batch)?;
-        }
-
-        Ok(batch)
-    }
-}
 
 /// Returns true if `left` and `right` have same columns and primary key encoding.
 pub(crate) fn has_same_columns_and_pk_encoding(
@@ -416,119 +302,23 @@ fn repeat_vector(vector: &VectorRef, to_len: usize, is_tag: bool) -> Result<Arra
     }
 }
 
-/// Helper to make primary key compatible.
+/// Index in source batch or a default value to fill a column.
 #[derive(Debug)]
-struct CompatPrimaryKey {
-    /// Row converter to append values to primary keys.
-    converter: Arc<dyn PrimaryKeyCodec>,
-    /// Default values to append.
-    values: Vec<(ColumnId, Value)>,
-}
-
-impl CompatPrimaryKey {
-    /// Make primary key of the `batch` compatible.
-    fn compat(&self, mut batch: Batch) -> Result<Batch> {
-        let mut buffer = Vec::with_capacity(
-            batch.primary_key().len() + self.converter.estimated_size().unwrap_or_default(),
-        );
-        buffer.extend_from_slice(batch.primary_key());
-        self.converter
-            .encode_values(&self.values, &mut buffer)
-            .context(EncodeSnafu)?;
-
-        batch.set_primary_key(buffer);
-
-        // update cache
-        if let Some(pk_values) = &mut batch.pk_values {
-            pk_values.extend(&self.values);
-        }
-
-        Ok(batch)
-    }
-}
-
-/// Helper to make fields compatible.
-#[derive(Debug)]
-struct CompatFields {
-    /// Column Ids and DataTypes the reader actually returns.
-    actual_fields: Vec<(ColumnId, ConcreteDataType)>,
-    /// Indices to convert actual fields to expect fields.
-    index_or_defaults: Vec<IndexOrDefault>,
-}
-
-impl CompatFields {
-    /// Make fields of the `batch` compatible.
-    fn compat(&self, batch: Batch) -> Result<Batch> {
-        debug_assert_eq!(self.actual_fields.len(), batch.fields().len());
-        debug_assert!(
-            self.actual_fields
-                .iter()
-                .zip(batch.fields())
-                .all(|((id, _), batch_column)| *id == batch_column.column_id)
-        );
-
-        let len = batch.num_rows();
-        self.index_or_defaults
-            .iter()
-            .map(|index_or_default| match index_or_default {
-                IndexOrDefault::Index { pos, cast_type } => {
-                    let old_column = &batch.fields()[*pos];
-
-                    let data = if let Some(ty) = cast_type {
-                        if let Some(json_type) = ty.as_json() {
-                            let json_array = old_column.data.to_arrow_array();
-                            let json_array =
-                                align_json_array(&json_array, &json_type.as_arrow_type())
-                                    .context(RecordBatchSnafu)?;
-                            Helper::try_into_vector(&json_array).context(ConvertVectorSnafu)?
-                        } else {
-                            old_column.data.cast(ty).with_context(|_| CastVectorSnafu {
-                                from: old_column.data.data_type(),
-                                to: ty.clone(),
-                            })?
-                        }
-                    } else {
-                        old_column.data.clone()
-                    };
-                    Ok(BatchColumn {
-                        column_id: old_column.column_id,
-                        data,
-                    })
-                }
-                IndexOrDefault::DefaultValue {
-                    column_id,
-                    default_vector,
-                    semantic_type: _,
-                } => {
-                    let data = default_vector.replicate(&[len]);
-                    Ok(BatchColumn {
-                        column_id: *column_id,
-                        data,
-                    })
-                }
-            })
-            .collect::<Result<Vec<_>>>()
-            .and_then(|fields| batch.with_fields(fields))
-    }
-}
-
-fn may_rewrite_primary_key(
-    expect: &RegionMetadata,
-    actual: &RegionMetadata,
-) -> Option<RewritePrimaryKey> {
-    if expect.primary_key_encoding == actual.primary_key_encoding {
-        return None;
-    }
-
-    let fields = expect.primary_key.clone();
-    let original = build_primary_key_codec(actual);
-    let new = build_primary_key_codec(expect);
-
-    Some(RewritePrimaryKey {
-        original,
-        new,
-        fields,
-    })
+enum IndexOrDefault {
+    /// Index of the column in source batch.
+    Index {
+        pos: usize,
+        cast_type: Option<ConcreteDataType>,
+    },
+    /// Default value for the column.
+    DefaultValue {
+        /// Id of the column.
+        column_id: ColumnId,
+        /// Default value. The vector has only 1 element.
+        default_vector: VectorRef,
+        /// Semantic type of the column.
+        semantic_type: SemanticType,
+    },
 }
 
 /// Returns true if the actual primary keys is the same as expected.
@@ -556,184 +346,6 @@ fn is_primary_key_same(expect: &RegionMetadata, actual: &RegionMetadata) -> Resu
     );
 
     Ok(actual.primary_key.len() == expect.primary_key.len())
-}
-
-/// Creates a [CompatPrimaryKey] if needed.
-fn may_compat_primary_key(
-    expect: &RegionMetadata,
-    actual: &RegionMetadata,
-) -> Result<Option<CompatPrimaryKey>> {
-    if is_primary_key_same(expect, actual)? {
-        return Ok(None);
-    }
-
-    // We need to append default values to the primary key.
-    let to_add = &expect.primary_key[actual.primary_key.len()..];
-    let mut fields = Vec::with_capacity(to_add.len());
-    let mut values = Vec::with_capacity(to_add.len());
-    for column_id in to_add {
-        // Safety: The id comes from expect region metadata.
-        let column = expect.column_by_id(*column_id).unwrap();
-        fields.push((
-            *column_id,
-            SortField::new(column.column_schema.data_type.clone()),
-        ));
-        let default_value = column
-            .column_schema
-            .create_default()
-            .context(CreateDefaultSnafu {
-                region_id: expect.region_id,
-                column: &column.column_schema.name,
-            })?
-            .with_context(|| CompatReaderSnafu {
-                region_id: expect.region_id,
-                reason: format!(
-                    "key column {} does not have a default value to read",
-                    column.column_schema.name
-                ),
-            })?;
-        values.push((*column_id, default_value));
-    }
-    // Using expect primary key encoding to build the converter
-    let converter =
-        build_primary_key_codec_with_fields(expect.primary_key_encoding, fields.into_iter());
-
-    Ok(Some(CompatPrimaryKey { converter, values }))
-}
-
-/// Creates a [CompatFields] if needed.
-fn may_compat_fields(
-    mapper: &PrimaryKeyProjectionMapper,
-    actual: &RegionMetadata,
-) -> Result<Option<CompatFields>> {
-    let expect_fields = mapper.batch_fields();
-    let actual_fields = Batch::projected_fields(actual, mapper.column_ids());
-    if expect_fields == actual_fields {
-        return Ok(None);
-    }
-
-    let source_field_index: HashMap<_, _> = actual_fields
-        .iter()
-        .enumerate()
-        .map(|(idx, (column_id, data_type))| (*column_id, (idx, data_type)))
-        .collect();
-
-    let index_or_defaults = expect_fields
-        .iter()
-        .map(|(column_id, expect_data_type)| {
-            if let Some((index, actual_data_type)) = source_field_index.get(column_id) {
-                let mut cast_type = None;
-
-                if expect_data_type != *actual_data_type {
-                    cast_type = Some(expect_data_type.clone())
-                }
-                // Source has this field.
-                Ok(IndexOrDefault::Index {
-                    pos: *index,
-                    cast_type,
-                })
-            } else {
-                // Safety: mapper must have this column.
-                let column = mapper.metadata().column_by_id(*column_id).unwrap();
-                // Create a default vector with 1 element for that column.
-                let default_vector = column
-                    .column_schema
-                    .create_default_vector(1)
-                    .context(CreateDefaultSnafu {
-                        region_id: mapper.metadata().region_id,
-                        column: &column.column_schema.name,
-                    })?
-                    .with_context(|| CompatReaderSnafu {
-                        region_id: mapper.metadata().region_id,
-                        reason: format!(
-                            "column {} does not have a default value to read",
-                            column.column_schema.name
-                        ),
-                    })?;
-                Ok(IndexOrDefault::DefaultValue {
-                    column_id: column.column_id,
-                    default_vector,
-                    semantic_type: SemanticType::Field,
-                })
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(Some(CompatFields {
-        actual_fields,
-        index_or_defaults,
-    }))
-}
-
-/// Index in source batch or a default value to fill a column.
-#[derive(Debug)]
-enum IndexOrDefault {
-    /// Index of the column in source batch.
-    Index {
-        pos: usize,
-        cast_type: Option<ConcreteDataType>,
-    },
-    /// Default value for the column.
-    DefaultValue {
-        /// Id of the column.
-        column_id: ColumnId,
-        /// Default value. The vector has only 1 element.
-        default_vector: VectorRef,
-        /// Semantic type of the column.
-        semantic_type: SemanticType,
-    },
-}
-
-/// Adapter to rewrite primary key.
-struct RewritePrimaryKey {
-    /// Original primary key codec.
-    original: Arc<dyn PrimaryKeyCodec>,
-    /// New primary key codec.
-    new: Arc<dyn PrimaryKeyCodec>,
-    /// Order of the fields in the new primary key.
-    fields: Vec<ColumnId>,
-}
-
-impl RewritePrimaryKey {
-    /// Make primary key of the `batch` compatible.
-    fn compat(&self, mut batch: Batch) -> Result<Batch> {
-        if batch.pk_values().is_none() {
-            let new_pk_values = self
-                .original
-                .decode(batch.primary_key())
-                .context(DecodeSnafu)?;
-            batch.set_pk_values(new_pk_values);
-        }
-        // Safety: We ensure pk_values is not None.
-        let values = batch.pk_values().unwrap();
-
-        let mut buffer = Vec::with_capacity(
-            batch.primary_key().len() + self.new.estimated_size().unwrap_or_default(),
-        );
-        match values {
-            CompositeValues::Dense(values) => {
-                self.new
-                    .encode_values(values.as_slice(), &mut buffer)
-                    .context(EncodeSnafu)?;
-            }
-            CompositeValues::Sparse(values) => {
-                let values = self
-                    .fields
-                    .iter()
-                    .map(|id| {
-                        let value = values.get_or_null(*id);
-                        (*id, value.as_value_ref())
-                    })
-                    .collect::<Vec<_>>();
-                self.new
-                    .encode_value_refs(&values, &mut buffer)
-                    .context(EncodeSnafu)?;
-            }
-        }
-        batch.set_primary_key(buffer);
-
-        Ok(batch)
-    }
 }
 
 /// Helper to rewrite primary key to another encoding for flat format.
@@ -982,7 +594,6 @@ mod tests {
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
     use datatypes::value::ValueRef;
-    use datatypes::vectors::{Int64Vector, TimestampMillisecondVector, UInt8Vector, UInt64Vector};
     use mito_codec::row_converter::{
         DensePrimaryKeyCodec, PrimaryKeyCodecExt, SparsePrimaryKeyCodec,
     };
@@ -994,7 +605,6 @@ mod tests {
     use crate::read::flat_projection::FlatProjectionMapper;
     use crate::sst::parquet::flat_format::FlatReadFormat;
     use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
-    use crate::test_util::{VecBatchReader, check_reader_result};
 
     /// Creates a new [RegionMetadata].
     fn new_metadata(
@@ -1055,44 +665,6 @@ mod tests {
         buffer
     }
 
-    /// Creates a batch for specific primary `key`.
-    ///
-    /// `fields`: [(column_id of the field, is null)]
-    fn new_batch(
-        primary_key: &[u8],
-        fields: &[(ColumnId, bool)],
-        start_ts: i64,
-        num_rows: usize,
-    ) -> Batch {
-        let timestamps = Arc::new(TimestampMillisecondVector::from_values(
-            start_ts..start_ts + num_rows as i64,
-        ));
-        let sequences = Arc::new(UInt64Vector::from_values(0..num_rows as u64));
-        let op_types = Arc::new(UInt8Vector::from_vec(vec![OpType::Put as u8; num_rows]));
-        let field_columns = fields
-            .iter()
-            .map(|(id, is_null)| {
-                let data = if *is_null {
-                    Arc::new(Int64Vector::from(vec![None; num_rows]))
-                } else {
-                    Arc::new(Int64Vector::from_vec(vec![*id as i64; num_rows]))
-                };
-                BatchColumn {
-                    column_id: *id,
-                    data,
-                }
-            })
-            .collect();
-        Batch::new(
-            primary_key.to_vec(),
-            timestamps,
-            sequences,
-            op_types,
-            field_columns,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn test_invalid_pk_len() {
         let reader_meta = new_metadata(
@@ -1120,7 +692,7 @@ mod tests {
             ],
             &[1],
         );
-        may_compat_primary_key(&expect_meta, &reader_meta).unwrap_err();
+        is_primary_key_same(&expect_meta, &reader_meta).unwrap_err();
     }
 
     #[test]
@@ -1152,7 +724,7 @@ mod tests {
             ],
             &[1, 2, 4],
         );
-        may_compat_primary_key(&expect_meta, &reader_meta).unwrap_err();
+        is_primary_key_same(&expect_meta, &reader_meta).unwrap_err();
     }
 
     #[test]
@@ -1170,353 +742,9 @@ mod tests {
             &[1],
         );
         assert!(
-            may_compat_primary_key(&reader_meta, &reader_meta)
+            is_primary_key_same(&reader_meta, &reader_meta)
                 .unwrap()
-                .is_none()
         );
-    }
-
-    #[test]
-    fn test_same_pk_encoding() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-            ],
-            &[1],
-        ));
-
-        assert!(
-            may_compat_primary_key(&reader_meta, &reader_meta)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_same_fields() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let mapper = PrimaryKeyProjectionMapper::all(&reader_meta).unwrap();
-        assert!(may_compat_fields(&mapper, &reader_meta).unwrap().is_none())
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let expect_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (3, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (4, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1, 3],
-        ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let k2 = encode_key(&[Some("b")]);
-        let source_reader = VecBatchReader::new(&[
-            new_batch(&k1, &[(2, false)], 1000, 3),
-            new_batch(&k2, &[(2, false)], 1000, 3),
-        ]);
-
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
-        let k1 = encode_key(&[Some("a"), None]);
-        let k2 = encode_key(&[Some("b"), None]);
-        check_reader_result(
-            &mut compat_reader,
-            &[
-                new_batch(&k1, &[(2, false), (4, true)], 1000, 3),
-                new_batch(&k2, &[(2, false), (4, true)], 1000, 3),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader_different_order() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let expect_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (4, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let k2 = encode_key(&[Some("b")]);
-        let source_reader = VecBatchReader::new(&[
-            new_batch(&k1, &[(2, false)], 1000, 3),
-            new_batch(&k2, &[(2, false)], 1000, 3),
-        ]);
-
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
-        check_reader_result(
-            &mut compat_reader,
-            &[
-                new_batch(&k1, &[(3, true), (2, false), (4, true)], 1000, 3),
-                new_batch(&k2, &[(3, true), (2, false), (4, true)], 1000, 3),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader_different_types() {
-        let actual_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let expect_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::string_datatype()),
-            ],
-            &[1],
-        ));
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let k2 = encode_key(&[Some("b")]);
-        let source_reader = VecBatchReader::new(&[
-            new_batch(&k1, &[(2, false)], 1000, 3),
-            new_batch(&k2, &[(2, false)], 1000, 3),
-        ]);
-
-        let fn_batch_cast = |batch: Batch| {
-            let mut new_fields = batch.fields.clone();
-            new_fields[0].data = new_fields[0]
-                .data
-                .cast(&ConcreteDataType::string_datatype())
-                .unwrap();
-
-            batch.with_fields(new_fields).unwrap()
-        };
-        let mut compat_reader = CompatReader::new(&mapper, actual_meta, source_reader).unwrap();
-        check_reader_result(
-            &mut compat_reader,
-            &[
-                fn_batch_cast(new_batch(&k1, &[(2, false)], 1000, 3)),
-                fn_batch_cast(new_batch(&k2, &[(2, false)], 1000, 3)),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader_projection() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let expect_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (4, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        // tag_1, field_2, field_3
-        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 3, 2].into_iter()).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
-
-        let mut compat_reader =
-            CompatReader::new(&mapper, reader_meta.clone(), source_reader).unwrap();
-        check_reader_result(
-            &mut compat_reader,
-            &[new_batch(&k1, &[(3, true), (2, false)], 1000, 3)],
-        )
-        .await;
-
-        // tag_1, field_4, field_3
-        let mapper = PrimaryKeyProjectionMapper::new(&expect_meta, [1, 4, 2].into_iter()).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let source_reader = VecBatchReader::new(&[new_batch(&k1, &[], 1000, 3)]);
-
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
-        check_reader_result(
-            &mut compat_reader,
-            &[new_batch(&k1, &[(3, true), (4, true)], 1000, 3)],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader_projection_read_superset() {
-        let reader_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        let expect_meta = Arc::new(new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (3, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (4, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        ));
-        // Output: tag_1, field_3, field_2. Read also includes field_4.
-        let mapper = PrimaryKeyProjectionMapper::new_with_read_columns(
-            &expect_meta,
-            vec![1, 3, 2],
-            vec![1, 3, 2, 4],
-        )
-        .unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let source_reader = VecBatchReader::new(&[new_batch(&k1, &[(2, false)], 1000, 3)]);
-
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
-        check_reader_result(
-            &mut compat_reader,
-            &[new_batch(&k1, &[(3, true), (2, false), (4, true)], 1000, 3)],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_compat_reader_different_pk_encoding() {
-        let mut reader_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1],
-        );
-        reader_meta.primary_key_encoding = PrimaryKeyEncoding::Dense;
-        let reader_meta = Arc::new(reader_meta);
-        let mut expect_meta = new_metadata(
-            &[
-                (
-                    0,
-                    SemanticType::Timestamp,
-                    ConcreteDataType::timestamp_millisecond_datatype(),
-                ),
-                (1, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (2, SemanticType::Field, ConcreteDataType::int64_datatype()),
-                (3, SemanticType::Tag, ConcreteDataType::string_datatype()),
-                (4, SemanticType::Field, ConcreteDataType::int64_datatype()),
-            ],
-            &[1, 3],
-        );
-        expect_meta.primary_key_encoding = PrimaryKeyEncoding::Sparse;
-        let expect_meta = Arc::new(expect_meta);
-
-        let mapper = PrimaryKeyProjectionMapper::all(&expect_meta).unwrap();
-        let k1 = encode_key(&[Some("a")]);
-        let k2 = encode_key(&[Some("b")]);
-        let source_reader = VecBatchReader::new(&[
-            new_batch(&k1, &[(2, false)], 1000, 3),
-            new_batch(&k2, &[(2, false)], 1000, 3),
-        ]);
-
-        let mut compat_reader = CompatReader::new(&mapper, reader_meta, source_reader).unwrap();
-        let k1 = encode_sparse_key(&[(1, Some("a")), (3, None)]);
-        let k2 = encode_sparse_key(&[(1, Some("b")), (3, None)]);
-        check_reader_result(
-            &mut compat_reader,
-            &[
-                new_batch(&k1, &[(2, false), (4, true)], 1000, 3),
-                new_batch(&k2, &[(2, false), (4, true)], 1000, 3),
-            ],
-        )
-        .await;
     }
 
     /// Creates a primary key array for flat format testing.

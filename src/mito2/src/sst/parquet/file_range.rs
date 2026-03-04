@@ -43,7 +43,7 @@ use crate::error::{
     UnexpectedSnafu,
 };
 use crate::read::Batch;
-use crate::read::compat::CompatBatch;
+use crate::read::compat::FlatCompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::{FlatRowGroupLastRowCachedReader, RowGroupLastRowCachedReader};
 use crate::read::prune::{FlatPruneReader, PruneReader};
@@ -173,69 +173,6 @@ impl FileRange {
         }
     }
 
-    /// Returns a reader to read the [FileRange].
-    #[allow(dead_code)]
-    pub(crate) async fn reader(
-        &self,
-        selector: Option<TimeSeriesRowSelector>,
-        fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<Option<PruneReader>> {
-        if !self.in_dynamic_filter_range() {
-            return Ok(None);
-        }
-        let parquet_reader = self
-            .context
-            .reader_builder
-            .build(
-                self.row_group_idx,
-                self.row_selection.clone(),
-                fetch_metrics,
-            )
-            .await?;
-
-        let use_last_row_reader = if selector
-            .map(|s| s == TimeSeriesRowSelector::LastRow)
-            .unwrap_or(false)
-        {
-            // Only use LastRowReader if row group does not contain DELETE
-            // and all rows are selected.
-            let put_only = !self
-                .context
-                .contains_delete(self.row_group_idx)
-                .inspect_err(|e| {
-                    error!(e; "Failed to decode min value of op_type, fallback to RowGroupReader");
-                })
-                .unwrap_or(true);
-            put_only && self.select_all()
-        } else {
-            // No selector provided, use RowGroupReader
-            false
-        };
-
-        // Compute skip_fields once for this row group
-        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
-
-        let prune_reader = if use_last_row_reader {
-            // Row group is PUT only, use LastRowReader to skip unnecessary rows.
-            let reader = RowGroupLastRowCachedReader::new(
-                self.file_handle().file_id().file_id(),
-                self.row_group_idx,
-                self.context.reader_builder.cache_strategy().clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader),
-            );
-            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
-        } else {
-            // Row group contains DELETE, fallback to default reader.
-            PruneReader::new_with_row_group_reader(
-                self.context.clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader),
-                skip_fields,
-            )
-        };
-
-        Ok(Some(prune_reader))
-    }
-
     /// Creates a flat reader that returns RecordBatch.
     pub(crate) async fn flat_reader(
         &self,
@@ -279,7 +216,6 @@ impl FileRange {
                 .context
                 .read_format()
                 .as_flat()
-                .expect("flat_reader only supports flat read format")
                 .projection_indices()
                 .to_vec();
             let reader = FlatRowGroupLastRowCachedReader::new(
@@ -303,8 +239,64 @@ impl FileRange {
         Ok(Some(flat_prune_reader))
     }
 
+    /// Returns a reader to read the [FileRange].
+    #[allow(dead_code)]
+    pub(crate) async fn reader(
+        &self,
+        selector: Option<TimeSeriesRowSelector>,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<Option<PruneReader>> {
+        if !self.in_dynamic_filter_range() {
+            return Ok(None);
+        }
+        let parquet_reader = self
+            .context
+            .reader_builder
+            .build(
+                self.row_group_idx,
+                self.row_selection.clone(),
+                fetch_metrics,
+            )
+            .await?;
+
+        let use_last_row_reader = if selector
+            .map(|s| s == TimeSeriesRowSelector::LastRow)
+            .unwrap_or(false)
+        {
+            let put_only = !self
+                .context
+                .contains_delete(self.row_group_idx)
+                .inspect_err(|e| {
+                    error!(e; "Failed to decode min value of op_type, fallback to RowGroupReader");
+                })
+                .unwrap_or(true);
+            put_only && self.select_all()
+        } else {
+            false
+        };
+
+        let skip_fields = self.context.should_skip_fields(self.row_group_idx);
+        let prune_reader = if use_last_row_reader {
+            let reader = RowGroupLastRowCachedReader::new(
+                self.file_handle().file_id().file_id(),
+                self.row_group_idx,
+                self.context.reader_builder.cache_strategy().clone(),
+                RowGroupReader::new(self.context.clone(), parquet_reader),
+            );
+            PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
+        } else {
+            PruneReader::new_with_row_group_reader(
+                self.context.clone(),
+                RowGroupReader::new(self.context.clone(), parquet_reader),
+                skip_fields,
+            )
+        };
+
+        Ok(Some(prune_reader))
+    }
+
     /// Returns the helper to compat batches.
-    pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
+    pub(crate) fn compat_batch(&self) -> Option<&FlatCompatBatch> {
         self.context.compat_batch()
     }
 
@@ -364,7 +356,7 @@ impl FileRangeContext {
     }
 
     /// Returns the helper to compat batches.
-    pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
+    pub(crate) fn compat_batch(&self) -> Option<&FlatCompatBatch> {
         self.base.compat_batch.as_ref()
     }
 
@@ -373,16 +365,9 @@ impl FileRangeContext {
         self.base.compaction_projection_mapper.as_ref()
     }
 
-    /// Sets the `CompatBatch` to the context.
-    pub(crate) fn set_compat_batch(&mut self, compat: Option<CompatBatch>) {
+    /// Sets the `FlatCompatBatch` to the context.
+    pub(crate) fn set_compat_batch(&mut self, compat: Option<FlatCompatBatch>) {
         self.base.compat_batch = compat;
-    }
-
-    /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
-    /// Return the filtered batch. If the entire batch is filtered out, return None.
-    /// If a partition expr filter is configured, it is also applied.
-    pub(crate) fn precise_filter(&self, input: Batch, skip_fields: bool) -> Result<Option<Batch>> {
-        self.base.precise_filter(input, skip_fields)
     }
 
     /// Filters the input RecordBatch by the pushed down predicate and returns RecordBatch.
@@ -393,6 +378,12 @@ impl FileRangeContext {
         skip_fields: bool,
     ) -> Result<Option<RecordBatch>> {
         self.base.precise_filter_flat(input, skip_fields)
+    }
+
+    /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
+    /// Return the filtered batch. If the entire batch is filtered out, return None.
+    pub(crate) fn precise_filter(&self, input: Batch, skip_fields: bool) -> Result<Option<Batch>> {
+        self.base.precise_filter(input, skip_fields)
     }
 
     /// Determines whether to skip field filters based on PreFilterMode and row group delete status.
@@ -454,7 +445,7 @@ pub(crate) struct RangeBase {
     /// Decoder for primary keys
     pub(crate) codec: Arc<dyn PrimaryKeyCodec>,
     /// Optional helper to compat batches.
-    pub(crate) compat_batch: Option<CompatBatch>,
+    pub(crate) compat_batch: Option<FlatCompatBatch>,
     /// Optional helper to project batches.
     pub(crate) compaction_projection_mapper: Option<CompactionProjectionMapper>,
     /// Mode to pre-filter columns.
@@ -480,15 +471,6 @@ impl TagDecodeState {
 impl RangeBase {
     /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
     /// Return the filtered batch. If the entire batch is filtered out, return None.
-    ///
-    /// Supported filter expr type is defined in [SimpleFilterEvaluator].
-    ///
-    /// When a filter is referencing primary key column, this method will decode
-    /// the primary key and put it into the batch.
-    ///
-    /// # Arguments
-    /// * `input` - The batch to filter
-    /// * `skip_fields` - Whether to skip field filters based on PreFilterMode and row group delete status
     pub(crate) fn precise_filter(
         &self,
         mut input: Batch,
@@ -496,14 +478,10 @@ impl RangeBase {
     ) -> Result<Option<Batch>> {
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
-        // Run filter one by one and combine them result
-        // TODO(ruihang): run primary key filter first. It may short circuit other filters
         for filter_ctx in &self.filters {
             let filter = match filter_ctx.filter() {
                 MaybeFilter::Filter(f) => f,
-                // Column matches.
                 MaybeFilter::Matched => continue,
-                // Column doesn't match, filter the entire batch.
                 MaybeFilter::Pruned => return Ok(None),
             };
             let result = match filter_ctx.semantic_type() {
@@ -520,7 +498,6 @@ impl RangeBase {
                     };
                     let pk_value = match pk_values {
                         CompositeValues::Dense(v) => {
-                            // Safety: this is a primary key
                             let pk_index = self
                                 .read_format
                                 .metadata()
@@ -543,25 +520,23 @@ impl RangeBase {
                     {
                         continue;
                     } else {
-                        // PK not match means the entire batch is filtered out.
                         return Ok(None);
                     }
                 }
                 SemanticType::Field => {
-                    // Skip field filters if skip_fields is true
                     if skip_fields {
                         continue;
                     }
-                    // Safety: Input is Batch so we are using primary key format.
-                    let Some(field_index) = self
+                    let field_idx = self
                         .read_format
-                        .as_primary_key()
-                        .unwrap()
-                        .field_index_by_id(filter_ctx.column_id())
-                    else {
+                        .metadata()
+                        .field_columns()
+                        .enumerate()
+                        .find_map(|(idx, col)| (col.column_id == filter_ctx.column_id()).then_some(idx));
+                    let Some(field_idx) = field_idx else {
                         continue;
                     };
-                    let field_col = &input.fields()[field_index].data;
+                    let field_col = &input.fields()[field_idx].data;
                     filter
                         .evaluate_vector(field_col)
                         .context(RecordBatchSnafu)?
@@ -578,7 +553,6 @@ impl RangeBase {
             return Ok(None);
         }
 
-        // Apply partition filter
         if let Some(partition_filter) = &self.partition_filter {
             let record_batch = self
                 .build_record_batch_for_pruning(&mut input, &partition_filter.partition_schema)?;
@@ -656,12 +630,7 @@ impl RangeBase {
     ) -> Result<Option<BooleanBuffer>> {
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
-        let flat_format = self
-            .read_format
-            .as_flat()
-            .context(crate::error::UnexpectedSnafu {
-                reason: "Expected flat format for precise_filter_flat",
-            })?;
+        let flat_format = self.read_format.as_flat();
         let metadata = flat_format.metadata();
 
         // Run filter one by one and combine them result
@@ -781,9 +750,6 @@ impl RangeBase {
     }
 
     /// Builds a `RecordBatch` from the input `Batch` matching the given schema.
-    ///
-    /// This is used for partition expression evaluation. The schema should only contain
-    /// the columns referenced by the partition expression to minimize overhead.
     fn build_record_batch_for_pruning(
         &self,
         input: &mut Batch,
@@ -792,7 +758,6 @@ impl RangeBase {
         let arrow_schema = schema.arrow_schema();
         let mut columns = Vec::with_capacity(arrow_schema.fields().len());
 
-        // Decode primary key if necessary.
         if input.pk_values().is_none() {
             input.set_pk_values(
                 self.codec
@@ -804,8 +769,6 @@ impl RangeBase {
         for field in arrow_schema.fields() {
             let metadata = self.read_format.metadata();
             let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
-
-            // Partition pruning schema should be a subset of the input batch schema.
             let Some(column_id) = column_id else {
                 return UnexpectedSnafu {
                     reason: format!(
@@ -817,7 +780,6 @@ impl RangeBase {
                 .fail();
             };
 
-            // 1. Check if it's a tag.
             if let Some(pk_index) = metadata.primary_key_index(column_id) {
                 let pk_values = input.pk_values().unwrap();
                 let value = match pk_values {
@@ -832,27 +794,32 @@ impl RangeBase {
                     .to_array_of_size(input.num_rows())
                     .context(EvalPartitionFilterSnafu)?;
                 columns.push(array);
-            } else if metadata.time_index_column().column_id == column_id {
-                // 2. Check if it's the timestamp column.
-                columns.push(input.timestamps().to_arrow_array());
-            } else if let Some(field_index) = self
-                .read_format
-                .as_primary_key()
-                .and_then(|f| f.field_index_by_id(column_id))
-            {
-                // 3. Check if it's a field column.
-                columns.push(input.fields()[field_index].data.to_arrow_array());
-            } else {
-                return UnexpectedSnafu {
-                    reason: format!(
-                        "Partition pruning schema expects column '{}' (id {}) but it is not \
-                         present in input batch",
-                        field.name(),
-                        column_id
-                    ),
-                }
-                .fail();
+                continue;
             }
+
+            if metadata.time_index_column().column_id == column_id {
+                columns.push(input.timestamps().to_arrow_array());
+                continue;
+            }
+
+            let field_idx = metadata
+                .field_columns()
+                .enumerate()
+                .find_map(|(idx, col)| (col.column_id == column_id).then_some(idx));
+            if let Some(field_idx) = field_idx {
+                columns.push(input.fields()[field_idx].data.to_arrow_array());
+                continue;
+            }
+
+            return UnexpectedSnafu {
+                reason: format!(
+                    "Partition pruning schema expects column '{}' (id {}) but it is not \
+                     present in input batch",
+                    field.name(),
+                    column_id
+                ),
+            }
+            .fail();
         }
 
         RecordBatch::try_new(arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
@@ -871,12 +838,7 @@ impl RangeBase {
         let arrow_schema = schema.arrow_schema();
         let mut columns = Vec::with_capacity(arrow_schema.fields().len());
 
-        let flat_format = self
-            .read_format
-            .as_flat()
-            .context(crate::error::UnexpectedSnafu {
-                reason: "Expected flat format for precise_filter_flat",
-            })?;
+        let flat_format = self.read_format.as_flat();
         let metadata = flat_format.metadata();
 
         for field in arrow_schema.fields() {

@@ -52,12 +52,11 @@ use crate::error::{
     NewRecordBatchSnafu, Result,
 };
 use crate::sst::parquet::format::{
-    FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray, PrimaryKeyReadFormat, ReadFormat,
-    StatValues,
+    FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray, ReadFormat, StatValues,
 };
 use crate::sst::{
     FlatSchemaOptions, flat_sst_arrow_schema_column_num, tag_maybe_to_dictionary_field,
-    to_flat_sst_arrow_schema,
+    to_flat_sst_arrow_schema, to_sst_arrow_schema,
 };
 
 /// Helper for writing the SST format.
@@ -369,8 +368,8 @@ enum ParquetAdapter {
 
 /// Helper to reads the parquet from primary key format into the flat format.
 struct ParquetPrimaryKeyToFlat {
-    /// The primary key format to read the parquet.
-    format: PrimaryKeyReadFormat,
+    /// The primary key format metadata and projection to read the parquet.
+    format: PrimaryKeyToFlatFormat,
     /// Format converter for handling flat format conversion.
     convert_format: Option<FlatConvertFormat>,
     /// Projection computed for the flat format.
@@ -398,13 +397,13 @@ impl ParquetPrimaryKeyToFlat {
             flat_sst_arrow_schema_column_num(&metadata, &FlatSchemaOptions::default());
 
         let codec = build_primary_key_codec(&metadata);
-        let format = PrimaryKeyReadFormat::new(metadata.clone(), column_ids.iter().copied());
+        let format = PrimaryKeyToFlatFormat::new(metadata.clone(), column_ids.iter().copied());
         let (convert_format, format_projection) = if skip_auto_convert {
             (
                 None,
                 FormatProjection {
                     projection_indices: format.projection_indices().to_vec(),
-                    column_id_to_projected_index: format.field_id_to_projected_index().clone(),
+                    column_id_to_projected_index: format.column_id_to_projected_index().clone(),
                 },
             )
         } else {
@@ -433,6 +432,98 @@ impl ParquetPrimaryKeyToFlat {
         } else {
             Ok(record_batch)
         }
+    }
+}
+
+/// Legacy projection/stat helper for reading primary-key-format parquet files.
+struct PrimaryKeyToFlatFormat {
+    metadata: RegionMetadataRef,
+    arrow_schema: SchemaRef,
+    format_projection: FormatProjection,
+    column_id_to_sst_index: HashMap<ColumnId, usize>,
+}
+
+impl PrimaryKeyToFlatFormat {
+    fn new(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+    ) -> PrimaryKeyToFlatFormat {
+        let column_id_to_sst_index = primary_key_sst_column_id_indices(&metadata);
+        let arrow_schema = to_sst_arrow_schema(&metadata);
+        let format_projection = FormatProjection::compute_format_projection(
+            &column_id_to_sst_index,
+            arrow_schema.fields().len(),
+            column_ids,
+        );
+
+        PrimaryKeyToFlatFormat {
+            metadata,
+            arrow_schema,
+            format_projection,
+            column_id_to_sst_index,
+        }
+    }
+
+    fn arrow_schema(&self) -> &SchemaRef {
+        &self.arrow_schema
+    }
+
+    fn metadata(&self) -> &RegionMetadataRef {
+        &self.metadata
+    }
+
+    fn projection_indices(&self) -> &[usize] {
+        &self.format_projection.projection_indices
+    }
+
+    fn column_id_to_projected_index(&self) -> &HashMap<ColumnId, usize> {
+        &self.format_projection.column_id_to_projected_index
+    }
+
+    fn min_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        self.get_stat_values(row_groups, column_id, true)
+    }
+
+    fn max_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        self.get_stat_values(row_groups, column_id, false)
+    }
+
+    fn null_counts(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+    ) -> StatValues {
+        let Some(index) = self.column_id_to_sst_index.get(&column_id) else {
+            return StatValues::NoColumn;
+        };
+
+        let stats = ReadFormat::column_null_counts(row_groups, *index);
+        StatValues::from_stats_opt(stats)
+    }
+
+    fn get_stat_values(
+        &self,
+        row_groups: &[impl Borrow<RowGroupMetaData>],
+        column_id: ColumnId,
+        is_min: bool,
+    ) -> StatValues {
+        let Some(column) = self.metadata.column_by_id(column_id) else {
+            return StatValues::NoColumn;
+        };
+        let Some(index) = self.column_id_to_sst_index.get(&column_id) else {
+            return StatValues::NoColumn;
+        };
+
+        let stats = ReadFormat::column_values(row_groups, column, *index, is_min);
+        StatValues::from_stats_opt(stats)
     }
 }
 
@@ -530,6 +621,22 @@ pub(crate) fn sst_column_id_indices(metadata: &RegionMetadata) -> HashMap<Column
         column_index += 1;
     }
     // fields
+    for column in &metadata.column_metadatas {
+        if column.semantic_type == SemanticType::Field {
+            id_to_index.insert(column.column_id, column_index);
+            column_index += 1;
+        }
+    }
+    // time index
+    id_to_index.insert(metadata.time_index_column().column_id, column_index);
+
+    id_to_index
+}
+
+fn primary_key_sst_column_id_indices(metadata: &RegionMetadata) -> HashMap<ColumnId, usize> {
+    let mut id_to_index = HashMap::with_capacity(metadata.column_metadatas.len());
+    let mut column_index = 0;
+    // fields in primary-key format
     for column in &metadata.column_metadatas {
         if column.semantic_type == SemanticType::Field {
             id_to_index.insert(column.column_id, column_index);
