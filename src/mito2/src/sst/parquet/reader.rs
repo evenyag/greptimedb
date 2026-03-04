@@ -51,7 +51,7 @@ use crate::cache::index::result_cache::PredicateKey;
 use crate::error::ApplyVectorIndexSnafu;
 use crate::error::{
     ArrowReaderSnafu, InvalidMetadataSnafu, InvalidParquetSnafu, ReadDataPartSnafu,
-    ReadParquetSnafu, Result, SerializePartitionExprSnafu,
+    ReadParquetSnafu, Result, SerializePartitionExprSnafu, UnsupportedOperationSnafu,
 };
 use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
@@ -141,8 +141,6 @@ pub struct ParquetReaderBuilder {
     /// This is usually the latest metadata of the region. The reader use
     /// it get the correct column id of a column by name.
     expected_metadata: Option<RegionMetadataRef>,
-    /// Whether to use flat format for reading.
-    flat_format: bool,
     /// Whether this reader is for compaction.
     compaction: bool,
     /// Mode to pre-filter columns.
@@ -176,7 +174,6 @@ impl ParquetReaderBuilder {
             #[cfg(feature = "vector_index")]
             vector_index_k: None,
             expected_metadata: None,
-            flat_format: false,
             compaction: false,
             pre_filter_mode: PreFilterMode::All,
             decode_primary_key_values: false,
@@ -254,13 +251,6 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn expected_metadata(mut self, expected_metadata: Option<RegionMetadataRef>) -> Self {
         self.expected_metadata = expected_metadata;
-        self
-    }
-
-    /// Sets the flat format flag.
-    #[must_use]
-    pub fn flat_format(mut self, flat_format: bool) -> Self {
-        self.flat_format = flat_format;
         self
     }
 
@@ -415,7 +405,6 @@ impl ParquetReaderBuilder {
         // before compat handling.
         let compaction_projection_mapper = if self.compaction
             && !is_same_region_partition
-            && self.flat_format
             && region_meta.primary_key_encoding == PrimaryKeyEncoding::Sparse
         {
             Some(CompactionProjectionMapper::try_new(&region_meta)?)
@@ -2040,8 +2029,6 @@ pub(crate) struct RowGroupReaderBase<T> {
     batches: VecDeque<Batch>,
     /// Local scan metrics.
     metrics: ReaderMetrics,
-    /// Cached sequence array to override sequences.
-    override_sequence: Option<ArrayRef>,
 }
 
 impl<T> RowGroupReaderBase<T>
@@ -2050,18 +2037,11 @@ where
 {
     /// Creates a new reader to read the primary key format.
     pub(crate) fn create(context: T, reader: ParquetRecordBatchReader) -> Self {
-        // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
-        let override_sequence = context
-            .read_format()
-            .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
-        // ReadFormat always uses flat format now.
-
         Self {
             context,
             reader,
             batches: VecDeque::new(),
             metrics: ReaderMetrics::default(),
-            override_sequence,
         }
     }
 
@@ -2091,15 +2071,16 @@ where
 
         // We need to fetch next record batch and convert it to batches.
         while self.batches.is_empty() {
-            let Some(record_batch) = self.fetch_next_record_batch()? else {
+            let Some(_record_batch) = self.fetch_next_record_batch()? else {
                 self.metrics.scan_cost += scan_start.elapsed();
                 return Ok(None);
             };
             self.metrics.num_record_batches += 1;
 
-            // TODO(migration): RowGroupReaderBase should be removed in favor of FlatRowGroupReader.
-            unimplemented!("PrimaryKeyReadFormat has been removed; use FlatRowGroupReader instead");
-            self.metrics.num_batches += self.batches.len();
+            return UnsupportedOperationSnafu {
+                err_msg: "Primary-key read path has been removed; use flat reader path",
+            }
+            .fail();
         }
         let batch = self.batches.pop_front();
         self.metrics.num_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);

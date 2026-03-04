@@ -1139,7 +1139,6 @@ impl ScanInput {
         };
         let res = reader
             .expected_metadata(Some(self.mapper.metadata().clone()))
-            .flat_format(true)
             .compaction(self.compaction)
             .pre_filter_mode(filter_mode)
             .decode_primary_key_values(decode_pk_values)

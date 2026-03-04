@@ -1486,7 +1486,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .inverted_index_appliers([inverted_index_applier.clone(), None])
         .cache(CacheStrategy::EnableAll(cache.clone()));
@@ -1585,7 +1584,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .bloom_filter_index_appliers([None, bloom_filter_applier.clone()])
         .cache(CacheStrategy::EnableAll(cache.clone()));
@@ -1686,7 +1684,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .inverted_index_appliers([inverted_index_applier.clone(), None])
         .cache(CacheStrategy::EnableAll(cache.clone()));
@@ -1789,7 +1786,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .bloom_filter_index_appliers([None, bloom_filter_applier.clone()])
         .cache(CacheStrategy::EnableAll(cache.clone()));
@@ -2049,7 +2045,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .fulltext_index_appliers([None, fulltext_applier.clone()])
         .cache(CacheStrategy::EnableAll(cache.clone()));
@@ -2094,7 +2089,6 @@ mod tests {
             handle.clone(),
             object_store.clone(),
         )
-        .flat_format(true)
         .predicate(Some(Predicate::new(preds)))
         .fulltext_index_appliers([None, fulltext_applier.clone()])
         .cache(CacheStrategy::EnableAll(cache.clone()));

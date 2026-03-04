@@ -440,6 +440,7 @@ impl StatValues {
 }
 
 /// Compute offsets of different primary keys in the array.
+#[cfg(test)]
 fn primary_key_offsets(pk_dict_array: &PrimaryKeyArray) -> Result<Vec<usize>> {
     if pk_dict_array.is_empty() {
         return Ok(Vec::new());

@@ -210,7 +210,6 @@ impl ObjbenchCommand {
             object_store.clone(),
         )
         .expected_metadata(Some(region_meta.clone()))
-        .flat_format(true)
         .build_flat_record_batch_stream()
         .await
         .map_err(|e| {
