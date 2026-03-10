@@ -491,7 +491,7 @@ impl SeriesDistributor {
                 let file_scan_semaphore = self.semaphore.clone();
                 let merge_semaphore = self.semaphore.clone();
                 tasks.push(common_runtime::spawn_global(async move {
-                    let plan = SeqScan::build_flat_partition_range_read(
+                    SeqScan::build_flat_partition_range_read(
                         &stream_ctx,
                         &part_range,
                         false,
@@ -500,8 +500,7 @@ impl SeriesDistributor {
                         file_scan_semaphore,
                         merge_semaphore,
                     )
-                    .await?;
-                    Ok(plan.stream)
+                    .await
                 }));
             }
         }
@@ -511,7 +510,7 @@ impl SeriesDistributor {
             range_streams.push(stream);
         }
         common_telemetry::debug!(
-            "scan_partitions_flat built {} range_streams, region: {}, total cost: {:?}",
+            "SeriesDistributor built {} range_streams, region: {}, total cost: {:?}",
             range_streams.len(),
             self.stream_ctx.input.region_metadata().region_id,
             fetch_start.elapsed(),

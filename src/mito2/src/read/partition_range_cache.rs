@@ -264,12 +264,6 @@ pub(crate) fn cache_flat_partition_range_stream(
             let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
 
             part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
-            common_telemetry::debug!(
-                "Partition range cache put, digest: {:x}, num_batches: {}, num_rows: {}",
-                key.digest(),
-                value.batches.len(),
-                num_rows,
-            );
             cache_strategy.put_partition_range_result(key, value);
         } else {
             part_metrics.inc_partition_range_cache_size(key.estimated_size());

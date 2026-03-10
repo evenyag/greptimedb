@@ -60,11 +60,6 @@ use crate::read::{
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
-/// A built flat read for one [`PartitionRange`].
-pub(crate) struct FlatPartitionRangeRead {
-    pub(crate) stream: BoxedRecordBatchStream,
-}
-
 /// Scans a region and returns rows in a sorted sequence.
 ///
 /// The output order is always `order by primary keys, time index` inside every
@@ -367,31 +362,18 @@ impl SeqScan {
         partition_pruner: Arc<PartitionPruner>,
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
-    ) -> Result<FlatPartitionRangeRead> {
+    ) -> Result<BoxedRecordBatchStream> {
         // Check cache before building sources and stream.
         let cache_key = build_partition_range_cache_key(stream_ctx, part_range);
 
         if let Some(key) = cache_key.as_ref() {
-            common_telemetry::debug!(
-                "Flat partition range cache-eligible, region: {}, part_range: {:?}, digest: {:x}",
-                stream_ctx.input.region_metadata().region_id,
-                part_range,
-                key.digest(),
-            );
-
             if let Some(value) = stream_ctx
                 .input
                 .cache_strategy
                 .get_partition_range_result(key)
             {
-                common_telemetry::debug!(
-                    "Flat partition range cache hit, region: {}, part_range: {:?}, digest: {:x}",
-                    stream_ctx.input.region_metadata().region_id,
-                    part_range,
-                    key.digest(),
-                );
                 let stream = cached_flat_partition_range_stream(value);
-                return Ok(FlatPartitionRangeRead { stream });
+                return Ok(stream);
             }
         }
 
@@ -416,24 +398,16 @@ impl SeqScan {
         .await?;
 
         let stream = match cache_key.clone() {
-            Some(key) => {
-                common_telemetry::debug!(
-                    "Flat partition range cache miss, region: {}, part_range: {:?}, digest: {:x}",
-                    stream_ctx.input.region_metadata().region_id,
-                    part_range,
-                    key.digest(),
-                );
-                cache_flat_partition_range_stream(
-                    stream,
-                    stream_ctx.input.cache_strategy.clone(),
-                    key,
-                    part_metrics.clone(),
-                )
-            }
+            Some(key) => cache_flat_partition_range_stream(
+                stream,
+                stream_ctx.input.cache_strategy.clone(),
+                key,
+                part_metrics.clone(),
+            ),
             None => stream,
         };
 
-        Ok(FlatPartitionRangeRead { stream })
+        Ok(stream)
     }
 
     /// Scans the given partition when the part list is set properly.
@@ -639,7 +613,7 @@ impl SeqScan {
 
             // Scans each part.
             for part_range in partition_ranges {
-                let plan = Self::build_flat_partition_range_read(
+                let mut reader = Self::build_flat_partition_range_read(
                     &stream_ctx,
                     &part_range,
                     compaction,
@@ -649,7 +623,6 @@ impl SeqScan {
                     semaphore.clone(),
                 )
                 .await?;
-                let mut reader = plan.stream;
 
                 let mut metrics = ScannerMetrics {
                     scan_cost: fetch_start.elapsed(),
