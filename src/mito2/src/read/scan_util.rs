@@ -249,6 +249,10 @@ pub(crate) struct ScanMetricsSet {
     num_peak_range_builders: isize,
     /// Total bytes added to the partition range cache during this scan.
     partition_range_cache_size: usize,
+    /// Number of partition range cache hits during this scan.
+    partition_range_cache_hit: usize,
+    /// Number of partition range cache misses during this scan.
+    partition_range_cache_miss: usize,
 }
 
 /// Wrapper for file metrics that compares by total cost in reverse order.
@@ -348,6 +352,8 @@ impl fmt::Debug for ScanMetricsSet {
             num_range_builders: _,
             num_peak_range_builders,
             partition_range_cache_size,
+            partition_range_cache_hit,
+            partition_range_cache_miss,
         } = self;
 
         // Write core metrics
@@ -597,6 +603,18 @@ impl fmt::Debug for ScanMetricsSet {
             write!(
                 f,
                 ", \"partition_range_cache_size\":{partition_range_cache_size}"
+            )?;
+        }
+        if *partition_range_cache_hit > 0 {
+            write!(
+                f,
+                ", \"partition_range_cache_hit\":{partition_range_cache_hit}"
+            )?;
+        }
+        if *partition_range_cache_miss > 0 {
+            write!(
+                f,
+                ", \"partition_range_cache_miss\":{partition_range_cache_miss}"
             )?;
         }
 
@@ -1112,6 +1130,18 @@ impl PartitionMetrics {
     pub(crate) fn inc_partition_range_cache_size(&self, size: usize) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.partition_range_cache_size += size;
+    }
+
+    /// Increments the partition range cache hit counter.
+    pub(crate) fn inc_partition_range_cache_hit(&self) {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.partition_range_cache_hit += 1;
+    }
+
+    /// Increments the partition range cache miss counter.
+    pub(crate) fn inc_partition_range_cache_miss(&self) {
+        let mut metrics = self.0.metrics.lock().unwrap();
+        metrics.partition_range_cache_miss += 1;
     }
 }
 

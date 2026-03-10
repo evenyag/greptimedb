@@ -15,8 +15,7 @@
 //! Cache key types for partition-range scan outputs.
 
 use std::collections::HashSet;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::mem;
 use std::sync::Arc;
 
@@ -63,12 +62,6 @@ pub(crate) struct PartitionRangeScanCacheKey {
 }
 
 impl PartitionRangeScanCacheKey {
-    pub(crate) fn digest(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        hasher.finish()
-    }
-
     pub(crate) fn estimated_size(&self) -> usize {
         mem::size_of::<Self>()
             + self.file_ids.capacity() * mem::size_of::<FileId>()
@@ -252,10 +245,8 @@ pub(crate) fn cache_flat_partition_range_stream(
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
         let mut batches = Vec::new();
-        let mut num_rows = 0usize;
         while let Some(batch) = stream.try_next().await? {
             let batch = compact_pk_dictionary(batch);
-            num_rows += batch.num_rows();
             batches.push(batch.clone());
             yield batch;
         }

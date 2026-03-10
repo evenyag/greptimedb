@@ -372,9 +372,11 @@ impl SeqScan {
                 .cache_strategy
                 .get_partition_range_result(key)
             {
+                part_metrics.inc_partition_range_cache_hit();
                 let stream = cached_flat_partition_range_stream(value);
                 return Ok(stream);
             }
+            part_metrics.inc_partition_range_cache_miss();
         }
 
         let mut sources = Vec::new();
