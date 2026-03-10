@@ -491,7 +491,7 @@ impl SeriesDistributor {
                 let file_scan_semaphore = self.semaphore.clone();
                 let merge_semaphore = self.semaphore.clone();
                 tasks.push(common_runtime::spawn_global(async move {
-                    let plan = SeqScan::build_flat_partition_range_read_plan(
+                    let plan = SeqScan::build_flat_partition_range_read(
                         &stream_ctx,
                         &part_range,
                         false,

@@ -358,8 +358,8 @@ impl SeqScan {
         Ok(reader)
     }
 
-    /// Builds a flat read plan for one partition range.
-    pub(crate) async fn build_flat_partition_range_read_plan(
+    /// Builds a flat read stream for one partition range.
+    pub(crate) async fn build_flat_partition_range_read(
         stream_ctx: &Arc<StreamContext>,
         part_range: &PartitionRange,
         compaction: bool,
@@ -639,7 +639,7 @@ impl SeqScan {
 
             // Scans each part.
             for part_range in partition_ranges {
-                let plan = Self::build_flat_partition_range_read_plan(
+                let plan = Self::build_flat_partition_range_read(
                     &stream_ctx,
                     &part_range,
                     compaction,

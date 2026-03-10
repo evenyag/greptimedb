@@ -342,8 +342,7 @@ mod tests {
             num_rows: 10,
         };
         let partition_range = range_meta.new_partition_range(0);
-        let scan_fingerprint =
-            crate::read::scan_region::build_scan_fingerprint(&input);
+        let scan_fingerprint = crate::read::scan_region::build_scan_fingerprint(&input);
         let stream_ctx = StreamContext {
             input,
             ranges: vec![range_meta],
