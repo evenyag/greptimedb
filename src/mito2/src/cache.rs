@@ -1137,13 +1137,12 @@ mod tests {
             scan: ScanRequestFingerprint {
                 read_column_ids: vec![],
                 filters: vec!["tag_0 = 1".to_string()],
+                time_filters: vec![],
                 series_row_selector: None,
                 distribution: None,
                 append_mode: false,
                 filter_deleted: true,
-                merge_mode: "last_row",
-                flat_format: true,
-                compaction: false,
+                merge_mode: crate::region::options::MergeMode::LastRow,
             },
         };
         let value = Arc::new(PartitionRangeScanCacheValue::new(Vec::new()));

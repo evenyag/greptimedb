@@ -27,13 +27,16 @@ use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use store_api::region_engine::PartitionRange;
-use store_api::storage::{ColumnId, FileId, RegionId};
+use store_api::storage::{
+    ColumnId, FileId, RegionId, TimeSeriesDistribution, TimeSeriesRowSelector,
+};
 
 use crate::cache::CacheStrategy;
 use crate::memtable::record_batch_estimated_size;
 use crate::read::BoxedRecordBatchStream;
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::PartitionMetrics;
+use crate::region::options::MergeMode;
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 
@@ -42,13 +45,12 @@ use crate::sst::parquet::flat_format::primary_key_column_index;
 pub(crate) struct ScanRequestFingerprint {
     pub(crate) read_column_ids: Vec<ColumnId>,
     pub(crate) filters: Vec<String>,
-    pub(crate) series_row_selector: Option<String>,
-    pub(crate) distribution: Option<String>,
+    pub(crate) time_filters: Vec<String>,
+    pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
+    pub(crate) distribution: Option<TimeSeriesDistribution>,
     pub(crate) append_mode: bool,
     pub(crate) filter_deleted: bool,
-    pub(crate) merge_mode: &'static str,
-    pub(crate) flat_format: bool,
-    pub(crate) compaction: bool,
+    pub(crate) merge_mode: MergeMode,
 }
 
 /// Cache key for partition-range scan outputs.
@@ -79,10 +81,10 @@ impl PartitionRangeScanCacheKey {
                 .sum::<usize>()
             + self
                 .scan
-                .series_row_selector
-                .as_ref()
-                .map_or(0, String::capacity)
-            + self.scan.distribution.as_ref().map_or(0, String::capacity)
+                .time_filters
+                .iter()
+                .map(|filter| filter.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -145,34 +147,28 @@ pub(crate) fn build_partition_range_cache_key(
     stream_ctx: &StreamContext,
     part_range: &PartitionRange,
 ) -> Option<PartitionRangeScanCacheKey> {
-    let files = collect_partition_range_file_ids(stream_ctx, part_range);
-    let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let eligible = stream_ctx.input.flat_format
-        && stream_ctx.input.has_tag_filter
-        && !stream_ctx.input.compaction
-        && files.only_file_sources
-        && !files.file_ids.is_empty()
-        && !matches!(stream_ctx.input.cache_strategy, CacheStrategy::Disabled);
+    let fingerprint = stream_ctx.scan_fingerprint.as_ref()?;
 
-    if eligible {
-        Some(PartitionRangeScanCacheKey {
-            region_id: stream_ctx.input.region_metadata().region_id,
-            range_index: part_range.identifier,
-            file_ids: files.file_ids,
-            scan: if query_time_range_covers_partition_range(
-                stream_ctx.input.time_range.as_ref(),
-                range_meta.time_range,
-            ) {
-                stream_ctx
-                    .input
-                    .scan_request_fingerprint_without_time_filters()
-            } else {
-                stream_ctx.input.scan_request_fingerprint()
-            },
-        })
-    } else {
-        None
+    let files = collect_partition_range_file_ids(stream_ctx, part_range);
+    if !files.only_file_sources || files.file_ids.is_empty() {
+        return None;
     }
+
+    let range_meta = &stream_ctx.ranges[part_range.identifier];
+    let mut scan = fingerprint.clone();
+    if query_time_range_covers_partition_range(
+        stream_ctx.input.time_range.as_ref(),
+        range_meta.time_range,
+    ) {
+        scan.time_filters.clear();
+    }
+
+    Some(PartitionRangeScanCacheKey {
+        region_id: stream_ctx.input.region_metadata().region_id,
+        range_index: part_range.identifier,
+        file_ids: files.file_ids,
+        scan,
+    })
 }
 
 fn query_time_range_covers_partition_range(
@@ -332,7 +328,6 @@ mod tests {
             .with_time_range(query_time_range)
             .with_files(vec![file])
             .with_cache(test_cache_strategy())
-            .with_has_tag_filter(true)
             .with_flat_format(true);
         let range_meta = RangeMeta {
             time_range: partition_time_range,
@@ -347,9 +342,12 @@ mod tests {
             num_rows: 10,
         };
         let partition_range = range_meta.new_partition_range(0);
+        let scan_fingerprint =
+            crate::read::scan_region::build_scan_fingerprint(&input);
         let stream_ctx = StreamContext {
             input,
             ranges: vec![range_meta],
+            scan_fingerprint,
             query_start: Instant::now(),
         };
 
@@ -374,12 +372,8 @@ mod tests {
 
         let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
 
-        assert_eq!(
-            key.scan,
-            stream_ctx
-                .input
-                .scan_request_fingerprint_without_time_filters()
-        );
+        // Time filters should be cleared when query covers partition range.
+        assert!(key.scan.time_filters.is_empty());
         assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
     }
 
@@ -397,7 +391,12 @@ mod tests {
 
         let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
 
-        assert_eq!(key.scan, stream_ctx.input.scan_request_fingerprint());
+        // Time filters should be preserved when query does not cover partition range.
+        assert_eq!(
+            key.scan.time_filters,
+            vec![col("ts").gt_eq(lit(1000)).to_string()]
+        );
+        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
     }
 
     #[tokio::test]
@@ -414,11 +413,8 @@ mod tests {
 
         let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
 
-        assert_eq!(
-            key.scan,
-            stream_ctx
-                .input
-                .scan_request_fingerprint_without_time_filters()
-        );
+        // Time filters should be cleared when query has no time range limit.
+        assert!(key.scan.time_filters.is_empty());
+        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
     }
 }

@@ -534,8 +534,6 @@ impl ScanRegion {
             // The batch is already large enough so we use a small channel size here.
             self.parallel_scan_channel_size = FLAT_SCAN_CHANNEL_SIZE;
         }
-        let has_tag_filter = self.has_tag_filter();
-
         let input = ScanInput::new(self.access_layer, mapper)
             .with_time_range(Some(time_range))
             .with_predicate(predicate)
@@ -553,7 +551,6 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
-            .with_has_tag_filter(has_tag_filter)
             .with_flat_format(flat_format);
         #[cfg(feature = "vector_index")]
         let input = input
@@ -678,31 +675,6 @@ impl ScanRegion {
             !columns
                 .iter()
                 .any(|column| field_columns.contains(&column.name))
-        })
-    }
-
-    /// Returns true if at least one request filter references a semantic TAG column.
-    fn has_tag_filter(&self) -> bool {
-        let metadata = &self.version.metadata;
-        let tag_names = metadata
-            .column_metadatas
-            .iter()
-            .filter(|col| col.semantic_type == SemanticType::Tag)
-            .map(|col| col.column_schema.name.as_str())
-            .collect::<HashSet<_>>();
-        if tag_names.is_empty() {
-            return false;
-        }
-
-        let mut columns = HashSet::new();
-        self.request.filters.iter().any(|expr| {
-            columns.clear();
-            if expr_to_columns(expr, &mut columns).is_err() {
-                return false;
-            }
-            columns
-                .iter()
-                .any(|column| tag_names.contains(column.name.as_str()))
         })
     }
 
@@ -882,8 +854,6 @@ pub struct ScanInput {
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
     /// Hint for the required distribution of the scanner.
     pub(crate) distribution: Option<TimeSeriesDistribution>,
-    /// Whether request filters reference semantic TAG columns.
-    pub(crate) has_tag_filter: bool,
     /// Whether to use flat format.
     pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
@@ -922,7 +892,6 @@ impl ScanInput {
             merge_mode: MergeMode::default(),
             series_row_selector: None,
             distribution: None,
-            has_tag_filter: false,
             flat_format: false,
             compaction: false,
             #[cfg(feature = "enterprise")]
@@ -1076,13 +1045,6 @@ impl ScanInput {
         distribution: Option<TimeSeriesDistribution>,
     ) -> Self {
         self.distribution = distribution;
-        self
-    }
-
-    /// Sets whether request filters reference semantic TAG columns.
-    #[must_use]
-    pub(crate) fn with_has_tag_filter(mut self, has_tag_filter: bool) -> Self {
-        self.has_tag_filter = has_tag_filter;
         self
     }
 
@@ -1389,83 +1351,6 @@ impl ScanInput {
         &self.predicate
     }
 
-    /// Returns a fingerprint that can be used in partition-range scan cache key.
-    pub(crate) fn scan_request_fingerprint(&self) -> ScanRequestFingerprint {
-        let filters = self
-            .predicate_group()
-            .predicate_without_region()
-            .map(|predicate| {
-                predicate
-                    .exprs()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        ScanRequestFingerprint {
-            read_column_ids: self.read_column_ids.clone(),
-            filters,
-            series_row_selector: self.series_row_selector.map(|v| v.to_string()),
-            distribution: self.distribution.map(|v| v.to_string()),
-            append_mode: self.append_mode,
-            filter_deleted: self.filter_deleted,
-            merge_mode: merge_mode_name(self.merge_mode),
-            flat_format: self.flat_format,
-            compaction: self.compaction,
-        }
-    }
-
-    /// Returns a fingerprint with time-index-only filter expressions removed.
-    ///
-    /// This is used when the query's time range fully covers the partition range,
-    /// making time filters redundant for cache key purposes.
-    pub(crate) fn scan_request_fingerprint_without_time_filters(&self) -> ScanRequestFingerprint {
-        let time_index_name = self
-            .region_metadata()
-            .time_index_column()
-            .column_schema
-            .name
-            .clone();
-
-        let filters = self
-            .predicate_group()
-            .predicate_without_region()
-            .map(|predicate| {
-                predicate
-                    .exprs()
-                    .iter()
-                    .filter(|expr| {
-                        // Keep expressions that reference columns other than the time index.
-                        let mut columns = HashSet::new();
-                        if expr_to_columns(expr, &mut columns).is_err() {
-                            // If we can't extract columns, keep the expression to be safe.
-                            return true;
-                        }
-                        if columns.is_empty() {
-                            return true;
-                        }
-                        // Exclude expressions that only reference the time index column.
-                        !columns.iter().all(|col| col.name == time_index_name)
-                    })
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        ScanRequestFingerprint {
-            read_column_ids: self.read_column_ids.clone(),
-            filters,
-            series_row_selector: self.series_row_selector.map(|v| v.to_string()),
-            distribution: self.distribution.map(|v| v.to_string()),
-            append_mode: self.append_mode,
-            filter_deleted: self.filter_deleted,
-            merge_mode: merge_mode_name(self.merge_mode),
-            flat_format: self.flat_format,
-            compaction: self.compaction,
-        }
-    }
-
     /// Returns number of memtables to scan.
     pub(crate) fn num_memtables(&self) -> usize {
         self.memtables.len()
@@ -1532,11 +1417,81 @@ fn pre_filter_mode(append_mode: bool, merge_mode: MergeMode) -> PreFilterMode {
     }
 }
 
-fn merge_mode_name(mode: MergeMode) -> &'static str {
-    match mode {
-        MergeMode::LastRow => "last_row",
-        MergeMode::LastNonNull => "last_non_null",
+/// Builds a [ScanRequestFingerprint] from a [ScanInput] if the scan is eligible
+/// for partition range caching.
+pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFingerprint> {
+    let eligible = input.flat_format
+        && !input.compaction
+        && !matches!(input.cache_strategy, CacheStrategy::Disabled);
+
+    if !eligible {
+        return None;
     }
+
+    let metadata = input.region_metadata();
+    let tag_names: HashSet<&str> = metadata
+        .column_metadatas
+        .iter()
+        .filter(|col| col.semantic_type == SemanticType::Tag)
+        .map(|col| col.column_schema.name.as_str())
+        .collect();
+
+    let time_index_name = metadata.time_index_column().column_schema.name.clone();
+
+    let exprs = input
+        .predicate_group()
+        .predicate_without_region()
+        .map(|predicate| predicate.exprs())
+        .unwrap_or_default();
+
+    // Check if any filter references a tag column.
+    let has_tag_filter = if tag_names.is_empty() {
+        false
+    } else {
+        let mut columns = HashSet::new();
+        exprs.iter().any(|expr| {
+            columns.clear();
+            if expr_to_columns(expr, &mut columns).is_err() {
+                return false;
+            }
+            columns
+                .iter()
+                .any(|col| tag_names.contains(col.name.as_str()))
+        })
+    };
+
+    if !has_tag_filter {
+        return None;
+    }
+
+    let mut filters = Vec::new();
+    let mut time_filters = Vec::new();
+
+    for expr in exprs {
+        let mut columns = HashSet::new();
+        let is_time_only = if expr_to_columns(expr, &mut columns).is_err() || columns.is_empty() {
+            false
+        } else {
+            columns.iter().all(|col| col.name == time_index_name)
+        };
+
+        if is_time_only {
+            time_filters.push(expr.to_string());
+        } else {
+            filters.push(expr.to_string());
+        }
+    }
+
+    Some(ScanRequestFingerprint {
+        read_column_ids: input.read_column_ids.clone(),
+        filters,
+        time_filters,
+        series_row_selector: input.series_row_selector,
+        distribution: input.distribution,
+        append_mode: input.append_mode,
+        filter_deleted: input.filter_deleted,
+        merge_mode: input.merge_mode,
+    })
 }
 
 /// Context shared by different streams from a scanner.
@@ -1546,6 +1501,9 @@ pub struct StreamContext {
     pub input: ScanInput,
     /// Metadata for partition ranges.
     pub(crate) ranges: Vec<RangeMeta>,
+    /// Precomputed scan fingerprint for partition range caching.
+    /// `None` when the scan is not eligible for caching.
+    pub(crate) scan_fingerprint: Option<ScanRequestFingerprint>,
 
     // Metrics:
     /// The start time of the query.
@@ -1558,10 +1516,12 @@ impl StreamContext {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::seq_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
+        let scan_fingerprint = build_scan_fingerprint(&input);
 
         Self {
             input,
             ranges,
+            scan_fingerprint,
             query_start,
         }
     }
@@ -1571,10 +1531,12 @@ impl StreamContext {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::unordered_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
+        let scan_fingerprint = build_scan_fingerprint(&input);
 
         Self {
             input,
             ranges,
+            scan_fingerprint,
             query_start,
         }
     }
