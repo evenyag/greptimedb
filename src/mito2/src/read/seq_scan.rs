@@ -14,7 +14,6 @@
 
 //! Sequential scan.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,9 +25,6 @@ use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
-use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
-use datatypes::arrow::datatypes::UInt32Type;
-use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
 use snafu::{OptionExt, ensure};
@@ -39,7 +35,6 @@ use store_api::region_engine::{
 use store_api::storage::TimeSeriesRowSelector;
 use tokio::sync::Semaphore;
 
-use crate::cache::CacheStrategy;
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu, UnexpectedSnafu};
 use crate::read::dedup::{DedupReader, LastNonNull, LastRow};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
@@ -47,8 +42,8 @@ use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
 use crate::read::partition_range_cache::{
-    FlatPartitionRangeCachePlan, PartitionRangeScanCacheKey, PartitionRangeScanCacheValue,
-    cache_enabled,
+    build_partition_range_cache_key, cache_flat_partition_range_stream,
+    cached_flat_partition_range_stream,
 };
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
@@ -64,12 +59,10 @@ use crate::read::{
 };
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::parquet::flat_format::primary_key_column_index;
 
-/// Read plan for one flat [`PartitionRange`].
-pub(crate) struct FlatPartitionRangeReadPlan {
+/// A built flat read for one [`PartitionRange`].
+pub(crate) struct FlatPartitionRangeRead {
     pub(crate) stream: BoxedRecordBatchStream,
-    pub(crate) cache_plan: FlatPartitionRangeCachePlan,
 }
 
 /// Scans a region and returns rows in a sorted sequence.
@@ -374,11 +367,11 @@ impl SeqScan {
         partition_pruner: Arc<PartitionPruner>,
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
-    ) -> Result<FlatPartitionRangeReadPlan> {
+    ) -> Result<FlatPartitionRangeRead> {
         // Check cache before building sources and stream.
-        let cache_plan = build_flat_partition_range_cache_plan(stream_ctx, part_range);
+        let cache_key = build_partition_range_cache_key(stream_ctx, part_range);
 
-        if let Some(key) = cache_plan.key.as_ref() {
+        if let Some(key) = cache_key.as_ref() {
             common_telemetry::debug!(
                 "Flat partition range cache-eligible, region: {}, part_range: {:?}, digest: {:x}",
                 stream_ctx.input.region_metadata().region_id,
@@ -398,11 +391,10 @@ impl SeqScan {
                     key.digest(),
                 );
                 let stream = cached_flat_partition_range_stream(value);
-                return Ok(FlatPartitionRangeReadPlan { stream, cache_plan });
+                return Ok(FlatPartitionRangeRead { stream });
             }
         }
 
-        let sources_start = Instant::now();
         let mut sources = Vec::new();
         build_flat_sources(
             stream_ctx,
@@ -414,16 +406,6 @@ impl SeqScan {
             file_scan_semaphore,
         )
         .await?;
-        let num_sources = sources.len();
-        common_telemetry::info!(
-            "build_flat_partition_range_read_plan build sources, region: {}, part_range: {:?}, num_sources: {}, cost: {:?}",
-            stream_ctx.input.region_metadata().region_id,
-            part_range,
-            num_sources,
-            sources_start.elapsed(),
-        );
-
-        let stream_start = Instant::now();
         let stream = Self::build_flat_reader_from_sources(
             stream_ctx,
             sources,
@@ -432,15 +414,8 @@ impl SeqScan {
             true,
         )
         .await?;
-        common_telemetry::info!(
-            "build_flat_partition_range_read_plan build stream, region: {}, part_range: {:?}, num_sources: {}, cost: {:?}",
-            stream_ctx.input.region_metadata().region_id,
-            part_range,
-            num_sources,
-            stream_start.elapsed(),
-        );
 
-        let stream = match cache_plan.key.clone() {
+        let stream = match cache_key.clone() {
             Some(key) => {
                 common_telemetry::debug!(
                     "Flat partition range cache miss, region: {}, part_range: {:?}, digest: {:x}",
@@ -458,7 +433,7 @@ impl SeqScan {
             None => stream,
         };
 
-        Ok(FlatPartitionRangeReadPlan { stream, cache_plan })
+        Ok(FlatPartitionRangeRead { stream })
     }
 
     /// Scans the given partition when the part list is set properly.
@@ -674,14 +649,6 @@ impl SeqScan {
                     semaphore.clone(),
                 )
                 .await?;
-                if let Some(key) = plan.cache_plan.key.as_ref() {
-                    common_telemetry::debug!(
-                        "SeqScan flat range cache candidate, region: {}, part_range: {:?}, digest: {:x}",
-                        stream_ctx.input.region_metadata().region_id,
-                        part_range,
-                        key.digest(),
-                    );
-                }
                 let mut reader = plan.stream;
 
                 let mut metrics = ScannerMetrics {
@@ -874,190 +841,6 @@ impl fmt::Debug for SeqScan {
             .field("num_ranges", &self.stream_ctx.ranges.len())
             .finish()
     }
-}
-
-fn build_flat_partition_range_cache_plan(
-    stream_ctx: &StreamContext,
-    part_range: &PartitionRange,
-) -> FlatPartitionRangeCachePlan {
-    let (file_ids, only_file_sources) = partition_range_file_ids(stream_ctx, part_range);
-    let eligible = stream_ctx.input.flat_format
-        && stream_ctx.input.has_tag_filter
-        && !stream_ctx.input.compaction
-        && only_file_sources
-        && !file_ids.is_empty()
-        && cache_enabled(&stream_ctx.input.cache_strategy);
-
-    let key = if eligible {
-        Some(PartitionRangeScanCacheKey {
-            region_id: stream_ctx.input.region_metadata().region_id,
-            partition_range_identifier: part_range.identifier,
-            file_ids,
-            scan: stream_ctx.input.scan_request_fingerprint(),
-        })
-    } else {
-        None
-    };
-
-    FlatPartitionRangeCachePlan { key }
-}
-
-fn partition_range_file_ids(
-    stream_ctx: &StreamContext,
-    part_range: &PartitionRange,
-) -> (Vec<store_api::storage::FileId>, bool) {
-    let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let mut file_ids = Vec::new();
-    let mut seen = HashSet::new();
-    let mut only_file_sources = true;
-
-    for index in &range_meta.row_group_indices {
-        if stream_ctx.is_file_range_index(*index) {
-            let file_id = stream_ctx.input.file_from_index(*index).file_id().file_id();
-            if seen.insert(file_id) {
-                file_ids.push(file_id);
-            }
-        } else {
-            only_file_sources = false;
-        }
-    }
-
-    (file_ids, only_file_sources)
-}
-
-fn cached_flat_partition_range_stream(
-    value: Arc<PartitionRangeScanCacheValue>,
-) -> BoxedRecordBatchStream {
-    Box::pin(futures::stream::iter(
-        value.batches.clone().into_iter().map(Ok),
-    ))
-}
-
-/// Compacts the `__primary_key` dictionary column in a record batch by removing
-/// unreferenced values. This reduces memory usage when caching batches whose
-/// dictionary values array contains entries not referenced by any key.
-///
-/// Only compacts when the values array has more than 4 entries to avoid
-/// unnecessary work for small dictionaries.
-fn compact_pk_dictionary(batch: RecordBatch) -> RecordBatch {
-    let pk_idx = primary_key_column_index(batch.num_columns());
-    let pk_col = match batch
-        .column(pk_idx)
-        .as_any()
-        .downcast_ref::<DictionaryArray<UInt32Type>>()
-    {
-        Some(dict) if dict.values().len() > 4 => dict,
-        _ => return batch,
-    };
-
-    let old_values = pk_col
-        .values()
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .expect("primary key dictionary values must be BinaryArray");
-    let keys = pk_col.keys();
-
-    // Single linear pass: since keys are sorted/grouped, we track when the key changes.
-    let mut remap = vec![0u32; old_values.len()];
-    let mut new_values: Vec<&[u8]> = Vec::new();
-    let mut prev_key: Option<u32> = None;
-
-    for key in keys.iter().flatten() {
-        if prev_key != Some(key) {
-            let new_index = new_values.len() as u32;
-            new_values.push(old_values.value(key as usize));
-            remap[key as usize] = new_index;
-            prev_key = Some(key);
-        }
-    }
-
-    if new_values.len() == old_values.len() {
-        return batch; // all values are in use
-    }
-
-    let new_keys = UInt32Array::from_iter(keys.iter().map(|k| k.map(|v| remap[v as usize])));
-    let new_values_array = BinaryArray::from_iter_values(new_values);
-    let new_dict = DictionaryArray::new(new_keys, Arc::new(new_values_array));
-
-    let mut columns: Vec<_> = batch.columns().to_vec();
-    columns[pk_idx] = Arc::new(new_dict);
-    RecordBatch::try_new(batch.schema(), columns).expect("schema should match after compaction")
-}
-
-fn cache_flat_partition_range_stream(
-    mut stream: BoxedRecordBatchStream,
-    cache_strategy: CacheStrategy,
-    key: PartitionRangeScanCacheKey,
-    part_metrics: PartitionMetrics,
-) -> BoxedRecordBatchStream {
-    Box::pin(try_stream! {
-        let mut batches = Vec::new();
-        let mut num_rows = 0usize;
-        while let Some(batch) = stream.try_next().await? {
-            let batch = compact_pk_dictionary(batch);
-            num_rows += batch.num_rows();
-            batches.push(batch.clone());
-            yield batch;
-        }
-
-        if !batches.is_empty() {
-            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
-
-            // Log __primary_key dictionary stats from the first batch.
-            if let Some(first_batch) = value.batches.first() {
-                let schema = first_batch.schema();
-                if let Some((pk_idx, _)) = schema.column_with_name("__primary_key") {
-                    let pk_col = first_batch.column(pk_idx);
-                    if let Some(dict_array) = pk_col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
-                        let distinct_keys: HashSet<_> = dict_array.keys().iter().flatten().collect();
-                        let num_distinct_keys = distinct_keys.len();
-                        let values_len = dict_array.values().len();
-                        common_telemetry::info!(
-                            "cache_flat_partition_range_stream: __primary_key dict stats, key_digest: {:x}, num_distinct_keys: {}, values_len: {}",
-                            key.digest(),
-                            num_distinct_keys,
-                            values_len,
-                        );
-                    }
-                }
-            }
-
-            // Build column info: name and estimated size for each column.
-            let column_info: Vec<String> = if let Some(first_batch) = value.batches.first() {
-                let schema = first_batch.schema();
-                value.batches[0]
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _col)| {
-                        let name = schema.field(i).name();
-                        let col_size: usize = value.batches.iter().map(|b| {
-                            b.column(i).to_data().get_slice_memory_size().unwrap_or(0)
-                        }).sum();
-                        format!("{}:{}", name, col_size)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
-            common_telemetry::info!(
-                "cache_flat_partition_range_stream: caching entry, key_digest: {:x}, key_size: {}, value_size: {}, total_cache_size: {}, num_batches: {}, num_rows: {}, columns: [{}]",
-                key.digest(),
-                key.estimated_size(),
-                value.estimated_size(),
-                part_metrics.partition_range_cache_size(),
-                value.batches.len(),
-                num_rows,
-                column_info.join(", "),
-            );
-            cache_strategy.put_partition_range_result(key, value);
-        } else {
-            part_metrics.inc_partition_range_cache_size(key.estimated_size());
-            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
-            cache_strategy.put_partition_range_result(key, value);
-        }
-    })
 }
 
 /// Builds sources for the partition range and push them to the `sources` vector.
@@ -1269,14 +1052,7 @@ pub(crate) async fn build_flat_sources(
 
     if should_split {
         common_telemetry::debug!(
-            "===== Splitting record batches, region: {}, sources: {}, part_range: {:?}",
-            stream_ctx.input.region_metadata().region_id,
-            sources.len(),
-            part_range,
-        );
-    } else {
-        common_telemetry::debug!(
-            "===== DO NOT split record batches, region: {}, sources: {}, part_range: {:?}",
+            "Splitting record batches, region: {}, sources: {}, part_range: {:?}",
             stream_ctx.input.region_metadata().region_id,
             sources.len(),
             part_range,

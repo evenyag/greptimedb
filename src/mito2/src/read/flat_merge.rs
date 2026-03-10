@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::try_stream;
-use common_telemetry::{debug, info};
+use common_telemetry::debug;
 use datatypes::arrow::array::{Int64Array, UInt64Array};
 use datatypes::arrow::compute::interleave;
 use datatypes::arrow::datatypes::SchemaRef;
@@ -589,20 +589,12 @@ impl FlatMergeReader {
             .enumerate()
             .map(|(node_index, iter)| {
                 common_runtime::spawn_global(async move {
-                    let node_start = Instant::now();
                     let mut node = StreamNode {
                         node_index,
                         iter,
                         cursor: None,
                     };
                     let batch = node.advance_batch().await?;
-                    let node_elapsed = node_start.elapsed();
-                    info!(
-                        "FlatMergeReader init node {}, cost: {:?}, has_batch: {}",
-                        node_index,
-                        node_elapsed,
-                        batch.is_some(),
-                    );
                     Ok((node, batch))
                 })
             })
@@ -629,7 +621,7 @@ impl FlatMergeReader {
             metrics_reporter,
         };
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "FlatMergeReader init done, num_iters: {}, active_nodes: {}, cost: {:?}",
             num_iters, num_active_nodes, elapsed,
         );

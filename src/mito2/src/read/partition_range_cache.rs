@@ -14,15 +14,26 @@
 
 //! Cache key types for partition-range scan outputs.
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem;
+use std::sync::Arc;
 
+use async_stream::try_stream;
+use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
+use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
+use futures::TryStreamExt;
+use store_api::region_engine::PartitionRange;
 use store_api::storage::{ColumnId, FileId, RegionId};
 
 use crate::cache::CacheStrategy;
 use crate::memtable::record_batch_estimated_size;
+use crate::read::BoxedRecordBatchStream;
+use crate::read::scan_region::StreamContext;
+use crate::read::scan_util::PartitionMetrics;
+use crate::sst::parquet::flat_format::primary_key_column_index;
 
 /// Fingerprint of request-relevant scan options.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,7 +53,7 @@ pub(crate) struct ScanRequestFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PartitionRangeScanCacheKey {
     pub(crate) region_id: RegionId,
-    pub(crate) partition_range_identifier: usize,
+    pub(crate) range_index: usize,
     pub(crate) file_ids: Vec<FileId>,
     pub(crate) scan: ScanRequestFingerprint,
 }
@@ -94,13 +105,156 @@ impl PartitionRangeScanCacheValue {
     }
 }
 
-/// Cache plan for a flat partition range.
-#[derive(Debug, Clone)]
-pub(crate) struct FlatPartitionRangeCachePlan {
-    pub(crate) key: Option<PartitionRangeScanCacheKey>,
+/// File IDs and whether all sources are file-only for a partition range.
+pub(crate) struct PartitionRangeFiles {
+    pub(crate) file_ids: Vec<FileId>,
+    pub(crate) only_file_sources: bool,
 }
 
-/// Returns true if cache is enabled by strategy.
-pub(crate) fn cache_enabled(cache_strategy: &CacheStrategy) -> bool {
-    !matches!(cache_strategy, CacheStrategy::Disabled)
+/// Collects file IDs from a partition range's row group indices.
+pub(crate) fn collect_partition_range_file_ids(
+    stream_ctx: &StreamContext,
+    part_range: &PartitionRange,
+) -> PartitionRangeFiles {
+    let range_meta = &stream_ctx.ranges[part_range.identifier];
+    let mut file_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut only_file_sources = true;
+
+    for index in &range_meta.row_group_indices {
+        if stream_ctx.is_file_range_index(*index) {
+            let file_id = stream_ctx.input.file_from_index(*index).file_id().file_id();
+            if seen.insert(file_id) {
+                file_ids.push(file_id);
+            }
+        } else {
+            only_file_sources = false;
+        }
+    }
+
+    PartitionRangeFiles {
+        file_ids,
+        only_file_sources,
+    }
+}
+
+/// Builds a cache key for the given partition range if it is eligible for caching.
+pub(crate) fn build_partition_range_cache_key(
+    stream_ctx: &StreamContext,
+    part_range: &PartitionRange,
+) -> Option<PartitionRangeScanCacheKey> {
+    let files = collect_partition_range_file_ids(stream_ctx, part_range);
+    let eligible = stream_ctx.input.flat_format
+        && stream_ctx.input.has_tag_filter
+        && !stream_ctx.input.compaction
+        && files.only_file_sources
+        && !files.file_ids.is_empty()
+        && !matches!(stream_ctx.input.cache_strategy, CacheStrategy::Disabled);
+
+    if eligible {
+        Some(PartitionRangeScanCacheKey {
+            region_id: stream_ctx.input.region_metadata().region_id,
+            range_index: part_range.identifier,
+            file_ids: files.file_ids,
+            scan: stream_ctx.input.scan_request_fingerprint(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Returns a stream that replays cached record batches.
+pub(crate) fn cached_flat_partition_range_stream(
+    value: Arc<PartitionRangeScanCacheValue>,
+) -> BoxedRecordBatchStream {
+    Box::pin(futures::stream::iter(
+        value.batches.clone().into_iter().map(Ok),
+    ))
+}
+
+/// Compacts the `__primary_key` dictionary column in a record batch by removing
+/// unreferenced values. This reduces memory usage when caching batches whose
+/// dictionary values array contains entries not referenced by any key.
+///
+/// Only compacts when the values array has more than 4 entries to avoid
+/// unnecessary work for small dictionaries.
+fn compact_pk_dictionary(batch: RecordBatch) -> RecordBatch {
+    let pk_idx = primary_key_column_index(batch.num_columns());
+    let pk_col = match batch
+        .column(pk_idx)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+    {
+        Some(dict) if dict.values().len() > 4 => dict,
+        _ => return batch,
+    };
+
+    let old_values = pk_col
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("primary key dictionary values must be BinaryArray");
+    let keys = pk_col.keys();
+
+    // Single linear pass: since keys are sorted/grouped, we track when the key changes.
+    let mut remap = vec![0u32; old_values.len()];
+    let mut new_values: Vec<&[u8]> = Vec::new();
+    let mut prev_key: Option<u32> = None;
+
+    for key in keys.iter().flatten() {
+        if prev_key != Some(key) {
+            let new_index = new_values.len() as u32;
+            new_values.push(old_values.value(key as usize));
+            remap[key as usize] = new_index;
+            prev_key = Some(key);
+        }
+    }
+
+    if new_values.len() == old_values.len() {
+        return batch; // all values are in use
+    }
+
+    let new_keys = UInt32Array::from_iter(keys.iter().map(|k| k.map(|v| remap[v as usize])));
+    let new_values_array = BinaryArray::from_iter_values(new_values);
+    let new_dict = DictionaryArray::new(new_keys, Arc::new(new_values_array));
+
+    let mut columns: Vec<_> = batch.columns().to_vec();
+    columns[pk_idx] = Arc::new(new_dict);
+    RecordBatch::try_new(batch.schema(), columns).expect("schema should match after compaction")
+}
+
+/// Wraps a stream to cache its output for future partition-range cache hits.
+pub(crate) fn cache_flat_partition_range_stream(
+    mut stream: BoxedRecordBatchStream,
+    cache_strategy: CacheStrategy,
+    key: PartitionRangeScanCacheKey,
+    part_metrics: PartitionMetrics,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        let mut batches = Vec::new();
+        let mut num_rows = 0usize;
+        while let Some(batch) = stream.try_next().await? {
+            let batch = compact_pk_dictionary(batch);
+            num_rows += batch.num_rows();
+            batches.push(batch.clone());
+            yield batch;
+        }
+
+        if !batches.is_empty() {
+            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+
+            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
+            common_telemetry::debug!(
+                "Partition range cache put, digest: {:x}, num_batches: {}, num_rows: {}",
+                key.digest(),
+                value.batches.len(),
+                num_rows,
+            );
+            cache_strategy.put_partition_range_result(key, value);
+        } else {
+            part_metrics.inc_partition_range_cache_size(key.estimated_size());
+            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+            cache_strategy.put_partition_range_result(key, value);
+        }
+    })
 }
