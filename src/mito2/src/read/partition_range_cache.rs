@@ -21,6 +21,7 @@ use std::mem;
 use std::sync::Arc;
 
 use async_stream::try_stream;
+use common_time::range::TimestampRange;
 use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
 use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
@@ -33,6 +34,7 @@ use crate::memtable::record_batch_estimated_size;
 use crate::read::BoxedRecordBatchStream;
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::PartitionMetrics;
+use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 
 /// Fingerprint of request-relevant scan options.
@@ -144,6 +146,7 @@ pub(crate) fn build_partition_range_cache_key(
     part_range: &PartitionRange,
 ) -> Option<PartitionRangeScanCacheKey> {
     let files = collect_partition_range_file_ids(stream_ctx, part_range);
+    let range_meta = &stream_ctx.ranges[part_range.identifier];
     let eligible = stream_ctx.input.flat_format
         && stream_ctx.input.has_tag_filter
         && !stream_ctx.input.compaction
@@ -156,11 +159,32 @@ pub(crate) fn build_partition_range_cache_key(
             region_id: stream_ctx.input.region_metadata().region_id,
             range_index: part_range.identifier,
             file_ids: files.file_ids,
-            scan: stream_ctx.input.scan_request_fingerprint(),
+            scan: if query_time_range_covers_partition_range(
+                stream_ctx.input.time_range.as_ref(),
+                range_meta.time_range,
+            ) {
+                stream_ctx
+                    .input
+                    .scan_request_fingerprint_without_time_filters()
+            } else {
+                stream_ctx.input.scan_request_fingerprint()
+            },
         })
     } else {
         None
     }
+}
+
+fn query_time_range_covers_partition_range(
+    query_time_range: Option<&TimestampRange>,
+    partition_time_range: FileTimeRange,
+) -> bool {
+    let Some(query_time_range) = query_time_range else {
+        return true;
+    };
+
+    let (part_start, part_end) = partition_time_range;
+    query_time_range.contains(&part_start) && query_time_range.contains(&part_end)
 }
 
 /// Returns a stream that replays cached record batches.
@@ -257,4 +281,144 @@ pub(crate) fn cache_flat_partition_range_stream(
             cache_strategy.put_partition_range_result(key, value);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use common_time::Timestamp;
+    use common_time::range::TimestampRange;
+    use common_time::timestamp::TimeUnit;
+    use datafusion_expr::{Expr, col, lit};
+    use smallvec::smallvec;
+    use store_api::storage::FileId;
+
+    use super::*;
+    use crate::cache::CacheManager;
+    use crate::read::projection::ProjectionMapper;
+    use crate::read::range::{RangeMeta, RowGroupIndex, SourceIndex};
+    use crate::read::scan_region::{PredicateGroup, ScanInput};
+    use crate::test_util::memtable_util::metadata_with_primary_key;
+    use crate::test_util::scheduler_util::SchedulerEnv;
+    use crate::test_util::sst_util::sst_file_handle_with_file_id;
+
+    fn test_cache_strategy() -> CacheStrategy {
+        CacheStrategy::EnableAll(Arc::new(
+            CacheManager::builder()
+                .partition_range_result_cache_size(1024)
+                .build(),
+        ))
+    }
+
+    async fn new_stream_context(
+        filters: Vec<Expr>,
+        query_time_range: Option<TimestampRange>,
+        partition_time_range: FileTimeRange,
+    ) -> (StreamContext, PartitionRange) {
+        let env = SchedulerEnv::new().await;
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let mapper = ProjectionMapper::new(&metadata, [0, 2, 3].into_iter(), true).unwrap();
+        let predicate = PredicateGroup::new(metadata.as_ref(), &filters).unwrap();
+        let file_id = FileId::random();
+        let file = sst_file_handle_with_file_id(
+            file_id,
+            partition_time_range.0.value(),
+            partition_time_range.1.value(),
+        );
+        let input = ScanInput::new(env.access_layer.clone(), mapper)
+            .with_predicate(predicate)
+            .with_time_range(query_time_range)
+            .with_files(vec![file])
+            .with_cache(test_cache_strategy())
+            .with_has_tag_filter(true)
+            .with_flat_format(true);
+        let range_meta = RangeMeta {
+            time_range: partition_time_range,
+            indices: smallvec![SourceIndex {
+                index: 0,
+                num_row_groups: 1,
+            }],
+            row_group_indices: smallvec![RowGroupIndex {
+                index: 0,
+                row_group_index: 0,
+            }],
+            num_rows: 10,
+        };
+        let partition_range = range_meta.new_partition_range(0);
+        let stream_ctx = StreamContext {
+            input,
+            ranges: vec![range_meta],
+            query_start: Instant::now(),
+        };
+
+        (stream_ctx, partition_range)
+    }
+
+    #[tokio::test]
+    async fn strips_time_only_filters_when_query_covers_partition_range() {
+        let (stream_ctx, part_range) = new_stream_context(
+            vec![
+                col("ts").gt_eq(lit(1000)),
+                col("ts").lt(lit(2001)),
+                col("k0").eq(lit("foo")),
+            ],
+            TimestampRange::with_unit(1000, 2002, TimeUnit::Millisecond),
+            (
+                Timestamp::new_millisecond(1000),
+                Timestamp::new_millisecond(2000),
+            ),
+        )
+        .await;
+
+        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+
+        assert_eq!(
+            key.scan,
+            stream_ctx
+                .input
+                .scan_request_fingerprint_without_time_filters()
+        );
+        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
+    }
+
+    #[tokio::test]
+    async fn preserves_time_filters_when_query_does_not_cover_partition_range() {
+        let (stream_ctx, part_range) = new_stream_context(
+            vec![col("ts").gt_eq(lit(1000)), col("k0").eq(lit("foo"))],
+            TimestampRange::with_unit(1000, 1500, TimeUnit::Millisecond),
+            (
+                Timestamp::new_millisecond(1000),
+                Timestamp::new_millisecond(2000),
+            ),
+        )
+        .await;
+
+        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+
+        assert_eq!(key.scan, stream_ctx.input.scan_request_fingerprint());
+    }
+
+    #[tokio::test]
+    async fn strips_time_only_filters_when_query_has_no_time_range_limit() {
+        let (stream_ctx, part_range) = new_stream_context(
+            vec![col("ts").gt_eq(lit(1000)), col("k0").eq(lit("foo"))],
+            None,
+            (
+                Timestamp::new_millisecond(1000),
+                Timestamp::new_millisecond(2000),
+            ),
+        )
+        .await;
+
+        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+
+        assert_eq!(
+            key.scan,
+            stream_ctx
+                .input
+                .scan_request_fingerprint_without_time_filters()
+        );
+    }
 }

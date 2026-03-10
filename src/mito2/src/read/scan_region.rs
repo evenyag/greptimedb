@@ -843,7 +843,7 @@ pub struct ScanInput {
     /// But this read columns might also include non-projected columns needed for filtering.
     pub(crate) read_column_ids: Vec<ColumnId>,
     /// Time range filter for time index.
-    time_range: Option<TimestampRange>,
+    pub(crate) time_range: Option<TimestampRange>,
     /// Predicate to push down.
     pub(crate) predicate: PredicateGroup,
     /// Region partition expr applied at read time.
@@ -1398,6 +1398,56 @@ impl ScanInput {
                 predicate
                     .exprs()
                     .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        ScanRequestFingerprint {
+            read_column_ids: self.read_column_ids.clone(),
+            filters,
+            series_row_selector: self.series_row_selector.map(|v| v.to_string()),
+            distribution: self.distribution.map(|v| v.to_string()),
+            append_mode: self.append_mode,
+            filter_deleted: self.filter_deleted,
+            merge_mode: merge_mode_name(self.merge_mode),
+            flat_format: self.flat_format,
+            compaction: self.compaction,
+        }
+    }
+
+    /// Returns a fingerprint with time-index-only filter expressions removed.
+    ///
+    /// This is used when the query's time range fully covers the partition range,
+    /// making time filters redundant for cache key purposes.
+    pub(crate) fn scan_request_fingerprint_without_time_filters(&self) -> ScanRequestFingerprint {
+        let time_index_name = self
+            .region_metadata()
+            .time_index_column()
+            .column_schema
+            .name
+            .clone();
+
+        let filters = self
+            .predicate_group()
+            .predicate_without_region()
+            .map(|predicate| {
+                predicate
+                    .exprs()
+                    .iter()
+                    .filter(|expr| {
+                        // Keep expressions that reference columns other than the time index.
+                        let mut columns = HashSet::new();
+                        if expr_to_columns(expr, &mut columns).is_err() {
+                            // If we can't extract columns, keep the expression to be safe.
+                            return true;
+                        }
+                        if columns.is_empty() {
+                            return true;
+                        }
+                        // Exclude expressions that only reference the time index column.
+                        !columns.iter().all(|col| col.name == time_index_name)
+                    })
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             })
