@@ -1143,6 +1143,7 @@ mod tests {
                 append_mode: false,
                 filter_deleted: true,
                 merge_mode: crate::region::options::MergeMode::LastRow,
+                partition_expr_version: 0,
             },
         };
         let value = Arc::new(PartitionRangeScanCacheValue::new(Vec::new()));

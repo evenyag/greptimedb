@@ -50,6 +50,7 @@ pub(crate) struct ScanRequestFingerprint {
     pub(crate) append_mode: bool,
     pub(crate) filter_deleted: bool,
     pub(crate) merge_mode: MergeMode,
+    pub(crate) partition_expr_version: u64,
 }
 
 /// Cache key for partition-range scan outputs.

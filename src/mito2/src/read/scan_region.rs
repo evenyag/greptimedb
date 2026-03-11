@@ -1491,6 +1491,7 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
         append_mode: input.append_mode,
         filter_deleted: input.filter_deleted,
         merge_mode: input.merge_mode,
+        partition_expr_version: metadata.partition_expr_version,
     })
 }
 
