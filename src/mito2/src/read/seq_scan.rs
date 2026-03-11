@@ -41,12 +41,11 @@ use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
 use crate::read::last_row::LastRowReader;
 use crate::read::merge::MergeReaderBuilder;
-use crate::read::partition_range_cache::{
-    build_partition_range_cache_key, cache_flat_partition_range_stream,
-    cached_flat_partition_range_stream,
-};
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
+use crate::read::range_cache::{
+    build_range_cache_key, cache_flat_range_stream, cached_flat_range_stream,
+};
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream, scan_file_ranges,
@@ -364,19 +363,15 @@ impl SeqScan {
         merge_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<BoxedRecordBatchStream> {
         // Check cache before building sources and stream.
-        let cache_key = build_partition_range_cache_key(stream_ctx, part_range);
+        let cache_key = build_range_cache_key(stream_ctx, part_range);
 
         if let Some(key) = cache_key.as_ref() {
-            if let Some(value) = stream_ctx
-                .input
-                .cache_strategy
-                .get_partition_range_result(key)
-            {
-                part_metrics.inc_partition_range_cache_hit();
-                let stream = cached_flat_partition_range_stream(value);
+            if let Some(value) = stream_ctx.input.cache_strategy.get_range_result(key) {
+                part_metrics.inc_range_cache_hit();
+                let stream = cached_flat_range_stream(value);
                 return Ok(stream);
             }
-            part_metrics.inc_partition_range_cache_miss();
+            part_metrics.inc_range_cache_miss();
         }
 
         let mut sources = Vec::new();
@@ -400,7 +395,7 @@ impl SeqScan {
         .await?;
 
         let stream = match cache_key.clone() {
-            Some(key) => cache_flat_partition_range_stream(
+            Some(key) => cache_flat_range_stream(
                 stream,
                 stream_ctx.input.cache_strategy.clone(),
                 key,

@@ -49,9 +49,7 @@ use crate::cache::write_cache::WriteCacheRef;
 use crate::memtable::record_batch_estimated_size;
 use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
-use crate::read::partition_range_cache::{
-    PartitionRangeScanCacheKey, PartitionRangeScanCacheValue,
-};
+use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::reader::MetadataCacheMetrics;
 
@@ -67,8 +65,8 @@ const FILE_TYPE: &str = "file";
 const INDEX_TYPE: &str = "index";
 /// Metrics type key for selector result cache.
 const SELECTOR_RESULT_TYPE: &str = "selector_result";
-/// Metrics type key for partition-range scan result cache.
-const PARTITION_RANGE_RESULT_TYPE: &str = "partition_range_result";
+/// Metrics type key for range scan result cache.
+const RANGE_RESULT_TYPE: &str = "range_result";
 
 /// Cache strategies that may only enable a subset of caches.
 #[derive(Clone)]
@@ -228,29 +226,27 @@ impl CacheStrategy {
         }
     }
 
-    /// Calls [CacheManager::get_partition_range_result()].
+    /// Calls [CacheManager::get_range_result()].
     /// It returns None if the strategy is [CacheStrategy::Compaction] or [CacheStrategy::Disabled].
-    pub(crate) fn get_partition_range_result(
+    pub(crate) fn get_range_result(
         &self,
-        key: &PartitionRangeScanCacheKey,
-    ) -> Option<Arc<PartitionRangeScanCacheValue>> {
+        key: &RangeScanCacheKey,
+    ) -> Option<Arc<RangeScanCacheValue>> {
         match self {
-            CacheStrategy::EnableAll(cache_manager) => {
-                cache_manager.get_partition_range_result(key)
-            }
+            CacheStrategy::EnableAll(cache_manager) => cache_manager.get_range_result(key),
             CacheStrategy::Compaction(_) | CacheStrategy::Disabled => None,
         }
     }
 
-    /// Calls [CacheManager::put_partition_range_result()].
+    /// Calls [CacheManager::put_range_result()].
     /// It does nothing if the strategy isn't [CacheStrategy::EnableAll].
-    pub(crate) fn put_partition_range_result(
+    pub(crate) fn put_range_result(
         &self,
-        key: PartitionRangeScanCacheKey,
-        result: Arc<PartitionRangeScanCacheValue>,
+        key: RangeScanCacheKey,
+        result: Arc<RangeScanCacheValue>,
     ) {
         if let CacheStrategy::EnableAll(cache_manager) = self {
-            cache_manager.put_partition_range_result(key, result);
+            cache_manager.put_range_result(key, result);
         }
     }
 
@@ -355,8 +351,8 @@ pub struct CacheManager {
     puffin_metadata_cache: Option<PuffinMetadataCacheRef>,
     /// Cache for time series selectors.
     selector_result_cache: Option<SelectorResultCache>,
-    /// Cache for partition-range scan outputs in flat format.
-    partition_range_result_cache: Option<PartitionRangeResultCache>,
+    /// Cache for range scan outputs in flat format.
+    range_result_cache: Option<RangeResultCache>,
     /// Cache for index result.
     index_result_cache: Option<IndexResultCache>,
 }
@@ -545,26 +541,26 @@ impl CacheManager {
         }
     }
 
-    /// Gets cached result for partition-range scan.
-    pub(crate) fn get_partition_range_result(
+    /// Gets cached result for range scan.
+    pub(crate) fn get_range_result(
         &self,
-        key: &PartitionRangeScanCacheKey,
-    ) -> Option<Arc<PartitionRangeScanCacheValue>> {
-        self.partition_range_result_cache
+        key: &RangeScanCacheKey,
+    ) -> Option<Arc<RangeScanCacheValue>> {
+        self.range_result_cache
             .as_ref()
-            .and_then(|cache| update_hit_miss(cache.get(key), PARTITION_RANGE_RESULT_TYPE))
+            .and_then(|cache| update_hit_miss(cache.get(key), RANGE_RESULT_TYPE))
     }
 
-    /// Puts partition-range scan result into cache.
-    pub(crate) fn put_partition_range_result(
+    /// Puts range scan result into cache.
+    pub(crate) fn put_range_result(
         &self,
-        key: PartitionRangeScanCacheKey,
-        result: Arc<PartitionRangeScanCacheValue>,
+        key: RangeScanCacheKey,
+        result: Arc<RangeScanCacheValue>,
     ) {
-        if let Some(cache) = &self.partition_range_result_cache {
+        if let Some(cache) = &self.range_result_cache {
             CACHE_BYTES
-                .with_label_values(&[PARTITION_RANGE_RESULT_TYPE])
-                .add(partition_range_result_cache_weight(&key, &result).into());
+                .with_label_values(&[RANGE_RESULT_TYPE])
+                .add(range_result_cache_weight(&key, &result).into());
             cache.insert(key, result);
         }
     }
@@ -619,7 +615,7 @@ pub struct CacheManagerBuilder {
     puffin_metadata_size: u64,
     write_cache: Option<WriteCacheRef>,
     selector_result_cache_size: u64,
-    partition_range_result_cache_size: u64,
+    range_result_cache_size: u64,
 }
 
 impl CacheManagerBuilder {
@@ -683,9 +679,9 @@ impl CacheManagerBuilder {
         self
     }
 
-    /// Sets partition-range result cache size.
-    pub fn partition_range_result_cache_size(mut self, bytes: u64) -> Self {
-        self.partition_range_result_cache_size = bytes;
+    /// Sets range result cache size.
+    pub fn range_result_cache_size(mut self, bytes: u64) -> Self {
+        self.range_result_cache_size = bytes;
         self
     }
 
@@ -776,22 +772,21 @@ impl CacheManagerBuilder {
                 })
                 .build()
         });
-        let partition_range_result_cache =
-            (self.partition_range_result_cache_size != 0).then(|| {
-                Cache::builder()
-                    .max_capacity(self.partition_range_result_cache_size)
-                    .weigher(partition_range_result_cache_weight)
-                    .eviction_listener(move |k, v, cause| {
-                        let size = partition_range_result_cache_weight(&k, &v);
-                        CACHE_BYTES
-                            .with_label_values(&[PARTITION_RANGE_RESULT_TYPE])
-                            .sub(size.into());
-                        CACHE_EVICTION
-                            .with_label_values(&[PARTITION_RANGE_RESULT_TYPE, to_str(cause)])
-                            .inc();
-                    })
-                    .build()
-            });
+        let range_result_cache = (self.range_result_cache_size != 0).then(|| {
+            Cache::builder()
+                .max_capacity(self.range_result_cache_size)
+                .weigher(range_result_cache_weight)
+                .eviction_listener(move |k, v, cause| {
+                    let size = range_result_cache_weight(&k, &v);
+                    CACHE_BYTES
+                        .with_label_values(&[RANGE_RESULT_TYPE])
+                        .sub(size.into());
+                    CACHE_EVICTION
+                        .with_label_values(&[RANGE_RESULT_TYPE, to_str(cause)])
+                        .inc();
+                })
+                .build()
+        });
         CacheManager {
             sst_meta_cache,
             vector_cache,
@@ -803,7 +798,7 @@ impl CacheManagerBuilder {
             vector_index_cache,
             puffin_metadata_cache: Some(Arc::new(puffin_metadata_cache)),
             selector_result_cache,
-            partition_range_result_cache,
+            range_result_cache,
             index_result_cache,
         }
     }
@@ -827,10 +822,7 @@ fn selector_result_cache_weight(k: &SelectorResultKey, v: &Arc<SelectorResultVal
     (mem::size_of_val(k) + v.estimated_size()) as u32
 }
 
-fn partition_range_result_cache_weight(
-    k: &PartitionRangeScanCacheKey,
-    v: &Arc<PartitionRangeScanCacheValue>,
-) -> u32 {
+fn range_result_cache_weight(k: &RangeScanCacheKey, v: &Arc<RangeScanCacheValue>) -> u32 {
     (k.estimated_size() + v.estimated_size()) as u32
 }
 
@@ -991,8 +983,7 @@ type PageCache = Cache<PageKey, Arc<PageValue>>;
 /// Maps (file id, row group id, time series row selector) to [SelectorResultValue].
 type SelectorResultCache = Cache<SelectorResultKey, Arc<SelectorResultValue>>;
 /// Maps partition-range scan key to cached flat batches.
-type PartitionRangeResultCache =
-    Cache<PartitionRangeScanCacheKey, Arc<PartitionRangeScanCacheValue>>;
+type RangeResultCache = Cache<RangeScanCacheKey, Arc<RangeScanCacheValue>>;
 
 #[cfg(test)]
 mod tests {
@@ -1007,8 +998,8 @@ mod tests {
     use crate::cache::index::bloom_filter_index::Tag;
     use crate::cache::index::result_cache::PredicateKey;
     use crate::cache::test_util::parquet_meta;
-    use crate::read::partition_range_cache::{
-        PartitionRangeScanCacheKey, PartitionRangeScanCacheValue, ScanRequestFingerprint,
+    use crate::read::range_cache::{
+        RangeScanCacheKey, RangeScanCacheValue, ScanRequestFingerprint,
     };
     use crate::sst::parquet::row_selection::RowGroupSelection;
 
@@ -1123,14 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_range_result_cache() {
+    fn test_range_result_cache() {
         let cache = Arc::new(
             CacheManager::builder()
-                .partition_range_result_cache_size(1024 * 1024)
+                .range_result_cache_size(1024 * 1024)
                 .build(),
         );
 
-        let key = PartitionRangeScanCacheKey {
+        let key = RangeScanCacheKey {
             region_id: RegionId::new(1, 1),
             range_index: 0,
             file_ids: vec![FileId::random()],
@@ -1147,24 +1138,24 @@ mod tests {
                 partition_expr_version: 0,
             },
         };
-        let value = Arc::new(PartitionRangeScanCacheValue::new(Vec::new()));
+        let value = Arc::new(RangeScanCacheValue::new(Vec::new()));
 
-        assert!(cache.get_partition_range_result(&key).is_none());
-        cache.put_partition_range_result(key.clone(), value.clone());
-        assert!(cache.get_partition_range_result(&key).is_some());
+        assert!(cache.get_range_result(&key).is_none());
+        cache.put_range_result(key.clone(), value.clone());
+        assert!(cache.get_range_result(&key).is_some());
 
         let enable_all = CacheStrategy::EnableAll(cache.clone());
-        assert!(enable_all.get_partition_range_result(&key).is_some());
+        assert!(enable_all.get_range_result(&key).is_some());
 
         let compaction = CacheStrategy::Compaction(cache.clone());
-        assert!(compaction.get_partition_range_result(&key).is_none());
-        compaction.put_partition_range_result(key.clone(), value.clone());
-        assert!(cache.get_partition_range_result(&key).is_some());
+        assert!(compaction.get_range_result(&key).is_none());
+        compaction.put_range_result(key.clone(), value.clone());
+        assert!(cache.get_range_result(&key).is_some());
 
         let disabled = CacheStrategy::Disabled;
-        assert!(disabled.get_partition_range_result(&key).is_none());
-        disabled.put_partition_range_result(key.clone(), value);
-        assert!(cache.get_partition_range_result(&key).is_some());
+        assert!(disabled.get_range_result(&key).is_none());
+        disabled.put_range_result(key.clone(), value);
+        assert!(cache.get_range_result(&key).is_some());
     }
 
     #[tokio::test]

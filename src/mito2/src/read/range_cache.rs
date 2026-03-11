@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cache key types for partition-range scan outputs.
+//! Cache key types for range scan outputs.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -55,16 +55,16 @@ pub(crate) struct ScanRequestFingerprint {
     pub(crate) partition_expr_version: u64,
 }
 
-/// Cache key for partition-range scan outputs.
+/// Cache key for range scan outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PartitionRangeScanCacheKey {
+pub(crate) struct RangeScanCacheKey {
     pub(crate) region_id: RegionId,
     pub(crate) range_index: usize,
     pub(crate) file_ids: Vec<FileId>,
     pub(crate) scan: ScanRequestFingerprint,
 }
 
-impl PartitionRangeScanCacheKey {
+impl RangeScanCacheKey {
     pub(crate) fn estimated_size(&self) -> usize {
         mem::size_of::<Self>()
             + self.file_ids.capacity() * mem::size_of::<FileId>()
@@ -85,12 +85,12 @@ impl PartitionRangeScanCacheKey {
     }
 }
 
-/// Cached result for one partition-range scan.
-pub(crate) struct PartitionRangeScanCacheValue {
+/// Cached result for one range scan.
+pub(crate) struct RangeScanCacheValue {
     pub(crate) batches: Vec<RecordBatch>,
 }
 
-impl PartitionRangeScanCacheValue {
+impl RangeScanCacheValue {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
         Self { batches }
     }
@@ -140,10 +140,10 @@ pub(crate) fn collect_partition_range_file_ids(
 }
 
 /// Builds a cache key for the given partition range if it is eligible for caching.
-pub(crate) fn build_partition_range_cache_key(
+pub(crate) fn build_range_cache_key(
     stream_ctx: &StreamContext,
     part_range: &PartitionRange,
-) -> Option<PartitionRangeScanCacheKey> {
+) -> Option<RangeScanCacheKey> {
     let fingerprint = stream_ctx.scan_fingerprint.as_ref()?;
 
     let files = collect_partition_range_file_ids(stream_ctx, part_range);
@@ -160,7 +160,7 @@ pub(crate) fn build_partition_range_cache_key(
         scan.time_filters.clear();
     }
 
-    Some(PartitionRangeScanCacheKey {
+    Some(RangeScanCacheKey {
         region_id: stream_ctx.input.region_metadata().region_id,
         range_index: part_range.identifier,
         file_ids: files.file_ids,
@@ -181,9 +181,7 @@ fn query_time_range_covers_partition_range(
 }
 
 /// Returns a stream that replays cached record batches.
-pub(crate) fn cached_flat_partition_range_stream(
-    value: Arc<PartitionRangeScanCacheValue>,
-) -> BoxedRecordBatchStream {
+pub(crate) fn cached_flat_range_stream(value: Arc<RangeScanCacheValue>) -> BoxedRecordBatchStream {
     Box::pin(futures::stream::iter(
         value.batches.clone().into_iter().map(Ok),
     ))
@@ -240,11 +238,11 @@ fn compact_pk_dictionary(batch: RecordBatch) -> RecordBatch {
     RecordBatch::try_new(batch.schema(), columns).expect("schema should match after compaction")
 }
 
-/// Wraps a stream to cache its output for future partition-range cache hits.
-pub(crate) fn cache_flat_partition_range_stream(
+/// Wraps a stream to cache its output for future range cache hits.
+pub(crate) fn cache_flat_range_stream(
     mut stream: BoxedRecordBatchStream,
     cache_strategy: CacheStrategy,
-    key: PartitionRangeScanCacheKey,
+    key: RangeScanCacheKey,
     part_metrics: PartitionMetrics,
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
@@ -256,14 +254,14 @@ pub(crate) fn cache_flat_partition_range_stream(
         }
 
         if !batches.is_empty() {
-            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
+            let value = Arc::new(RangeScanCacheValue::new(batches));
 
-            part_metrics.inc_partition_range_cache_size(key.estimated_size() + value.estimated_size());
-            cache_strategy.put_partition_range_result(key, value);
+            part_metrics.inc_range_cache_size(key.estimated_size() + value.estimated_size());
+            cache_strategy.put_range_result(key, value);
         } else {
-            part_metrics.inc_partition_range_cache_size(key.estimated_size());
-            let value = Arc::new(PartitionRangeScanCacheValue::new(batches));
-            cache_strategy.put_partition_range_result(key, value);
+            part_metrics.inc_range_cache_size(key.estimated_size());
+            let value = Arc::new(RangeScanCacheValue::new(batches));
+            cache_strategy.put_range_result(key, value);
         }
     })
 }
@@ -292,7 +290,7 @@ mod tests {
     fn test_cache_strategy() -> CacheStrategy {
         CacheStrategy::EnableAll(Arc::new(
             CacheManager::builder()
-                .partition_range_result_cache_size(1024)
+                .range_result_cache_size(1024)
                 .build(),
         ))
     }
@@ -358,7 +356,7 @@ mod tests {
         )
         .await;
 
-        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+        let key = build_range_cache_key(&stream_ctx, &part_range).unwrap();
 
         // Time filters should be cleared when query covers partition range.
         assert!(key.scan.time_filters.is_empty());
@@ -377,7 +375,7 @@ mod tests {
         )
         .await;
 
-        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+        let key = build_range_cache_key(&stream_ctx, &part_range).unwrap();
 
         // Time filters should be preserved when query does not cover partition range.
         assert_eq!(
@@ -399,7 +397,7 @@ mod tests {
         )
         .await;
 
-        let key = build_partition_range_cache_key(&stream_ctx, &part_range).unwrap();
+        let key = build_range_cache_key(&stream_ctx, &part_range).unwrap();
 
         // Time filters should be cleared when query has no time range limit.
         assert!(key.scan.time_filters.is_empty());
