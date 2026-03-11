@@ -1484,6 +1484,15 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
 
     Some(ScanRequestFingerprint {
         read_column_ids: input.read_column_ids.clone(),
+        read_column_types: input
+            .read_column_ids
+            .iter()
+            .map(|id| {
+                metadata
+                    .column_by_id(*id)
+                    .map(|col| col.column_schema.data_type.clone())
+            })
+            .collect(),
         filters,
         time_filters,
         series_row_selector: input.series_row_selector,

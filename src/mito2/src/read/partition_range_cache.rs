@@ -24,6 +24,7 @@ use common_time::range::TimestampRange;
 use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
 use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
+use datatypes::prelude::ConcreteDataType;
 use futures::TryStreamExt;
 use store_api::region_engine::PartitionRange;
 use store_api::storage::{
@@ -43,6 +44,7 @@ use crate::sst::parquet::flat_format::primary_key_column_index;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScanRequestFingerprint {
     pub(crate) read_column_ids: Vec<ColumnId>,
+    pub(crate) read_column_types: Vec<Option<ConcreteDataType>>,
     pub(crate) filters: Vec<String>,
     pub(crate) time_filters: Vec<String>,
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
@@ -67,6 +69,7 @@ impl PartitionRangeScanCacheKey {
         mem::size_of::<Self>()
             + self.file_ids.capacity() * mem::size_of::<FileId>()
             + self.scan.read_column_ids.capacity() * mem::size_of::<ColumnId>()
+            + self.scan.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
             + self
                 .scan
                 .filters

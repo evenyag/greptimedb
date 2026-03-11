@@ -1136,6 +1136,7 @@ mod tests {
             file_ids: vec![FileId::random()],
             scan: ScanRequestFingerprint {
                 read_column_ids: vec![],
+                read_column_types: vec![],
                 filters: vec!["tag_0 = 1".to_string()],
                 time_filters: vec![],
                 series_row_selector: None,
