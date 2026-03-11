@@ -1482,6 +1482,9 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
         }
     }
 
+    filters.sort_unstable();
+    time_filters.sort_unstable();
+
     Some(ScanRequestFingerprint {
         read_column_ids: input.read_column_ids.clone(),
         read_column_types: input

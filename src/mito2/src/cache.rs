@@ -1123,8 +1123,7 @@ mod tests {
 
         let key = RangeScanCacheKey {
             region_id: RegionId::new(1, 1),
-            range_index: 0,
-            file_ids: vec![FileId::random()],
+            row_groups: vec![(FileId::random(), 0)],
             scan: ScanRequestFingerprint {
                 read_column_ids: vec![],
                 read_column_types: vec![],

@@ -14,7 +14,6 @@
 
 //! Cache key types for range scan outputs.
 
-use std::collections::HashSet;
 use std::hash::Hash;
 use std::mem;
 use std::sync::Arc;
@@ -59,15 +58,15 @@ pub(crate) struct ScanRequestFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RangeScanCacheKey {
     pub(crate) region_id: RegionId,
-    pub(crate) range_index: usize,
-    pub(crate) file_ids: Vec<FileId>,
+    /// Sorted (file_id, row_group_index) pairs that uniquely identify the data this range covers.
+    pub(crate) row_groups: Vec<(FileId, i64)>,
     pub(crate) scan: ScanRequestFingerprint,
 }
 
 impl RangeScanCacheKey {
     pub(crate) fn estimated_size(&self) -> usize {
         mem::size_of::<Self>()
-            + self.file_ids.capacity() * mem::size_of::<FileId>()
+            + self.row_groups.capacity() * mem::size_of::<(FileId, i64)>()
             + self.scan.read_column_ids.capacity() * mem::size_of::<ColumnId>()
             + self.scan.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
             + self
@@ -106,35 +105,35 @@ impl RangeScanCacheValue {
     }
 }
 
-/// File IDs and whether all sources are file-only for a partition range.
-pub(crate) struct PartitionRangeFiles {
-    pub(crate) file_ids: Vec<FileId>,
+/// Row groups and whether all sources are file-only for a partition range.
+pub(crate) struct PartitionRangeRowGroups {
+    /// Sorted (file_id, row_group_index) pairs.
+    pub(crate) row_groups: Vec<(FileId, i64)>,
     pub(crate) only_file_sources: bool,
 }
 
-/// Collects file IDs from a partition range's row group indices.
-pub(crate) fn collect_partition_range_file_ids(
+/// Collects (file_id, row_group_index) pairs from a partition range's row group indices.
+pub(crate) fn collect_partition_range_row_groups(
     stream_ctx: &StreamContext,
     part_range: &PartitionRange,
-) -> PartitionRangeFiles {
+) -> PartitionRangeRowGroups {
     let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let mut file_ids = Vec::new();
-    let mut seen = HashSet::new();
+    let mut row_groups = Vec::new();
     let mut only_file_sources = true;
 
     for index in &range_meta.row_group_indices {
         if stream_ctx.is_file_range_index(*index) {
             let file_id = stream_ctx.input.file_from_index(*index).file_id().file_id();
-            if seen.insert(file_id) {
-                file_ids.push(file_id);
-            }
+            row_groups.push((file_id, index.row_group_index));
         } else {
             only_file_sources = false;
         }
     }
 
-    PartitionRangeFiles {
-        file_ids,
+    row_groups.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(&b.1)));
+
+    PartitionRangeRowGroups {
+        row_groups,
         only_file_sources,
     }
 }
@@ -146,8 +145,8 @@ pub(crate) fn build_range_cache_key(
 ) -> Option<RangeScanCacheKey> {
     let fingerprint = stream_ctx.scan_fingerprint.as_ref()?;
 
-    let files = collect_partition_range_file_ids(stream_ctx, part_range);
-    if !files.only_file_sources || files.file_ids.is_empty() {
+    let rg = collect_partition_range_row_groups(stream_ctx, part_range);
+    if !rg.only_file_sources || rg.row_groups.is_empty() {
         return None;
     }
 
@@ -162,8 +161,7 @@ pub(crate) fn build_range_cache_key(
 
     Some(RangeScanCacheKey {
         region_id: stream_ctx.input.region_metadata().region_id,
-        range_index: part_range.identifier,
-        file_ids: files.file_ids,
+        row_groups: rg.row_groups,
         scan,
     })
 }
