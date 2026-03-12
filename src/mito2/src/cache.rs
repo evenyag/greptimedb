@@ -998,9 +998,7 @@ mod tests {
     use crate::cache::index::bloom_filter_index::Tag;
     use crate::cache::index::result_cache::PredicateKey;
     use crate::cache::test_util::parquet_meta;
-    use crate::read::range_cache::{
-        RangeScanCacheKey, RangeScanCacheValue, ScanRequestFingerprint,
-    };
+    use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
     use crate::sst::parquet::row_selection::RowGroupSelection;
 
     #[tokio::test]
@@ -1124,7 +1122,7 @@ mod tests {
         let key = RangeScanCacheKey {
             region_id: RegionId::new(1, 1),
             row_groups: vec![(FileId::random(), 0)],
-            scan: ScanRequestFingerprint {
+            scan: crate::read::range_cache::ScanRequestFingerprintBuilder {
                 read_column_ids: vec![],
                 read_column_types: vec![],
                 filters: vec!["tag_0 = 1".to_string()],
@@ -1135,7 +1133,8 @@ mod tests {
                 filter_deleted: true,
                 merge_mode: crate::region::options::MergeMode::LastRow,
                 partition_expr_version: 0,
-            },
+            }
+            .build(),
         };
         let value = Arc::new(RangeScanCacheValue::new(Vec::new()));
 

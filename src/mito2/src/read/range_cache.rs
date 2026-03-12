@@ -42,6 +42,18 @@ use crate::sst::parquet::flat_format::primary_key_column_index;
 /// Fingerprint of request-relevant scan options.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScanRequestFingerprint {
+    inner: Arc<SharedScanRequestFingerprint>,
+    time_filters: Option<Arc<Vec<String>>>,
+    series_row_selector: Option<TimeSeriesRowSelector>,
+    distribution: Option<TimeSeriesDistribution>,
+    append_mode: bool,
+    filter_deleted: bool,
+    merge_mode: MergeMode,
+    partition_expr_version: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScanRequestFingerprintBuilder {
     pub(crate) read_column_ids: Vec<ColumnId>,
     pub(crate) read_column_types: Vec<Option<ConcreteDataType>>,
     pub(crate) filters: Vec<String>,
@@ -52,6 +64,98 @@ pub(crate) struct ScanRequestFingerprint {
     pub(crate) filter_deleted: bool,
     pub(crate) merge_mode: MergeMode,
     pub(crate) partition_expr_version: u64,
+}
+
+impl ScanRequestFingerprintBuilder {
+    pub(crate) fn build(self) -> ScanRequestFingerprint {
+        let Self {
+            read_column_ids,
+            read_column_types,
+            filters,
+            time_filters,
+            series_row_selector,
+            distribution,
+            append_mode,
+            filter_deleted,
+            merge_mode,
+            partition_expr_version,
+        } = self;
+
+        ScanRequestFingerprint {
+            inner: Arc::new(SharedScanRequestFingerprint {
+                read_column_ids,
+                read_column_types,
+                filters,
+            }),
+            time_filters: (!time_filters.is_empty()).then(|| Arc::new(time_filters)),
+            series_row_selector,
+            distribution,
+            append_mode,
+            filter_deleted,
+            merge_mode,
+            partition_expr_version,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SharedScanRequestFingerprint {
+    read_column_ids: Vec<ColumnId>,
+    read_column_types: Vec<Option<ConcreteDataType>>,
+    filters: Vec<String>,
+}
+
+impl ScanRequestFingerprint {
+    pub(crate) fn without_time_filters(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            time_filters: None,
+            series_row_selector: self.series_row_selector,
+            distribution: self.distribution,
+            append_mode: self.append_mode,
+            filter_deleted: self.filter_deleted,
+            merge_mode: self.merge_mode,
+            partition_expr_version: self.partition_expr_version,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_column_ids(&self) -> &[ColumnId] {
+        &self.inner.read_column_ids
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_column_types(&self) -> &[Option<ConcreteDataType>] {
+        &self.inner.read_column_types
+    }
+
+    #[cfg(test)]
+    pub(crate) fn filters(&self) -> &[String] {
+        &self.inner.filters
+    }
+
+    pub(crate) fn time_filters(&self) -> &[String] {
+        self.time_filters
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        self.inner.read_column_ids.capacity() * mem::size_of::<ColumnId>()
+            + self.inner.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
+            + self
+                .inner
+                .filters
+                .iter()
+                .map(|filter| filter.capacity())
+                .sum::<usize>()
+            + self
+                .time_filters()
+                .iter()
+                .map(|filter| filter.capacity())
+                .sum::<usize>()
+    }
 }
 
 /// Cache key for range scan outputs.
@@ -67,20 +171,7 @@ impl RangeScanCacheKey {
     pub(crate) fn estimated_size(&self) -> usize {
         mem::size_of::<Self>()
             + self.row_groups.capacity() * mem::size_of::<(FileId, i64)>()
-            + self.scan.read_column_ids.capacity() * mem::size_of::<ColumnId>()
-            + self.scan.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
-            + self
-                .scan
-                .filters
-                .iter()
-                .map(|filter| filter.capacity())
-                .sum::<usize>()
-            + self
-                .scan
-                .time_filters
-                .iter()
-                .map(|filter| filter.capacity())
-                .sum::<usize>()
+            + self.scan.estimated_size()
     }
 }
 
@@ -151,13 +242,14 @@ pub(crate) fn build_range_cache_key(
     }
 
     let range_meta = &stream_ctx.ranges[part_range.identifier];
-    let mut scan = fingerprint.clone();
-    if query_time_range_covers_partition_range(
+    let scan = if query_time_range_covers_partition_range(
         stream_ctx.input.time_range.as_ref(),
         range_meta.time_range,
     ) {
-        scan.time_filters.clear();
-    }
+        fingerprint.without_time_filters()
+    } else {
+        fingerprint.clone()
+    };
 
     Some(RangeScanCacheKey {
         region_id: stream_ctx.input.region_metadata().region_id,
@@ -357,8 +449,11 @@ mod tests {
         let key = build_range_cache_key(&stream_ctx, &part_range).unwrap();
 
         // Time filters should be cleared when query covers partition range.
-        assert!(key.scan.time_filters.is_empty());
-        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
+        assert!(key.scan.time_filters().is_empty());
+        assert_eq!(
+            key.scan.filters(),
+            [col("k0").eq(lit("foo")).to_string()].as_slice()
+        );
     }
 
     #[tokio::test]
@@ -377,10 +472,13 @@ mod tests {
 
         // Time filters should be preserved when query does not cover partition range.
         assert_eq!(
-            key.scan.time_filters,
-            vec![col("ts").gt_eq(lit(1000)).to_string()]
+            key.scan.time_filters(),
+            [col("ts").gt_eq(lit(1000)).to_string()].as_slice()
         );
-        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
+        assert_eq!(
+            key.scan.filters(),
+            [col("k0").eq(lit("foo")).to_string()].as_slice()
+        );
     }
 
     #[tokio::test]
@@ -398,7 +496,59 @@ mod tests {
         let key = build_range_cache_key(&stream_ctx, &part_range).unwrap();
 
         // Time filters should be cleared when query has no time range limit.
-        assert!(key.scan.time_filters.is_empty());
-        assert_eq!(key.scan.filters, vec![col("k0").eq(lit("foo")).to_string()]);
+        assert!(key.scan.time_filters().is_empty());
+        assert_eq!(
+            key.scan.filters(),
+            [col("k0").eq(lit("foo")).to_string()].as_slice()
+        );
+    }
+
+    #[test]
+    fn normalizes_and_clears_time_filters() {
+        let normalized = ScanRequestFingerprintBuilder {
+            read_column_ids: vec![1, 2],
+            read_column_types: vec![None, None],
+            filters: vec!["k0 = 'foo'".to_string()],
+            time_filters: vec![],
+            series_row_selector: None,
+            distribution: None,
+            append_mode: false,
+            filter_deleted: true,
+            merge_mode: MergeMode::LastRow,
+            partition_expr_version: 0,
+        }
+        .build();
+
+        assert!(normalized.time_filters().is_empty());
+
+        let fingerprint = ScanRequestFingerprintBuilder {
+            read_column_ids: vec![1, 2],
+            read_column_types: vec![None, None],
+            filters: vec!["k0 = 'foo'".to_string()],
+            time_filters: vec!["ts >= 1000".to_string()],
+            series_row_selector: Some(TimeSeriesRowSelector::LastRow),
+            distribution: Some(TimeSeriesDistribution::PerSeries),
+            append_mode: false,
+            filter_deleted: true,
+            merge_mode: MergeMode::LastRow,
+            partition_expr_version: 7,
+        }
+        .build();
+
+        let reset = fingerprint.without_time_filters();
+
+        assert_eq!(reset.read_column_ids(), fingerprint.read_column_ids());
+        assert_eq!(reset.read_column_types(), fingerprint.read_column_types());
+        assert_eq!(reset.filters(), fingerprint.filters());
+        assert!(reset.time_filters().is_empty());
+        assert_eq!(reset.series_row_selector, fingerprint.series_row_selector);
+        assert_eq!(reset.distribution, fingerprint.distribution);
+        assert_eq!(reset.append_mode, fingerprint.append_mode);
+        assert_eq!(reset.filter_deleted, fingerprint.filter_deleted);
+        assert_eq!(reset.merge_mode, fingerprint.merge_mode);
+        assert_eq!(
+            reset.partition_expr_version,
+            fingerprint.partition_expr_version
+        );
     }
 }
