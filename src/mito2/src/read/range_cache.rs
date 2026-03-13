@@ -26,9 +26,7 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use futures::TryStreamExt;
 use store_api::region_engine::PartitionRange;
-use store_api::storage::{
-    ColumnId, FileId, RegionId, TimeSeriesDistribution, TimeSeriesRowSelector,
-};
+use store_api::storage::{ColumnId, FileId, RegionId, TimeSeriesRowSelector};
 
 use crate::cache::CacheStrategy;
 use crate::memtable::record_batch_estimated_size;
@@ -45,7 +43,6 @@ pub(crate) struct ScanRequestFingerprint {
     inner: Arc<SharedScanRequestFingerprint>,
     time_filters: Option<Arc<Vec<String>>>,
     series_row_selector: Option<TimeSeriesRowSelector>,
-    distribution: Option<TimeSeriesDistribution>,
     append_mode: bool,
     filter_deleted: bool,
     merge_mode: MergeMode,
@@ -59,7 +56,6 @@ pub(crate) struct ScanRequestFingerprintBuilder {
     pub(crate) filters: Vec<String>,
     pub(crate) time_filters: Vec<String>,
     pub(crate) series_row_selector: Option<TimeSeriesRowSelector>,
-    pub(crate) distribution: Option<TimeSeriesDistribution>,
     pub(crate) append_mode: bool,
     pub(crate) filter_deleted: bool,
     pub(crate) merge_mode: MergeMode,
@@ -74,7 +70,6 @@ impl ScanRequestFingerprintBuilder {
             filters,
             time_filters,
             series_row_selector,
-            distribution,
             append_mode,
             filter_deleted,
             merge_mode,
@@ -89,7 +84,6 @@ impl ScanRequestFingerprintBuilder {
             }),
             time_filters: (!time_filters.is_empty()).then(|| Arc::new(time_filters)),
             series_row_selector,
-            distribution,
             append_mode,
             filter_deleted,
             merge_mode,
@@ -111,7 +105,6 @@ impl ScanRequestFingerprint {
             inner: Arc::clone(&self.inner),
             time_filters: None,
             series_row_selector: self.series_row_selector,
-            distribution: self.distribution,
             append_mode: self.append_mode,
             filter_deleted: self.filter_deleted,
             merge_mode: self.merge_mode,
@@ -134,6 +127,7 @@ impl ScanRequestFingerprint {
         &self.inner.filters
     }
 
+    #[cfg(test)]
     pub(crate) fn time_filters(&self) -> &[String] {
         self.time_filters
             .as_deref()
@@ -142,7 +136,8 @@ impl ScanRequestFingerprint {
     }
 
     pub(crate) fn estimated_size(&self) -> usize {
-        self.inner.read_column_ids.capacity() * mem::size_of::<ColumnId>()
+        mem::size_of::<SharedScanRequestFingerprint>()
+            + self.inner.read_column_ids.capacity() * mem::size_of::<ColumnId>()
             + self.inner.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
             + self
                 .inner
@@ -150,11 +145,10 @@ impl ScanRequestFingerprint {
                 .iter()
                 .map(|filter| filter.capacity())
                 .sum::<usize>()
-            + self
-                .time_filters()
-                .iter()
-                .map(|filter| filter.capacity())
-                .sum::<usize>()
+            + self.time_filters.as_ref().map_or(0, |arc| {
+                mem::size_of::<Vec<String>>()
+                    + arc.iter().map(|f| f.capacity()).sum::<usize>()
+            })
     }
 }
 
@@ -235,6 +229,16 @@ pub(crate) fn build_range_cache_key(
     part_range: &PartitionRange,
 ) -> Option<RangeScanCacheKey> {
     let fingerprint = stream_ctx.scan_fingerprint.as_ref()?;
+
+    // Dyn filters can change at runtime, so we can't cache when they're present.
+    let has_dyn_filters = stream_ctx
+        .input
+        .predicate_group()
+        .predicate_without_region()
+        .is_some_and(|p| !p.dyn_filters().is_empty());
+    if has_dyn_filters {
+        return None;
+    }
 
     let rg = collect_partition_range_row_groups(stream_ctx, part_range);
     if !rg.only_file_sources || rg.row_groups.is_empty() {
@@ -511,7 +515,6 @@ mod tests {
             filters: vec!["k0 = 'foo'".to_string()],
             time_filters: vec![],
             series_row_selector: None,
-            distribution: None,
             append_mode: false,
             filter_deleted: true,
             merge_mode: MergeMode::LastRow,
@@ -527,7 +530,6 @@ mod tests {
             filters: vec!["k0 = 'foo'".to_string()],
             time_filters: vec!["ts >= 1000".to_string()],
             series_row_selector: Some(TimeSeriesRowSelector::LastRow),
-            distribution: Some(TimeSeriesDistribution::PerSeries),
             append_mode: false,
             filter_deleted: true,
             merge_mode: MergeMode::LastRow,
@@ -542,7 +544,6 @@ mod tests {
         assert_eq!(reset.filters(), fingerprint.filters());
         assert!(reset.time_filters().is_empty());
         assert_eq!(reset.series_row_selector, fingerprint.series_row_selector);
-        assert_eq!(reset.distribution, fingerprint.distribution);
         assert_eq!(reset.append_mode, fingerprint.append_mode);
         assert_eq!(reset.filter_deleted, fingerprint.filter_deleted);
         assert_eq!(reset.merge_mode, fingerprint.merge_mode);

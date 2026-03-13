@@ -1500,7 +1500,6 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFin
             filters,
             time_filters,
             series_row_selector: input.series_row_selector,
-            distribution: input.distribution,
             append_mode: input.append_mode,
             filter_deleted: input.filter_deleted,
             merge_mode: input.merge_mode,
