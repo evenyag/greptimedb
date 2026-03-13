@@ -40,12 +40,17 @@ use crate::sst::parquet::flat_format::primary_key_column_index;
 /// Fingerprint of request-relevant scan options.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScanRequestFingerprint {
+    /// Projection and filters without the time index and partition exprs.
     inner: Arc<SharedScanRequestFingerprint>,
+    /// Filters with the time index column.
     time_filters: Option<Arc<Vec<String>>>,
     series_row_selector: Option<TimeSeriesRowSelector>,
     append_mode: bool,
     filter_deleted: bool,
     merge_mode: MergeMode,
+    /// We keep the partition expr version to ensure we won't reuse the fingerprint after we
+    /// change the partition expr. We store the version instead of the whole partition expr or
+    /// partition expr filters.
     partition_expr_version: u64,
 }
 
@@ -94,8 +99,12 @@ impl ScanRequestFingerprintBuilder {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct SharedScanRequestFingerprint {
+    /// Column ids of the projection.
     read_column_ids: Vec<ColumnId>,
+    /// Column types of the projection.
+    /// We keep this to ensure we won't reuse the fingerprint after a schema change.
     read_column_types: Vec<Option<ConcreteDataType>>,
+    /// Filters without the time index column and region partition exprs.
     filters: Vec<String>,
 }
 
@@ -139,6 +148,7 @@ impl ScanRequestFingerprint {
         mem::size_of::<SharedScanRequestFingerprint>()
             + self.inner.read_column_ids.capacity() * mem::size_of::<ColumnId>()
             + self.inner.read_column_types.capacity() * mem::size_of::<Option<ConcreteDataType>>()
+            + self.inner.filters.capacity() * mem::size_of::<String>()
             + self
                 .inner
                 .filters
@@ -147,6 +157,7 @@ impl ScanRequestFingerprint {
                 .sum::<usize>()
             + self.time_filters.as_ref().map_or(0, |arc| {
                 mem::size_of::<Vec<String>>()
+                    + arc.capacity() * mem::size_of::<String>()
                     + arc.iter().map(|f| f.capacity()).sum::<usize>()
             })
     }
