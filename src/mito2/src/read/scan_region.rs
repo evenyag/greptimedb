@@ -1422,7 +1422,8 @@ fn pre_filter_mode(append_mode: bool, merge_mode: MergeMode) -> PreFilterMode {
 pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanRequestFingerprint> {
     let eligible = input.flat_format
         && !input.compaction
-        && !matches!(input.cache_strategy, CacheStrategy::Disabled);
+        && !input.files.is_empty()
+        && matches!(input.cache_strategy, CacheStrategy::EnableAll(_));
 
     if !eligible {
         return None;
