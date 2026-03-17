@@ -27,7 +27,7 @@ use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, FileId, RegionId};
 use table::predicate::Predicate;
 
-use crate::cache::CacheStrategy;
+use crate::cache::{CacheManager, CacheStrategy};
 use crate::error::Result;
 use crate::sst::file::{FileHandle, FileMeta};
 use crate::sst::file_purger::NoopFilePurger;
@@ -287,7 +287,25 @@ fn build_index_appliers(
     )
 }
 
-fn new_bench_builder(fixture: &ExternalBenchFixture, flat_format: bool) -> ParquetReaderBuilder {
+fn create_bench_cache() -> Arc<CacheManager> {
+    Arc::new(
+        CacheManager::builder()
+            .sst_meta_cache_size(1024 * 1024)
+            .page_cache_size(256 * 1024 * 1024)
+            .index_result_cache_size(1024 * 1024)
+            .index_metadata_size(1024 * 1024)
+            .index_content_page_size(1024 * 1024)
+            .index_content_size(1024 * 1024)
+            .puffin_metadata_size(1024 * 1024)
+            .build(),
+    )
+}
+
+fn new_bench_builder(
+    fixture: &ExternalBenchFixture,
+    flat_format: bool,
+    cache_strategy: CacheStrategy,
+) -> ParquetReaderBuilder {
     let predicate = scan_request_predicate();
     let (inverted_index_appliers, bloom_filter_index_appliers, fulltext_index_appliers) =
         build_index_appliers(fixture, predicate.exprs());
@@ -301,7 +319,7 @@ fn new_bench_builder(fixture: &ExternalBenchFixture, flat_format: bool) -> Parqu
     .projection(Some(scan_request_projection_ids(&fixture.metadata)))
     .predicate(Some(predicate))
     .flat_format(flat_format)
-    .cache(CacheStrategy::Disabled)
+    .cache(cache_strategy)
     .inverted_index_appliers(inverted_index_appliers)
     .bloom_filter_index_appliers(bloom_filter_index_appliers)
     .fulltext_index_appliers(fulltext_index_appliers)
@@ -310,12 +328,13 @@ fn new_bench_builder(fixture: &ExternalBenchFixture, flat_format: bool) -> Parqu
 async fn bench_raw_parquet_next(
     fixture: &ExternalBenchFixture,
     flat_format: bool,
+    cache_strategy: CacheStrategy,
     iterations: usize,
 ) -> Result<ReaderRunStats> {
     let mut stats = ReaderRunStats::default();
 
     for _ in 0..iterations {
-        let builder = new_bench_builder(fixture, flat_format);
+        let builder = new_bench_builder(fixture, flat_format, cache_strategy.clone());
         let mut metrics = ReaderMetrics::default();
 
         let build_input_start = Instant::now();
@@ -363,12 +382,13 @@ async fn bench_raw_parquet_next(
 async fn bench_wrapped_reader(
     fixture: &ExternalBenchFixture,
     flat_format: bool,
+    cache_strategy: CacheStrategy,
     iterations: usize,
 ) -> Result<ReaderRunStats> {
     let mut stats = ReaderRunStats::default();
 
     for _ in 0..iterations {
-        let builder = new_bench_builder(fixture, flat_format);
+        let builder = new_bench_builder(fixture, flat_format, cache_strategy.clone());
         let mut metrics = ReaderMetrics::default();
 
         let build_input_start = Instant::now();
@@ -447,6 +467,8 @@ fn print_bench_stats(label: &str, stats: &ReaderRunStats, iterations: usize) {
 pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
     let config = ExternalBenchConfig::from_env();
     let fixture = load_external_bench_fixture(&config).await?;
+    let primary_cache = create_bench_cache();
+    let flat_cache = create_bench_cache();
 
     println!(
         "Benchmark file: {}, region_id: {}, projection_positions: {:?}, projection_ids: {:?}, iterations: {}",
@@ -457,18 +479,71 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         config.iterations,
     );
 
-    let raw_primary = bench_raw_parquet_next(&fixture, false, config.iterations).await?;
-    let raw_flat = bench_raw_parquet_next(&fixture, true, config.iterations).await?;
-    let wrapped_primary = bench_wrapped_reader(&fixture, false, config.iterations).await?;
-    let wrapped_flat = bench_wrapped_reader(&fixture, true, config.iterations).await?;
+    let raw_primary_no_cache =
+        bench_raw_parquet_next(&fixture, false, CacheStrategy::Disabled, config.iterations).await?;
+    let raw_flat_no_cache =
+        bench_raw_parquet_next(&fixture, true, CacheStrategy::Disabled, config.iterations).await?;
+    let wrapped_primary_no_cache =
+        bench_wrapped_reader(&fixture, false, CacheStrategy::Disabled, config.iterations).await?;
+    let wrapped_flat_no_cache =
+        bench_wrapped_reader(&fixture, true, CacheStrategy::Disabled, config.iterations).await?;
+
+    let raw_primary_cache = bench_raw_parquet_next(
+        &fixture,
+        false,
+        CacheStrategy::EnableAll(primary_cache.clone()),
+        config.iterations,
+    )
+    .await?;
+    let raw_flat_cache = bench_raw_parquet_next(
+        &fixture,
+        true,
+        CacheStrategy::EnableAll(flat_cache.clone()),
+        config.iterations,
+    )
+    .await?;
+    let wrapped_primary_cache = bench_wrapped_reader(
+        &fixture,
+        false,
+        CacheStrategy::EnableAll(primary_cache),
+        config.iterations,
+    )
+    .await?;
+    let wrapped_flat_cache = bench_wrapped_reader(
+        &fixture,
+        true,
+        CacheStrategy::EnableAll(flat_cache),
+        config.iterations,
+    )
+    .await?;
 
     println!("Raw parquet next():");
-    print_bench_stats("  primary_key", &raw_primary, config.iterations);
-    print_bench_stats("  flat", &raw_flat, config.iterations);
+    print_bench_stats("  no_cache primary_key", &raw_primary_no_cache, config.iterations);
+    print_bench_stats("  no_cache flat", &raw_flat_no_cache, config.iterations);
+    print_bench_stats("  cache primary_key", &raw_primary_cache, config.iterations);
+    print_bench_stats("  cache flat", &raw_flat_cache, config.iterations);
 
     println!("Wrapped readers:");
-    print_bench_stats("  RowGroupReader", &wrapped_primary, config.iterations);
-    print_bench_stats("  FlatRowGroupReader", &wrapped_flat, config.iterations);
+    print_bench_stats(
+        "  no_cache RowGroupReader",
+        &wrapped_primary_no_cache,
+        config.iterations,
+    );
+    print_bench_stats(
+        "  no_cache FlatRowGroupReader",
+        &wrapped_flat_no_cache,
+        config.iterations,
+    );
+    print_bench_stats(
+        "  cache RowGroupReader",
+        &wrapped_primary_cache,
+        config.iterations,
+    );
+    print_bench_stats(
+        "  cache FlatRowGroupReader",
+        &wrapped_flat_cache,
+        config.iterations,
+    );
 
     Ok(())
 }
