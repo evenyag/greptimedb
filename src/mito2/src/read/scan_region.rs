@@ -52,7 +52,7 @@ use crate::error::{InvalidPartitionExprSnafu, InvalidRequestSnafu, Result};
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
-use crate::read::compat::{self, CompatBatch, FlatCompatBatch, PrimaryKeyCompatBatch};
+use crate::read::compat::{self, CompatBatch, FlatCompatBatch};
 use crate::read::projection::ProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::range_cache::ScanRequestFingerprint;
@@ -427,10 +427,9 @@ impl ScanRegion {
             Some(p) => ProjectionMapper::new_with_read_columns(
                 &self.version.metadata,
                 p.iter().copied(),
-                flat_format,
                 read_column_ids.clone(),
             )?,
-            None => ProjectionMapper::all(&self.version.metadata, flat_format)?,
+            None => ProjectionMapper::all(&self.version.metadata)?,
         };
 
         let ssts = &self.version.ssts;
@@ -1144,7 +1143,7 @@ impl ScanInput {
     ) -> Result<FileRangeBuilder> {
         let predicate = self.predicate_for_file(file);
         let filter_mode = pre_filter_mode(self.append_mode, self.merge_mode);
-        let decode_pk_values = !self.compaction && self.mapper.has_tags();
+        let decode_pk_values = false;
         let reader = self
             .access_layer
             .read_sst(file.clone())
@@ -1192,22 +1191,15 @@ impl ScanInput {
         if need_compat {
             // They have different schema. We need to adapt the batch first so the
             // mapper can convert it.
-            let compat = if let Some(flat_format) = file_range_ctx.read_format().as_flat() {
-                let mapper = self.mapper.as_flat().unwrap();
-                FlatCompatBatch::try_new(
-                    mapper,
-                    flat_format.metadata(),
-                    flat_format.format_projection(),
-                    self.compaction,
-                )?
-                .map(CompatBatch::Flat)
-            } else {
-                let compact_batch = PrimaryKeyCompatBatch::new(
-                    &self.mapper,
-                    file_range_ctx.read_format().metadata().clone(),
-                )?;
-                Some(CompatBatch::PrimaryKey(compact_batch))
-            };
+            let flat_format = file_range_ctx.read_format().as_flat().unwrap();
+            let mapper = self.mapper.as_flat().unwrap();
+            let compat = FlatCompatBatch::try_new(
+                mapper,
+                flat_format.metadata(),
+                flat_format.format_projection(),
+                self.compaction,
+            )?
+            .map(CompatBatch::Flat);
             file_range_ctx.set_compat_batch(compat);
         }
         Ok(FileRangeBuilder::new(Arc::new(file_range_ctx), selection))
@@ -1918,7 +1910,7 @@ mod tests {
 
     async fn new_scan_input(metadata: RegionMetadataRef, filters: Vec<Expr>) -> ScanInput {
         let env = SchedulerEnv::new().await;
-        let mapper = ProjectionMapper::new(&metadata, [0, 2, 3].into_iter(), true).unwrap();
+        let mapper = ProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap();
         let predicate = PredicateGroup::new(metadata.as_ref(), &filters).unwrap();
         let file = FileHandle::new(
             crate::sst::file::FileMeta::default(),
@@ -2030,7 +2022,7 @@ mod tests {
             request,
             CacheStrategy::Disabled,
         );
-        assert!(!scan_region.use_flat_format());
+        assert!(scan_region.use_flat_format());
 
         let request = ScanRequest {
             force_flat_format: true,
@@ -2126,7 +2118,7 @@ mod tests {
 
         let disabled = ScanInput::new(
             SchedulerEnv::new().await.access_layer.clone(),
-            ProjectionMapper::new(&metadata, [0, 2, 3].into_iter(), true).unwrap(),
+            ProjectionMapper::new(&metadata, [0, 2, 3].into_iter()).unwrap(),
         )
         .with_predicate(PredicateGroup::new(metadata.as_ref(), &filters).unwrap())
         .with_flat_format(true);

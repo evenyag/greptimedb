@@ -38,7 +38,7 @@ use tokio::sync::Semaphore;
 use crate::error::{PartitionOutOfRangeSnafu, Result, TooManyFilesToReadSnafu};
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
-use crate::read::last_row::{FlatLastRowReader};
+use crate::read::last_row::FlatLastRowReader;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RangeMeta;
 use crate::read::scan_region::{ScanInput, StreamContext};

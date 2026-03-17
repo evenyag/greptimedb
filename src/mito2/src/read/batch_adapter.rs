@@ -360,8 +360,10 @@ mod tests {
         let metadata = Arc::new(sst_region_metadata());
         let codec = build_primary_key_codec(&metadata);
 
-        let empty = Batch::empty();
         let pk = new_primary_key(&["x", "y"]);
+        let empty = new_batch_builder(&pk, &[], &[], &[], 2, &[])
+            .build()
+            .unwrap();
         let batch = new_batch_builder(&pk, &[1], &[1], &[OpType::Put], 2, &[42])
             .build()
             .unwrap();

@@ -848,7 +848,7 @@ impl CompactionSstReaderBuilder<'_> {
     }
 
     fn build_scan_input(self) -> Result<ScanInput> {
-        let mapper = ProjectionMapper::all(&self.metadata, true)?;
+        let mapper = ProjectionMapper::all(&self.metadata)?;
         let mut scan_input = ScanInput::new(self.sst_layer, mapper)
             .with_files(self.inputs.to_vec())
             .with_append_mode(self.append_mode)

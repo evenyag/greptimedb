@@ -38,7 +38,7 @@ pub mod series_scan;
 pub mod stream;
 pub(crate) mod unordered_scan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,20 +52,17 @@ use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::arrow::row::{RowConverter, SortField};
 use datatypes::prelude::{ConcreteDataType, DataType, ScalarVector};
-use datatypes::scalars::ScalarVectorBuilder;
 use datatypes::types::TimestampType;
 use datatypes::value::{Value, ValueRef};
 use datatypes::vectors::{
     BooleanVector, Helper, TimestampMicrosecondVector, TimestampMillisecondVector,
-    TimestampMillisecondVectorBuilder, TimestampNanosecondVector, TimestampSecondVector,
-    UInt8Vector, UInt8VectorBuilder, UInt32Vector, UInt64Vector, UInt64VectorBuilder, Vector,
-    VectorRef,
+    TimestampNanosecondVector, TimestampSecondVector, UInt8Vector, UInt32Vector, UInt64Vector,
+    Vector, VectorRef,
 };
 use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
 use snafu::{OptionExt, ResultExt, ensure};
-use store_api::metadata::RegionMetadata;
 use store_api::storage::{ColumnId, SequenceNumber, SequenceRange};
 
 use crate::error::{
@@ -73,7 +70,6 @@ use crate::error::{
     Result,
 };
 use crate::memtable::{BoxedBatchIterator, BoxedRecordBatchIterator};
-use crate::read::prune::PruneReader;
 
 /// Storage internal representation of a batch of rows for a primary key (time series).
 ///
@@ -172,20 +168,6 @@ impl Batch {
         // All vectors have the same length. We use the length of sequences vector
         // since it has static type.
         self.sequences.len()
-    }
-
-    /// Create an empty [`Batch`].
-    #[allow(dead_code)]
-    pub(crate) fn empty() -> Self {
-        Self {
-            primary_key: vec![],
-            pk_values: None,
-            timestamps: Arc::new(TimestampMillisecondVectorBuilder::with_capacity(0).finish()),
-            sequences: Arc::new(UInt64VectorBuilder::with_capacity(0).finish()),
-            op_types: Arc::new(UInt8VectorBuilder::with_capacity(0).finish()),
-            fields: vec![],
-            fields_idx: None,
-        }
     }
 
     /// Returns true if the number of rows in the batch is 0.
@@ -575,24 +557,6 @@ impl Batch {
         size
     }
 
-    /// Returns ids and datatypes of fields in the [Batch] after applying the `projection`.
-    pub(crate) fn projected_fields(
-        metadata: &RegionMetadata,
-        projection: &[ColumnId],
-    ) -> Vec<(ColumnId, ConcreteDataType)> {
-        let projected_ids: HashSet<_> = projection.iter().copied().collect();
-        metadata
-            .field_columns()
-            .filter_map(|column| {
-                if projected_ids.contains(&column.column_id) {
-                    Some((column.column_id, column.column_schema.data_type.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Returns timestamps in a native slice or `None` if the batch is empty.
     pub(crate) fn timestamps_native(&self) -> Option<&[i64]> {
         if self.timestamps.is_empty() {
@@ -676,86 +640,6 @@ impl Batch {
         self.sequences.get_data(index).unwrap()
     }
 
-    /// Checks the batch is monotonic by timestamps.
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
-    pub(crate) fn check_monotonic(&self) -> Result<(), String> {
-        use std::cmp::Ordering;
-        if self.timestamps_native().is_none() {
-            return Ok(());
-        }
-
-        let timestamps = self.timestamps_native().unwrap();
-        let sequences = self.sequences.as_arrow().values();
-        for (i, window) in timestamps.windows(2).enumerate() {
-            let current = window[0];
-            let next = window[1];
-            let current_sequence = sequences[i];
-            let next_sequence = sequences[i + 1];
-            match current.cmp(&next) {
-                Ordering::Less => {
-                    // The current timestamp is less than the next timestamp.
-                    continue;
-                }
-                Ordering::Equal => {
-                    // The current timestamp is equal to the next timestamp.
-                    if current_sequence < next_sequence {
-                        return Err(format!(
-                            "sequence are not monotonic: ts {} == {} but current sequence {} < {}, index: {}",
-                            current, next, current_sequence, next_sequence, i
-                        ));
-                    }
-                }
-                Ordering::Greater => {
-                    // The current timestamp is greater than the next timestamp.
-                    return Err(format!(
-                        "timestamps are not monotonic: {} > {}, index: {}",
-                        current, next, i
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Returns Ok if the given batch is behind the current batch.
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
-    pub(crate) fn check_next_batch(&self, other: &Batch) -> Result<(), String> {
-        // Checks the primary key
-        if self.primary_key() < other.primary_key() {
-            return Ok(());
-        }
-        if self.primary_key() > other.primary_key() {
-            return Err(format!(
-                "primary key is not monotonic: {:?} > {:?}",
-                self.primary_key(),
-                other.primary_key()
-            ));
-        }
-        // Checks the timestamp.
-        if self.last_timestamp() < other.first_timestamp() {
-            return Ok(());
-        }
-        if self.last_timestamp() > other.first_timestamp() {
-            return Err(format!(
-                "timestamps are not monotonic: {:?} > {:?}",
-                self.last_timestamp(),
-                other.first_timestamp()
-            ));
-        }
-        // Checks the sequence.
-        if self.last_sequence() >= other.first_sequence() {
-            return Ok(());
-        }
-        Err(format!(
-            "sequences are not monotonic: {:?} < {:?}",
-            self.last_sequence(),
-            other.first_sequence()
-        ))
-    }
-
     /// Returns the value of the column in the primary key.
     ///
     /// Lazily decodes the primary key and caches the result.
@@ -795,112 +679,6 @@ impl Batch {
             .unwrap()
             .get(&column_id)
             .map(|&idx| &self.fields[idx])
-    }
-}
-
-/// A struct to check the batch is monotonic.
-#[cfg(debug_assertions)]
-#[derive(Default)]
-#[allow(dead_code)]
-pub(crate) struct BatchChecker {
-    last_batch: Option<Batch>,
-    start: Option<Timestamp>,
-    end: Option<Timestamp>,
-}
-
-#[cfg(debug_assertions)]
-#[allow(dead_code)]
-impl BatchChecker {
-    /// Attaches the given start timestamp to the checker.
-    pub(crate) fn with_start(mut self, start: Option<Timestamp>) -> Self {
-        self.start = start;
-        self
-    }
-
-    /// Attaches the given end timestamp to the checker.
-    pub(crate) fn with_end(mut self, end: Option<Timestamp>) -> Self {
-        self.end = end;
-        self
-    }
-
-    /// Returns true if the given batch is monotonic and behind
-    /// the last batch.
-    pub(crate) fn check_monotonic(&mut self, batch: &Batch) -> Result<(), String> {
-        batch.check_monotonic()?;
-
-        if let (Some(start), Some(first)) = (self.start, batch.first_timestamp())
-            && start > first
-        {
-            return Err(format!(
-                "batch's first timestamp is before the start timestamp: {:?} > {:?}",
-                start, first
-            ));
-        }
-        if let (Some(end), Some(last)) = (self.end, batch.last_timestamp())
-            && end <= last
-        {
-            return Err(format!(
-                "batch's last timestamp is after the end timestamp: {:?} <= {:?}",
-                end, last
-            ));
-        }
-
-        // Checks the batch is behind the last batch.
-        // Then Updates the last batch.
-        let res = self
-            .last_batch
-            .as_ref()
-            .map(|last| last.check_next_batch(batch))
-            .unwrap_or(Ok(()));
-        self.last_batch = Some(batch.clone());
-        res
-    }
-
-    /// Formats current batch and last batch for debug.
-    pub(crate) fn format_batch(&self, batch: &Batch) -> String {
-        use std::fmt::Write;
-
-        let mut message = String::new();
-        if let Some(last) = &self.last_batch {
-            write!(
-                message,
-                "last_pk: {:?}, last_ts: {:?}, last_seq: {:?}, ",
-                last.primary_key(),
-                last.last_timestamp(),
-                last.last_sequence()
-            )
-            .unwrap();
-        }
-        write!(
-            message,
-            "batch_pk: {:?}, batch_ts: {:?}, batch_seq: {:?}",
-            batch.primary_key(),
-            batch.timestamps(),
-            batch.sequences()
-        )
-        .unwrap();
-
-        message
-    }
-
-    /// Checks batches from the part range are monotonic. Otherwise, panics.
-    pub(crate) fn ensure_part_range_batch(
-        &mut self,
-        scanner: &str,
-        region_id: store_api::storage::RegionId,
-        partition: usize,
-        part_range: store_api::region_engine::PartitionRange,
-        batch: &Batch,
-    ) {
-        if let Err(e) = self.check_monotonic(batch) {
-            let err_msg = format!(
-                "{}: batch is not sorted, {}, region_id: {}, partition: {}, part_range: {:?}",
-                scanner, e, region_id, partition, part_range,
-            );
-            common_telemetry::error!("{err_msg}, {}", self.format_batch(batch));
-            // Only print the number of row in the panic message.
-            panic!("{err_msg}, batch rows: {}", batch.num_rows());
-        }
     }
 }
 
@@ -1113,8 +891,6 @@ pub enum Source {
     Iter(BoxedBatchIterator),
     /// Source from a [BoxedBatchStream].
     Stream(BoxedBatchStream),
-    /// Source from a [PruneReader].
-    PruneReader(PruneReader),
 }
 
 impl Source {
@@ -1124,7 +900,6 @@ impl Source {
             Source::Reader(reader) => reader.next_batch().await,
             Source::Iter(iter) => iter.next().transpose(),
             Source::Stream(stream) => stream.try_next().await,
-            Source::PruneReader(reader) => reader.next_batch().await,
         }
     }
 }
@@ -1273,17 +1048,6 @@ mod tests {
             .unwrap();
 
         builder.build().unwrap()
-    }
-
-    #[test]
-    fn test_empty_batch() {
-        let batch = Batch::empty();
-        assert!(batch.is_empty());
-        assert_eq!(None, batch.first_timestamp());
-        assert_eq!(None, batch.last_timestamp());
-        assert_eq!(None, batch.first_sequence());
-        assert_eq!(None, batch.last_sequence());
-        assert!(batch.timestamps_native().is_none());
     }
 
     #[test]

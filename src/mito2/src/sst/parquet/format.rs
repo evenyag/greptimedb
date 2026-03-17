@@ -207,6 +207,7 @@ impl ReadFormat {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn as_primary_key(&self) -> Option<&PrimaryKeyReadFormat> {
         match self {
             ReadFormat::PrimaryKey(format) => Some(format),

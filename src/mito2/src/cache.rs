@@ -52,7 +52,6 @@ use crate::cache::write_cache::WriteCacheRef;
 use crate::error::{InvalidMetadataSnafu, InvalidParquetSnafu, Result};
 use crate::memtable::record_batch_estimated_size;
 use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
-use crate::read::Batch;
 use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
@@ -1100,8 +1099,6 @@ pub struct SelectorResultKey {
 
 /// Result stored in the selector result cache.
 pub enum SelectorResult {
-    /// Batches in the primary key format.
-    PrimaryKey(Vec<Batch>),
     /// Record batches in the flat format.
     Flat(Vec<RecordBatch>),
 }
@@ -1115,14 +1112,6 @@ pub struct SelectorResultValue {
 }
 
 impl SelectorResultValue {
-    /// Creates a new selector result value with primary key format.
-    pub fn new(result: Vec<Batch>, projection: Vec<usize>) -> SelectorResultValue {
-        SelectorResultValue {
-            result: SelectorResult::PrimaryKey(result),
-            projection,
-        }
-    }
-
     /// Creates a new selector result value with flat format.
     pub fn new_flat(result: Vec<RecordBatch>, projection: Vec<usize>) -> SelectorResultValue {
         SelectorResultValue {
@@ -1134,9 +1123,6 @@ impl SelectorResultValue {
     /// Returns memory used by the value (estimated).
     fn estimated_size(&self) -> usize {
         match &self.result {
-            SelectorResult::PrimaryKey(batches) => {
-                batches.iter().map(|batch| batch.memory_size()).sum()
-            }
             SelectorResult::Flat(batches) => batches.iter().map(record_batch_estimated_size).sum(),
         }
     }
@@ -1329,7 +1315,7 @@ mod tests {
             selector: TimeSeriesRowSelector::LastRow,
         };
         assert!(cache.get_selector_result(&key).is_none());
-        let result = Arc::new(SelectorResultValue::new(Vec::new(), Vec::new()));
+        let result = Arc::new(SelectorResultValue::new_flat(Vec::new(), Vec::new()));
         cache.put_selector_result(key, result);
         assert!(cache.get_selector_result(&key).is_some());
     }
