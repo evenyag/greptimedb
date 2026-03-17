@@ -1633,6 +1633,8 @@ pub struct ReaderMetrics {
     pub(crate) metadata_cache_metrics: MetadataCacheMetrics,
     /// Optional metrics for page/row group fetch operations.
     pub(crate) fetch_metrics: Option<Arc<ParquetFetchMetrics>>,
+    /// Duration to convert parquet RecordBatches via ReadFormat.
+    pub(crate) convert_cost: Duration,
     /// Memory size of metadata loaded for building file ranges.
     pub(crate) metadata_mem_size: isize,
     /// Number of file range builders created.
@@ -1645,6 +1647,7 @@ impl ReaderMetrics {
         self.filter_metrics.merge_from(&other.filter_metrics);
         self.build_cost += other.build_cost;
         self.scan_cost += other.scan_cost;
+        self.convert_cost += other.convert_cost;
         self.num_record_batches += other.num_record_batches;
         self.num_batches += other.num_batches;
         self.num_rows += other.num_rows;
@@ -2059,6 +2062,7 @@ where
             self.metrics.num_record_batches += 1;
 
             // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
+            let convert_start = Instant::now();
             self.context
                 .read_format()
                 .as_primary_key()
@@ -2068,6 +2072,7 @@ where
                     self.override_sequence.as_ref(),
                     &mut self.batches,
                 )?;
+            self.metrics.convert_cost += convert_start.elapsed();
             self.metrics.num_batches += self.batches.len();
         }
         let batch = self.batches.pop_front();
@@ -2095,6 +2100,8 @@ pub(crate) struct FlatRowGroupReader {
     reader: ParquetRecordBatchReader,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Duration to convert parquet RecordBatches via ReadFormat.
+    convert_cost: Duration,
 }
 
 impl FlatRowGroupReader {
@@ -2109,7 +2116,13 @@ impl FlatRowGroupReader {
             context,
             reader,
             override_sequence,
+            convert_cost: Duration::default(),
         }
+    }
+
+    /// Returns the accumulated convert cost.
+    pub(crate) fn convert_cost(&self) -> Duration {
+        self.convert_cost
     }
 
     /// Returns the next RecordBatch.
@@ -2122,8 +2135,10 @@ impl FlatRowGroupReader {
 
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
+                let convert_start = Instant::now();
                 let record_batch =
                     flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
+                self.convert_cost += convert_start.elapsed();
                 Ok(Some(record_batch))
             }
             None => Ok(None),

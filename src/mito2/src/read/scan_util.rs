@@ -67,6 +67,8 @@ pub struct FileScanMetrics {
     pub build_reader_cost: Duration,
     /// Time spent scanning this file (accumulated across all ranges).
     pub scan_cost: Duration,
+    /// Time spent converting parquet RecordBatches via ReadFormat.
+    pub convert_cost: Duration,
 }
 
 impl fmt::Debug for FileScanMetrics {
@@ -89,6 +91,9 @@ impl fmt::Debug for FileScanMetrics {
         if !self.scan_cost.is_zero() {
             write!(f, ", \"scan_cost\":\"{:?}\"", self.scan_cost)?;
         }
+        if !self.convert_cost.is_zero() {
+            write!(f, ", \"convert_cost\":\"{:?}\"", self.convert_cost)?;
+        }
 
         write!(f, "}}")
     }
@@ -102,6 +107,7 @@ impl FileScanMetrics {
         self.build_part_cost += other.build_part_cost;
         self.build_reader_cost += other.build_reader_cost;
         self.scan_cost += other.scan_cost;
+        self.convert_cost += other.convert_cost;
     }
 }
 
@@ -144,6 +150,8 @@ pub(crate) struct ScanMetricsSet {
     build_parts_cost: Duration,
     /// Duration to scan SST files.
     sst_scan_cost: Duration,
+    /// Duration to convert parquet RecordBatches via ReadFormat.
+    sst_convert_cost: Duration,
     /// Number of row groups before filtering.
     rg_total: usize,
     /// Number of row groups filtered by fulltext index.
@@ -293,6 +301,7 @@ impl fmt::Debug for ScanMetricsSet {
             num_file_ranges,
             build_parts_cost,
             sst_scan_cost,
+            sst_convert_cost,
             rg_total,
             rg_fulltext_filtered,
             rg_inverted_filtered,
@@ -361,6 +370,7 @@ impl fmt::Debug for ScanMetricsSet {
             \"num_file_ranges\":{num_file_ranges}, \
             \"build_parts_cost\":\"{build_parts_cost:?}\", \
             \"sst_scan_cost\":\"{sst_scan_cost:?}\", \
+            \"sst_convert_cost\":\"{sst_convert_cost:?}\", \
             \"rg_total\":{rg_total}, \
             \"rows_before_filter\":{rows_before_filter}, \
             \"num_sst_record_batches\":{num_sst_record_batches}, \
@@ -664,6 +674,7 @@ impl ScanMetricsSet {
             num_batches,
             num_rows,
             scan_cost,
+            convert_cost,
             metadata_cache_metrics,
             fetch_metrics,
             metadata_mem_size,
@@ -672,6 +683,7 @@ impl ScanMetricsSet {
 
         self.build_parts_cost += *build_cost;
         self.sst_scan_cost += *scan_cost;
+        self.sst_convert_cost += *convert_cost;
 
         self.rg_total += *rg_total;
         self.rg_fulltext_filtered += *rg_fulltext_filtered;
@@ -1442,6 +1454,7 @@ pub fn build_file_range_scan_stream(
                     file_metrics.num_rows += prune_metrics.num_rows;
                     file_metrics.build_reader_cost += build_cost;
                     file_metrics.scan_cost += prune_metrics.scan_cost;
+                    file_metrics.convert_cost += prune_metrics.convert_cost;
                 }
 
                 reader_metrics.merge_from(&prune_metrics);
@@ -1522,6 +1535,7 @@ pub fn build_flat_file_range_scan_stream(
                 file_metrics.num_rows += prune_metrics.num_rows;
                 file_metrics.build_reader_cost += build_cost;
                 file_metrics.scan_cost += prune_metrics.scan_cost;
+                file_metrics.convert_cost += prune_metrics.convert_cost;
             }
 
             reader_metrics.merge_from(&prune_metrics);

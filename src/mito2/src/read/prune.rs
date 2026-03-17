@@ -294,7 +294,11 @@ impl FlatPruneReader {
 
     /// Returns metrics.
     pub(crate) fn metrics(&self) -> ReaderMetrics {
-        self.metrics.clone()
+        let mut metrics = self.metrics.clone();
+        if let FlatSource::RowGroup(reader) = &self.source {
+            metrics.convert_cost += reader.convert_cost();
+        }
+        metrics
     }
 
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
