@@ -14,5 +14,7 @@
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> mito2::error::Result<()> {
+    common_telemetry::init_default_ut_logging();
+
     mito2::debug_bench::run_sparse_series_scan_reader_bench_from_env().await
 }
