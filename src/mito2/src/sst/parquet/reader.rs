@@ -2058,10 +2058,12 @@ where
 
         // We need to fetch next record batch and convert it to batches.
         while self.batches.is_empty() {
+            let fetch_start = Instant::now();
             let Some(record_batch) = self.fetch_next_record_batch()? else {
-                self.metrics.scan_cost += scan_start.elapsed();
+                self.metrics.scan_cost += fetch_start.elapsed();
                 return Ok(None);
             };
+            self.metrics.scan_cost += fetch_start.elapsed();
             self.metrics.num_record_batches += 1;
 
             // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
@@ -2078,6 +2080,7 @@ where
             self.metrics.convert_cost += convert_start.elapsed();
             self.metrics.num_batches += self.batches.len();
         }
+        let scan_start = Instant::now();
         let batch = self.batches.pop_front();
         self.metrics.num_rows += batch.as_ref().map(|b| b.num_rows()).unwrap_or(0);
         self.metrics.scan_cost += scan_start.elapsed();
@@ -2139,11 +2142,12 @@ impl FlatRowGroupReader {
     /// Returns the next RecordBatch.
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let scan_start = Instant::now();
-        let result = match self.reader.next() {
+        match self.reader.next() {
             Some(batch_result) => {
                 let record_batch = batch_result.context(ArrowReaderSnafu {
                     path: self.context.file_path(),
                 })?;
+                self.scan_cost += scan_start.elapsed();
 
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
@@ -2153,10 +2157,11 @@ impl FlatRowGroupReader {
                 self.convert_cost += convert_start.elapsed();
                 Ok(Some(record_batch))
             }
-            None => Ok(None),
-        };
-        self.scan_cost += scan_start.elapsed();
-        result
+            None => {
+                self.scan_cost += scan_start.elapsed();
+                Ok(None)
+            }
+        }
     }
 }
 

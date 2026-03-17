@@ -476,11 +476,9 @@ impl SeriesDistributor {
             &self.metrics_list,
         );
         part_metrics.on_first_poll();
-        // Start fetch time before building sources so scan cost contains
-        // build part cost.
-        let mut fetch_start = Instant::now();
 
         // Scans all parts.
+        let build_source_start = Instant::now();
         let mut sources = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
             sources.reserve(partition.len());
@@ -497,8 +495,10 @@ impl SeriesDistributor {
                 .await?;
             }
         }
+        let build_source_cost = build_source_start.elapsed();
 
         // Builds a flat reader that merge sources from all parts.
+        let build_reader_start = Instant::now();
         let mut reader = SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             sources,
@@ -506,7 +506,18 @@ impl SeriesDistributor {
             Some(&part_metrics),
         )
         .await?;
+        let build_reader_cost = build_reader_start.elapsed();
+
+        let region_id = self.stream_ctx.input.mapper.metadata().region_id;
+        common_telemetry::info!(
+            "SeriesScan distributor flat, region_id: {}, build_source_cost: {:?}, build_reader_cost: {:?}",
+            region_id,
+            build_source_cost,
+            build_reader_cost,
+        );
+
         let mut metrics = SeriesDistributorMetrics::default();
+        let mut fetch_start = Instant::now();
 
         let mut divider = FlatSeriesBatchDivider::default();
         while let Some(record_batch) = reader.try_next().await? {
@@ -582,11 +593,9 @@ impl SeriesDistributor {
             &self.metrics_list,
         );
         part_metrics.on_first_poll();
-        // Start fetch time before building sources so scan cost contains
-        // build part cost.
-        let mut fetch_start = Instant::now();
 
         // Scans all parts.
+        let build_source_start = Instant::now();
         let mut sources = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
             sources.reserve(partition.len());
@@ -603,8 +612,10 @@ impl SeriesDistributor {
                 .await?;
             }
         }
+        let build_source_cost = build_source_start.elapsed();
 
         // Builds a reader that merge sources from all parts.
+        let build_reader_start = Instant::now();
         let mut reader = SeqScan::build_reader_from_sources(
             &self.stream_ctx,
             sources,
@@ -612,7 +623,18 @@ impl SeriesDistributor {
             Some(&part_metrics),
         )
         .await?;
+        let build_reader_cost = build_reader_start.elapsed();
+
+        let region_id = self.stream_ctx.input.mapper.metadata().region_id;
+        common_telemetry::info!(
+            "SeriesScan distributor, region_id: {}, build_source_cost: {:?}, build_reader_cost: {:?}",
+            region_id,
+            build_source_cost,
+            build_reader_cost,
+        );
+
         let mut metrics = SeriesDistributorMetrics::default();
+        let mut fetch_start = Instant::now();
 
         let mut current_series = PrimaryKeySeriesBatch::default();
         while let Some(batch) = reader.next_batch().await? {
