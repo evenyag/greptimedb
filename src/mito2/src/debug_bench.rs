@@ -151,7 +151,7 @@ fn external_file_meta(
         num_rows,
         num_row_groups,
         sequence: None,
-        partition_expr: partition_expr.map(|expr| {
+        partition_expr: partition_expr.and_then(|expr| {
             PartitionExpr::from_json_str(expr)
                 .expect("partition expression in parquet metadata should be valid JSON")
         }),
@@ -177,7 +177,10 @@ async fn load_external_bench_fixture(config: &ExternalBenchConfig) -> Result<Ext
         file_purger.clone(),
     );
     let probe_path = probe_handle.file_path(&table_dir, path_type);
-    object_store.write(&probe_path, bytes.clone()).await?;
+    object_store
+        .write(&probe_path, bytes.clone())
+        .await
+        .unwrap_or_else(|e| panic!("failed to write probe parquet object {probe_path}: {e}"));
 
     let mut cache_metrics = MetadataCacheMetrics::default();
     let loader = MetadataLoader::new(object_store.clone(), &probe_path, file_size);
@@ -194,13 +197,16 @@ async fn load_external_bench_fixture(config: &ExternalBenchConfig) -> Result<Ext
             final_file_id,
             file_size,
             parquet_meta.file_metadata().num_rows() as u64,
-            parquet_meta.num_row_groups() as u64,
+            parquet_meta.row_groups().len() as u64,
             metadata.partition_expr.as_deref(),
         ),
         file_purger,
     );
     let final_path = file_handle.file_path(&table_dir, path_type);
-    object_store.write(&final_path, bytes).await?;
+    object_store
+        .write(&final_path, bytes)
+        .await
+        .unwrap_or_else(|e| panic!("failed to write benchmark parquet object {final_path}: {e}"));
 
     Ok(ExternalBenchFixture {
         object_store,
@@ -260,7 +266,12 @@ async fn bench_raw_parquet_next(
 
             let scan_start = Instant::now();
             while let Some(batch_result) = parquet_reader.next() {
-                let batch = batch_result?;
+                let batch = batch_result.unwrap_or_else(|e| {
+                    panic!(
+                        "raw parquet next() failed for row_group={} flat_format={}: {e}",
+                        row_group_idx, flat_format
+                    )
+                });
                 stats.output_rows += batch.num_rows();
                 stats.output_batches += 1;
             }
