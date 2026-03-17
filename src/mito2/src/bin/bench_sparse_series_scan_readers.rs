@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> mito2::error::Result<()> {
     mito2::debug_bench::run_sparse_series_scan_reader_bench_from_env().await
 }
