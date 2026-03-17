@@ -14,6 +14,7 @@
 
 use std::ops::BitAnd;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::Timestamp;
@@ -99,7 +100,10 @@ impl PruneReader {
 
     pub(crate) async fn next_batch(&mut self) -> Result<Option<Batch>> {
         while let Some(b) = self.source.next_batch().await? {
-            match self.prune(b)? {
+            let prune_start = Instant::now();
+            let pruned = self.prune(b)?;
+            self.metrics.prune_cost += prune_start.elapsed();
+            match pruned {
                 Some(b) => {
                     return Ok(Some(b));
                 }
@@ -297,22 +301,21 @@ impl FlatPruneReader {
         let mut metrics = self.metrics.clone();
         if let FlatSource::RowGroup(reader) = &self.source {
             metrics.convert_cost += reader.convert_cost();
+            metrics.scan_cost += reader.scan_cost();
         }
         metrics
     }
 
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        while let Some(record_batch) = {
-            let start = std::time::Instant::now();
-            let batch = self.source.next_batch()?;
-            self.metrics.scan_cost += start.elapsed();
-            batch
-        } {
+        while let Some(record_batch) = self.source.next_batch()? {
             // Update metrics for the received batch
             self.metrics.num_rows += record_batch.num_rows();
             self.metrics.num_batches += 1;
 
-            match self.prune_flat(record_batch)? {
+            let prune_start = Instant::now();
+            let pruned = self.prune_flat(record_batch)?;
+            self.metrics.prune_cost += prune_start.elapsed();
+            match pruned {
                 Some(filtered_batch) => {
                     return Ok(Some(filtered_batch));
                 }

@@ -1635,6 +1635,8 @@ pub struct ReaderMetrics {
     pub(crate) fetch_metrics: Option<Arc<ParquetFetchMetrics>>,
     /// Duration to convert parquet RecordBatches via ReadFormat.
     pub(crate) convert_cost: Duration,
+    /// Duration to prune (predicate filter) batches.
+    pub(crate) prune_cost: Duration,
     /// Memory size of metadata loaded for building file ranges.
     pub(crate) metadata_mem_size: isize,
     /// Number of file range builders created.
@@ -1648,6 +1650,7 @@ impl ReaderMetrics {
         self.build_cost += other.build_cost;
         self.scan_cost += other.scan_cost;
         self.convert_cost += other.convert_cost;
+        self.prune_cost += other.prune_cost;
         self.num_record_batches += other.num_record_batches;
         self.num_batches += other.num_batches;
         self.num_rows += other.num_rows;
@@ -2102,6 +2105,8 @@ pub(crate) struct FlatRowGroupReader {
     override_sequence: Option<ArrayRef>,
     /// Duration to convert parquet RecordBatches via ReadFormat.
     convert_cost: Duration,
+    /// Duration to scan (read from parquet reader + convert).
+    scan_cost: Duration,
 }
 
 impl FlatRowGroupReader {
@@ -2117,6 +2122,7 @@ impl FlatRowGroupReader {
             reader,
             override_sequence,
             convert_cost: Duration::default(),
+            scan_cost: Duration::default(),
         }
     }
 
@@ -2125,9 +2131,15 @@ impl FlatRowGroupReader {
         self.convert_cost
     }
 
+    /// Returns the accumulated scan cost.
+    pub(crate) fn scan_cost(&self) -> Duration {
+        self.scan_cost
+    }
+
     /// Returns the next RecordBatch.
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        match self.reader.next() {
+        let scan_start = Instant::now();
+        let result = match self.reader.next() {
             Some(batch_result) => {
                 let record_batch = batch_result.context(ArrowReaderSnafu {
                     path: self.context.file_path(),
@@ -2142,7 +2154,9 @@ impl FlatRowGroupReader {
                 Ok(Some(record_batch))
             }
             None => Ok(None),
-        }
+        };
+        self.scan_cost += scan_start.elapsed();
+        result
     }
 }
 
