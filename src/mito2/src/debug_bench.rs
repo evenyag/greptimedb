@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
-use datafusion_expr::{col, lit};
+use datafusion_expr::{Expr, col, lit};
 use object_store::ObjectStore;
 use object_store::services::Memory;
 use partition::expr::PartitionExpr;
@@ -30,9 +31,17 @@ use crate::cache::CacheStrategy;
 use crate::error::Result;
 use crate::sst::file::{FileHandle, FileMeta};
 use crate::sst::file_purger::NoopFilePurger;
+use crate::sst::index::bloom_filter::applier::{
+    BloomFilterIndexApplierBuilder, BloomFilterIndexApplierRef,
+};
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
+use crate::sst::index::fulltext_index::applier::FulltextIndexApplierRef;
+use crate::sst::index::fulltext_index::applier::builder::FulltextIndexApplierBuilder;
+use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
+use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
+use crate::sst::index::puffin_manager::PuffinManagerFactory;
 
 const BENCH_PROJECTION_POSITIONS: [usize; 6] = [0, 1, 2, 3, 4, 79];
 const BENCH_TIME_START_MS: i64 = 1_742_550_540_001;
@@ -67,6 +76,7 @@ struct ExternalBenchFixture {
     path_type: PathType,
     file_handle: FileHandle,
     metadata: RegionMetadataRef,
+    puffin_manager_factory: PuffinManagerFactory,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -167,7 +177,12 @@ async fn load_external_bench_fixture(config: &ExternalBenchConfig) -> Result<Ext
     let object_store = ObjectStore::new(Memory::default()).unwrap().finish();
     let table_dir = "bench_series_scan".to_string();
     let path_type = PathType::Bare;
-    let file_purger = std::sync::Arc::new(NoopFilePurger);
+    let file_purger = Arc::new(NoopFilePurger);
+    let aux_path = std::env::temp_dir().join(format!(
+        "mito2-bench-puffin-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let puffin_manager_factory = PuffinManagerFactory::new(&aux_path, 4096, None, None).await?;
 
     // Write once to decode embedded region metadata, then write again to the final path that
     // matches the real region id from the file metadata.
@@ -214,10 +229,69 @@ async fn load_external_bench_fixture(config: &ExternalBenchConfig) -> Result<Ext
         path_type,
         file_handle,
         metadata,
+        puffin_manager_factory,
     })
 }
 
+fn build_index_appliers(
+    fixture: &ExternalBenchFixture,
+    filters: &[Expr],
+) -> (
+    [Option<InvertedIndexApplierRef>; 2],
+    [Option<BloomFilterIndexApplierRef>; 2],
+    [Option<FulltextIndexApplierRef>; 2],
+) {
+    let metadata = fixture.metadata.as_ref();
+
+    let inverted_index_applier = InvertedIndexApplierBuilder::new(
+        fixture.table_dir.clone(),
+        fixture.path_type,
+        fixture.object_store.clone(),
+        metadata,
+        metadata.inverted_indexed_column_ids(std::iter::empty()),
+        fixture.puffin_manager_factory.clone(),
+    )
+    .build(filters)
+    .ok()
+    .flatten()
+    .map(Arc::new);
+
+    let bloom_filter_applier = BloomFilterIndexApplierBuilder::new(
+        fixture.table_dir.clone(),
+        fixture.path_type,
+        fixture.object_store.clone(),
+        metadata,
+        fixture.puffin_manager_factory.clone(),
+    )
+    .build(filters)
+    .ok()
+    .flatten()
+    .map(Arc::new);
+
+    let fulltext_index_applier = FulltextIndexApplierBuilder::new(
+        fixture.table_dir.clone(),
+        fixture.path_type,
+        fixture.object_store.clone(),
+        fixture.puffin_manager_factory.clone(),
+        metadata,
+    )
+    .build(filters)
+    .ok()
+    .flatten()
+    .map(Arc::new);
+
+    (
+        [inverted_index_applier, None],
+        [bloom_filter_applier, None],
+        [None, fulltext_index_applier],
+    )
+}
+
 fn new_bench_builder(fixture: &ExternalBenchFixture, flat_format: bool) -> ParquetReaderBuilder {
+    let predicate = scan_request_predicate();
+    let (inverted_index_appliers, bloom_filter_index_appliers, fulltext_index_appliers) =
+        build_index_appliers(fixture, predicate.exprs());
+
     ParquetReaderBuilder::new(
         fixture.table_dir.clone(),
         fixture.path_type,
@@ -225,9 +299,12 @@ fn new_bench_builder(fixture: &ExternalBenchFixture, flat_format: bool) -> Parqu
         fixture.object_store.clone(),
     )
     .projection(Some(scan_request_projection_ids(&fixture.metadata)))
-    .predicate(Some(scan_request_predicate()))
+    .predicate(Some(predicate))
     .flat_format(flat_format)
     .cache(CacheStrategy::Disabled)
+    .inverted_index_appliers(inverted_index_appliers)
+    .bloom_filter_index_appliers(bloom_filter_index_appliers)
+    .fulltext_index_appliers(fulltext_index_appliers)
 }
 
 async fn bench_raw_parquet_next(
