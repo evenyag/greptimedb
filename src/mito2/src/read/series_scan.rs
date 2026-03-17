@@ -470,7 +470,7 @@ impl SeriesDistributor {
 
         let part_metrics = new_partition_metrics(
             &self.stream_ctx,
-            false,
+            true,
             &self.metrics_set,
             self.partitions.len(),
             &self.metrics_list,
@@ -576,7 +576,7 @@ impl SeriesDistributor {
 
         let part_metrics = new_partition_metrics(
             &self.stream_ctx,
-            false,
+            true,
             &self.metrics_set,
             self.partitions.len(),
             &self.metrics_list,
