@@ -29,6 +29,7 @@ pub mod access_layer;
 pub mod cache;
 pub mod compaction;
 pub mod config;
+pub mod debug_bench;
 pub mod engine;
 pub mod error;
 #[cfg(feature = "enterprise")]

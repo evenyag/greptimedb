@@ -602,7 +602,7 @@ impl ParquetReaderBuilder {
     }
 
     /// Decodes region metadata from key value.
-    fn get_region_metadata(
+    pub(crate) fn get_region_metadata(
         file_path: &str,
         key_value_meta: Option<&Vec<KeyValue>>,
     ) -> Result<RegionMetadata> {
