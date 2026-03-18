@@ -8051,6 +8051,7 @@ dependencies = [
  "partition",
  "paste",
  "pin-project",
+ "pprof",
  "prometheus 0.14.0",
  "prost 0.14.1",
  "puffin",

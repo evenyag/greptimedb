@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{Expr, col, lit};
+use datatypes::arrow::record_batch::RecordBatch;
 use object_store::ObjectStore;
 use object_store::services::Memory;
 use partition::expr::PartitionExpr;
@@ -29,6 +31,7 @@ use table::predicate::Predicate;
 
 use crate::cache::{CacheManager, CacheStrategy};
 use crate::error::Result;
+use crate::read::Batch;
 use crate::sst::file::{FileHandle, FileMeta};
 use crate::sst::file_purger::NoopFilePurger;
 use crate::sst::index::bloom_filter::applier::{
@@ -39,6 +42,7 @@ use crate::sst::index::fulltext_index::applier::builder::FulltextIndexApplierBui
 use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
@@ -588,6 +592,244 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         &wrapped_flat_split_cache,
         config.iterations,
     );
+
+    Ok(())
+}
+
+const MAX_COLLECT_BATCHES: usize = 100;
+
+/// Collects raw parquet RecordBatches from the file, up to `MAX_COLLECT_BATCHES`.
+async fn collect_raw_batches(
+    fixture: &ExternalBenchFixture,
+    flat_format: bool,
+) -> Result<Vec<RecordBatch>> {
+    let builder = new_bench_builder(fixture, flat_format, CacheStrategy::Disabled);
+    let mut metrics = ReaderMetrics::default();
+
+    let Some((context, selection)) = builder.build_reader_input(&mut metrics).await? else {
+        panic!("benchmark selection is empty for flat_format={flat_format}");
+    };
+    let context = Arc::new(context);
+
+    let mut raw_batches = Vec::new();
+    for (row_group_idx, row_selection) in selection.iter() {
+        if raw_batches.len() >= MAX_COLLECT_BATCHES {
+            break;
+        }
+        let mut parquet_reader = context
+            .reader_builder()
+            .build(*row_group_idx, Some(row_selection.clone()), None)
+            .await?;
+        while let Some(batch_result) = parquet_reader.next() {
+            let batch = batch_result.unwrap_or_else(|e| {
+                panic!("raw parquet next() failed for row_group={row_group_idx}: {e}")
+            });
+            raw_batches.push(batch);
+            if raw_batches.len() >= MAX_COLLECT_BATCHES {
+                break;
+            }
+        }
+    }
+
+    Ok(raw_batches)
+}
+
+/// Benchmark that isolates convert_batch and precise_filter costs.
+///
+/// Set `MITO_BENCH_MODE` to `convert`, `filter`, or `all` (default).
+pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
+    let config = ExternalBenchConfig::from_env();
+    let fixture = load_external_bench_fixture(&config).await?;
+    let bench_mode = env::var("MITO_BENCH_MODE")
+        .unwrap_or_else(|_| "all".to_string())
+        .to_lowercase();
+
+    println!(
+        "Benchmark file: {}, region_id: {}, iterations: {}, mode: {}",
+        config.parquet_file, fixture.metadata.region_id, config.iterations, bench_mode,
+    );
+
+    // Build contexts for both formats.
+    let flat_builder = new_bench_builder(&fixture, true, CacheStrategy::Disabled);
+    let pk_builder = new_bench_builder(&fixture, false, CacheStrategy::Disabled);
+    let mut flat_metrics = ReaderMetrics::default();
+    let mut pk_metrics = ReaderMetrics::default();
+
+    let Some((flat_context, _)) = flat_builder.build_reader_input(&mut flat_metrics).await? else {
+        panic!("benchmark selection is empty for flat_format=true");
+    };
+    let Some((pk_context, _)) = pk_builder.build_reader_input(&mut pk_metrics).await? else {
+        panic!("benchmark selection is empty for flat_format=false");
+    };
+    let flat_context = Arc::new(flat_context);
+    let pk_context = Arc::new(pk_context);
+
+    // Collect raw batches.
+    let flat_raw_batches = collect_raw_batches(&fixture, true).await?;
+    let pk_raw_batches = collect_raw_batches(&fixture, false).await?;
+    let flat_total_rows: usize = flat_raw_batches.iter().map(|b| b.num_rows()).sum();
+    let pk_total_rows: usize = pk_raw_batches.iter().map(|b| b.num_rows()).sum();
+    println!(
+        "Collected {} flat raw batches ({} rows), {} pk raw batches ({} rows)",
+        flat_raw_batches.len(),
+        flat_total_rows,
+        pk_raw_batches.len(),
+        pk_total_rows,
+    );
+
+    let run_convert = bench_mode == "convert" || bench_mode == "all";
+    let run_filter = bench_mode == "filter" || bench_mode == "all";
+
+    let pprof_file = env::var("MITO_BENCH_PPROF_FILE").ok();
+
+    // Start profiling if pprof_file is specified.
+    #[cfg(unix)]
+    let profiler_guard = if let Some(ref pprof_path) = pprof_file {
+        println!("Starting profiling, output: {}", pprof_path);
+        Some(
+            pprof::ProfilerGuardBuilder::default()
+                .frequency(99)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+                .unwrap_or_else(|e| panic!("Failed to start profiler: {e}")),
+        )
+    } else {
+        None
+    };
+
+    #[cfg(not(unix))]
+    if pprof_file.is_some() {
+        eprintln!("Warning: Profiling is not supported on this platform");
+    }
+
+    // --- Convert benchmarks ---
+    if run_convert {
+        // FlatReadFormat::convert_batch
+        let flat_format = flat_context.read_format().as_flat().unwrap();
+        let flat_override_seq = flat_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+        let mut total_convert_flat = Duration::ZERO;
+        let mut convert_flat_rows = 0usize;
+        for _ in 0..config.iterations {
+            let start = Instant::now();
+            for batch in &flat_raw_batches {
+                let converted =
+                    flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref())?;
+                convert_flat_rows += converted.num_rows();
+            }
+            total_convert_flat += start.elapsed();
+        }
+        println!(
+            "FlatReadFormat::convert_batch: avg={:?}, batches={}, avg_rows={:.0}",
+            avg_duration(total_convert_flat, config.iterations),
+            flat_raw_batches.len(),
+            avg_count(convert_flat_rows, config.iterations),
+        );
+
+        // PrimaryKeyReadFormat::convert_record_batch
+        let pk_format = pk_context.read_format().as_primary_key().unwrap();
+        let pk_override_seq = pk_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+        let mut total_convert_pk = Duration::ZERO;
+        let mut convert_pk_rows = 0usize;
+        for _ in 0..config.iterations {
+            let start = Instant::now();
+            for batch in &pk_raw_batches {
+                let mut batches_out = VecDeque::new();
+                pk_format.convert_record_batch(
+                    batch,
+                    pk_override_seq.as_ref(),
+                    &mut batches_out,
+                )?;
+                convert_pk_rows += batches_out.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+            total_convert_pk += start.elapsed();
+        }
+        println!(
+            "PrimaryKeyReadFormat::convert_record_batch: avg={:?}, batches={}, avg_rows={:.0}",
+            avg_duration(total_convert_pk, config.iterations),
+            pk_raw_batches.len(),
+            avg_count(convert_pk_rows, config.iterations),
+        );
+    }
+
+    // --- Filter benchmarks ---
+    if run_filter {
+        // Pre-convert batches (not timed).
+        let flat_format = flat_context.read_format().as_flat().unwrap();
+        let flat_override_seq = flat_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+        let mut converted_flat_batches = Vec::new();
+        for batch in &flat_raw_batches {
+            let converted = flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref())?;
+            converted_flat_batches.push(converted);
+        }
+
+        let pk_format = pk_context.read_format().as_primary_key().unwrap();
+        let pk_override_seq = pk_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+        let mut converted_pk_batches: Vec<Batch> = Vec::new();
+        for batch in &pk_raw_batches {
+            let mut batches_out = VecDeque::new();
+            pk_format.convert_record_batch(batch, pk_override_seq.as_ref(), &mut batches_out)?;
+            converted_pk_batches.extend(batches_out);
+        }
+
+        // precise_filter_flat
+        let mut total_filter_flat = Duration::ZERO;
+        let mut filter_flat_output_rows = 0usize;
+        for _ in 0..config.iterations {
+            let start = Instant::now();
+            for batch in &converted_flat_batches {
+                if let Some(filtered) = flat_context.precise_filter_flat(batch.clone(), false)? {
+                    filter_flat_output_rows += filtered.num_rows();
+                }
+            }
+            total_filter_flat += start.elapsed();
+        }
+        println!(
+            "precise_filter_flat: avg={:?}, input_batches={}, avg_output_rows={:.0}",
+            avg_duration(total_filter_flat, config.iterations),
+            converted_flat_batches.len(),
+            avg_count(filter_flat_output_rows, config.iterations),
+        );
+
+        // precise_filter
+        let mut total_filter_pk = Duration::ZERO;
+        let mut filter_pk_output_rows = 0usize;
+        for _ in 0..config.iterations {
+            let start = Instant::now();
+            for batch in &converted_pk_batches {
+                if let Some(filtered) = pk_context.precise_filter(batch.clone(), false)? {
+                    filter_pk_output_rows += filtered.num_rows();
+                }
+            }
+            total_filter_pk += start.elapsed();
+        }
+        println!(
+            "precise_filter: avg={:?}, input_batches={}, avg_output_rows={:.0}",
+            avg_duration(total_filter_pk, config.iterations),
+            converted_pk_batches.len(),
+            avg_count(filter_pk_output_rows, config.iterations),
+        );
+    }
+
+    // Stop profiling and generate flamegraph.
+    #[cfg(unix)]
+    if let (Some(guard), Some(pprof_path)) = (profiler_guard, &pprof_file) {
+        println!("Generating flamegraph...");
+        match guard.report().build() {
+            Ok(report) => {
+                let mut flamegraph_data = Vec::new();
+                if let Err(e) = report.flamegraph(&mut flamegraph_data) {
+                    eprintln!("Failed to generate flamegraph: {e}");
+                } else if let Err(e) = std::fs::write(pprof_path, flamegraph_data) {
+                    eprintln!("Failed to write flamegraph to {pprof_path}: {e}");
+                } else {
+                    println!("Flamegraph saved to {pprof_path}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to generate pprof report: {e}");
+            }
+        }
+    }
 
     Ok(())
 }
