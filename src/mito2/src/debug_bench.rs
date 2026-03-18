@@ -47,7 +47,7 @@ use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
 
-const BENCH_PROJECTION_POSITIONS: [usize; 6] = [0, 1, 2, 3, 4, 79];
+const BENCH_PROJECTION_POSITIONS: [usize; 7] = [0, 1, 2, 3, 4, 25, 79];
 const BENCH_TIME_START_MS: i64 = 1_742_550_540_001;
 const BENCH_TIME_END_MS: i64 = 1_742_552_400_000;
 const BENCH_TABLE_ID: u32 = 1182;
