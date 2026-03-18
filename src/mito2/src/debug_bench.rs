@@ -34,14 +34,14 @@ use crate::sst::file_purger::NoopFilePurger;
 use crate::sst::index::bloom_filter::applier::{
     BloomFilterIndexApplierBuilder, BloomFilterIndexApplierRef,
 };
-use crate::sst::parquet::file_range::FileRange;
-use crate::sst::parquet::metadata::MetadataLoader;
-use crate::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplierRef;
 use crate::sst::index::fulltext_index::applier::builder::FulltextIndexApplierBuilder;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplierRef;
 use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBuilder;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
+use crate::sst::parquet::file_range::FileRange;
+use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
 
 const BENCH_PROJECTION_POSITIONS: [usize; 6] = [0, 1, 2, 3, 4, 79];
 const BENCH_TIME_START_MS: i64 = 1_742_550_540_001;
@@ -178,10 +178,8 @@ async fn load_external_bench_fixture(config: &ExternalBenchConfig) -> Result<Ext
     let table_dir = "bench_series_scan".to_string();
     let path_type = PathType::Bare;
     let file_purger = Arc::new(NoopFilePurger);
-    let aux_path = std::env::temp_dir().join(format!(
-        "mito2-bench-puffin-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let aux_path =
+        std::env::temp_dir().join(format!("mito2-bench-puffin-{}", uuid::Uuid::new_v4()));
     let puffin_manager_factory = PuffinManagerFactory::new(&aux_path, 4096, None, None).await?;
 
     // Write once to decode embedded region metadata, then write again to the final path that
@@ -382,6 +380,7 @@ async fn bench_raw_parquet_next(
 async fn bench_wrapped_reader(
     fixture: &ExternalBenchFixture,
     flat_format: bool,
+    should_split: bool,
     cache_strategy: CacheStrategy,
     iterations: usize,
 ) -> Result<ReaderRunStats> {
@@ -411,7 +410,7 @@ async fn bench_wrapped_reader(
             let build_reader_start = Instant::now();
 
             if flat_format {
-                let Some(mut reader) = range.flat_reader(None, None).await? else {
+                let Some(mut reader) = range.flat_reader(None, None, should_split).await? else {
                     continue;
                 };
                 stats.build_reader_cost += build_reader_start.elapsed();
@@ -483,10 +482,30 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         bench_raw_parquet_next(&fixture, false, CacheStrategy::Disabled, config.iterations).await?;
     let raw_flat_no_cache =
         bench_raw_parquet_next(&fixture, true, CacheStrategy::Disabled, config.iterations).await?;
-    let wrapped_primary_no_cache =
-        bench_wrapped_reader(&fixture, false, CacheStrategy::Disabled, config.iterations).await?;
-    let wrapped_flat_no_cache =
-        bench_wrapped_reader(&fixture, true, CacheStrategy::Disabled, config.iterations).await?;
+    let wrapped_primary_no_cache = bench_wrapped_reader(
+        &fixture,
+        false,
+        false,
+        CacheStrategy::Disabled,
+        config.iterations,
+    )
+    .await?;
+    let wrapped_flat_no_cache = bench_wrapped_reader(
+        &fixture,
+        true,
+        false,
+        CacheStrategy::Disabled,
+        config.iterations,
+    )
+    .await?;
+    let wrapped_flat_split_no_cache = bench_wrapped_reader(
+        &fixture,
+        true,
+        true,
+        CacheStrategy::Disabled,
+        config.iterations,
+    )
+    .await?;
 
     let raw_primary_cache = bench_raw_parquet_next(
         &fixture,
@@ -505,20 +524,35 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
     let wrapped_primary_cache = bench_wrapped_reader(
         &fixture,
         false,
+        false,
         CacheStrategy::EnableAll(primary_cache),
         config.iterations,
     )
     .await?;
+    let flat_split_cache = create_bench_cache();
     let wrapped_flat_cache = bench_wrapped_reader(
         &fixture,
         true,
+        false,
         CacheStrategy::EnableAll(flat_cache),
+        config.iterations,
+    )
+    .await?;
+    let wrapped_flat_split_cache = bench_wrapped_reader(
+        &fixture,
+        true,
+        true,
+        CacheStrategy::EnableAll(flat_split_cache),
         config.iterations,
     )
     .await?;
 
     println!("Raw parquet next():");
-    print_bench_stats("  no_cache primary_key", &raw_primary_no_cache, config.iterations);
+    print_bench_stats(
+        "  no_cache primary_key",
+        &raw_primary_no_cache,
+        config.iterations,
+    );
     print_bench_stats("  no_cache flat", &raw_flat_no_cache, config.iterations);
     print_bench_stats("  cache primary_key", &raw_primary_cache, config.iterations);
     print_bench_stats("  cache flat", &raw_flat_cache, config.iterations);
@@ -535,6 +569,11 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         config.iterations,
     );
     print_bench_stats(
+        "  no_cache FlatRowGroupReader(split)",
+        &wrapped_flat_split_no_cache,
+        config.iterations,
+    );
+    print_bench_stats(
         "  cache RowGroupReader",
         &wrapped_primary_cache,
         config.iterations,
@@ -542,6 +581,11 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
     print_bench_stats(
         "  cache FlatRowGroupReader",
         &wrapped_flat_cache,
+        config.iterations,
+    );
+    print_bench_stats(
+        "  cache FlatRowGroupReader(split)",
+        &wrapped_flat_split_cache,
         config.iterations,
     );
 

@@ -239,6 +239,7 @@ impl FileRange {
         &self,
         selector: Option<TimeSeriesRowSelector>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
+        should_split: bool,
     ) -> Result<Option<FlatPruneReader>> {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -276,7 +277,7 @@ impl FileRange {
 
         let flat_prune_reader = if use_last_row_reader {
             let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader);
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, should_split);
             let reader = FlatRowGroupLastRowCachedReader::new(
                 self.file_handle().file_id().file_id(),
                 self.row_group_idx,
@@ -287,7 +288,7 @@ impl FileRange {
             FlatPruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
         } else {
             let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader);
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, should_split);
             FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 flat_row_group_reader,

@@ -851,6 +851,7 @@ pub(crate) async fn build_flat_sources(
     sources.reserve(num_indices);
     let mut ordered_sources = Vec::with_capacity(num_indices);
     ordered_sources.resize_with(num_indices, || None);
+    let mut is_file_position = vec![false; num_indices];
     let mut file_scan_tasks = Vec::new();
 
     for (position, index) in range_meta.row_group_indices.iter().enumerate() {
@@ -863,6 +864,7 @@ pub(crate) async fn build_flat_sources(
             );
             ordered_sources[position] = Some(Box::pin(stream) as _);
         } else if stream_ctx.is_file_range_index(*index) {
+            is_file_position[position] = true;
             if let Some(semaphore_ref) = semaphore.as_ref() {
                 // run in parallel, controlled by semaphore
                 let stream_ctx = stream_ctx.clone();
@@ -878,6 +880,7 @@ pub(crate) async fn build_flat_sources(
                         row_group_index,
                         read_type,
                         partition_pruner,
+                        should_split,
                     )
                     .await?;
                     Ok((position, Box::pin(stream) as _))
@@ -890,6 +893,7 @@ pub(crate) async fn build_flat_sources(
                     *index,
                     read_type,
                     partition_pruner.clone(),
+                    should_split,
                 )
                 .await?;
                 ordered_sources[position] = Some(Box::pin(stream) as _);
@@ -908,11 +912,14 @@ pub(crate) async fn build_flat_sources(
         }
     }
 
-    for stream in ordered_sources.into_iter().flatten() {
-        if should_split {
-            sources.push(Box::pin(SplitRecordBatchStream::new(stream)));
-        } else {
-            sources.push(stream);
+    for (position, stream) in ordered_sources.into_iter().enumerate() {
+        if let Some(stream) = stream {
+            if should_split && !is_file_position[position] {
+                // File streams are already split by the reader.
+                sources.push(Box::pin(SplitRecordBatchStream::new(stream)));
+            } else {
+                sources.push(stream);
+            }
         }
     }
 

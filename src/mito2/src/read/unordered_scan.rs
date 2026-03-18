@@ -191,6 +191,7 @@ impl UnorderedScan {
                         *index,
                         "unordered_scan_files",
                         partition_pruner.clone(),
+                        false,
                     ).await?;
                     for await record_batch in stream {
                         yield record_batch?;

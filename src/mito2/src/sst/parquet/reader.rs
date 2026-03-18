@@ -1909,7 +1909,7 @@ impl ParquetReader {
             let skip_fields = self.context.should_skip_fields(row_group_idx);
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader),
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, false),
                 skip_fields,
             ));
         }
@@ -1936,7 +1936,7 @@ impl ParquetReader {
             let skip_fields = context.should_skip_fields(row_group_idx);
             Some(FlatPruneReader::new_with_row_group_reader(
                 context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader),
+                FlatRowGroupReader::new(context.clone(), parquet_reader, false),
                 skip_fields,
             ))
         } else {
@@ -2106,6 +2106,10 @@ pub(crate) struct FlatRowGroupReader {
     reader: ParquetRecordBatchReader,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Whether to split batches by timestamp boundaries.
+    should_split: bool,
+    /// Buffered split batches.
+    batches: VecDeque<RecordBatch>,
     /// Duration to convert parquet RecordBatches via ReadFormat.
     convert_cost: Duration,
     /// Duration to scan (read from parquet reader + convert).
@@ -2114,7 +2118,11 @@ pub(crate) struct FlatRowGroupReader {
 
 impl FlatRowGroupReader {
     /// Creates a new flat reader from file range.
-    pub(crate) fn new(context: FileRangeContextRef, reader: ParquetRecordBatchReader) -> Self {
+    pub(crate) fn new(
+        context: FileRangeContextRef,
+        reader: ParquetRecordBatchReader,
+        should_split: bool,
+    ) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
             .read_format()
@@ -2124,6 +2132,8 @@ impl FlatRowGroupReader {
             context,
             reader,
             override_sequence,
+            should_split,
+            batches: VecDeque::new(),
             convert_cost: Duration::default(),
             scan_cost: Duration::default(),
         }
@@ -2141,6 +2151,11 @@ impl FlatRowGroupReader {
 
     /// Returns the next RecordBatch.
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        // Return buffered split batch first.
+        if let Some(batch) = self.batches.pop_front() {
+            return Ok(Some(batch));
+        }
+
         let scan_start = Instant::now();
         match self.reader.next() {
             Some(batch_result) => {
@@ -2155,7 +2170,13 @@ impl FlatRowGroupReader {
                 let record_batch =
                     flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
                 self.convert_cost += convert_start.elapsed();
-                Ok(Some(record_batch))
+
+                if self.should_split {
+                    crate::read::scan_util::split_record_batch(record_batch, &mut self.batches);
+                    Ok(self.batches.pop_front())
+                } else {
+                    Ok(Some(record_batch))
+                }
             }
             None => {
                 self.scan_cost += scan_start.elapsed();

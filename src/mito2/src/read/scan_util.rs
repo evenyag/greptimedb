@@ -1377,6 +1377,7 @@ pub(crate) async fn scan_flat_file_ranges(
     index: RowGroupIndex,
     read_type: &'static str,
     partition_pruner: Arc<PartitionPruner>,
+    should_split: bool,
 ) -> Result<impl Stream<Item = Result<RecordBatch>>> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
@@ -1412,6 +1413,7 @@ pub(crate) async fn scan_flat_file_ranges(
         read_type,
         ranges,
         init_per_file_metrics,
+        should_split,
     ))
 }
 
@@ -1492,6 +1494,7 @@ pub fn build_flat_file_range_scan_stream(
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
+    should_split: bool,
 ) -> impl Stream<Item = Result<RecordBatch>> {
     try_stream! {
         let fetch_metrics = if part_metrics.explain_verbose() {
@@ -1505,7 +1508,7 @@ pub fn build_flat_file_range_scan_stream(
         };
         for range in ranges {
             let build_reader_start = Instant::now();
-            let Some(mut reader) = range.flat_reader(_stream_ctx.input.series_row_selector, fetch_metrics.as_deref()).await? else{continue};
+            let Some(mut reader) = range.flat_reader(_stream_ctx.input.series_row_selector, fetch_metrics.as_deref(), should_split).await? else{continue};
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 
