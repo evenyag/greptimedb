@@ -472,6 +472,7 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
     let fixture = load_external_bench_fixture(&config).await?;
     let primary_cache = create_bench_cache();
     let flat_cache = create_bench_cache();
+    let pprof_file = env::var("MITO_BENCH_PPROF_FILE").ok();
 
     println!(
         "Benchmark file: {}, region_id: {}, projection_positions: {:?}, projection_ids: {:?}, iterations: {}",
@@ -542,6 +543,26 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         config.iterations,
     )
     .await?;
+    // Start profiling if pprof_file is specified.
+    #[cfg(unix)]
+    let profiler_guard = if let Some(ref pprof_path) = pprof_file {
+        println!("Starting profiling, output: {}", pprof_path);
+        Some(
+            pprof::ProfilerGuardBuilder::default()
+                .frequency(99)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+                .unwrap_or_else(|e| panic!("Failed to start profiler: {e}")),
+        )
+    } else {
+        None
+    };
+
+    #[cfg(not(unix))]
+    if pprof_file.is_some() {
+        eprintln!("Warning: Profiling is not supported on this platform");
+    }
+
     let wrapped_flat_split_cache = bench_wrapped_reader(
         &fixture,
         true,
@@ -550,6 +571,27 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         config.iterations,
     )
     .await?;
+
+    // Stop profiling and generate flamegraph.
+    #[cfg(unix)]
+    if let (Some(guard), Some(pprof_path)) = (profiler_guard, &pprof_file) {
+        println!("Generating flamegraph...");
+        match guard.report().build() {
+            Ok(report) => {
+                let mut flamegraph_data = Vec::new();
+                if let Err(e) = report.flamegraph(&mut flamegraph_data) {
+                    eprintln!("Failed to generate flamegraph: {e}");
+                } else if let Err(e) = std::fs::write(pprof_path, flamegraph_data) {
+                    eprintln!("Failed to write flamegraph to {pprof_path}: {e}");
+                } else {
+                    println!("Flamegraph saved to {pprof_path}");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to generate pprof report: {e}");
+            }
+        }
+    }
 
     println!("Raw parquet next():");
     print_bench_stats(
