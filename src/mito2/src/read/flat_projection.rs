@@ -61,6 +61,8 @@ pub struct FlatProjectionMapper {
     batch_indices: Vec<usize>,
     /// Precomputed Arrow schema for input batches.
     input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
+    /// Whether the projection contains any tag columns.
+    has_tags: bool,
 }
 
 impl FlatProjectionMapper {
@@ -157,6 +159,14 @@ impl FlatProjectionMapper {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        let has_tags = projection.iter().any(|idx| {
+            metadata
+                .column_metadatas
+                .get(*idx)
+                .map(|col| col.semantic_type == SemanticType::Tag)
+                .unwrap_or(false)
+        });
+
         Ok(FlatProjectionMapper {
             metadata: metadata.clone(),
             output_schema,
@@ -165,12 +175,18 @@ impl FlatProjectionMapper {
             is_empty_projection,
             batch_indices,
             input_arrow_schema,
+            has_tags,
         })
     }
 
     /// Returns a new mapper without projection.
     pub fn all(metadata: &RegionMetadataRef) -> Result<Self> {
         FlatProjectionMapper::new(metadata, 0..metadata.column_metadatas.len())
+    }
+
+    /// Returns true if the projection includes any tag columns.
+    pub(crate) fn has_tags(&self) -> bool {
+        self.has_tags
     }
 
     /// Returns the metadata that created the mapper.

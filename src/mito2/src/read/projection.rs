@@ -111,7 +111,7 @@ impl ProjectionMapper {
     pub(crate) fn has_tags(&self) -> bool {
         match self {
             ProjectionMapper::PrimaryKey(m) => m.has_tags(),
-            ProjectionMapper::Flat(_) => false,
+            ProjectionMapper::Flat(m) => m.has_tags(),
         }
     }
 
