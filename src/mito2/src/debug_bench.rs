@@ -312,6 +312,7 @@ fn new_bench_builder(
     let (inverted_index_appliers, bloom_filter_index_appliers, fulltext_index_appliers) =
         build_index_appliers(fixture, predicate.exprs());
 
+    let decode_pk_values = !fixture.metadata.primary_key.is_empty();
     ParquetReaderBuilder::new(
         fixture.table_dir.clone(),
         fixture.path_type,
@@ -325,6 +326,7 @@ fn new_bench_builder(
     .inverted_index_appliers(inverted_index_appliers)
     .bloom_filter_index_appliers(bloom_filter_index_appliers)
     .fulltext_index_appliers(fulltext_index_appliers)
+    .decode_primary_key_values(decode_pk_values)
 }
 
 async fn bench_raw_parquet_next(
