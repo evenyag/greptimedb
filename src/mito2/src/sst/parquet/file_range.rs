@@ -397,6 +397,18 @@ impl FileRangeContext {
         self.base.precise_filter_flat(input, skip_fields, skip_tags)
     }
 
+    /// Filters a raw PK-format RecordBatch (before tag assembly).
+    /// Tags have already been evaluated via `evaluate_tags_scalar`.
+    pub(crate) fn precise_filter_flat_pk_format(
+        &self,
+        input: RecordBatch,
+        pk_values: &CompositeValues,
+        skip_fields: bool,
+    ) -> Result<Option<RecordBatch>> {
+        self.base
+            .precise_filter_flat_pk_format(input, pk_values, skip_fields)
+    }
+
     /// Determines whether to skip field filters based on PreFilterMode and row group delete status.
     pub(crate) fn should_skip_fields(&self, row_group_idx: usize) -> bool {
         match self.base.pre_filter_mode {
@@ -660,6 +672,165 @@ impl RangeBase {
         } else {
             Ok(None)
         }
+    }
+
+    /// Filters a raw PK-format RecordBatch (before tag assembly).
+    ///
+    /// In PK format, tag columns are NOT in the batch. Tags have already been
+    /// evaluated via `evaluate_tags_scalar`, so this method:
+    /// - Skips all tag filters
+    /// - Uses PK-format projected indices for field columns
+    /// - Applies partition filter by building tag columns from pk_values on-demand
+    pub(crate) fn precise_filter_flat_pk_format(
+        &self,
+        input: RecordBatch,
+        pk_values: &CompositeValues,
+        skip_fields: bool,
+    ) -> Result<Option<RecordBatch>> {
+        let flat_format = self
+            .read_format
+            .as_flat()
+            .context(crate::error::UnexpectedSnafu {
+                reason: "Expected flat format for precise_filter_flat_pk_format",
+            })?;
+
+        let mut mask = BooleanBuffer::new_set(input.num_rows());
+
+        // Evaluate non-tag filters using PK-format indices.
+        for filter_ctx in &self.filters {
+            let filter = match filter_ctx.filter() {
+                MaybeFilter::Filter(f) => f,
+                MaybeFilter::Matched => continue,
+                MaybeFilter::Pruned => return Ok(None),
+            };
+
+            // Skip tag filters — already handled by evaluate_tags_scalar.
+            if filter_ctx.semantic_type() == SemanticType::Tag {
+                continue;
+            }
+
+            // Skip field filters if requested.
+            if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+                continue;
+            }
+
+            if filter_ctx.semantic_type() == SemanticType::Timestamp {
+                let time_index_pos =
+                    crate::sst::parquet::flat_format::time_index_column_index(input.num_columns());
+                let column = &input.columns()[time_index_pos];
+                let result = filter.evaluate_array(column).context(RecordBatchSnafu)?;
+                mask = mask.bitand(&result);
+            } else if let Some(column) = flat_format
+                .pk_format_projected_index_by_id(filter_ctx.column_id())
+                .and_then(|idx| input.columns().get(idx))
+            {
+                let result = filter.evaluate_array(column).context(RecordBatchSnafu)?;
+                mask = mask.bitand(&result);
+            }
+        }
+
+        // Apply partition filter using pk_values to build tag columns on-demand.
+        if let Some(partition_filter) = &self.partition_filter {
+            let metadata = flat_format.metadata();
+            let record_batch = self.build_partition_batch_from_pk_values(
+                metadata,
+                pk_values,
+                input.num_rows(),
+                &partition_filter.partition_schema,
+                &input,
+                flat_format,
+            )?;
+            let partition_mask =
+                self.evaluate_partition_filter(&record_batch, partition_filter)?;
+            mask = mask.bitand(&partition_mask);
+        }
+
+        if mask.count_set_bits() == 0 {
+            return Ok(None);
+        }
+
+        let filtered_batch =
+            datatypes::arrow::compute::filter_record_batch(&input, &BooleanArray::from(mask))
+                .context(ComputeArrowSnafu)?;
+
+        if filtered_batch.num_rows() > 0 {
+            Ok(Some(filtered_batch))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Builds a RecordBatch for partition filter evaluation from pk_values and the raw
+    /// PK-format input batch.
+    fn build_partition_batch_from_pk_values(
+        &self,
+        metadata: &RegionMetadataRef,
+        pk_values: &CompositeValues,
+        num_rows: usize,
+        partition_schema: &Arc<Schema>,
+        input: &RecordBatch,
+        flat_format: &crate::sst::parquet::flat_format::FlatReadFormat,
+    ) -> Result<RecordBatch> {
+        let arrow_schema = partition_schema.arrow_schema();
+        let mut columns = Vec::with_capacity(arrow_schema.fields().len());
+
+        for field in arrow_schema.fields() {
+            let column_id = metadata
+                .column_by_name(field.name())
+                .map(|c| c.column_id);
+
+            let Some(column_id) = column_id else {
+                return UnexpectedSnafu {
+                    reason: format!(
+                        "Partition pruning schema expects column '{}' but it is missing in region metadata",
+                        field.name()
+                    ),
+                }
+                .fail();
+            };
+
+            // Check if it's a tag — build from pk_values.
+            if let Some(pk_index) = metadata.primary_key_index(column_id) {
+                let value = match pk_values {
+                    CompositeValues::Dense(v) => &v[pk_index].1,
+                    CompositeValues::Sparse(v) => v.get_or_null(column_id),
+                };
+                let concrete_type = ConcreteDataType::from_arrow_type(field.data_type());
+                let arrow_scalar = value
+                    .try_to_scalar_value(&concrete_type)
+                    .context(DataTypeMismatchSnafu)?;
+                let array = arrow_scalar
+                    .to_array_of_size(num_rows)
+                    .context(EvalPartitionFilterSnafu)?;
+                columns.push(array);
+            } else if metadata.time_index_column().column_id == column_id {
+                let time_index_pos =
+                    crate::sst::parquet::flat_format::time_index_column_index(input.num_columns());
+                columns.push(input.column(time_index_pos).clone());
+            } else if let Some(idx) = flat_format.pk_format_projected_index_by_id(column_id) {
+                if let Some(column) = input.columns().get(idx) {
+                    columns.push(column.clone());
+                } else {
+                    return UnexpectedSnafu {
+                        reason: format!(
+                            "Partition pruning schema expects column '{}' (id {}) but index {} is out of bounds",
+                            field.name(), column_id, idx
+                        ),
+                    }
+                    .fail();
+                }
+            } else {
+                return UnexpectedSnafu {
+                    reason: format!(
+                        "Partition pruning schema expects column '{}' (id {}) but it is not present in PK-format batch",
+                        field.name(), column_id
+                    ),
+                }
+                .fail();
+            }
+        }
+
+        RecordBatch::try_new(arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
     }
 
     /// Computes the filter mask for the input RecordBatch based on pushed down predicates.

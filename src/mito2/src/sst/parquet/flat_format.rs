@@ -323,6 +323,7 @@ impl FlatReadFormat {
             batches.push_back(crate::read::prune::FlatRecordBatch {
                 record_batch: batch,
                 pk_values: None,
+                needs_tag_assembly: false,
             });
             Ok(())
         }
@@ -383,17 +384,28 @@ impl FlatReadFormat {
                 None
             };
 
-            // Apply format conversion and sequence override.
-            // Pass pk_values to avoid double-decoding in PrimaryKeyToFlat path.
-            let converted = self.convert_and_override_sequence(
-                sliced,
-                override_sequence_array,
-                pk_values.as_ref(),
-            )?;
+            // When we have pk_values and the adapter is PrimaryKeyToFlat, skip tag
+            // assembly — it will be done after filtering in FlatPruneReader on the
+            // smaller filtered batch.
+            let (converted, needs_assembly) = if pk_values.is_some()
+                && matches!(&self.parquet_adapter, ParquetAdapter::PrimaryKeyToFlat(_))
+            {
+                let batch =
+                    Self::apply_sequence_override(sliced, override_sequence_array)?;
+                (batch, true)
+            } else {
+                let batch = self.convert_and_override_sequence(
+                    sliced,
+                    override_sequence_array,
+                    pk_values.as_ref(),
+                )?;
+                (batch, false)
+            };
 
             batches.push_back(crate::read::prune::FlatRecordBatch {
                 record_batch: converted,
                 pk_values,
+                needs_tag_assembly: needs_assembly,
             });
         }
 
@@ -496,6 +508,39 @@ impl FlatReadFormat {
             );
 
             Ok(true)
+        }
+    }
+
+    /// Assembles tag columns from pre-decoded primary key values into the batch.
+    ///
+    /// This is used after filtering a raw PK-format batch to prepend tag columns
+    /// on the smaller filtered result.
+    pub(crate) fn assemble_tags_from_pk_values(
+        &self,
+        batch: RecordBatch,
+        pk_values: &CompositeValues,
+    ) -> Result<RecordBatch> {
+        match &self.parquet_adapter {
+            ParquetAdapter::PrimaryKeyToFlat(p) => {
+                p.convert_batch_with_pk_values(batch, pk_values)
+            }
+            _ => Ok(batch),
+        }
+    }
+
+    /// Returns the projected index for a column in PK-format (before tag assembly).
+    ///
+    /// This delegates to `PrimaryKeyReadFormat.field_id_to_projected_index()` which
+    /// maps column IDs to their positions in the raw PK-format batch.
+    pub(crate) fn pk_format_projected_index_by_id(
+        &self,
+        column_id: ColumnId,
+    ) -> Option<usize> {
+        match &self.parquet_adapter {
+            ParquetAdapter::PrimaryKeyToFlat(p) => {
+                p.format.field_id_to_projected_index().get(&column_id).copied()
+            }
+            _ => None,
         }
     }
 }

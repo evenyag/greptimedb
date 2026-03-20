@@ -251,6 +251,9 @@ pub(crate) struct FlatRecordBatch {
     pub(crate) record_batch: RecordBatch,
     /// Decoded primary key values, available when split by primary key.
     pub(crate) pk_values: Option<CompositeValues>,
+    /// When true, record_batch is in raw PK format (no tag columns prepended).
+    /// Tag columns must be assembled before returning to downstream consumers.
+    pub(crate) needs_tag_assembly: bool,
 }
 
 pub enum FlatSource {
@@ -265,6 +268,7 @@ impl FlatSource {
             FlatSource::LastRow(r) => Ok(r.next_batch()?.map(|b| FlatRecordBatch {
                 record_batch: b,
                 pk_values: None,
+                needs_tag_assembly: false,
             })),
         }
     }
@@ -344,10 +348,18 @@ impl FlatPruneReader {
         let FlatRecordBatch {
             record_batch,
             pk_values,
+            needs_tag_assembly,
         } = flat_batch;
 
         // fast path
         if self.context.filters().is_empty() && !self.context.has_partition_filter() {
+            if needs_tag_assembly {
+                let pk_values = pk_values.as_ref().unwrap();
+                let flat_format = self.context.read_format().as_flat().unwrap();
+                let assembled =
+                    flat_format.assemble_tags_from_pk_values(record_batch, pk_values)?;
+                return Ok(Some(assembled));
+            }
             return Ok(Some(record_batch));
         }
 
@@ -364,23 +376,49 @@ impl FlatPruneReader {
         };
 
         let num_rows_before_filter = record_batch.num_rows();
-        let Some(filtered_batch) = self
-            .context
-            .precise_filter_flat(record_batch, self.skip_fields, skip_tags)?
-        else {
-            // the entire batch is filtered out
-            self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
-            return Ok(None);
-        };
 
-        // update metric
-        let filtered_rows = num_rows_before_filter - filtered_batch.num_rows();
-        self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
+        if needs_tag_assembly {
+            // Filter raw PK-format batch (no tag columns).
+            let pk_values = pk_values.as_ref().unwrap();
+            let filtered = self.context.precise_filter_flat_pk_format(
+                record_batch,
+                pk_values,
+                self.skip_fields,
+            )?;
+            let Some(filtered_batch) = filtered else {
+                self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
+                return Ok(None);
+            };
 
-        if filtered_batch.num_rows() > 0 {
-            Ok(Some(filtered_batch))
+            let filtered_rows = num_rows_before_filter - filtered_batch.num_rows();
+            self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
+
+            if filtered_batch.num_rows() == 0 {
+                return Ok(None);
+            }
+
+            // Assemble tags AFTER filtering (fewer rows = cheaper).
+            let flat_format = self.context.read_format().as_flat().unwrap();
+            let assembled =
+                flat_format.assemble_tags_from_pk_values(filtered_batch, pk_values)?;
+            Ok(Some(assembled))
         } else {
-            Ok(None)
+            let Some(filtered_batch) = self
+                .context
+                .precise_filter_flat(record_batch, self.skip_fields, skip_tags)?
+            else {
+                self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
+                return Ok(None);
+            };
+
+            let filtered_rows = num_rows_before_filter - filtered_batch.num_rows();
+            self.metrics.filter_metrics.rows_precise_filtered += filtered_rows;
+
+            if filtered_batch.num_rows() > 0 {
+                Ok(Some(filtered_batch))
+            } else {
+                Ok(None)
+            }
         }
     }
 }
