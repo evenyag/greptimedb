@@ -473,7 +473,6 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
     let config = ExternalBenchConfig::from_env();
     let fixture = load_external_bench_fixture(&config).await?;
     let primary_cache = create_bench_cache();
-    let flat_cache = create_bench_cache();
     let pprof_file = env::var("MITO_BENCH_PPROF_FILE").ok();
 
     println!(
@@ -485,66 +484,6 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         config.iterations,
     );
 
-    let raw_primary_no_cache =
-        bench_raw_parquet_next(&fixture, false, CacheStrategy::Disabled, config.iterations).await?;
-    let raw_flat_no_cache =
-        bench_raw_parquet_next(&fixture, true, CacheStrategy::Disabled, config.iterations).await?;
-    let wrapped_primary_no_cache = bench_wrapped_reader(
-        &fixture,
-        false,
-        false,
-        CacheStrategy::Disabled,
-        config.iterations,
-    )
-    .await?;
-    let wrapped_flat_no_cache = bench_wrapped_reader(
-        &fixture,
-        true,
-        false,
-        CacheStrategy::Disabled,
-        config.iterations,
-    )
-    .await?;
-    let wrapped_flat_split_no_cache = bench_wrapped_reader(
-        &fixture,
-        true,
-        true,
-        CacheStrategy::Disabled,
-        config.iterations,
-    )
-    .await?;
-
-    let raw_primary_cache = bench_raw_parquet_next(
-        &fixture,
-        false,
-        CacheStrategy::EnableAll(primary_cache.clone()),
-        config.iterations,
-    )
-    .await?;
-    let raw_flat_cache = bench_raw_parquet_next(
-        &fixture,
-        true,
-        CacheStrategy::EnableAll(flat_cache.clone()),
-        config.iterations,
-    )
-    .await?;
-    let wrapped_primary_cache = bench_wrapped_reader(
-        &fixture,
-        false,
-        false,
-        CacheStrategy::EnableAll(primary_cache),
-        config.iterations,
-    )
-    .await?;
-    let flat_split_cache = create_bench_cache();
-    let wrapped_flat_cache = bench_wrapped_reader(
-        &fixture,
-        true,
-        false,
-        CacheStrategy::EnableAll(flat_cache),
-        config.iterations,
-    )
-    .await?;
     // Start profiling if pprof_file is specified.
     #[cfg(unix)]
     let profiler_guard = if let Some(ref pprof_path) = pprof_file {
@@ -565,6 +504,15 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         eprintln!("Warning: Profiling is not supported on this platform");
     }
 
+    let wrapped_primary_cache = bench_wrapped_reader(
+        &fixture,
+        false,
+        false,
+        CacheStrategy::EnableAll(primary_cache),
+        config.iterations,
+    )
+    .await?;
+    let flat_split_cache = create_bench_cache();
     let wrapped_flat_split_cache = bench_wrapped_reader(
         &fixture,
         true,
@@ -595,40 +543,10 @@ pub async fn run_sparse_series_scan_reader_bench_from_env() -> Result<()> {
         }
     }
 
-    println!("Raw parquet next():");
-    print_bench_stats(
-        "  no_cache primary_key",
-        &raw_primary_no_cache,
-        config.iterations,
-    );
-    print_bench_stats("  no_cache flat", &raw_flat_no_cache, config.iterations);
-    print_bench_stats("  cache primary_key", &raw_primary_cache, config.iterations);
-    print_bench_stats("  cache flat", &raw_flat_cache, config.iterations);
-
     println!("Wrapped readers:");
-    print_bench_stats(
-        "  no_cache RowGroupReader",
-        &wrapped_primary_no_cache,
-        config.iterations,
-    );
-    print_bench_stats(
-        "  no_cache FlatRowGroupReader",
-        &wrapped_flat_no_cache,
-        config.iterations,
-    );
-    print_bench_stats(
-        "  no_cache FlatRowGroupReader(split)",
-        &wrapped_flat_split_no_cache,
-        config.iterations,
-    );
     print_bench_stats(
         "  cache RowGroupReader",
         &wrapped_primary_cache,
-        config.iterations,
-    );
-    print_bench_stats(
-        "  cache FlatRowGroupReader",
-        &wrapped_flat_cache,
         config.iterations,
     );
     print_bench_stats(
