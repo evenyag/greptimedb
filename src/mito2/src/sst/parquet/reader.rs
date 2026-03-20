@@ -43,8 +43,8 @@ use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, FileId};
 use table::predicate::Predicate;
 
-use crate::cache::CacheStrategy;
 use crate::cache::index::result_cache::PredicateKey;
+use crate::cache::{CacheStrategy, CachedSstMeta};
 #[cfg(feature = "vector_index")]
 use crate::error::ApplyVectorIndexSnafu;
 use crate::error::{
@@ -340,7 +340,7 @@ impl ParquetReaderBuilder {
         let file_size = self.file_handle.meta_ref().file_size;
 
         // Loads parquet metadata of the file.
-        let (parquet_meta, cache_miss) = self
+        let (sst_meta, cache_miss) = self
             .read_parquet_metadata(
                 &file_path,
                 file_size,
@@ -348,9 +348,8 @@ impl ParquetReaderBuilder {
                 self.page_index_policy,
             )
             .await?;
-        // Decodes region metadata.
-        let key_value_meta = parquet_meta.file_metadata().key_value_metadata();
-        let region_meta = Arc::new(Self::get_region_metadata(&file_path, key_value_meta)?);
+        let parquet_meta = sst_meta.parquet_metadata();
+        let region_meta = sst_meta.region_metadata();
         let region_partition_expr_str = self
             .expected_metadata
             .as_ref()
@@ -629,14 +628,14 @@ impl ParquetReaderBuilder {
     }
 
     /// Reads parquet metadata of specific file.
-    /// Returns (metadata, cache_miss_flag).
+    /// Returns (fused metadata, cache_miss_flag).
     async fn read_parquet_metadata(
         &self,
         file_path: &str,
         file_size: u64,
         cache_metrics: &mut MetadataCacheMetrics,
         page_index_policy: PageIndexPolicy,
-    ) -> Result<(Arc<ParquetMetaData>, bool)> {
+    ) -> Result<(Arc<CachedSstMeta>, bool)> {
         let start = Instant::now();
         let _t = READ_STAGE_ELAPSED
             .with_label_values(&["read_parquet_metadata"])
@@ -646,7 +645,7 @@ impl ParquetReaderBuilder {
         // Tries to get from cache with metrics tracking.
         if let Some(metadata) = self
             .cache_strategy
-            .get_parquet_meta_data(file_id, cache_metrics, page_index_policy)
+            .get_sst_meta_data(file_id, cache_metrics, page_index_policy)
             .await
         {
             cache_metrics.metadata_load_cost += start.elapsed();
@@ -659,10 +658,10 @@ impl ParquetReaderBuilder {
         metadata_loader.with_page_index_policy(page_index_policy);
         let metadata = metadata_loader.load(cache_metrics).await?;
 
-        let metadata = Arc::new(metadata);
+        let metadata = Arc::new(CachedSstMeta::try_new(file_path, metadata)?);
         // Cache the metadata.
         self.cache_strategy
-            .put_parquet_meta_data(file_id, metadata.clone());
+            .put_sst_meta_data(file_id, metadata.clone());
 
         cache_metrics.metadata_load_cost += start.elapsed();
         Ok((metadata, true))
@@ -2150,9 +2149,7 @@ impl FlatRowGroupReader {
     }
 
     /// Returns the next FlatRecordBatch.
-    pub(crate) fn next_batch(
-        &mut self,
-    ) -> Result<Option<crate::read::prune::FlatRecordBatch>> {
+    pub(crate) fn next_batch(&mut self) -> Result<Option<crate::read::prune::FlatRecordBatch>> {
         // Return buffered split batch first.
         if let Some(batch) = self.batches.pop_front() {
             return Ok(Some(batch));
