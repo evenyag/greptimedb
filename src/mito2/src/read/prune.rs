@@ -21,6 +21,7 @@ use common_time::Timestamp;
 use datatypes::arrow::array::BooleanArray;
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
+use mito_codec::row_converter::CompositeValues;
 use snafu::ResultExt;
 
 use crate::error::{RecordBatchSnafu, Result};
@@ -245,16 +246,26 @@ impl Iterator for PruneTimeIterator {
     }
 }
 
+/// A flat format record batch with optional decoded primary key values.
+pub(crate) struct FlatRecordBatch {
+    pub(crate) record_batch: RecordBatch,
+    /// Decoded primary key values, available when split by primary key.
+    pub(crate) pk_values: Option<CompositeValues>,
+}
+
 pub enum FlatSource {
     RowGroup(FlatRowGroupReader),
     LastRow(FlatRowGroupLastRowCachedReader),
 }
 
 impl FlatSource {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    fn next_batch(&mut self) -> Result<Option<FlatRecordBatch>> {
         match self {
             FlatSource::RowGroup(r) => r.next_batch(),
-            FlatSource::LastRow(r) => r.next_batch(),
+            FlatSource::LastRow(r) => Ok(r.next_batch()?.map(|b| FlatRecordBatch {
+                record_batch: b,
+                pk_values: None,
+            })),
         }
     }
 }
@@ -307,13 +318,13 @@ impl FlatPruneReader {
     }
 
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        while let Some(record_batch) = self.source.next_batch()? {
+        while let Some(flat_batch) = self.source.next_batch()? {
             // Update metrics for the received batch
-            self.metrics.num_rows += record_batch.num_rows();
+            self.metrics.num_rows += flat_batch.record_batch.num_rows();
             self.metrics.num_batches += 1;
 
             let prune_start = Instant::now();
-            let pruned = self.prune_flat(record_batch)?;
+            let pruned = self.prune_flat(flat_batch)?;
             self.metrics.prune_cost += prune_start.elapsed();
             match pruned {
                 Some(filtered_batch) => {
@@ -329,10 +340,24 @@ impl FlatPruneReader {
     }
 
     /// Prunes batches by the pushed down predicate and returns RecordBatch.
-    fn prune_flat(&mut self, record_batch: RecordBatch) -> Result<Option<RecordBatch>> {
+    fn prune_flat(&mut self, flat_batch: FlatRecordBatch) -> Result<Option<RecordBatch>> {
+        let FlatRecordBatch {
+            record_batch,
+            pk_values,
+        } = flat_batch;
+
         // fast path
         if self.context.filters().is_empty() && !self.context.has_partition_filter() {
             return Ok(Some(record_batch));
+        }
+
+        // If we have decoded PK values, try scalar tag evaluation first to short-circuit.
+        if let Some(pk_values) = &pk_values {
+            if !self.context.base().evaluate_tags_scalar(pk_values)? {
+                let num_rows = record_batch.num_rows();
+                self.metrics.filter_metrics.rows_precise_filtered += num_rows;
+                return Ok(None);
+            }
         }
 
         let num_rows_before_filter = record_batch.num_rows();

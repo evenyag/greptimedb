@@ -471,8 +471,8 @@ impl FlatRowGroupLastRowReader {
             return self.flush_pending();
         }
 
-        while let Some(batch) = self.reader.next_batch()? {
-            self.selector.on_next(batch, &mut self.pending)?;
+        while let Some(flat_batch) = self.reader.next_batch()? {
+            self.selector.on_next(flat_batch.record_batch, &mut self.pending)?;
             if self.pending.is_full() {
                 return self.flush_pending();
             }

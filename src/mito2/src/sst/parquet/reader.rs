@@ -2098,7 +2098,7 @@ where
     }
 }
 
-/// Reader to read a row group of a parquet file in flat format, returning RecordBatch.
+/// Reader to read a row group of a parquet file in flat format, returning FlatRecordBatch.
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
     context: FileRangeContextRef,
@@ -2106,10 +2106,10 @@ pub(crate) struct FlatRowGroupReader {
     reader: ParquetRecordBatchReader,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
-    /// Whether to split batches by timestamp boundaries.
+    /// Whether to split batches by primary key boundaries.
     should_split: bool,
     /// Buffered split batches.
-    batches: VecDeque<RecordBatch>,
+    batches: VecDeque<crate::read::prune::FlatRecordBatch>,
     /// Duration to convert parquet RecordBatches via ReadFormat.
     convert_cost: Duration,
     /// Duration to scan (read from parquet reader + convert).
@@ -2149,8 +2149,10 @@ impl FlatRowGroupReader {
         self.scan_cost
     }
 
-    /// Returns the next RecordBatch.
-    pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    /// Returns the next FlatRecordBatch.
+    pub(crate) fn next_batch(
+        &mut self,
+    ) -> Result<Option<crate::read::prune::FlatRecordBatch>> {
         // Return buffered split batch first.
         if let Some(batch) = self.batches.pop_front() {
             return Ok(Some(batch));
@@ -2172,10 +2174,18 @@ impl FlatRowGroupReader {
                 self.convert_cost += convert_start.elapsed();
 
                 if self.should_split {
-                    crate::read::scan_util::split_record_batch(record_batch, &mut self.batches);
+                    let codec = flat_format.primary_key_codec();
+                    crate::read::scan_util::split_record_batch_by_pk(
+                        record_batch,
+                        codec,
+                        &mut self.batches,
+                    )?;
                     Ok(self.batches.pop_front())
                 } else {
-                    Ok(Some(record_batch))
+                    Ok(Some(crate::read::prune::FlatRecordBatch {
+                        record_batch,
+                        pk_values: None,
+                    }))
                 }
             }
             None => {

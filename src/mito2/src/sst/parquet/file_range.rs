@@ -359,6 +359,11 @@ impl FileRangeContext {
         &self.reader_builder
     }
 
+    /// Returns the base context.
+    pub(crate) fn base(&self) -> &RangeBase {
+        &self.base
+    }
+
     /// Returns the helper to compat batches.
     pub(crate) fn compat_batch(&self) -> Option<&CompatBatch> {
         self.base.compat_batch.as_ref()
@@ -474,6 +479,50 @@ impl TagDecodeState {
 }
 
 impl RangeBase {
+    /// Evaluates all tag filters using scalar values from decoded primary key.
+    /// Returns true if the batch should be kept, false if filtered out.
+    /// This short-circuits: if any tag filter fails, the entire batch is rejected.
+    pub(crate) fn evaluate_tags_scalar(
+        &self,
+        pk_values: &CompositeValues,
+    ) -> Result<bool> {
+        for filter_ctx in &self.filters {
+            if filter_ctx.semantic_type() != SemanticType::Tag {
+                continue;
+            }
+            let filter = match filter_ctx.filter() {
+                MaybeFilter::Filter(f) => f,
+                MaybeFilter::Matched => continue,
+                MaybeFilter::Pruned => return Ok(false),
+            };
+            let pk_value = match pk_values {
+                CompositeValues::Dense(v) => {
+                    let pk_index = self
+                        .read_format
+                        .metadata()
+                        .primary_key_index(filter_ctx.column_id())
+                        .unwrap();
+                    v[pk_index]
+                        .1
+                        .try_to_scalar_value(filter_ctx.data_type())
+                        .context(DataTypeMismatchSnafu)?
+                }
+                CompositeValues::Sparse(v) => {
+                    let v = v.get_or_null(filter_ctx.column_id());
+                    v.try_to_scalar_value(filter_ctx.data_type())
+                        .context(DataTypeMismatchSnafu)?
+                }
+            };
+            if !filter
+                .evaluate_scalar(&pk_value)
+                .context(RecordBatchSnafu)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// TRY THE BEST to perform pushed down predicate precisely on the input batch.
     /// Return the filtered batch. If the entire batch is filtered out, return None.
     ///
@@ -490,58 +539,31 @@ impl RangeBase {
         mut input: Batch,
         skip_fields: bool,
     ) -> Result<Option<Batch>> {
+        // Decode PK and evaluate tag filters using scalar path (short-circuits entire batch).
+        let pk_values = if let Some(pk_values) = input.pk_values() {
+            pk_values.clone()
+        } else {
+            let decoded = self.codec.decode(input.primary_key()).context(DecodeSnafu)?;
+            input.set_pk_values(decoded);
+            input.pk_values().unwrap().clone()
+        };
+        if !self.evaluate_tags_scalar(&pk_values)? {
+            return Ok(None);
+        }
+
         let mut mask = BooleanBuffer::new_set(input.num_rows());
 
-        // Run filter one by one and combine them result
-        // TODO(ruihang): run primary key filter first. It may short circuit other filters
+        // Run non-tag filters
         for filter_ctx in &self.filters {
             let filter = match filter_ctx.filter() {
                 MaybeFilter::Filter(f) => f,
-                // Column matches.
                 MaybeFilter::Matched => continue,
-                // Column doesn't match, filter the entire batch.
                 MaybeFilter::Pruned => return Ok(None),
             };
             let result = match filter_ctx.semantic_type() {
                 SemanticType::Tag => {
-                    let pk_values = if let Some(pk_values) = input.pk_values() {
-                        pk_values
-                    } else {
-                        input.set_pk_values(
-                            self.codec
-                                .decode(input.primary_key())
-                                .context(DecodeSnafu)?,
-                        );
-                        input.pk_values().unwrap()
-                    };
-                    let pk_value = match pk_values {
-                        CompositeValues::Dense(v) => {
-                            // Safety: this is a primary key
-                            let pk_index = self
-                                .read_format
-                                .metadata()
-                                .primary_key_index(filter_ctx.column_id())
-                                .unwrap();
-                            v[pk_index]
-                                .1
-                                .try_to_scalar_value(filter_ctx.data_type())
-                                .context(DataTypeMismatchSnafu)?
-                        }
-                        CompositeValues::Sparse(v) => {
-                            let v = v.get_or_null(filter_ctx.column_id());
-                            v.try_to_scalar_value(filter_ctx.data_type())
-                                .context(DataTypeMismatchSnafu)?
-                        }
-                    };
-                    if filter
-                        .evaluate_scalar(&pk_value)
-                        .context(RecordBatchSnafu)?
-                    {
-                        continue;
-                    } else {
-                        // PK not match means the entire batch is filtered out.
-                        return Ok(None);
-                    }
+                    // Already handled above.
+                    continue;
                 }
                 SemanticType::Field => {
                     // Skip field filters if skip_fields is true

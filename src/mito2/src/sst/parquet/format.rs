@@ -374,8 +374,9 @@ impl ReadFormat {
 
     /// Enables or disables eager decoding of primary key values into batches.
     pub(crate) fn set_decode_primary_key_values(&mut self, decode: bool) {
-        if let ReadFormat::PrimaryKey(format) = self {
-            format.set_decode_primary_key_values(decode);
+        match self {
+            ReadFormat::PrimaryKey(format) => format.set_decode_primary_key_values(decode),
+            ReadFormat::Flat(format) => format.set_decode_primary_key_values(decode),
         }
     }
 

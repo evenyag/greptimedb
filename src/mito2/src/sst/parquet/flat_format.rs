@@ -153,6 +153,8 @@ pub struct FlatReadFormat {
     override_sequence: Option<SequenceNumber>,
     /// Parquet format adapter.
     parquet_adapter: ParquetAdapter,
+    /// Optional primary key codec for decoding primary key values.
+    primary_key_codec: Option<Arc<dyn PrimaryKeyCodec>>,
 }
 
 impl FlatReadFormat {
@@ -192,12 +194,27 @@ impl FlatReadFormat {
         Ok(FlatReadFormat {
             override_sequence: None,
             parquet_adapter,
+            primary_key_codec: None,
         })
     }
 
     /// Sets the sequence number to override.
     pub(crate) fn set_override_sequence(&mut self, sequence: Option<SequenceNumber>) {
         self.override_sequence = sequence;
+    }
+
+    /// Enables or disables eager decoding of primary key values.
+    pub(crate) fn set_decode_primary_key_values(&mut self, decode: bool) {
+        if decode {
+            self.primary_key_codec = Some(build_primary_key_codec(self.metadata()));
+        } else {
+            self.primary_key_codec = None;
+        }
+    }
+
+    /// Returns the primary key codec if set.
+    pub(crate) fn primary_key_codec(&self) -> Option<&Arc<dyn PrimaryKeyCodec>> {
+        self.primary_key_codec.as_ref()
     }
 
     /// Index of a column in the projected batch by its column id.
