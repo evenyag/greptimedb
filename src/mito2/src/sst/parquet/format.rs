@@ -1419,7 +1419,9 @@ mod tests {
 
         // Test without override sequence - should return clone
         let mut flat_batches = std::collections::VecDeque::new();
-        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        format
+            .convert_batch(record_batch.clone(), None, false, &mut flat_batches)
+            .unwrap();
         let result = flat_batches.pop_front().unwrap().record_batch;
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
@@ -1435,7 +1437,12 @@ mod tests {
         let override_sequence_array = format.new_override_sequence_array(num_rows).unwrap();
         flat_batches.clear();
         format
-            .convert_batch(record_batch, Some(&override_sequence_array), false, &mut flat_batches)
+            .convert_batch(
+                record_batch,
+                Some(&override_sequence_array),
+                false,
+                &mut flat_batches,
+            )
             .unwrap();
         let result = flat_batches.pop_front().unwrap().record_batch;
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
@@ -1671,7 +1678,9 @@ mod tests {
 
         // Test conversion with dense encoding
         let mut flat_batches = std::collections::VecDeque::new();
-        format.convert_batch(record_batch, None, false, &mut flat_batches).unwrap();
+        format
+            .convert_batch(record_batch, None, false, &mut flat_batches)
+            .unwrap();
         let result = flat_batches.pop_front().unwrap().record_batch;
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
@@ -1761,7 +1770,9 @@ mod tests {
 
         // Test conversion with sparse encoding
         let mut flat_batches = std::collections::VecDeque::new();
-        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        format
+            .convert_batch(record_batch.clone(), None, false, &mut flat_batches)
+            .unwrap();
         let result = flat_batches.pop_front().unwrap().record_batch;
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
@@ -1797,7 +1808,9 @@ mod tests {
                 .unwrap();
         // Test conversion with sparse encoding and skip convert.
         flat_batches.clear();
-        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        format
+            .convert_batch(record_batch.clone(), None, false, &mut flat_batches)
+            .unwrap();
         let result = flat_batches.pop_front().unwrap().record_batch;
         assert_eq!(record_batch, result);
     }

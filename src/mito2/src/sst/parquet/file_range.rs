@@ -219,14 +219,14 @@ impl FileRange {
                 self.file_handle().file_id().file_id(),
                 self.row_group_idx,
                 self.context.reader_builder.cache_strategy().clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader),
+                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx),
             );
             PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
         } else {
             // Row group contains DELETE, fallback to default reader.
             PruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader),
+                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx),
                 skip_fields,
             )
         };
@@ -276,8 +276,12 @@ impl FileRange {
         let skip_fields = self.context.should_skip_fields(self.row_group_idx);
 
         let flat_prune_reader = if use_last_row_reader {
-            let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader, should_split);
+            let flat_row_group_reader = FlatRowGroupReader::new(
+                self.context.clone(),
+                parquet_reader,
+                should_split,
+                self.row_group_idx,
+            );
             let reader = FlatRowGroupLastRowCachedReader::new(
                 self.file_handle().file_id().file_id(),
                 self.row_group_idx,
@@ -287,8 +291,12 @@ impl FileRange {
             );
             FlatPruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
         } else {
-            let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader, should_split);
+            let flat_row_group_reader = FlatRowGroupReader::new(
+                self.context.clone(),
+                parquet_reader,
+                should_split,
+                self.row_group_idx,
+            );
             FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 flat_row_group_reader,
@@ -495,10 +503,7 @@ impl RangeBase {
     /// Evaluates all tag filters using scalar values from decoded primary key.
     /// Returns true if the batch should be kept, false if filtered out.
     /// This short-circuits: if any tag filter fails, the entire batch is rejected.
-    pub(crate) fn evaluate_tags_scalar(
-        &self,
-        pk_values: &CompositeValues,
-    ) -> Result<bool> {
+    pub(crate) fn evaluate_tags_scalar(&self, pk_values: &CompositeValues) -> Result<bool> {
         for filter_ctx in &self.filters {
             if filter_ctx.semantic_type() != SemanticType::Tag {
                 continue;
@@ -556,7 +561,10 @@ impl RangeBase {
         let pk_values = if let Some(pk_values) = input.pk_values() {
             pk_values.clone()
         } else {
-            let decoded = self.codec.decode(input.primary_key()).context(DecodeSnafu)?;
+            let decoded = self
+                .codec
+                .decode(input.primary_key())
+                .context(DecodeSnafu)?;
             input.set_pk_values(decoded);
             input.pk_values().unwrap().clone()
         };
@@ -740,8 +748,7 @@ impl RangeBase {
                 &input,
                 flat_format,
             )?;
-            let partition_mask =
-                self.evaluate_partition_filter(&record_batch, partition_filter)?;
+            let partition_mask = self.evaluate_partition_filter(&record_batch, partition_filter)?;
             mask = mask.bitand(&partition_mask);
         }
 
@@ -775,9 +782,7 @@ impl RangeBase {
         let mut columns = Vec::with_capacity(arrow_schema.fields().len());
 
         for field in arrow_schema.fields() {
-            let column_id = metadata
-                .column_by_name(field.name())
-                .map(|c| c.column_id);
+            let column_id = metadata.column_by_name(field.name()).map(|c| c.column_id);
 
             let Some(column_id) = column_id else {
                 return UnexpectedSnafu {

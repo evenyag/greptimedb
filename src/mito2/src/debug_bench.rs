@@ -675,8 +675,16 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         for _ in 0..config.iterations {
             let start = Instant::now();
             for batch in &flat_raw_batches {
-                flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref(), false, &mut flat_batches)?;
-                convert_flat_rows += flat_batches.drain(..).map(|b| b.record_batch.num_rows()).sum::<usize>();
+                flat_format.convert_batch(
+                    batch.clone(),
+                    flat_override_seq.as_ref(),
+                    false,
+                    &mut flat_batches,
+                )?;
+                convert_flat_rows += flat_batches
+                    .drain(..)
+                    .map(|b| b.record_batch.num_rows())
+                    .sum::<usize>();
             }
             total_convert_flat += start.elapsed();
         }
@@ -721,7 +729,12 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         let mut converted_flat_batches = Vec::new();
         let mut flat_batches = std::collections::VecDeque::new();
         for batch in &flat_raw_batches {
-            flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref(), false, &mut flat_batches)?;
+            flat_format.convert_batch(
+                batch.clone(),
+                flat_override_seq.as_ref(),
+                false,
+                &mut flat_batches,
+            )?;
             converted_flat_batches.extend(flat_batches.drain(..).map(|b| b.record_batch));
         }
 
@@ -740,7 +753,9 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         for _ in 0..config.iterations {
             let start = Instant::now();
             for batch in &converted_flat_batches {
-                if let Some(filtered) = flat_context.precise_filter_flat(batch.clone(), false, false)? {
+                if let Some(filtered) =
+                    flat_context.precise_filter_flat(batch.clone(), false, false)?
+                {
                     filter_flat_output_rows += filtered.num_rows();
                 }
             }

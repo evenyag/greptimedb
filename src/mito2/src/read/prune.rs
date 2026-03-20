@@ -399,13 +399,12 @@ impl FlatPruneReader {
 
             // Assemble tags AFTER filtering (fewer rows = cheaper).
             let flat_format = self.context.read_format().as_flat().unwrap();
-            let assembled =
-                flat_format.assemble_tags_from_pk_values(filtered_batch, pk_values)?;
+            let assembled = flat_format.assemble_tags_from_pk_values(filtered_batch, pk_values)?;
             Ok(Some(assembled))
         } else {
-            let Some(filtered_batch) = self
-                .context
-                .precise_filter_flat(record_batch, self.skip_fields, skip_tags)?
+            let Some(filtered_batch) =
+                self.context
+                    .precise_filter_flat(record_batch, self.skip_fields, skip_tags)?
             else {
                 self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
                 return Ok(None);

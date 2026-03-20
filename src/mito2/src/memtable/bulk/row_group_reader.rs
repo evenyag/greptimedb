@@ -124,6 +124,10 @@ impl RowGroupReaderContext for BulkIterContextRef {
     fn read_format(&self) -> &ReadFormat {
         self.as_ref().read_format()
     }
+
+    fn file_path(&self) -> &str {
+        "bulk-memtable"
+    }
 }
 
 pub(crate) struct MemtableRowGroupReaderBuilder {

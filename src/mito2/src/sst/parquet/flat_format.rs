@@ -315,11 +315,8 @@ impl FlatReadFormat {
         if split {
             self.convert_batch_split(record_batch, override_sequence_array, batches)
         } else {
-            let batch = self.convert_and_override_sequence(
-                record_batch,
-                override_sequence_array,
-                None,
-            )?;
+            let batch =
+                self.convert_and_override_sequence(record_batch, override_sequence_array, None)?;
             batches.push_back(crate::read::prune::FlatRecordBatch {
                 record_batch: batch,
                 pk_values: None,
@@ -390,8 +387,7 @@ impl FlatReadFormat {
             let (converted, needs_assembly) = if pk_values.is_some()
                 && matches!(&self.parquet_adapter, ParquetAdapter::PrimaryKeyToFlat(_))
             {
-                let batch =
-                    Self::apply_sequence_override(sliced, override_sequence_array)?;
+                let batch = Self::apply_sequence_override(sliced, override_sequence_array)?;
                 (batch, true)
             } else {
                 let batch = self.convert_and_override_sequence(
@@ -521,9 +517,7 @@ impl FlatReadFormat {
         pk_values: &CompositeValues,
     ) -> Result<RecordBatch> {
         match &self.parquet_adapter {
-            ParquetAdapter::PrimaryKeyToFlat(p) => {
-                p.convert_batch_with_pk_values(batch, pk_values)
-            }
+            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch_with_pk_values(batch, pk_values),
             _ => Ok(batch),
         }
     }
@@ -532,14 +526,13 @@ impl FlatReadFormat {
     ///
     /// This delegates to `PrimaryKeyReadFormat.field_id_to_projected_index()` which
     /// maps column IDs to their positions in the raw PK-format batch.
-    pub(crate) fn pk_format_projected_index_by_id(
-        &self,
-        column_id: ColumnId,
-    ) -> Option<usize> {
+    pub(crate) fn pk_format_projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
         match &self.parquet_adapter {
-            ParquetAdapter::PrimaryKeyToFlat(p) => {
-                p.format.field_id_to_projected_index().get(&column_id).copied()
-            }
+            ParquetAdapter::PrimaryKeyToFlat(p) => p
+                .format
+                .field_id_to_projected_index()
+                .get(&column_id)
+                .copied(),
             _ => None,
         }
     }

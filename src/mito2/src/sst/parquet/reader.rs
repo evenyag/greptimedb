@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
-use common_telemetry::{tracing, warn};
+use common_telemetry::{info, tracing, warn};
 use datafusion_expr::Expr;
 use datatypes::arrow::array::ArrayRef;
 use datatypes::arrow::datatypes::Field;
@@ -1908,7 +1908,7 @@ impl ParquetReader {
             let skip_fields = self.context.should_skip_fields(row_group_idx);
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader, false),
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, false, row_group_idx),
                 skip_fields,
             ));
         }
@@ -1935,7 +1935,7 @@ impl ParquetReader {
             let skip_fields = context.should_skip_fields(row_group_idx);
             Some(FlatPruneReader::new_with_row_group_reader(
                 context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader, false),
+                FlatRowGroupReader::new(context.clone(), parquet_reader, false, row_group_idx),
                 skip_fields,
             ))
         } else {
@@ -1969,6 +1969,8 @@ pub(crate) trait RowGroupReaderContext: Send {
     ) -> Result<Option<RecordBatch>>;
 
     fn read_format(&self) -> &ReadFormat;
+
+    fn file_path(&self) -> &str;
 }
 
 impl RowGroupReaderContext for FileRangeContextRef {
@@ -1984,6 +1986,10 @@ impl RowGroupReaderContext for FileRangeContextRef {
     fn read_format(&self) -> &ReadFormat {
         self.as_ref().read_format()
     }
+
+    fn file_path(&self) -> &str {
+        FileRangeContext::file_path(self)
+    }
 }
 
 /// [RowGroupReader] that reads from [FileRange].
@@ -1991,8 +1997,12 @@ pub(crate) type RowGroupReader = RowGroupReaderBase<FileRangeContextRef>;
 
 impl RowGroupReader {
     /// Creates a new reader from file range.
-    pub(crate) fn new(context: FileRangeContextRef, reader: ParquetRecordBatchReader) -> Self {
-        Self::create(context, reader)
+    pub(crate) fn new(
+        context: FileRangeContextRef,
+        reader: ParquetRecordBatchReader,
+        row_group_idx: usize,
+    ) -> Self {
+        Self::create(context, reader, row_group_idx)
     }
 }
 
@@ -2008,6 +2018,10 @@ pub(crate) struct RowGroupReaderBase<T> {
     metrics: ReaderMetrics,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Index of the row group being read.
+    row_group_idx: usize,
+    /// File path for logging on drop.
+    file_path: String,
 }
 
 impl<T> RowGroupReaderBase<T>
@@ -2015,12 +2029,17 @@ where
     T: RowGroupReaderContext,
 {
     /// Creates a new reader to read the primary key format.
-    pub(crate) fn create(context: T, reader: ParquetRecordBatchReader) -> Self {
+    pub(crate) fn create(
+        context: T,
+        reader: ParquetRecordBatchReader,
+        row_group_idx: usize,
+    ) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
         assert!(context.read_format().as_primary_key().is_some());
+        let file_path = context.file_path().to_string();
 
         Self {
             context,
@@ -2028,6 +2047,8 @@ where
             batches: VecDeque::new(),
             metrics: ReaderMetrics::default(),
             override_sequence,
+            row_group_idx,
+            file_path,
         }
     }
 
@@ -2097,6 +2118,22 @@ where
     }
 }
 
+impl<T> Drop for RowGroupReaderBase<T> {
+    fn drop(&mut self) {
+        info!(
+            "RowGroupReader finished, file: {}, row_group: {}, scan_cost: {:?}, convert_cost: {:?}, \
+             num_record_batches: {}, num_batches: {}, num_rows: {}",
+            self.file_path,
+            self.row_group_idx,
+            self.metrics.scan_cost,
+            self.metrics.convert_cost,
+            self.metrics.num_record_batches,
+            self.metrics.num_batches,
+            self.metrics.num_rows,
+        );
+    }
+}
+
 /// Reader to read a row group of a parquet file in flat format, returning FlatRecordBatch.
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
@@ -2113,6 +2150,14 @@ pub(crate) struct FlatRowGroupReader {
     convert_cost: Duration,
     /// Duration to scan (read from parquet reader + convert).
     scan_cost: Duration,
+    /// Index of the row group being read.
+    row_group_idx: usize,
+    /// Number of record batches fetched from the parquet reader.
+    num_record_batches: usize,
+    /// Number of flat batches produced.
+    num_batches: usize,
+    /// Number of rows read.
+    num_rows: usize,
 }
 
 impl FlatRowGroupReader {
@@ -2121,6 +2166,7 @@ impl FlatRowGroupReader {
         context: FileRangeContextRef,
         reader: ParquetRecordBatchReader,
         should_split: bool,
+        row_group_idx: usize,
     ) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
@@ -2135,6 +2181,10 @@ impl FlatRowGroupReader {
             batches: VecDeque::new(),
             convert_cost: Duration::default(),
             scan_cost: Duration::default(),
+            row_group_idx,
+            num_record_batches: 0,
+            num_batches: 0,
+            num_rows: 0,
         }
     }
 
@@ -2152,6 +2202,8 @@ impl FlatRowGroupReader {
     pub(crate) fn next_batch(&mut self) -> Result<Option<crate::read::prune::FlatRecordBatch>> {
         // Return buffered split batch first.
         if let Some(batch) = self.batches.pop_front() {
+            self.num_rows += batch.record_batch.num_rows();
+            self.num_batches += 1;
             return Ok(Some(batch));
         }
 
@@ -2162,6 +2214,7 @@ impl FlatRowGroupReader {
                     path: self.context.file_path(),
                 })?;
                 self.scan_cost += scan_start.elapsed();
+                self.num_record_batches += 1;
 
                 // Safety: Only flat format uses FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
@@ -2174,13 +2227,34 @@ impl FlatRowGroupReader {
                 )?;
                 self.convert_cost += convert_start.elapsed();
 
-                Ok(self.batches.pop_front())
+                let batch = self.batches.pop_front();
+                if let Some(b) = &batch {
+                    self.num_rows += b.record_batch.num_rows();
+                    self.num_batches += 1;
+                }
+                Ok(batch)
             }
             None => {
                 self.scan_cost += scan_start.elapsed();
                 Ok(None)
             }
         }
+    }
+}
+
+impl Drop for FlatRowGroupReader {
+    fn drop(&mut self) {
+        info!(
+            "FlatRowGroupReader finished, file: {}, row_group: {}, scan_cost: {:?}, convert_cost: {:?}, \
+             num_record_batches: {}, num_batches: {}, num_rows: {}",
+            self.context.file_path(),
+            self.row_group_idx,
+            self.scan_cost,
+            self.convert_cost,
+            self.num_record_batches,
+            self.num_batches,
+            self.num_rows,
+        );
     }
 }
 
