@@ -820,7 +820,7 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         for _ in 0..config.iterations {
             let start = Instant::now();
             for batch in &converted_flat_batches {
-                if let Some(filtered) = flat_context.precise_filter_flat(batch.clone(), false)? {
+                if let Some(filtered) = flat_context.precise_filter_flat(batch.clone(), false, false)? {
                     filter_flat_output_rows += filtered.num_rows();
                 }
             }

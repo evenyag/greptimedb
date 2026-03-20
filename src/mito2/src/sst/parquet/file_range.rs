@@ -392,8 +392,9 @@ impl FileRangeContext {
         &self,
         input: RecordBatch,
         skip_fields: bool,
+        skip_tags: bool,
     ) -> Result<Option<RecordBatch>> {
-        self.base.precise_filter_flat(input, skip_fields)
+        self.base.precise_filter_flat(input, skip_fields, skip_tags)
     }
 
     /// Determines whether to skip field filters based on PreFilterMode and row group delete status.
@@ -619,13 +620,16 @@ impl RangeBase {
     /// # Arguments
     /// * `input` - The RecordBatch to filter
     /// * `skip_fields` - Whether to skip field filters based on PreFilterMode and row group delete status
+    /// * `skip_tags` - Whether to skip tag filters (e.g., when tags have already been evaluated via `evaluate_tags_scalar`)
     pub(crate) fn precise_filter_flat(
         &self,
         input: RecordBatch,
         skip_fields: bool,
+        skip_tags: bool,
     ) -> Result<Option<RecordBatch>> {
         let mut tag_decode_state = TagDecodeState::new();
-        let mask = self.compute_filter_mask_flat(&input, skip_fields, &mut tag_decode_state)?;
+        let mask =
+            self.compute_filter_mask_flat(&input, skip_fields, skip_tags, &mut tag_decode_state)?;
 
         // If mask is None, the entire batch is filtered out
         let Some(mut mask) = mask else {
@@ -666,10 +670,12 @@ impl RangeBase {
     /// # Arguments
     /// * `input` - The RecordBatch to compute mask for
     /// * `skip_fields` - Whether to skip field filters based on PreFilterMode and row group delete status
+    /// * `skip_tags` - Whether to skip tag filters (e.g., when tags have already been evaluated via `evaluate_tags_scalar`)
     pub(crate) fn compute_filter_mask_flat(
         &self,
         input: &RecordBatch,
         skip_fields: bool,
+        skip_tags: bool,
         tag_decode_state: &mut TagDecodeState,
     ) -> Result<Option<BooleanBuffer>> {
         let mut mask = BooleanBuffer::new_set(input.num_rows());
@@ -694,6 +700,11 @@ impl RangeBase {
 
             // Skip field filters if skip_fields is true
             if skip_fields && filter_ctx.semantic_type() == SemanticType::Field {
+                continue;
+            }
+
+            // Skip tag filters if skip_tags is true (already evaluated via evaluate_tags_scalar)
+            if skip_tags && filter_ctx.semantic_type() == SemanticType::Tag {
                 continue;
             }
 

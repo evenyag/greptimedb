@@ -352,18 +352,21 @@ impl FlatPruneReader {
         }
 
         // If we have decoded PK values, try scalar tag evaluation first to short-circuit.
-        if let Some(pk_values) = &pk_values {
+        let skip_tags = if let Some(pk_values) = &pk_values {
             if !self.context.base().evaluate_tags_scalar(pk_values)? {
                 let num_rows = record_batch.num_rows();
                 self.metrics.filter_metrics.rows_precise_filtered += num_rows;
                 return Ok(None);
             }
-        }
+            true
+        } else {
+            false
+        };
 
         let num_rows_before_filter = record_batch.num_rows();
         let Some(filtered_batch) = self
             .context
-            .precise_filter_flat(record_batch, self.skip_fields)?
+            .precise_filter_flat(record_batch, self.skip_fields, skip_tags)?
         else {
             // the entire batch is filtered out
             self.metrics.filter_metrics.rows_precise_filtered += num_rows_before_filter;
