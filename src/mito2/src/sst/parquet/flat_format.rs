@@ -921,15 +921,18 @@ impl FlatConvertFormat {
             }
             let scalar_array = builder.to_vector().to_arrow_array();
 
-            // Repeat the single value for all rows.
-            if num_rows == 1 {
-                decoded_columns.push(scalar_array);
+            // String tag columns are stored as Dictionary(UInt32, Utf8) in the schema,
+            // so wrap the scalar value in a dictionary array instead of repeating it.
+            let column = if data_type.is_string() {
+                let keys = UInt32Array::from_value(0, num_rows);
+                Arc::new(DictionaryArray::new(keys, scalar_array)) as ArrayRef
+            } else if num_rows == 1 {
+                scalar_array
             } else {
                 let indices = UInt32Array::from_value(0, num_rows);
-                let taken =
-                    take(&scalar_array, &indices, None).context(ComputeArrowSnafu)?;
-                decoded_columns.push(taken);
-            }
+                take(&scalar_array, &indices, None).context(ComputeArrowSnafu)?
+            };
+            decoded_columns.push(column);
         }
 
         self.assemble_batch(batch, decoded_columns)
