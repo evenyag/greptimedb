@@ -709,12 +709,12 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         let flat_override_seq = flat_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
         let mut total_convert_flat = Duration::ZERO;
         let mut convert_flat_rows = 0usize;
+        let mut flat_batches = std::collections::VecDeque::new();
         for _ in 0..config.iterations {
             let start = Instant::now();
             for batch in &flat_raw_batches {
-                let converted =
-                    flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref())?;
-                convert_flat_rows += converted.num_rows();
+                flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref(), false, &mut flat_batches)?;
+                convert_flat_rows += flat_batches.drain(..).map(|b| b.record_batch.num_rows()).sum::<usize>();
             }
             total_convert_flat += start.elapsed();
         }
@@ -757,9 +757,10 @@ pub async fn run_convert_and_filter_bench_from_env() -> Result<()> {
         let flat_format = flat_context.read_format().as_flat().unwrap();
         let flat_override_seq = flat_format.new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
         let mut converted_flat_batches = Vec::new();
+        let mut flat_batches = std::collections::VecDeque::new();
         for batch in &flat_raw_batches {
-            let converted = flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref())?;
-            converted_flat_batches.push(converted);
+            flat_format.convert_batch(batch.clone(), flat_override_seq.as_ref(), false, &mut flat_batches)?;
+            converted_flat_batches.extend(flat_batches.drain(..).map(|b| b.record_batch));
         }
 
         let pk_format = pk_context.read_format().as_primary_key().unwrap();

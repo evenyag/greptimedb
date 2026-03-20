@@ -2166,27 +2166,18 @@ impl FlatRowGroupReader {
                 })?;
                 self.scan_cost += scan_start.elapsed();
 
-                // Safety: Only flat format use FlatRowGroupReader.
+                // Safety: Only flat format uses FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
                 let convert_start = Instant::now();
-                let record_batch =
-                    flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
+                flat_format.convert_batch(
+                    record_batch,
+                    self.override_sequence.as_ref(),
+                    self.should_split,
+                    &mut self.batches,
+                )?;
                 self.convert_cost += convert_start.elapsed();
 
-                if self.should_split {
-                    let codec = flat_format.primary_key_codec();
-                    crate::read::scan_util::split_record_batch_by_pk(
-                        record_batch,
-                        codec,
-                        &mut self.batches,
-                    )?;
-                    Ok(self.batches.pop_front())
-                } else {
-                    Ok(Some(crate::read::prune::FlatRecordBatch {
-                        record_batch,
-                        pk_values: None,
-                    }))
-                }
+                Ok(self.batches.pop_front())
             }
             None => {
                 self.scan_cost += scan_start.elapsed();

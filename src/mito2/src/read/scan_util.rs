@@ -29,7 +29,7 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
-use snafu::{OptionExt, ResultExt};
+use snafu::OptionExt;
 use store_api::storage::RegionId;
 
 use crate::error::{Result, UnexpectedSnafu};
@@ -50,7 +50,7 @@ use crate::sst::index::fulltext_index::applier::FulltextIndexApplyMetrics;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplyMetrics;
 use crate::sst::parquet::DEFAULT_ROW_GROUP_SIZE;
 use crate::sst::parquet::file_range::FileRange;
-use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
+use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderFilterMetrics, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
@@ -1690,74 +1690,6 @@ where
             // Continue the loop to return the first split batch
         }
     }
-}
-
-/// Splits a flat format record batch by primary key boundaries and optionally decodes the primary key.
-///
-/// Each resulting `FlatRecordBatch` contains rows with the same primary key.
-/// If a `codec` is provided, the primary key bytes are decoded into `CompositeValues`.
-pub(crate) fn split_record_batch_by_pk(
-    record_batch: RecordBatch,
-    codec: Option<&std::sync::Arc<dyn mito_codec::row_converter::PrimaryKeyCodec>>,
-    batches: &mut VecDeque<crate::read::prune::FlatRecordBatch>,
-) -> Result<()> {
-    use crate::sst::parquet::format::{PrimaryKeyArray, primary_key_offsets};
-
-    let batch_rows = record_batch.num_rows();
-    if batch_rows == 0 {
-        return Ok(());
-    }
-
-    let pk_col_idx = primary_key_column_index(record_batch.num_columns());
-    let pk_dict_array = record_batch
-        .column(pk_col_idx)
-        .as_any()
-        .downcast_ref::<PrimaryKeyArray>()
-        .context(UnexpectedSnafu {
-            reason: "Primary key column is not a dictionary array in flat batch",
-        })?;
-
-    let offsets = primary_key_offsets(pk_dict_array)?;
-    if offsets.len() <= 1 {
-        return Ok(());
-    }
-
-    // Get the values array for decoding
-    let pk_values_array = pk_dict_array
-        .values()
-        .as_any()
-        .downcast_ref::<datatypes::arrow::array::BinaryArray>();
-    let pk_keys = pk_dict_array.keys();
-
-    for (i, &start) in offsets[..offsets.len() - 1].iter().enumerate() {
-        let end = offsets[i + 1];
-        let len = end - start;
-        let sliced = record_batch.slice(start, len);
-
-        let pk_values = if let Some(codec) = codec {
-            // Get the dictionary key for this segment's primary key
-            let key_index = pk_keys.value(start) as usize;
-            if let Some(values_array) = pk_values_array {
-                let pk_bytes = values_array.value(key_index);
-                Some(
-                    codec
-                        .decode(pk_bytes)
-                        .context(crate::error::DecodeSnafu)?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        batches.push_back(crate::read::prune::FlatRecordBatch {
-            record_batch: sliced,
-            pk_values,
-        });
-    }
-
-    Ok(())
 }
 
 /// Splits the batch by timestamps.

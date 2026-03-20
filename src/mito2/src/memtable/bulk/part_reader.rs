@@ -357,7 +357,9 @@ fn apply_combined_filters(
 ) -> error::Result<Option<RecordBatch>> {
     // Converts the format to the flat format first.
     let format = context.read_format().as_flat().unwrap();
-    let record_batch = format.convert_batch(record_batch, None)?;
+    let mut flat_batches = std::collections::VecDeque::new();
+    format.convert_batch(record_batch, None, false, &mut flat_batches)?;
+    let record_batch = flat_batches.pop_front().unwrap().record_batch;
 
     let num_rows = record_batch.num_rows();
     let mut combined_filter = None;

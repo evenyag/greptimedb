@@ -1418,7 +1418,9 @@ mod tests {
             RecordBatch::try_new(format.arrow_schema().clone(), test_columns).unwrap();
 
         // Test without override sequence - should return clone
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        let mut flat_batches = std::collections::VecDeque::new();
+        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        let result = flat_batches.pop_front().unwrap().record_batch;
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
             .as_any()
@@ -1431,9 +1433,11 @@ mod tests {
         // Set override sequence and test with new_override_sequence_array
         format.set_override_sequence(Some(override_sequence));
         let override_sequence_array = format.new_override_sequence_array(num_rows).unwrap();
-        let result = format
-            .convert_batch(record_batch, Some(&override_sequence_array))
+        flat_batches.clear();
+        format
+            .convert_batch(record_batch, Some(&override_sequence_array), false, &mut flat_batches)
             .unwrap();
+        let result = flat_batches.pop_front().unwrap().record_batch;
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
             .as_any()
@@ -1666,7 +1670,9 @@ mod tests {
         let record_batch = RecordBatch::try_new(old_schema, columns).unwrap();
 
         // Test conversion with dense encoding
-        let result = format.convert_batch(record_batch, None).unwrap();
+        let mut flat_batches = std::collections::VecDeque::new();
+        format.convert_batch(record_batch, None, false, &mut flat_batches).unwrap();
+        let result = flat_batches.pop_front().unwrap().record_batch;
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
         let expected_columns: Vec<ArrayRef> = vec![
@@ -1754,7 +1760,9 @@ mod tests {
         let record_batch = RecordBatch::try_new(old_schema, columns).unwrap();
 
         // Test conversion with sparse encoding
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        let mut flat_batches = std::collections::VecDeque::new();
+        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        let result = flat_batches.pop_front().unwrap().record_batch;
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
         let tag0_array = Arc::new(DictionaryArray::new(
@@ -1788,7 +1796,9 @@ mod tests {
             FlatReadFormat::new(metadata.clone(), column_ids.into_iter(), None, "test", true)
                 .unwrap();
         // Test conversion with sparse encoding and skip convert.
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        flat_batches.clear();
+        format.convert_batch(record_batch.clone(), None, false, &mut flat_batches).unwrap();
+        let result = flat_batches.pop_front().unwrap().record_batch;
         assert_eq!(record_batch, result);
     }
 

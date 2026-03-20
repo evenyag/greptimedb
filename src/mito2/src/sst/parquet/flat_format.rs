@@ -212,11 +212,6 @@ impl FlatReadFormat {
         }
     }
 
-    /// Returns the primary key codec if set.
-    pub(crate) fn primary_key_codec(&self) -> Option<&Arc<dyn PrimaryKeyCodec>> {
-        self.primary_key_codec.as_ref()
-    }
-
     /// Index of a column in the projected batch by its column id.
     pub fn projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
         self.format_projection()
@@ -307,20 +302,133 @@ impl FlatReadFormat {
 
     /// Convert a record batch to apply flat format conversion and override sequence array.
     ///
-    /// Returns a new RecordBatch with flat format conversion applied first (if enabled),
-    /// then the sequence column replaced by the override sequence array.
+    /// When `split` is true, splits the batch by primary key boundaries, decodes
+    /// primary key values, and produces one `FlatRecordBatch` per primary key.
+    /// When false, produces a single `FlatRecordBatch` with `pk_values: None`.
     pub(crate) fn convert_batch(
         &self,
         record_batch: RecordBatch,
         override_sequence_array: Option<&ArrayRef>,
+        split: bool,
+        batches: &mut std::collections::VecDeque<crate::read::prune::FlatRecordBatch>,
+    ) -> Result<()> {
+        if split {
+            self.convert_batch_split(record_batch, override_sequence_array, batches)
+        } else {
+            let batch = self.convert_and_override_sequence(
+                record_batch,
+                override_sequence_array,
+                None,
+            )?;
+            batches.push_back(crate::read::prune::FlatRecordBatch {
+                record_batch: batch,
+                pk_values: None,
+            });
+            Ok(())
+        }
+    }
+
+    /// Splits the record batch by primary key boundaries, converts each slice,
+    /// and decodes primary key values.
+    fn convert_batch_split(
+        &self,
+        record_batch: RecordBatch,
+        override_sequence_array: Option<&ArrayRef>,
+        batches: &mut std::collections::VecDeque<crate::read::prune::FlatRecordBatch>,
+    ) -> Result<()> {
+        use crate::sst::parquet::format::primary_key_offsets;
+
+        let batch_rows = record_batch.num_rows();
+        if batch_rows == 0 {
+            return Ok(());
+        }
+
+        // Split by PK boundaries on the raw batch (before format conversion).
+        let pk_col_idx = primary_key_column_index(record_batch.num_columns());
+        let pk_dict_array = record_batch
+            .column(pk_col_idx)
+            .as_any()
+            .downcast_ref::<PrimaryKeyArray>()
+            .context(InvalidRecordBatchSnafu {
+                reason: "Primary key column is not a dictionary array in flat batch",
+            })?;
+
+        let offsets = primary_key_offsets(pk_dict_array)?;
+        if offsets.len() <= 1 {
+            return Ok(());
+        }
+
+        // Get PK values array for decoding.
+        let pk_values_array = pk_dict_array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>();
+        let pk_keys = pk_dict_array.keys();
+
+        for (i, &start) in offsets[..offsets.len() - 1].iter().enumerate() {
+            let end = offsets[i + 1];
+            let len = end - start;
+            let sliced = record_batch.slice(start, len);
+
+            // Decode PK values if codec is available.
+            let pk_values = if let Some(codec) = &self.primary_key_codec {
+                if let Some(values_array) = pk_values_array {
+                    let key_index = pk_keys.value(start) as usize;
+                    let pk_bytes = values_array.value(key_index);
+                    Some(codec.decode(pk_bytes).context(DecodeSnafu)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Apply format conversion and sequence override.
+            // Pass pk_values to avoid double-decoding in PrimaryKeyToFlat path.
+            let converted = self.convert_and_override_sequence(
+                sliced,
+                override_sequence_array,
+                pk_values.as_ref(),
+            )?;
+
+            batches.push_back(crate::read::prune::FlatRecordBatch {
+                record_batch: converted,
+                pk_values,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Applies format conversion (if needed) and sequence override.
+    ///
+    /// When `pk_values` is provided and the adapter is `PrimaryKeyToFlat`,
+    /// uses pre-decoded values to avoid decoding the primary key again.
+    fn convert_and_override_sequence(
+        &self,
+        record_batch: RecordBatch,
+        override_sequence_array: Option<&ArrayRef>,
+        pk_values: Option<&CompositeValues>,
     ) -> Result<RecordBatch> {
-        // First, apply flat format conversion.
         let batch = match &self.parquet_adapter {
             ParquetAdapter::Flat(_) => record_batch,
-            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch)?,
+            ParquetAdapter::PrimaryKeyToFlat(p) => {
+                if let Some(pk_values) = pk_values {
+                    p.convert_batch_with_pk_values(record_batch, pk_values)?
+                } else {
+                    p.convert_batch(record_batch)?
+                }
+            }
         };
 
-        // Then apply sequence override if provided
+        Self::apply_sequence_override(batch, override_sequence_array)
+    }
+
+    /// Applies sequence override to a batch.
+    fn apply_sequence_override(
+        batch: RecordBatch,
+        override_sequence_array: Option<&ArrayRef>,
+    ) -> Result<RecordBatch> {
         let Some(override_array) = override_sequence_array else {
             return Ok(batch);
         };
@@ -328,7 +436,6 @@ impl FlatReadFormat {
         let mut columns = batch.columns().to_vec();
         let sequence_column_idx = sequence_column_index(batch.num_columns());
 
-        // Use the provided override sequence array, slicing if necessary to match batch length
         let sequence_array = if override_array.len() > batch.num_rows() {
             override_array.slice(0, batch.num_rows())
         } else {
@@ -462,6 +569,20 @@ impl ParquetPrimaryKeyToFlat {
     fn convert_batch(&self, record_batch: RecordBatch) -> Result<RecordBatch> {
         if let Some(convert_format) = &self.convert_format {
             convert_format.convert(record_batch)
+        } else {
+            Ok(record_batch)
+        }
+    }
+
+    /// Converts a single-PK slice using pre-decoded `CompositeValues` to avoid
+    /// decoding the primary key again.
+    fn convert_batch_with_pk_values(
+        &self,
+        record_batch: RecordBatch,
+        pk_values: &CompositeValues,
+    ) -> Result<RecordBatch> {
+        if let Some(convert_format) = &self.convert_format {
+            convert_format.convert_with_pk_values(record_batch, pk_values)
         } else {
             Ok(record_batch)
         }
@@ -761,6 +882,65 @@ impl FlatConvertFormat {
             decoded_columns.push(tag_column);
         }
 
+        self.assemble_batch(batch, decoded_columns)
+    }
+
+    /// Converts a single-PK batch using pre-decoded `CompositeValues`.
+    ///
+    /// All rows in the batch share the same primary key, so each tag column
+    /// is a constant-value array.
+    pub(crate) fn convert_with_pk_values(
+        &self,
+        batch: RecordBatch,
+        pk_values: &CompositeValues,
+    ) -> Result<RecordBatch> {
+        if self.projected_primary_keys.is_empty() {
+            return Ok(batch);
+        }
+
+        let num_rows = batch.num_rows();
+        let mut decoded_columns = Vec::new();
+        for (column_id, pk_index, column_index) in &self.projected_primary_keys {
+            let column_metadata = &self.metadata.column_metadatas[*column_index];
+            let data_type = &column_metadata.column_schema.data_type;
+
+            // Build a constant-value array from the single PK value.
+            let mut builder = data_type.create_mutable_vector(1);
+            match pk_values {
+                CompositeValues::Dense(dense) => {
+                    if *pk_index < dense.len() {
+                        builder.push_value_ref(&dense[*pk_index].1.as_value_ref());
+                    } else {
+                        builder.push_null();
+                    }
+                }
+                CompositeValues::Sparse(sparse) => {
+                    let value = sparse.get_or_null(*column_id);
+                    builder.push_value_ref(&value.as_value_ref());
+                }
+            }
+            let scalar_array = builder.to_vector().to_arrow_array();
+
+            // Repeat the single value for all rows.
+            if num_rows == 1 {
+                decoded_columns.push(scalar_array);
+            } else {
+                let indices = UInt32Array::from_value(0, num_rows);
+                let taken =
+                    take(&scalar_array, &indices, None).context(ComputeArrowSnafu)?;
+                decoded_columns.push(taken);
+            }
+        }
+
+        self.assemble_batch(batch, decoded_columns)
+    }
+
+    /// Assembles a new RecordBatch with decoded tag columns prepended.
+    fn assemble_batch(
+        &self,
+        batch: RecordBatch,
+        decoded_columns: Vec<ArrayRef>,
+    ) -> Result<RecordBatch> {
         // Builds new columns: decoded tag columns first, then original columns
         let mut new_columns = Vec::with_capacity(batch.num_columns() + decoded_columns.len());
         new_columns.extend(decoded_columns);
