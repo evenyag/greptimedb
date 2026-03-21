@@ -1908,7 +1908,7 @@ impl ParquetReader {
             let skip_fields = self.context.should_skip_fields(row_group_idx);
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader, false, row_group_idx),
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, false, row_group_idx)?,
                 skip_fields,
             ));
         }
@@ -1935,7 +1935,7 @@ impl ParquetReader {
             let skip_fields = context.should_skip_fields(row_group_idx);
             Some(FlatPruneReader::new_with_row_group_reader(
                 context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader, false, row_group_idx),
+                FlatRowGroupReader::new(context.clone(), parquet_reader, false, row_group_idx)?,
                 skip_fields,
             ))
         } else {
@@ -2001,7 +2001,7 @@ impl RowGroupReader {
         context: FileRangeContextRef,
         reader: ParquetRecordBatchReader,
         row_group_idx: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::create(context, reader, row_group_idx)
     }
 }
@@ -2010,8 +2010,8 @@ impl RowGroupReader {
 pub(crate) struct RowGroupReaderBase<T> {
     /// Context of [RowGroupReader] so adapts to different underlying implementation.
     context: T,
-    /// Inner parquet reader.
-    reader: ParquetRecordBatchReader,
+    /// Raw record batches collected from the parquet reader.
+    record_batches: VecDeque<RecordBatch>,
     /// Buffered batches to return.
     batches: VecDeque<Batch>,
     /// Local scan metrics.
@@ -2031,9 +2031,9 @@ where
     /// Creates a new reader to read the primary key format.
     pub(crate) fn create(
         context: T,
-        reader: ParquetRecordBatchReader,
+        mut reader: ParquetRecordBatchReader,
         row_group_idx: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
             .read_format()
@@ -2041,15 +2041,17 @@ where
         assert!(context.read_format().as_primary_key().is_some());
         let file_path = context.file_path().to_string();
 
-        Self {
+        let mut this = Self {
             context,
-            reader,
+            record_batches: VecDeque::new(),
             batches: VecDeque::new(),
             metrics: ReaderMetrics::default(),
             override_sequence,
             row_group_idx,
             file_path,
-        }
+        };
+        this.maybe_collect_record_batches(&mut reader)?;
+        Ok(this)
     }
 
     /// Gets the metrics.
@@ -2062,9 +2064,22 @@ where
         self.context.read_format()
     }
 
-    /// Tries to fetch next [RecordBatch] from the reader.
-    fn fetch_next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.context.map_result(self.reader.next().transpose())
+    /// Collects all [RecordBatch]es from the parquet reader into the internal buffer.
+    fn maybe_collect_record_batches(
+        &mut self,
+        reader: &mut ParquetRecordBatchReader,
+    ) -> Result<()> {
+        let scan_start = Instant::now();
+        loop {
+            let result = self.context.map_result(reader.next().transpose())?;
+            let Some(record_batch) = result else {
+                break;
+            };
+            self.metrics.num_record_batches += 1;
+            self.record_batches.push_back(record_batch);
+        }
+        self.metrics.scan_cost += scan_start.elapsed();
+        Ok(())
     }
 
     /// Returns the next [Batch].
@@ -2076,15 +2091,11 @@ where
             return Ok(Some(batch));
         }
 
-        // We need to fetch next record batch and convert it to batches.
+        // We need to convert next record batch to batches.
         while self.batches.is_empty() {
-            let fetch_start = Instant::now();
-            let Some(record_batch) = self.fetch_next_record_batch()? else {
-                self.metrics.scan_cost += fetch_start.elapsed();
+            let Some(record_batch) = self.record_batches.pop_front() else {
                 return Ok(None);
             };
-            self.metrics.scan_cost += fetch_start.elapsed();
-            self.metrics.num_record_batches += 1;
 
             // Safety: We ensures the format is primary key in the RowGroupReaderBase::create().
             let convert_start = Instant::now();
@@ -2138,8 +2149,8 @@ impl<T> Drop for RowGroupReaderBase<T> {
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
     context: FileRangeContextRef,
-    /// Inner parquet reader.
-    reader: ParquetRecordBatchReader,
+    /// Raw record batches collected from the parquet reader.
+    record_batches: VecDeque<RecordBatch>,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
     /// Whether to split batches by primary key boundaries.
@@ -2164,28 +2175,48 @@ impl FlatRowGroupReader {
     /// Creates a new flat reader from file range.
     pub(crate) fn new(
         context: FileRangeContextRef,
-        reader: ParquetRecordBatchReader,
+        mut reader: ParquetRecordBatchReader,
         should_split: bool,
         row_group_idx: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
 
-        Self {
+        // Collect all record batches from the parquet reader upfront.
+        let mut record_batches = VecDeque::new();
+        let mut num_record_batches = 0;
+        let mut scan_cost = Duration::default();
+        let scan_start = Instant::now();
+        loop {
+            let result = reader
+                .next()
+                .transpose()
+                .context(ArrowReaderSnafu {
+                    path: context.file_path(),
+                })?;
+            let Some(record_batch) = result else {
+                break;
+            };
+            num_record_batches += 1;
+            record_batches.push_back(record_batch);
+        }
+        scan_cost += scan_start.elapsed();
+
+        Ok(Self {
             context,
-            reader,
+            record_batches,
             override_sequence,
             should_split,
             batches: VecDeque::new(),
             convert_cost: Duration::default(),
-            scan_cost: Duration::default(),
+            scan_cost,
             row_group_idx,
-            num_record_batches: 0,
+            num_record_batches,
             num_batches: 0,
             num_rows: 0,
-        }
+        })
     }
 
     /// Returns the accumulated convert cost.
@@ -2207,38 +2238,27 @@ impl FlatRowGroupReader {
             return Ok(Some(batch));
         }
 
-        let scan_start = Instant::now();
-        match self.reader.next() {
-            Some(batch_result) => {
-                let record_batch = batch_result.context(ArrowReaderSnafu {
-                    path: self.context.file_path(),
-                })?;
-                self.scan_cost += scan_start.elapsed();
-                self.num_record_batches += 1;
+        let Some(record_batch) = self.record_batches.pop_front() else {
+            return Ok(None);
+        };
 
-                // Safety: Only flat format uses FlatRowGroupReader.
-                let flat_format = self.context.read_format().as_flat().unwrap();
-                let convert_start = Instant::now();
-                flat_format.convert_batch(
-                    record_batch,
-                    self.override_sequence.as_ref(),
-                    self.should_split,
-                    &mut self.batches,
-                )?;
-                self.convert_cost += convert_start.elapsed();
+        // Safety: Only flat format uses FlatRowGroupReader.
+        let flat_format = self.context.read_format().as_flat().unwrap();
+        let convert_start = Instant::now();
+        flat_format.convert_batch(
+            record_batch,
+            self.override_sequence.as_ref(),
+            self.should_split,
+            &mut self.batches,
+        )?;
+        self.convert_cost += convert_start.elapsed();
 
-                let batch = self.batches.pop_front();
-                if let Some(b) = &batch {
-                    self.num_rows += b.record_batch.num_rows();
-                    self.num_batches += 1;
-                }
-                Ok(batch)
-            }
-            None => {
-                self.scan_cost += scan_start.elapsed();
-                Ok(None)
-            }
+        let batch = self.batches.pop_front();
+        if let Some(b) = &batch {
+            self.num_rows += b.record_batch.num_rows();
+            self.num_batches += 1;
         }
+        Ok(batch)
     }
 }
 

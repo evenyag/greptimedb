@@ -219,14 +219,14 @@ impl FileRange {
                 self.file_handle().file_id().file_id(),
                 self.row_group_idx,
                 self.context.reader_builder.cache_strategy().clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx),
+                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx)?,
             );
             PruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
         } else {
             // Row group contains DELETE, fallback to default reader.
             PruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx),
+                RowGroupReader::new(self.context.clone(), parquet_reader, self.row_group_idx)?,
                 skip_fields,
             )
         };
@@ -281,7 +281,7 @@ impl FileRange {
                 parquet_reader,
                 should_split,
                 self.row_group_idx,
-            );
+            )?;
             let reader = FlatRowGroupLastRowCachedReader::new(
                 self.file_handle().file_id().file_id(),
                 self.row_group_idx,
@@ -296,7 +296,7 @@ impl FileRange {
                 parquet_reader,
                 should_split,
                 self.row_group_idx,
-            );
+            )?;
             FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 flat_row_group_reader,
