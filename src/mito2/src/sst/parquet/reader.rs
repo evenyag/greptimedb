@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
-use common_telemetry::{info, tracing, warn};
+use common_telemetry::{info, trace, tracing, warn};
 use datafusion_expr::Expr;
 use datatypes::arrow::array::ArrayRef;
 use datatypes::arrow::datatypes::Field;
@@ -2131,7 +2131,7 @@ where
 
 impl<T> Drop for RowGroupReaderBase<T> {
     fn drop(&mut self) {
-        info!(
+        trace!(
             "RowGroupReader finished, file: {}, row_group: {}, scan_cost: {:?}, convert_cost: {:?}, \
              num_record_batches: {}, num_batches: {}, num_rows: {}",
             self.file_path,
@@ -2264,7 +2264,7 @@ impl FlatRowGroupReader {
 
 impl Drop for FlatRowGroupReader {
     fn drop(&mut self) {
-        info!(
+        trace!(
             "FlatRowGroupReader finished, file: {}, row_group: {}, scan_cost: {:?}, convert_cost: {:?}, \
              num_record_batches: {}, num_batches: {}, num_rows: {}",
             self.context.file_path(),
