@@ -232,12 +232,16 @@ impl SeriesScan {
         };
         let region_id = distributor.stream_ctx.input.mapper.metadata().region_id;
         let span = tracing::info_span!("SeriesScan::distributor", region_id = %region_id);
-        common_runtime::spawn_global(
-            async move {
-                distributor.execute().await;
-            }
-            .instrument(span),
-        );
+        let scan_in_place = self.stream_ctx.input.scan_in_place;
+        let fut = async move {
+            distributor.execute().await;
+        }
+        .instrument(span);
+        if scan_in_place {
+            tokio::spawn(fut);
+        } else {
+            common_runtime::spawn_global(fut);
+        }
 
         *rx_list = receivers;
     }

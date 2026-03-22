@@ -237,6 +237,9 @@ pub(crate) struct ScanRegion {
     /// Whether to filter out the deleted rows.
     /// Usually true for normal read, and false for scan for compaction.
     filter_deleted: bool,
+    /// Whether to run scan tasks in the current async context instead of
+    /// spawning to the global runtime.
+    scan_in_place: bool,
     #[cfg(feature = "enterprise")]
     extension_range_provider: Option<BoxedExtensionRangeProvider>,
 }
@@ -261,6 +264,7 @@ impl ScanRegion {
             ignore_bloom_filter: false,
             start_time: None,
             filter_deleted: true,
+            scan_in_place: false,
             #[cfg(feature = "enterprise")]
             extension_range_provider: None,
         }
@@ -315,6 +319,14 @@ impl ScanRegion {
 
     pub(crate) fn set_filter_deleted(&mut self, filter_deleted: bool) {
         self.filter_deleted = filter_deleted;
+    }
+
+    /// Sets whether to run scan tasks in the current async context instead of
+    /// spawning to the global runtime.
+    #[must_use]
+    pub(crate) fn with_scan_in_place(mut self, scan_in_place: bool) -> Self {
+        self.scan_in_place = scan_in_place;
+        self
     }
 
     #[cfg(feature = "enterprise")]
@@ -552,7 +564,8 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
-            .with_flat_format(flat_format);
+            .with_flat_format(flat_format)
+            .with_scan_in_place(self.scan_in_place);
         #[cfg(feature = "vector_index")]
         let input = input
             .with_vector_index_applier(vector_index_applier)
@@ -859,6 +872,9 @@ pub struct ScanInput {
     pub(crate) flat_format: bool,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Whether to run scan tasks in the current async context instead of
+    /// spawning to the global runtime.
+    pub(crate) scan_in_place: bool,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -895,6 +911,7 @@ impl ScanInput {
             distribution: None,
             flat_format: false,
             compaction: false,
+            scan_in_place: false,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -1073,6 +1090,14 @@ impl ScanInput {
         self
     }
 
+    /// Sets whether to run scan tasks in the current async context instead of
+    /// spawning to the global runtime.
+    #[must_use]
+    pub(crate) fn with_scan_in_place(mut self, scan_in_place: bool) -> Self {
+        self.scan_in_place = scan_in_place;
+        self
+    }
+
     /// Scans sources in parallel.
     ///
     /// # Panics if the input doesn't allow parallel scan.
@@ -1088,7 +1113,7 @@ impl ScanInput {
         sources: Vec<Source>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Vec<Source>> {
-        if sources.len() <= 1 {
+        if sources.len() <= 1 || self.scan_in_place {
             return Ok(sources);
         }
 
@@ -1273,7 +1298,7 @@ impl ScanInput {
         sources: Vec<BoxedRecordBatchStream>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Vec<BoxedRecordBatchStream>> {
-        if sources.len() <= 1 {
+        if sources.len() <= 1 || self.scan_in_place {
             return Ok(sources);
         }
 

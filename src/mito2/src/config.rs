@@ -144,6 +144,9 @@ pub struct MitoConfig {
     pub parallel_scan_channel_size: usize,
     /// Maximum number of SST files to scan concurrently (default 384).
     pub max_concurrent_scan_files: usize,
+    /// Whether to run scan tasks in the current async context instead of
+    /// spawning to the global runtime (default false).
+    pub scan_in_place: bool,
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
     /// Memory limit for table scans across all queries. Setting it to 0 disables the limit.
@@ -211,6 +214,7 @@ impl Default for MitoConfig {
             sst_write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             parallel_scan_channel_size: DEFAULT_SCAN_CHANNEL_SIZE,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            scan_in_place: false,
             allow_stale_entries: false,
             scan_memory_limit: MemoryLimit::default(),
             index: IndexConfig::default(),
