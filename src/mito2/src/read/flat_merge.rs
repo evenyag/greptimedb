@@ -659,11 +659,14 @@ impl FlatMergeReader {
         let start = Instant::now();
         let next = hottest.advance_batch().await?;
         self.metrics.fetch_cost += start.elapsed();
-        // The node is the heap is not empty, so it must have existing rows in the builder.
-        let batch = self
-            .in_progress
-            .take_remaining_rows(hottest.node_index, next);
-        Self::maybe_output_batch(batch, &mut self.output_batch);
+        // // The node is the heap is not empty, so it must have existing rows in the builder.
+        // let batch = self
+        //     .in_progress
+        //     .take_remaining_rows(hottest.node_index, next);
+        // Self::maybe_output_batch(batch, &mut self.output_batch);
+        if let Some(batch) = next {
+            Self::maybe_output_batch(batch, &mut self.output_batch);
+        }
         self.algo.reheap(hottest);
 
         Ok(())
