@@ -45,6 +45,7 @@ use table::predicate::Predicate;
 
 use crate::cache::index::result_cache::PredicateKey;
 use crate::cache::{CacheStrategy, CachedSstMeta};
+use crate::config::PrefilterConfig;
 #[cfg(feature = "vector_index")]
 use crate::error::ApplyVectorIndexSnafu;
 use crate::error::{
@@ -147,6 +148,7 @@ pub struct ParquetReaderBuilder {
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
+    prefilter_config: PrefilterConfig,
 }
 
 impl ParquetReaderBuilder {
@@ -178,6 +180,7 @@ impl ParquetReaderBuilder {
             pre_filter_mode: PreFilterMode::All,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
+            prefilter_config: PrefilterConfig::default(),
         }
     }
 
@@ -285,6 +288,12 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn page_index_policy(mut self, page_index_policy: PageIndexPolicy) -> Self {
         self.page_index_policy = page_index_policy;
+        self
+    }
+
+    #[must_use]
+    pub fn prefilter_config(mut self, config: PrefilterConfig) -> Self {
+        self.prefilter_config = config;
         self
     }
 
@@ -485,6 +494,23 @@ impl ParquetReaderBuilder {
             vec![]
         };
 
+        let mut primary_key_filters = if let Some(predicate) = &self.predicate {
+            predicate
+                .exprs()
+                .iter()
+                .filter_map(SimpleFilterEvaluator::try_new)
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        crate::sst::parquet::prefilter::retain_usable_primary_key_filters(
+            &region_meta,
+            self.expected_metadata.as_deref(),
+            &mut primary_key_filters,
+        );
+        let primary_key_filters =
+            (!primary_key_filters.is_empty()).then_some(Arc::new(primary_key_filters));
+
         let dyn_filters = if let Some(predicate) = &self.predicate {
             predicate.dyn_filters().as_ref().clone()
         } else {
@@ -499,6 +525,7 @@ impl ParquetReaderBuilder {
             reader_builder,
             RangeBase {
                 filters,
+                primary_key_filters,
                 dyn_filters,
                 read_format,
                 expected_metadata: self.expected_metadata.clone(),
@@ -507,6 +534,7 @@ impl ParquetReaderBuilder {
                 compat_batch: None,
                 compaction_projection_mapper,
                 pre_filter_mode: self.pre_filter_mode,
+                prefilter_config: self.prefilter_config.clone(),
                 partition_filter,
             },
         );

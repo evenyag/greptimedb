@@ -174,6 +174,9 @@ pub struct MitoConfig {
     /// When enabled, forces using BulkMemtable and BulkMemtableBuilder.
     pub default_experimental_flat_format: bool,
 
+    /// Prefilter config.
+    pub prefilter: PrefilterConfig,
+
     pub gc: GcConfig,
 }
 
@@ -222,6 +225,7 @@ impl Default for MitoConfig {
             memtable: MemtableConfig::default(),
             min_compaction_interval: Duration::from_secs(0),
             default_experimental_flat_format: false,
+            prefilter: PrefilterConfig::default(),
             gc: GcConfig::default(),
         };
 
@@ -231,6 +235,28 @@ impl Default for MitoConfig {
         }
 
         mito_config
+    }
+}
+
+/// Configuration for prefilter optimization in parquet reader.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct PrefilterConfig {
+    /// Whether prefilter optimization is enabled.
+    pub enable: bool,
+    /// Maximum ratio of prefilter columns to total columns in percent.
+    pub column_ratio_threshold_percent: u32,
+    /// Minimum number of remaining columns required to use prefiltering.
+    pub min_remaining_columns: usize,
+}
+
+impl Default for PrefilterConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            column_ratio_threshold_percent: 50,
+            min_remaining_columns: 2,
+        }
     }
 }
 

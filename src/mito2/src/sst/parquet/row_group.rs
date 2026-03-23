@@ -64,6 +64,10 @@ pub struct ParquetFetchMetricsData {
     pub store_fetch_elapsed: std::time::Duration,
     /// Total elapsed time for fetching row groups.
     pub total_fetch_elapsed: std::time::Duration,
+    /// Time spent running prefilter reads.
+    pub prefilter_cost: std::time::Duration,
+    /// Rows filtered by prefilter.
+    pub prefilter_filtered_rows: usize,
 }
 
 impl ParquetFetchMetricsData {
@@ -100,6 +104,8 @@ impl std::fmt::Debug for ParquetFetchMetrics {
             write_cache_fetch_elapsed,
             store_fetch_elapsed,
             total_fetch_elapsed,
+            prefilter_cost,
+            prefilter_filtered_rows,
         } = *data;
 
         write!(f, "{{")?;
@@ -158,6 +164,16 @@ impl std::fmt::Debug for ParquetFetchMetrics {
         if !store_fetch_elapsed.is_zero() {
             write!(f, ", \"store_fetch_elapsed\":\"{:?}\"", store_fetch_elapsed)?;
         }
+        if !prefilter_cost.is_zero() {
+            write!(f, ", \"prefilter_cost\":\"{:?}\"", prefilter_cost)?;
+        }
+        if prefilter_filtered_rows > 0 {
+            write!(
+                f,
+                ", \"prefilter_filtered_rows\":{}",
+                prefilter_filtered_rows
+            )?;
+        }
 
         write!(f, "}}")
     }
@@ -185,6 +201,8 @@ impl ParquetFetchMetrics {
             write_cache_fetch_elapsed,
             store_fetch_elapsed,
             total_fetch_elapsed,
+            prefilter_cost,
+            prefilter_filtered_rows,
         } = *other.data.lock().unwrap();
 
         let mut data = self.data.lock().unwrap();
@@ -201,6 +219,8 @@ impl ParquetFetchMetrics {
         data.write_cache_fetch_elapsed += write_cache_fetch_elapsed;
         data.store_fetch_elapsed += store_fetch_elapsed;
         data.total_fetch_elapsed += total_fetch_elapsed;
+        data.prefilter_cost += prefilter_cost;
+        data.prefilter_filtered_rows += prefilter_filtered_rows;
     }
 }
 
@@ -560,7 +580,7 @@ impl<'a> InMemoryRowGroup<'a> {
 /// - aligned_size: total size aligned to pooled buffer size
 /// - unaligned_size: actual total size without alignment
 // See https://github.com/apache/opendal/blob/v0.54.0/core/src/types/read/reader.rs#L166-L192
-fn compute_total_range_size(ranges: &[Range<u64>]) -> (u64, u64) {
+pub(crate) fn compute_total_range_size(ranges: &[Range<u64>]) -> (u64, u64) {
     if ranges.is_empty() {
         return (0, 0);
     }

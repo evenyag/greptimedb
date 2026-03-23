@@ -20,6 +20,7 @@ use std::ops::BitAnd;
 use std::sync::Arc;
 
 use api::v1::{OpType, SemanticType};
+use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::error;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
@@ -37,6 +38,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, TimeSeriesRowSelector};
 use table::predicate::Predicate;
 
+use crate::config::PrefilterConfig;
 use crate::error::{
     ComputeArrowSnafu, DataTypeMismatchSnafu, DecodeSnafu, DecodeStatsSnafu,
     EvalPartitionFilterSnafu, NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu,
@@ -343,6 +345,14 @@ impl FileRangeContext {
         &self.base.filters
     }
 
+    pub(crate) fn primary_key_filters(&self) -> Option<&Arc<Vec<SimpleFilterEvaluator>>> {
+        self.base.primary_key_filters.as_ref()
+    }
+
+    pub(crate) fn prefilter_config(&self) -> &PrefilterConfig {
+        &self.base.prefilter_config
+    }
+
     /// Returns true if a partition filter is configured.
     pub(crate) fn has_partition_filter(&self) -> bool {
         self.base.partition_filter.is_some()
@@ -439,6 +449,8 @@ pub(crate) struct PartitionFilterContext {
 pub(crate) struct RangeBase {
     /// Filters pushed down.
     pub(crate) filters: Vec<SimpleFilterContext>,
+    /// Simple filters that can be evaluated against encoded primary keys.
+    pub(crate) primary_key_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
     /// Dynamic filter physical exprs.
     pub(crate) dyn_filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
     /// Helper to read the SST.
@@ -454,6 +466,8 @@ pub(crate) struct RangeBase {
     pub(crate) compaction_projection_mapper: Option<CompactionProjectionMapper>,
     /// Mode to pre-filter columns.
     pub(crate) pre_filter_mode: PreFilterMode,
+    /// Prefilter config.
+    pub(crate) prefilter_config: PrefilterConfig,
     /// Partition filter.
     pub(crate) partition_filter: Option<PartitionFilterContext>,
 }

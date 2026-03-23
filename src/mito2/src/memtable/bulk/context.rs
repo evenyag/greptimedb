@@ -23,6 +23,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use table::predicate::Predicate;
 
+use crate::config::PrefilterConfig;
 use crate::error::Result;
 use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
 use crate::sst::parquet::flat_format::FlatReadFormat;
@@ -90,6 +91,7 @@ impl BulkIterContext {
         Ok(Self {
             base: RangeBase {
                 filters: simple_filters,
+                primary_key_filters: None,
                 dyn_filters,
                 read_format,
                 prune_schema: region_metadata.schema.clone(),
@@ -99,6 +101,7 @@ impl BulkIterContext {
                 compat_batch: None,
                 compaction_projection_mapper: None,
                 pre_filter_mode,
+                prefilter_config: PrefilterConfig::default(),
                 partition_filter: None,
             },
             predicate,

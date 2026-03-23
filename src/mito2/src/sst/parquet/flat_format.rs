@@ -282,6 +282,12 @@ impl FlatReadFormat {
         }
     }
 
+    /// Returns true if the raw parquet batch stores the encoded primary key as a dictionary column.
+    pub(crate) fn raw_batch_has_primary_key_dictionary(&self) -> bool {
+        matches!(self.parquet_adapter, ParquetAdapter::Flat(_))
+            && !self.metadata().primary_key.is_empty()
+    }
+
     /// Creates a sequence array to override.
     pub(crate) fn new_override_sequence_array(&self, length: usize) -> Option<ArrayRef> {
         self.override_sequence
