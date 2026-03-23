@@ -193,6 +193,8 @@ impl SeqScan {
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
     ) -> Result<BoxedBatchReader> {
+        common_telemetry::info!("build_reader_from_sources, num_sources: {}", sources.len());
+
         if let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
@@ -244,6 +246,8 @@ impl SeqScan {
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
     ) -> Result<BoxedRecordBatchStream> {
+        common_telemetry::info!("build_flat_reader_from_sources, num_sources: {}", sources.len());
+
         if let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
