@@ -443,11 +443,28 @@ impl SeriesDistributor {
         fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
     )]
     async fn execute(&mut self) {
+        let region_id = self.stream_ctx.input.mapper.metadata().region_id;
+        let thread_id = std::thread::current().id();
+        common_telemetry::info!(
+            "SeriesScan distributor starting, region_id: {}, thread_id: {:?}",
+            region_id,
+            thread_id,
+        );
+        let start = Instant::now();
+
         let result = if self.stream_ctx.input.flat_format {
             self.scan_partitions_flat().await
         } else {
             self.scan_partitions().await
         };
+
+        let cost = start.elapsed();
+        common_telemetry::info!(
+            "SeriesScan distributor finished, region_id: {}, cost: {:?}, thread_id: {:?}",
+            region_id,
+            cost,
+            thread_id,
+        );
 
         if let Err(e) = result {
             self.senders.send_error(e).await;
