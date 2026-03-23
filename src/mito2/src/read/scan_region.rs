@@ -1261,9 +1261,10 @@ impl ScanInput {
             async move {
                 let thread_id = std::thread::current().id();
                 info!("Source scan task starting, region_id: {}, thread_id: {:?}", region_id, thread_id);
-                let start = Instant::now();
+                let scan_start = Instant::now();
                 let mut num_batches = 0;
                 let mut num_rows = 0;
+                let mut batches = Vec::new();
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
                     // the channel with the permit held.
@@ -1276,7 +1277,7 @@ impl ScanInput {
                         Ok(Some(batch)) => {
                             num_batches += 1;
                             num_rows += batch.num_rows();
-                            let _ = sender.send(Ok(batch)).await;
+                            batches.push(batch);
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -1285,8 +1286,13 @@ impl ScanInput {
                         }
                     }
                 }
-                let cost = start.elapsed();
-                info!("Source scan task finished, region_id: {}, num_batches: {}, num_rows: {}, cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, cost, thread_id);
+                let scan_cost = scan_start.elapsed();
+                let send_start = Instant::now();
+                for batch in batches {
+                    let _ = sender.send(Ok(batch)).await;
+                }
+                let send_cost = send_start.elapsed();
+                info!("Source scan task finished, region_id: {}, num_batches: {}, num_rows: {}, scan_cost: {:?}, send_cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, scan_cost, send_cost, thread_id);
             }
             .instrument(span),
         );
@@ -1345,9 +1351,10 @@ impl ScanInput {
             async move {
                 let thread_id = std::thread::current().id();
                 info!("FlatSource scan task starting, region_id: {}, thread_id: {:?}", region_id, thread_id);
-                let start = Instant::now();
+                let scan_start = Instant::now();
                 let mut num_batches = 0;
                 let mut num_rows = 0;
+                let mut batches = Vec::new();
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
                     // the channel with the permit held.
@@ -1360,7 +1367,7 @@ impl ScanInput {
                         Some(Ok(batch)) => {
                             num_batches += 1;
                             num_rows += batch.num_rows();
-                            let _ = sender.send(Ok(batch)).await;
+                            batches.push(batch);
                         }
                         Some(Err(e)) => {
                             let _ = sender.send(Err(e)).await;
@@ -1369,8 +1376,13 @@ impl ScanInput {
                         None => break,
                     }
                 }
-                let cost = start.elapsed();
-                info!("FlatSource scan task finished, region_id: {}, num_batches: {}, num_rows: {}, cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, cost, thread_id);
+                let scan_cost = scan_start.elapsed();
+                let send_start = Instant::now();
+                for batch in batches {
+                    let _ = sender.send(Ok(batch)).await;
+                }
+                let send_cost = send_start.elapsed();
+                info!("FlatSource scan task finished, region_id: {}, num_batches: {}, num_rows: {}, scan_cost: {:?}, send_cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, scan_cost, send_cost, thread_id);
             }
             .instrument(span),
         );
