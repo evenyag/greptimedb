@@ -25,7 +25,7 @@ use common_error::ext::BoxedError;
 use common_recordbatch::SendableRecordBatchStream;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::tracing::Instrument;
-use common_telemetry::{debug, error, tracing, warn};
+use common_telemetry::{debug, error, info, tracing, warn};
 use common_time::range::TimestampRange;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
 use datafusion_common::Column;
@@ -1259,6 +1259,11 @@ impl ScanInput {
         );
         common_runtime::spawn_global(
             async move {
+                let thread_id = std::thread::current().id();
+                info!("Source scan task starting, region_id: {}, thread_id: {:?}", region_id, thread_id);
+                let start = Instant::now();
+                let mut num_batches = 0;
+                let mut num_rows = 0;
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
                     // the channel with the permit held.
@@ -1269,6 +1274,8 @@ impl ScanInput {
                     };
                     match maybe_batch {
                         Ok(Some(batch)) => {
+                            num_batches += 1;
+                            num_rows += batch.num_rows();
                             let _ = sender.send(Ok(batch)).await;
                         }
                         Ok(None) => break,
@@ -1278,6 +1285,8 @@ impl ScanInput {
                         }
                     }
                 }
+                let cost = start.elapsed();
+                info!("Source scan task finished, region_id: {}, num_batches: {}, num_rows: {}, cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, cost, thread_id);
             }
             .instrument(span),
         );
@@ -1334,6 +1343,11 @@ impl ScanInput {
         );
         common_runtime::spawn_global(
             async move {
+                let thread_id = std::thread::current().id();
+                info!("FlatSource scan task starting, region_id: {}, thread_id: {:?}", region_id, thread_id);
+                let start = Instant::now();
+                let mut num_batches = 0;
+                let mut num_rows = 0;
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
                     // the channel with the permit held.
@@ -1344,6 +1358,8 @@ impl ScanInput {
                     };
                     match maybe_batch {
                         Some(Ok(batch)) => {
+                            num_batches += 1;
+                            num_rows += batch.num_rows();
                             let _ = sender.send(Ok(batch)).await;
                         }
                         Some(Err(e)) => {
@@ -1353,6 +1369,8 @@ impl ScanInput {
                         None => break,
                     }
                 }
+                let cost = start.elapsed();
+                info!("FlatSource scan task finished, region_id: {}, num_batches: {}, num_rows: {}, cost: {:?}, thread_id: {:?}", region_id, num_batches, num_rows, cost, thread_id);
             }
             .instrument(span),
         );
