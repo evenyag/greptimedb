@@ -55,7 +55,8 @@ use crate::sst::parquet::flat_format::{
 };
 use crate::sst::parquet::format::ReadFormat;
 use crate::sst::parquet::reader::{
-    FlatRowGroupReader, MaybeFilter, RowGroupReader, RowGroupReaderBuilder, SimpleFilterContext,
+    FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReader, RowGroupReaderBuilder,
+    SimpleFilterContext,
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -190,6 +191,11 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    primary_key_filters: self.context.primary_key_filters(),
+                    read_format: self.context.read_format(),
+                    prefilter_config: self.context.prefilter_config(),
+                },
             )
             .await?;
 
@@ -252,6 +258,11 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                RowGroupBuildContext {
+                    primary_key_filters: self.context.primary_key_filters(),
+                    read_format: self.context.read_format(),
+                    prefilter_config: self.context.prefilter_config(),
+                },
             )
             .await?;
 

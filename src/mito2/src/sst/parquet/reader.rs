@@ -77,6 +77,9 @@ use crate::sst::parquet::file_range::{
 };
 use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
 use crate::sst::parquet::metadata::MetadataLoader;
+use crate::sst::parquet::prefilter::{
+    PrefilterContext, execute_prefilter, retain_usable_primary_key_filters,
+};
 use crate::sst::parquet::row_group::{InMemoryRowGroup, ParquetFetchMetrics};
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
@@ -503,7 +506,7 @@ impl ParquetReaderBuilder {
         } else {
             vec![]
         };
-        crate::sst::parquet::prefilter::retain_usable_primary_key_filters(
+        retain_usable_primary_key_filters(
             &region_meta,
             self.expected_metadata.as_deref(),
             &mut primary_key_filters,
@@ -1707,14 +1710,47 @@ impl RowGroupReaderBuilder {
         &self.cache_strategy
     }
 
+    pub(crate) fn object_store(&self) -> &ObjectStore {
+        &self.object_store
+    }
+
     /// Builds a [ParquetRecordBatchReader] to read the row group at `row_group_idx`.
     pub(crate) async fn build(
         &self,
         row_group_idx: usize,
         row_selection: Option<RowSelection>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
+        build_ctx: RowGroupBuildContext<'_>,
     ) -> Result<ParquetRecordBatchReader> {
         let fetch_start = Instant::now();
+        let parquet_schema = self.parquet_meta.file_metadata().schema_descr();
+        let row_selection = if let Some(prefilter_ctx) = PrefilterContext::compute(
+            build_ctx.read_format,
+            parquet_schema,
+            build_ctx.primary_key_filters,
+            build_ctx.prefilter_config,
+        ) {
+            let primary_key_filters = build_ctx.primary_key_filters.expect("prefilter checked");
+            let prefilter_start = Instant::now();
+            let result = execute_prefilter(
+                self,
+                row_group_idx,
+                row_selection.clone(),
+                &prefilter_ctx,
+                build_ctx.read_format,
+                primary_key_filters,
+                fetch_metrics,
+            )
+            .await?;
+            if let Some(metrics) = fetch_metrics {
+                let mut data = metrics.data.lock().unwrap();
+                data.prefilter_cost += prefilter_start.elapsed();
+                data.prefilter_filtered_rows += result.filtered_rows();
+            }
+            Some(result.refined_selection().clone())
+        } else {
+            row_selection
+        };
 
         let mut row_group = InMemoryRowGroup::create(
             self.file_handle.region_id(),
@@ -1750,6 +1786,12 @@ impl RowGroupReaderBuilder {
             path: &self.file_path,
         })
     }
+}
+
+pub(crate) struct RowGroupBuildContext<'a> {
+    pub(crate) primary_key_filters: Option<&'a Arc<Vec<SimpleFilterEvaluator>>>,
+    pub(crate) read_format: &'a ReadFormat,
+    pub(crate) prefilter_config: &'a PrefilterConfig,
 }
 
 /// The filter to evaluate or the prune result of the default value.
@@ -1896,6 +1938,11 @@ impl ParquetReader {
                     row_group_idx,
                     Some(row_selection),
                     Some(&self.fetch_metrics),
+                    RowGroupBuildContext {
+                        primary_key_filters: self.context.primary_key_filters(),
+                        read_format: self.context.read_format(),
+                        prefilter_config: self.context.prefilter_config(),
+                    },
                 )
                 .await?;
 
@@ -1924,7 +1971,16 @@ impl ParquetReader {
         let reader = if let Some((row_group_idx, row_selection)) = selection.pop_first() {
             let parquet_reader = context
                 .reader_builder()
-                .build(row_group_idx, Some(row_selection), Some(&fetch_metrics))
+                .build(
+                    row_group_idx,
+                    Some(row_selection),
+                    Some(&fetch_metrics),
+                    RowGroupBuildContext {
+                        primary_key_filters: context.primary_key_filters(),
+                        read_format: context.read_format(),
+                        prefilter_config: context.prefilter_config(),
+                    },
+                )
                 .await?;
             let skip_fields = context.should_skip_fields(row_group_idx);
             Some(FlatPruneReader::new_with_row_group_reader(
