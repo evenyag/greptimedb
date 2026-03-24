@@ -29,7 +29,7 @@ use futures::{Stream, TryStreamExt};
 use snafu::ResultExt;
 use store_api::storage::SequenceNumber;
 
-use crate::error::{ComputeArrowSnafu, Result};
+use crate::error::{ComputeArrowSnafu, JoinSnafu, Result};
 use crate::memtable::BoxedRecordBatchIterator;
 use crate::metrics::READ_STAGE_ELAPSED;
 use crate::read::BoxedRecordBatchStream;
@@ -581,19 +581,34 @@ impl FlatMergeReader {
         let metrics = MergeMetrics::default();
         let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
         let mut nodes = Vec::with_capacity(iters.len());
-        // Initialize nodes and the buffer.
-        for (node_index, iter) in iters.into_iter().enumerate() {
-            let mut node = StreamNode {
-                node_index,
-                iter,
-                cursor: None,
-            };
-            if let Some(batch) = node.advance_batch().await? {
-                in_progress.push_batch(node_index, batch);
+        // Spawn a task per node to fetch the first batch in parallel.
+        let num_iters = iters.len();
+        let tasks: Vec<_> = iters
+            .into_iter()
+            .enumerate()
+            .map(|(node_index, iter)| {
+                common_runtime::spawn_global(async move {
+                    let mut node = StreamNode {
+                        node_index,
+                        iter,
+                        cursor: None,
+                    };
+                    let batch = node.advance_batch().await?;
+                    Ok((node, batch))
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let (node, batch): (StreamNode, Option<RecordBatch>) =
+                task.await.context(JoinSnafu)??;
+            if let Some(batch) = batch {
+                in_progress.push_batch(node.node_index, batch);
                 nodes.push(node);
             }
         }
 
+        let num_active_nodes = nodes.len();
         let algo = MergeAlgo::new(nodes);
 
         let mut reader = Self {
@@ -605,6 +620,10 @@ impl FlatMergeReader {
             metrics_reporter,
         };
         let elapsed = start.elapsed();
+        debug!(
+            "FlatMergeReader init done, num_iters: {}, active_nodes: {}, cost: {:?}",
+            num_iters, num_active_nodes, elapsed,
+        );
         reader.metrics.init_cost += elapsed;
         reader.metrics.scan_cost += elapsed;
 

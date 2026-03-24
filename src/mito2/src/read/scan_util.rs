@@ -1118,21 +1118,18 @@ impl PartitionMetrics {
     }
 
     /// Increments the total bytes added to the range cache.
-    #[allow(dead_code)]
     pub(crate) fn inc_range_cache_size(&self, size: usize) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.range_cache_size += size;
     }
 
     /// Increments the range cache hit counter.
-    #[allow(dead_code)]
     pub(crate) fn inc_range_cache_hit(&self) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.range_cache_hit += 1;
     }
 
     /// Increments the range cache miss counter.
-    #[allow(dead_code)]
     pub(crate) fn inc_range_cache_miss(&self) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.range_cache_miss += 1;
@@ -1276,13 +1273,22 @@ pub(crate) fn should_split_flat_batches_for_merge(
             // This is a file range.
             let file_index = index.index - stream_ctx.input.num_memtables();
             let file = &stream_ctx.input.files[file_index];
-            if file.meta_ref().num_rows < SPLIT_ROW_THRESHOLD || file.meta_ref().num_series == 0 {
+            let file_meta = file.meta_ref();
+            if file_meta.level == 0 {
+                // Always split level 0 files.
+                num_files_to_split += 1;
+            } else if file_meta.num_rows < SPLIT_ROW_THRESHOLD || file_meta.num_series == 0 {
                 // If the file doesn't have enough rows, or the number of series is unavailable, skips it.
                 continue;
-            }
-            debug_assert!(file.meta_ref().num_rows > 0);
-            if !can_split_series(file.meta_ref().num_rows, file.meta_ref().num_series) {
+            } else if !can_split_series(file_meta.num_rows, file_meta.num_series) {
                 // We can't split batches in a file.
+                common_telemetry::debug!(
+                    "Can't split series for file {}, level: {}, num_rows: {}, num_series: {}",
+                    file_meta.file_id,
+                    file_meta.level,
+                    file_meta.num_rows,
+                    file_meta.num_series,
+                );
                 return false;
             } else {
                 num_files_to_split += 1;
