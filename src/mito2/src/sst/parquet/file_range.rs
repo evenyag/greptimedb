@@ -25,7 +25,6 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
 use datatypes::arrow::array::{Array as _, ArrayRef, BooleanArray};
 use datatypes::arrow::buffer::BooleanBuffer;
-use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::Schema;
@@ -378,11 +377,6 @@ impl FileRangeContext {
         self.base.compaction_projection_mapper.as_ref()
     }
 
-    /// Returns the original nullable schema if the non-nullable workaround was applied.
-    pub(crate) fn nullable_override_schema(&self) -> Option<&SchemaRef> {
-        self.base.nullable_override_schema.as_ref()
-    }
-
     /// Sets the `CompatBatch` to the context.
     pub(crate) fn set_compat_batch(&mut self, compat: Option<CompatBatch>) {
         self.base.compat_batch = compat;
@@ -492,9 +486,6 @@ pub(crate) struct RangeBase {
     pub(crate) pre_filter_mode: PreFilterMode,
     /// Partition filter.
     pub(crate) partition_filter: Option<PartitionFilterContext>,
-    /// Original nullable schema to restore on record batches when a non-nullable
-    /// workaround was used to build the arrow reader metadata.
-    pub(crate) nullable_override_schema: Option<SchemaRef>,
 }
 
 pub(crate) struct TagDecodeState {
@@ -1011,7 +1002,6 @@ mod tests {
             compaction_projection_mapper: None,
             pre_filter_mode: PreFilterMode::All,
             partition_filter: None,
-            nullable_override_schema: None,
         }
     }
 

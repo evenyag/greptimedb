@@ -478,27 +478,21 @@ impl ParquetReaderBuilder {
         // Create ArrowReaderMetadata for async stream building.
         let arrow_reader_options =
             ArrowReaderOptions::new().with_schema(read_format.arrow_schema().clone());
-        let (arrow_metadata, need_schema_override) =
+        let arrow_metadata =
             match ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options) {
-                Ok(metadata) => (metadata, false),
+                Ok(metadata) => metadata,
                 Err(_) => {
                     // Retry with greptime_value set to non-nullable to handle schema
                     // evolution mismatch where the parquet file was written with a
                     // non-nullable greptime_value but the current schema has it nullable.
                     let non_nullable_schema =
                         make_greptime_value_non_nullable(read_format.arrow_schema());
-                    let retry_options = ArrowReaderOptions::new().with_schema(non_nullable_schema);
-                    let metadata =
-                        ArrowReaderMetadata::try_new(parquet_meta.clone(), retry_options)
-                            .context(ReadDataPartSnafu)?;
-                    (metadata, true)
+                    let retry_options =
+                        ArrowReaderOptions::new().with_schema(non_nullable_schema);
+                    ArrowReaderMetadata::try_new(parquet_meta.clone(), retry_options)
+                        .context(ReadDataPartSnafu)?
                 }
             };
-        let nullable_override_schema = if need_schema_override {
-            Some(read_format.arrow_schema().clone())
-        } else {
-            None
-        };
 
         let filters = if let Some(predicate) = &self.predicate {
             predicate
@@ -566,7 +560,6 @@ impl ParquetReaderBuilder {
                 compaction_projection_mapper,
                 pre_filter_mode: self.pre_filter_mode,
                 partition_filter,
-                nullable_override_schema,
             },
         );
 
@@ -2210,6 +2203,16 @@ where
     }
 }
 
+/// Cached state for nullable schema override in [FlatRowGroupReader].
+enum NullableSchemaOverride {
+    /// Not yet checked.
+    Unknown,
+    /// No override needed.
+    NoOverride,
+    /// Override needed; the cached schema has `greptime_value` set to nullable.
+    Override(SchemaRef),
+}
+
 /// Reader to read a row group of a parquet file in flat format, returning RecordBatch.
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
@@ -2218,6 +2221,8 @@ pub(crate) struct FlatRowGroupReader {
     stream: ParquetRecordBatchStream<SstAsyncFileReader>,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Cached nullable schema override state.
+    nullable_schema_override: NullableSchemaOverride,
 }
 
 impl FlatRowGroupReader {
@@ -2235,6 +2240,7 @@ impl FlatRowGroupReader {
             context,
             stream,
             override_sequence,
+            nullable_schema_override: NullableSchemaOverride::Unknown,
         }
     }
 
@@ -2246,13 +2252,9 @@ impl FlatRowGroupReader {
                     path: self.context.file_path(),
                 })?;
 
-                // Restore original nullable schema if the non-nullable workaround was applied.
-                let record_batch = if let Some(schema) = self.context.nullable_override_schema() {
-                    RecordBatch::try_new(schema.clone(), record_batch.columns().to_vec())
-                        .context(crate::error::NewRecordBatchSnafu)?
-                } else {
-                    record_batch
-                };
+                // If the greptime_value field is non-nullable in the batch but nullable
+                // in the read format schema, override the batch schema to make it nullable.
+                let record_batch = self.maybe_override_nullable_schema(record_batch)?;
 
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
@@ -2261,6 +2263,73 @@ impl FlatRowGroupReader {
                 Ok(Some(record_batch))
             }
             None => Ok(None),
+        }
+    }
+
+    /// If the `greptime_value` field is non-nullable in the batch but nullable in the
+    /// read format schema, overrides the batch schema. Caches the result so subsequent
+    /// batches skip the check entirely.
+    fn maybe_override_nullable_schema(
+        &mut self,
+        record_batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        match &self.nullable_schema_override {
+            NullableSchemaOverride::Override(schema) => {
+                RecordBatch::try_new(schema.clone(), record_batch.columns().to_vec())
+                    .context(crate::error::NewRecordBatchSnafu)
+            }
+            NullableSchemaOverride::NoOverride => Ok(record_batch),
+            NullableSchemaOverride::Unknown => {
+                self.check_and_override_nullable_schema(record_batch)
+            }
+        }
+    }
+
+    /// Checks the first batch to determine if the `greptime_value` field needs a
+    /// nullable override and caches the result.
+    fn check_and_override_nullable_schema(
+        &mut self,
+        record_batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        let batch_schema = record_batch.schema();
+        let greptime_value_name = greptime_value();
+        // Check if greptime_value is non-nullable in the batch but nullable in the
+        // read format schema.
+        let needs_override = batch_schema
+            .field_with_name(greptime_value_name)
+            .ok()
+            .is_some_and(|f| !f.is_nullable())
+            && self
+                .context
+                .read_format()
+                .arrow_schema()
+                .field_with_name(greptime_value_name)
+                .ok()
+                .is_some_and(|f| f.is_nullable());
+
+        if needs_override {
+            let fields: Vec<_> = batch_schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    if f.name() == greptime_value_name {
+                        Arc::new(f.as_ref().clone().with_nullable(true))
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect();
+            let nullable_schema = Arc::new(Schema::new_with_metadata(
+                fields,
+                batch_schema.metadata().clone(),
+            ));
+            self.nullable_schema_override =
+                NullableSchemaOverride::Override(nullable_schema.clone());
+            RecordBatch::try_new(nullable_schema, record_batch.columns().to_vec())
+                .context(crate::error::NewRecordBatchSnafu)
+        } else {
+            self.nullable_schema_override = NullableSchemaOverride::NoOverride;
+            Ok(record_batch)
         }
     }
 }
