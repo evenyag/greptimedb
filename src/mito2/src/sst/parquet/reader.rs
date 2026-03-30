@@ -21,11 +21,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
+use common_query::prelude::greptime_value;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_telemetry::{tracing, warn};
 use datafusion_expr::Expr;
 use datatypes::arrow::array::ArrayRef;
-use datatypes::arrow::datatypes::Field;
+use datatypes::arrow::datatypes::{Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::DataType;
@@ -108,6 +109,25 @@ macro_rules! handle_index_error {
             );
         }
     };
+}
+
+/// Creates a copy of the schema with the `greptime_value` field set to non-nullable.
+/// This is a workaround for parquet files written with a non-nullable `greptime_value`
+/// field that are read with a schema where it is nullable.
+fn make_greptime_value_non_nullable(schema: &SchemaRef) -> SchemaRef {
+    let greptime_value_name = greptime_value();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == greptime_value_name && f.is_nullable() {
+                Arc::new(f.as_ref().clone().with_nullable(false))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// Parquet SST reader builder.
@@ -458,9 +478,27 @@ impl ParquetReaderBuilder {
         // Create ArrowReaderMetadata for async stream building.
         let arrow_reader_options =
             ArrowReaderOptions::new().with_schema(read_format.arrow_schema().clone());
-        let arrow_metadata =
-            ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options)
-                .context(ReadDataPartSnafu)?;
+        let (arrow_metadata, need_schema_override) =
+            match ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options) {
+                Ok(metadata) => (metadata, false),
+                Err(_) => {
+                    // Retry with greptime_value set to non-nullable to handle schema
+                    // evolution mismatch where the parquet file was written with a
+                    // non-nullable greptime_value but the current schema has it nullable.
+                    let non_nullable_schema =
+                        make_greptime_value_non_nullable(read_format.arrow_schema());
+                    let retry_options = ArrowReaderOptions::new().with_schema(non_nullable_schema);
+                    let metadata =
+                        ArrowReaderMetadata::try_new(parquet_meta.clone(), retry_options)
+                            .context(ReadDataPartSnafu)?;
+                    (metadata, true)
+                }
+            };
+        let nullable_override_schema = if need_schema_override {
+            Some(read_format.arrow_schema().clone())
+        } else {
+            None
+        };
 
         let filters = if let Some(predicate) = &self.predicate {
             predicate
@@ -528,6 +566,7 @@ impl ParquetReaderBuilder {
                 compaction_projection_mapper,
                 pre_filter_mode: self.pre_filter_mode,
                 partition_filter,
+                nullable_override_schema,
             },
         );
 
@@ -2206,6 +2245,14 @@ impl FlatRowGroupReader {
                 let record_batch = batch_result.context(ReadParquetSnafu {
                     path: self.context.file_path(),
                 })?;
+
+                // Restore original nullable schema if the non-nullable workaround was applied.
+                let record_batch = if let Some(schema) = self.context.nullable_override_schema() {
+                    RecordBatch::try_new(schema.clone(), record_batch.columns().to_vec())
+                        .context(crate::error::NewRecordBatchSnafu)?
+                } else {
+                    record_batch
+                };
 
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
