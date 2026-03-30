@@ -221,7 +221,7 @@ impl PrefilterContextBuilder {
 
         // Only flat format with dictionary-encoded PKs supports PK prefiltering.
         let flat_format = read_format.as_flat()?;
-        if !flat_format.raw_batch_has_primary_key_dictionary() {
+        if flat_format.raw_batch_has_primary_key_dictionary() {
             common_telemetry::info!(
                 "xxxxx PrefilterContextBuilder, pk raw_batch_has_primary_key_dictionary"
             );
