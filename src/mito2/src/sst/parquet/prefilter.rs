@@ -209,17 +209,22 @@ impl PrefilterContextBuilder {
     ) -> Option<Self> {
         let pk_filters = primary_key_filters?;
         if pk_filters.is_empty() {
+            common_telemetry::info!("xxxxx PrefilterContextBuilder, pk_filters is empty");
             return None;
         }
 
         let metadata = read_format.metadata();
         if metadata.primary_key.is_empty() {
+            common_telemetry::info!("xxxxx PrefilterContextBuilder, pk is empty");
             return None;
         }
 
         // Only flat format with dictionary-encoded PKs supports PK prefiltering.
         let flat_format = read_format.as_flat()?;
         if !flat_format.raw_batch_has_primary_key_dictionary() {
+            common_telemetry::info!(
+                "xxxxx PrefilterContextBuilder, pk raw_batch_has_primary_key_dictionary"
+            );
             return None;
         }
 
