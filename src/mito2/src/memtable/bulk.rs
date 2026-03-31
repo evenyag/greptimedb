@@ -22,7 +22,8 @@ pub mod part;
 pub mod part_reader;
 mod row_group_reader;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
@@ -47,7 +48,8 @@ use crate::error::{Result, UnsupportedOperationSnafu};
 use crate::flush::WriteBufferManagerRef;
 use crate::memtable::bulk::context::BulkIterContext;
 use crate::memtable::bulk::part::{
-    BulkPart, BulkPartEncodeMetrics, BulkPartEncoder, MultiBulkPart, UnorderedPart,
+    BulkPart, BulkPartEncodeMetrics, BulkPartEncoder, MultiBulkPart, RawBulkPart, UnorderedPart,
+    convert_to_shared_bulk_part,
 };
 use crate::memtable::bulk::part_reader::BulkPartBatchIter;
 use crate::memtable::stats::WriteMetrics;
@@ -97,6 +99,50 @@ static ENCODE_BYTES_THRESHOLD: LazyLock<usize> = LazyLock::new(|| {
         DEFAULT_ENCODE_BYTES_THRESHOLD,
     )
 });
+
+pub(crate) const SHARED_PK_DICT_THRESHOLD: usize = 10_000;
+
+#[derive(Default)]
+pub(crate) struct SharedPkDictionary {
+    key_to_id: HashMap<Vec<u8>, u32>,
+    id_to_key: Vec<Vec<u8>>,
+    estimated_bytes: usize,
+}
+
+impl SharedPkDictionary {
+    pub(crate) fn len(&self) -> usize {
+        self.id_to_key.len()
+    }
+
+    pub(crate) fn contains(&self, key: &[u8]) -> bool {
+        self.key_to_id.contains_key(key)
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.estimated_bytes
+    }
+
+    pub(crate) fn key(&self, id: u32) -> Option<&[u8]> {
+        self.id_to_key.get(id as usize).map(Vec::as_slice)
+    }
+
+    pub(crate) fn lookup_or_insert(&mut self, key: &[u8]) -> Option<(u32, usize)> {
+        if let Some(id) = self.key_to_id.get(key) {
+            return Some((*id, 0));
+        }
+        if self.len() >= SHARED_PK_DICT_THRESHOLD {
+            return None;
+        }
+
+        let id = self.id_to_key.len() as u32;
+        let owned = key.to_vec();
+        let delta = owned.len() + size_of::<u32>() + size_of::<Vec<u8>>();
+        self.estimated_bytes += delta;
+        self.id_to_key.push(owned.clone());
+        self.key_to_id.insert(owned, id);
+        Some((id, delta))
+    }
+}
 
 /// Configuration for bulk memtable.
 #[derive(Debug, Clone)]
@@ -373,6 +419,8 @@ pub struct BulkMemtable {
     compactor: Arc<Mutex<MemtableCompactor>>,
     /// Dispatcher for scheduling compaction tasks
     compact_dispatcher: Option<Arc<CompactDispatcher>>,
+    /// Shared memtable-level dictionary for primary keys.
+    shared_pk_dict: Arc<RwLock<SharedPkDictionary>>,
     /// Whether the append mode is enabled
     append_mode: bool,
     /// Mode to handle duplicate rows while merging
@@ -387,6 +435,10 @@ impl std::fmt::Debug for BulkMemtable {
             .field("min_timestamp", &self.min_timestamp.load(Ordering::Relaxed))
             .field("max_timestamp", &self.max_timestamp.load(Ordering::Relaxed))
             .field("max_sequence", &self.max_sequence.load(Ordering::Relaxed))
+            .field(
+                "shared_pk_dict_len",
+                &self.shared_pk_dict.read().unwrap().len(),
+            )
             .finish()
     }
 }
@@ -411,17 +463,15 @@ impl Memtable for BulkMemtable {
     }
 
     fn write_bulk(&self, fragment: BulkPart) -> Result<()> {
-        let local_metrics = WriteMetrics {
-            key_bytes: 0,
-            value_bytes: fragment.estimated_size(),
-            min_ts: fragment.min_timestamp,
-            max_ts: fragment.max_timestamp,
-            num_rows: fragment.num_rows(),
-            max_sequence: fragment.sequence,
-        };
+        let min_ts = fragment.min_timestamp;
+        let max_ts = fragment.max_timestamp;
+        let num_rows = fragment.num_rows();
+        let max_sequence = fragment.sequence;
 
         {
             let mut bulk_parts = self.parts.write().unwrap();
+            let (fragment, dict_bytes) = self.normalize_raw_part(fragment)?;
+            let value_bytes = fragment.estimated_size() + dict_bytes;
 
             // Routes small parts to unordered_part based on threshold
             if bulk_parts.unordered_part.should_accept(fragment.num_rows()) {
@@ -429,11 +479,13 @@ impl Memtable for BulkMemtable {
 
                 // Compacts unordered_part if threshold is reached
                 if bulk_parts.should_compact_unordered_part()
-                    && let Some(bulk_part) = bulk_parts.unordered_part.to_bulk_part()?
+                    && let Some(bulk_part) = bulk_parts
+                        .unordered_part
+                        .to_bulk_part(&self.shared_pk_dict.read().unwrap())?
                 {
                     bulk_parts.parts.push(BulkPartWrapper {
                         part: PartToMerge::Bulk {
-                            part: bulk_part,
+                            part: RawBulkPart::Plain(bulk_part),
                             file_id: FileId::random(),
                         },
                         merging: false,
@@ -454,7 +506,14 @@ impl Memtable for BulkMemtable {
             // This ensure the statistics in `ranges()` are correct. What's more,
             // it guarantees no rows are out of the time range so we don't need to
             // prune rows by time range again in the iterator of the MemtableRange.
-            self.update_stats(local_metrics);
+            self.update_stats(WriteMetrics {
+                key_bytes: 0,
+                value_bytes,
+                min_ts,
+                max_ts,
+                num_rows,
+                max_sequence,
+            });
         }
 
         if self.should_compact() {
@@ -489,15 +548,18 @@ impl Memtable for BulkMemtable {
 
             // Adds range for unordered part if not empty
             if !bulk_parts.unordered_part.is_empty()
-                && let Some(unordered_bulk_part) = bulk_parts.unordered_part.to_bulk_part()?
+                && let Some(unordered_bulk_part) = bulk_parts
+                    .unordered_part
+                    .to_bulk_part(&self.shared_pk_dict.read().unwrap())?
             {
                 let part_stats = unordered_bulk_part.to_memtable_stats(&self.metadata);
                 let range = MemtableRange::new(
                     Arc::new(MemtableRangeContext::new(
                         self.id,
                         Box::new(BulkRangeIterBuilder {
-                            part: unordered_bulk_part,
+                            part: RawBulkPart::Plain(unordered_bulk_part),
                             context: context.clone(),
+                            shared_pk_dict: self.shared_pk_dict.clone(),
                             sequence,
                         }),
                         predicate.clone(),
@@ -520,6 +582,7 @@ impl Memtable for BulkMemtable {
                     PartToMerge::Bulk { part, .. } => Box::new(BulkRangeIterBuilder {
                         part: part.clone(),
                         context: context.clone(),
+                        shared_pk_dict: self.shared_pk_dict.clone(),
                         sequence,
                     }),
                     PartToMerge::Multi { part, .. } => Box::new(MultiBulkRangeIterBuilder {
@@ -564,7 +627,7 @@ impl Memtable for BulkMemtable {
     }
 
     fn stats(&self) -> MemtableStats {
-        let estimated_bytes = self.alloc_tracker.bytes_allocated();
+        let estimated_bytes = self.estimated_bytes();
 
         if estimated_bytes == 0 || self.num_rows.load(Ordering::Relaxed) == 0 {
             return MemtableStats {
@@ -624,6 +687,7 @@ impl Memtable for BulkMemtable {
                 self.config.clone(),
             ))),
             compact_dispatcher: self.compact_dispatcher.clone(),
+            shared_pk_dict: Arc::new(RwLock::new(SharedPkDictionary::default())),
             append_mode: self.append_mode,
             merge_mode: self.merge_mode,
         })
@@ -646,6 +710,7 @@ impl Memtable for BulkMemtable {
             compactor.merge_parts(
                 &self.flat_arrow_schema,
                 &self.parts,
+                &self.shared_pk_dict,
                 &self.metadata,
                 !self.append_mode,
                 self.merge_mode,
@@ -686,6 +751,7 @@ impl BulkMemtable {
             flat_arrow_schema,
             compactor: Arc::new(Mutex::new(MemtableCompactor::new(region_id, id, config))),
             compact_dispatcher,
+            shared_pk_dict: Arc::new(RwLock::new(SharedPkDictionary::default())),
             append_mode,
             merge_mode,
         }
@@ -727,6 +793,28 @@ impl BulkMemtable {
         self.num_rows.fetch_add(stats.num_rows, Ordering::Relaxed);
     }
 
+    fn normalize_raw_part(&self, fragment: BulkPart) -> Result<(RawBulkPart, usize)> {
+        let mut shared_pk_dict = self.shared_pk_dict.write().unwrap();
+        if let Some((part, dict_bytes)) =
+            convert_to_shared_bulk_part(fragment.clone(), &mut shared_pk_dict)?
+        {
+            Ok((RawBulkPart::Shared(part), dict_bytes))
+        } else {
+            Ok((RawBulkPart::Plain(fragment), 0))
+        }
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        let parts = self.parts.read().unwrap();
+        let shared_pk_dict = self.shared_pk_dict.read().unwrap();
+        let parts_bytes: usize = parts
+            .parts
+            .iter()
+            .map(|part| part.part.estimated_size())
+            .sum();
+        parts_bytes + parts.unordered_part.estimated_size() + shared_pk_dict.estimated_bytes()
+    }
+
     /// Returns the estimated time series count.
     fn estimated_series_count(&self) -> usize {
         let bulk_parts = self.parts.read().unwrap();
@@ -752,6 +840,7 @@ impl BulkMemtable {
                 config: self.config.clone(),
                 flat_arrow_schema: self.flat_arrow_schema.clone(),
                 compactor: self.compactor.clone(),
+                shared_pk_dict: self.shared_pk_dict.clone(),
                 append_mode: self.append_mode,
                 merge_mode: self.merge_mode,
             };
@@ -768,9 +857,10 @@ impl BulkMemtable {
 
 /// Iterator builder for bulk range
 pub struct BulkRangeIterBuilder {
-    pub part: BulkPart,
-    pub context: Arc<BulkIterContext>,
-    pub sequence: Option<SequenceRange>,
+    part: RawBulkPart,
+    context: Arc<BulkIterContext>,
+    shared_pk_dict: Arc<RwLock<SharedPkDictionary>>,
+    sequence: Option<SequenceRange>,
 }
 
 /// Iterator builder for multi bulk range
@@ -797,9 +887,12 @@ impl IterBuilder for BulkRangeIterBuilder {
         _time_range: Option<(Timestamp, Timestamp)>,
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
-        let series_count = self.part.estimated_series_count();
+        let part = self
+            .part
+            .materialize(&self.shared_pk_dict.read().unwrap())?;
+        let series_count = part.estimated_series_count();
         let iter = BulkPartBatchIter::from_single(
-            self.part.batch.clone(),
+            part.batch,
             self.context.clone(),
             self.sequence,
             series_count,
@@ -908,7 +1001,7 @@ impl BulkPartWrapper {
 #[derive(Clone)]
 enum PartToMerge {
     /// Raw bulk part.
-    Bulk { part: BulkPart, file_id: FileId },
+    Bulk { part: RawBulkPart, file_id: FileId },
     /// Multiple bulk parts.
     Multi {
         part: MultiBulkPart,
@@ -934,7 +1027,10 @@ impl PartToMerge {
     /// Gets the minimum timestamp of this part.
     fn min_timestamp(&self) -> i64 {
         match self {
-            PartToMerge::Bulk { part, .. } => part.min_timestamp,
+            PartToMerge::Bulk { part, .. } => match part {
+                RawBulkPart::Plain(part) => part.min_timestamp,
+                RawBulkPart::Shared(part) => part.min_timestamp,
+            },
             PartToMerge::Multi { part, .. } => part.min_timestamp(),
             PartToMerge::Encoded { part, .. } => part.metadata().min_timestamp,
         }
@@ -943,7 +1039,10 @@ impl PartToMerge {
     /// Gets the maximum timestamp of this part.
     fn max_timestamp(&self) -> i64 {
         match self {
-            PartToMerge::Bulk { part, .. } => part.max_timestamp,
+            PartToMerge::Bulk { part, .. } => match part {
+                RawBulkPart::Plain(part) => part.max_timestamp,
+                RawBulkPart::Shared(part) => part.max_timestamp,
+            },
             PartToMerge::Multi { part, .. } => part.max_timestamp(),
             PartToMerge::Encoded { part, .. } => part.metadata().max_timestamp,
         }
@@ -961,7 +1060,10 @@ impl PartToMerge {
     /// Gets the maximum sequence number of this part.
     fn max_sequence(&self) -> u64 {
         match self {
-            PartToMerge::Bulk { part, .. } => part.sequence,
+            PartToMerge::Bulk { part, .. } => match part {
+                RawBulkPart::Plain(part) => part.sequence,
+                RawBulkPart::Shared(part) => part.sequence,
+            },
             PartToMerge::Multi { part, .. } => part.max_sequence(),
             PartToMerge::Encoded { part, .. } => part.metadata().max_sequence,
         }
@@ -993,7 +1095,10 @@ impl PartToMerge {
     /// Converts this part to `MemtableStats`.
     fn to_memtable_stats(&self, region_metadata: &RegionMetadataRef) -> MemtableStats {
         match self {
-            PartToMerge::Bulk { part, .. } => part.to_memtable_stats(region_metadata),
+            PartToMerge::Bulk { part, .. } => match part {
+                RawBulkPart::Plain(part) => part.to_memtable_stats(region_metadata),
+                RawBulkPart::Shared(part) => part.to_memtable_stats(region_metadata),
+            },
             PartToMerge::Multi { part, .. } => part.to_memtable_stats(region_metadata),
             PartToMerge::Encoded { part, .. } => part.to_memtable_stats(),
         }
@@ -1003,9 +1108,11 @@ impl PartToMerge {
     fn create_iterator(
         self,
         context: Arc<BulkIterContext>,
+        shared_pk_dict: &Arc<RwLock<SharedPkDictionary>>,
     ) -> Result<Option<BoxedRecordBatchIterator>> {
         match self {
             PartToMerge::Bulk { part, .. } => {
+                let part = part.materialize(&shared_pk_dict.read().unwrap())?;
                 let series_count = part.estimated_series_count();
                 let iter = BulkPartBatchIter::from_single(
                     part.batch,
@@ -1044,6 +1151,7 @@ impl MemtableCompactor {
         &mut self,
         arrow_schema: &SchemaRef,
         bulk_parts: &RwLock<BulkParts>,
+        shared_pk_dict: &Arc<RwLock<SharedPkDictionary>>,
         metadata: &RegionMetadataRef,
         dedup: bool,
         merge_mode: MergeMode,
@@ -1083,6 +1191,7 @@ impl MemtableCompactor {
                 Self::merge_parts_group(
                     group,
                     arrow_schema,
+                    shared_pk_dict,
                     metadata,
                     dedup,
                     merge_mode,
@@ -1117,6 +1226,7 @@ impl MemtableCompactor {
     fn merge_parts_group(
         parts_to_merge: Vec<PartToMerge>,
         arrow_schema: &SchemaRef,
+        shared_pk_dict: &Arc<RwLock<SharedPkDictionary>>,
         metadata: &RegionMetadataRef,
         dedup: bool,
         merge_mode: MergeMode,
@@ -1163,7 +1273,11 @@ impl MemtableCompactor {
         // Creates iterators for all parts to merge.
         let iterators: Vec<BoxedRecordBatchIterator> = parts_to_merge
             .into_iter()
-            .filter_map(|part| part.create_iterator(context.clone()).ok().flatten())
+            .filter_map(|part| {
+                part.create_iterator(context.clone(), shared_pk_dict)
+                    .ok()
+                    .flatten()
+            })
             .collect();
 
         if iterators.is_empty() {
@@ -1257,6 +1371,8 @@ struct MemCompactTask {
     flat_arrow_schema: SchemaRef,
     /// Compactor for merging bulk parts
     compactor: Arc<Mutex<MemtableCompactor>>,
+    /// Shared memtable-level primary key dictionary.
+    shared_pk_dict: Arc<RwLock<SharedPkDictionary>>,
     /// Whether the append mode is enabled
     append_mode: bool,
     /// Mode to handle duplicate rows while merging
@@ -1276,6 +1392,7 @@ impl MemCompactTask {
             compactor.merge_parts(
                 &self.flat_arrow_schema,
                 &self.parts,
+                &self.shared_pk_dict,
                 &self.metadata,
                 !self.append_mode,
                 self.merge_mode,
@@ -1376,6 +1493,7 @@ mod tests {
     use super::*;
     use crate::memtable::bulk::part::BulkPartConverter;
     use crate::read::scan_region::PredicateGroup;
+    use crate::sst::parquet::format::PrimaryKeyArray;
     use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
     use crate::test_util::memtable_util::{build_key_values_with_ts_seq_values, metadata_for_test};
 
@@ -2022,7 +2140,7 @@ mod tests {
     fn create_bulk_part_wrapper(part: BulkPart) -> BulkPartWrapper {
         BulkPartWrapper {
             part: PartToMerge::Bulk {
-                part,
+                part: RawBulkPart::Plain(part),
                 file_id: FileId::random(),
             },
             merging: false,
@@ -2209,5 +2327,120 @@ mod tests {
             }
         }
         assert_eq!(expected_rows, total_rows_read);
+    }
+
+    #[test]
+    fn test_bulk_memtable_uses_shared_pk_dictionary_for_raw_parts() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(
+            3001,
+            BulkMemtableConfig::default(),
+            metadata,
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+        );
+        memtable.set_unordered_part_threshold(0);
+
+        let part = create_bulk_part_with_converter(
+            "shared_key",
+            1,
+            vec![1000, 2000],
+            vec![Some(1.0), Some(2.0)],
+            1,
+        )
+        .unwrap();
+        memtable.write_bulk(part).unwrap();
+
+        assert_eq!(1, memtable.shared_pk_dict.read().unwrap().len());
+
+        let parts = memtable.parts.read().unwrap();
+        assert_eq!(1, parts.parts.len());
+        assert!(matches!(
+            &parts.parts[0].part,
+            PartToMerge::Bulk {
+                part: RawBulkPart::Shared(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bulk_memtable_materializes_shared_pk_batches_on_read() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(
+            3002,
+            BulkMemtableConfig::default(),
+            metadata.clone(),
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+        );
+        memtable.set_unordered_part_threshold(0);
+
+        let part = create_bulk_part_with_converter(
+            "materialize_key",
+            7,
+            vec![1000, 2000],
+            vec![Some(1.0), Some(2.0)],
+            1,
+        )
+        .unwrap();
+        memtable.write_bulk(part).unwrap();
+
+        let predicate_group = PredicateGroup::new(&metadata, &[]).unwrap();
+        let ranges = memtable
+            .ranges(
+                None,
+                RangesOptions::default().with_predicate(predicate_group),
+            )
+            .unwrap();
+        let range = ranges.ranges.get(&0).unwrap();
+        let mut iter = range.build_record_batch_iter(None, None).unwrap();
+        let batch = iter.next().unwrap().unwrap();
+        let pk_column = batch.column_by_name("__primary_key").unwrap();
+        assert!(
+            pk_column
+                .as_any()
+                .downcast_ref::<PrimaryKeyArray>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_bulk_memtable_falls_back_after_shared_pk_threshold() {
+        let metadata = metadata_for_test();
+        let memtable = BulkMemtable::new(
+            3003,
+            BulkMemtableConfig::default(),
+            metadata,
+            None,
+            None,
+            false,
+            MergeMode::LastRow,
+        );
+        memtable.set_unordered_part_threshold(0);
+
+        {
+            let mut dict = memtable.shared_pk_dict.write().unwrap();
+            for i in 0..SHARED_PK_DICT_THRESHOLD {
+                dict.lookup_or_insert(format!("pk-{i}").as_bytes()).unwrap();
+            }
+        }
+
+        let part = create_bulk_part_with_converter("plain_key", 9, vec![1000], vec![Some(1.0)], 1)
+            .unwrap();
+        memtable.write_bulk(part).unwrap();
+
+        let parts = memtable.parts.read().unwrap();
+        assert!(matches!(
+            &parts.parts[0].part,
+            PartToMerge::Bulk {
+                part: RawBulkPart::Plain(_),
+                ..
+            }
+        ));
     }
 }

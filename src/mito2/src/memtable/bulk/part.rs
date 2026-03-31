@@ -62,10 +62,11 @@ use table::predicate::Predicate;
 use crate::error::{
     self, ColumnNotFoundSnafu, ComputeArrowSnafu, ConvertColumnDataTypeSnafu, CreateDefaultSnafu,
     DataTypeMismatchSnafu, EncodeMemtableSnafu, EncodeSnafu, InvalidMetadataSnafu,
-    InvalidRequestSnafu, NewRecordBatchSnafu, Result, UnexpectedSnafu,
+    InvalidRecordBatchSnafu, InvalidRequestSnafu, NewRecordBatchSnafu, Result, UnexpectedSnafu,
 };
 use crate::memtable::bulk::context::BulkIterContextRef;
 use crate::memtable::bulk::part_reader::EncodedBulkPartIter;
+use crate::memtable::bulk::{SHARED_PK_DICT_THRESHOLD, SharedPkDictionary};
 use crate::memtable::time_series::{ValueBuilder, Values};
 use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics, MemtableStats};
 use crate::sst::index::IndexOutput;
@@ -86,6 +87,145 @@ pub struct BulkPart {
     pub sequence: u64,
     pub timestamp_index: usize,
     pub raw_data: Option<ArrowIpc>,
+}
+
+#[derive(Clone)]
+pub struct SharedBulkPart {
+    pub batch: RecordBatch,
+    pub max_timestamp: i64,
+    pub min_timestamp: i64,
+    pub sequence: u64,
+    pub timestamp_index: usize,
+    pub series_count: usize,
+}
+
+impl SharedBulkPart {
+    pub fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        record_batch_estimated_size(&self.batch)
+    }
+
+    pub(crate) fn estimated_series_count(&self) -> usize {
+        self.series_count
+    }
+
+    pub(crate) fn to_memtable_stats(&self, region_metadata: &RegionMetadataRef) -> MemtableStats {
+        let ts_type = region_metadata.time_index_type();
+        let min_ts = ts_type.create_timestamp(self.min_timestamp);
+        let max_ts = ts_type.create_timestamp(self.max_timestamp);
+
+        MemtableStats {
+            estimated_bytes: self.estimated_size(),
+            time_range: Some((min_ts, max_ts)),
+            num_rows: self.num_rows(),
+            num_ranges: 1,
+            max_sequence: self.sequence,
+            series_count: self.series_count,
+        }
+    }
+
+    pub(crate) fn materialize(&self, dict: &SharedPkDictionary) -> Result<BulkPart> {
+        let pk_column_idx = primary_key_column_index(self.batch.num_columns());
+        let shared_ids = self
+            .batch
+            .column(pk_column_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .with_context(|| InvalidRecordBatchSnafu {
+                reason: "Primary key column is not a shared-id array".to_string(),
+            })?;
+
+        let mut local_ids = HashMap::new();
+        let mut values = BinaryBuilder::with_capacity(self.series_count, self.series_count * 16);
+        let mut keys = Vec::with_capacity(shared_ids.len());
+
+        for shared_id in shared_ids.values().iter().take(shared_ids.len()) {
+            let local_id = if let Some(local_id) = local_ids.get(shared_id) {
+                *local_id
+            } else {
+                let key = dict
+                    .key(*shared_id)
+                    .with_context(|| InvalidRecordBatchSnafu {
+                        reason: format!("Shared primary key id {} is missing", shared_id),
+                    })?;
+                values.append_value(key);
+                let local_id = local_ids.len() as u32;
+                local_ids.insert(*shared_id, local_id);
+                local_id
+            };
+            keys.push(local_id);
+        }
+
+        let mut columns = self.batch.columns().to_vec();
+        columns[pk_column_idx] = Arc::new(DictionaryArray::new(
+            UInt32Array::from(keys),
+            Arc::new(values.finish()),
+        ));
+
+        let mut fields = self
+            .batch
+            .schema()
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        fields[pk_column_idx] = Arc::new(Field::new_dictionary(
+            PRIMARY_KEY_COLUMN_NAME,
+            ArrowDataType::UInt32,
+            ArrowDataType::Binary,
+            false,
+        ));
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)?;
+
+        Ok(BulkPart {
+            batch,
+            max_timestamp: self.max_timestamp,
+            min_timestamp: self.min_timestamp,
+            sequence: self.sequence,
+            timestamp_index: self.timestamp_index,
+            raw_data: None,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub enum RawBulkPart {
+    Plain(BulkPart),
+    Shared(SharedBulkPart),
+}
+
+impl RawBulkPart {
+    pub(crate) fn num_rows(&self) -> usize {
+        match self {
+            RawBulkPart::Plain(part) => part.num_rows(),
+            RawBulkPart::Shared(part) => part.num_rows(),
+        }
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        match self {
+            RawBulkPart::Plain(part) => part.estimated_size(),
+            RawBulkPart::Shared(part) => part.estimated_size(),
+        }
+    }
+
+    pub(crate) fn estimated_series_count(&self) -> usize {
+        match self {
+            RawBulkPart::Plain(part) => part.estimated_series_count(),
+            RawBulkPart::Shared(part) => part.estimated_series_count(),
+        }
+    }
+
+    pub(crate) fn materialize(&self, dict: &SharedPkDictionary) -> Result<BulkPart> {
+        match self {
+            RawBulkPart::Plain(part) => Ok(part.clone()),
+            RawBulkPart::Shared(part) => part.materialize(dict),
+        }
+    }
 }
 
 impl TryFrom<BulkWalEntry> for BulkPart {
@@ -335,7 +475,7 @@ impl BulkPart {
 /// Used to batch small parts together before merging them into a sorted part.
 pub struct UnorderedPart {
     /// Small bulk parts that haven't been sorted yet.
-    parts: Vec<BulkPart>,
+    parts: Vec<RawBulkPart>,
     /// Total number of rows across all parts.
     total_rows: usize,
     /// Minimum timestamp across all parts.
@@ -401,11 +541,15 @@ impl UnorderedPart {
     }
 
     /// Adds a BulkPart to this unordered collection.
-    pub fn push(&mut self, part: BulkPart) {
+    pub fn push(&mut self, part: RawBulkPart) {
         self.total_rows += part.num_rows();
-        self.min_timestamp = self.min_timestamp.min(part.min_timestamp);
-        self.max_timestamp = self.max_timestamp.max(part.max_timestamp);
-        self.max_sequence = self.max_sequence.max(part.sequence);
+        let (min_timestamp, max_timestamp, sequence) = match &part {
+            RawBulkPart::Plain(part) => (part.min_timestamp, part.max_timestamp, part.sequence),
+            RawBulkPart::Shared(part) => (part.min_timestamp, part.max_timestamp, part.sequence),
+        };
+        self.min_timestamp = self.min_timestamp.min(min_timestamp);
+        self.max_timestamp = self.max_timestamp.max(max_timestamp);
+        self.max_sequence = self.max_sequence.max(sequence);
         self.parts.push(part);
     }
 
@@ -426,21 +570,30 @@ impl UnorderedPart {
 
     /// Concatenates and sorts all parts into a single RecordBatch.
     /// Returns None if the collection is empty.
-    pub fn concat_and_sort(&self) -> Result<Option<RecordBatch>> {
+    pub(crate) fn concat_and_sort(
+        &self,
+        shared_dict: &SharedPkDictionary,
+    ) -> Result<Option<RecordBatch>> {
         if self.parts.is_empty() {
             return Ok(None);
         }
 
         if self.parts.len() == 1 {
             // If there's only one part, return its batch directly
-            return Ok(Some(self.parts[0].batch.clone()));
+            return Ok(Some(self.parts[0].materialize(shared_dict)?.batch));
         }
 
+        let materialized_parts = self
+            .parts
+            .iter()
+            .map(|part| part.materialize(shared_dict))
+            .collect::<Result<Vec<_>>>()?;
+
         // Get the schema from the first part
-        let schema = self.parts[0].batch.schema();
+        let schema = materialized_parts[0].batch.schema();
 
         // Concatenate all record batches
-        let batches: Vec<RecordBatch> = self.parts.iter().map(|p| p.batch.clone()).collect();
+        let batches: Vec<RecordBatch> = materialized_parts.into_iter().map(|p| p.batch).collect();
         let concatenated =
             arrow::compute::concat_batches(&schema, &batches).context(ComputeArrowSnafu)?;
 
@@ -452,12 +605,18 @@ impl UnorderedPart {
 
     /// Converts all parts into a single sorted BulkPart.
     /// Returns None if the collection is empty.
-    pub fn to_bulk_part(&self) -> Result<Option<BulkPart>> {
-        let Some(sorted_batch) = self.concat_and_sort()? else {
+    pub(crate) fn to_bulk_part(
+        &self,
+        shared_dict: &SharedPkDictionary,
+    ) -> Result<Option<BulkPart>> {
+        let Some(sorted_batch) = self.concat_and_sort(shared_dict)? else {
             return Ok(None);
         };
 
-        let timestamp_index = self.parts[0].timestamp_index;
+        let timestamp_index = match &self.parts[0] {
+            RawBulkPart::Plain(part) => part.timestamp_index,
+            RawBulkPart::Shared(part) => part.timestamp_index,
+        };
 
         Ok(Some(BulkPart {
             batch: sorted_batch,
@@ -476,6 +635,10 @@ impl UnorderedPart {
         self.min_timestamp = i64::MAX;
         self.max_timestamp = i64::MIN;
         self.max_sequence = 0;
+    }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        self.parts.iter().map(RawBulkPart::estimated_size).sum()
     }
 }
 
@@ -954,6 +1117,87 @@ pub fn convert_bulk_part(
         timestamp_index: new_timestamp_index,
         raw_data: None,
     }))
+}
+
+pub(crate) fn convert_to_shared_bulk_part(
+    part: BulkPart,
+    dict: &mut SharedPkDictionary,
+) -> Result<Option<(SharedBulkPart, usize)>> {
+    if part.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let pk_column_idx = primary_key_column_index(part.batch.num_columns());
+    let pk_dict_array = part
+        .batch
+        .column(pk_column_idx)
+        .as_any()
+        .downcast_ref::<PrimaryKeyArray>()
+        .with_context(|| InvalidRecordBatchSnafu {
+            reason: "Primary key column is not a dictionary array".to_string(),
+        })?;
+    let values = pk_dict_array
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .with_context(|| InvalidRecordBatchSnafu {
+            reason: "Primary key dictionary values are not binary".to_string(),
+        })?;
+
+    let missing = (0..values.len())
+        .filter(|idx| !dict.contains(values.value(*idx)))
+        .count();
+    if dict.len() + missing > SHARED_PK_DICT_THRESHOLD {
+        return Ok(None);
+    }
+
+    let mut mapped_ids = Vec::with_capacity(values.len());
+    let mut dict_bytes_delta = 0;
+    for value_idx in 0..values.len() {
+        let Some((shared_id, delta)) = dict.lookup_or_insert(values.value(value_idx)) else {
+            return Ok(None);
+        };
+        mapped_ids.push(shared_id);
+        dict_bytes_delta += delta;
+    }
+
+    let keys = pk_dict_array.keys();
+    let shared_ids = keys
+        .values()
+        .iter()
+        .take(keys.len())
+        .map(|key| mapped_ids[*key as usize])
+        .collect::<Vec<_>>();
+
+    let mut columns = part.batch.columns().to_vec();
+    columns[pk_column_idx] = Arc::new(UInt32Array::from(shared_ids));
+
+    let mut fields = part
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields[pk_column_idx] = Arc::new(Field::new(
+        PRIMARY_KEY_COLUMN_NAME,
+        ArrowDataType::UInt32,
+        false,
+    ));
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)?;
+
+    Ok(Some((
+        SharedBulkPart {
+            batch,
+            max_timestamp: part.max_timestamp,
+            min_timestamp: part.min_timestamp,
+            sequence: part.sequence,
+            timestamp_index: part.timestamp_index,
+            series_count: mapped_ids.len(),
+        },
+        dict_bytes_delta,
+    )))
 }
 
 #[derive(Debug, Clone)]
