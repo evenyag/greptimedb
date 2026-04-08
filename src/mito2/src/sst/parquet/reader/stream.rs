@@ -36,7 +36,7 @@ pub struct MissingColFiller<S> {
     /// Inner stream that yields record batches from parquet reader.
     inner: S,
     /// Output schema expected by the upper reader.
-    output_schema: SchemaRef,
+    pub output_schema: SchemaRef,
     /// Whether each projected root exists in the physical batch returned by parquet.
     projected_root_matches: Vec<bool>,
     /// Number of columns expected from the physical batch returned by parquet.

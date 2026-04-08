@@ -52,7 +52,9 @@ use crate::cache::index::result_cache::PredicateKey;
 use crate::cache::{CacheStrategy, CachedSstMeta};
 #[cfg(feature = "vector_index")]
 use crate::error::ApplyVectorIndexSnafu;
-use crate::error::{ReadDataPartSnafu, ReadParquetSnafu, Result, SerializePartitionExprSnafu};
+use crate::error::{
+    NewRecordBatchSnafu, ReadDataPartSnafu, ReadParquetSnafu, Result, SerializePartitionExprSnafu,
+};
 use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
     READ_ROWS_TOTAL, READ_STAGE_ELAPSED,
@@ -448,9 +450,33 @@ impl ParquetReaderBuilder {
         // Create ArrowReaderMetadata for async stream building.
         let arrow_reader_options =
             ArrowReaderOptions::new().with_schema(read_format.arrow_schema().clone());
-        let arrow_metadata =
-            ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options)
-                .context(ReadDataPartSnafu)?;
+        let (arrow_metadata, value_column_nullable_fix) =
+            match ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options) {
+                Ok(metadata) => (metadata, false),
+                Err(original_err) => {
+                    // Some legacy parquet files have greptime_value as non-nullable but
+                    // region metadata expects it to be nullable. Retry with non-nullable
+                    // value column schema to work around this mismatch.
+                    if let Some(fixed_schema) =
+                        make_value_column_non_null(read_format.arrow_schema())
+                    {
+                        let retry_options = ArrowReaderOptions::new().with_schema(fixed_schema);
+                        match ArrowReaderMetadata::try_new(parquet_meta.clone(), retry_options) {
+                            Ok(metadata) => {
+                                warn!(
+                                    "Parquet file {} has non-nullable greptime_value column, \
+                                     applying nullable workaround",
+                                    file_path
+                                );
+                                (metadata, true)
+                            }
+                            Err(_) => return Err(original_err).context(ReadDataPartSnafu),
+                        }
+                    } else {
+                        return Err(original_err).context(ReadDataPartSnafu);
+                    }
+                }
+            };
 
         let dyn_filters = if let Some(predicate) = &self.predicate {
             predicate.dyn_filters().as_ref().clone()
@@ -481,6 +507,7 @@ impl ParquetReaderBuilder {
             projection: projection_plan,
             cache_strategy: self.cache_strategy.clone(),
             prefilter_builder: filter_plan.prefilter_builder,
+            value_column_nullable_fix,
         };
 
         let partition_filter = self.build_partition_filter(&read_format, &prune_schema)?;
@@ -1631,6 +1658,9 @@ pub(crate) struct RowGroupReaderBuilder {
     cache_strategy: CacheStrategy,
     /// Pre-built prefilter state. `None` if prefiltering is not applicable.
     prefilter_builder: Option<PrefilterContextBuilder>,
+    /// Whether the greptime_value column nullability needs to be fixed back to nullable.
+    /// This is a workaround for legacy parquet files with non-nullable greptime_value.
+    value_column_nullable_fix: bool,
 }
 
 /// Context passed to [RowGroupReaderBuilder::build()] carrying all information
@@ -1665,6 +1695,11 @@ impl RowGroupReaderBuilder {
 
     pub(crate) fn has_predicate_prefilter(&self) -> bool {
         self.prefilter_builder.is_some()
+    }
+
+    /// Returns whether the greptime_value column nullability needs to be fixed.
+    pub(crate) fn value_column_nullable_fix(&self) -> bool {
+        self.value_column_nullable_fix
     }
 
     /// Builds a [ParquetRecordBatchStream] to read the row group at `row_group_idx`.
@@ -2097,6 +2132,50 @@ impl ParquetReader {
     }
 }
 
+fn make_value_column_non_null(schema: &SchemaRef) -> Option<SchemaRef> {
+    let value_column_name = common_query::prelude::greptime_value();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == value_column_name && f.is_nullable() {
+                Arc::new(f.as_ref().clone().with_nullable(false))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    if fields == schema.fields().to_vec() {
+        return None;
+    }
+    Some(Arc::new(
+        datatypes::arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone()),
+    ))
+}
+
+/// Returns a new schema with the `greptime_value` column set to nullable,
+/// or `None` if no fix is needed.
+fn make_value_column_nullable(schema: &SchemaRef) -> Option<SchemaRef> {
+    let value_column_name = common_query::prelude::greptime_value();
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == value_column_name && !f.is_nullable() {
+                Arc::new(f.as_ref().clone().with_nullable(true))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    if fields == schema.fields().to_vec() {
+        return None;
+    }
+    Some(Arc::new(
+        datatypes::arrow::datatypes::Schema::new_with_metadata(fields, schema.metadata().clone()),
+    ))
+}
+
 /// Reader to read a row group of a parquet file in flat format, returning RecordBatch.
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
@@ -2105,6 +2184,9 @@ pub(crate) struct FlatRowGroupReader {
     stream: ProjectedRecordBatchStream,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Cached schema with greptime_value set back to nullable.
+    /// This is a workaround for legacy parquet files with non-nullable greptime_value.
+    nullable_value_schema: Option<SchemaRef>,
 }
 
 impl FlatRowGroupReader {
@@ -2115,10 +2197,18 @@ impl FlatRowGroupReader {
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
 
+        // Pre-compute the fixed schema if we need to restore nullable on greptime_value.
+        let nullable_value_schema = if context.reader_builder().value_column_nullable_fix() {
+            make_value_column_nullable(&stream.output_schema)
+        } else {
+            None
+        };
+
         Self {
             context,
             stream,
             override_sequence,
+            nullable_value_schema,
         }
     }
 
@@ -2132,6 +2222,15 @@ impl FlatRowGroupReader {
                     .context
                     .read_format()
                     .convert_batch(record_batch, self.override_sequence.as_ref())?;
+
+                // Fix the schema back to nullable for the greptime_value column if needed.
+                let record_batch = if let Some(schema) = &self.nullable_value_schema {
+                    RecordBatch::try_new(schema.clone(), record_batch.columns().to_vec())
+                        .context(NewRecordBatchSnafu)?
+                } else {
+                    record_batch
+                };
+
                 Ok(Some(record_batch))
             }
             None => Ok(None),
