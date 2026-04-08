@@ -447,13 +447,20 @@ pub(crate) fn new_repeated_vector(
 mod tests {
     use std::sync::Arc;
 
-    use api::v1::OpType;
-    use datatypes::arrow::array::{Int64Array, TimestampMillisecondArray, UInt8Array, UInt64Array};
+    use api::v1::{OpType, SemanticType};
+    use datatypes::arrow::array::{
+        BinaryArray, DictionaryArray, Int64Array, StringArray, TimestampMillisecondArray,
+        UInt8Array, UInt32Array, UInt64Array,
+    };
     use datatypes::arrow::datatypes::Field;
     use datatypes::arrow::util::pretty;
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
     use datatypes::value::ValueRef;
     use mito_codec::row_converter::{DensePrimaryKeyCodec, PrimaryKeyCodecExt, SortField};
     use mito_codec::test_util::TestRegionMetadataBuilder;
+    use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
+    use store_api::storage::RegionId;
     use store_api::storage::consts::{
         OP_TYPE_COLUMN_NAME, PRIMARY_KEY_COLUMN_NAME, SEQUENCE_COLUMN_NAME,
     };
@@ -570,6 +577,124 @@ mod tests {
         let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(fields));
 
         datatypes::arrow::record_batch::RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn new_string_tag_metadata() -> Arc<RegionMetadata> {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 1));
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "ts",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            semantic_type: SemanticType::Timestamp,
+            column_id: 0,
+        });
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new("k0", ConcreteDataType::string_datatype(), true),
+            semantic_type: SemanticType::Tag,
+            column_id: 1,
+        });
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new("v0", ConcreteDataType::int64_datatype(), true),
+            semantic_type: SemanticType::Field,
+            column_id: 2,
+        });
+        builder.primary_key(vec![1]);
+
+        Arc::new(builder.build().unwrap())
+    }
+
+    fn encode_string_key(value: &str) -> Vec<u8> {
+        DensePrimaryKeyCodec::with_fields(vec![(
+            0,
+            SortField::new(ConcreteDataType::string_datatype()),
+        )])
+        .encode([ValueRef::String(value)].into_iter())
+        .unwrap()
+    }
+
+    fn new_flat_batch_with_string_tag(
+        tag_keys: &[u32],
+        tag_values: &[Option<&str>],
+        pk_keys: &[u32],
+        pk_values: &[Vec<u8>],
+        field_values: &[i64],
+    ) -> datatypes::arrow::record_batch::RecordBatch {
+        let num_rows = field_values.len();
+        assert_eq!(num_rows, tag_keys.len());
+        assert_eq!(num_rows, pk_keys.len());
+
+        let tag_array = Arc::new(DictionaryArray::new(
+            UInt32Array::from(tag_keys.to_vec()),
+            Arc::new(StringArray::from(tag_values.to_vec())),
+        )) as _;
+        let field_array = Arc::new(Int64Array::from(field_values.to_vec())) as _;
+        let ts_array = Arc::new(TimestampMillisecondArray::from_iter_values(
+            (0..num_rows).map(|i| i as i64 * 1000),
+        )) as _;
+        let pk_refs = pk_values
+            .iter()
+            .map(|value| value.as_slice())
+            .collect::<Vec<_>>();
+        let pk_array = Arc::new(
+            DictionaryArray::try_new(
+                UInt32Array::from(pk_keys.to_vec()),
+                Arc::new(BinaryArray::from_vec(pk_refs)),
+            )
+            .unwrap(),
+        ) as _;
+        let seq_array = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as _;
+        let op_type_array = Arc::new(UInt8Array::from_iter_values(
+            (0..num_rows).map(|_| OpType::Put as u8),
+        )) as _;
+
+        let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
+            Field::new_dictionary(
+                "k0",
+                datatypes::arrow::datatypes::DataType::UInt32,
+                datatypes::arrow::datatypes::DataType::Utf8,
+                true,
+            ),
+            Field::new("v0", datatypes::arrow::datatypes::DataType::Int64, true),
+            Field::new(
+                "ts",
+                datatypes::arrow::datatypes::DataType::Timestamp(
+                    datatypes::arrow::datatypes::TimeUnit::Millisecond,
+                    None,
+                ),
+                true,
+            ),
+            Field::new_dictionary(
+                PRIMARY_KEY_COLUMN_NAME,
+                datatypes::arrow::datatypes::DataType::UInt32,
+                datatypes::arrow::datatypes::DataType::Binary,
+                false,
+            ),
+            Field::new(
+                SEQUENCE_COLUMN_NAME,
+                datatypes::arrow::datatypes::DataType::UInt64,
+                false,
+            ),
+            Field::new(
+                OP_TYPE_COLUMN_NAME,
+                datatypes::arrow::datatypes::DataType::UInt8,
+                false,
+            ),
+        ]));
+
+        datatypes::arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                tag_array,
+                field_array,
+                ts_array,
+                pk_array,
+                seq_array,
+                op_type_array,
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -693,5 +818,80 @@ mod tests {
         assert_eq!(3, record_batch.num_rows());
         assert_eq!(0, record_batch.num_columns());
         assert!(record_batch.schema.is_empty());
+    }
+
+    #[test]
+    fn test_flat_projection_mapper_single_primary_key_same_key() {
+        let metadata = new_string_tag_metadata();
+        let cache = CacheStrategy::Disabled;
+        let mapper = ProjectionMapper::all(&metadata).unwrap();
+
+        let batch = new_flat_batch_with_string_tag(
+            &[1, 1, 1],
+            &[Some("unused"), Some("host-a")],
+            &[1, 1, 1],
+            &[encode_string_key("unused"), encode_string_key("host-a")],
+            &[10, 20, 30],
+        );
+        let record_batch = mapper.as_flat().unwrap().convert(&batch, &cache).unwrap();
+        let expect = "\
++---------------------+--------+----+
+| ts                  | k0     | v0 |
++---------------------+--------+----+
+| 1970-01-01T00:00:00 | host-a | 10 |
+| 1970-01-01T00:00:01 | host-a | 20 |
+| 1970-01-01T00:00:02 | host-a | 30 |
++---------------------+--------+----+";
+        assert_eq!(expect, print_record_batch(record_batch));
+    }
+
+    #[test]
+    fn test_flat_projection_mapper_single_primary_key_same_value() {
+        let metadata = new_string_tag_metadata();
+        let cache = CacheStrategy::Disabled;
+        let mapper = ProjectionMapper::all(&metadata).unwrap();
+
+        let batch = new_flat_batch_with_string_tag(
+            &[0, 1, 1],
+            &[Some("host-a"), Some("host-a")],
+            &[0, 1, 1],
+            &[encode_string_key("host-a"), encode_string_key("host-a")],
+            &[10, 20, 30],
+        );
+        let record_batch = mapper.as_flat().unwrap().convert(&batch, &cache).unwrap();
+        let expect = "\
++---------------------+--------+----+
+| ts                  | k0     | v0 |
++---------------------+--------+----+
+| 1970-01-01T00:00:00 | host-a | 10 |
+| 1970-01-01T00:00:01 | host-a | 20 |
+| 1970-01-01T00:00:02 | host-a | 30 |
++---------------------+--------+----+";
+        assert_eq!(expect, print_record_batch(record_batch));
+    }
+
+    #[test]
+    fn test_flat_projection_mapper_non_single_primary_key() {
+        let metadata = new_string_tag_metadata();
+        let cache = CacheStrategy::Disabled;
+        let mapper = ProjectionMapper::all(&metadata).unwrap();
+
+        let batch = new_flat_batch_with_string_tag(
+            &[0, 0, 1],
+            &[Some("host-a"), Some("host-b")],
+            &[0, 0, 1],
+            &[encode_string_key("host-a"), encode_string_key("host-b")],
+            &[10, 20, 30],
+        );
+        let record_batch = mapper.as_flat().unwrap().convert(&batch, &cache).unwrap();
+        let expect = "\
++---------------------+--------+----+
+| ts                  | k0     | v0 |
++---------------------+--------+----+
+| 1970-01-01T00:00:00 | host-a | 10 |
+| 1970-01-01T00:00:01 | host-a | 20 |
+| 1970-01-01T00:00:02 | host-b | 30 |
++---------------------+--------+----+";
+        assert_eq!(expect, print_record_batch(record_batch));
     }
 }

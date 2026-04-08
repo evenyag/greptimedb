@@ -60,8 +60,8 @@ pub struct FlatProjectionMapper {
     batch_schema: Vec<(ColumnId, ConcreteDataType)>,
     /// `true` If the original projection is empty.
     is_empty_projection: bool,
-    /// The index in flat format [RecordBatch] for each column in the output [RecordBatch].
-    batch_indices: Vec<usize>,
+    /// `(projected_batch_index, is_tag)` in flat format [RecordBatch] for each output column.
+    batch_indices: Vec<(usize, bool)>,
     /// Precomputed Arrow schema for input batches.
     input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
 }
@@ -139,7 +139,7 @@ impl FlatProjectionMapper {
                 .iter()
                 .map(|id| {
                     // Safety: The map is computed from the read projection.
-                    format_projection
+                    let index = format_projection
                         .column_id_to_projected_index
                         .get(id)
                         .copied()
@@ -155,7 +155,11 @@ impl FlatProjectionMapper {
                                     name
                                 ),
                             }
-                        })
+                        })?;
+                    let is_tag = metadata
+                        .column_by_id(*id)
+                        .is_some_and(|column| column.semantic_type == SemanticType::Tag);
+                    Ok((index, is_tag))
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -259,36 +263,30 @@ impl FlatProjectionMapper {
         // Construct output record batch directly from Arrow arrays to avoid
         // Arrow -> Vector -> Arrow roundtrips in the hot path.
         let mut arrays = Vec::with_capacity(self.output_schema.num_columns());
-        for (output_idx, index) in self.batch_indices.iter().enumerate() {
+        let single_primary_key = batch_single_primary_key(batch);
+        for (output_idx, (index, is_tag)) in self.batch_indices.iter().enumerate() {
             let mut array = batch.column(*index).clone();
-            // Cast dictionary values to the target type.
-            if let ArrowDataType::Dictionary(_key_type, value_type) = array.data_type() {
-                // When a string dictionary column contains only a single value, reuse a cached
-                // repeated vector to avoid repeatedly expanding the dictionary.
-                if let Some(dict_array) = single_value_string_dictionary(
+            if *is_tag && single_primary_key {
+                if let Some(value) = string_dictionary_row_value(
                     &array,
                     &self.output_schema.column_schemas()[output_idx].data_type,
-                    value_type.as_ref(),
+                    0,
                 ) {
-                    let dict_values = dict_array.values();
-                    let value = if dict_values.is_null(0) {
-                        Value::Null
-                    } else {
-                        Value::from(datatypes::arrow_array::string_array_value(dict_values, 0))
-                    };
-
                     let repeated = repeated_vector_with_cache(
                         &self.output_schema.column_schemas()[output_idx].data_type,
                         &value,
                         batch.num_rows(),
                         cache_strategy,
                     )?;
-                    array = repeated.to_arrow_array();
-                } else {
-                    let casted = datatypes::arrow::compute::cast(&array, value_type)
-                        .context(ArrowComputeSnafu)?;
-                    array = casted;
+                    arrays.push(repeated.to_arrow_array());
+                    continue;
                 }
+            }
+            // Cast dictionary values to the target type.
+            if let ArrowDataType::Dictionary(_key_type, value_type) = array.data_type() {
+                let casted = datatypes::arrow::compute::cast(&array, value_type)
+                    .context(ArrowComputeSnafu)?;
+                array = casted;
             }
             arrays.push(array);
         }
@@ -308,7 +306,7 @@ impl FlatProjectionMapper {
         batch: &datatypes::arrow::record_batch::RecordBatch,
     ) -> common_recordbatch::error::Result<Vec<datatypes::vectors::VectorRef>> {
         let mut columns = Vec::with_capacity(self.output_schema.num_columns());
-        for index in &self.batch_indices {
+        for (index, _) in &self.batch_indices {
             let mut array = batch.column(*index).clone();
             // Casts dictionary values to the target type.
             if let datatypes::arrow::datatypes::DataType::Dictionary(_key_type, value_type) =
@@ -327,16 +325,47 @@ impl FlatProjectionMapper {
     }
 }
 
-fn single_value_string_dictionary<'a>(
-    array: &'a Arc<dyn Array>,
+fn batch_single_primary_key(batch: &datatypes::arrow::record_batch::RecordBatch) -> bool {
+    if batch.num_rows() == 0 || batch.num_columns() < 3 {
+        return false;
+    }
+
+    let Some(dict_array) = batch
+        .column(batch.num_columns() - 3)
+        .as_any()
+        .downcast_ref::<datatypes::arrow::array::DictionaryArray<
+        datatypes::arrow::datatypes::UInt32Type,
+    >>() else {
+        return false;
+    };
+
+    let first_key = dict_array.keys().value(0);
+    let last_key = dict_array.keys().value(batch.num_rows() - 1);
+    if first_key == last_key {
+        return true;
+    }
+
+    let values = dict_array.values();
+    datatypes::arrow_array::binary_array_value(values, first_key as usize)
+        == datatypes::arrow_array::binary_array_value(values, last_key as usize)
+}
+
+fn string_dictionary_row_value(
+    array: &Arc<dyn Array>,
     output_type: &ConcreteDataType,
-    value_type: &ArrowDataType,
-) -> Option<&'a datatypes::arrow::array::DictionaryArray<datatypes::arrow::datatypes::UInt32Type>> {
+    row: usize,
+) -> Option<Value> {
+    if !output_type.is_string() || array.is_null(row) {
+        return output_type.is_string().then_some(Value::Null);
+    }
+
+    let ArrowDataType::Dictionary(_key_type, value_type) = array.data_type() else {
+        return None;
+    };
     if !matches!(
-        value_type,
+        value_type.as_ref(),
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Utf8View
-    ) || !output_type.is_string()
-    {
+    ) {
         return None;
     }
 
@@ -345,8 +374,17 @@ fn single_value_string_dictionary<'a>(
         .downcast_ref::<datatypes::arrow::array::DictionaryArray<
             datatypes::arrow::datatypes::UInt32Type,
         >>()?;
+    let key = dict_array.keys().value(row) as usize;
+    let dict_values = dict_array.values();
 
-    (dict_array.values().len() == 1 && dict_array.null_count() == 0).then_some(dict_array)
+    if dict_values.is_null(key) {
+        Some(Value::Null)
+    } else {
+        Some(Value::from(datatypes::arrow_array::string_array_value(
+            dict_values,
+            key,
+        )))
+    }
 }
 
 /// Returns ids and datatypes of columns of the output batch after applying the `projection`.
