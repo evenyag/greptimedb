@@ -15,10 +15,10 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
-use common_telemetry::debug;
+use common_telemetry::{debug, info};
 use datatypes::arrow::array::{Array, AsArray, Int64Array, UInt64Array};
 use datatypes::arrow::compute::interleave;
 use datatypes::arrow::datatypes::{ArrowNativeType, BinaryType, DataType, SchemaRef, Utf8Type};
@@ -122,16 +122,21 @@ pub struct BatchBuilder {
     /// The accumulated stream indexes from which to pull rows
     /// Consists of a tuple of `(batch_idx, row_idx)`
     indices: Vec<(usize, usize)>,
+
+    /// Accumulated interleave cost per column across all `build_record_batch()` calls.
+    interleave_costs: Vec<Duration>,
 }
 
 impl BatchBuilder {
     /// Create a new [`BatchBuilder`] with the provided `stream_count` and `batch_size`
     pub fn new(schema: SchemaRef, stream_count: usize, batch_size: usize) -> Self {
+        let num_columns = schema.fields.len();
         Self {
             schema,
             batches: Vec::with_capacity(stream_count * 2),
             cursors: vec![BatchCursor::default(); stream_count],
             indices: Vec::with_capacity(batch_size),
+            interleave_costs: vec![Duration::ZERO; num_columns],
         }
     }
 
@@ -180,16 +185,18 @@ impl BatchBuilder {
 
         check_interleave_overflow(&self.batches, &self.schema, &self.indices)?;
 
-        let columns = (0..self.schema.fields.len())
-            .map(|column_idx| {
-                let arrays: Vec<_> = self
-                    .batches
-                    .iter()
-                    .map(|(_, batch)| batch.column(column_idx).as_ref())
-                    .collect();
-                interleave(&arrays, &self.indices).context(ComputeArrowSnafu)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut columns = Vec::with_capacity(self.schema.fields.len());
+        for column_idx in 0..self.schema.fields.len() {
+            let arrays: Vec<_> = self
+                .batches
+                .iter()
+                .map(|(_, batch)| batch.column(column_idx).as_ref())
+                .collect();
+            let start = Instant::now();
+            let column = interleave(&arrays, &self.indices).context(ComputeArrowSnafu)?;
+            self.interleave_costs[column_idx] += start.elapsed();
+            columns.push(column);
+        }
 
         self.indices.clear();
 
@@ -241,6 +248,19 @@ impl BatchBuilder {
             }
             retain
         });
+    }
+}
+
+impl Drop for BatchBuilder {
+    fn drop(&mut self) {
+        let costs: Vec<_> = self
+            .schema
+            .fields()
+            .iter()
+            .zip(&self.interleave_costs)
+            .map(|(field, cost)| format!("{}={:?}", field.name(), cost))
+            .collect();
+        info!("BatchBuilder dropped, interleave costs: [{}]", costs.join(", "));
     }
 }
 
