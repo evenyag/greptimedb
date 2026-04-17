@@ -118,6 +118,9 @@ pub(crate) struct ScanMetricsSet {
     yield_cost: Duration,
     /// Duration to convert [`Batch`]es.
     convert_cost: Option<Time>,
+    /// Duration spent inside `FlatReadFormat::convert_batch` (primary-key-to-flat decode)
+    /// on the parquet read path.
+    flat_convert_cost: Duration,
     /// Duration of the scan.
     total_cost: Duration,
     /// Number of rows returned.
@@ -296,6 +299,7 @@ impl fmt::Debug for ScanMetricsSet {
             scan_cost,
             yield_cost,
             convert_cost,
+            flat_convert_cost,
             total_cost,
             num_rows,
             num_batches,
@@ -388,6 +392,11 @@ impl fmt::Debug for ScanMetricsSet {
         if let Some(time) = convert_cost {
             let duration = Duration::from_nanos(time.value() as u64);
             write!(f, ", \"convert_cost\":\"{duration:?}\"")?;
+        }
+
+        // Write flat_convert_cost if non-zero
+        if !flat_convert_cost.is_zero() {
+            write!(f, ", \"flat_convert_cost\":\"{flat_convert_cost:?}\"")?;
         }
 
         // Write non-zero filter counters
@@ -698,6 +707,7 @@ impl ScanMetricsSet {
             num_batches,
             num_rows,
             scan_cost,
+            flat_convert_cost,
             metadata_cache_metrics,
             fetch_metrics,
             metadata_mem_size,
@@ -706,6 +716,7 @@ impl ScanMetricsSet {
 
         self.build_parts_cost += *build_cost;
         self.sst_scan_cost += *scan_cost;
+        self.flat_convert_cost += *flat_convert_cost;
 
         self.rg_total += *rg_total;
         self.rg_fulltext_filtered += *rg_fulltext_filtered;
@@ -904,6 +915,8 @@ struct PartitionMetricsInner {
     yield_cost: Time,
     /// Duration to convert [`Batch`]es.
     convert_cost: Time,
+    /// Duration spent inside `FlatReadFormat::convert_batch` on the parquet path.
+    flat_convert_cost: Time,
     /// Aggregated compute time reported to DataFusion.
     elapsed_compute: Time,
 }
@@ -1029,6 +1042,8 @@ impl PartitionMetrics {
             scan_cost: MetricBuilder::new(metrics_set).subset_time("scan_cost", partition),
             yield_cost: MetricBuilder::new(metrics_set).subset_time("yield_cost", partition),
             convert_cost,
+            flat_convert_cost: MetricBuilder::new(metrics_set)
+                .subset_time("flat_convert_cost", partition),
             elapsed_compute: MetricBuilder::new(metrics_set).elapsed_compute(partition),
         };
         Self(Arc::new(inner))
@@ -1098,6 +1113,10 @@ impl PartitionMetrics {
         per_file_metrics: Option<&HashMap<RegionFileId, FileScanMetrics>>,
     ) {
         self.0.build_parts_cost.add_duration(metrics.build_cost);
+        self.0
+            .flat_convert_cost
+            .add_duration(metrics.flat_convert_cost);
+        self.record_elapsed_compute(metrics.flat_convert_cost);
 
         let mut metrics_set = self.0.metrics.lock().unwrap();
         metrics_set.merge_reader_metrics(metrics);

@@ -257,6 +257,14 @@ impl FlatSource {
             FlatSource::LastRow(r) => r.next_batch().await,
         }
     }
+
+    /// Takes and resets the accumulated `flat_convert_cost` from the underlying reader.
+    fn take_flat_convert_cost(&mut self) -> std::time::Duration {
+        match self {
+            FlatSource::RowGroup(r) => std::mem::take(&mut r.flat_convert_cost),
+            FlatSource::LastRow(r) => r.take_flat_convert_cost(),
+        }
+    }
 }
 
 /// A flat format reader that returns RecordBatch instead of Batch.
@@ -306,6 +314,7 @@ impl FlatPruneReader {
             let start = std::time::Instant::now();
             let batch = self.source.next_batch().await?;
             self.metrics.scan_cost += start.elapsed();
+            self.metrics.flat_convert_cost += self.source.take_flat_convert_cost();
 
             let Some(record_batch) = batch else {
                 return Ok(None);

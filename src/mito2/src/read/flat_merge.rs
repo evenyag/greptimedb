@@ -260,7 +260,10 @@ impl Drop for BatchBuilder {
             .zip(&self.interleave_costs)
             .map(|(field, cost)| format!("{}={:?}", field.name(), cost))
             .collect();
-        info!("BatchBuilder dropped, interleave costs: [{}]", costs.join(", "));
+        info!(
+            "BatchBuilder dropped, interleave costs: [{}]",
+            costs.join(", ")
+        );
     }
 }
 

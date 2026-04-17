@@ -342,6 +342,16 @@ impl FlatRowGroupLastRowCachedReader {
         }
     }
 
+    /// Takes the accumulated `flat_convert_cost` from the underlying row group reader, if any.
+    pub(crate) fn take_flat_convert_cost(&mut self) -> std::time::Duration {
+        match self {
+            FlatRowGroupLastRowCachedReader::Hit(_) => std::time::Duration::ZERO,
+            FlatRowGroupLastRowCachedReader::Miss(r) => {
+                std::mem::take(&mut r.reader.flat_convert_cost)
+            }
+        }
+    }
+
     fn new_hit(value: Arc<SelectorResultValue>) -> Self {
         selector_result_cache_hit();
         Self::Hit(FlatLastRowCacheReader { value, idx: 0 })

@@ -1627,6 +1627,8 @@ pub struct ReaderMetrics {
     pub(crate) build_cost: Duration,
     /// Duration to scan the reader.
     pub(crate) scan_cost: Duration,
+    /// Duration spent inside `FlatReadFormat::convert_batch` (primary-key-to-flat decode).
+    pub(crate) flat_convert_cost: Duration,
     /// Number of record batches read.
     pub(crate) num_record_batches: usize,
     /// Number of batches decoded.
@@ -1649,6 +1651,7 @@ impl ReaderMetrics {
         self.filter_metrics.merge_from(&other.filter_metrics);
         self.build_cost += other.build_cost;
         self.scan_cost += other.scan_cost;
+        self.flat_convert_cost += other.flat_convert_cost;
         self.num_record_batches += other.num_record_batches;
         self.num_batches += other.num_batches;
         self.num_rows += other.num_rows;
@@ -2252,6 +2255,9 @@ pub(crate) struct FlatRowGroupReader {
     /// Cached schema with greptime_value set back to nullable.
     /// This is a workaround for legacy parquet files with non-nullable greptime_value.
     nullable_value_schema: Option<SchemaRef>,
+    /// Accumulated cost of invoking `FlatReadFormat::convert_batch`.
+    /// Drained by [`FlatPruneReader`] into `ReaderMetrics`.
+    pub(crate) flat_convert_cost: Duration,
 }
 
 impl FlatRowGroupReader {
@@ -2277,6 +2283,7 @@ impl FlatRowGroupReader {
             stream,
             override_sequence,
             nullable_value_schema,
+            flat_convert_cost: Duration::ZERO,
         }
     }
 
@@ -2290,8 +2297,10 @@ impl FlatRowGroupReader {
 
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
+                let convert_start = Instant::now();
                 let record_batch =
                     flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
+                self.flat_convert_cost += convert_start.elapsed();
 
                 // Fix the schema back to nullable for the greptime_value column if needed.
                 let record_batch = if let Some(schema) = &self.nullable_value_schema {
