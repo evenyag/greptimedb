@@ -70,6 +70,7 @@ use crate::error::{
     Result,
 };
 use crate::memtable::{BoxedBatchIterator, BoxedRecordBatchIterator};
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 /// Storage internal representation of a batch of rows for a primary key (time series).
 ///
 /// Rows are sorted by primary key, timestamp, sequence desc, op_type desc. Fields
@@ -1144,6 +1145,37 @@ pub type BoxedBatchStream = BoxStream<'static, Result<Batch>>;
 
 /// Pointer to a stream that yields [RecordBatch].
 pub type BoxedRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+/// A [BoxedRecordBatchStream] paired with the [FlatBatchSchema] describing
+/// every batch yielded by the stream.
+///
+/// Producers attach the schema once and consumers split via [Self::into_parts]
+/// to drive the underlying stream as before. The wrapper does not implement
+/// [futures::Stream]; callers that just need to poll batches should use
+/// `into_parts()` to extract the raw stream.
+pub struct FlatBatchStream {
+    schema: FlatBatchSchemaRef,
+    stream: BoxedRecordBatchStream,
+}
+
+impl FlatBatchStream {
+    /// Creates a new flat batch stream.
+    pub fn new(schema: FlatBatchSchemaRef, stream: BoxedRecordBatchStream) -> Self {
+        Self { schema, stream }
+    }
+
+    /// Schema info for batches yielded by this stream.
+    #[allow(dead_code)]
+    pub fn schema(&self) -> &FlatBatchSchemaRef {
+        &self.schema
+    }
+
+    /// Splits the wrapper into its schema and the underlying boxed stream.
+    #[allow(dead_code)]
+    pub fn into_parts(self) -> (FlatBatchSchemaRef, BoxedRecordBatchStream) {
+        (self.schema, self.stream)
+    }
+}
 
 #[async_trait::async_trait]
 impl<T: BatchReader + ?Sized> BatchReader for Box<T> {
