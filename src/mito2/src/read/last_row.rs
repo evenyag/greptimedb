@@ -32,7 +32,9 @@ use crate::error::{ComputeArrowSnafu, Result};
 use crate::memtable::partition_tree::data::timestamp_array_to_i64_slice;
 use crate::read::{Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream};
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
+use crate::sst::parquet::flat_format::{
+    FlatBatchSchemaRef, primary_key_column_index, time_index_column_index,
+};
 use crate::sst::parquet::format::{PrimaryKeyArray, primary_key_offsets};
 use crate::sst::parquet::reader::FlatRowGroupReader;
 
@@ -143,16 +145,27 @@ impl FlatRowGroupLastRowCachedReader {
             selector: TimeSeriesRowSelector::LastRow,
         };
 
+        let schema = reader.schema().clone();
+
         if let Some(value) = cache_strategy.get_selector_result(&key) {
             let is_flat = matches!(&value.result, SelectorResult::Flat(_));
             let schema_matches = value.projection == projection;
             if is_flat && schema_matches {
-                Self::new_hit(value)
+                Self::new_hit(value, schema)
             } else {
                 Self::new_miss(key, projection, reader, cache_strategy)
             }
         } else {
             Self::new_miss(key, projection, reader, cache_strategy)
+        }
+    }
+
+    /// Schema info for batches produced by this reader.
+    #[allow(dead_code)]
+    pub(crate) fn schema(&self) -> &FlatBatchSchemaRef {
+        match self {
+            FlatRowGroupLastRowCachedReader::Hit(r) => &r.schema,
+            FlatRowGroupLastRowCachedReader::Miss(r) => r.reader.schema(),
         }
     }
 
@@ -164,9 +177,13 @@ impl FlatRowGroupLastRowCachedReader {
         }
     }
 
-    fn new_hit(value: Arc<SelectorResultValue>) -> Self {
+    fn new_hit(value: Arc<SelectorResultValue>, schema: FlatBatchSchemaRef) -> Self {
         selector_result_cache_hit();
-        Self::Hit(FlatLastRowCacheReader { value, idx: 0 })
+        Self::Hit(FlatLastRowCacheReader {
+            value,
+            idx: 0,
+            schema,
+        })
     }
 
     fn new_miss(
@@ -189,6 +206,9 @@ impl FlatRowGroupLastRowCachedReader {
 pub(crate) struct FlatLastRowCacheReader {
     value: Arc<SelectorResultValue>,
     idx: usize,
+    /// Schema info captured from the underlying row-group reader at construction.
+    #[allow(dead_code)]
+    schema: FlatBatchSchemaRef,
 }
 
 impl FlatLastRowCacheReader {

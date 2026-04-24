@@ -75,7 +75,7 @@ use crate::sst::parquet::async_reader::SstAsyncFileReader;
 use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
 };
-use crate::sst::parquet::flat_format::FlatReadFormat;
+use crate::sst::parquet::flat_format::{FlatBatchSchemaRef, FlatReadFormat};
 use crate::sst::parquet::format::need_override_sequence;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::prefilter::{
@@ -2025,6 +2025,8 @@ pub(crate) struct FlatRowGroupReader {
     stream: ProjectedRecordBatchStream,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// Schema info for the produced batches.
+    schema: FlatBatchSchemaRef,
 }
 
 impl FlatRowGroupReader {
@@ -2034,12 +2036,19 @@ impl FlatRowGroupReader {
         let override_sequence = context
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+        let schema = context.read_format().batch_schema().clone();
 
         Self {
             context,
             stream,
             override_sequence,
+            schema,
         }
+    }
+
+    /// Schema info for batches produced by this reader.
+    pub(crate) fn schema(&self) -> &FlatBatchSchemaRef {
+        &self.schema
     }
 
     /// Returns the next RecordBatch.

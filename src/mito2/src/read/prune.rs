@@ -28,6 +28,7 @@ use crate::read::Batch;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::file_range::FileRangeContextRef;
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics};
 
 /// An iterator that prunes batches by time range.
@@ -146,6 +147,15 @@ impl FlatSource {
             FlatSource::LastRow(r) => r.next_batch().await,
         }
     }
+
+    /// Schema info for batches produced by this source.
+    #[allow(dead_code)]
+    pub(crate) fn schema(&self) -> &FlatBatchSchemaRef {
+        match self {
+            FlatSource::RowGroup(r) => r.schema(),
+            FlatSource::LastRow(r) => r.schema(),
+        }
+    }
 }
 
 /// A flat format reader that returns RecordBatch instead of Batch.
@@ -188,6 +198,12 @@ impl FlatPruneReader {
     /// Returns metrics.
     pub(crate) fn metrics(&self) -> ReaderMetrics {
         self.metrics.clone()
+    }
+
+    /// Schema info for batches produced by this reader.
+    #[allow(dead_code)]
+    pub(crate) fn schema(&self) -> &FlatBatchSchemaRef {
+        self.source.schema()
     }
 
     pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
