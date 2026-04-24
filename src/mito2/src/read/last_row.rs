@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use datatypes::arrow::array::{Array, BinaryArray};
 use datatypes::arrow::compute::concat_batches;
 use datatypes::arrow::record_batch::RecordBatch;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
 use snafu::ResultExt;
 use store_api::storage::{FileId, TimeSeriesRowSelector};
 
@@ -30,11 +30,9 @@ use crate::cache::{
 };
 use crate::error::{ComputeArrowSnafu, Result};
 use crate::memtable::partition_tree::data::timestamp_array_to_i64_slice;
-use crate::read::{Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream};
+use crate::read::{Batch, BatchReader, BoxedBatchReader, BoxedRecordBatchStream, FlatBatchStream};
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::parquet::flat_format::{
-    FlatBatchSchemaRef, primary_key_column_index, time_index_column_index,
-};
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 use crate::sst::parquet::format::{PrimaryKeyArray, primary_key_offsets};
 use crate::sst::parquet::reader::FlatRowGroupReader;
 
@@ -289,10 +287,11 @@ impl FlatRowGroupLastRowReader {
         reader: FlatRowGroupReader,
         cache_strategy: CacheStrategy,
     ) -> Self {
+        let selector = FlatLastTimestampSelector::new(reader.schema().clone());
         Self {
             key,
             reader,
-            selector: FlatLastTimestampSelector::default(),
+            selector,
             yielded_batches: vec![],
             cache_strategy,
             projection,
@@ -353,8 +352,8 @@ impl FlatRowGroupLastRowReader {
 ///
 /// Assumes that input batches are sorted by primary key then by timestamp,
 /// and contain only PUT operations (no DELETE).
-#[derive(Default)]
 pub(crate) struct FlatLastTimestampSelector {
+    schema: FlatBatchSchemaRef,
     /// State for the currently in-progress primary key.
     current_key: Option<LastKeyState>,
 }
@@ -377,6 +376,13 @@ impl LastKeyState {
 }
 
 impl FlatLastTimestampSelector {
+    fn new(schema: FlatBatchSchemaRef) -> Self {
+        Self {
+            schema,
+            current_key: None,
+        }
+    }
+
     /// Processes the next batch and appends completed-key results into `output_buffer`.
     pub(crate) fn on_next(
         &mut self,
@@ -387,9 +393,8 @@ impl FlatLastTimestampSelector {
             return Ok(());
         }
 
-        let num_columns = batch.num_columns();
-        let pk_col_idx = primary_key_column_index(num_columns);
-        let ts_col_idx = time_index_column_index(num_columns);
+        let pk_col_idx = self.schema.primary_key_index();
+        let ts_col_idx = self.schema.time_index_index();
 
         let pk_array = batch
             .column(pk_col_idx)
@@ -455,9 +460,41 @@ impl FlatLastTimestampSelector {
     }
 }
 
+#[cfg(test)]
+impl Default for FlatLastTimestampSelector {
+    fn default() -> Self {
+        use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        Self::new(Arc::new(
+            crate::sst::parquet::flat_format::FlatBatchSchema::for_test(
+                Arc::new(Schema::new(vec![
+                    Field::new("field", DataType::Int64, true),
+                    Field::new(
+                        "ts",
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
+                        false,
+                    ),
+                    Field::new(
+                        "__primary_key",
+                        DataType::Dictionary(
+                            Box::new(DataType::UInt32),
+                            Box::new(DataType::Binary),
+                        ),
+                        false,
+                    ),
+                    Field::new("__sequence", DataType::UInt64, false),
+                    Field::new("__op_type", DataType::UInt8, false),
+                ])),
+                0,
+            ),
+        ))
+    }
+}
+
 /// Reader that keeps only the last row of each time series from a flat RecordBatch stream.
 /// Assumes input is sorted, deduped, and contains no delete operations.
 pub(crate) struct FlatLastRowReader {
+    schema: FlatBatchSchemaRef,
     stream: BoxedRecordBatchStream,
     selector: FlatLastTimestampSelector,
     pending: BatchBuffer,
@@ -465,28 +502,34 @@ pub(crate) struct FlatLastRowReader {
 
 impl FlatLastRowReader {
     /// Creates a new `FlatLastRowReader`.
-    pub(crate) fn new(stream: BoxedRecordBatchStream) -> Self {
+    pub(crate) fn new(stream: FlatBatchStream) -> Self {
+        let (schema, stream) = stream.into_parts();
         Self {
+            selector: FlatLastTimestampSelector::new(schema.clone()),
+            schema,
             stream,
-            selector: FlatLastTimestampSelector::default(),
             pending: BatchBuffer::new(),
         }
     }
 
     /// Converts the reader into a stream of RecordBatches.
-    pub(crate) fn into_stream(mut self) -> impl Stream<Item = Result<RecordBatch>> {
-        async_stream::try_stream! {
-            while let Some(batch) = self.stream.try_next().await? {
-                self.selector.on_next(batch, &mut self.pending)?;
-                if self.pending.is_full() {
+    pub(crate) fn into_stream(mut self) -> FlatBatchStream {
+        let schema = self.schema.clone();
+        FlatBatchStream::new(
+            schema,
+            Box::pin(async_stream::try_stream! {
+                while let Some(batch) = self.stream.try_next().await? {
+                    self.selector.on_next(batch, &mut self.pending)?;
+                    if self.pending.is_full() {
+                        yield self.pending.concat()?;
+                    }
+                }
+                self.selector.finish(&mut self.pending)?;
+                if !self.pending.is_empty() {
                     yield self.pending.concat()?;
                 }
-            }
-            self.selector.finish(&mut self.pending)?;
-            if !self.pending.is_empty() {
-                yield self.pending.concat()?;
-            }
-        }
+            }),
+        )
     }
 }
 

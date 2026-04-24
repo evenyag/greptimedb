@@ -27,17 +27,15 @@ use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::arrow_array::BinaryArray;
 use datatypes::timestamp::timestamp_array_to_primitive;
-use futures::{Stream, TryStreamExt};
+use futures::TryStreamExt;
 use snafu::ResultExt;
 use store_api::storage::SequenceNumber;
 
 use crate::error::{ComputeArrowSnafu, Result};
 use crate::memtable::BoxedRecordBatchIterator;
 use crate::metrics::READ_STAGE_ELAPSED;
-use crate::read::BoxedRecordBatchStream;
-use crate::sst::parquet::flat_format::{
-    primary_key_column_index, sequence_column_index, time_index_column_index,
-};
+use crate::read::{BoxedRecordBatchStream, FlatBatchStream};
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 use crate::sst::parquet::format::PrimaryKeyArray;
 
 /// Checks whether interleaving the selected rows from byte columns would overflow
@@ -442,18 +440,18 @@ impl SortColumns {
     ///
     /// # Panics
     /// Panics if the input batch doesn't have correct internal columns.
-    fn new(batch: &RecordBatch) -> Self {
-        let num_columns = batch.num_columns();
+    #[cfg(test)]
+    fn new(batch: &RecordBatch, schema: &FlatBatchSchemaRef) -> Self {
         let primary_key = batch
-            .column(primary_key_column_index(num_columns))
+            .column(schema.primary_key_index())
             .as_any()
             .downcast_ref::<PrimaryKeyArray>()
             .unwrap()
             .clone();
-        let timestamp = batch.column(time_index_column_index(num_columns));
+        let timestamp = batch.column(schema.time_index_index());
         let (timestamp, _unit) = timestamp_array_to_primitive(timestamp).unwrap();
         let sequence = batch
-            .column(sequence_column_index(num_columns))
+            .column(schema.sequence_index())
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap()
@@ -586,12 +584,16 @@ impl FlatMergeIterator {
         iters: Vec<BoxedRecordBatchIterator>,
         batch_size: usize,
     ) -> Result<Self> {
-        let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
+        let mut in_progress = BatchBuilder::new(schema.clone(), iters.len(), batch_size);
         let mut nodes = Vec::with_capacity(iters.len());
         // Initialize nodes and the buffer.
         for (node_index, iter) in iters.into_iter().enumerate() {
+            let num_columns = schema.fields().len();
             let mut node = IterNode {
                 node_index,
+                primary_key_index: num_columns - 3,
+                time_index_index: num_columns - 4,
+                sequence_index: num_columns - 2,
                 iter,
                 cursor: None,
             };
@@ -690,6 +692,8 @@ impl Iterator for FlatMergeIterator {
 ///
 /// All iterators must be sorted by primary key, time index, sequence desc.
 pub struct FlatMergeReader {
+    /// Schema of the merged output batches.
+    schema: FlatBatchSchemaRef,
     /// The merge algorithm to maintain heaps.
     algo: MergeAlgo<StreamNode>,
     /// Current buffered rows to output.
@@ -709,19 +713,29 @@ pub struct FlatMergeReader {
 impl FlatMergeReader {
     /// Creates a new iterator to merge sorted `iters`.
     pub async fn new(
-        schema: SchemaRef,
-        iters: Vec<BoxedRecordBatchStream>,
+        schema: FlatBatchSchemaRef,
+        iters: Vec<FlatBatchStream>,
         batch_size: usize,
         metrics_reporter: Option<Arc<dyn MergeMetricsReport>>,
     ) -> Result<Self> {
         let start = Instant::now();
         let metrics = MergeMetrics::default();
-        let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
+        let mut in_progress =
+            BatchBuilder::new(schema.arrow_schema().clone(), iters.len(), batch_size);
         let mut nodes = Vec::with_capacity(iters.len());
         // Initialize nodes and the buffer.
         for (node_index, iter) in iters.into_iter().enumerate() {
+            debug_assert_eq!(
+                iter.schema().arrow_schema(),
+                schema.arrow_schema(),
+                "flat merge input schema must match merge output schema"
+            );
+            let (_input_schema, iter) = iter.into_parts();
             let mut node = StreamNode {
                 node_index,
+                primary_key_index: schema.primary_key_index(),
+                time_index_index: schema.time_index_index(),
+                sequence_index: schema.sequence_index(),
                 iter,
                 cursor: None,
             };
@@ -734,6 +748,7 @@ impl FlatMergeReader {
         let algo = MergeAlgo::new(nodes);
 
         let mut reader = Self {
+            schema,
             algo,
             in_progress,
             output_batch: None,
@@ -778,12 +793,16 @@ impl FlatMergeReader {
     }
 
     /// Converts the reader into a stream.
-    pub fn into_stream(mut self) -> impl Stream<Item = Result<RecordBatch>> {
-        try_stream! {
-            while let Some(batch) = self.next_batch().await? {
-                yield batch;
-            }
-        }
+    pub fn into_stream(mut self) -> FlatBatchStream {
+        let schema = self.schema.clone();
+        FlatBatchStream::new(
+            schema,
+            Box::pin(try_stream! {
+                while let Some(batch) = self.next_batch().await? {
+                    yield batch;
+                }
+            }),
+        )
     }
 
     /// Fetches a batch from the hottest node.
@@ -862,6 +881,12 @@ impl Drop for FlatMergeReader {
 struct GenericNode<T> {
     /// Index of the node.
     node_index: usize,
+    /// Index of the primary key column.
+    primary_key_index: usize,
+    /// Index of the time index column.
+    time_index_index: usize,
+    /// Index of the sequence column.
+    sequence_index: usize,
     /// Iterator of this `Node`.
     iter: T,
     /// Current batch to be read. The node should ensure the batch is not empty (The
@@ -933,7 +958,25 @@ impl GenericNode<BoxedRecordBatchIterator> {
     /// Returns the fetched new batch.
     fn advance_batch(&mut self) -> Result<Option<RecordBatch>> {
         let batch = self.advance_inner_iter()?;
-        let columns = batch.as_ref().map(SortColumns::new);
+        let columns = batch.as_ref().map(|batch| SortColumns {
+            primary_key: batch
+                .column(self.primary_key_index)
+                .as_any()
+                .downcast_ref::<PrimaryKeyArray>()
+                .unwrap()
+                .clone(),
+            timestamp: {
+                let timestamp = batch.column(self.time_index_index);
+                let (timestamp, _unit) = timestamp_array_to_primitive(timestamp).unwrap();
+                timestamp
+            },
+            sequence: batch
+                .column(self.sequence_index)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .clone(),
+        });
         self.cursor = columns.map(RowCursor::new);
 
         Ok(batch)
@@ -972,7 +1015,25 @@ impl GenericNode<BoxedRecordBatchStream> {
     /// Returns the fetched new batch.
     async fn advance_batch(&mut self) -> Result<Option<RecordBatch>> {
         let batch = self.advance_inner_iter().await?;
-        let columns = batch.as_ref().map(SortColumns::new);
+        let columns = batch.as_ref().map(|batch| SortColumns {
+            primary_key: batch
+                .column(self.primary_key_index)
+                .as_any()
+                .downcast_ref::<PrimaryKeyArray>()
+                .unwrap()
+                .clone(),
+            timestamp: {
+                let timestamp = batch.column(self.time_index_index);
+                let (timestamp, _unit) = timestamp_array_to_primitive(timestamp).unwrap();
+                timestamp
+            },
+            sequence: batch
+                .column(self.sequence_index)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .clone(),
+        });
         self.cursor = columns.map(RowCursor::new);
 
         Ok(batch)
@@ -1286,8 +1347,12 @@ mod tests {
             &[11, 12],
         );
 
-        let columns1 = SortColumns::new(&batch1);
-        let columns2 = SortColumns::new(&batch2);
+        let schema = Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::for_test(
+            batch1.schema(),
+            0,
+        ));
+        let columns1 = SortColumns::new(&batch1, &schema);
+        let columns2 = SortColumns::new(&batch2, &schema);
 
         let cursor1 = RowCursor::new(columns1);
         let cursor2 = RowCursor::new(columns2);

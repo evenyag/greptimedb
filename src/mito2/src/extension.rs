@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::read::range::RowGroupIndex;
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::PartitionMetrics;
-use crate::read::{BoxedBatchStream, BoxedRecordBatchStream};
+use crate::read::{BoxedBatchStream, FlatBatchStream};
 use crate::region::MitoRegionRef;
 
 pub type InclusiveTimeRange = (Timestamp, Timestamp);
@@ -62,7 +62,7 @@ pub trait ExtensionFlatRangeReader: Send {
         context: Arc<StreamContext>,
         metrics: PartitionMetrics,
         index: RowGroupIndex,
-    ) -> Result<BoxedRecordBatchStream, BoxedError>;
+    ) -> Result<FlatBatchStream, BoxedError>;
 }
 
 pub type BoxedExtensionFlatRangeReader = Box<dyn ExtensionFlatRangeReader>;

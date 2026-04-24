@@ -31,12 +31,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::CacheStrategy;
 use crate::error::{ComputeArrowSnafu, Result, UnexpectedSnafu};
-use crate::read::BoxedRecordBatchStream;
+use crate::read::FlatBatchStream;
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::PartitionMetrics;
 use crate::region::options::MergeMode;
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 
 const RANGE_CACHE_COMPACT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 const RANGE_CACHE_SKIP_BYTES: usize = 512 * 1024 * 1024;
@@ -206,6 +207,7 @@ impl CachedBatchSlice {
 }
 
 pub(crate) struct RangeScanCacheValue {
+    schema: FlatBatchSchemaRef,
     cached_batches: Vec<CachedBatchSlice>,
     /// Precomputed size of all compacted batches.
     estimated_batches_size: usize,
@@ -213,10 +215,12 @@ pub(crate) struct RangeScanCacheValue {
 
 impl RangeScanCacheValue {
     pub(crate) fn new(
+        schema: FlatBatchSchemaRef,
         cached_batches: Vec<CachedBatchSlice>,
         estimated_batches_size: usize,
     ) -> Self {
         Self {
+            schema,
             cached_batches,
             estimated_batches_size,
         }
@@ -323,21 +327,25 @@ fn query_time_range_covers_partition_range(
 }
 
 /// Returns a stream that replays cached record batches.
-pub(crate) fn cached_flat_range_stream(value: Arc<RangeScanCacheValue>) -> BoxedRecordBatchStream {
-    Box::pin(try_stream! {
-        for cached_batch in &value.cached_batches {
-            let mut offset = 0;
-            for &len in &cached_batch.slice_lengths {
-                yield cached_batch.batch.slice(offset, len);
-                offset += len;
+pub(crate) fn cached_flat_range_stream(value: Arc<RangeScanCacheValue>) -> FlatBatchStream {
+    FlatBatchStream::new(
+        value.schema.clone(),
+        Box::pin(try_stream! {
+            for cached_batch in &value.cached_batches {
+                let mut offset = 0;
+                for &len in &cached_batch.slice_lengths {
+                    yield cached_batch.batch.slice(offset, len);
+                    offset += len;
+                }
             }
-        }
-    })
+        }),
+    )
 }
 
 enum CacheConcatCommand {
     Compact(Vec<RecordBatch>),
     Finish {
+        schema: FlatBatchSchemaRef,
         pending: Vec<RecordBatch>,
         key: RangeScanCacheKey,
         cache_strategy: CacheStrategy,
@@ -379,8 +387,8 @@ impl CacheConcatState {
         Ok(())
     }
 
-    fn finish(self) -> RangeScanCacheValue {
-        RangeScanCacheValue::new(self.cached_batches, self.estimated_size)
+    fn finish(self, schema: FlatBatchSchemaRef) -> RangeScanCacheValue {
+        RangeScanCacheValue::new(schema, self.cached_batches, self.estimated_size)
     }
 }
 
@@ -423,6 +431,7 @@ async fn run_cache_concat_task(
                 }
             }
             CacheConcatCommand::Finish {
+                schema,
                 pending,
                 key,
                 cache_strategy,
@@ -432,7 +441,7 @@ async fn run_cache_concat_task(
                 let result = state
                     .compact(pending, &limiter)
                     .await
-                    .map(|()| state.finish());
+                    .map(|()| state.finish(schema));
                 if let Err(err) = &result {
                     warn!(err; "Failed to finalize range cache batches");
                 }
@@ -524,6 +533,7 @@ impl CacheBatchBuffer {
 
     fn finish(
         mut self,
+        schema: FlatBatchSchemaRef,
         key: RangeScanCacheKey,
         cache_strategy: CacheStrategy,
         part_metrics: PartitionMetrics,
@@ -535,6 +545,7 @@ impl CacheBatchBuffer {
 
         if sender
             .send(CacheConcatCommand::Finish {
+                schema,
                 pending: mem::take(&mut self.buffered_batches),
                 key,
                 cache_strategy,
@@ -550,20 +561,24 @@ impl CacheBatchBuffer {
 
 /// Wraps a stream to cache its output for future range cache hits.
 pub(crate) fn cache_flat_range_stream(
-    mut stream: BoxedRecordBatchStream,
+    stream: FlatBatchStream,
     cache_strategy: CacheStrategy,
     key: RangeScanCacheKey,
     part_metrics: PartitionMetrics,
-) -> BoxedRecordBatchStream {
-    Box::pin(try_stream! {
-        let mut buffer = CacheBatchBuffer::new(&cache_strategy);
-        while let Some(batch) = stream.try_next().await? {
-            buffer.push(batch.clone())?;
-            yield batch;
-        }
+) -> FlatBatchStream {
+    let (schema, mut stream) = stream.into_parts();
+    FlatBatchStream::new(
+        schema.clone(),
+        Box::pin(try_stream! {
+            let mut buffer = CacheBatchBuffer::new(&cache_strategy);
+            while let Some(batch) = stream.try_next().await? {
+                buffer.push(batch.clone())?;
+                yield batch;
+            }
 
-        buffer.finish(key, cache_strategy, part_metrics, None);
-    })
+            buffer.finish(schema, key, cache_strategy, part_metrics, None);
+        }),
+    )
 }
 
 /// Creates a `cache_flat_range_stream` with dummy internals for benchmarking.
@@ -572,10 +587,10 @@ pub(crate) fn cache_flat_range_stream(
 /// `PartitionMetrics` publicly.
 #[cfg(feature = "test")]
 pub fn bench_cache_flat_range_stream(
-    stream: BoxedRecordBatchStream,
+    stream: FlatBatchStream,
     cache_size_bytes: u64,
     region_id: RegionId,
-) -> BoxedRecordBatchStream {
+) -> FlatBatchStream {
     use std::time::Instant;
 
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -680,7 +695,13 @@ mod tests {
         part_metrics: PartitionMetrics,
     ) -> Option<Arc<RangeScanCacheValue>> {
         let (tx, rx) = oneshot::channel();
-        buffer.finish(key, cache_strategy, part_metrics, Some(tx));
+        buffer.finish(
+            test_flat_batch_schema(),
+            key,
+            cache_strategy,
+            part_metrics,
+            Some(tx),
+        );
         rx.await.context(crate::error::RecvSnafu).ok().flatten()
     }
 
@@ -864,21 +885,61 @@ mod tests {
     }
 
     fn test_schema() -> Arc<datatypes::arrow::datatypes::Schema> {
-        use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, TimeUnit};
 
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            ArrowDataType::Int64,
-            false,
-        )]))
+        Arc::new(Schema::new(vec![
+            Field::new("value", ArrowDataType::Int64, false),
+            Field::new(
+                "ts",
+                ArrowDataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "__primary_key",
+                ArrowDataType::Dictionary(
+                    Box::new(ArrowDataType::UInt32),
+                    Box::new(ArrowDataType::Binary),
+                ),
+                false,
+            ),
+            Field::new("__sequence", ArrowDataType::UInt64, false),
+            Field::new("__op_type", ArrowDataType::UInt8, false),
+        ]))
+    }
+
+    fn test_flat_batch_schema() -> FlatBatchSchemaRef {
+        Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::for_test(
+            test_schema(),
+            0,
+        ))
     }
 
     fn make_batch(values: &[i64]) -> RecordBatch {
-        use datatypes::arrow::array::Int64Array;
+        use api::v1::OpType;
+        use datatypes::arrow::array::builder::BinaryDictionaryBuilder;
+        use datatypes::arrow::array::{
+            Int64Array, TimestampMillisecondArray, UInt8Array, UInt64Array,
+        };
+        use datatypes::arrow::datatypes::UInt32Type;
+
+        let mut pk_builder = BinaryDictionaryBuilder::<UInt32Type>::new();
+        for value in values {
+            pk_builder.append(format!("k{value}").as_bytes()).unwrap();
+        }
 
         RecordBatch::try_new(
             test_schema(),
-            vec![Arc::new(Int64Array::from(values.to_vec()))],
+            vec![
+                Arc::new(Int64Array::from(values.to_vec())),
+                Arc::new(TimestampMillisecondArray::from(
+                    values.iter().copied().collect::<Vec<_>>(),
+                )),
+                Arc::new(pk_builder.finish()),
+                Arc::new(UInt64Array::from(
+                    (0..values.len() as u64).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt8Array::from(vec![OpType::Put as u8; values.len()])),
+            ],
         )
         .unwrap()
     }
@@ -911,6 +972,7 @@ mod tests {
     #[tokio::test]
     async fn cached_flat_range_stream_replays_original_batches() {
         let value = Arc::new(RangeScanCacheValue::new(
+            test_flat_batch_schema(),
             vec![CachedBatchSlice {
                 batch: make_batch(&[1, 2, 3]),
                 slice_lengths: vec![2, 1],
@@ -918,10 +980,8 @@ mod tests {
             make_batch(&[1, 2, 3]).get_array_memory_size(),
         ));
 
-        let replayed = cached_flat_range_stream(value)
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let (_schema, replayed) = cached_flat_range_stream(value).into_parts();
+        let replayed = replayed.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0].num_rows(), 2);

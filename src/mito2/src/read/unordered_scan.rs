@@ -138,6 +138,7 @@ impl UnorderedScan {
                         "unordered_scan_files",
                         partition_pruner.clone(),
                     ).await?;
+                    let (_schema, stream) = stream.into_parts();
                     for await record_batch in stream {
                         yield record_batch?;
                     }
@@ -147,6 +148,7 @@ impl UnorderedScan {
                         *index,
                         &part_metrics,
                     ).await?;
+                    let (_schema, stream) = stream.into_parts();
                     for await record_batch in stream {
                         yield record_batch?;
                     }

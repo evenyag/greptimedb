@@ -59,7 +59,7 @@ use crate::error::{
     RemoteCompactionSnafu, Result, TimeRangePredicateOverflowSnafu, TimeoutSnafu,
 };
 use crate::metrics::{COMPACTION_STAGE_ELAPSED, INFLIGHT_COMPACTION_COUNT};
-use crate::read::BoxedRecordBatchStream;
+use crate::read::FlatBatchStream;
 use crate::read::flat_projection::FlatProjectionMapper;
 use crate::read::scan_region::{PredicateGroup, ScanInput};
 use crate::read::seq_scan::SeqScan;
@@ -979,7 +979,7 @@ pub struct SerializedCompactionOutput {
     output_time_range: Option<TimestampRange>,
 }
 
-/// Builders to create [BoxedRecordBatchStream] for compaction.
+/// Builders to create [FlatBatchStream] for compaction.
 struct CompactionSstReaderBuilder<'a> {
     metadata: RegionMetadataRef,
     sst_layer: AccessLayerRef,
@@ -992,8 +992,8 @@ struct CompactionSstReaderBuilder<'a> {
 }
 
 impl CompactionSstReaderBuilder<'_> {
-    /// Builds [BoxedRecordBatchStream] that reads all SST files and yields batches in flat format for compaction.
-    async fn build_flat_sst_reader(self) -> Result<BoxedRecordBatchStream> {
+    /// Builds [FlatBatchStream] that reads all SST files and yields batches in flat format for compaction.
+    async fn build_flat_sst_reader(self) -> Result<FlatBatchStream> {
         let scan_input = self.build_scan_input()?.with_compaction(true);
 
         SeqScan::new(scan_input)

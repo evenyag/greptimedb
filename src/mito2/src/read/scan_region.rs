@@ -61,7 +61,7 @@ use crate::read::seq_scan::SeqScan;
 use crate::read::series_scan::SeriesScan;
 use crate::read::stream::ScanBatchStream;
 use crate::read::unordered_scan::UnorderedScan;
-use crate::read::{BoxedRecordBatchStream, RecordBatch};
+use crate::read::{BoxedRecordBatchStream, FlatBatchStream, RecordBatch};
 use crate::region::options::MergeMode;
 use crate::region::version::VersionRef;
 use crate::sst::file::FileHandle;
@@ -1174,10 +1174,10 @@ impl ScanInput {
     )]
     pub(crate) fn create_parallel_flat_sources(
         &self,
-        sources: Vec<BoxedRecordBatchStream>,
+        sources: Vec<FlatBatchStream>,
         semaphore: Arc<Semaphore>,
         channel_size: usize,
-    ) -> Result<Vec<BoxedRecordBatchStream>> {
+    ) -> Result<Vec<FlatBatchStream>> {
         if sources.len() <= 1 {
             return Ok(sources);
         }
@@ -1186,10 +1186,11 @@ impl ScanInput {
         let sources = sources
             .into_iter()
             .map(|source| {
+                let (schema, source) = source.into_parts();
                 let (sender, receiver) = mpsc::channel(channel_size);
                 self.spawn_flat_scan_task(source, semaphore.clone(), sender);
                 let stream = Box::pin(ReceiverStream::new(receiver));
-                Box::pin(stream) as _
+                FlatBatchStream::new(schema, Box::pin(stream) as _)
             })
             .collect();
         Ok(sources)

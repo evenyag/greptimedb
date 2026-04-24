@@ -50,7 +50,7 @@ use crate::read::scan_util::{
     scan_flat_file_ranges, scan_flat_mem_ranges, should_split_flat_batches_for_merge,
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
-use crate::read::{BoxedRecordBatchStream, ScannerMetrics, scan_util};
+use crate::read::{FlatBatchStream, ScannerMetrics, scan_util};
 use crate::region::options::MergeMode;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 
@@ -130,7 +130,7 @@ impl SeqScan {
     ///
     /// # Panics
     /// Panics if the compaction flag is not set.
-    pub async fn build_flat_reader_for_compaction(&self) -> Result<BoxedRecordBatchStream> {
+    pub async fn build_flat_reader_for_compaction(&self) -> Result<FlatBatchStream> {
         assert!(self.stream_ctx.input.compaction);
 
         let metrics_set = ExecutionPlanMetricsSet::new();
@@ -155,7 +155,7 @@ impl SeqScan {
         partition_ranges: &[PartitionRange],
         part_metrics: &PartitionMetrics,
         pruner: Arc<Pruner>,
-    ) -> Result<BoxedRecordBatchStream> {
+    ) -> Result<FlatBatchStream> {
         pruner.add_partition_ranges(partition_ranges);
         let partition_pruner = Arc::new(PartitionPruner::new(pruner, partition_ranges));
 
@@ -196,12 +196,12 @@ impl SeqScan {
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
     pub(crate) async fn build_flat_reader_from_sources(
         stream_ctx: &StreamContext,
-        mut sources: Vec<BoxedRecordBatchStream>,
+        mut sources: Vec<FlatBatchStream>,
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
         skip_dedup: bool,
         channel_size: usize,
-    ) -> Result<BoxedRecordBatchStream> {
+    ) -> Result<FlatBatchStream> {
         if let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
             if sources.len() > 1 {
@@ -214,17 +214,17 @@ impl SeqScan {
         }
 
         let mapper = &stream_ctx.input.mapper;
-        let reader: BoxedRecordBatchStream = if sources.len() == 1 {
+        let reader = if sources.len() == 1 {
             // Currently, we can't skip dedup when there is only one source because
             // that source may have duplicate rows.
             sources.pop().unwrap()
         } else {
-            let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
+            let schema = mapper.flat_batch_schema(stream_ctx.input.compaction);
             let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
             let reader =
                 FlatMergeReader::new(schema, sources, DEFAULT_READ_BATCH_SIZE, metrics_reporter)
                     .await?;
-            Box::pin(reader.into_stream())
+            reader.into_stream()
         };
 
         let dedup = !skip_dedup && !stream_ctx.input.append_mode;
@@ -232,31 +232,25 @@ impl SeqScan {
         let reader = if dedup {
             let flat_batch_schema = mapper.flat_batch_schema(stream_ctx.input.compaction);
             match stream_ctx.input.merge_mode {
-                MergeMode::LastRow => Box::pin(
-                    FlatDedupReader::new(
-                        reader,
-                        FlatLastRow::new(stream_ctx.input.filter_deleted, flat_batch_schema),
-                        dedup_metrics_reporter,
-                    )
-                    .into_stream(),
-                ) as _,
-                MergeMode::LastNonNull => Box::pin(
-                    FlatDedupReader::new(
-                        reader,
-                        FlatLastNonNull::new(stream_ctx.input.filter_deleted, flat_batch_schema),
-                        dedup_metrics_reporter,
-                    )
-                    .into_stream(),
-                ) as _,
+                MergeMode::LastRow => FlatDedupReader::new_flat(
+                    reader,
+                    FlatLastRow::new(stream_ctx.input.filter_deleted, flat_batch_schema),
+                    dedup_metrics_reporter,
+                )
+                .into_stream(),
+                MergeMode::LastNonNull => FlatDedupReader::new_flat(
+                    reader,
+                    FlatLastNonNull::new(stream_ctx.input.filter_deleted, flat_batch_schema),
+                    dedup_metrics_reporter,
+                )
+                .into_stream(),
             }
         } else {
             reader
         };
 
         let reader = match &stream_ctx.input.series_row_selector {
-            Some(TimeSeriesRowSelector::LastRow) => {
-                Box::pin(FlatLastRowReader::new(reader).into_stream()) as _
-            }
+            Some(TimeSeriesRowSelector::LastRow) => FlatLastRowReader::new(reader).into_stream(),
             None => reader,
         };
 
@@ -272,7 +266,7 @@ impl SeqScan {
         partition_pruner: Arc<PartitionPruner>,
         file_scan_semaphore: Option<Arc<Semaphore>>,
         merge_semaphore: Option<Arc<Semaphore>>,
-    ) -> Result<(BoxedRecordBatchStream, usize)> {
+    ) -> Result<(FlatBatchStream, usize)> {
         let cache_key = build_range_cache_key(stream_ctx, part_range);
 
         if let Some(key) = cache_key.as_ref() {
@@ -397,7 +391,7 @@ impl SeqScan {
 
             // Scans each part.
             for part_range in partition_ranges {
-                let (mut reader, _) = Self::build_flat_partition_range_read(
+                let (reader, _) = Self::build_flat_partition_range_read(
                     &stream_ctx,
                     &part_range,
                     compaction,
@@ -407,6 +401,7 @@ impl SeqScan {
                     semaphore.clone(),
                 )
                 .await?;
+                let (_schema, mut reader) = reader.into_parts();
 
                 let mut metrics = ScannerMetrics {
                     scan_cost: fetch_start.elapsed(),
@@ -612,7 +607,7 @@ pub(crate) async fn build_flat_sources(
     compaction: bool,
     part_metrics: &PartitionMetrics,
     partition_pruner: Arc<PartitionPruner>,
-    sources: &mut Vec<BoxedRecordBatchStream>,
+    sources: &mut Vec<FlatBatchStream>,
     semaphore: Option<Arc<Semaphore>>,
 ) -> Result<Option<usize>> {
     // Gets range meta.
@@ -656,7 +651,8 @@ pub(crate) async fn build_flat_sources(
                 *index,
                 range_meta.time_range,
             );
-            ordered_sources[position] = Some(Box::pin(stream) as _);
+            let schema = stream_ctx.input.mapper.flat_batch_schema(compaction);
+            ordered_sources[position] = Some(FlatBatchStream::new(schema, Box::pin(stream) as _));
         } else if stream_ctx.is_file_range_index(*index) {
             if let Some(semaphore_ref) = semaphore.as_ref() {
                 // run in parallel, controlled by semaphore
@@ -675,7 +671,7 @@ pub(crate) async fn build_flat_sources(
                         partition_pruner,
                     )
                     .await?;
-                    Ok((position, Box::pin(stream) as _))
+                    Ok((position, stream))
                 });
             } else {
                 // no semaphore, run sequentially
@@ -687,7 +683,7 @@ pub(crate) async fn build_flat_sources(
                     partition_pruner.clone(),
                 )
                 .await?;
-                ordered_sources[position] = Some(Box::pin(stream) as _);
+                ordered_sources[position] = Some(stream);
             }
         } else {
             let stream =
@@ -705,7 +701,11 @@ pub(crate) async fn build_flat_sources(
 
     for stream in ordered_sources.into_iter().flatten() {
         if should_split {
-            sources.push(Box::pin(SplitRecordBatchStream::new(stream)));
+            let (schema, stream) = stream.into_parts();
+            sources.push(FlatBatchStream::new(
+                schema.clone(),
+                Box::pin(SplitRecordBatchStream::new(schema, stream)),
+            ));
         } else {
             sources.push(stream);
         }

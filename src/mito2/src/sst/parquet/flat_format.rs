@@ -279,21 +279,6 @@ pub(crate) fn op_type_column_index(num_columns: usize) -> usize {
     num_columns - 1
 }
 
-/// Returns the start index of field columns in a flat batch.
-///
-/// `num_columns` is the total number of columns in the flat batch schema,
-/// including tag columns (if present), field columns, and fixed position columns
-/// (time index, primary key, sequence, op type).
-///
-/// For Dense encoding (raw PK columns included): field_column_start = primary_key.len()
-/// For Sparse encoding (no raw PK columns): field_column_start = 0
-pub(crate) fn field_column_start(metadata: &RegionMetadata, num_columns: usize) -> usize {
-    // Calculates field column start: total columns - fixed columns - field columns
-    // Field column count = total metadata columns - time index column - primary key columns
-    let field_column_count = metadata.column_metadatas.len() - 1 - metadata.primary_key.len();
-    num_columns - FIXED_POS_COLUMN_NUM - field_column_count
-}
-
 // TODO(yingwen): Add an option to skip reading internal columns if the region is
 // append only and doesn't use sparse encoding (We need to check the table id under
 // sparse encoding).
@@ -1010,10 +995,8 @@ mod tests {
     use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
-    use super::{FlatReadFormat, field_column_start};
-    use crate::sst::{
-        FlatSchemaOptions, flat_sst_arrow_schema_column_num, to_flat_sst_arrow_schema,
-    };
+    use super::{FlatBatchSchema, FlatReadFormat};
+    use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 
     /// Builds a `RegionMetadata` with the given number of tags and fields.
     fn build_metadata(
@@ -1079,8 +1062,8 @@ mod tests {
         for (num_tags, num_fields, encoding, expected) in cases {
             let metadata = build_metadata(num_tags, num_fields, encoding);
             let options = FlatSchemaOptions::from_encoding(encoding);
-            let num_columns = flat_sst_arrow_schema_column_num(&metadata, &options);
-            let result = field_column_start(&metadata, num_columns);
+            let arrow_schema = to_flat_sst_arrow_schema(&metadata, &options);
+            let result = FlatBatchSchema::new(&metadata, arrow_schema).field_column_start();
             assert_eq!(
                 result, expected,
                 "num_tags={num_tags}, num_fields={num_fields}, encoding={encoding:?}"

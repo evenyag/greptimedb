@@ -46,9 +46,7 @@ use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::read::prune::FlatPruneReader;
 use crate::sst::file::FileHandle;
-use crate::sst::parquet::flat_format::{
-    DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys, time_index_column_index,
-};
+use crate::sst::parquet::flat_format::{DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys};
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
@@ -519,7 +517,7 @@ impl RangeBase {
                     mask = mask.bitand(&result);
                 }
             } else if filter_ctx.semantic_type() == SemanticType::Timestamp {
-                let time_index_pos = time_index_column_index(input.num_columns());
+                let time_index_pos = self.read_format.batch_schema().time_index_index();
                 let column = &input.columns()[time_index_pos];
                 let result = filter.evaluate_array(column).context(RecordBatchSnafu)?;
                 mask = mask.bitand(&result);
@@ -640,7 +638,7 @@ impl RangeBase {
             }
 
             if metadata.time_index_column().column_id == column_id {
-                let time_index_pos = time_index_column_index(input.num_columns());
+                let time_index_pos = self.read_format.batch_schema().time_index_index();
                 columns.push(input.column(time_index_pos).clone());
                 continue;
             }

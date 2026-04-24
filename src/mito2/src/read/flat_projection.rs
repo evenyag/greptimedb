@@ -33,7 +33,9 @@ use store_api::storage::ColumnId;
 use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, RecordBatchSnafu, Result};
 use crate::read::projection::{read_column_ids_from_projection, repeated_vector_with_cache};
-use crate::sst::parquet::flat_format::sst_column_id_indices;
+use crate::sst::parquet::flat_format::{
+    FlatBatchSchema, FlatBatchSchemaRef, sst_column_id_indices,
+};
 use crate::sst::parquet::format::FormatProjection;
 use crate::sst::{
     FlatSchemaOptions, internal_fields, tag_maybe_to_dictionary_field, to_flat_sst_arrow_schema,
@@ -63,7 +65,12 @@ pub struct FlatProjectionMapper {
     /// The index in flat format [RecordBatch] for each column in the output [RecordBatch].
     batch_indices: Vec<usize>,
     /// Precomputed Arrow schema for input batches.
+    #[cfg_attr(not(test), allow(dead_code))]
     input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
+    /// Cached flat batch schema for non-compaction reads.
+    flat_batch_schema: FlatBatchSchemaRef,
+    /// Cached flat batch schema for compaction reads.
+    compaction_flat_batch_schema: FlatBatchSchemaRef,
 }
 
 impl FlatProjectionMapper {
@@ -160,6 +167,16 @@ impl FlatProjectionMapper {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        let flat_batch_schema =
+            Arc::new(FlatBatchSchema::new(metadata, input_arrow_schema.clone()));
+        let compaction_flat_batch_schema = Arc::new(FlatBatchSchema::new(
+            metadata,
+            to_flat_sst_arrow_schema(
+                metadata,
+                &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+            ),
+        ));
+
         Ok(FlatProjectionMapper {
             metadata: metadata.clone(),
             output_schema,
@@ -168,6 +185,8 @@ impl FlatProjectionMapper {
             is_empty_projection,
             batch_indices,
             input_arrow_schema,
+            flat_batch_schema,
+            compaction_flat_batch_schema,
         })
     }
 
@@ -187,29 +206,6 @@ impl FlatProjectionMapper {
         &self.read_column_ids
     }
 
-    /// Returns the field column start index in output batch.
-    pub(crate) fn field_column_start(&self) -> usize {
-        for (idx, column_id) in self
-            .batch_schema
-            .iter()
-            .map(|(column_id, _)| column_id)
-            .enumerate()
-        {
-            // Safety: We get the column id from the metadata in new().
-            if self
-                .metadata
-                .column_by_id(*column_id)
-                .unwrap()
-                .semantic_type
-                == SemanticType::Field
-            {
-                return idx;
-            }
-        }
-
-        self.batch_schema.len()
-    }
-
     /// Returns ids of columns of the batch that the mapper expects to convert.
     pub(crate) fn batch_schema(&self) -> &[(ColumnId, ConcreteDataType)] {
         &self.batch_schema
@@ -218,6 +214,7 @@ impl FlatProjectionMapper {
     /// Returns the input arrow schema from sources.
     ///
     /// The merge reader can use this schema.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn input_arrow_schema(
         &self,
         compaction: bool,
@@ -237,14 +234,12 @@ impl FlatProjectionMapper {
     /// reader (matches [Self::input_arrow_schema] for the same `compaction`
     /// flag). Built fresh on each call; callers cache the result if they need
     /// to reuse it across many batches.
-    pub(crate) fn flat_batch_schema(
-        &self,
-        compaction: bool,
-    ) -> crate::sst::parquet::flat_format::FlatBatchSchemaRef {
-        Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::new(
-            &self.metadata,
-            self.input_arrow_schema(compaction),
-        ))
+    pub(crate) fn flat_batch_schema(&self, compaction: bool) -> FlatBatchSchemaRef {
+        if compaction {
+            self.compaction_flat_batch_schema.clone()
+        } else {
+            self.flat_batch_schema.clone()
+        }
     }
 
     /// Returns the schema of converted [RecordBatch].

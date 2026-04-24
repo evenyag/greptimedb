@@ -538,7 +538,7 @@ impl SeriesDistributor {
         // Each partition range stream is already deduped, so skip dedup here.
         // Use a separate semaphore for the final merge to avoid deadlock with
         // range-level merge tasks that share the range_semaphore.
-        let mut reader = SeqScan::build_flat_reader_from_sources(
+        let reader = SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             range_streams,
             self.final_merge_semaphore.clone(),
@@ -547,6 +547,7 @@ impl SeriesDistributor {
             channel_size,
         )
         .await?;
+        let (_schema, mut reader) = reader.into_parts();
         let mut metrics = SeriesDistributorMetrics::default();
 
         let mut divider = FlatSeriesBatchDivider::default();

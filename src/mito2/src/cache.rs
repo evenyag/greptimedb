@@ -1246,7 +1246,31 @@ mod tests {
     use crate::read::range_cache::{
         RangeScanCacheKey, RangeScanCacheValue, ScanRequestFingerprintBuilder,
     };
+    use crate::sst::parquet::flat_format::FlatBatchSchema;
     use crate::sst::parquet::row_selection::RowGroupSelection;
+
+    fn test_flat_batch_schema() -> Arc<FlatBatchSchema> {
+        use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        Arc::new(FlatBatchSchema::for_test(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+                Field::new(
+                    "__primary_key",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
+                    false,
+                ),
+                Field::new("__sequence", DataType::UInt64, false),
+                Field::new("__op_type", DataType::UInt8, false),
+            ])),
+            0,
+        ))
+    }
 
     #[tokio::test]
     async fn test_disable_cache() {
@@ -1428,7 +1452,11 @@ mod tests {
             }
             .build(),
         };
-        let value = Arc::new(RangeScanCacheValue::new(Vec::new(), 0));
+        let value = Arc::new(RangeScanCacheValue::new(
+            test_flat_batch_schema(),
+            Vec::new(),
+            0,
+        ));
 
         assert!(cache.get_range_result(&key).is_none());
         cache.put_range_result(key.clone(), value.clone());

@@ -42,13 +42,13 @@ use crate::read::flat_merge::{MergeMetrics, MergeMetricsReport};
 use crate::read::pruner::PartitionPruner;
 use crate::read::range::{RangeMeta, RowGroupIndex};
 use crate::read::scan_region::StreamContext;
-use crate::read::{BoxedRecordBatchStream, ScannerMetrics};
+use crate::read::{FlatBatchStream, ScannerMetrics};
 use crate::sst::file::{FileTimeRange, RegionFileId};
 use crate::sst::index::bloom_filter::applier::BloomFilterIndexApplyMetrics;
 use crate::sst::index::fulltext_index::applier::FulltextIndexApplyMetrics;
 use crate::sst::index::inverted_index::applier::InvertedIndexApplyMetrics;
 use crate::sst::parquet::file_range::FileRange;
-use crate::sst::parquet::flat_format::time_index_column_index;
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderFilterMetrics, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
@@ -1453,7 +1453,7 @@ pub(crate) async fn scan_flat_file_ranges(
     index: RowGroupIndex,
     read_type: &'static str,
     partition_pruner: Arc<PartitionPruner>,
-) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+) -> Result<FlatBatchStream> {
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
         ..Default::default()
@@ -1502,73 +1502,80 @@ pub fn build_flat_file_range_scan_stream(
     read_type: &'static str,
     ranges: SmallVec<[FileRange; 2]>,
     mut per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
-) -> impl Stream<Item = Result<RecordBatch>> {
-    try_stream! {
-        let fetch_metrics = if part_metrics.explain_verbose() {
-            Some(Arc::new(ParquetFetchMetrics::default()))
-        } else {
-            None
-        };
-        let reader_metrics = &mut ReaderMetrics {
-            fetch_metrics: fetch_metrics.clone(),
-            ..Default::default()
-        };
-        for range in ranges {
-            let build_reader_start = Instant::now();
-            let Some(mut reader) = range
-                .flat_reader(
-                    stream_ctx.input.series_row_selector,
-                    fetch_metrics.as_deref(),
-                )
-                .await?
-            else {
-                continue;
+) -> FlatBatchStream {
+    let schema = stream_ctx
+        .input
+        .mapper
+        .flat_batch_schema(stream_ctx.input.compaction);
+    FlatBatchStream::new(
+        schema,
+        Box::pin(try_stream! {
+            let fetch_metrics = if part_metrics.explain_verbose() {
+                Some(Arc::new(ParquetFetchMetrics::default()))
+            } else {
+                None
             };
-            let build_cost = build_reader_start.elapsed();
-            part_metrics.inc_build_reader_cost(build_cost);
-
-            let may_compat = range.compat_batch();
-
-            let mapper = range.compaction_projection_mapper();
-            while let Some(record_batch) = reader.next_batch().await? {
-                let record_batch = if let Some(mapper) = mapper {
-                    let batch = mapper.project(record_batch)?;
-                    batch
-                } else {
-                    record_batch
+            let reader_metrics = &mut ReaderMetrics {
+                fetch_metrics: fetch_metrics.clone(),
+                ..Default::default()
+            };
+            for range in ranges {
+                let build_reader_start = Instant::now();
+                let Some(mut reader) = range
+                    .flat_reader(
+                        stream_ctx.input.series_row_selector,
+                        fetch_metrics.as_deref(),
+                    )
+                    .await?
+                else {
+                    continue;
                 };
+                let build_cost = build_reader_start.elapsed();
+                part_metrics.inc_build_reader_cost(build_cost);
 
-                if let Some(flat_compat) = may_compat {
-                    let batch = flat_compat.compat(record_batch)?;
-                    yield batch;
-                } else {
-                    yield record_batch;
+                let may_compat = range.compat_batch();
+
+                let mapper = range.compaction_projection_mapper();
+                while let Some(record_batch) = reader.next_batch().await? {
+                    let record_batch = if let Some(mapper) = mapper {
+                        let batch = mapper.project(record_batch)?;
+                        batch
+                    } else {
+                        record_batch
+                    };
+
+                    if let Some(flat_compat) = may_compat {
+                        let batch = flat_compat.compat(record_batch)?;
+                        yield batch;
+                    } else {
+                        yield record_batch;
+                    }
                 }
+
+                let prune_metrics = reader.metrics();
+
+                // Update per-file metrics if tracking is enabled
+                if let Some(file_metrics_map) = per_file_metrics.as_mut() {
+                    let file_id = range.file_handle().file_id();
+                    let file_metrics = file_metrics_map
+                        .entry(file_id)
+                        .or_insert_with(FileScanMetrics::default);
+
+                    file_metrics.num_ranges += 1;
+                    file_metrics.num_rows += prune_metrics.num_rows;
+                    file_metrics.build_reader_cost += build_cost;
+                    file_metrics.scan_cost += prune_metrics.scan_cost;
+                }
+
+                reader_metrics.merge_from(&prune_metrics);
             }
 
-            let prune_metrics = reader.metrics();
-
-            // Update per-file metrics if tracking is enabled
-            if let Some(file_metrics_map) = per_file_metrics.as_mut() {
-                let file_id = range.file_handle().file_id();
-                let file_metrics = file_metrics_map
-                    .entry(file_id)
-                    .or_insert_with(FileScanMetrics::default);
-
-                file_metrics.num_ranges += 1;
-                file_metrics.num_rows += prune_metrics.num_rows;
-                file_metrics.build_reader_cost += build_cost;
-                file_metrics.scan_cost += prune_metrics.scan_cost;
-            }
-
-            reader_metrics.merge_from(&prune_metrics);
-        }
-
-        // Reports metrics.
-        reader_metrics.observe_rows(read_type);
-        reader_metrics.filter_metrics.observe();
-        part_metrics.merge_reader_metrics(reader_metrics, per_file_metrics.as_ref());
-    }
+            // Reports metrics.
+            reader_metrics.observe_rows(read_type);
+            reader_metrics.filter_metrics.observe();
+            part_metrics.merge_reader_metrics(reader_metrics, per_file_metrics.as_ref());
+        }),
+    )
 }
 
 /// Build the stream of scanning the extension range in flat format denoted by the [`RowGroupIndex`].
@@ -1577,7 +1584,7 @@ pub(crate) async fn scan_flat_extension_range(
     context: Arc<StreamContext>,
     index: RowGroupIndex,
     partition_metrics: PartitionMetrics,
-) -> Result<BoxedRecordBatchStream> {
+) -> Result<FlatBatchStream> {
     use snafu::ResultExt;
 
     let range = context.input.extension_range(index.index);
@@ -1593,7 +1600,7 @@ pub(crate) async fn maybe_scan_flat_other_ranges(
     context: &Arc<StreamContext>,
     index: RowGroupIndex,
     metrics: &PartitionMetrics,
-) -> Result<BoxedRecordBatchStream> {
+) -> Result<FlatBatchStream> {
     #[cfg(feature = "enterprise")]
     {
         scan_flat_extension_range(context.clone(), index, metrics.clone()).await
@@ -1614,6 +1621,7 @@ pub(crate) async fn maybe_scan_flat_other_ranges(
 
 /// A stream wrapper that splits record batches from an inner stream.
 pub(crate) struct SplitRecordBatchStream<S> {
+    schema: FlatBatchSchemaRef,
     /// The inner stream that yields record batches.
     inner: S,
     /// Buffer for split batches.
@@ -1622,8 +1630,9 @@ pub(crate) struct SplitRecordBatchStream<S> {
 
 impl<S> SplitRecordBatchStream<S> {
     /// Creates a new splitting stream wrapper.
-    pub(crate) fn new(inner: S) -> Self {
+    pub(crate) fn new(schema: FlatBatchSchemaRef, inner: S) -> Self {
         Self {
+            schema,
             inner,
             batches: VecDeque::new(),
         }
@@ -1651,7 +1660,8 @@ where
             };
 
             // Split the batch and buffer the results
-            split_record_batch(record_batch, &mut self.batches);
+            let schema = self.schema.clone();
+            split_record_batch(record_batch, &schema, &mut self.batches);
             // Continue the loop to return the first split batch
         }
     }
@@ -1661,7 +1671,11 @@ where
 ///
 /// # Panics
 /// Panics if the timestamp array is invalid.
-pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeque<RecordBatch>) {
+pub(crate) fn split_record_batch(
+    record_batch: RecordBatch,
+    schema: &FlatBatchSchemaRef,
+    batches: &mut VecDeque<RecordBatch>,
+) {
     let batch_rows = record_batch.num_rows();
     if batch_rows == 0 {
         return;
@@ -1671,7 +1685,7 @@ pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeq
         return;
     }
 
-    let time_index_pos = time_index_column_index(record_batch.num_columns());
+    let time_index_pos = schema.time_index_index();
     let timestamps = record_batch.column(time_index_pos);
     let (ts_values, _unit) = timestamp_array_to_primitive(timestamps).unwrap();
     let mut offsets = Vec::with_capacity(16);

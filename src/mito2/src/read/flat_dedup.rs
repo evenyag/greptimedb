@@ -41,9 +41,8 @@ use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 use crate::memtable::partition_tree::data::timestamp_array_to_i64_slice;
 use crate::metrics::MERGE_FILTER_ROWS_TOTAL;
 use crate::read::dedup::{DedupMetrics, DedupMetricsReport};
-use crate::sst::parquet::flat_format::{
-    FlatBatchSchemaRef, op_type_column_index, primary_key_column_index, time_index_column_index,
-};
+use crate::read::{BoxedRecordBatchStream, FlatBatchStream};
+use crate::sst::parquet::flat_format::FlatBatchSchemaRef;
 use crate::sst::parquet::format::{FIXED_POS_COLUMN_NUM, PrimaryKeyArray};
 
 /// An iterator to dedup sorted batches from an iterator based on the dedup strategy.
@@ -89,6 +88,7 @@ impl<I: Iterator<Item = Result<RecordBatch>>, S: RecordBatchDedupStrategy> Itera
 
 /// An async reader to dedup sorted record batches from a stream based on the dedup strategy.
 pub struct FlatDedupReader<I, S> {
+    schema: FlatBatchSchemaRef,
     stream: I,
     strategy: S,
     metrics: DedupMetrics,
@@ -99,11 +99,13 @@ pub struct FlatDedupReader<I, S> {
 impl<I, S> FlatDedupReader<I, S> {
     /// Creates a new dedup reader.
     pub fn new(
+        schema: FlatBatchSchemaRef,
         stream: I,
         strategy: S,
         metrics_reporter: Option<Arc<dyn DedupMetricsReport>>,
     ) -> Self {
         Self {
+            schema,
             stream,
             strategy,
             metrics: DedupMetrics::default(),
@@ -112,7 +114,7 @@ impl<I, S> FlatDedupReader<I, S> {
     }
 }
 
-impl<I: Stream<Item = Result<RecordBatch>> + Unpin, S: RecordBatchDedupStrategy>
+impl<I: Stream<Item = Result<RecordBatch>> + Unpin + Send, S: RecordBatchDedupStrategy + 'static>
     FlatDedupReader<I, S>
 {
     /// Returns the next deduplicated batch.
@@ -130,12 +132,34 @@ impl<I: Stream<Item = Result<RecordBatch>> + Unpin, S: RecordBatchDedupStrategy>
     }
 
     /// Converts the reader into a stream.
-    pub fn into_stream(mut self) -> impl Stream<Item = Result<RecordBatch>> {
-        try_stream! {
-            while let Some(batch) = self.fetch_next_batch().await? {
-                yield batch;
-            }
-        }
+    pub fn into_stream(mut self) -> FlatBatchStream
+    where
+        I: 'static,
+    {
+        let schema = self.schema.clone();
+        FlatBatchStream::new(
+            schema,
+            Box::pin(try_stream! {
+                while let Some(batch) = self.fetch_next_batch().await? {
+                    yield batch;
+                }
+            }),
+        )
+    }
+}
+
+impl<S> FlatDedupReader<BoxedRecordBatchStream, S>
+where
+    S: RecordBatchDedupStrategy,
+{
+    /// Creates a dedup reader from a flat batch stream.
+    pub fn new_flat(
+        stream: FlatBatchStream,
+        strategy: S,
+        metrics_reporter: Option<Arc<dyn DedupMetricsReport>>,
+    ) -> Self {
+        let (schema, stream) = stream.into_parts();
+        Self::new(schema, stream, strategy, metrics_reporter)
     }
 }
 
@@ -198,14 +222,13 @@ impl FlatLastRow {
     }
 
     /// Remove duplications from the batch without considering previous rows.
-    fn dedup_one_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    fn dedup_one_batch(batch: RecordBatch, schema: &FlatBatchSchemaRef) -> Result<RecordBatch> {
         let num_rows = batch.num_rows();
         if num_rows < 2 {
             return Ok(batch);
         }
 
-        let num_columns = batch.num_columns();
-        let timestamps = batch.column(time_index_column_index(num_columns));
+        let timestamps = batch.column(schema.time_index_index());
         // Checks duplications based on the timestamp.
         let mask = find_boundaries(timestamps).context(ComputeArrowSnafu)?;
         if mask.count_set_bits() == num_rows - 1 {
@@ -216,13 +239,10 @@ impl FlatLastRow {
         // The batch has duplicated timestamps, but it doesn't mean it must
         // has duplicated rows.
         // Partitions the batch by the primary key and time index.
-        let columns: Vec<_> = [
-            primary_key_column_index(num_columns),
-            time_index_column_index(num_columns),
-        ]
-        .iter()
-        .map(|index| batch.column(*index).clone())
-        .collect();
+        let columns: Vec<_> = [schema.primary_key_index(), schema.time_index_index()]
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect();
         let partitions = partition(&columns).context(ComputeArrowSnafu)?;
 
         Self::dedup_by_partitions(batch, &partitions)
@@ -258,7 +278,7 @@ impl RecordBatchDedupStrategy for FlatLastRow {
 
         // Dedup current batch to ensure no duplication before we checking the previous row.
         let row_before_dedup = batch.num_rows();
-        let mut batch = Self::dedup_one_batch(batch)?;
+        let mut batch = Self::dedup_one_batch(batch, &self.schema)?;
 
         if let Some(prev_batch) = &self.prev_batch {
             // If we have previous batch.
@@ -269,7 +289,7 @@ impl RecordBatchDedupStrategy for FlatLastRow {
         }
         metrics.num_unselected_rows += row_before_dedup - batch.num_rows();
 
-        let Some(batch_last_row) = BatchLastRow::try_new(batch.clone()) else {
+        let Some(batch_last_row) = BatchLastRow::try_new(batch.clone(), self.schema.clone()) else {
             // The batch after dedup is empty.
             // We don't need to update `prev_batch` because they have the same
             // key and timestamp.
@@ -285,7 +305,7 @@ impl RecordBatchDedupStrategy for FlatLastRow {
         self.prev_batch = Some(batch_last_row);
 
         // Filters deleted rows at last.
-        let result = maybe_filter_deleted(batch, self.filter_deleted, metrics);
+        let result = maybe_filter_deleted(batch, &self.schema, self.filter_deleted, metrics);
 
         metrics.dedup_cost += start.elapsed();
 
@@ -332,9 +352,9 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
             // If the buffer is None, dedup the batch, put the batch into the buffer and return.
             // There is no previous batch with the same key, we can pass contains_delete as false.
             let (record_batch, contains_delete) =
-                Self::dedup_one_batch(batch, field_column_start, false)?;
+                Self::dedup_one_batch(batch, &self.schema, field_column_start, false)?;
             metrics.num_unselected_rows += row_before_dedup - record_batch.num_rows();
-            self.buffer = BatchLastRow::try_new(record_batch);
+            self.buffer = BatchLastRow::try_new(record_batch, self.schema.clone());
             self.contains_delete = contains_delete;
 
             metrics.dedup_cost += start.elapsed();
@@ -347,13 +367,18 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
             // Dedup the batch.
             // There is no previous batch with the same key, we can pass contains_delete as false.
             let (record_batch, contains_delete) =
-                Self::dedup_one_batch(batch, field_column_start, false)?;
+                Self::dedup_one_batch(batch, &self.schema, field_column_start, false)?;
             metrics.num_unselected_rows += row_before_dedup - record_batch.num_rows();
             debug_assert!(record_batch.num_rows() > 0);
-            self.buffer = BatchLastRow::try_new(record_batch);
+            self.buffer = BatchLastRow::try_new(record_batch, self.schema.clone());
             self.contains_delete = contains_delete;
 
-            let result = maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics);
+            let result = maybe_filter_deleted(
+                buffer.last_batch,
+                &self.schema,
+                self.filter_deleted,
+                metrics,
+            );
             metrics.dedup_cost += start.elapsed();
             return result;
         }
@@ -364,7 +389,7 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
             let dedup_batch = buffer.last_batch.slice(0, buffer.last_batch.num_rows() - 1);
             debug_assert_eq!(buffer.last_batch.num_rows() - 1, dedup_batch.num_rows());
 
-            maybe_filter_deleted(dedup_batch, self.filter_deleted, metrics)?
+            maybe_filter_deleted(dedup_batch, &self.schema, self.filter_deleted, metrics)?
         } else {
             None
         };
@@ -375,11 +400,15 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
         let merged = concat_batches(&schema, &[last_row, batch]).context(ComputeArrowSnafu)?;
         let merged_row_count = merged.num_rows();
         // Dedup the merged batch and update the buffer.
-        let (record_batch, contains_delete) =
-            Self::dedup_one_batch(merged, field_column_start, self.contains_delete)?;
+        let (record_batch, contains_delete) = Self::dedup_one_batch(
+            merged,
+            &self.schema,
+            field_column_start,
+            self.contains_delete,
+        )?;
         metrics.num_unselected_rows += merged_row_count - record_batch.num_rows();
         debug_assert!(record_batch.num_rows() > 0);
-        self.buffer = BatchLastRow::try_new(record_batch);
+        self.buffer = BatchLastRow::try_new(record_batch, self.schema.clone());
         self.contains_delete = contains_delete;
 
         metrics.dedup_cost += start.elapsed();
@@ -394,7 +423,12 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
 
         let start = Instant::now();
 
-        let result = maybe_filter_deleted(buffer.last_batch, self.filter_deleted, metrics);
+        let result = maybe_filter_deleted(
+            buffer.last_batch,
+            &self.schema,
+            self.filter_deleted,
+            metrics,
+        );
 
         metrics.dedup_cost += start.elapsed();
 
@@ -417,13 +451,12 @@ impl FlatLastNonNull {
     /// Returns a tuple containing the deduplicated batch and a boolean indicating whether the last range contains deleted rows.
     fn dedup_one_batch(
         batch: RecordBatch,
+        schema: &FlatBatchSchemaRef,
         field_column_start: usize,
         prev_batch_contains_delete: bool,
     ) -> Result<(RecordBatch, bool)> {
         // Get op type array for checking delete operations
-        let op_type_column = batch
-            .column(op_type_column_index(batch.num_columns()))
-            .clone();
+        let op_type_column = batch.column(schema.op_type_index()).clone();
         let op_types = op_type_column
             .as_any()
             .downcast_ref::<UInt8Array>()
@@ -438,8 +471,7 @@ impl FlatLastNonNull {
             return Ok((batch, contains_delete));
         }
 
-        let num_columns = batch.num_columns();
-        let timestamps = batch.column(time_index_column_index(num_columns));
+        let timestamps = batch.column(schema.time_index_index());
         // Checks duplications based on the timestamp.
         let mask = find_boundaries(timestamps).context(ComputeArrowSnafu)?;
         if mask.count_set_bits() == num_rows - 1 {
@@ -451,13 +483,10 @@ impl FlatLastNonNull {
         // The batch has duplicated timestamps, but it doesn't mean it must
         // has duplicated rows.
         // Partitions the batch by the primary key and time index.
-        let columns: Vec<_> = [
-            primary_key_column_index(num_columns),
-            time_index_column_index(num_columns),
-        ]
-        .iter()
-        .map(|index| batch.column(*index).clone())
-        .collect();
+        let columns: Vec<_> = [schema.primary_key_index(), schema.time_index_index()]
+            .iter()
+            .map(|index| batch.column(*index).clone())
+            .collect();
         let partitions = partition(&columns).context(ComputeArrowSnafu)?;
 
         Self::dedup_by_partitions(
@@ -576,26 +605,28 @@ struct BatchLastRow {
     primary_key: PrimaryKeyArray,
     /// Last timestamp value.
     timestamp: i64,
+    /// Schema info for the input batches.
+    schema: FlatBatchSchemaRef,
 }
 
 impl BatchLastRow {
     /// Returns a new [BatchLastRow] if the record batch is not empty.
-    fn try_new(record_batch: RecordBatch) -> Option<Self> {
+    fn try_new(record_batch: RecordBatch, schema: FlatBatchSchemaRef) -> Option<Self> {
         if record_batch.num_rows() > 0 {
-            let num_columns = record_batch.num_columns();
             let primary_key = record_batch
-                .column(primary_key_column_index(num_columns))
+                .column(schema.primary_key_index())
                 .as_any()
                 .downcast_ref::<PrimaryKeyArray>()
                 .unwrap()
                 .clone();
-            let timestamp_array = record_batch.column(time_index_column_index(num_columns));
+            let timestamp_array = record_batch.column(schema.time_index_index());
             let timestamp = timestamp_value(timestamp_array, timestamp_array.len() - 1);
 
             Some(Self {
                 last_batch: record_batch,
                 primary_key,
                 timestamp,
+                schema,
             })
         } else {
             None
@@ -609,17 +640,14 @@ impl BatchLastRow {
         }
 
         // The first timestamp in the batch.
-        let batch_timestamp = timestamp_value(
-            batch.column(time_index_column_index(batch.num_columns())),
-            0,
-        );
+        let batch_timestamp = timestamp_value(batch.column(self.schema.time_index_index()), 0);
         if batch_timestamp != self.timestamp {
             return false;
         }
 
         let last_key = primary_key_at(&self.primary_key, self.last_batch.num_rows() - 1);
         let primary_key = batch
-            .column(primary_key_column_index(batch.num_columns()))
+            .column(self.schema.primary_key_index())
             .as_any()
             .downcast_ref::<PrimaryKeyArray>()
             .unwrap();
@@ -651,13 +679,14 @@ fn find_boundaries(v: &dyn Array) -> Result<BooleanBuffer, ArrowError> {
 /// Filters deleted rows from the record batch if `filter_deleted` is true.
 fn maybe_filter_deleted(
     record_batch: RecordBatch,
+    schema: &FlatBatchSchemaRef,
     filter_deleted: bool,
     metrics: &mut DedupMetrics,
 ) -> Result<Option<RecordBatch>> {
     if !filter_deleted {
         return Ok(Some(record_batch));
     }
-    let batch = filter_deleted_from_batch(record_batch, metrics)?;
+    let batch = filter_deleted_from_batch(record_batch, schema, metrics)?;
     // Skips empty batches.
     if batch.num_rows() == 0 {
         return Ok(None);
@@ -668,10 +697,11 @@ fn maybe_filter_deleted(
 /// Removes deleted rows from the batch and updates metrics.
 fn filter_deleted_from_batch(
     batch: RecordBatch,
+    schema: &FlatBatchSchemaRef,
     metrics: &mut DedupMetrics,
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
-    let op_type_column = batch.column(op_type_column_index(batch.num_columns()));
+    let op_type_column = batch.column(schema.op_type_index());
     // Safety: The column should be op type.
     let op_types = op_type_column
         .as_any()
