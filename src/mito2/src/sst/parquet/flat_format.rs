@@ -60,10 +60,130 @@ use crate::sst::{
     to_flat_sst_arrow_schema,
 };
 
+/// Schema info for a flat-format [RecordBatch].
+///
+/// Captures the projected arrow schema, the column-id → projected-index map,
+/// and pre-computed positions of the four fixed trailing columns
+/// (time index, primary key, sequence, op type) plus the start of the field
+/// columns. Cheap to clone (`Arc<FlatBatchSchema>`) and intended to be carried
+/// alongside readers and streams that produce flat-format batches.
+pub struct FlatBatchSchema {
+    /// Projected arrow schema of the [RecordBatch].
+    arrow_schema: SchemaRef,
+    /// Column id → column index in the projected [RecordBatch].
+    /// Does not contain the internal columns.
+    column_id_to_projected_index: HashMap<ColumnId, usize>,
+    /// Index of the time index column.
+    time_index_index: usize,
+    /// Index of the encoded primary key column.
+    primary_key_index: usize,
+    /// Index of the sequence column.
+    sequence_index: usize,
+    /// Index of the op type column.
+    op_type_index: usize,
+    /// Start index of the field columns.
+    field_column_start: usize,
+    /// Total number of columns in the projected [RecordBatch].
+    num_columns: usize,
+}
+
+/// A reference-counted [FlatBatchSchema].
+pub type FlatBatchSchemaRef = Arc<FlatBatchSchema>;
+
+impl FlatBatchSchema {
+    /// Builds a schema describing a flat-format [RecordBatch].
+    ///
+    /// `arrow_schema` is the projected arrow schema. The column-id →
+    /// projected-index map and the field-column-start are derived by walking
+    /// the schema's fields and resolving each one against `metadata` (the
+    /// trailing internal columns are skipped since they do not have column
+    /// ids).
+    pub(crate) fn new(metadata: &RegionMetadata, arrow_schema: SchemaRef) -> Self {
+        let num_columns = arrow_schema.fields().len();
+        debug_assert!(num_columns >= FIXED_POS_COLUMN_NUM);
+
+        let user_column_count = num_columns - INTERNAL_COLUMN_NUM;
+        let mut column_id_to_projected_index = HashMap::with_capacity(user_column_count);
+        let mut field_column_start = num_columns - FIXED_POS_COLUMN_NUM;
+        for (idx, field) in arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .take(user_column_count)
+        {
+            let Some(col) = metadata.column_by_name(field.name()) else {
+                continue;
+            };
+            column_id_to_projected_index.insert(col.column_id, idx);
+            if col.semantic_type == SemanticType::Field && idx < field_column_start {
+                field_column_start = idx;
+            }
+        }
+
+        Self {
+            arrow_schema,
+            column_id_to_projected_index,
+            time_index_index: num_columns - 4,
+            primary_key_index: num_columns - 3,
+            sequence_index: num_columns - 2,
+            op_type_index: num_columns - 1,
+            field_column_start,
+            num_columns,
+        }
+    }
+
+    /// Projected arrow schema of the [RecordBatch].
+    pub fn arrow_schema(&self) -> &SchemaRef {
+        &self.arrow_schema
+    }
+
+    /// Total number of columns in the projected [RecordBatch].
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    /// Index of the time index column.
+    pub fn time_index_index(&self) -> usize {
+        self.time_index_index
+    }
+
+    /// Index of the encoded primary key column.
+    pub fn primary_key_index(&self) -> usize {
+        self.primary_key_index
+    }
+
+    /// Index of the sequence column.
+    pub fn sequence_index(&self) -> usize {
+        self.sequence_index
+    }
+
+    /// Index of the op type column.
+    pub fn op_type_index(&self) -> usize {
+        self.op_type_index
+    }
+
+    /// Start index of the field columns in the projected [RecordBatch].
+    pub fn field_column_start(&self) -> usize {
+        self.field_column_start
+    }
+
+    /// Looks up a column's index in the projected [RecordBatch] by its column id.
+    pub fn projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
+        self.column_id_to_projected_index.get(&column_id).copied()
+    }
+
+    /// Map from column id to column index in the projected [RecordBatch].
+    pub fn column_id_to_projected_index(&self) -> &HashMap<ColumnId, usize> {
+        &self.column_id_to_projected_index
+    }
+}
+
 /// Helper for writing the SST format.
 pub(crate) struct FlatWriteFormat {
     /// SST file schema.
     arrow_schema: SchemaRef,
+    /// Cached schema info for batches handled by this writer.
+    batch_schema: FlatBatchSchemaRef,
     override_sequence: Option<SequenceNumber>,
 }
 
@@ -71,8 +191,10 @@ impl FlatWriteFormat {
     /// Creates a new helper.
     pub(crate) fn new(metadata: RegionMetadataRef, options: &FlatSchemaOptions) -> FlatWriteFormat {
         let arrow_schema = to_flat_sst_arrow_schema(&metadata, options);
+        let batch_schema = Arc::new(FlatBatchSchema::new(&metadata, arrow_schema.clone()));
         FlatWriteFormat {
             arrow_schema,
+            batch_schema,
             override_sequence: None,
         }
     }
@@ -92,6 +214,12 @@ impl FlatWriteFormat {
         &self.arrow_schema
     }
 
+    /// Schema info for batches handled by this writer.
+    #[allow(dead_code)]
+    pub(crate) fn batch_schema(&self) -> &FlatBatchSchemaRef {
+        &self.batch_schema
+    }
+
     /// Convert `batch` to a arrow record batch to store in parquet.
     pub(crate) fn convert_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         debug_assert_eq!(batch.num_columns(), self.arrow_schema.fields().len());
@@ -102,7 +230,7 @@ impl FlatWriteFormat {
 
         let mut columns = batch.columns().to_vec();
         let sequence_array = Arc::new(UInt64Array::from(vec![override_sequence; batch.num_rows()]));
-        columns[sequence_column_index(batch.num_columns())] = sequence_array;
+        columns[self.batch_schema.sequence_index()] = sequence_array;
 
         RecordBatch::try_new(batch.schema(), columns).context(NewRecordBatchSnafu)
     }
@@ -154,6 +282,8 @@ pub struct FlatReadFormat {
     override_sequence: Option<SequenceNumber>,
     /// Parquet format adapter.
     parquet_adapter: ParquetAdapter,
+    /// Cached schema info for batches produced by [Self::convert_batch].
+    batch_schema: FlatBatchSchemaRef,
 }
 
 impl FlatReadFormat {
@@ -190,10 +320,19 @@ impl FlatReadFormat {
             ParquetAdapter::Flat(ParquetFlat::new(metadata, column_ids))
         };
 
+        let batch_schema = build_read_batch_schema(&parquet_adapter)?;
+
         Ok(FlatReadFormat {
             override_sequence: None,
             parquet_adapter,
+            batch_schema,
         })
+    }
+
+    /// Schema info for batches produced by [Self::convert_batch].
+    #[allow(dead_code)]
+    pub(crate) fn batch_schema(&self) -> &FlatBatchSchemaRef {
+        &self.batch_schema
     }
 
     /// Sets the sequence number to override.
@@ -326,7 +465,7 @@ impl FlatReadFormat {
         };
 
         let mut columns = batch.columns().to_vec();
-        let sequence_column_idx = sequence_column_index(batch.num_columns());
+        let sequence_column_idx = self.batch_schema.sequence_index();
 
         // Use the provided override sequence array, slicing if necessary to match batch length
         let sequence_array = if override_array.len() > batch.num_rows() {
@@ -391,6 +530,45 @@ impl FlatReadFormat {
             Ok(true)
         }
     }
+}
+
+/// Computes the schema info for batches produced by [FlatReadFormat::convert_batch].
+///
+/// For [ParquetAdapter::Flat] the post-batch schema is the projected flat
+/// arrow schema. For [ParquetAdapter::PrimaryKeyToFlat] with auto-conversion
+/// enabled the post-batch schema is also a projected flat arrow schema (the
+/// converter prepends raw tag columns to match flat layout). When auto-convert
+/// is skipped the batch stays in the legacy primary-key format and the
+/// projected legacy schema is used.
+fn build_read_batch_schema(parquet_adapter: &ParquetAdapter) -> Result<FlatBatchSchemaRef> {
+    let (metadata, projected_arrow_schema) = match parquet_adapter {
+        ParquetAdapter::Flat(p) => {
+            let projected = p
+                .arrow_schema
+                .project(&p.format_projection.projection_indices)
+                .context(ComputeArrowSnafu)?;
+            (&p.metadata, Arc::new(projected))
+        }
+        ParquetAdapter::PrimaryKeyToFlat(p) => {
+            let metadata = p.format.metadata();
+            let projected = if p.convert_format.is_some() {
+                let flat_arrow = to_flat_sst_arrow_schema(metadata, &FlatSchemaOptions::default());
+                flat_arrow
+                    .project(&p.format_projection.projection_indices)
+                    .context(ComputeArrowSnafu)?
+            } else {
+                p.format
+                    .arrow_schema()
+                    .project(p.format.projection_indices())
+                    .context(ComputeArrowSnafu)?
+            };
+            (metadata, Arc::new(projected))
+        }
+    };
+    Ok(Arc::new(FlatBatchSchema::new(
+        metadata,
+        projected_arrow_schema,
+    )))
 }
 
 /// Wraps the parquet helper for different formats.
