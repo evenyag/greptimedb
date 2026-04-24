@@ -58,7 +58,7 @@ use crate::memtable::{
 use crate::read::flat_dedup::{FlatDedupIterator, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeIterator;
 use crate::region::options::MergeMode;
-use crate::sst::parquet::flat_format::field_column_start;
+use crate::sst::parquet::flat_format::FlatBatchSchema;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 
@@ -1178,19 +1178,18 @@ impl MemtableCompactor {
             FlatMergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;
 
         let boxed_iter: BoxedRecordBatchIterator = if dedup {
+            let flat_schema = Arc::new(FlatBatchSchema::new(metadata, arrow_schema.clone()));
             // Applies deduplication based on merge mode
             match merge_mode {
                 MergeMode::LastRow => {
-                    let dedup_iter = FlatDedupIterator::new(merged_iter, FlatLastRow::new(false));
+                    let dedup_iter =
+                        FlatDedupIterator::new(merged_iter, FlatLastRow::new(false, flat_schema));
                     Box::new(dedup_iter)
                 }
                 MergeMode::LastNonNull => {
-                    let field_column_start =
-                        field_column_start(metadata, arrow_schema.fields().len());
-
                     let dedup_iter = FlatDedupIterator::new(
                         merged_iter,
-                        FlatLastNonNull::new(field_column_start, false),
+                        FlatLastNonNull::new(false, flat_schema),
                     );
                     Box::new(dedup_iter)
                 }

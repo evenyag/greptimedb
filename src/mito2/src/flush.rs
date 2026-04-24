@@ -22,7 +22,6 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use common_telemetry::{debug, error, info};
-use datatypes::arrow::datatypes::SchemaRef;
 use partition::expr::PartitionExpr;
 use smallvec::{SmallVec, smallvec};
 use snafu::ResultExt;
@@ -58,10 +57,9 @@ use crate::request::{
 };
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::FileMeta;
+use crate::sst::parquet::flat_format::{FlatBatchSchema, FlatBatchSchemaRef};
 use crate::sst::parquet::metadata::extract_primary_key_range;
-use crate::sst::parquet::{
-    DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, SstInfo, WriteOptions, flat_format,
-};
+use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, SstInfo, WriteOptions};
 use crate::sst::{FlatSchemaOptions, FormatType, to_flat_sst_arrow_schema};
 use crate::worker::WorkerListener;
 
@@ -554,14 +552,8 @@ impl RegionFlushTask {
             &version.metadata,
             &FlatSchemaOptions::from_encoding(version.metadata.primary_key_encoding),
         );
-        let field_column_start =
-            flat_format::field_column_start(&version.metadata, batch_schema.fields().len());
-        let flat_sources = memtable_flat_sources(
-            batch_schema,
-            mem_ranges,
-            &version.options,
-            field_column_start,
-        )?;
+        let flat_schema = Arc::new(FlatBatchSchema::new(&version.metadata, batch_schema));
+        let flat_sources = memtable_flat_sources(flat_schema, mem_ranges, &version.options)?;
         let mut tasks = Vec::with_capacity(flat_sources.encoded.len() + flat_sources.sources.len());
         let num_encoded = flat_sources.encoded.len();
         for (source, max_sequence) in flat_sources.sources {
@@ -714,10 +706,9 @@ struct FlatSources {
 
 /// Returns the max sequence and [FlatSource] for the given memtable.
 fn memtable_flat_sources(
-    schema: SchemaRef,
+    flat_schema: FlatBatchSchemaRef,
     mem_ranges: MemtableRanges,
     options: &RegionOptions,
-    field_column_start: usize,
 ) -> Result<FlatSources> {
     let MemtableRanges { ranges } = mem_ranges;
     let mut flat_sources = FlatSources {
@@ -736,12 +727,8 @@ fn memtable_flat_sources(
             let iter = only_range.build_record_batch_iter(None, None)?;
             // Dedup according to append mode and merge mode.
             // Even single range may have duplicate rows.
-            let iter = maybe_dedup_one(
-                options.append_mode,
-                options.merge_mode(),
-                field_column_start,
-                iter,
-            );
+            let iter =
+                maybe_dedup_one(options.append_mode, options.merge_mode(), flat_schema, iter);
             flat_sources
                 .sources
                 .push((FlatSource::Iter(iter), max_sequence));
@@ -800,10 +787,9 @@ fn memtable_flat_sources(
                     .unwrap_or(0);
 
                 let maybe_dedup = merge_and_dedup(
-                    &schema,
                     options.append_mode,
                     options.merge_mode(),
-                    field_column_start,
+                    flat_schema.clone(),
                     std::mem::replace(&mut input_iters, Vec::with_capacity(num_ranges)),
                 )?;
 
@@ -831,10 +817,9 @@ fn memtable_flat_sources(
                 .unwrap_or(0);
 
             let maybe_dedup = merge_and_dedup(
-                &schema,
                 options.append_mode,
                 options.merge_mode(),
-                field_column_start,
+                flat_schema,
                 input_iters,
             )?;
 
@@ -860,9 +845,8 @@ fn memtable_flat_sources(
 /// * `merge_mode` - The strategy used for deduplication when not in append mode:
 ///   - `MergeMode::LastRow`: Keeps the last record for each primary key
 ///   - `MergeMode::LastNonNull`: Keeps the last non-null values for each field
-/// * `field_column_start` - The starting column index for fields in the record batch.
-///                          Used when `MergeMode::LastNonNull` to identify which columns
-///                          contain field values versus primary key columns.
+/// * `flat_schema` - Schema info for the input batches; supplies the field
+///                   column start needed by the `LastNonNull` strategy.
 /// * `input_iters` - A vector of record batch iterators to be merged and deduplicated
 ///
 /// # Returns
@@ -879,38 +863,30 @@ fn memtable_flat_sources(
 ///    applies the specified merge mode:
 ///    - `LastRow`: Removes duplicate rows, keeping only the last one
 ///    - `LastNonNull`: Removes duplicates but preserves the last non-null value for each field
-///
-/// # Examples
-///
-/// ```ignore
-/// let merged_iter = merge_and_dedup(
-///     &schema,
-///     false,  // not append mode, apply dedup
-///     MergeMode::LastRow,
-///     2,  // fields start at column 2 after primary key columns
-///     vec![iter1, iter2, iter3],
-/// )?;
-/// ```
 pub fn merge_and_dedup(
-    schema: &SchemaRef,
     append_mode: bool,
     merge_mode: MergeMode,
-    field_column_start: usize,
+    flat_schema: FlatBatchSchemaRef,
     input_iters: Vec<BoxedRecordBatchIterator>,
 ) -> Result<BoxedRecordBatchIterator> {
-    let merge_iter = FlatMergeIterator::new(schema.clone(), input_iters, DEFAULT_READ_BATCH_SIZE)?;
+    let merge_iter = FlatMergeIterator::new(
+        flat_schema.arrow_schema().clone(),
+        input_iters,
+        DEFAULT_READ_BATCH_SIZE,
+    )?;
     let maybe_dedup = if append_mode {
         // No dedup in append mode
         Box::new(merge_iter) as _
     } else {
         // Dedup according to merge mode.
         match merge_mode {
-            MergeMode::LastRow => {
-                Box::new(FlatDedupIterator::new(merge_iter, FlatLastRow::new(false))) as _
-            }
+            MergeMode::LastRow => Box::new(FlatDedupIterator::new(
+                merge_iter,
+                FlatLastRow::new(false, flat_schema),
+            )) as _,
             MergeMode::LastNonNull => Box::new(FlatDedupIterator::new(
                 merge_iter,
-                FlatLastNonNull::new(field_column_start, false),
+                FlatLastNonNull::new(false, flat_schema),
             )) as _,
         }
     };
@@ -920,7 +896,7 @@ pub fn merge_and_dedup(
 pub fn maybe_dedup_one(
     append_mode: bool,
     merge_mode: MergeMode,
-    field_column_start: usize,
+    flat_schema: FlatBatchSchemaRef,
     input_iter: BoxedRecordBatchIterator,
 ) -> BoxedRecordBatchIterator {
     if append_mode {
@@ -929,12 +905,13 @@ pub fn maybe_dedup_one(
     } else {
         // Dedup according to merge mode.
         match merge_mode {
-            MergeMode::LastRow => {
-                Box::new(FlatDedupIterator::new(input_iter, FlatLastRow::new(false)))
-            }
+            MergeMode::LastRow => Box::new(FlatDedupIterator::new(
+                input_iter,
+                FlatLastRow::new(false, flat_schema),
+            )),
             MergeMode::LastNonNull => Box::new(FlatDedupIterator::new(
                 input_iter,
-                FlatLastNonNull::new(field_column_start, false),
+                FlatLastNonNull::new(false, flat_schema),
             )),
         }
     }
@@ -1500,13 +1477,8 @@ mod tests {
                 ..Default::default()
             };
 
-            let flat_sources = memtable_flat_sources(
-                schema.clone(),
-                mem_ranges,
-                &options,
-                metadata.primary_key.len(),
-            )
-            .unwrap();
+            let flat_schema = Arc::new(FlatBatchSchema::new(&metadata, schema.clone()));
+            let flat_sources = memtable_flat_sources(flat_schema, mem_ranges, &options).unwrap();
             assert!(flat_sources.encoded.is_empty());
             assert_eq!(1, flat_sources.sources.len());
 
@@ -1535,9 +1507,8 @@ mod tests {
                 ..Default::default()
             };
 
-            let flat_sources =
-                memtable_flat_sources(schema, mem_ranges, &options, metadata.primary_key.len())
-                    .unwrap();
+            let flat_schema = Arc::new(FlatBatchSchema::new(&metadata, schema));
+            let flat_sources = memtable_flat_sources(flat_schema, mem_ranges, &options).unwrap();
             assert!(flat_sources.encoded.is_empty());
             assert_eq!(1, flat_sources.sources.len());
 

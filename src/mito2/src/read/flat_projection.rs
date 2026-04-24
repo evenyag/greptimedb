@@ -233,6 +233,20 @@ impl FlatProjectionMapper {
         }
     }
 
+    /// Returns the [FlatBatchSchema] describing batches consumed by the merge
+    /// reader (matches [Self::input_arrow_schema] for the same `compaction`
+    /// flag). Built fresh on each call; callers cache the result if they need
+    /// to reuse it across many batches.
+    pub(crate) fn flat_batch_schema(
+        &self,
+        compaction: bool,
+    ) -> crate::sst::parquet::flat_format::FlatBatchSchemaRef {
+        Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::new(
+            &self.metadata,
+            self.input_arrow_schema(compaction),
+        ))
+    }
+
     /// Returns the schema of converted [RecordBatch].
     /// This is the schema that the stream will output. This schema may contain
     /// less columns than [FlatProjectionMapper::column_ids()].

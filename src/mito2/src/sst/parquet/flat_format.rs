@@ -176,6 +176,29 @@ impl FlatBatchSchema {
     pub fn column_id_to_projected_index(&self) -> &HashMap<ColumnId, usize> {
         &self.column_id_to_projected_index
     }
+
+    /// Test-only constructor that builds the schema from a precomputed
+    /// `field_column_start` without consulting [RegionMetadata].
+    ///
+    /// The resulting `column_id_to_projected_index` map is empty — only the
+    /// fixed-position indices and `field_column_start` are populated. Use this
+    /// in unit tests that synthesize record batches without a real region
+    /// metadata.
+    #[cfg(any(test, feature = "test"))]
+    pub fn for_test(arrow_schema: SchemaRef, field_column_start: usize) -> Self {
+        let num_columns = arrow_schema.fields().len();
+        debug_assert!(num_columns >= FIXED_POS_COLUMN_NUM);
+        Self {
+            arrow_schema,
+            column_id_to_projected_index: HashMap::new(),
+            time_index_index: num_columns - 4,
+            primary_key_index: num_columns - 3,
+            sequence_index: num_columns - 2,
+            op_type_index: num_columns - 1,
+            field_column_start,
+            num_columns,
+        }
+    }
 }
 
 /// Helper for writing the SST format.

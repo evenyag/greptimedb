@@ -42,7 +42,7 @@ use crate::memtable::partition_tree::data::timestamp_array_to_i64_slice;
 use crate::metrics::MERGE_FILTER_ROWS_TOTAL;
 use crate::read::dedup::{DedupMetrics, DedupMetricsReport};
 use crate::sst::parquet::flat_format::{
-    op_type_column_index, primary_key_column_index, time_index_column_index,
+    FlatBatchSchemaRef, op_type_column_index, primary_key_column_index, time_index_column_index,
 };
 use crate::sst::parquet::format::{FIXED_POS_COLUMN_NUM, PrimaryKeyArray};
 
@@ -182,14 +182,18 @@ pub struct FlatLastRow {
     prev_batch: Option<BatchLastRow>,
     /// Filter deleted rows.
     filter_deleted: bool,
+    /// Schema info for the input batches.
+    #[allow(dead_code)]
+    schema: FlatBatchSchemaRef,
 }
 
 impl FlatLastRow {
     /// Creates a new strategy with the given `filter_deleted` flag.
-    pub fn new(filter_deleted: bool) -> Self {
+    pub fn new(filter_deleted: bool, schema: FlatBatchSchemaRef) -> Self {
         Self {
             prev_batch: None,
             filter_deleted,
+            schema,
         }
     }
 
@@ -295,8 +299,9 @@ impl RecordBatchDedupStrategy for FlatLastRow {
 
 /// Dedup strategy that keeps the last non-null field for the same key.
 pub struct FlatLastNonNull {
-    /// The start index of field columns:
-    field_column_start: usize,
+    /// Schema info for the input batches; provides `field_column_start` and
+    /// the trailing internal column positions.
+    schema: FlatBatchSchemaRef,
     /// Filter deleted rows.
     filter_deleted: bool,
     /// Buffered batch to check whether the next batch have duplicated rows with this batch.
@@ -321,12 +326,13 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
         }
 
         let row_before_dedup = batch.num_rows();
+        let field_column_start = self.schema.field_column_start();
 
         let Some(buffer) = self.buffer.take() else {
             // If the buffer is None, dedup the batch, put the batch into the buffer and return.
             // There is no previous batch with the same key, we can pass contains_delete as false.
             let (record_batch, contains_delete) =
-                Self::dedup_one_batch(batch, self.field_column_start, false)?;
+                Self::dedup_one_batch(batch, field_column_start, false)?;
             metrics.num_unselected_rows += row_before_dedup - record_batch.num_rows();
             self.buffer = BatchLastRow::try_new(record_batch);
             self.contains_delete = contains_delete;
@@ -341,7 +347,7 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
             // Dedup the batch.
             // There is no previous batch with the same key, we can pass contains_delete as false.
             let (record_batch, contains_delete) =
-                Self::dedup_one_batch(batch, self.field_column_start, false)?;
+                Self::dedup_one_batch(batch, field_column_start, false)?;
             metrics.num_unselected_rows += row_before_dedup - record_batch.num_rows();
             debug_assert!(record_batch.num_rows() > 0);
             self.buffer = BatchLastRow::try_new(record_batch);
@@ -370,7 +376,7 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
         let merged_row_count = merged.num_rows();
         // Dedup the merged batch and update the buffer.
         let (record_batch, contains_delete) =
-            Self::dedup_one_batch(merged, self.field_column_start, self.contains_delete)?;
+            Self::dedup_one_batch(merged, field_column_start, self.contains_delete)?;
         metrics.num_unselected_rows += merged_row_count - record_batch.num_rows();
         debug_assert!(record_batch.num_rows() > 0);
         self.buffer = BatchLastRow::try_new(record_batch);
@@ -398,9 +404,9 @@ impl RecordBatchDedupStrategy for FlatLastNonNull {
 
 impl FlatLastNonNull {
     /// Creates a new strategy with the given `filter_deleted` flag.
-    pub fn new(field_column_start: usize, filter_deleted: bool) -> Self {
+    pub fn new(filter_deleted: bool, schema: FlatBatchSchemaRef) -> Self {
         Self {
-            field_column_start,
+            schema,
             filter_deleted,
             buffer: None,
             contains_delete: false,
@@ -854,6 +860,22 @@ mod tests {
         Arc::new(Schema::new(fields))
     }
 
+    /// Builds a test schema for batches produced by [`new_record_batch`].
+    fn test_flat_batch_schema() -> FlatBatchSchemaRef {
+        Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::for_test(
+            build_test_flat_schema(),
+            1,
+        ))
+    }
+
+    /// Builds a test schema for batches produced by [`new_record_batch_multi_fields`].
+    fn test_multi_field_batch_schema() -> FlatBatchSchemaRef {
+        Arc::new(crate::sst::parquet::flat_format::FlatBatchSchema::for_test(
+            build_test_multi_field_schema(),
+            1,
+        ))
+    }
+
     /// Builds the arrow schema for test flat format with multiple fields.
     fn build_test_multi_field_schema() -> SchemaRef {
         let fields = vec![
@@ -922,7 +944,8 @@ mod tests {
 
         // Test with filter_deleted = true
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastRow::new(true));
+        let mut dedup_iter =
+            FlatDedupIterator::new(iter, FlatLastRow::new(true, test_flat_batch_schema()));
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&input, &result);
         assert_eq!(0, dedup_iter.metrics.num_unselected_rows);
@@ -930,7 +953,8 @@ mod tests {
 
         // Test with filter_deleted = false
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastRow::new(false));
+        let mut dedup_iter =
+            FlatDedupIterator::new(iter, FlatLastRow::new(false, test_flat_batch_schema()));
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&input, &result);
         assert_eq!(0, dedup_iter.metrics.num_unselected_rows);
@@ -986,7 +1010,8 @@ mod tests {
         ];
 
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastRow::new(true));
+        let mut dedup_iter =
+            FlatDedupIterator::new(iter, FlatLastRow::new(true, test_flat_batch_schema()));
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected_filter_deleted, &result);
         assert_eq!(5, dedup_iter.metrics.num_unselected_rows);
@@ -1019,7 +1044,8 @@ mod tests {
         ];
 
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastRow::new(false));
+        let mut dedup_iter =
+            FlatDedupIterator::new(iter, FlatLastRow::new(false, test_flat_batch_schema()));
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected_no_filter, &result);
         assert_eq!(3, dedup_iter.metrics.num_unselected_rows);
@@ -1048,7 +1074,10 @@ mod tests {
 
         // Test with filter_deleted = true
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, true));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(true, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&input, &result);
         assert_eq!(0, dedup_iter.metrics.num_unselected_rows);
@@ -1056,7 +1085,10 @@ mod tests {
 
         // Test with filter_deleted = false
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, false));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(false, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&input, &result);
         assert_eq!(0, dedup_iter.metrics.num_unselected_rows);
@@ -1155,7 +1187,10 @@ mod tests {
         ];
 
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, true));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(true, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected_filter_deleted, &result);
         assert_eq!(6, dedup_iter.metrics.num_unselected_rows);
@@ -1201,7 +1236,10 @@ mod tests {
         ];
 
         let iter = input.clone().into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, false));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(false, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected_no_filter, &result);
         assert_eq!(4, dedup_iter.metrics.num_unselected_rows);
@@ -1252,7 +1290,10 @@ mod tests {
         ];
 
         let iter = input.into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, true));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(true, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected, &result);
         assert_eq!(2, dedup_iter.metrics.num_unselected_rows);
@@ -1310,7 +1351,10 @@ mod tests {
         ];
 
         let iter = input.into_iter().map(Ok);
-        let mut dedup_iter = FlatDedupIterator::new(iter, FlatLastNonNull::new(1, true));
+        let mut dedup_iter = FlatDedupIterator::new(
+            iter,
+            FlatLastNonNull::new(true, test_multi_field_batch_schema()),
+        );
         let result = collect_iterator_results(&mut dedup_iter);
         check_record_batches_equal(&expected, &result);
         assert_eq!(1, dedup_iter.metrics.num_unselected_rows);
@@ -1371,7 +1415,7 @@ mod tests {
             new_record_batch_multi_fields(&[b"k2"], &[3], &[3], &[OpType::Put], &[(None, Some(3))]),
         ];
 
-        let mut strategy = FlatLastNonNull::new(1, true);
+        let mut strategy = FlatLastNonNull::new(true, test_multi_field_batch_schema());
         check_flat_dedup_strategy(
             &input,
             &mut strategy,
@@ -1414,7 +1458,7 @@ mod tests {
             ),
         ];
 
-        let mut strategy = FlatLastNonNull::new(1, true);
+        let mut strategy = FlatLastNonNull::new(true, test_multi_field_batch_schema());
         check_flat_dedup_strategy(
             &input,
             &mut strategy,
@@ -1441,7 +1485,7 @@ mod tests {
             ),
         ];
 
-        let mut strategy = FlatLastNonNull::new(1, true);
+        let mut strategy = FlatLastNonNull::new(true, test_multi_field_batch_schema());
         check_flat_dedup_strategy(&input, &mut strategy, &[]);
     }
 
@@ -1479,7 +1523,7 @@ mod tests {
             new_record_batch_multi_fields(&[b"k1"], &[3], &[3], &[OpType::Put], &[(None, Some(3))]),
         ];
 
-        let mut strategy = FlatLastNonNull::new(1, true);
+        let mut strategy = FlatLastNonNull::new(true, test_multi_field_batch_schema());
         check_flat_dedup_strategy(
             &input,
             &mut strategy,
@@ -1559,7 +1603,7 @@ mod tests {
             ),
         ];
 
-        let mut strategy = FlatLastNonNull::new(1, true);
+        let mut strategy = FlatLastNonNull::new(true, test_multi_field_batch_schema());
         check_flat_dedup_strategy(
             &input,
             &mut strategy,
