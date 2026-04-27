@@ -238,10 +238,15 @@ impl FileRange {
     }
 
     /// Creates a flat reader that returns RecordBatch.
+    ///
+    /// `decode_buffers` is a recyclable per-string scratch pool reused across
+    /// row-group readers from the same scan. It is taken (via `mem::take`) when
+    /// a reader is constructed and left untouched on the early `Ok(None)` path.
     pub(crate) async fn flat_reader(
         &self,
         selector: Option<TimeSeriesRowSelector>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
+        decode_buffers: &mut Vec<Vec<u8>>,
     ) -> Result<Option<FlatPruneReader>> {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -278,8 +283,11 @@ impl FileRange {
         };
 
         let flat_prune_reader = if use_last_row_reader {
-            let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader);
+            let flat_row_group_reader = FlatRowGroupReader::new(
+                self.context.clone(),
+                parquet_reader,
+                std::mem::take(decode_buffers),
+            );
             // Flat PK prefilter makes the input stream predicate-dependent, so cached
             // selector results are not reusable across queries with different filters.
             let cache_strategy = if self.context.reader_builder.has_flat_primary_key_prefilter() {
@@ -296,8 +304,11 @@ impl FileRange {
             );
             FlatPruneReader::new_with_last_row_reader(self.context.clone(), reader, skip_fields)
         } else {
-            let flat_row_group_reader =
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader);
+            let flat_row_group_reader = FlatRowGroupReader::new(
+                self.context.clone(),
+                parquet_reader,
+                std::mem::take(decode_buffers),
+            );
             FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
                 flat_row_group_reader,

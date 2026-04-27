@@ -1427,9 +1427,12 @@ pub fn build_flat_file_range_scan_stream(
             fetch_metrics: fetch_metrics.clone(),
             ..Default::default()
         };
+        // Recyclable per-string decode buffer pool, reused across all row group
+        // readers built from these ranges (which all belong to the same SST).
+        let mut decode_buffers: Vec<Vec<u8>> = Vec::new();
         for range in ranges {
             let build_reader_start = Instant::now();
-            let Some(mut reader) = range.flat_reader(_stream_ctx.input.series_row_selector, fetch_metrics.as_deref()).await? else{continue};
+            let Some(mut reader) = range.flat_reader(_stream_ctx.input.series_row_selector, fetch_metrics.as_deref(), &mut decode_buffers).await? else{continue};
             let build_cost = build_reader_start.elapsed();
             part_metrics.inc_build_reader_cost(build_cost);
 
@@ -1459,6 +1462,7 @@ pub fn build_flat_file_range_scan_stream(
                 }
             }
 
+            decode_buffers = reader.take_decode_buffers();
             let prune_metrics = reader.metrics();
 
             // Update per-file metrics if tracking is enabled

@@ -352,6 +352,15 @@ impl FlatRowGroupLastRowCachedReader {
         }
     }
 
+    /// Takes the recyclable decode buffer pool from the underlying row group reader.
+    /// Returns an empty `Vec` on cache hits since no row-group reader exists.
+    pub(crate) fn take_decode_buffers(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            FlatRowGroupLastRowCachedReader::Hit(_) => Vec::new(),
+            FlatRowGroupLastRowCachedReader::Miss(r) => r.reader.take_decode_buffers(),
+        }
+    }
+
     fn new_hit(value: Arc<SelectorResultValue>) -> Self {
         selector_result_cache_hit();
         Self::Hit(FlatLastRowCacheReader { value, idx: 0 })

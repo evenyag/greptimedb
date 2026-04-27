@@ -265,6 +265,14 @@ impl FlatSource {
             FlatSource::LastRow(r) => r.take_flat_convert_cost(),
         }
     }
+
+    /// Takes the recyclable decode buffer pool from the underlying reader.
+    fn take_decode_buffers(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            FlatSource::RowGroup(r) => r.take_decode_buffers(),
+            FlatSource::LastRow(r) => r.take_decode_buffers(),
+        }
+    }
 }
 
 /// A flat format reader that returns RecordBatch instead of Batch.
@@ -307,6 +315,12 @@ impl FlatPruneReader {
     /// Returns metrics.
     pub(crate) fn metrics(&self) -> ReaderMetrics {
         self.metrics.clone()
+    }
+
+    /// Takes the recyclable decode buffer pool from the underlying source so the
+    /// caller can reuse it on the next row group.
+    pub(crate) fn take_decode_buffers(&mut self) -> Vec<Vec<u8>> {
+        self.source.take_decode_buffers()
     }
 
     pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {

@@ -2006,7 +2006,7 @@ impl ParquetReader {
                 .await?;
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader),
+                FlatRowGroupReader::new(self.context.clone(), parquet_reader, Vec::new()),
                 skip_fields,
             ));
         }
@@ -2038,7 +2038,7 @@ impl ParquetReader {
                 .await?;
             Some(FlatPruneReader::new_with_row_group_reader(
                 context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader),
+                FlatRowGroupReader::new(context.clone(), parquet_reader, Vec::new()),
                 skip_fields,
             ))
         } else {
@@ -2267,6 +2267,7 @@ impl FlatRowGroupReader {
     pub(crate) fn new(
         context: FileRangeContextRef,
         stream: ParquetRecordBatchStream<SstAsyncFileReader>,
+        decode_buffers: Vec<Vec<u8>>,
     ) -> Self {
         // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
         let override_sequence = context
@@ -2286,8 +2287,13 @@ impl FlatRowGroupReader {
             override_sequence,
             nullable_value_schema,
             flat_convert_cost: Duration::ZERO,
-            decode_buffers: Vec::new(),
+            decode_buffers,
         }
+    }
+
+    /// Takes the recyclable decode buffer pool, leaving an empty `Vec` in its place.
+    pub(crate) fn take_decode_buffers(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.decode_buffers)
     }
 
     /// Returns the next RecordBatch.
