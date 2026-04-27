@@ -217,5 +217,10 @@ fn bench_inline_threshold(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, encode_sparse, bench_has_column, bench_inline_threshold);
+criterion_group!(
+    benches,
+    encode_sparse,
+    bench_has_column,
+    bench_inline_threshold
+);
 criterion_main!(benches);

@@ -134,10 +134,46 @@ pub trait PrimaryKeyCodec: Send + Sync + Debug {
     /// Decodes the primary key from the given bytes.
     ///
     /// Returns a [`CompositeValues`] that follows the primary key ordering.
-    fn decode(&self, bytes: &[u8]) -> Result<CompositeValues>;
+    ///
+    /// `buffers` is a recyclable pool of `Vec<u8>` workspaces used for variable-length
+    /// fields (today: sparse string labels). Callers that decode many keys in a row
+    /// — like the parquet read path — should reuse a single pool and replenish it via
+    /// [`recycle_composite_buffers`] after consuming the decoded values, so steady
+    /// state is allocation-free. Callers that decode one-shot can pass
+    /// `&mut Vec::new()`.
+    fn decode(&self, bytes: &[u8], buffers: &mut Vec<Vec<u8>>) -> Result<CompositeValues>;
 
     /// Decode the leftmost value from bytes.
     fn decode_leftmost(&self, bytes: &[u8]) -> Result<Option<Value>>;
+}
+
+/// Drains string-backed values from `composite` and pushes their backing `Vec<u8>` into
+/// `buffers` for reuse by a later [`PrimaryKeyCodec::decode`] call.
+///
+/// Called by the parquet read path after a batch's decoded primary keys have been
+/// consumed (e.g. copied into Arrow tag column builders) to amortize per-string
+/// allocations across batches.
+pub fn recycle_composite_buffers(composite: CompositeValues, buffers: &mut Vec<Vec<u8>>) {
+    match composite {
+        CompositeValues::Sparse(sparse) => {
+            for (_, value) in sparse.into_inner() {
+                if let Value::String(s) = value {
+                    let mut bytes = s.into_string().into_bytes();
+                    bytes.clear();
+                    buffers.push(bytes);
+                }
+            }
+        }
+        CompositeValues::Dense(dense) => {
+            for (_, value) in dense {
+                if let Value::String(s) = value {
+                    let mut bytes = s.into_string().into_bytes();
+                    bytes.clear();
+                    buffers.push(bytes);
+                }
+            }
+        }
+    }
 }
 
 /// Builds a primary key codec from region metadata.

@@ -16,18 +16,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::BufMut;
+use common_base::bytes::StringBytes;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::value::{Value, ValueRef};
 use memcomparable::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::ColumnId;
 use store_api::storage::consts::ReservedColumnId;
 
-use crate::error::{DeserializeFieldSnafu, Result, SerializeFieldSnafu, UnsupportedOperationSnafu};
+use crate::error::{
+    InvalidSparseEncodingSnafu, Result, SerializeFieldSnafu, UnsupportedOperationSnafu,
+};
 use crate::key_values::KeyValue;
 use crate::primary_key_filter::SparsePrimaryKeyFilter;
 use crate::row_converter::dense::SortField;
@@ -87,6 +90,11 @@ impl SparseValues {
     /// Returns an iterator over all stored column id/value pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&ColumnId, &Value)> {
         self.values.iter()
+    }
+
+    /// Consumes this `SparseValues` and returns the inner map.
+    pub fn into_inner(self) -> HashMap<ColumnId, Value> {
+        self.values
     }
 }
 
@@ -326,20 +334,52 @@ impl SparsePrimaryKeyCodec {
     }
 
     /// Decodes the given bytes into a [`SparseValues`].
+    ///
+    /// Calls [`Self::decode_sparse_with_buffer`] with a fresh empty pool. Prefer
+    /// [`Self::decode_sparse_with_buffer`] when decoding many keys in a row, so the
+    /// inner string buffers can be reused.
+    #[cfg(test)]
     fn decode_sparse(&self, bytes: &[u8]) -> Result<SparseValues> {
-        let mut deserializer = Deserializer::new(bytes);
+        self.decode_sparse_with_buffer(bytes, &mut Vec::new())
+    }
+
+    /// Decodes the given bytes into a [`SparseValues`], reusing buffers from `buffers`.
+    ///
+    /// Bypasses [`memcomparable::Deserializer`] for string fields and reads the wire
+    /// format directly (matches both [`Self::encode_to_vec`] and
+    /// [`Self::encode_raw_tag_value`] — `test_encode_by_short_cuts` asserts they
+    /// produce identical bytes). For each string label, an empty `Vec<u8>` is taken
+    /// from `buffers` (or freshly allocated if the pool is empty) and handed to
+    /// `String::from_utf8` so the `Vec`'s heap becomes the `String`'s backing store
+    /// without copying.
+    pub fn decode_sparse_with_buffer(
+        &self,
+        bytes: &[u8],
+        buffers: &mut Vec<Vec<u8>>,
+    ) -> Result<SparseValues> {
         let mut values = SparseValues::new(HashMap::new());
+        let mut pos = 0;
 
-        let column_id = u32::deserialize(&mut deserializer).context(DeserializeFieldSnafu)?;
-        let value = self.inner.table_id_field.deserialize(&mut deserializer)?;
-        values.insert(column_id, value);
+        while pos < bytes.len() {
+            let column_id = read_u32_be(bytes, &mut pos)?;
+            let some_marker = read_u8(bytes, &mut pos)?;
+            ensure!(
+                some_marker == 1,
+                InvalidSparseEncodingSnafu {
+                    reason: format!(
+                        "expected Some marker (1) for column {}, got {}",
+                        column_id, some_marker
+                    ),
+                }
+            );
 
-        let column_id = u32::deserialize(&mut deserializer).context(DeserializeFieldSnafu)?;
-        let value = self.inner.tsid_field.deserialize(&mut deserializer)?;
-        values.insert(column_id, value);
-        while deserializer.has_remaining() {
-            let column_id = u32::deserialize(&mut deserializer).context(DeserializeFieldSnafu)?;
-            let value = self.inner.label_field.deserialize(&mut deserializer)?;
+            let value = match column_id {
+                RESERVED_COLUMN_ID_TABLE_ID => Value::UInt32(read_u32_be(bytes, &mut pos)?),
+                RESERVED_COLUMN_ID_TSID => Value::UInt64(read_u64_be(bytes, &mut pos)?),
+                _ => Value::String(StringBytes::from(decode_string_into_pool(
+                    bytes, &mut pos, buffers,
+                )?)),
+            };
             values.insert(column_id, value);
         }
 
@@ -492,13 +532,123 @@ impl PrimaryKeyCodec for SparsePrimaryKeyCodec {
         ))
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<CompositeValues> {
-        Ok(CompositeValues::Sparse(self.decode_sparse(bytes)?))
+    fn decode(&self, bytes: &[u8], buffers: &mut Vec<Vec<u8>>) -> Result<CompositeValues> {
+        Ok(CompositeValues::Sparse(
+            self.decode_sparse_with_buffer(bytes, buffers)?,
+        ))
     }
 
     fn decode_leftmost(&self, bytes: &[u8]) -> Result<Option<Value>> {
         self.decode_leftmost(bytes)
     }
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8> {
+    ensure!(
+        *pos < bytes.len(),
+        InvalidSparseEncodingSnafu {
+            reason: "unexpected end of input while reading u8",
+        }
+    );
+    let v = bytes[*pos];
+    *pos += 1;
+    Ok(v)
+}
+
+fn read_u32_be(bytes: &[u8], pos: &mut usize) -> Result<u32> {
+    let end = *pos + 4;
+    ensure!(
+        end <= bytes.len(),
+        InvalidSparseEncodingSnafu {
+            reason: "unexpected end of input while reading u32",
+        }
+    );
+    // Safety: bounds checked above.
+    let v = u32::from_be_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn read_u64_be(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let end = *pos + 8;
+    ensure!(
+        end <= bytes.len(),
+        InvalidSparseEncodingSnafu {
+            reason: "unexpected end of input while reading u64",
+        }
+    );
+    // Safety: bounds checked above.
+    let v = u64::from_be_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+/// Decodes a memcomparable-encoded string at `pos` into a buffer popped from `buffers`,
+/// returning the resulting owned `String` (which takes ownership of the buffer's heap).
+///
+/// Wire format: 1 byte empty marker (0 = empty, 1 = non-empty) followed by 9-byte
+/// chunks if non-empty (8 data bytes + 1 tag byte; tag 9 = continue, tag 1..=8 = last
+/// chunk with that many significant bytes).
+fn decode_string_into_pool(
+    bytes: &[u8],
+    pos: &mut usize,
+    buffers: &mut Vec<Vec<u8>>,
+) -> Result<String> {
+    let empty_marker = read_u8(bytes, pos)?;
+    if empty_marker == 0 {
+        return Ok(String::new());
+    }
+    ensure!(
+        empty_marker == 1,
+        InvalidSparseEncodingSnafu {
+            reason: format!("invalid string empty marker: {}", empty_marker),
+        }
+    );
+
+    let mut buf = buffers.pop().unwrap_or_default();
+    buf.clear();
+
+    loop {
+        let chunk_end = *pos + 9;
+        ensure!(
+            chunk_end <= bytes.len(),
+            InvalidSparseEncodingSnafu {
+                reason: "unexpected end of input while reading string chunk",
+            }
+        );
+        let chunk = &bytes[*pos..*pos + 8];
+        let tag = bytes[*pos + 8];
+        *pos = chunk_end;
+
+        match tag {
+            9 => buf.extend_from_slice(chunk),
+            1..=8 => {
+                buf.extend_from_slice(&chunk[..tag as usize]);
+                break;
+            }
+            _ => {
+                return InvalidSparseEncodingSnafu {
+                    reason: format!("invalid string chunk tag: {}", tag),
+                }
+                .fail();
+            }
+        }
+    }
+
+    String::from_utf8(buf).map_err(|err| {
+        InvalidSparseEncodingSnafu {
+            reason: format!("invalid utf-8 in string label: {}", err),
+        }
+        .build()
+    })
+}
+
+/// Returns a `Vec<u8>` from the pool to be reused on the next decode.
+///
+/// Clears `bytes`'s contents (preserving capacity) before pushing.
+pub fn return_buffer_to_pool(buffers: &mut Vec<Vec<u8>>, mut bytes: Vec<u8>) {
+    bytes.clear();
+    buffers.push(bytes);
 }
 
 /// Field with column id.
@@ -923,5 +1073,119 @@ mod tests {
                 .unwrap();
             assert!(encoded_value.is_none());
         }
+    }
+
+    fn assert_sparse_round_trip(label: &str) {
+        let region_metadata = test_region_metadata();
+        let codec = SparsePrimaryKeyCodec::new(&region_metadata);
+
+        let row: Vec<(ColumnId, ValueRef<'_>)> = vec![
+            (RESERVED_COLUMN_ID_TABLE_ID, ValueRef::UInt32(7)),
+            (RESERVED_COLUMN_ID_TSID, ValueRef::UInt64(123)),
+            (1, ValueRef::String(label)),
+        ];
+
+        let mut buffer = Vec::new();
+        codec.encode_to_vec(row.into_iter(), &mut buffer).unwrap();
+        let mut pool = Vec::new();
+        let decoded = codec.decode_sparse_with_buffer(&buffer, &mut pool).unwrap();
+        assert_eq!(decoded.get_or_null(1), &Value::String(label.into()));
+
+        // Same bytes via the raw-tag fast encoder.
+        let mut raw_buffer = Vec::new();
+        codec.encode_internal(7, 123, &mut raw_buffer).unwrap();
+        codec
+            .encode_raw_tag_value([(1, label.as_bytes())].into_iter(), &mut raw_buffer)
+            .unwrap();
+        assert_eq!(buffer, raw_buffer, "label={:?}", label);
+        let decoded_raw = codec
+            .decode_sparse_with_buffer(&raw_buffer, &mut pool)
+            .unwrap();
+        assert_eq!(decoded_raw.get_or_null(1), &Value::String(label.into()));
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_empty_string() {
+        assert_sparse_round_trip("");
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_short_string() {
+        assert_sparse_round_trip("abc");
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_chunk_boundary() {
+        assert_sparse_round_trip("abcdefgh"); // exactly 8 bytes — first chunk is the last.
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_multi_chunk_string() {
+        assert_sparse_round_trip("greptime-frontend-6989d9899-22222");
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_unicode_string() {
+        assert_sparse_round_trip("héllo-世界-🌍");
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_pool_reuse() {
+        let region_metadata = test_region_metadata();
+        let codec = SparsePrimaryKeyCodec::new(&region_metadata);
+        let mut buffer = Vec::new();
+        codec
+            .encode_to_vec(test_row().into_iter(), &mut buffer)
+            .unwrap();
+
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        // First decode populates the pool implicitly only by allocating Strings — pool
+        // stays empty until callers explicitly recycle. Simulate the recycle hook.
+        let decoded = codec.decode_sparse_with_buffer(&buffer, &mut pool).unwrap();
+        for (_, value) in decoded.values {
+            if let Value::String(s) = value {
+                return_buffer_to_pool(&mut pool, s.into_string().into_bytes());
+            }
+        }
+
+        let prev_pool_len = pool.len();
+        let prev_capacities: Vec<usize> = pool.iter().map(|v| v.capacity()).collect();
+        assert!(prev_pool_len > 0);
+        assert!(prev_capacities.iter().all(|&c| c > 0));
+
+        // Second decode should reuse buffers from the pool. Keep capacities stable.
+        let _ = codec.decode_sparse_with_buffer(&buffer, &mut pool).unwrap();
+        // Pool should be drained back to ~0 (each label took one Vec out).
+        assert!(pool.len() < prev_pool_len);
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_invalid_marker() {
+        let region_metadata = test_region_metadata();
+        let codec = SparsePrimaryKeyCodec::new(&region_metadata);
+        // column_id (table_id) + bogus Some marker (2).
+        let mut bad = Vec::new();
+        bad.put_u32(RESERVED_COLUMN_ID_TABLE_ID);
+        bad.put_u8(2);
+        bad.put_u32(0);
+        let mut pool = Vec::new();
+        assert!(codec.decode_sparse_with_buffer(&bad, &mut pool).is_err());
+    }
+
+    #[test]
+    fn test_decode_sparse_with_buffer_invalid_utf8() {
+        let region_metadata = test_region_metadata();
+        let codec = SparsePrimaryKeyCodec::new(&region_metadata);
+        let mut bad = Vec::new();
+        codec.encode_internal(1, 1, &mut bad).unwrap();
+        // Manually craft a label entry with invalid utf-8 in the chunk payload.
+        bad.put_u32(1); // column_id
+        bad.put_u8(1); // some marker
+        bad.put_u8(1); // non-empty marker
+        // 9-byte chunk: 8 bytes of 0xFF (invalid UTF-8 standalone) + tag = 8 (last chunk, 8 sig bytes).
+        bad.extend_from_slice(&[0xFF; 8]);
+        bad.put_u8(8);
+        let mut pool = Vec::new();
+        assert!(codec.decode_sparse_with_buffer(&bad, &mut pool).is_err());
     }
 }

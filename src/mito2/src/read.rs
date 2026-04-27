@@ -766,7 +766,11 @@ impl Batch {
         column_id: ColumnId,
     ) -> Result<Option<&Value>> {
         if self.pk_values.is_none() {
-            self.pk_values = Some(codec.decode(&self.primary_key).context(DecodeSnafu)?);
+            self.pk_values = Some(
+                codec
+                    .decode(&self.primary_key, &mut Vec::new())
+                    .context(DecodeSnafu)?,
+            );
         }
 
         let pk_values = self.pk_values.as_ref().unwrap();

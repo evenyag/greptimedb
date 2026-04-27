@@ -128,5 +128,10 @@ name = "simple_bulk_memtable"
 harness = false
 required-features = ["test"]
 
+[[bench]]
+name = "flat_format_bench"
+harness = false
+required-features = ["test"]
+
 [package.metadata.cargo-udeps.ignore]
 normal = ["aquamarine"]

@@ -1189,7 +1189,10 @@ pub(crate) fn decode_primary_keys_with_counts(
 
         // New key, decodes it.
         let pk_bytes = pk_values_array.value(current_key as usize);
-        let decoded_value = codec.decoder().decode(pk_bytes).context(DecodeSnafu)?;
+        let decoded_value = codec
+            .decoder()
+            .decode(pk_bytes, &mut Vec::new())
+            .context(DecodeSnafu)?;
 
         result.push((decoded_value, 1));
         prev_key = Some(current_key);

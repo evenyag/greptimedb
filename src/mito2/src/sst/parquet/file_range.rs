@@ -492,6 +492,9 @@ pub(crate) struct RangeBase {
 pub(crate) struct TagDecodeState {
     decoded_pks: Option<DecodedPrimaryKeys>,
     decoded_tag_cache: HashMap<ColumnId, ArrayRef>,
+    /// Recyclable per-string decode buffers reused across primary key decodes within
+    /// a single prefilter call.
+    decode_buffers: Vec<Vec<u8>>,
 }
 
 impl TagDecodeState {
@@ -499,6 +502,7 @@ impl TagDecodeState {
         Self {
             decoded_pks: None,
             decoded_tag_cache: HashMap::new(),
+            decode_buffers: Vec::new(),
         }
     }
 }
@@ -539,7 +543,7 @@ impl RangeBase {
                     } else {
                         input.set_pk_values(
                             self.codec
-                                .decode(input.primary_key())
+                                .decode(input.primary_key(), &mut Vec::new())
                                 .context(DecodeSnafu)?,
                         );
                         input.pk_values().unwrap()
@@ -767,7 +771,11 @@ impl RangeBase {
         }
 
         if tag_decode_state.decoded_pks.is_none() {
-            tag_decode_state.decoded_pks = Some(decode_primary_keys(self.codec.as_ref(), input)?);
+            tag_decode_state.decoded_pks = Some(decode_primary_keys(
+                self.codec.as_ref(),
+                input,
+                &mut tag_decode_state.decode_buffers,
+            )?);
         }
 
         let pk_index = if self.codec.encoding() == PrimaryKeyEncoding::Sparse {
@@ -841,7 +849,7 @@ impl RangeBase {
         if input.pk_values().is_none() {
             input.set_pk_values(
                 self.codec
-                    .decode(input.primary_key())
+                    .decode(input.primary_key(), &mut Vec::new())
                     .context(DecodeSnafu)?,
             );
         }

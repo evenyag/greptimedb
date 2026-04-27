@@ -181,7 +181,11 @@ mod tests {
 
         let codec =
             IndexValuesCodec::from_tag_columns(PrimaryKeyEncoding::Dense, tag_columns.iter());
-        let values = codec.decoder().decode(&primary_key).unwrap().into_dense();
+        let values = codec
+            .decoder()
+            .decode(&primary_key, &mut Vec::new())
+            .unwrap()
+            .into_dense();
 
         assert_eq!(values.len(), 2);
         assert_eq!(values[0], Value::Null);

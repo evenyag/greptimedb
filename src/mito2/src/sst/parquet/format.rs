@@ -573,8 +573,9 @@ impl PrimaryKeyReadFormat {
 
             let mut batch = builder.build()?;
             if let Some(codec) = &self.primary_key_codec {
-                let pk_values: CompositeValues =
-                    codec.decode(batch.primary_key()).context(DecodeSnafu)?;
+                let pk_values: CompositeValues = codec
+                    .decode(batch.primary_key(), &mut Vec::new())
+                    .context(DecodeSnafu)?;
                 batch.set_pk_values(pk_values);
             }
             batches.push_back(batch);
@@ -1417,7 +1418,9 @@ mod tests {
             RecordBatch::try_new(format.arrow_schema().clone(), test_columns).unwrap();
 
         // Test without override sequence - should return clone
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        let result = format
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
+            .unwrap();
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
             .as_any()
@@ -1431,7 +1434,11 @@ mod tests {
         format.set_override_sequence(Some(override_sequence));
         let override_sequence_array = format.new_override_sequence_array(num_rows).unwrap();
         let result = format
-            .convert_batch(record_batch, Some(&override_sequence_array))
+            .convert_batch(
+                record_batch,
+                Some(&override_sequence_array),
+                &mut Vec::new(),
+            )
             .unwrap();
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
@@ -1665,7 +1672,9 @@ mod tests {
         let record_batch = RecordBatch::try_new(old_schema, columns).unwrap();
 
         // Test conversion with dense encoding
-        let result = format.convert_batch(record_batch, None).unwrap();
+        let result = format
+            .convert_batch(record_batch, None, &mut Vec::new())
+            .unwrap();
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
         let expected_columns: Vec<ArrayRef> = vec![
@@ -1753,7 +1762,9 @@ mod tests {
         let record_batch = RecordBatch::try_new(old_schema, columns).unwrap();
 
         // Test conversion with sparse encoding
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        let result = format
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
+            .unwrap();
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
         let tag0_array = Arc::new(DictionaryArray::new(
@@ -1787,7 +1798,9 @@ mod tests {
             FlatReadFormat::new(metadata.clone(), column_ids.into_iter(), None, "test", true)
                 .unwrap();
         // Test conversion with sparse encoding and skip convert.
-        let result = format.convert_batch(record_batch.clone(), None).unwrap();
+        let result = format
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
+            .unwrap();
         assert_eq!(record_batch, result);
     }
 

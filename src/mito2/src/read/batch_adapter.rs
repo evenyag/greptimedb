@@ -95,7 +95,7 @@ impl BatchToRecordBatchAdapter {
         } else {
             Cow::Owned(
                 self.codec
-                    .decode(batch.primary_key())
+                    .decode(batch.primary_key(), &mut Vec::new())
                     .context(DecodeSnafu)?,
             )
         };
@@ -597,7 +597,7 @@ mod tests {
             .unwrap();
 
         // Decode and set pk_values ahead of time.
-        let decoded = codec.decode(&pk).unwrap();
+        let decoded = codec.decode(&pk, &mut Vec::new()).unwrap();
         batch.set_pk_values(decoded);
 
         let adapter = build_adapter(vec![batch], &metadata, &codec);

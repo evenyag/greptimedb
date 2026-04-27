@@ -324,7 +324,7 @@ impl PrimaryKeyProjectionMapper {
                 Some(v) => v.clone(),
                 None => self
                     .codec
-                    .decode(batch.primary_key())
+                    .decode(batch.primary_key(), &mut Vec::new())
                     .map_err(BoxedError::new)
                     .context(ExternalSnafu)?,
             }

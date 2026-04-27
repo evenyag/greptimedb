@@ -2258,6 +2258,8 @@ pub(crate) struct FlatRowGroupReader {
     /// Accumulated cost of invoking `FlatReadFormat::convert_batch`.
     /// Drained by [`FlatPruneReader`] into `ReaderMetrics`.
     pub(crate) flat_convert_cost: Duration,
+    /// Recyclable per-string decode buffers reused across batches in convert_batch.
+    decode_buffers: Vec<Vec<u8>>,
 }
 
 impl FlatRowGroupReader {
@@ -2284,6 +2286,7 @@ impl FlatRowGroupReader {
             override_sequence,
             nullable_value_schema,
             flat_convert_cost: Duration::ZERO,
+            decode_buffers: Vec::new(),
         }
     }
 
@@ -2298,8 +2301,11 @@ impl FlatRowGroupReader {
                 // Safety: Only flat format use FlatRowGroupReader.
                 let flat_format = self.context.read_format().as_flat().unwrap();
                 let convert_start = Instant::now();
-                let record_batch =
-                    flat_format.convert_batch(record_batch, self.override_sequence.as_ref())?;
+                let record_batch = flat_format.convert_batch(
+                    record_batch,
+                    self.override_sequence.as_ref(),
+                    &mut self.decode_buffers,
+                )?;
                 self.flat_convert_cost += convert_start.elapsed();
 
                 // Fix the schema back to nullable for the greptime_value column if needed.

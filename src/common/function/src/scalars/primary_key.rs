@@ -242,7 +242,7 @@ fn decode_one(
     name_lookup: &HashMap<ColumnId, String>,
 ) -> datafusion_common::Result<Vec<NameValuePair>> {
     let decoded = codec
-        .decode(pk)
+        .decode(pk, &mut Vec::new())
         .map_err(|e| DataFusionError::Execution(format!("failed to decode primary key: {e}")))?;
 
     Ok(match decoded {

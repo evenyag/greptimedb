@@ -49,6 +49,8 @@ pub struct EncodedBulkPartIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Recyclable per-string decode buffers reused across batches in convert_batch.
+    decode_buffers: Vec<Vec<u8>>,
 }
 
 impl EncodedBulkPartIter {
@@ -98,6 +100,7 @@ impl EncodedBulkPartIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            decode_buffers: Vec::new(),
         })
     }
 
@@ -128,6 +131,7 @@ impl EncodedBulkPartIter {
                     .as_mut()
                     .map(|f| f as &mut dyn PrimaryKeyFilter),
                 &mut self.metrics,
+                &mut self.decode_buffers,
             )? {
                 // Update metrics
                 self.metrics.num_batches += 1;
@@ -158,6 +162,7 @@ impl EncodedBulkPartIter {
                         .as_mut()
                         .map(|f| f as &mut dyn PrimaryKeyFilter),
                     &mut self.metrics,
+                    &mut self.decode_buffers,
                 )? {
                     // Update metrics
                     self.metrics.num_batches += 1;
@@ -229,6 +234,8 @@ pub struct BulkPartBatchIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Recyclable per-string decode buffers reused across batches in convert_batch.
+    decode_buffers: Vec<Vec<u8>>,
 }
 
 impl BulkPartBatchIter {
@@ -254,6 +261,7 @@ impl BulkPartBatchIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            decode_buffers: Vec::new(),
         }
     }
 
@@ -314,6 +322,7 @@ impl BulkPartBatchIter {
                 .as_mut()
                 .map(|f| f as &mut dyn PrimaryKeyFilter),
             &mut self.metrics,
+            &mut self.decode_buffers,
         )?
         else {
             self.metrics.scan_cost += start.elapsed();
@@ -388,6 +397,7 @@ fn apply_combined_filters(
     skip_fields: bool,
     pk_filter: Option<&mut dyn PrimaryKeyFilter>,
     metrics: &mut MemScanMetricsData,
+    decode_buffers: &mut Vec<Vec<u8>>,
 ) -> error::Result<Option<RecordBatch>> {
     // Apply PK prefilter on raw batch before convert_batch to reduce conversion overhead.
     let has_pk_prefilter = pk_filter.is_some();
@@ -413,7 +423,7 @@ fn apply_combined_filters(
 
     // Converts the format to the flat format.
     let format = context.read_format().as_flat().unwrap();
-    let record_batch = format.convert_batch(record_batch, None)?;
+    let record_batch = format.convert_batch(record_batch, None, decode_buffers)?;
 
     let num_rows = record_batch.num_rows();
     let mut combined_filter = None;

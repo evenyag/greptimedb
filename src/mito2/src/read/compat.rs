@@ -699,7 +699,7 @@ impl RewritePrimaryKey {
         if batch.pk_values().is_none() {
             let new_pk_values = self
                 .original
-                .decode(batch.primary_key())
+                .decode(batch.primary_key(), &mut Vec::new())
                 .context(DecodeSnafu)?;
             batch.set_pk_values(new_pk_values);
         }
@@ -798,7 +798,10 @@ impl FlatRewritePrimaryKey {
                 continue;
             };
             // Decodes the old primary key.
-            let mut pk_values = self.old_codec.decode(old_pk).context(DecodeSnafu)?;
+            let mut pk_values = self
+                .old_codec
+                .decode(old_pk, &mut Vec::new())
+                .context(DecodeSnafu)?;
             pk_values.extend(append_values);
 
             buffer.clear();

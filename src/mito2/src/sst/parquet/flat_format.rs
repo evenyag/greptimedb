@@ -40,7 +40,9 @@ use datatypes::arrow::compute::kernels::take::take;
 use datatypes::arrow::datatypes::{Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::{ConcreteDataType, DataType};
-use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec, build_primary_key_codec};
+use mito_codec::row_converter::{
+    CompositeValues, PrimaryKeyCodec, build_primary_key_codec, recycle_composite_buffers,
+};
 use parquet::file::metadata::RowGroupMetaData;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
@@ -299,15 +301,16 @@ impl FlatReadFormat {
     ///
     /// Returns a new RecordBatch with flat format conversion applied first (if enabled),
     /// then the sequence column replaced by the override sequence array.
-    pub(crate) fn convert_batch(
+    pub fn convert_batch(
         &self,
         record_batch: RecordBatch,
         override_sequence_array: Option<&ArrayRef>,
+        decode_buffers: &mut Vec<Vec<u8>>,
     ) -> Result<RecordBatch> {
         // First, apply flat format conversion.
         let batch = match &self.parquet_adapter {
             ParquetAdapter::Flat(_) => record_batch,
-            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch)?,
+            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch, decode_buffers)?,
         };
 
         // Then apply sequence override if provided
@@ -449,9 +452,13 @@ impl ParquetPrimaryKeyToFlat {
         }
     }
 
-    fn convert_batch(&self, record_batch: RecordBatch) -> Result<RecordBatch> {
+    fn convert_batch(
+        &self,
+        record_batch: RecordBatch,
+        decode_buffers: &mut Vec<Vec<u8>>,
+    ) -> Result<RecordBatch> {
         if let Some(convert_format) = &self.convert_format {
-            convert_format.convert(record_batch)
+            convert_format.convert(record_batch, decode_buffers)
         } else {
             Ok(record_batch)
         }
@@ -570,6 +577,7 @@ pub(crate) fn sst_column_id_indices(metadata: &RegionMetadata) -> HashMap<Column
 pub(crate) fn decode_primary_keys(
     codec: &dyn PrimaryKeyCodec,
     batch: &RecordBatch,
+    decode_buffers: &mut Vec<Vec<u8>>,
 ) -> Result<DecodedPrimaryKeys> {
     let primary_key_index = primary_key_column_index(batch.num_columns());
     let pk_dict_array = batch
@@ -610,7 +618,9 @@ pub(crate) fn decode_primary_keys(
 
         // New key, decodes the value
         let pk_bytes = pk_values_array.value(current_key as usize);
-        let decoded_value = codec.decode(pk_bytes).context(DecodeSnafu)?;
+        let decoded_value = codec
+            .decode(pk_bytes, decode_buffers)
+            .context(DecodeSnafu)?;
 
         decoded_pk_values.push(decoded_value);
         key_to_decoded_index.push((decoded_pk_values.len() - 1) as u32);
@@ -635,6 +645,17 @@ pub(crate) struct DecodedPrimaryKeys {
 }
 
 impl DecodedPrimaryKeys {
+    /// Returns the per-string `Vec<u8>` backing storage to `decode_buffers` for reuse
+    /// by the next batch's [`decode_primary_keys`] call.
+    ///
+    /// Should be called after the decoded values have been consumed (e.g. copied into
+    /// Arrow tag column builders by [`Self::get_tag_column`]).
+    pub(crate) fn recycle_buffers(self, decode_buffers: &mut Vec<Vec<u8>>) {
+        for composite in self.decoded_pk_values {
+            recycle_composite_buffers(composite, decode_buffers);
+        }
+    }
+
     /// Gets a tag column array by column id and data type.
     ///
     /// For sparse encoding, uses column_id to lookup values.
@@ -732,12 +753,16 @@ impl FlatConvertFormat {
     /// Converts a batch to have decoded primary key columns in flat format.
     ///
     /// The primary key array in the batch is a dictionary array.
-    pub(crate) fn convert(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    pub(crate) fn convert(
+        &self,
+        batch: RecordBatch,
+        decode_buffers: &mut Vec<Vec<u8>>,
+    ) -> Result<RecordBatch> {
         if self.projected_primary_keys.is_empty() {
             return Ok(batch);
         }
 
-        let decoded_pks = decode_primary_keys(self.codec.as_ref(), &batch)?;
+        let decoded_pks = decode_primary_keys(self.codec.as_ref(), &batch, decode_buffers)?;
 
         // Builds decoded tag column arrays.
         let mut decoded_columns = Vec::new();
@@ -750,6 +775,10 @@ impl FlatConvertFormat {
             )?;
             decoded_columns.push(tag_column);
         }
+
+        // The decoded primary key values have been copied into the tag column builders.
+        // Return their string backing buffers to the pool for the next batch.
+        decoded_pks.recycle_buffers(decode_buffers);
 
         // Builds new columns: decoded tag columns first, then original columns
         let mut new_columns = Vec::with_capacity(batch.num_columns() + decoded_columns.len());

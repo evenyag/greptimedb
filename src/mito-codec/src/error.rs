@@ -60,6 +60,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Invalid sparse primary key encoding: {}", reason))]
+    InvalidSparseEncoding {
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Operation not supported: {}", err_msg))]
     UnsupportedOperation {
         err_msg: String,
@@ -90,9 +97,10 @@ impl ErrorExt for Error {
 
         match self {
             FieldTypeMismatch { source, .. } => source.status_code(),
-            SerializeField { .. } | DeserializeField { .. } | IndexEncodeNull { .. } => {
-                StatusCode::InvalidArguments
-            }
+            SerializeField { .. }
+            | DeserializeField { .. }
+            | InvalidSparseEncoding { .. }
+            | IndexEncodeNull { .. } => StatusCode::InvalidArguments,
             NotSupportedField { .. } | UnsupportedOperation { .. } => StatusCode::Unsupported,
             EvaluateFilter { source, .. } => source.status_code(),
         }

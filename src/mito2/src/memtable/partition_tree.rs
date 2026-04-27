@@ -773,7 +773,10 @@ mod tests {
             .build(None)
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
-        let pk = codec.decode(batch.primary_key()).unwrap().into_dense();
+        let pk = codec
+            .decode(batch.primary_key(), &mut Vec::new())
+            .unwrap()
+            .into_dense();
         if let Value::String(s) = &pk[2] {
             assert_eq!("10min", s.as_utf8());
         } else {
@@ -849,7 +852,10 @@ mod tests {
         let mut res = HashMap::new();
         for v in iter {
             let batch = v.unwrap();
-            let values = decoder.decode(batch.primary_key()).unwrap().into_dense();
+            let values = decoder
+                .decode(batch.primary_key(), &mut Vec::new())
+                .unwrap()
+                .into_dense();
             let field_vector = batch.fields()[0]
                 .data
                 .as_any()

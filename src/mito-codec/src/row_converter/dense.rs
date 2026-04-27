@@ -566,7 +566,10 @@ impl PrimaryKeyCodec for DensePrimaryKeyCodec {
         ))
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<CompositeValues> {
+    fn decode(&self, bytes: &[u8], _buffers: &mut Vec<Vec<u8>>) -> Result<CompositeValues> {
+        // TODO: thread buffer pool through SortField for string fields. Today the
+        // dense decode goes through memcomparable's `Option::<String>::deserialize`
+        // which allocates a fresh `Vec<u8>` and a `String` per field.
         Ok(CompositeValues::Dense(self.decode_dense(bytes)?))
     }
 
@@ -596,7 +599,10 @@ mod tests {
         let value_ref = row.iter().map(|v| v.as_value_ref()).collect::<Vec<_>>();
 
         let result = encoder.encode(value_ref.iter().cloned()).unwrap();
-        let decoded = encoder.decode(&result).unwrap().into_dense();
+        let decoded = encoder
+            .decode(&result, &mut Vec::new())
+            .unwrap()
+            .into_dense();
         assert_eq!(decoded, row);
         let mut decoded = Vec::new();
         let mut offsets = Vec::new();
@@ -622,7 +628,10 @@ mod tests {
         let value_ref = values.iter().map(|v| v.as_value_ref()).collect::<Vec<_>>();
         let result = encoder.encode(value_ref.iter().cloned()).unwrap();
 
-        let decoded = encoder.decode(&result).unwrap().into_dense();
+        let decoded = encoder
+            .decode(&result, &mut Vec::new())
+            .unwrap()
+            .into_dense();
         assert_eq!(&values, &decoded as &[Value]);
     }
 
