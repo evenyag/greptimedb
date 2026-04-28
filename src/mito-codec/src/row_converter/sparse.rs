@@ -60,40 +60,62 @@ struct SparsePrimaryKeyCodecInner {
 
 /// Sparse values representation.
 ///
-/// A map of [`ColumnId`] to [`Value`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A list of `(ColumnId, Value)` pairs. Lookups are linear scans, which is
+/// faster than a `HashMap` at the small fan-outs typical of sparse primary
+/// keys. Append-only: callers must not insert a column id that is already
+/// present, otherwise the duplicate will shadow the later value on lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SparseValues {
-    values: HashMap<ColumnId, Value>,
+    values: Vec<(ColumnId, Value)>,
 }
 
 impl SparseValues {
-    /// Creates a new [`SparseValues`] instance.
-    pub fn new(values: HashMap<ColumnId, Value>) -> Self {
-        Self { values }
+    /// Creates an empty [`SparseValues`].
+    pub fn new() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    /// Creates an empty [`SparseValues`] with space reserved for `cap` entries.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(cap),
+        }
     }
 
     /// Returns the value of the given column, or [`Value::Null`] if the column is not present.
     pub fn get_or_null(&self, column_id: ColumnId) -> &Value {
-        self.values.get(&column_id).unwrap_or(&Value::Null)
+        for (id, value) in &self.values {
+            if *id == column_id {
+                return value;
+            }
+        }
+        &Value::Null
     }
 
     /// Returns the value of the given column, or [`None`] if the column is not present.
     pub fn get(&self, column_id: &ColumnId) -> Option<&Value> {
-        self.values.get(column_id)
+        for (id, value) in &self.values {
+            if id == column_id {
+                return Some(value);
+            }
+        }
+        None
     }
 
-    /// Inserts a new value into the [`SparseValues`].
+    /// Appends a new `(column_id, value)` pair.
+    ///
+    /// Append-only: the caller must ensure `column_id` is not already present.
     pub fn insert(&mut self, column_id: ColumnId, value: Value) {
-        self.values.insert(column_id, value);
+        self.values.push((column_id, value));
     }
 
     /// Returns an iterator over all stored column id/value pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&ColumnId, &Value)> {
-        self.values.iter()
+        self.values.iter().map(|(id, value)| (id, value))
     }
 
-    /// Consumes this `SparseValues` and returns the inner map.
-    pub fn into_inner(self) -> HashMap<ColumnId, Value> {
+    /// Consumes this `SparseValues` and returns the inner vec.
+    pub fn into_inner(self) -> Vec<(ColumnId, Value)> {
         self.values
     }
 }
@@ -357,7 +379,7 @@ impl SparsePrimaryKeyCodec {
         bytes: &[u8],
         buffers: &mut Vec<Vec<u8>>,
     ) -> Result<SparseValues> {
-        let mut values = SparseValues::new(HashMap::new());
+        let mut values = SparseValues::new();
         let mut pos = 0;
 
         while pos < bytes.len() {
@@ -798,9 +820,8 @@ mod tests {
 
     #[test]
     fn test_sparse_value_new_and_get_or_null() {
-        let mut values = HashMap::new();
-        values.insert(1, Value::Int32(42));
-        let sparse_value = SparseValues::new(values);
+        let mut sparse_value = SparseValues::new();
+        sparse_value.insert(1, Value::Int32(42));
 
         assert_eq!(sparse_value.get_or_null(1), &Value::Int32(42));
         assert_eq!(sparse_value.get_or_null(2), &Value::Null);
@@ -808,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_sparse_value_insert() {
-        let mut sparse_value = SparseValues::new(HashMap::new());
+        let mut sparse_value = SparseValues::new();
         sparse_value.insert(1, Value::Int32(42));
 
         assert_eq!(sparse_value.get_or_null(1), &Value::Int32(42));
