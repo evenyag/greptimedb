@@ -24,6 +24,7 @@ use mito2::sst::location::sst_file_path;
 use mito2::sst::parquet::async_reader::SstAsyncFileReader;
 use mito2::sst::parquet::metadata::MetadataLoader;
 use mito2::sst::parquet::reader::MetadataCacheMetrics;
+use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
@@ -368,24 +369,31 @@ fn resolve_projection_names(
         return Ok(None);
     };
 
-    let available_columns = metadata
-        .column_metadatas
+    let sst_schema = to_flat_sst_arrow_schema(
+        metadata,
+        &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+    );
+    let available_columns = sst_schema
+        .fields()
         .iter()
-        .map(|column| column.column_schema.name.as_str())
+        .map(|field| field.name().as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let projection = projection_names
         .iter()
         .map(|name| {
-            metadata.column_index_by_name(name).ok_or_else(|| {
-                error::IllegalConfigSnafu {
-                    msg: format!(
-                        "Unknown column '{}' in projection_names, available columns: [{}]",
-                        name, available_columns
-                    ),
-                }
-                .build()
-            })
+            sst_schema
+                .column_with_name(name)
+                .map(|x| x.0)
+                .ok_or_else(|| {
+                    error::IllegalConfigSnafu {
+                        msg: format!(
+                            "Unknown column '{}' in projection_names, available columns: [{}]",
+                            name, available_columns
+                        ),
+                    }
+                    .build()
+                })
         })
         .collect::<error::Result<Vec<_>>>()?;
     Ok(Some(projection))
