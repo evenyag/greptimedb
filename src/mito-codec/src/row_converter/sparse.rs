@@ -379,7 +379,7 @@ impl SparsePrimaryKeyCodec {
         bytes: &[u8],
         buffers: &mut Vec<Vec<u8>>,
     ) -> Result<SparseValues> {
-        let mut values = SparseValues::new();
+        let mut values = SparseValues::with_capacity(16);
         let mut pos = 0;
 
         while pos < bytes.len() {
@@ -627,7 +627,7 @@ fn decode_string_into_pool(
         }
     );
 
-    let mut buf = buffers.pop().unwrap_or_default();
+    let mut buf = buffers.pop().unwrap_or_else(|| Vec::with_capacity(128));
     buf.clear();
 
     loop {
