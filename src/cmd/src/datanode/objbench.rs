@@ -67,7 +67,7 @@ pub struct ObjbenchCommand {
     pub pprof_file: Option<PathBuf>,
 }
 
-pub(super) fn parse_config(
+pub(crate) fn parse_config(
     config_path: &PathBuf,
 ) -> error::Result<(
     StorageConfig,
@@ -482,7 +482,7 @@ fn parse_file_dir_components(path: &str) -> error::Result<FileDirComponents> {
     })
 }
 
-fn extract_region_metadata(
+pub(crate) fn extract_region_metadata(
     file_path: &str,
     meta: &parquet::file::metadata::ParquetMetaData,
 ) -> error::Result<RegionMetadataRef> {
@@ -512,7 +512,7 @@ fn extract_region_metadata(
     Ok(Arc::new(region))
 }
 
-pub(super) async fn build_object_store(sc: &StorageConfig) -> error::Result<ObjectStore> {
+pub(crate) async fn build_object_store(sc: &StorageConfig) -> error::Result<ObjectStore> {
     store::new_object_store(sc.store.clone(), &sc.data_home)
         .await
         .map_err(|e| {
@@ -605,7 +605,7 @@ fn new_noop_file_purger() -> FilePurgerRef {
     Arc::new(Noop)
 }
 
-async fn load_parquet_metadata(
+pub(crate) async fn load_parquet_metadata(
     object_store: ObjectStore,
     path: &str,
     file_size: u64,

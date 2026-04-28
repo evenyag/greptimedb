@@ -16,6 +16,8 @@ pub mod builder;
 #[allow(clippy::print_stdout)]
 mod objbench;
 #[allow(clippy::print_stdout)]
+mod parquetbench;
+#[allow(clippy::print_stdout)]
 mod scanbench;
 
 use std::path::Path;
@@ -37,6 +39,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use crate::App;
 use crate::datanode::builder::InstanceBuilder;
 use crate::datanode::objbench::ObjbenchCommand;
+use crate::datanode::parquetbench::ParquetbenchCommand;
 use crate::datanode::scanbench::ScanbenchCommand;
 use crate::error::{
     LoadLayeredConfigSnafu, MissingConfigSnafu, Result, ShutdownDatanodeSnafu, StartDatanodeSnafu,
@@ -108,7 +111,7 @@ impl Command {
     pub fn load_options(&self, global_options: &GlobalOptions) -> Result<DatanodeOptions> {
         match &self.subcmd {
             SubCommand::Start(cmd) => cmd.load_options(global_options),
-            SubCommand::Objbench(_) | SubCommand::Scanbench(_) => {
+            SubCommand::Objbench(_) | SubCommand::Parquetbench(_) | SubCommand::Scanbench(_) => {
                 // For bench commands, we don't need to load DatanodeOptions
                 // They are standalone utility commands
                 let mut opts = datanode::config::DatanodeOptions::default();
@@ -128,6 +131,8 @@ pub enum SubCommand {
     Start(StartCommand),
     /// Object storage benchmark tool
     Objbench(ObjbenchCommand),
+    /// Raw parquet benchmark tool - benchmarks scanning a single parquet SST directly
+    Parquetbench(ParquetbenchCommand),
     /// Scan benchmark tool - benchmarks scanning a region directly from storage
     Scanbench(ScanbenchCommand),
 }
@@ -140,6 +145,10 @@ impl SubCommand {
                 builder.build().await
             }
             SubCommand::Objbench(cmd) => {
+                cmd.run().await?;
+                std::process::exit(0);
+            }
+            SubCommand::Parquetbench(cmd) => {
                 cmd.run().await?;
                 std::process::exit(0);
             }

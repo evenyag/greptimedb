@@ -1548,19 +1548,19 @@ mod vector_index_tests {
 
 /// Metrics for parquet metadata cache operations.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct MetadataCacheMetrics {
+pub struct MetadataCacheMetrics {
     /// Number of memory cache hits for parquet metadata.
-    pub(crate) mem_cache_hit: usize,
+    pub mem_cache_hit: usize,
     /// Number of file cache hits for parquet metadata.
-    pub(crate) file_cache_hit: usize,
+    pub file_cache_hit: usize,
     /// Number of cache misses for parquet metadata.
-    pub(crate) cache_miss: usize,
+    pub cache_miss: usize,
     /// Duration to load parquet metadata.
-    pub(crate) metadata_load_cost: Duration,
+    pub metadata_load_cost: Duration,
     /// Number of read operations performed.
-    pub(crate) num_reads: usize,
+    pub num_reads: usize,
     /// Total bytes read from storage.
-    pub(crate) bytes_read: u64,
+    pub bytes_read: u64,
 }
 
 impl std::fmt::Debug for MetadataCacheMetrics {
@@ -1603,12 +1603,12 @@ impl std::fmt::Debug for MetadataCacheMetrics {
 
 impl MetadataCacheMetrics {
     /// Returns true if the metrics are empty (contain no meaningful data).
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.metadata_load_cost.is_zero()
     }
 
     /// Adds `other` metrics to this metrics.
-    pub(crate) fn merge_from(&mut self, other: &MetadataCacheMetrics) {
+    pub fn merge_from(&mut self, other: &MetadataCacheMetrics) {
         self.mem_cache_hit += other.mem_cache_hit;
         self.file_cache_hit += other.file_cache_hit;
         self.cache_miss += other.cache_miss;
