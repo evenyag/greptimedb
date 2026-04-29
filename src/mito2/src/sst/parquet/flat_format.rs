@@ -265,15 +265,26 @@ impl FlatReadFormat {
             Some(num) => Self::is_legacy_format(&metadata, num, file_path)?,
             None => metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
         };
+        let mut effective_options = options;
+        if is_legacy {
+            // Legacy SSTs materialize tags and compat primary keys from the
+            // encoded `__primary_key` column, so mocking it would make alter
+            // reads lose or panic on historical rows.
+            effective_options.read_primary_key_column = true;
+        }
 
         // Capture the user's original column ids before any filtering.
         let user_column_ids: Vec<ColumnId> = column_ids.collect();
-        let actual_batch_layout = actual_batch_schema(&metadata, &user_column_ids, options);
+        let actual_batch_layout =
+            actual_batch_schema(&metadata, &user_column_ids, effective_options);
 
         // When raw tag columns are skipped at the parquet layer, filter the
         // tag column ids out of the read set.
-        let parquet_column_ids =
-            filter_column_ids_for_options(&metadata, user_column_ids.iter().copied(), options);
+        let parquet_column_ids = filter_column_ids_for_options(
+            &metadata,
+            user_column_ids.iter().copied(),
+            effective_options,
+        );
 
         let parquet_adapter = if is_legacy {
             // Safety: is_legacy_format() ensures primary_key is not empty.
@@ -283,21 +294,21 @@ impl FlatReadFormat {
                     metadata,
                     parquet_column_ids.into_iter(),
                     skip_auto_convert,
-                    options,
+                    effective_options,
                 ))
             } else {
                 ParquetAdapter::PrimaryKeyToFlat(ParquetPrimaryKeyToFlat::new(
                     metadata,
                     parquet_column_ids.into_iter(),
                     false,
-                    options,
+                    effective_options,
                 ))
             }
         } else {
             ParquetAdapter::Flat(ParquetFlat::new(
                 metadata,
                 parquet_column_ids.into_iter(),
-                options,
+                effective_options,
             ))
         };
 
@@ -310,7 +321,7 @@ impl FlatReadFormat {
         Ok(FlatReadFormat {
             override_sequence: None,
             parquet_adapter,
-            options,
+            options: effective_options,
             actual_batch_layout,
             actual_batch_position,
         })
@@ -1179,6 +1190,26 @@ mod tests {
         assert!(read_format.projected_index_by_id(0).is_none());
         assert_eq!(read_format.projected_index_by_id(1), Some(0));
         assert_eq!(read_format.projected_index_by_id(2), Some(1));
+    }
+
+    #[test]
+    fn test_legacy_read_forces_primary_key_column() {
+        let metadata = Arc::new(build_metadata(1, 1, PrimaryKeyEncoding::Dense));
+        let mut opts = FlatReadOptions::full();
+        opts.read_raw_tag_columns = false;
+        opts.read_primary_key_column = false;
+        let read_format = FlatReadFormat::new(
+            metadata,
+            [0_u32, 1_u32, 2_u32].into_iter(),
+            Some(5),
+            "test",
+            false,
+            opts,
+        )
+        .unwrap();
+
+        assert!(read_format.options().read_primary_key_column);
+        assert!(read_format.projected_index_by_id(0).is_none());
     }
 
     #[test]

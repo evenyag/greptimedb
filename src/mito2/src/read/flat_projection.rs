@@ -222,7 +222,8 @@ impl FlatProjectionMapper {
     pub(crate) fn apply_flat_read_options(&mut self, options: FlatReadOptions) -> Result<()> {
         let id_to_index = sst_column_id_indices(&self.metadata);
         let sst_column_num = self.metadata.column_metadatas.len() + 3;
-        let read_column_ids = filter_read_column_ids_for_options(&self.metadata, &self.read_column_ids, options);
+        let read_column_ids =
+            filter_read_column_ids_for_options(&self.metadata, &self.read_column_ids, options);
         let format_projection = FormatProjection::compute_format_projection(
             &id_to_index,
             sst_column_num,
@@ -616,7 +617,8 @@ fn filter_read_column_ids_for_options(
         return read_column_ids.to_vec();
     }
 
-    let pk_column_ids: std::collections::HashSet<_> = metadata.primary_key.iter().copied().collect();
+    let pk_column_ids: std::collections::HashSet<_> =
+        metadata.primary_key.iter().copied().collect();
     read_column_ids
         .iter()
         .copied()
