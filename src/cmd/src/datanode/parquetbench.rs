@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use colored::Colorize;
-use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use mito2::cache::CacheStrategy;
 use mito2::sst::file::RegionFileId;
@@ -33,6 +34,7 @@ use serde::Deserialize;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadata;
 use store_api::region_request::PathType;
+use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use store_api::storage::{FileId, RegionId};
 
 use crate::datanode::objbench::{build_object_store, extract_region_metadata, parse_config};
@@ -80,6 +82,10 @@ pub struct ParquetbenchCommand {
     /// Start pprof after the first iteration (use first iteration as warmup).
     #[clap(long, default_value_t = false)]
     pprof_after_warmup: bool,
+
+    /// Read the `__primary_key` column as BinaryArray instead of DictionaryArray.
+    #[clap(long, default_value_t = false)]
+    pk_as_binary: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -143,10 +149,13 @@ impl ParquetbenchCommand {
         let row_groups = resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?;
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
-        let sst_schema = to_flat_sst_arrow_schema(
+        let mut sst_schema = to_flat_sst_arrow_schema(
             &region_meta,
             &FlatSchemaOptions::from_encoding(region_meta.primary_key_encoding),
         );
+        if self.pk_as_binary {
+            sst_schema = override_pk_to_binary(&sst_schema);
+        }
 
         println!(
             "{} Region ID: {} (u64: {})",
@@ -161,6 +170,16 @@ impl ParquetbenchCommand {
             projected_columns.as_deref().unwrap_or("all columns").cyan()
         );
         println!("{} Row groups: {}", "✓".green(), row_groups_display.cyan());
+        println!(
+            "{} __primary_key type: {}",
+            "✓".green(),
+            if self.pk_as_binary {
+                "Binary"
+            } else {
+                "Dictionary(UInt32, Binary)"
+            }
+            .cyan()
+        );
         println!(
             "{} Parquet rows: {}, row groups: {}, file size: {}",
             "✓".green(),
@@ -455,6 +474,25 @@ fn row_groups_display(row_groups: &[usize], total_row_groups: usize) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+fn override_pk_to_binary(schema: &SchemaRef) -> SchemaRef {
+    let new_fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == PRIMARY_KEY_COLUMN_NAME {
+                Arc::new(Field::new(
+                    PRIMARY_KEY_COLUMN_NAME,
+                    ArrowDataType::Binary,
+                    f.is_nullable(),
+                ))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new(new_fields))
 }
 
 fn parse_region_id(s: &str) -> error::Result<RegionId> {
