@@ -996,7 +996,7 @@ impl CompactionSstReaderBuilder<'_> {
     async fn build_flat_sst_reader(self) -> Result<BoxedRecordBatchStream> {
         let scan_input = self.build_scan_input()?.with_compaction(true);
 
-        SeqScan::new(scan_input)
+        SeqScan::new(scan_input)?
             .build_flat_reader_for_compaction()
             .await
     }

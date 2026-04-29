@@ -72,6 +72,8 @@ pub struct FlatProjectionMapper {
     output_column_ids: Vec<ColumnId>,
     /// Precomputed Arrow schema for input batches.
     input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
+    /// Start position of field columns in the actual input batch layout.
+    input_field_column_start: usize,
     /// When `true`, raw tag columns in the input batch are mocked at the SST
     /// boundary; projected tag columns must be decoded from `__primary_key`
     /// at convert time. See [`Self::enable_lazy_tag_decode`].
@@ -157,6 +159,7 @@ impl FlatProjectionMapper {
 
         // Safety: We get the column id from the metadata.
         let input_arrow_schema = compute_input_arrow_schema(metadata, &batch_schema);
+        let input_field_column_start = compute_batch_field_column_start(metadata, &batch_schema);
 
         // If projection is empty, we don't output any column.
         let output_schema = if is_empty_projection {
@@ -203,6 +206,7 @@ impl FlatProjectionMapper {
             batch_indices,
             output_column_ids,
             input_arrow_schema,
+            input_field_column_start,
             decode_tags_lazily: false,
             pk_codec: None,
             output_pk_decode_info: Vec::new(),
@@ -215,11 +219,29 @@ impl FlatProjectionMapper {
     /// scan). Has no effect when the projection is empty or the metadata has
     /// no primary key.
     #[allow(dead_code)]
-    pub(crate) fn enable_lazy_tag_decode(&mut self) {
-        if self.is_empty_projection || self.metadata.primary_key.is_empty() {
-            return;
-        }
+    pub(crate) fn apply_flat_read_options(&mut self, options: FlatReadOptions) -> Result<()> {
+        let id_to_index = sst_column_id_indices(&self.metadata);
+        let sst_column_num = self.metadata.column_metadatas.len() + 3;
+        let format_projection = FormatProjection::compute_format_projection(
+            &id_to_index,
+            sst_column_num,
+            self.read_column_ids.iter().copied(),
+            options,
+        );
+        self.batch_schema = flat_projected_columns(&self.metadata, &format_projection);
+        self.input_arrow_schema = compute_input_arrow_schema(&self.metadata, &self.batch_schema);
+        self.input_field_column_start =
+            compute_batch_field_column_start(&self.metadata, &self.batch_schema);
+        self.decode_tags_lazily = false;
+        self.pk_codec = None;
+        self.output_pk_decode_info.clear();
 
+        let actual_index_by_id: std::collections::HashMap<ColumnId, usize> = self
+            .batch_schema
+            .iter()
+            .enumerate()
+            .map(|(idx, (column_id, _))| (*column_id, idx))
+            .collect();
         let pk_index_by_id: std::collections::HashMap<ColumnId, usize> = self
             .metadata
             .primary_key
@@ -228,31 +250,45 @@ impl FlatProjectionMapper {
             .map(|(idx, &id)| (id, idx))
             .collect();
 
+        let lazy_decode_tags = !options.read_raw_tag_columns;
         let mut info = Vec::with_capacity(self.output_column_ids.len());
+        let mut batch_indices = Vec::with_capacity(self.output_column_ids.len());
         for &id in &self.output_column_ids {
-            if let Some(&pk_index) = pk_index_by_id.get(&id) {
+            if let Some(&index) = actual_index_by_id.get(&id) {
+                batch_indices.push(index);
+                info.push(None);
+            } else if lazy_decode_tags && let Some(&pk_index) = pk_index_by_id.get(&id) {
                 let column_index = self
                     .metadata
                     .column_index_by_id(id)
                     .expect("output column id must be in metadata");
+                batch_indices.push(0);
                 info.push(Some(TagDecodeInfo {
                     column_id: id,
                     pk_index,
                     column_index,
                 }));
             } else {
-                info.push(None);
+                let name = self
+                    .metadata
+                    .column_by_id(id)
+                    .map(|column| column.column_schema.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                return InvalidRequestSnafu {
+                    region_id: self.metadata.region_id,
+                    reason: format!("output column {} is missing in read projection", name),
+                }
+                .fail();
             }
         }
+        self.batch_indices = batch_indices;
 
-        // If no projected outputs are tags, nothing to decode lazily.
-        if info.iter().all(|i| i.is_none()) {
-            return;
+        if lazy_decode_tags && info.iter().any(|i| i.is_some()) {
+            self.decode_tags_lazily = true;
+            self.pk_codec = Some(build_primary_key_codec(&self.metadata));
+            self.output_pk_decode_info = info;
         }
-
-        self.decode_tags_lazily = true;
-        self.pk_codec = Some(build_primary_key_codec(&self.metadata));
-        self.output_pk_decode_info = info;
+        Ok(())
     }
 
     /// Returns a new mapper without projection.
@@ -279,25 +315,7 @@ impl FlatProjectionMapper {
 
     /// Returns the field column start index in output batch.
     pub(crate) fn field_column_start(&self) -> usize {
-        for (idx, column_id) in self
-            .batch_schema
-            .iter()
-            .map(|(column_id, _)| column_id)
-            .enumerate()
-        {
-            // Safety: We get the column id from the metadata in new().
-            if self
-                .metadata
-                .column_by_id(*column_id)
-                .unwrap()
-                .semantic_type
-                == SemanticType::Field
-            {
-                return idx;
-            }
-        }
-
-        self.batch_schema.len()
+        self.input_field_column_start
     }
 
     /// Returns ids of columns of the batch that the mapper expects to convert.
@@ -572,6 +590,92 @@ pub(crate) fn compute_input_arrow_schema(
     new_fields.extend_from_slice(&internal_fields());
 
     Arc::new(datatypes::arrow::datatypes::Schema::new(new_fields))
+}
+
+fn compute_batch_field_column_start(
+    metadata: &RegionMetadata,
+    batch_schema: &[(ColumnId, ConcreteDataType)],
+) -> usize {
+    batch_schema
+        .iter()
+        .position(|(column_id, _)| {
+            metadata
+                .column_by_id(*column_id)
+                .is_some_and(|column| column.semantic_type == SemanticType::Field)
+        })
+        .unwrap_or(batch_schema.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use api::v1::SemanticType;
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
+    use store_api::codec::PrimaryKeyEncoding;
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
+    use store_api::storage::RegionId;
+
+    use super::compute_batch_field_column_start;
+
+    #[test]
+    fn test_compute_batch_field_column_start_for_projected_schema() {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(0, 0));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "tag_0",
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "tag_1",
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "field_0",
+                    ConcreteDataType::int64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 3,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 4,
+            })
+            .primary_key(vec![1, 2])
+            .primary_key_encoding(PrimaryKeyEncoding::Dense);
+        let metadata = Arc::new(builder.build().unwrap());
+
+        let with_tag = vec![
+            (1, ConcreteDataType::string_datatype()),
+            (3, ConcreteDataType::int64_datatype()),
+            (4, ConcreteDataType::timestamp_millisecond_datatype()),
+        ];
+        assert_eq!(compute_batch_field_column_start(&metadata, &with_tag), 1);
+
+        let without_tag = vec![
+            (3, ConcreteDataType::int64_datatype()),
+            (4, ConcreteDataType::timestamp_millisecond_datatype()),
+        ];
+        assert_eq!(compute_batch_field_column_start(&metadata, &without_tag), 0);
+    }
 }
 
 /// Helper to project compaction batches into flat format columns

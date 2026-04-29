@@ -358,21 +358,21 @@ impl ScanRegion {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn seq_scan(self) -> Result<SeqScan> {
         let input = self.scan_input().await?.with_compaction(false);
-        Ok(SeqScan::new(input))
+        SeqScan::new(input)
     }
 
     /// Unordered scan.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn unordered_scan(self) -> Result<UnorderedScan> {
         let input = self.scan_input().await?;
-        Ok(UnorderedScan::new(input))
+        UnorderedScan::new(input)
     }
 
     /// Scans by series.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn series_scan(self) -> Result<SeriesScan> {
         let input = self.scan_input().await?;
-        Ok(SeriesScan::new(input))
+        SeriesScan::new(input)
     }
 
     /// Returns true if the region can use unordered scan for current request.
@@ -1466,7 +1466,7 @@ pub struct StreamContext {
 
 impl StreamContext {
     /// Creates a new [StreamContext] for [SeqScan].
-    pub(crate) fn seq_scan_ctx(input: ScanInput) -> Self {
+    pub(crate) fn seq_scan_ctx(input: ScanInput) -> Result<Self> {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::seq_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
@@ -1480,12 +1480,12 @@ impl StreamContext {
             query_start,
         };
         ctx.precompute_split_decision();
-        ctx.precompute_flat_read_options();
-        ctx
+        ctx.precompute_flat_read_options()?;
+        Ok(ctx)
     }
 
     /// Creates a new [StreamContext] for [UnorderedScan].
-    pub(crate) fn unordered_scan_ctx(input: ScanInput) -> Self {
+    pub(crate) fn unordered_scan_ctx(input: ScanInput) -> Result<Self> {
         let query_start = input.query_start.unwrap_or_else(Instant::now);
         let ranges = RangeMeta::unordered_scan_ranges(&input);
         READ_SST_COUNT.observe(input.num_files() as f64);
@@ -1499,8 +1499,8 @@ impl StreamContext {
             query_start,
         };
         ctx.precompute_split_decision();
-        ctx.precompute_flat_read_options();
-        ctx
+        ctx.precompute_flat_read_options()?;
+        Ok(ctx)
     }
 
     /// Computes the scan-wide split decision once, just after ranges are
@@ -1516,7 +1516,7 @@ impl StreamContext {
     /// stores it on `self.input`. Also enables lazy tag decode on the
     /// projection mapper when the rule indicates raw tag columns are mocked.
     /// Must be called after [`Self::precompute_split_decision`].
-    fn precompute_flat_read_options(&mut self) {
+    fn precompute_flat_read_options(&mut self) -> Result<()> {
         let metadata = self.input.mapper.metadata().clone();
         let pk_set: HashSet<ColumnId> = metadata.primary_key.iter().copied().collect();
 
@@ -1561,13 +1561,12 @@ impl StreamContext {
         };
         let opts = FlatReadOptions::from_context(ctx);
 
-        if !opts.read_raw_tag_columns && !self.input.compaction && projection_has_tag {
-            // Mapper outputs include tag columns whose batch positions are
-            // mocked at the SST boundary; switch the mapper to lazy decode.
+        {
             let mapper = Arc::make_mut(&mut self.input.mapper);
-            mapper.enable_lazy_tag_decode();
+            mapper.apply_flat_read_options(opts)?;
         }
         self.input.flat_read_options = opts;
+        Ok(())
     }
 
     /// Returns true if the index refers to a memtable.

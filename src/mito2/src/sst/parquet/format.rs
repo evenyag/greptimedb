@@ -269,11 +269,6 @@ impl PrimaryKeyReadFormat {
         &self.projection_indices
     }
 
-    /// Gets the field id to projected index.
-    pub(crate) fn field_id_to_projected_index(&self) -> &HashMap<ColumnId, usize> {
-        &self.field_id_to_projected_index
-    }
-
     /// Convert a arrow record batch into `batches`.
     ///
     /// The length of `override_sequence_array` must be larger than the length of the record batch.

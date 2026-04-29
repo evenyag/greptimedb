@@ -182,12 +182,9 @@ impl FlatReadOptions {
         }
     }
 
-    /// Returns `true` if any column is mocked at the boundary.
+    /// Returns `true` if any internal column is mocked at the boundary.
     pub fn has_mocked_columns(&self) -> bool {
-        !self.read_raw_tag_columns
-            || !self.read_primary_key_column
-            || !self.read_sequence_column
-            || !self.read_op_type_column
+        !self.read_primary_key_column || !self.read_sequence_column || !self.read_op_type_column
     }
 }
 

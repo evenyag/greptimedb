@@ -83,24 +83,24 @@ pub struct SeriesScan {
 
 impl SeriesScan {
     /// Creates a new [SeriesScan].
-    pub(crate) fn new(input: ScanInput) -> Self {
+    pub(crate) fn new(input: ScanInput) -> Result<Self> {
         let mut properties = ScannerProperties::default()
             .with_append_mode(input.append_mode)
             .with_total_rows(input.total_rows());
-        let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
+        let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input)?);
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
         // Create the shared pruner with number of workers equal to CPU cores.
         let num_workers = common_stat::get_total_cpu_cores().max(1);
         let pruner = Arc::new(Pruner::new(stream_ctx.clone(), num_workers));
 
-        Self {
+        Ok(Self {
             properties,
             stream_ctx,
             pruner,
             receivers: Mutex::new(Vec::new()),
             metrics_list: Arc::new(PartitionMetricsList::default()),
-        }
+        })
     }
 
     #[tracing::instrument(
