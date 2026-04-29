@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use colored::Colorize;
+use datatypes::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use mito2::cache::CacheStrategy;
 use mito2::sst::file::RegionFileId;
@@ -26,7 +27,7 @@ use mito2::sst::parquet::metadata::MetadataLoader;
 use mito2::sst::parquet::reader::MetadataCacheMetrics;
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use serde::Deserialize;
 use snafu::ResultExt;
@@ -139,6 +140,10 @@ impl ParquetbenchCommand {
         let scan_config = self.load_scan_config().await?;
         let projection = resolve_projection_names(&scan_config, &region_meta)?;
         let projected_columns = projection_names_display(&scan_config);
+        let sst_schema = to_flat_sst_arrow_schema(
+            &region_meta,
+            &FlatSchemaOptions::from_encoding(region_meta.primary_key_encoding),
+        );
 
         println!(
             "{} Region ID: {} (u64: {})",
@@ -204,6 +209,7 @@ impl ParquetbenchCommand {
                 region_file_id,
                 parquet_meta.clone(),
                 projection.clone(),
+                sst_schema.clone(),
             )
             .await?;
 
@@ -304,18 +310,22 @@ async fn run_iteration(
     region_file_id: RegionFileId,
     parquet_meta: parquet::file::metadata::ParquetMetaData,
     projection: Option<Vec<usize>>,
+    sst_schema: SchemaRef,
 ) -> error::Result<IterationStats> {
     let parquet_meta = std::sync::Arc::new(parquet_meta);
-    let arrow_metadata = ArrowReaderMetadata::try_new(parquet_meta.clone(), Default::default())
-        .map_err(|e| {
-            error::IllegalConfigSnafu {
-                msg: format!(
-                    "Failed to build parquet arrow metadata for {}: {}",
-                    file_path, e
-                ),
-            }
-            .build()
-        })?;
+    let arrow_metadata = ArrowReaderMetadata::try_new(
+        parquet_meta.clone(),
+        ArrowReaderOptions::new().with_schema(sst_schema),
+    )
+    .map_err(|e| {
+        error::IllegalConfigSnafu {
+            msg: format!(
+                "Failed to build parquet arrow metadata for {}: {}",
+                file_path, e
+            ),
+        }
+        .build()
+    })?;
     let start = Instant::now();
     let mut stats = IterationStats::default();
     for row_group_idx in 0..parquet_meta.num_row_groups() {
