@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use colored::Colorize;
-use datatypes::arrow::array::DictionaryArray;
-use datatypes::arrow::datatypes::{SchemaRef, UInt32Type};
+use datatypes::arrow::datatypes::SchemaRef;
 use futures::StreamExt;
 use mito2::cache::CacheStrategy;
 use mito2::sst::file::RegionFileId;
@@ -34,7 +33,6 @@ use serde::Deserialize;
 use snafu::ResultExt;
 use store_api::metadata::RegionMetadata;
 use store_api::region_request::PathType;
-use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use store_api::storage::{FileId, RegionId};
 
 use crate::datanode::objbench::{build_object_store, extract_region_metadata, parse_config};
@@ -371,19 +369,6 @@ async fn run_iteration(
             }
             .build()
         })? {
-            if let Some((idx, _)) = batch.schema_ref().column_with_name(PRIMARY_KEY_COLUMN_NAME)
-                && let Some(dict) = batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<DictionaryArray<UInt32Type>>()
-            {
-                println!(
-                    "  Batch {} {} dictionary values: {}",
-                    stats.record_batches,
-                    PRIMARY_KEY_COLUMN_NAME,
-                    dict.values().len()
-                );
-            }
             stats.rows += batch.num_rows();
             stats.record_batches += 1;
         }
