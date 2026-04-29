@@ -84,6 +84,7 @@ impl BulkIterContext {
                 None,
                 "memtable",
                 skip_auto_convert,
+                crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
             )?
         } else {
             FlatReadFormat::new(
@@ -95,6 +96,7 @@ impl BulkIterContext {
                 None,
                 "memtable",
                 skip_auto_convert,
+                crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
             )?
         };
 

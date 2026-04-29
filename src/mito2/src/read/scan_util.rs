@@ -1233,7 +1233,7 @@ const BATCH_SIZE_THRESHOLD: u64 = 50;
 /// Returns the estimated rows per batch after splitting if splitting flat record batches
 /// may improve merge performance. Returns `None` if splitting is not beneficial.
 pub(crate) fn should_split_flat_batches_for_merge(
-    stream_ctx: &Arc<StreamContext>,
+    stream_ctx: &StreamContext,
     range_meta: &RangeMeta,
 ) -> Option<usize> {
     // Number of files to split and scan.
@@ -1314,6 +1314,39 @@ pub(crate) fn should_split_flat_batches_for_merge(
     Some(estimated_batch_size)
 }
 
+/// Maximum number of partition ranges sampled by
+/// [`scan_split_batch_size`] to derive a single scan-wide split decision.
+pub(crate) const SPLIT_SAMPLE_RANGES: usize = 4;
+
+/// Returns a single scan-wide estimated rows-per-batch when splitting flat
+/// record batches looks beneficial across the scan, or `None` when at least
+/// one sampled range cannot be split.
+///
+/// Up to [`SPLIT_SAMPLE_RANGES`] ranges are sampled at evenly spaced
+/// positions across `stream_ctx.ranges`. The decision is conservative: if
+/// any sampled range returns `None`, the scan-wide answer is `None`. When
+/// every sample agrees on splitting, the smallest per-range estimate wins to
+/// avoid over-splitting.
+pub(crate) fn scan_split_batch_size(stream_ctx: &StreamContext) -> Option<usize> {
+    let total = stream_ctx.ranges.len();
+    if total == 0 {
+        return None;
+    }
+    let n = SPLIT_SAMPLE_RANGES.min(total).max(1);
+    let mut min_estimate: Option<usize> = None;
+    for i in 0..n {
+        let idx = i * total / n;
+        let range = &stream_ctx.ranges[idx];
+        match should_split_flat_batches_for_merge(stream_ctx, range) {
+            Some(est) => {
+                min_estimate = Some(min_estimate.map_or(est, |cur| cur.min(est)));
+            }
+            None => return None,
+        }
+    }
+    min_estimate
+}
+
 /// Computes the channel size for parallel scan based on the estimated rows per batch.
 /// The channel should buffer approximately `2 * DEFAULT_READ_BATCH_SIZE` rows.
 pub(crate) fn compute_parallel_channel_size(estimated_rows_per_batch: usize) -> usize {
@@ -1375,6 +1408,7 @@ mod split_tests {
             input,
             ranges: vec![],
             scan_fingerprint: None,
+            scan_split_batch_size: None,
             query_start: std::time::Instant::now(),
         }
     }
@@ -1755,6 +1789,7 @@ mod tests {
             input,
             ranges: Vec::new(),
             scan_fingerprint: None,
+            scan_split_batch_size: None,
             query_start: Instant::now(),
         })
     }
@@ -1903,6 +1938,66 @@ mod tests {
             Some(DEFAULT_READ_BATCH_SIZE),
             should_split_flat_batches_for_merge(&stream_ctx, &range_meta)
         );
+    }
+
+    #[tokio::test]
+    async fn test_scan_split_batch_size_returns_min_when_all_samples_split() {
+        // Choose `num_series` values that produce per-file estimates below
+        // `DEFAULT_READ_BATCH_SIZE` so the clamp doesn't collapse them.
+        let num_rows = SPLIT_ROW_THRESHOLD * 2;
+        let mut stream_ctx = new_test_stream_ctx(
+            vec![
+                new_test_file(num_rows, num_rows / 100),
+                new_test_file(num_rows, num_rows / 200),
+                new_test_file(num_rows, num_rows / 400),
+            ],
+            vec![],
+        )
+        .await;
+        let mut ranges = Vec::new();
+        for i in 0..3 {
+            ranges.push(new_test_range_meta(smallvec![RowGroupIndex {
+                index: i,
+                row_group_index: 0,
+            }]));
+        }
+        let stream_ctx_mut = Arc::get_mut(&mut stream_ctx).unwrap();
+        stream_ctx_mut.ranges = ranges;
+        // Per-file estimates are 100, 200, 400 ⇒ min = 100.
+        assert_eq!(Some(100), scan_split_batch_size(&stream_ctx));
+    }
+
+    #[tokio::test]
+    async fn test_scan_split_batch_size_returns_none_when_any_sample_unsplittable() {
+        let num_series_unsplittable =
+            (SPLIT_ROW_THRESHOLD / (BATCH_SIZE_THRESHOLD - 1)).max(NUM_SERIES_THRESHOLD) + 1;
+        let mut stream_ctx = new_test_stream_ctx(
+            vec![
+                new_test_file(SPLIT_ROW_THRESHOLD * 2, 100),
+                new_test_file(SPLIT_ROW_THRESHOLD, num_series_unsplittable),
+            ],
+            vec![],
+        )
+        .await;
+        let ranges = vec![
+            new_test_range_meta(smallvec![RowGroupIndex {
+                index: 0,
+                row_group_index: 0,
+            }]),
+            new_test_range_meta(smallvec![RowGroupIndex {
+                index: 1,
+                row_group_index: 0,
+            }]),
+        ];
+        let stream_ctx_mut = Arc::get_mut(&mut stream_ctx).unwrap();
+        stream_ctx_mut.ranges = ranges;
+        assert_eq!(None, scan_split_batch_size(&stream_ctx));
+    }
+
+    #[tokio::test]
+    async fn test_scan_split_batch_size_returns_none_for_empty_ranges() {
+        let stream_ctx = new_test_stream_ctx(vec![], vec![]).await;
+        assert_eq!(None, scan_split_batch_size(&stream_ctx));
     }
 
     #[test]

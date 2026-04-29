@@ -76,6 +76,7 @@ use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
 };
 use crate::sst::parquet::flat_format::FlatReadFormat;
+use crate::sst::parquet::flat_read_options::FlatReadOptions;
 use crate::sst::parquet::format::need_override_sequence;
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::prefilter::{
@@ -153,6 +154,8 @@ pub struct ParquetReaderBuilder {
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
+    /// Options that control which physical columns are read from the SST.
+    flat_read_options: FlatReadOptions,
 }
 
 impl ParquetReaderBuilder {
@@ -183,6 +186,7 @@ impl ParquetReaderBuilder {
             pre_filter_mode: PreFilterMode::All,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
+            flat_read_options: FlatReadOptions::full(),
         }
     }
 
@@ -286,6 +290,13 @@ impl ParquetReaderBuilder {
         self
     }
 
+    /// Sets options that control which physical columns are read from the SST.
+    #[must_use]
+    pub(crate) fn flat_read_options(mut self, options: FlatReadOptions) -> Self {
+        self.flat_read_options = options;
+        self
+    }
+
     /// Builds a [ParquetReader].
     ///
     /// This needs to perform IO operation.
@@ -382,6 +393,7 @@ impl ParquetReaderBuilder {
                 Some(parquet_meta.file_metadata().schema_descr().num_columns()),
                 &file_path,
                 skip_auto_convert,
+                self.flat_read_options,
             )?
         } else {
             // Lists all column ids to read, we always use the expected metadata if possible.
@@ -397,6 +409,7 @@ impl ParquetReaderBuilder {
                 Some(parquet_meta.file_metadata().schema_descr().num_columns()),
                 &file_path,
                 skip_auto_convert,
+                self.flat_read_options,
             )?
         };
         if need_override_sequence(&parquet_meta) {
@@ -2149,6 +2162,7 @@ mod tests {
             None,
             &file_path,
             false,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
 

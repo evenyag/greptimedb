@@ -37,7 +37,7 @@ use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, DictionaryArray, UInt32Array, UInt64Array,
 };
 use datatypes::arrow::compute::kernels::take::take;
-use datatypes::arrow::datatypes::{Schema, SchemaRef};
+use datatypes::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::{ConcreteDataType, DataType};
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec, build_primary_key_codec};
@@ -51,13 +51,14 @@ use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, InvalidParquetSnafu, InvalidRecordBatchSnafu,
     NewRecordBatchSnafu, Result,
 };
+use crate::sst::parquet::flat_read_options::FlatReadOptions;
 use crate::sst::parquet::format::{
     FIXED_POS_COLUMN_NUM, FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray,
     PrimaryKeyReadFormat, StatValues, column_null_counts, column_values,
 };
 use crate::sst::{
-    FlatSchemaOptions, flat_sst_arrow_schema_column_num, tag_maybe_to_dictionary_field,
-    to_flat_sst_arrow_schema,
+    FlatSchemaOptions, flat_sst_arrow_schema_column_num, internal_fields,
+    tag_maybe_to_dictionary_field, to_flat_sst_arrow_schema,
 };
 
 /// Helper for writing the SST format.
@@ -143,9 +144,112 @@ pub(crate) fn field_column_start(metadata: &RegionMetadata, num_columns: usize) 
     num_columns - FIXED_POS_COLUMN_NUM - field_column_count
 }
 
-// TODO(yingwen): Add an option to skip reading internal columns if the region is
-// append only and doesn't use sparse encoding (We need to check the table id under
-// sparse encoding).
+/// Drops tag column ids from `column_ids` when `options.read_raw_tag_columns`
+/// is `false`. Returns a `Vec<ColumnId>` so the caller can re-iterate it
+/// across the legacy and flat parquet adapter constructors.
+///
+/// Tag column ids come from `metadata.primary_key`. Other column ids (field,
+/// time index, internal) pass through unchanged.
+fn filter_column_ids_for_options(
+    metadata: &RegionMetadata,
+    column_ids: impl Iterator<Item = ColumnId>,
+    options: FlatReadOptions,
+) -> Vec<ColumnId> {
+    if options.read_raw_tag_columns {
+        return column_ids.collect();
+    }
+    let pk_set: std::collections::HashSet<ColumnId> =
+        metadata.primary_key.iter().copied().collect();
+    column_ids.filter(|id| !pk_set.contains(id)).collect()
+}
+
+/// Returns the canonical (data columns + time index) schema for the SST
+/// boundary output.
+///
+/// Columns appear in SST canonical order (tags, fields, time index). Columns
+/// not present in `metadata` are dropped silently. Time index is always
+/// included even if absent from `user_column_ids`.
+fn canonical_batch_schema(
+    metadata: &RegionMetadata,
+    user_column_ids: &[ColumnId],
+) -> Vec<(ColumnId, ConcreteDataType)> {
+    let id_to_index = sst_column_id_indices(metadata);
+    let mut pairs: Vec<(ColumnId, usize, ConcreteDataType)> = user_column_ids
+        .iter()
+        .filter_map(|&id| {
+            id_to_index.get(&id).copied().map(|pos| {
+                let dt = metadata
+                    .column_by_id(id)
+                    .unwrap()
+                    .column_schema
+                    .data_type
+                    .clone();
+                (id, pos, dt)
+            })
+        })
+        .collect();
+    pairs.sort_unstable_by_key(|e| e.1);
+    pairs.dedup_by_key(|e| e.1);
+
+    // Always include the time index column.
+    let time_idx = metadata.time_index_column();
+    if !pairs.iter().any(|(id, _, _)| *id == time_idx.column_id) {
+        let pos = id_to_index[&time_idx.column_id];
+        let dt = time_idx.column_schema.data_type.clone();
+        let insert_at = pairs
+            .binary_search_by_key(&pos, |e| e.1)
+            .unwrap_or_else(|p| p);
+        pairs.insert(insert_at, (time_idx.column_id, pos, dt));
+    }
+
+    pairs.into_iter().map(|(id, _, dt)| (id, dt)).collect()
+}
+
+/// Builds a mocked tag column for the boundary expansion.
+///
+/// For string types we produce a dictionary-encoded array (one null value,
+/// `n` keys all set to 0). For non-string types we produce a length-`n`
+/// array of nulls.
+fn mock_tag_column(data_type: &ConcreteDataType, n: usize) -> ArrayRef {
+    if data_type.is_string() {
+        // Dictionary array of (UInt32, Utf8) with a single null value and
+        // `n` keys set to 0.
+        let mut builder = data_type.create_mutable_vector(1);
+        builder.push_null();
+        let values = builder.to_vector().to_arrow_array();
+        let keys = UInt32Array::new_null(n);
+        Arc::new(DictionaryArray::new(keys, values))
+    } else {
+        let mut builder = data_type.create_mutable_vector(n);
+        for _ in 0..n {
+            builder.push_null();
+        }
+        builder.to_vector().to_arrow_array()
+    }
+}
+
+/// Builds a mocked `__primary_key` column: a binary dictionary whose only
+/// dictionary value is an empty string (`b""`) with `n` keys all set to 0.
+fn mock_primary_key_column(n: usize) -> ArrayRef {
+    let values = Arc::new(BinaryArray::from_iter_values([b"" as &[u8]]));
+    let keys = UInt32Array::from_value(0, n);
+    Arc::new(DictionaryArray::new(keys, values))
+}
+
+/// Builds a mocked `__sequence` column: zeros.
+fn mock_sequence_column(n: usize) -> ArrayRef {
+    Arc::new(UInt64Array::from_value(0, n))
+}
+
+/// Builds a mocked `__op_type` column: `OpType::Put`.
+fn mock_op_type_column(n: usize) -> ArrayRef {
+    use api::v1::OpType;
+    Arc::new(datatypes::arrow::array::UInt8Array::from_value(
+        OpType::Put as u8,
+        n,
+    ))
+}
+
 /// Helper for reading the flat SST format with projection.
 ///
 /// It only supports flat format that stores primary keys additionally.
@@ -154,23 +258,58 @@ pub struct FlatReadFormat {
     override_sequence: Option<SequenceNumber>,
     /// Parquet format adapter.
     parquet_adapter: ParquetAdapter,
+    /// Read options used to construct this format.
+    options: FlatReadOptions,
+    /// Canonical column layout produced at the SST boundary
+    /// (data columns in SST canonical order, including the time index).
+    /// Internal columns (`__primary_key`, `__sequence`, `__op_type`) are
+    /// always appended on top of these and are not listed here.
+    canonical_layout: Vec<(ColumnId, ConcreteDataType)>,
+    /// Position of each canonical data column in the post-boundary batch.
+    /// Only populated when [`Self::expand_at_boundary`] is `true`; otherwise
+    /// callers fall back to [`FormatProjection::column_id_to_projected_index`].
+    canonical_position: HashMap<ColumnId, usize>,
+    /// Whether the boundary should expand the post-adapter batch by inserting
+    /// mocked arrays. `false` when [`Self::options`] is full or when the
+    /// adapter returns a non-flat layout (legacy primary-key compaction).
+    expand_at_boundary: bool,
 }
 
 impl FlatReadFormat {
     /// Creates a helper with existing `metadata` and `column_ids` to read.
     ///
-    /// If `skip_auto_convert` is true, skips auto conversion of format when the encoding is sparse encoding.
+    /// If `skip_auto_convert` is true, skips auto conversion of format when
+    /// the encoding is sparse encoding.
+    ///
+    /// `options` controls which physical columns are projected from parquet.
+    /// Pass [`FlatReadOptions::full`] to preserve current behavior. Tag
+    /// column IDs in `column_ids` are dropped automatically when
+    /// `options.read_raw_tag_columns` is `false`.
     pub fn new(
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
         num_columns: Option<usize>,
         file_path: &str,
         skip_auto_convert: bool,
+        options: FlatReadOptions,
     ) -> Result<FlatReadFormat> {
         let is_legacy = match num_columns {
             Some(num) => Self::is_legacy_format(&metadata, num, file_path)?,
             None => metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
         };
+
+        // Capture the user's original column ids before any filtering — needed
+        // to build the canonical layout for boundary expansion.
+        let user_column_ids: Vec<ColumnId> = column_ids.collect();
+
+        // The canonical layout described downstream: data columns + time
+        // index, in SST canonical order.
+        let canonical_layout = canonical_batch_schema(&metadata, &user_column_ids);
+
+        // When raw tag columns are skipped at the parquet layer, filter the
+        // tag column ids out of the read set.
+        let parquet_column_ids =
+            filter_column_ids_for_options(&metadata, user_column_ids.iter().copied(), options);
 
         let parquet_adapter = if is_legacy {
             // Safety: is_legacy_format() ensures primary_key is not empty.
@@ -178,22 +317,90 @@ impl FlatReadFormat {
                 // Only skip auto convert when the primary key encoding is sparse.
                 ParquetAdapter::PrimaryKeyToFlat(ParquetPrimaryKeyToFlat::new(
                     metadata,
-                    column_ids,
+                    parquet_column_ids.into_iter(),
                     skip_auto_convert,
+                    options,
                 ))
             } else {
                 ParquetAdapter::PrimaryKeyToFlat(ParquetPrimaryKeyToFlat::new(
-                    metadata, column_ids, false,
+                    metadata,
+                    parquet_column_ids.into_iter(),
+                    false,
+                    options,
                 ))
             }
         } else {
-            ParquetAdapter::Flat(ParquetFlat::new(metadata, column_ids))
+            ParquetAdapter::Flat(ParquetFlat::new(
+                metadata,
+                parquet_column_ids.into_iter(),
+                options,
+            ))
+        };
+
+        // Boundary expansion only applies when the adapter returns a flat
+        // (canonical-order) batch and at least one column was skipped. The
+        // `skip_auto_convert` path returns a primary-key layout that the
+        // compaction caller consumes directly, and only happens with full
+        // options — assert that to keep the contract clear.
+        let returns_flat_layout = match &parquet_adapter {
+            ParquetAdapter::Flat(_) => true,
+            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_format.is_some(),
+        };
+        debug_assert!(
+            returns_flat_layout || !options.has_mocked_columns(),
+            "skip_auto_convert path cannot be combined with non-full FlatReadOptions"
+        );
+        let expand_at_boundary = returns_flat_layout && options.has_mocked_columns();
+        let canonical_position = if expand_at_boundary {
+            canonical_layout
+                .iter()
+                .enumerate()
+                .map(|(idx, (col_id, _))| (*col_id, idx))
+                .collect()
+        } else {
+            HashMap::new()
         };
 
         Ok(FlatReadFormat {
             override_sequence: None,
             parquet_adapter,
+            options,
+            canonical_layout,
+            canonical_position,
+            expand_at_boundary,
         })
+    }
+
+    /// Returns the read options used to construct this format.
+    #[allow(dead_code)]
+    pub(crate) fn options(&self) -> &FlatReadOptions {
+        &self.options
+    }
+
+    /// Returns the canonical batch schema (data columns + time index) the
+    /// boundary produces. Internal columns are not included.
+    #[allow(dead_code)]
+    pub(crate) fn canonical_batch_schema(&self) -> &[(ColumnId, ConcreteDataType)] {
+        &self.canonical_layout
+    }
+
+    /// Returns the post-boundary "actual" data-column schema
+    /// `(column_id, data_type)` pairs that downstream
+    /// (e.g. [`FlatCompatBatch`](crate::read::compat::FlatCompatBatch))
+    /// should treat as the schema of batches produced by this format.
+    ///
+    /// When the boundary expands mocked columns this is the canonical layout
+    /// of the SST. Otherwise it matches the format projection (which is the
+    /// historical behavior).
+    pub(crate) fn batch_actual_schema(&self) -> Vec<(ColumnId, ConcreteDataType)> {
+        if self.expand_at_boundary {
+            self.canonical_layout.clone()
+        } else {
+            crate::read::flat_projection::flat_projected_columns(
+                self.metadata(),
+                self.format_projection(),
+            )
+        }
     }
 
     /// Sets the sequence number to override.
@@ -201,12 +408,31 @@ impl FlatReadFormat {
         self.override_sequence = sequence;
     }
 
-    /// Index of a column in the projected batch by its column id.
+    /// Index of a column in the post-boundary batch by its column id.
+    ///
+    /// When the boundary expands mocked columns the position follows the
+    /// canonical layout. Otherwise the lookup falls back to the format
+    /// projection's `column_id_to_projected_index`, which is the historical
+    /// behavior.
+    ///
+    /// Mocked columns are reported as `None` so callers (filter evaluation,
+    /// partition pruning) fall through to a real source — e.g. decoding tags
+    /// from `__primary_key` — rather than reading the placeholder array.
     pub fn projected_index_by_id(&self, column_id: ColumnId) -> Option<usize> {
-        self.format_projection()
-            .column_id_to_projected_index
-            .get(&column_id)
-            .copied()
+        if self.expand_at_boundary {
+            // Tag columns are mocked when `read_raw_tag_columns == false`.
+            if !self.options.read_raw_tag_columns
+                && self.metadata().primary_key.contains(&column_id)
+            {
+                return None;
+            }
+            self.canonical_position.get(&column_id).copied()
+        } else {
+            self.format_projection()
+                .column_id_to_projected_index
+                .get(&column_id)
+                .copied()
+        }
     }
 
     /// Returns min values of specific column in row groups.
@@ -320,6 +546,14 @@ impl FlatReadFormat {
             ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch)?,
         };
 
+        // Expand to canonical layout, inserting mocked arrays for any column
+        // that was skipped at the parquet layer.
+        let batch = if self.expand_at_boundary {
+            self.expand_to_canonical_layout(batch)?
+        } else {
+            batch
+        };
+
         // Then apply sequence override if provided
         let Some(override_array) = override_sequence_array else {
             return Ok(batch);
@@ -338,6 +572,94 @@ impl FlatReadFormat {
         columns[sequence_column_idx] = sequence_array;
 
         RecordBatch::try_new(batch.schema(), columns).context(NewRecordBatchSnafu)
+    }
+
+    /// Inserts mocked arrays for columns that were skipped at the parquet
+    /// layer, so the resulting batch matches the canonical downstream layout
+    /// `[<canonical_layout cols>, __primary_key, __sequence, __op_type]`.
+    ///
+    /// Assumes the input `batch` is already in canonical-or-subset order:
+    /// data columns from `column_id_to_projected_index` first (in SST
+    /// canonical order), then any internal columns that were actually read.
+    fn expand_to_canonical_layout(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let metadata = self.metadata();
+        let proj = self.format_projection();
+        let opts = self.options;
+        let n = batch.num_rows();
+
+        // Number of internal columns currently present in the post-adapter
+        // batch (in `[__pk, __seq, __op_type]` order, only those that were
+        // actually read).
+        let n_internal_in_batch = opts.read_primary_key_column as usize
+            + opts.read_sequence_column as usize
+            + opts.read_op_type_column as usize;
+        let mut internal_cursor = batch.num_columns() - n_internal_in_batch;
+
+        // Time index is always present in the projected batch (added by
+        // `compute_format_projection`'s fixed indices) but may not appear in
+        // `column_id_to_projected_index`. When that happens it sits at the
+        // position just before the internal columns.
+        let ts_id = metadata.time_index_column().column_id;
+        let ts_implicit_position = (!proj.column_id_to_projected_index.contains_key(&ts_id))
+            .then(|| internal_cursor.saturating_sub(1));
+
+        let mut new_columns: Vec<ArrayRef> =
+            Vec::with_capacity(self.canonical_layout.len() + INTERNAL_COLUMN_NUM);
+        let mut new_fields: Vec<FieldRef> =
+            Vec::with_capacity(self.canonical_layout.len() + INTERNAL_COLUMN_NUM);
+
+        // Data columns in canonical (SST) order.
+        for (col_id, data_type) in &self.canonical_layout {
+            let column_meta = metadata.column_by_id(*col_id).expect("canonical layout id");
+            let canonical_index = metadata
+                .column_index_by_id(*col_id)
+                .expect("canonical layout id");
+            let raw_field = &metadata.schema.arrow_schema().fields()[canonical_index];
+            let field = if column_meta.semantic_type == SemanticType::Tag {
+                tag_maybe_to_dictionary_field(data_type, raw_field)
+            } else {
+                raw_field.clone()
+            };
+            new_fields.push(field);
+
+            if let Some(&batch_idx) = proj.column_id_to_projected_index.get(col_id) {
+                new_columns.push(batch.column(batch_idx).clone());
+            } else if *col_id == ts_id
+                && let Some(idx) = ts_implicit_position
+            {
+                // Time index added implicitly by fixed indices.
+                new_columns.push(batch.column(idx).clone());
+            } else {
+                // Must be a tag column dropped by `filter_column_ids_for_options`.
+                new_columns.push(mock_tag_column(data_type, n));
+            }
+        }
+
+        // Internal columns at the end: `[__primary_key, __sequence, __op_type]`.
+        let internal = internal_fields();
+        new_fields.push(internal[0].clone());
+        if opts.read_primary_key_column {
+            new_columns.push(batch.column(internal_cursor).clone());
+            internal_cursor += 1;
+        } else {
+            new_columns.push(mock_primary_key_column(n));
+        }
+        new_fields.push(internal[1].clone());
+        if opts.read_sequence_column {
+            new_columns.push(batch.column(internal_cursor).clone());
+            internal_cursor += 1;
+        } else {
+            new_columns.push(mock_sequence_column(n));
+        }
+        new_fields.push(internal[2].clone());
+        if opts.read_op_type_column {
+            new_columns.push(batch.column(internal_cursor).clone());
+        } else {
+            new_columns.push(mock_op_type_column(n));
+        }
+
+        let new_schema = Arc::new(Schema::new(new_fields));
+        RecordBatch::try_new(new_schema, new_columns).context(NewRecordBatchSnafu)
     }
 
     /// Checks whether the batch from the parquet file needs to be converted to match the flat format.
@@ -407,6 +729,9 @@ struct ParquetPrimaryKeyToFlat {
     convert_format: Option<FlatConvertFormat>,
     /// Projection computed for the flat format.
     format_projection: FormatProjection,
+    /// Read options for this adapter.
+    #[allow(dead_code)]
+    options: FlatReadOptions,
 }
 
 impl ParquetPrimaryKeyToFlat {
@@ -415,6 +740,7 @@ impl ParquetPrimaryKeyToFlat {
         metadata: RegionMetadataRef,
         column_ids: impl Iterator<Item = ColumnId>,
         skip_auto_convert: bool,
+        options: FlatReadOptions,
     ) -> ParquetPrimaryKeyToFlat {
         assert!(if skip_auto_convert {
             metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse
@@ -445,9 +771,15 @@ impl ParquetPrimaryKeyToFlat {
                 &id_to_index,
                 sst_column_num,
                 column_ids.iter().copied(),
+                options,
             );
             (
-                FlatConvertFormat::new(Arc::clone(&metadata), &format_projection, codec),
+                FlatConvertFormat::new(
+                    Arc::clone(&metadata),
+                    &format_projection,
+                    codec,
+                    options.read_raw_tag_columns,
+                ),
                 format_projection,
             )
         };
@@ -456,6 +788,7 @@ impl ParquetPrimaryKeyToFlat {
             format,
             convert_format,
             format_projection,
+            options,
         }
     }
 
@@ -478,24 +811,36 @@ struct ParquetFlat {
     format_projection: FormatProjection,
     /// Column id to index in SST.
     column_id_to_sst_index: HashMap<ColumnId, usize>,
+    /// Read options for this adapter.
+    #[allow(dead_code)]
+    options: FlatReadOptions,
 }
 
 impl ParquetFlat {
     /// Creates a helper with existing `metadata` and `column_ids` to read.
-    fn new(metadata: RegionMetadataRef, column_ids: impl Iterator<Item = ColumnId>) -> ParquetFlat {
+    fn new(
+        metadata: RegionMetadataRef,
+        column_ids: impl Iterator<Item = ColumnId>,
+        options: FlatReadOptions,
+    ) -> ParquetFlat {
         // Creates a map to lookup index.
         let id_to_index = sst_column_id_indices(&metadata);
         let arrow_schema = to_flat_sst_arrow_schema(&metadata, &FlatSchemaOptions::default());
         let sst_column_num =
             flat_sst_arrow_schema_column_num(&metadata, &FlatSchemaOptions::default());
-        let format_projection =
-            FormatProjection::compute_format_projection(&id_to_index, sst_column_num, column_ids);
+        let format_projection = FormatProjection::compute_format_projection(
+            &id_to_index,
+            sst_column_num,
+            column_ids,
+            options,
+        );
 
         Self {
             metadata,
             arrow_schema,
             format_projection,
             column_id_to_sst_index: id_to_index,
+            options,
         }
     }
 
@@ -701,6 +1046,12 @@ pub(crate) struct FlatConvertFormat {
     codec: Arc<dyn PrimaryKeyCodec>,
     /// Projected primary key column information: (column_id, pk_index, column_index in metadata).
     projected_primary_keys: Vec<(ColumnId, usize, usize)>,
+    /// Whether `convert()` should decode raw tag columns and prepend them.
+    ///
+    /// `true` for the default eager-decode path. `false` when the consumer
+    /// (e.g. `FlatProjectionMapper` with lazy decode) doesn't need raw tag
+    /// columns in the intermediate batch — `convert` then short-circuits.
+    decode_to_raw_columns: bool,
 }
 
 impl FlatConvertFormat {
@@ -708,12 +1059,17 @@ impl FlatConvertFormat {
     ///
     /// The `format_projection` is the projection computed in the [FlatReadFormat] with the `metadata`.
     /// The `codec` is the primary key codec of the `metadata`.
+    /// `decode_to_raw_columns` controls whether `convert()` actually decodes
+    /// the primary key into raw tag columns. Pass `false` when raw tag
+    /// columns are mocked at the SST boundary and downstream stages decode
+    /// lazily — the converter then short-circuits unconditionally.
     ///
     /// Returns `None` if there is no primary key.
     pub(crate) fn new(
         metadata: RegionMetadataRef,
         format_projection: &FormatProjection,
         codec: Arc<dyn PrimaryKeyCodec>,
+        decode_to_raw_columns: bool,
     ) -> Option<Self> {
         if metadata.primary_key.is_empty() {
             return None;
@@ -736,6 +1092,7 @@ impl FlatConvertFormat {
             metadata,
             codec,
             projected_primary_keys,
+            decode_to_raw_columns,
         })
     }
 
@@ -743,7 +1100,7 @@ impl FlatConvertFormat {
     ///
     /// The primary key array in the batch is a dictionary array.
     pub(crate) fn convert(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        if self.projected_primary_keys.is_empty() {
+        if !self.decode_to_raw_columns || self.projected_primary_keys.is_empty() {
             return Ok(batch);
         }
 
@@ -793,6 +1150,7 @@ impl FlatReadFormat {
             None,
             "test",
             false,
+            FlatReadOptions::full(),
         )
         .unwrap()
     }
@@ -809,7 +1167,10 @@ mod tests {
     use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
-    use super::{FlatReadFormat, field_column_start};
+    use super::{
+        FlatReadFormat, FlatReadOptions, canonical_batch_schema, field_column_start,
+        filter_column_ids_for_options,
+    };
     use crate::sst::{
         FlatSchemaOptions, flat_sst_arrow_schema_column_num, to_flat_sst_arrow_schema,
     };
@@ -896,6 +1257,7 @@ mod tests {
             None,
             "test",
             false,
+            FlatReadOptions::full(),
         )
         .unwrap();
 
@@ -907,5 +1269,75 @@ mod tests {
         );
 
         assert_eq!(expected, output_schema);
+    }
+
+    #[test]
+    fn test_filter_column_ids_drops_tags_when_raw_tag_off() {
+        let metadata = build_metadata(2, 2, PrimaryKeyEncoding::Dense);
+        let mut opts = FlatReadOptions::full();
+        opts.read_raw_tag_columns = false;
+        // user_column_ids: [tag_0, tag_1, field_0, field_1, ts]
+        let kept = filter_column_ids_for_options(&metadata, [0, 1, 2, 3, 4].into_iter(), opts);
+        // tags (0 and 1) are dropped.
+        assert_eq!(kept, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_canonical_layout_includes_time_index() {
+        let metadata = build_metadata(1, 2, PrimaryKeyEncoding::Dense);
+        // user_column_ids only mentions field_0 (id=1). Time index (id=3) must
+        // still appear in the canonical layout because the boundary always
+        // produces it.
+        let layout = canonical_batch_schema(&metadata, &[1]);
+        let ids: Vec<u32> = layout.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&3));
+        assert!(ids.contains(&1));
+    }
+
+    #[test]
+    fn test_projected_index_skips_mocked_tags() {
+        let metadata = Arc::new(build_metadata(1, 1, PrimaryKeyEncoding::Dense));
+        let mut opts = FlatReadOptions::full();
+        // Drop the raw tag column.
+        opts.read_raw_tag_columns = false;
+        // We must still read the pk so the format has at least one missing
+        // column; otherwise `expand_at_boundary` is false and the lookup falls
+        // back to `column_id_to_projected_index`.
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            [0_u32, 1_u32, 2_u32].into_iter(),
+            None,
+            "test",
+            false,
+            opts,
+        )
+        .unwrap();
+
+        // Tag column (id=0): mocked at boundary, should report `None` so the
+        // caller falls back to the tag-decode path.
+        assert!(read_format.projected_index_by_id(0).is_none());
+        // Field column (id=1) and time index (id=2) report their canonical
+        // positions.
+        assert_eq!(read_format.projected_index_by_id(1), Some(1));
+        assert_eq!(read_format.projected_index_by_id(2), Some(2));
+    }
+
+    #[test]
+    fn test_canonical_batch_schema_excludes_internal_columns() {
+        let metadata = Arc::new(build_metadata(1, 1, PrimaryKeyEncoding::Dense));
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            [0_u32, 1_u32, 2_u32].into_iter(),
+            None,
+            "test",
+            false,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
+
+        let canonical = read_format.canonical_batch_schema();
+        // Tag, field, ts — no internal columns.
+        let ids: Vec<u32> = canonical.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 }

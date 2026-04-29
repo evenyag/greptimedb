@@ -419,6 +419,7 @@ mod tests {
             None,
             "test",
             true,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
         assert!(!read_format.batch_has_raw_pk_columns());

@@ -42,9 +42,9 @@ use crate::error::{
     CompatReaderSnafu, ComputeArrowSnafu, ConvertValueSnafu, CreateDefaultSnafu, DecodeSnafu,
     EncodeSnafu, NewRecordBatchSnafu, Result, UnsupportedOperationSnafu,
 };
-use crate::read::flat_projection::{FlatProjectionMapper, flat_projected_columns};
+use crate::read::flat_projection::FlatProjectionMapper;
 use crate::sst::parquet::flat_format::primary_key_column_index;
-use crate::sst::parquet::format::{FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray};
+use crate::sst::parquet::format::{INTERNAL_COLUMN_NUM, PrimaryKeyArray};
 use crate::sst::{internal_fields, tag_maybe_to_dictionary_field};
 
 /// Returns true if `left` and `right` have same columns and primary key encoding.
@@ -89,15 +89,15 @@ impl FlatCompatBatch {
     ///
     /// - `mapper` is built from the metadata users expect to see.
     /// - `actual` is the [RegionMetadata] of the input parquet.
-    /// - `format_projection` is the projection of the read format for the input parquet.
+    /// - `actual_schema` describes the data-column schema of batches produced
+    ///   by the read format, after any boundary materialization.
     /// - `compaction` indicates whether the reader is for compaction.
     pub(crate) fn try_new(
         mapper: &FlatProjectionMapper,
         actual: &RegionMetadataRef,
-        format_projection: &FormatProjection,
+        actual_schema: &[(ColumnId, ConcreteDataType)],
         compaction: bool,
     ) -> Result<Option<Self>> {
-        let actual_schema = flat_projected_columns(actual, format_projection);
         let expect_schema = mapper.batch_schema();
         if expect_schema == actual_schema {
             // Although the SST has a different schema, but the schema after projection is the same
@@ -111,7 +111,7 @@ impl FlatCompatBatch {
         }
 
         let (index_or_defaults, fields) =
-            Self::compute_index_and_fields(&actual_schema, expect_schema, mapper.metadata())?;
+            Self::compute_index_and_fields(actual_schema, expect_schema, mapper.metadata())?;
 
         let compat_pk = FlatCompatPrimaryKey::new(mapper.metadata(), actual)?;
 
@@ -710,12 +710,13 @@ mod tests {
             None,
             "test",
             false,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
+        let actual_schema = read_format.batch_actual_schema();
 
         let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
+            FlatCompatBatch::try_new(&mapper, &actual_metadata, &actual_schema, false)
                 .unwrap()
                 .unwrap();
 
@@ -805,12 +806,13 @@ mod tests {
             None,
             "test",
             false,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
+        let actual_schema = read_format.batch_actual_schema();
 
         let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
+            FlatCompatBatch::try_new(&mapper, &actual_metadata, &actual_schema, false)
                 .unwrap()
                 .unwrap();
 
@@ -896,12 +898,13 @@ mod tests {
             None,
             "test",
             false,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
+        let actual_schema = read_format.batch_actual_schema();
 
         let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, false)
+            FlatCompatBatch::try_new(&mapper, &actual_metadata, &actual_schema, false)
                 .unwrap()
                 .unwrap();
 
@@ -990,12 +993,13 @@ mod tests {
             None,
             "test",
             true,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
-        let format_projection = read_format.format_projection();
+        let actual_schema = read_format.batch_actual_schema();
 
         let compat_batch =
-            FlatCompatBatch::try_new(&mapper, &actual_metadata, format_projection, true)
+            FlatCompatBatch::try_new(&mapper, &actual_metadata, &actual_schema, true)
                 .unwrap()
                 .unwrap();
 

@@ -735,6 +735,7 @@ mod tests {
             input,
             ranges: vec![range_meta],
             scan_fingerprint,
+            scan_split_batch_size: None,
             query_start: Instant::now(),
         };
 

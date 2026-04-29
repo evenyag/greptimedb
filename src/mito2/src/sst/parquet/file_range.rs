@@ -685,6 +685,7 @@ mod tests {
             None,
             "test",
             true,
+            crate::sst::parquet::flat_read_options::FlatReadOptions::full(),
         )
         .unwrap();
 

@@ -27,6 +27,7 @@ use crate::sst::index::IndexOutput;
 pub(crate) mod async_reader;
 pub mod file_range;
 pub mod flat_format;
+pub mod flat_read_options;
 pub mod format;
 pub(crate) mod helper;
 pub(crate) mod metadata;

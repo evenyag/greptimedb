@@ -47,7 +47,7 @@ use crate::read::range_cache::{
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SplitRecordBatchStream, compute_parallel_channel_size,
-    scan_flat_file_ranges, scan_flat_mem_ranges, should_split_flat_batches_for_merge,
+    scan_flat_file_ranges, scan_flat_mem_ranges,
 };
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{BoxedRecordBatchStream, ScannerMetrics, scan_util};
@@ -643,7 +643,9 @@ pub(crate) async fn build_flat_sources(
         return Ok(None);
     }
 
-    let split_batch_size = should_split_flat_batches_for_merge(stream_ctx, range_meta);
+    // The split decision is precomputed scan-wide in `StreamContext`.
+    // Compaction always returns `None` (never splits).
+    let split_batch_size = stream_ctx.scan_split_batch_size;
     let should_split = split_batch_size.is_some();
     sources.reserve(num_indices);
     let mut ordered_sources = Vec::with_capacity(num_indices);

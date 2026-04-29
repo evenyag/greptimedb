@@ -57,6 +57,7 @@ use crate::read::compat::{self, FlatCompatBatch};
 use crate::read::flat_projection::FlatProjectionMapper;
 use crate::read::range::{FileRangeBuilder, MemRangeBuilder, RangeMeta, RowGroupIndex};
 use crate::read::range_cache::ScanRequestFingerprint;
+use crate::read::scan_util::scan_split_batch_size;
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_scan::SeriesScan;
 use crate::read::stream::ScanBatchStream;
@@ -75,6 +76,7 @@ use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBui
 #[cfg(feature = "vector_index")]
 use crate::sst::index::vector_index::applier::{VectorIndexApplier, VectorIndexApplierRef};
 use crate::sst::parquet::file_range::PreFilterMode;
+use crate::sst::parquet::flat_read_options::{FlatReadContext, FlatReadOptions};
 use crate::sst::parquet::reader::ReaderMetrics;
 
 #[cfg(feature = "vector_index")]
@@ -845,6 +847,11 @@ pub struct ScanInput {
     pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Scan-wide flat read options. Computed in [`StreamContext`] after the
+    /// split decision is known. Defaults to [`FlatReadOptions::full`] which
+    /// preserves pre-refactor behavior for any caller that bypasses the
+    /// `StreamContext` setup.
+    pub(crate) flat_read_options: FlatReadOptions,
     #[cfg(feature = "enterprise")]
     extension_ranges: Vec<BoxedExtensionRange>,
 }
@@ -881,6 +888,7 @@ impl ScanInput {
             explain_flat_format: false,
             snapshot_sequence: None,
             compaction: false,
+            flat_read_options: FlatReadOptions::full(),
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
@@ -1126,6 +1134,7 @@ impl ScanInput {
             .compaction(self.compaction)
             .pre_filter_mode(pre_filter_mode)
             .decode_primary_key_values(decode_pk_values)
+            .flat_read_options(self.flat_read_options)
             .build_reader_input(reader_metrics)
             .await;
         let read_input = match res {
@@ -1151,10 +1160,11 @@ impl ScanInput {
         if need_compat {
             // They have different schema. We need to adapt the batch first so the
             // mapper can convert it.
+            let actual_schema = file_range_ctx.read_format().batch_actual_schema();
             let compat = FlatCompatBatch::try_new(
                 &self.mapper,
                 file_range_ctx.read_format().metadata(),
-                file_range_ctx.read_format().format_projection(),
+                &actual_schema,
                 self.compaction,
             )?;
             file_range_ctx.set_compat_batch(compat);
@@ -1444,6 +1454,10 @@ pub struct StreamContext {
     /// `None` when the scan is not eligible for caching.
     #[allow(dead_code)]
     pub(crate) scan_fingerprint: Option<ScanRequestFingerprint>,
+    /// Scan-wide split decision precomputed by sampling partition ranges.
+    /// `Some(estimated_batch_size)` when splitting is beneficial, `None`
+    /// when not (e.g. compaction, or too few/non-splittable files).
+    pub(crate) scan_split_batch_size: Option<usize>,
 
     // Metrics:
     /// The start time of the query.
@@ -1458,12 +1472,16 @@ impl StreamContext {
         READ_SST_COUNT.observe(input.num_files() as f64);
         let scan_fingerprint = build_scan_fingerprint(&input);
 
-        Self {
+        let mut ctx = Self {
             input,
             ranges,
             scan_fingerprint,
+            scan_split_batch_size: None,
             query_start,
-        }
+        };
+        ctx.precompute_split_decision();
+        ctx.precompute_flat_read_options();
+        ctx
     }
 
     /// Creates a new [StreamContext] for [UnorderedScan].
@@ -1473,12 +1491,83 @@ impl StreamContext {
         READ_SST_COUNT.observe(input.num_files() as f64);
         let scan_fingerprint = build_scan_fingerprint(&input);
 
-        Self {
+        let mut ctx = Self {
             input,
             ranges,
             scan_fingerprint,
+            scan_split_batch_size: None,
             query_start,
+        };
+        ctx.precompute_split_decision();
+        ctx.precompute_flat_read_options();
+        ctx
+    }
+
+    /// Computes the scan-wide split decision once, just after ranges are
+    /// built. Compaction never splits.
+    fn precompute_split_decision(&mut self) {
+        if self.input.compaction || self.ranges.is_empty() {
+            return;
         }
+        self.scan_split_batch_size = scan_split_batch_size(self);
+    }
+
+    /// Computes scan-wide [`FlatReadOptions`] from the current state and
+    /// stores it on `self.input`. Also enables lazy tag decode on the
+    /// projection mapper when the rule indicates raw tag columns are mocked.
+    /// Must be called after [`Self::precompute_split_decision`].
+    fn precompute_flat_read_options(&mut self) {
+        let metadata = self.input.mapper.metadata().clone();
+        let pk_set: HashSet<ColumnId> = metadata.primary_key.iter().copied().collect();
+
+        let projection_has_tag = self
+            .input
+            .mapper
+            .output_column_ids()
+            .iter()
+            .any(|id| pk_set.contains(id));
+
+        // A tag is "filter-only" if it's in the read set but not in the
+        // output projection. Treating a tag that appears in both as
+        // projection-only is fine: the projection rule already forces
+        // raw_tag_columns / pk_column on, so the safety override would be
+        // redundant. Filter-only tags need explicit detection because the
+        // merge low-card-split optimization otherwise drops raw tag reads.
+        let output_set: HashSet<ColumnId> = self
+            .input
+            .mapper
+            .output_column_ids()
+            .iter()
+            .copied()
+            .collect();
+        let filter_columns_have_tag = self
+            .input
+            .read_column_ids
+            .iter()
+            .any(|id| pk_set.contains(id) && !output_set.contains(id));
+
+        let need_pk_filter = self.input.region_partition_expr.is_some();
+        let series_row_selector = self.input.series_row_selector.is_some();
+
+        let ctx = FlatReadContext {
+            append_mode: self.input.append_mode,
+            compaction: self.input.compaction,
+            encoding: metadata.primary_key_encoding,
+            projection_has_tag,
+            filter_columns_have_tag,
+            need_pk_filter,
+            series_row_selector,
+            merge_split_low_cardinality: self.scan_split_batch_size.is_some(),
+        };
+        let opts = FlatReadOptions::from_context(ctx);
+
+        if !opts.read_raw_tag_columns && !self.input.compaction && projection_has_tag {
+            // Mapper outputs include tag columns whose batch positions are
+            // mocked at the SST boundary; switch the mapper to lazy decode.
+            let mapper = Arc::make_mut(&mut self.input.mapper);
+            mapper.enable_lazy_tag_decode();
+        }
+        self.input.flat_read_options = opts;
     }
 
     /// Returns true if the index refers to a memtable.

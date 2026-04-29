@@ -20,12 +20,13 @@ use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::error::{ArrowComputeSnafu, ExternalSnafu, NewDfRecordBatchSnafu};
 use common_recordbatch::{DfRecordBatch, RecordBatch};
-use datatypes::arrow::array::Array;
+use datatypes::arrow::array::{Array, ArrayRef};
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field};
 use datatypes::prelude::{ConcreteDataType, DataType};
 use datatypes::schema::{Schema, SchemaRef};
 use datatypes::value::Value;
 use datatypes::vectors::Helper;
+use mito_codec::row_converter::{PrimaryKeyCodec, build_primary_key_codec};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::ColumnId;
@@ -33,7 +34,8 @@ use store_api::storage::ColumnId;
 use crate::cache::CacheStrategy;
 use crate::error::{InvalidRequestSnafu, RecordBatchSnafu, Result};
 use crate::read::projection::{read_column_ids_from_projection, repeated_vector_with_cache};
-use crate::sst::parquet::flat_format::sst_column_id_indices;
+use crate::sst::parquet::flat_format::{decode_primary_keys, sst_column_id_indices};
+use crate::sst::parquet::flat_read_options::FlatReadOptions;
 use crate::sst::parquet::format::FormatProjection;
 use crate::sst::{
     FlatSchemaOptions, internal_fields, tag_maybe_to_dictionary_field, to_flat_sst_arrow_schema,
@@ -43,6 +45,7 @@ use crate::sst::{
 ///
 /// This mapper support duplicate and unsorted projection indices.
 /// The output schema is determined by the projection indices.
+#[derive(Clone)]
 pub struct FlatProjectionMapper {
     /// Metadata of the region.
     metadata: RegionMetadataRef,
@@ -62,8 +65,38 @@ pub struct FlatProjectionMapper {
     is_empty_projection: bool,
     /// The index in flat format [RecordBatch] for each column in the output [RecordBatch].
     batch_indices: Vec<usize>,
+    /// Output column id for each output position. Same length as
+    /// [`Self::batch_indices`]. Used to identify tag projections for lazy
+    /// `__primary_key` decoding.
+    #[allow(dead_code)]
+    output_column_ids: Vec<ColumnId>,
     /// Precomputed Arrow schema for input batches.
     input_arrow_schema: datatypes::arrow::datatypes::SchemaRef,
+    /// When `true`, raw tag columns in the input batch are mocked at the SST
+    /// boundary; projected tag columns must be decoded from `__primary_key`
+    /// at convert time. See [`Self::enable_lazy_tag_decode`].
+    decode_tags_lazily: bool,
+    /// Primary key codec used by the lazy decode path. `None` when
+    /// [`Self::decode_tags_lazily`] is `false`.
+    pk_codec: Option<Arc<dyn PrimaryKeyCodec>>,
+    /// For each output position, the (pk_index, column_id) needed to decode
+    /// the column from `__primary_key` when lazy decode is on. `None` for
+    /// non-tag outputs. Empty when lazy decode is off.
+    output_pk_decode_info: Vec<Option<TagDecodeInfo>>,
+}
+
+/// Decode plan for a single output column when lazy tag decode is on.
+#[derive(Debug, Clone)]
+struct TagDecodeInfo {
+    /// Column id of the tag.
+    column_id: ColumnId,
+    /// Position of the tag in `metadata.primary_key` (for dense lookup).
+    /// Always `Some` here; the dense vs. sparse decision happens in
+    /// `DecodedPrimaryKeys::get_tag_column`.
+    pk_index: usize,
+    /// Index of the column in `metadata.column_metadatas`. Used to look up
+    /// the input data type when decoding.
+    column_index: usize,
 }
 
 impl FlatProjectionMapper {
@@ -117,6 +150,7 @@ impl FlatProjectionMapper {
             // All columns with internal columns.
             metadata.column_metadatas.len() + 3,
             read_column_ids.iter().copied(),
+            FlatReadOptions::full(),
         );
 
         let batch_schema = flat_projected_columns(metadata, &format_projection);
@@ -167,8 +201,58 @@ impl FlatProjectionMapper {
             batch_schema,
             is_empty_projection,
             batch_indices,
+            output_column_ids,
             input_arrow_schema,
+            decode_tags_lazily: false,
+            pk_codec: None,
+            output_pk_decode_info: Vec::new(),
         })
+    }
+
+    /// Enables lazy decoding of tag columns from `__primary_key` at convert
+    /// time. Call this when the SST read boundary mocked raw tag columns
+    /// (i.e. `FlatReadOptions::read_raw_tag_columns` was `false` for this
+    /// scan). Has no effect when the projection is empty or the metadata has
+    /// no primary key.
+    #[allow(dead_code)]
+    pub(crate) fn enable_lazy_tag_decode(&mut self) {
+        if self.is_empty_projection || self.metadata.primary_key.is_empty() {
+            return;
+        }
+
+        let pk_index_by_id: std::collections::HashMap<ColumnId, usize> = self
+            .metadata
+            .primary_key
+            .iter()
+            .enumerate()
+            .map(|(idx, &id)| (id, idx))
+            .collect();
+
+        let mut info = Vec::with_capacity(self.output_column_ids.len());
+        for &id in &self.output_column_ids {
+            if let Some(&pk_index) = pk_index_by_id.get(&id) {
+                let column_index = self
+                    .metadata
+                    .column_index_by_id(id)
+                    .expect("output column id must be in metadata");
+                info.push(Some(TagDecodeInfo {
+                    column_id: id,
+                    pk_index,
+                    column_index,
+                }));
+            } else {
+                info.push(None);
+            }
+        }
+
+        // If no projected outputs are tags, nothing to decode lazily.
+        if info.iter().all(|i| i.is_none()) {
+            return;
+        }
+
+        self.decode_tags_lazily = true;
+        self.pk_codec = Some(build_primary_key_codec(&self.metadata));
+        self.output_pk_decode_info = info;
     }
 
     /// Returns a new mapper without projection.
@@ -185,6 +269,12 @@ impl FlatProjectionMapper {
     /// from memtables and SSTs.
     pub(crate) fn column_ids(&self) -> &[ColumnId] {
         &self.read_column_ids
+    }
+
+    /// Returns the column ids of the user's output projection (without
+    /// filter-only columns).
+    pub(crate) fn output_column_ids(&self) -> &[ColumnId] {
+        &self.output_column_ids
     }
 
     /// Returns the field column start index in output batch.
@@ -251,10 +341,53 @@ impl FlatProjectionMapper {
         if self.is_empty_projection {
             return RecordBatch::new_with_count(self.output_schema.clone(), batch.num_rows());
         }
+
+        // Lazy tag decode: when the SST boundary mocked raw tag columns,
+        // decode them from `__primary_key` once and reuse across the
+        // projected tag outputs.
+        let decoded_pks = if self.decode_tags_lazily {
+            let codec = self
+                .pk_codec
+                .as_ref()
+                .expect("pk_codec must be set when decode_tags_lazily=true");
+            Some(
+                decode_primary_keys(codec.as_ref(), batch)
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?,
+            )
+        } else {
+            None
+        };
+
         // Construct output record batch directly from Arrow arrays to avoid
         // Arrow -> Vector -> Arrow roundtrips in the hot path.
         let mut arrays = Vec::with_capacity(self.output_schema.num_columns());
         for (output_idx, index) in self.batch_indices.iter().enumerate() {
+            // Lazy tag decode short-circuit.
+            if let Some(decoded) = decoded_pks.as_ref()
+                && let Some(info) = self
+                    .output_pk_decode_info
+                    .get(output_idx)
+                    .and_then(|x| x.as_ref())
+            {
+                let column_meta = &self.metadata.column_metadatas[info.column_index];
+                let array = decoded
+                    .get_tag_column(
+                        info.column_id,
+                        Some(info.pk_index),
+                        &column_meta.column_schema.data_type,
+                    )
+                    .map_err(BoxedError::new)
+                    .context(ExternalSnafu)?;
+                arrays.push(maybe_repeat_string_dictionary(
+                    array,
+                    &self.output_schema.column_schemas()[output_idx].data_type,
+                    batch.num_rows(),
+                    cache_strategy,
+                )?);
+                continue;
+            }
+
             let mut array = batch.column(*index).clone();
             // Cast dictionary values to the target type.
             if let ArrowDataType::Dictionary(_key_type, value_type) = array.data_type() {
@@ -320,6 +453,35 @@ impl FlatProjectionMapper {
         }
         Ok(columns)
     }
+}
+
+/// Casts a (possibly dictionary-encoded) decoded tag column to its output
+/// type, applying the same single-value-string-dictionary fast path used for
+/// in-batch tag columns.
+fn maybe_repeat_string_dictionary(
+    array: ArrayRef,
+    output_type: &ConcreteDataType,
+    num_rows: usize,
+    cache_strategy: &CacheStrategy,
+) -> common_recordbatch::error::Result<ArrayRef> {
+    let ArrowDataType::Dictionary(_key_type, value_type) = array.data_type().clone() else {
+        return Ok(array);
+    };
+    if let Some(dict_array) =
+        single_value_string_dictionary(&array, output_type, value_type.as_ref())
+    {
+        let dict_values = dict_array.values();
+        let value = if dict_values.is_null(0) {
+            Value::Null
+        } else {
+            Value::from(datatypes::arrow_array::string_array_value(dict_values, 0))
+        };
+        let repeated = repeated_vector_with_cache(output_type, &value, num_rows, cache_strategy)?;
+        return Ok(repeated.to_arrow_array());
+    }
+    let casted =
+        datatypes::arrow::compute::cast(&array, value_type.as_ref()).context(ArrowComputeSnafu)?;
+    Ok(casted)
 }
 
 fn single_value_string_dictionary<'a>(

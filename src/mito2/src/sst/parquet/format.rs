@@ -54,6 +54,7 @@ use crate::error::{
 };
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::sst::file::{FileMeta, FileTimeRange};
+use crate::sst::parquet::flat_read_options::FlatReadOptions;
 use crate::sst::to_sst_arrow_schema;
 
 /// Arrow array type for the primary key dictionary.
@@ -237,6 +238,7 @@ impl PrimaryKeyReadFormat {
             &field_id_to_index,
             arrow_schema.fields.len(),
             column_ids,
+            FlatReadOptions::full(),
         );
 
         PrimaryKeyReadFormat {
@@ -593,10 +595,15 @@ impl FormatProjection {
     /// Computes the projection.
     ///
     /// `id_to_index` is a mapping from column id to the index of the column in the SST.
+    /// `options` controls which fixed-position internal columns
+    /// (`__primary_key`, `__sequence`, `__op_type`) are included in the
+    /// projection. The time index is always included. Pass
+    /// [`FlatReadOptions::full`] to keep the legacy / current behavior.
     pub(crate) fn compute_format_projection(
         id_to_index: &HashMap<ColumnId, usize>,
         sst_column_num: usize,
         column_ids: impl Iterator<Item = ColumnId>,
+        options: FlatReadOptions,
     ) -> Self {
         // Maps column id of a projected column to its index in SST.
         // It also ignores columns not in the SST.
@@ -615,13 +622,31 @@ impl FormatProjection {
         // Dedups the entries to avoid the case that `column_ids` has duplicated columns.
         projected_schema.dedup_by_key(|x| x.1);
 
+        // Fixed-position layout at the end of the SST: time_index,
+        // __primary_key, __sequence, __op_type. The time index is always
+        // read; the rest are gated by `options`.
+        let time_index_pos = sst_column_num - FIXED_POS_COLUMN_NUM;
+        let pk_pos = sst_column_num - 3;
+        let seq_pos = sst_column_num - 2;
+        let op_type_pos = sst_column_num - 1;
+        let mut fixed_indices: Vec<usize> = Vec::with_capacity(FIXED_POS_COLUMN_NUM);
+        fixed_indices.push(time_index_pos);
+        if options.read_primary_key_column {
+            fixed_indices.push(pk_pos);
+        }
+        if options.read_sequence_column {
+            fixed_indices.push(seq_pos);
+        }
+        if options.read_op_type_column {
+            fixed_indices.push(op_type_pos);
+        }
+
         // Collects all projected indices.
         // It contains the positions of all columns we need to read.
         let mut projection_indices: Vec<_> = projected_schema
             .iter()
             .map(|(_column_id, index)| *index)
-            // We need to add all fixed position columns.
-            .chain(sst_column_num - FIXED_POS_COLUMN_NUM..sst_column_num)
+            .chain(fixed_indices)
             .collect();
         projection_indices.sort_unstable();
         // Removes duplications.
@@ -1159,26 +1184,51 @@ mod tests {
         // The projection includes all "fixed position" columns: ts(4), __primary_key(5), __sequence(6), __op_type(7)
 
         // Only read tag1 (column_id=3, index=1) + fixed columns
-        let read_format =
-            FlatReadFormat::new(metadata.clone(), [3].iter().copied(), None, "test", false)
-                .unwrap();
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            [3].iter().copied(),
+            None,
+            "test",
+            false,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
         assert_eq!(&[1, 4, 5, 6, 7], read_format.projection_indices());
 
         // Only read field1 (column_id=4, index=2) + fixed columns
-        let read_format =
-            FlatReadFormat::new(metadata.clone(), [4].iter().copied(), None, "test", false)
-                .unwrap();
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            [4].iter().copied(),
+            None,
+            "test",
+            false,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
         assert_eq!(&[2, 4, 5, 6, 7], read_format.projection_indices());
 
         // Only read ts (column_id=5, index=4) + fixed columns (ts is already included in fixed)
-        let read_format =
-            FlatReadFormat::new(metadata.clone(), [5].iter().copied(), None, "test", false)
-                .unwrap();
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            [5].iter().copied(),
+            None,
+            "test",
+            false,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
         assert_eq!(&[4, 5, 6, 7], read_format.projection_indices());
 
         // Read field0(column_id=2, index=3), tag0(column_id=1, index=0), ts(column_id=5, index=4) + fixed columns
-        let read_format =
-            FlatReadFormat::new(metadata, [2, 1, 5].iter().copied(), None, "test", false).unwrap();
+        let read_format = FlatReadFormat::new(
+            metadata,
+            [2, 1, 5].iter().copied(),
+            None,
+            "test",
+            false,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
         assert_eq!(&[0, 3, 4, 5, 6, 7], read_format.projection_indices());
     }
 
@@ -1191,6 +1241,7 @@ mod tests {
             Some(8),
             "test",
             false,
+            FlatReadOptions::full(),
         )
         .unwrap();
 
@@ -1408,6 +1459,7 @@ mod tests {
             Some(6),
             "test",
             false,
+            FlatReadOptions::full(),
         )
         .unwrap();
 
@@ -1490,6 +1542,7 @@ mod tests {
             None,
             "test",
             false,
+            FlatReadOptions::full(),
         )
         .unwrap();
 
@@ -1573,9 +1626,15 @@ mod tests {
         // Compare the actual result with the expected record batch
         assert_eq!(expected_record_batch, result);
 
-        let format =
-            FlatReadFormat::new(metadata.clone(), column_ids.into_iter(), None, "test", true)
-                .unwrap();
+        let format = FlatReadFormat::new(
+            metadata.clone(),
+            column_ids.into_iter(),
+            None,
+            "test",
+            true,
+            FlatReadOptions::full(),
+        )
+        .unwrap();
         // Test conversion with sparse encoding and skip convert.
         let result = format.convert_batch(record_batch.clone(), None).unwrap();
         assert_eq!(record_batch, result);
