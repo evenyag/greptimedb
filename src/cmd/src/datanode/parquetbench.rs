@@ -85,6 +85,7 @@ pub struct ParquetbenchCommand {
 #[derive(Debug, Deserialize, Default)]
 struct ParquetScanConfig {
     projection_names: Option<Vec<String>>,
+    row_groups: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -139,7 +140,9 @@ impl ParquetbenchCommand {
         let region_meta = extract_region_metadata(&file_path, &parquet_meta)?;
         let scan_config = self.load_scan_config().await?;
         let projection = resolve_projection_names(&scan_config, &region_meta)?;
+        let row_groups = resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?;
         let projected_columns = projection_names_display(&scan_config);
+        let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
         let sst_schema = to_flat_sst_arrow_schema(
             &region_meta,
             &FlatSchemaOptions::from_encoding(region_meta.primary_key_encoding),
@@ -157,6 +160,7 @@ impl ParquetbenchCommand {
             "✓".green(),
             projected_columns.as_deref().unwrap_or("all columns").cyan()
         );
+        println!("{} Row groups: {}", "✓".green(), row_groups_display.cyan());
         println!(
             "{} Parquet rows: {}, row groups: {}, file size: {}",
             "✓".green(),
@@ -209,6 +213,7 @@ impl ParquetbenchCommand {
                 region_file_id,
                 parquet_meta.clone(),
                 projection.clone(),
+                row_groups.clone(),
                 sst_schema.clone(),
             )
             .await?;
@@ -310,6 +315,7 @@ async fn run_iteration(
     region_file_id: RegionFileId,
     parquet_meta: parquet::file::metadata::ParquetMetaData,
     projection: Option<Vec<usize>>,
+    row_groups: Vec<usize>,
     sst_schema: SchemaRef,
 ) -> error::Result<IterationStats> {
     let parquet_meta = std::sync::Arc::new(parquet_meta);
@@ -328,7 +334,7 @@ async fn run_iteration(
     })?;
     let start = Instant::now();
     let mut stats = IterationStats::default();
-    for row_group_idx in 0..parquet_meta.num_row_groups() {
+    for row_group_idx in row_groups {
         let async_reader = SstAsyncFileReader::new(
             region_file_id,
             file_path.clone(),
@@ -409,11 +415,46 @@ fn resolve_projection_names(
     Ok(Some(projection))
 }
 
+fn resolve_row_groups(
+    scan_config: &ParquetScanConfig,
+    num_row_groups: usize,
+) -> error::Result<Vec<usize>> {
+    match &scan_config.row_groups {
+        Some(row_groups) => {
+            for row_group_idx in row_groups {
+                if *row_group_idx >= num_row_groups {
+                    return Err(error::IllegalConfigSnafu {
+                        msg: format!(
+                            "Invalid row group {} in row_groups, parquet file has row groups [0, {})",
+                            row_group_idx, num_row_groups
+                        ),
+                    }
+                    .build());
+                }
+            }
+            Ok(row_groups.clone())
+        }
+        None => Ok((0..num_row_groups).collect()),
+    }
+}
+
 fn projection_names_display(scan_config: &ParquetScanConfig) -> Option<String> {
     scan_config
         .projection_names
         .as_ref()
         .map(|cols| cols.join(", "))
+}
+
+fn row_groups_display(row_groups: &[usize], total_row_groups: usize) -> String {
+    if row_groups.len() == total_row_groups {
+        "all row groups".to_string()
+    } else {
+        row_groups
+            .iter()
+            .map(|idx| idx.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn parse_region_id(s: &str) -> error::Result<RegionId> {
@@ -551,11 +592,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scan_config_row_groups() {
+        let config: ParquetScanConfig =
+            serde_json::from_value(json!({ "row_groups": [0, 2, 4] })).unwrap();
+        assert_eq!(config.row_groups, Some(vec![0, 2, 4]));
+    }
+
+    #[test]
     fn test_resolve_projection_names() {
         let metadata = new_test_metadata();
         let projection = resolve_projection_names(
             &ParquetScanConfig {
                 projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
+                row_groups: None,
             },
             &metadata,
         )
@@ -569,6 +618,7 @@ mod tests {
         let err = resolve_projection_names(
             &ParquetScanConfig {
                 projection_names: Some(vec!["memory".to_string()]),
+                row_groups: None,
             },
             &metadata,
         )
@@ -578,6 +628,33 @@ mod tests {
         assert!(msg.contains("host"));
         assert!(msg.contains("cpu"));
         assert!(msg.contains("ts"));
+    }
+
+    #[test]
+    fn test_resolve_row_groups_all() {
+        assert_eq!(
+            resolve_row_groups(&ParquetScanConfig::default(), 3).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn test_resolve_row_groups_subset() {
+        let config = ParquetScanConfig {
+            projection_names: None,
+            row_groups: Some(vec![2, 0]),
+        };
+        assert_eq!(resolve_row_groups(&config, 4).unwrap(), vec![2, 0]);
+    }
+
+    #[test]
+    fn test_resolve_row_groups_invalid() {
+        let config = ParquetScanConfig {
+            projection_names: None,
+            row_groups: Some(vec![3]),
+        };
+        let err = resolve_row_groups(&config, 3).unwrap_err();
+        assert!(err.to_string().contains("Invalid row group 3"));
     }
 
     #[test]
