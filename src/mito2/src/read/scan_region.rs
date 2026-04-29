@@ -1145,6 +1145,12 @@ impl ScanInput {
             return Ok(FileRangeBuilder::default());
         };
 
+        common_telemetry::info!(
+            "Prune file, file: {}, selection: {:?}",
+            file.file_id(),
+            selection
+        );
+
         let need_compat = !compat::has_same_columns_and_pk_encoding(
             self.mapper.metadata(),
             file_range_ctx.read_format().metadata(),
