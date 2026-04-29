@@ -222,10 +222,11 @@ impl FlatProjectionMapper {
     pub(crate) fn apply_flat_read_options(&mut self, options: FlatReadOptions) -> Result<()> {
         let id_to_index = sst_column_id_indices(&self.metadata);
         let sst_column_num = self.metadata.column_metadatas.len() + 3;
+        let read_column_ids = filter_read_column_ids_for_options(&self.metadata, &self.read_column_ids, options);
         let format_projection = FormatProjection::compute_format_projection(
             &id_to_index,
             sst_column_num,
-            self.read_column_ids.iter().copied(),
+            read_column_ids.into_iter(),
             options,
         );
         self.batch_schema = flat_projected_columns(&self.metadata, &format_projection);
@@ -606,6 +607,23 @@ fn compute_batch_field_column_start(
         .unwrap_or(batch_schema.len())
 }
 
+fn filter_read_column_ids_for_options(
+    metadata: &RegionMetadata,
+    read_column_ids: &[ColumnId],
+    options: FlatReadOptions,
+) -> Vec<ColumnId> {
+    if options.read_raw_tag_columns {
+        return read_column_ids.to_vec();
+    }
+
+    let pk_column_ids: std::collections::HashSet<_> = metadata.primary_key.iter().copied().collect();
+    read_column_ids
+        .iter()
+        .copied()
+        .filter(|column_id| !pk_column_ids.contains(column_id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -617,7 +635,8 @@ mod tests {
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
-    use super::compute_batch_field_column_start;
+    use super::{compute_batch_field_column_start, filter_read_column_ids_for_options};
+    use crate::sst::parquet::flat_read_options::FlatReadOptions;
 
     #[test]
     fn test_compute_batch_field_column_start_for_projected_schema() {
@@ -675,6 +694,50 @@ mod tests {
             (4, ConcreteDataType::timestamp_millisecond_datatype()),
         ];
         assert_eq!(compute_batch_field_column_start(&metadata, &without_tag), 0);
+    }
+
+    #[test]
+    fn test_filter_read_column_ids_for_options_drops_tags() {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(0, 0));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "tag_0",
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "field_0",
+                    ConcreteDataType::int64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 3,
+            })
+            .primary_key(vec![1])
+            .primary_key_encoding(PrimaryKeyEncoding::Dense);
+        let metadata = builder.build().unwrap();
+
+        let mut opts = FlatReadOptions::full();
+        opts.read_raw_tag_columns = false;
+
+        assert_eq!(
+            filter_read_column_ids_for_options(&metadata, &[1, 2, 3], opts),
+            vec![2, 3]
+        );
     }
 }
 

@@ -29,9 +29,10 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
+use snafu::ResultExt;
 use store_api::storage::RegionId;
 
-use crate::error::Result;
+use crate::error::{NewRecordBatchSnafu, Result};
 use crate::memtable::MemScanMetrics;
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
@@ -1210,7 +1211,7 @@ pub(crate) fn scan_flat_mem_ranges(
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
             while let Some(record_batch) = iter.next().transpose()? {
-                yield record_batch;
+                yield maybe_drop_raw_tag_columns(&stream_ctx, record_batch)?;
             }
 
             // Report the memtable scan metrics to partition metrics
@@ -1220,6 +1221,51 @@ pub(crate) fn scan_flat_mem_ranges(
             }
         }
     }
+}
+
+fn maybe_drop_raw_tag_columns(
+    stream_ctx: &StreamContext,
+    record_batch: RecordBatch,
+) -> Result<RecordBatch> {
+    if stream_ctx.input.flat_read_options.read_raw_tag_columns {
+        return Ok(record_batch);
+    }
+
+    let read_column_ids: std::collections::HashSet<_> =
+        stream_ctx.input.read_column_ids.iter().copied().collect();
+    let raw_tag_column_names: std::collections::HashSet<_> = stream_ctx
+        .input
+        .region_metadata()
+        .primary_key_columns()
+        .filter(|column| read_column_ids.contains(&column.column_id))
+        .map(|column| column.column_schema.name.as_str())
+        .collect();
+    if raw_tag_column_names.is_empty() {
+        return Ok(record_batch);
+    }
+
+    let data_column_count = record_batch.num_columns().saturating_sub(3);
+    let mut kept_indices = Vec::with_capacity(record_batch.num_columns());
+    for (index, field) in record_batch.schema().fields().iter().enumerate() {
+        if index < data_column_count && raw_tag_column_names.contains(field.name().as_str()) {
+            continue;
+        }
+        kept_indices.push(index);
+    }
+    if kept_indices.len() == record_batch.num_columns() {
+        return Ok(record_batch);
+    }
+
+    let columns = kept_indices
+        .iter()
+        .map(|index| record_batch.column(*index).clone())
+        .collect::<Vec<_>>();
+    let fields = kept_indices
+        .iter()
+        .map(|index| record_batch.schema().fields()[*index].clone())
+        .collect::<Vec<_>>();
+    let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(fields));
+    RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)
 }
 
 /// Files with row count greater than this threshold can contribute to the estimation.
