@@ -43,6 +43,8 @@ use store_api::storage::{ColumnId, FileId, RegionId};
 use crate::datanode::objbench::{build_object_store, extract_region_metadata, parse_config};
 use crate::error;
 
+const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
+
 /// Parquet benchmark command - benchmarks scanning a single parquet SST directly.
 #[derive(Debug, Parser)]
 pub struct ParquetbenchCommand {
@@ -69,6 +71,10 @@ pub struct ParquetbenchCommand {
     /// Number of iterations for benchmarking
     #[clap(long, default_value = "1")]
     iterations: usize,
+
+    /// Number of rows per record batch for the direct reader.
+    #[clap(long, default_value_t = DEFAULT_READ_BATCH_SIZE, value_parser = parse_batch_size)]
+    batch_size: usize,
 
     /// Path type for the region: bare, data, metadata
     #[clap(long, default_value = "bare")]
@@ -214,6 +220,23 @@ impl ParquetbenchCommand {
             }
             .cyan()
         );
+        match self.reader {
+            ReaderMode::Direct => {
+                println!("{} Batch size: {}", "✓".green(), self.batch_size);
+            }
+            ReaderMode::FlatPrune => {
+                println!(
+                    "{} Batch size: {} (flat-prune internal default)",
+                    "✓".green(),
+                    DEFAULT_READ_BATCH_SIZE
+                );
+                println!(
+                    "{} --batch-size is only used by the direct reader; ignoring {} in flat-prune mode",
+                    "ℹ".blue(),
+                    self.batch_size
+                );
+            }
+        }
         if self.reader == ReaderMode::FlatPrune && self.pk_as_binary {
             println!(
                 "{} --pk-as-binary is only used by the direct reader; ignoring it in flat-prune mode",
@@ -296,6 +319,7 @@ impl ParquetbenchCommand {
                         projection.clone(),
                         row_groups.clone(),
                         sst_schema.clone(),
+                        self.batch_size,
                     )
                     .await?
                 }
@@ -413,6 +437,7 @@ async fn run_direct_iteration(
     projection: Option<Vec<usize>>,
     row_groups: Vec<usize>,
     sst_schema: SchemaRef,
+    batch_size: usize,
 ) -> error::Result<IterationStats> {
     let parquet_meta = std::sync::Arc::new(parquet_meta);
     let arrow_metadata = ArrowReaderMetadata::try_new(
@@ -443,7 +468,8 @@ async fn run_direct_iteration(
             async_reader,
             arrow_metadata.clone(),
         )
-        .with_row_groups(vec![row_group_idx]);
+        .with_row_groups(vec![row_group_idx])
+        .with_batch_size(batch_size);
         if let Some(projection) = projection.as_ref() {
             builder = builder.with_projection(ProjectionMask::roots(
                 arrow_metadata.parquet_schema(),
@@ -681,6 +707,16 @@ fn override_pk_to_binary(schema: &SchemaRef) -> SchemaRef {
         })
         .collect();
     Arc::new(Schema::new(new_fields))
+}
+
+fn parse_batch_size(s: &str) -> Result<usize, String> {
+    let batch_size = s
+        .parse::<usize>()
+        .map_err(|e| format!("invalid batch size '{s}': {e}"))?;
+    if batch_size == 0 {
+        return Err("batch size must be greater than 0".to_string());
+    }
+    Ok(batch_size)
 }
 
 fn parse_region_id(s: &str) -> error::Result<RegionId> {
