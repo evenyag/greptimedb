@@ -37,7 +37,7 @@ use smallvec::SmallVec;
 use snafu::ResultExt;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_request::PathType;
-use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
+use store_api::storage::consts::{PRIMARY_KEY_COLUMN_NAME, is_internal_column};
 use store_api::storage::{ColumnId, FileId, RegionId};
 
 use crate::datanode::objbench::{build_object_store, extract_region_metadata, parse_config};
@@ -160,8 +160,16 @@ impl ParquetbenchCommand {
             })?;
         let region_meta = extract_region_metadata(&file_path, &parquet_meta)?;
         let scan_config = self.load_scan_config().await?;
-        let projection = resolve_projection_names(&scan_config, &region_meta)?;
-        let projection_column_ids = resolve_projection_column_ids(&scan_config, &region_meta)?;
+        let projection = if self.reader == ReaderMode::Direct {
+            resolve_projection_names(&scan_config, &region_meta)?
+        } else {
+            None
+        };
+        let projection_column_ids = if self.reader == ReaderMode::FlatPrune {
+            resolve_projection_column_ids(&scan_config, &region_meta)?
+        } else {
+            None
+        };
         let row_groups = resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?;
         let read_all_row_groups = scan_config.row_groups.is_none();
         let projected_columns = projection_names_display(&scan_config);
@@ -589,21 +597,26 @@ fn resolve_projection_column_ids(
         .join(", ");
     let projection = projection_names
         .iter()
-        .map(|name| {
-            metadata
-                .column_metadatas
-                .iter()
-                .find(|column| column.column_schema.name == *name)
-                .map(|column| column.column_id)
-                .ok_or_else(|| {
-                    error::IllegalConfigSnafu {
-                        msg: format!(
-                            "Unknown column '{}' in projection_names, available columns: [{}]",
-                            name, available_columns
-                        ),
-                    }
-                    .build()
-                })
+        .filter_map(|name| {
+            if is_internal_column(name) {
+                return None;
+            }
+            Some(
+                metadata
+                    .column_metadatas
+                    .iter()
+                    .find(|column| column.column_schema.name == *name)
+                    .map(|column| column.column_id)
+                    .ok_or_else(|| {
+                        error::IllegalConfigSnafu {
+                            msg: format!(
+                                "Unknown column '{}' in projection_names, available columns: [{}]",
+                                name, available_columns
+                            ),
+                        }
+                        .build()
+                    }),
+            )
         })
         .collect::<error::Result<Vec<_>>>()?;
     Ok(Some(projection))
@@ -837,6 +850,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection, Some(vec![2, 1]));
+    }
+
+    #[test]
+    fn test_resolve_projection_column_ids_ignores_internal_columns() {
+        let metadata = new_test_metadata();
+        let projection = resolve_projection_column_ids(
+            &ParquetScanConfig {
+                projection_names: Some(vec![
+                    "cpu".to_string(),
+                    "__primary_key".to_string(),
+                    "__sequence".to_string(),
+                    "__op_type".to_string(),
+                ]),
+                row_groups: None,
+            },
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(projection, Some(vec![2]));
     }
 
     #[test]
