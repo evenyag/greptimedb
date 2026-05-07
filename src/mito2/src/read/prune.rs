@@ -31,7 +31,7 @@ use crate::sst::parquet::file_range::FileRangeContextRef;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics, RowGroupReader};
 
 #[allow(dead_code)]
-pub enum Source {
+pub(crate) enum Source {
     RowGroup(RowGroupReader),
     LastRow(RowGroupLastRowCachedReader),
 }
@@ -245,7 +245,7 @@ impl Iterator for PruneTimeIterator {
     }
 }
 
-pub enum FlatSource {
+pub(crate) enum FlatSource {
     RowGroup(FlatRowGroupReader),
     LastRow(FlatRowGroupLastRowCachedReader),
 }
@@ -323,7 +323,7 @@ impl FlatPruneReader {
         self.source.take_decode_buffers()
     }
 
-    pub(crate) async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         loop {
             let start = std::time::Instant::now();
             let batch = self.source.next_batch().await?;

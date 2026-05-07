@@ -2090,6 +2090,7 @@ dependencies = [
  "servers",
  "session",
  "similar-asserts",
+ "smallvec",
  "snafu 0.8.6",
  "sqlparser",
  "standalone",

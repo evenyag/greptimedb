@@ -86,6 +86,7 @@ serde.workspace = true
 serde_json.workspace = true
 servers.workspace = true
 session.workspace = true
+smallvec.workspace = true
 snafu.workspace = true
 sqlparser.workspace = true
 standalone.workspace = true

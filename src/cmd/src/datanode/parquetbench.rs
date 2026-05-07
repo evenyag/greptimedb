@@ -16,26 +16,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::Colorize;
 use datatypes::arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use mito2::cache::CacheStrategy;
-use mito2::sst::file::RegionFileId;
+use mito2::read::range::FileRangeBuilder;
+use mito2::sst::file::{FileHandle, FileMeta, RegionFileId};
+use mito2::sst::file_purger::NoopFilePurger;
 use mito2::sst::location::sst_file_path;
 use mito2::sst::parquet::async_reader::SstAsyncFileReader;
 use mito2::sst::parquet::metadata::MetadataLoader;
-use mito2::sst::parquet::reader::MetadataCacheMetrics;
+use mito2::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use serde::Deserialize;
+use smallvec::SmallVec;
 use snafu::ResultExt;
-use store_api::metadata::RegionMetadata;
+use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_request::PathType;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
-use store_api::storage::{FileId, RegionId};
+use store_api::storage::{ColumnId, FileId, RegionId};
 
 use crate::datanode::objbench::{build_object_store, extract_region_metadata, parse_config};
 use crate::error;
@@ -86,6 +89,18 @@ pub struct ParquetbenchCommand {
     /// Read the `__primary_key` column as BinaryArray instead of DictionaryArray.
     #[clap(long, default_value_t = false)]
     pk_as_binary: bool,
+
+    /// Reader implementation to benchmark.
+    #[clap(long, value_enum, default_value = "direct")]
+    reader: ReaderMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReaderMode {
+    /// Read directly via ParquetRecordBatchStreamBuilder.
+    Direct,
+    /// Read via ParquetReaderBuilder, FileRange, and FlatPruneReader.
+    FlatPrune,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -146,7 +161,9 @@ impl ParquetbenchCommand {
         let region_meta = extract_region_metadata(&file_path, &parquet_meta)?;
         let scan_config = self.load_scan_config().await?;
         let projection = resolve_projection_names(&scan_config, &region_meta)?;
+        let projection_column_ids = resolve_projection_column_ids(&scan_config, &region_meta)?;
         let row_groups = resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?;
+        let read_all_row_groups = scan_config.row_groups.is_none();
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
         let mut sst_schema = to_flat_sst_arrow_schema(
@@ -157,6 +174,15 @@ impl ParquetbenchCommand {
             sst_schema = override_pk_to_binary(&sst_schema);
         }
 
+        println!(
+            "{} Reader: {}",
+            "✓".green(),
+            match self.reader {
+                ReaderMode::Direct => "direct",
+                ReaderMode::FlatPrune => "flat-prune",
+            }
+            .cyan()
+        );
         println!(
             "{} Region ID: {} (u64: {})",
             "✓".green(),
@@ -180,6 +206,12 @@ impl ParquetbenchCommand {
             }
             .cyan()
         );
+        if self.reader == ReaderMode::FlatPrune && self.pk_as_binary {
+            println!(
+                "{} --pk-as-binary is only used by the direct reader; ignoring it in flat-prune mode",
+                "ℹ".blue()
+            );
+        }
         println!(
             "{} Parquet rows: {}, row groups: {}, file size: {}",
             "✓".green(),
@@ -224,18 +256,55 @@ impl ParquetbenchCommand {
         let mut total_elapsed_all = Duration::ZERO;
         let mut total_rows_all = 0usize;
         let mut total_batches_all = 0usize;
+        let file_handle = FileHandle::new(
+            FileMeta {
+                region_id,
+                file_id,
+                time_range: Default::default(),
+                level: 0,
+                file_size,
+                max_row_group_uncompressed_size: 0,
+                available_indexes: Default::default(),
+                indexes: Default::default(),
+                index_file_size: 0,
+                index_version: 0,
+                num_rows: parquet_meta.file_metadata().num_rows() as u64,
+                num_row_groups: parquet_meta.num_row_groups() as u64,
+                sequence: None,
+                partition_expr: None,
+                num_series: 0,
+            },
+            Arc::new(NoopFilePurger),
+        );
 
         for iteration in 0..self.iterations {
-            let stats = run_iteration(
-                object_store.clone(),
-                file_path.clone(),
-                region_file_id,
-                parquet_meta.clone(),
-                projection.clone(),
-                row_groups.clone(),
-                sst_schema.clone(),
-            )
-            .await?;
+            let stats = match self.reader {
+                ReaderMode::Direct => {
+                    run_direct_iteration(
+                        object_store.clone(),
+                        file_path.clone(),
+                        region_file_id,
+                        parquet_meta.clone(),
+                        projection.clone(),
+                        row_groups.clone(),
+                        sst_schema.clone(),
+                    )
+                    .await?
+                }
+                ReaderMode::FlatPrune => {
+                    run_flat_prune_iteration(
+                        object_store.clone(),
+                        self.table_dir.clone(),
+                        path_type,
+                        file_handle.clone(),
+                        region_meta.clone(),
+                        projection_column_ids.clone(),
+                        row_groups.clone(),
+                        read_all_row_groups,
+                    )
+                    .await?
+                }
+            };
 
             total_elapsed_all += stats.elapsed;
             total_rows_all += stats.rows;
@@ -328,7 +397,7 @@ impl ParquetbenchCommand {
     }
 }
 
-async fn run_iteration(
+async fn run_direct_iteration(
     object_store: object_store::ObjectStore,
     file_path: String,
     region_file_id: RegionFileId,
@@ -396,6 +465,76 @@ async fn run_iteration(
     Ok(stats)
 }
 
+async fn run_flat_prune_iteration(
+    object_store: object_store::ObjectStore,
+    table_dir: String,
+    path_type: PathType,
+    file_handle: FileHandle,
+    region_meta: RegionMetadataRef,
+    projection: Option<Vec<ColumnId>>,
+    row_groups: Vec<usize>,
+    read_all_row_groups: bool,
+) -> error::Result<IterationStats> {
+    let reader_builder = ParquetReaderBuilder::new(table_dir, path_type, file_handle, object_store)
+        .expected_metadata(Some(region_meta))
+        .cache(CacheStrategy::Disabled)
+        .projection(projection);
+    let mut reader_metrics = ReaderMetrics::default();
+    let start = Instant::now();
+    let mut stats = IterationStats::default();
+    let Some((context, selection)) = reader_builder
+        .build_reader_input(&mut reader_metrics)
+        .await
+        .map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("build flat prune reader input failed: {e:?}"),
+            }
+            .build()
+        })?
+    else {
+        stats.elapsed = start.elapsed();
+        return Ok(stats);
+    };
+
+    let range_builder = FileRangeBuilder::new(Arc::new(context), selection);
+    let mut ranges = SmallVec::new();
+    if read_all_row_groups {
+        range_builder.build_ranges(-1, &mut ranges);
+    } else {
+        for row_group_idx in row_groups {
+            range_builder.build_ranges(row_group_idx as i64, &mut ranges);
+        }
+    }
+
+    for range in ranges {
+        let mut decode_buffers = Vec::new();
+        let Some(mut reader) = range
+            .flat_reader(None, None, &mut decode_buffers)
+            .await
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("build flat prune reader failed: {e:?}"),
+                }
+                .build()
+            })?
+        else {
+            continue;
+        };
+        while let Some(batch) = reader.next_batch().await.map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("scan flat prune reader failed: {e:?}"),
+            }
+            .build()
+        })? {
+            stats.rows += batch.num_rows();
+            stats.record_batches += 1;
+        }
+    }
+
+    stats.elapsed = start.elapsed();
+    Ok(stats)
+}
+
 fn resolve_projection_names(
     scan_config: &ParquetScanConfig,
     metadata: &RegionMetadata,
@@ -420,6 +559,42 @@ fn resolve_projection_names(
             sst_schema
                 .column_with_name(name)
                 .map(|x| x.0)
+                .ok_or_else(|| {
+                    error::IllegalConfigSnafu {
+                        msg: format!(
+                            "Unknown column '{}' in projection_names, available columns: [{}]",
+                            name, available_columns
+                        ),
+                    }
+                    .build()
+                })
+        })
+        .collect::<error::Result<Vec<_>>>()?;
+    Ok(Some(projection))
+}
+
+fn resolve_projection_column_ids(
+    scan_config: &ParquetScanConfig,
+    metadata: &RegionMetadata,
+) -> error::Result<Option<Vec<ColumnId>>> {
+    let Some(projection_names) = &scan_config.projection_names else {
+        return Ok(None);
+    };
+
+    let available_columns = metadata
+        .column_metadatas
+        .iter()
+        .map(|column| column.column_schema.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projection = projection_names
+        .iter()
+        .map(|name| {
+            metadata
+                .column_metadatas
+                .iter()
+                .find(|column| column.column_schema.name == *name)
+                .map(|column| column.column_id)
                 .ok_or_else(|| {
                     error::IllegalConfigSnafu {
                         msg: format!(
@@ -648,6 +823,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection, Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn test_resolve_projection_column_ids() {
+        let metadata = new_test_metadata();
+        let projection = resolve_projection_column_ids(
+            &ParquetScanConfig {
+                projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
+                row_groups: None,
+            },
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(projection, Some(vec![2, 1]));
     }
 
     #[test]

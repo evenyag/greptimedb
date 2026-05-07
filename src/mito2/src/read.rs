@@ -24,7 +24,7 @@ pub mod last_row;
 pub mod merge;
 pub mod plain_batch;
 pub mod projection;
-pub(crate) mod prune;
+pub mod prune;
 pub(crate) mod pruner;
 pub mod range;
 #[cfg(feature = "test")]

@@ -314,7 +314,7 @@ impl ParquetReaderBuilder {
             file_id = %self.file_handle.file_id()
         )
     )]
-    pub(crate) async fn build_reader_input(
+    pub async fn build_reader_input(
         &self,
         metrics: &mut ReaderMetrics,
     ) -> Result<Option<(FileRangeContext, RowGroupSelection)>> {

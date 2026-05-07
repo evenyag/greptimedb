@@ -242,7 +242,7 @@ impl FileRange {
     /// `decode_buffers` is a recyclable per-string scratch pool reused across
     /// row-group readers from the same scan. It is taken (via `mem::take`) when
     /// a reader is constructed and left untouched on the early `Ok(None)` path.
-    pub(crate) async fn flat_reader(
+    pub async fn flat_reader(
         &self,
         selector: Option<TimeSeriesRowSelector>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
@@ -336,14 +336,14 @@ impl FileRange {
 }
 
 /// Context shared by ranges of the same parquet SST.
-pub(crate) struct FileRangeContext {
+pub struct FileRangeContext {
     /// Row group reader builder for the file.
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.
     base: RangeBase,
 }
 
-pub(crate) type FileRangeContextRef = Arc<FileRangeContext>;
+pub type FileRangeContextRef = Arc<FileRangeContext>;
 
 impl FileRangeContext {
     /// Creates a new [FileRangeContext].
