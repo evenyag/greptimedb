@@ -218,6 +218,29 @@ pub(crate) fn internal_fields() -> [FieldRef; 3] {
     ]
 }
 
+/// Returns a schema where the `__primary_key` field's data type is replaced
+/// with plain `Binary` (preserving its nullability). All other fields are
+/// reused unchanged. Used to make the parquet decoder skip dictionary
+/// decoding for the primary-key column.
+pub fn override_pk_field_to_binary(schema: &SchemaRef) -> SchemaRef {
+    let new_fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if field.name() == PRIMARY_KEY_COLUMN_NAME {
+                Arc::new(Field::new(
+                    PRIMARY_KEY_COLUMN_NAME,
+                    ArrowDataType::Binary,
+                    field.is_nullable(),
+                ))
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    Arc::new(Schema::new(new_fields))
+}
+
 /// Gets the arrow schema to store in parquet.
 pub fn to_plain_sst_arrow_schema(metadata: &RegionMetadata) -> SchemaRef {
     let fields = Fields::from_iter(

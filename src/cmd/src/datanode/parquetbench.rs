@@ -237,12 +237,6 @@ impl ParquetbenchCommand {
                 );
             }
         }
-        if self.reader == ReaderMode::FlatPrune && self.pk_as_binary {
-            println!(
-                "{} --pk-as-binary is only used by the direct reader; ignoring it in flat-prune mode",
-                "ℹ".blue()
-            );
-        }
         println!(
             "{} Parquet rows: {}, row groups: {}, file size: {}",
             "✓".green(),
@@ -333,6 +327,7 @@ impl ParquetbenchCommand {
                         projection_column_ids.clone(),
                         row_groups.clone(),
                         read_all_row_groups,
+                        self.pk_as_binary,
                     )
                     .await?
                 }
@@ -508,11 +503,13 @@ async fn run_flat_prune_iteration(
     projection: Option<Vec<ColumnId>>,
     row_groups: Vec<usize>,
     read_all_row_groups: bool,
+    pk_as_binary: bool,
 ) -> error::Result<IterationStats> {
     let reader_builder = ParquetReaderBuilder::new(table_dir, path_type, file_handle, object_store)
         .expected_metadata(Some(region_meta))
         .cache(CacheStrategy::Disabled)
-        .projection(projection);
+        .projection(projection)
+        .pk_as_binary(pk_as_binary);
     let mut reader_metrics = ReaderMetrics::default();
     let start = Instant::now();
     let mut stats = IterationStats::default();

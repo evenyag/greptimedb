@@ -84,7 +84,7 @@ use crate::sst::parquet::prefilter::{
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
-use crate::sst::tag_maybe_to_dictionary_field;
+use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
 const INDEX_TYPE_FULLTEXT: &str = "fulltext";
 const INDEX_TYPE_INVERTED: &str = "inverted";
@@ -150,6 +150,11 @@ pub struct ParquetReaderBuilder {
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
+    /// When `true`, the parquet decoder is configured to read `__primary_key`
+    /// as a plain `BinaryArray`; the format's convert path then wraps it back
+    /// into a `DictionaryArray<UInt32>` with identity keys. Useful for
+    /// benchmarking the cost of parquet's dictionary decoding.
+    pk_as_binary: bool,
 }
 
 impl ParquetReaderBuilder {
@@ -180,6 +185,7 @@ impl ParquetReaderBuilder {
             pre_filter_mode: PreFilterMode::All,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
+            pk_as_binary: false,
         }
     }
 
@@ -280,6 +286,16 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub fn page_index_policy(mut self, page_index_policy: PageIndexPolicy) -> Self {
         self.page_index_policy = page_index_policy;
+        self
+    }
+
+    /// When `true`, the parquet decoder reads `__primary_key` as plain
+    /// `BinaryArray`; the format's convert path wraps it into a
+    /// `DictionaryArray<UInt32>` with identity keys. Output schema is
+    /// unchanged. Default `false`.
+    #[must_use]
+    pub fn pk_as_binary(mut self, pk_as_binary: bool) -> Self {
+        self.pk_as_binary = pk_as_binary;
         self
     }
 
@@ -401,6 +417,9 @@ impl ParquetReaderBuilder {
         if self.decode_primary_key_values {
             read_format.set_decode_primary_key_values(true);
         }
+        if self.pk_as_binary {
+            read_format.set_pk_as_binary(true);
+        }
         if need_override_sequence(&parquet_meta) {
             read_format
                 .set_override_sequence(self.file_handle.meta_ref().sequence.map(|x| x.get()));
@@ -444,8 +463,15 @@ impl ParquetReaderBuilder {
             .unwrap_or_else(|| region_meta.schema.clone());
 
         // Create ArrowReaderMetadata for async stream building.
-        let arrow_reader_options =
-            ArrowReaderOptions::new().with_schema(read_format.arrow_schema().clone());
+        // When `pk_as_binary` is set, override the `__primary_key` field so the
+        // decoder produces a plain `BinaryArray`; the convert path wraps it
+        // back into a `DictionaryArray<UInt32>` later.
+        let decode_schema = if self.pk_as_binary {
+            override_pk_field_to_binary(read_format.arrow_schema())
+        } else {
+            read_format.arrow_schema().clone()
+        };
+        let arrow_reader_options = ArrowReaderOptions::new().with_schema(decode_schema.clone());
         let (arrow_metadata, value_column_nullable_fix) =
             match ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options) {
                 Ok(metadata) => (metadata, false),
@@ -453,9 +479,7 @@ impl ParquetReaderBuilder {
                     // Some legacy parquet files have greptime_value as non-nullable but
                     // region metadata expects it to be nullable. Retry with non-nullable
                     // value column schema to work around this mismatch.
-                    if let Some(fixed_schema) =
-                        make_value_column_non_null(read_format.arrow_schema())
-                    {
+                    if let Some(fixed_schema) = make_value_column_non_null(&decode_schema) {
                         let retry_options = ArrowReaderOptions::new().with_schema(fixed_schema);
                         match ArrowReaderMetadata::try_new(parquet_meta.clone(), retry_options) {
                             Ok(metadata) => {
@@ -2274,9 +2298,13 @@ impl FlatRowGroupReader {
             .read_format()
             .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
 
-        // Pre-compute the fixed schema if we need to restore nullable on greptime_value.
+        // Pre-compute the fixed schema if we need to restore nullable on
+        // greptime_value. Derive it from the read format's `arrow_schema`
+        // (the post-convert output schema) rather than `stream.schema()`,
+        // because under `pk_as_binary` the stream schema has Binary
+        // `__primary_key` while convert_batch produces a Dict-encoded one.
         let nullable_value_schema = if context.reader_builder().value_column_nullable_fix() {
-            make_value_column_nullable(stream.schema())
+            make_value_column_nullable(context.read_format().arrow_schema())
         } else {
             None
         };

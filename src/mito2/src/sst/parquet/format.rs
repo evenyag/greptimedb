@@ -379,6 +379,18 @@ impl ReadFormat {
         }
     }
 
+    /// Configures whether the parquet decoder will produce a plain
+    /// `BinaryArray` for the `__primary_key` column. The convert path
+    /// wraps the binary column back into a `DictionaryArray<UInt32>` with
+    /// identity keys before downstream code sees the batch, so the output
+    /// shape (and `arrow_schema()`) is unchanged.
+    pub(crate) fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
+        match self {
+            ReadFormat::PrimaryKey(format) => format.set_pk_as_binary(pk_as_binary),
+            ReadFormat::Flat(format) => format.set_pk_as_binary(pk_as_binary),
+        }
+    }
+
     /// Creates a sequence array to override.
     pub(crate) fn new_override_sequence_array(&self, length: usize) -> Option<ArrayRef> {
         match self {
@@ -406,6 +418,11 @@ pub struct PrimaryKeyReadFormat {
     override_sequence: Option<SequenceNumber>,
     /// Codec used to decode primary key values if eager decoding is enabled.
     primary_key_codec: Option<Arc<dyn PrimaryKeyCodec>>,
+    /// When `true`, the parquet decoder is expected to produce a plain
+    /// `BinaryArray` for the `__primary_key` column, and `convert_record_batch`
+    /// wraps it back into a `DictionaryArray<UInt32>` with identity keys
+    /// before the rest of the pipeline runs.
+    pk_as_binary: bool,
 }
 
 impl PrimaryKeyReadFormat {
@@ -435,6 +452,7 @@ impl PrimaryKeyReadFormat {
             field_id_to_projected_index: format_projection.column_id_to_projected_index,
             override_sequence: None,
             primary_key_codec: None,
+            pk_as_binary: false,
         }
     }
 
@@ -450,6 +468,19 @@ impl PrimaryKeyReadFormat {
         } else {
             None
         };
+    }
+
+    /// Configures whether the parquet decoder will produce a plain
+    /// `BinaryArray` for the `__primary_key` column. See
+    /// [`PrimaryKeyReadFormat::pk_as_binary`].
+    pub(crate) fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
+        self.pk_as_binary = pk_as_binary;
+    }
+
+    /// Returns whether `__primary_key` is read as a plain `BinaryArray`
+    /// from parquet (and wrapped back into a dict in the convert path).
+    pub(crate) fn pk_as_binary(&self) -> bool {
+        self.pk_as_binary
     }
 
     /// Gets the arrow schema of the SST file.
@@ -503,6 +534,18 @@ impl PrimaryKeyReadFormat {
                 ),
             }
         );
+
+        // When the parquet decoder produced a plain `BinaryArray` for
+        // `__primary_key` (`pk_as_binary` mode), wrap it into the
+        // `DictionaryArray<UInt32>` shape the rest of this function expects.
+        let wrapped_batch_owned;
+        let record_batch = if self.pk_as_binary {
+            wrapped_batch_owned =
+                crate::sst::parquet::flat_format::wrap_pk_binary_to_dict(record_batch.clone())?;
+            &wrapped_batch_owned
+        } else {
+            record_batch
+        };
 
         let mut fixed_pos_columns = record_batch
             .columns()
