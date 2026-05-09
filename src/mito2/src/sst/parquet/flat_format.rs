@@ -29,10 +29,11 @@
 //! and stores primary key columns in the same order as [RegionMetadata::primary_key].
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use api::v1::SemanticType;
+use common_telemetry::debug;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, DictionaryArray, UInt32Array, UInt64Array,
 };
@@ -43,7 +44,7 @@ use datatypes::prelude::{ConcreteDataType, DataType};
 use mito_codec::row_converter::{
     CompositeValues, PrimaryKeyCodec, build_primary_key_codec, recycle_composite_buffers,
 };
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
@@ -166,6 +167,88 @@ pub(crate) fn wrap_pk_binary_to_dict(record_batch: RecordBatch) -> Result<Record
     columns[pk_idx] = dict_array;
 
     RecordBatch::try_new(new_schema, columns).context(NewRecordBatchSnafu)
+}
+
+pub(crate) struct PkAsBinaryConvertBatchLog<'a> {
+    pub(crate) file_path: &'a str,
+    pub(crate) row_group_idx: usize,
+    pub(crate) column_metadata: Option<&'a ColumnChunkMetaData>,
+}
+
+fn unique_primary_key_count(record_batch: &RecordBatch) -> Result<usize> {
+    let pk_idx = primary_key_column_index(record_batch.num_columns());
+    let pk_column = record_batch.column(pk_idx);
+    let pk_dict = pk_column
+        .as_any()
+        .downcast_ref::<PrimaryKeyArray>()
+        .with_context(|| InvalidRecordBatchSnafu {
+            reason: format!(
+                "expected DictionaryArray<UInt32, Binary> for __primary_key, got {:?}",
+                pk_column.data_type()
+            ),
+        })?;
+    let pk_values = pk_dict
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .with_context(|| InvalidRecordBatchSnafu {
+            reason: format!(
+                "expected BinaryArray values for __primary_key dictionary, got {:?}",
+                pk_dict.values().data_type()
+            ),
+        })?;
+
+    let mut unique_keys = HashSet::new();
+    for row_idx in 0..pk_dict.len() {
+        if pk_dict.is_null(row_idx) {
+            continue;
+        }
+        let value_idx = pk_dict.keys().value(row_idx) as usize;
+        unique_keys.insert(pk_values.value(value_idx));
+    }
+
+    Ok(unique_keys.len())
+}
+
+fn log_pk_as_binary_convert_batch(record_batch: &RecordBatch, log: PkAsBinaryConvertBatchLog<'_>) {
+    let unique_primary_keys = match unique_primary_key_count(record_batch) {
+        Ok(count) => count.to_string(),
+        Err(err) => format!("unknown: {err}"),
+    };
+
+    let column_metadata = log.column_metadata.map(|metadata| {
+        let encodings = metadata
+            .encodings()
+            .map(|encoding| format!("{encoding:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let null_count = metadata
+            .statistics()
+            .and_then(|stats| stats.null_count_opt())
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        format!(
+            "column_path={}, physical_type={:?}, encodings=[{}], compression={:?}, num_values={}, null_count={}, compressed_size={}, uncompressed_size={}",
+            metadata.column_path(),
+            metadata.column_type(),
+            encodings,
+            metadata.compression(),
+            metadata.num_values(),
+            null_count,
+            metadata.compressed_size(),
+            metadata.uncompressed_size()
+        )
+    });
+    let column_metadata = column_metadata.as_deref().unwrap_or("not found");
+
+    debug!(
+        "pk_as_binary converted parquet batch: file_path={}, row_group_idx={}, rows={}, unique_primary_keys={}, primary_key_column_metadata={}",
+        log.file_path,
+        log.row_group_idx,
+        record_batch.num_rows(),
+        unique_primary_keys,
+        column_metadata,
+    );
 }
 
 /// Returns the position of the op type key column.
@@ -357,11 +440,12 @@ impl FlatReadFormat {
     ///
     /// Returns a new RecordBatch with flat format conversion applied first (if enabled),
     /// then the sequence column replaced by the override sequence array.
-    pub fn convert_batch(
+    pub(crate) fn convert_batch(
         &self,
         record_batch: RecordBatch,
         override_sequence_array: Option<&ArrayRef>,
         decode_buffers: &mut Vec<Vec<u8>>,
+        pk_as_binary_log: Option<PkAsBinaryConvertBatchLog<'_>>,
     ) -> Result<RecordBatch> {
         // First, apply flat format conversion.
         let batch = match &self.parquet_adapter {
@@ -370,12 +454,24 @@ impl FlatReadFormat {
                     // Re-establish the dict-encoded __primary_key column so
                     // downstream code (filters, prefilter, etc.) sees the
                     // expected DictionaryArray.
-                    wrap_pk_binary_to_dict(record_batch)?
+                    let batch = wrap_pk_binary_to_dict(record_batch)?;
+                    if let Some(log) = pk_as_binary_log {
+                        log_pk_as_binary_convert_batch(&batch, log);
+                    }
+                    batch
                 } else {
                     record_batch
                 }
             }
-            ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch, decode_buffers)?,
+            ParquetAdapter::PrimaryKeyToFlat(p) => {
+                let batch = p.convert_batch(record_batch, decode_buffers)?;
+                if p.format.pk_as_binary()
+                    && let Some(log) = pk_as_binary_log
+                {
+                    log_pk_as_binary_convert_batch(&batch, log);
+                }
+                batch
+            }
         };
 
         // Then apply sequence override if provided
@@ -972,7 +1068,7 @@ mod tests {
         };
         use datatypes::arrow::record_batch::RecordBatch;
 
-        use super::{primary_key_column_index, wrap_pk_binary_to_dict};
+        use super::{primary_key_column_index, unique_primary_key_count, wrap_pk_binary_to_dict};
 
         // Build a record batch matching the layout
         // [time_index, __primary_key (Binary), __sequence, __op_type]
@@ -999,6 +1095,7 @@ mod tests {
         let record_batch = RecordBatch::try_new(schema, columns).unwrap();
 
         let wrapped = wrap_pk_binary_to_dict(record_batch).unwrap();
+        assert_eq!(3, unique_primary_key_count(&wrapped).unwrap());
 
         // Output schema should have __primary_key as Dictionary(UInt32, Binary).
         let pk_idx = primary_key_column_index(wrapped.num_columns());

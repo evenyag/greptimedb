@@ -41,6 +41,7 @@ use snafu::ResultExt;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::{ColumnMetadata, RegionMetadata, RegionMetadataRef};
 use store_api::region_request::PathType;
+use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use store_api::storage::{ColumnId, FileId};
 use table::predicate::Predicate;
 
@@ -76,6 +77,7 @@ use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
     row_group_contains_delete,
 };
+use crate::sst::parquet::flat_format::PkAsBinaryConvertBatchLog;
 use crate::sst::parquet::format::{ReadFormat, need_override_sequence};
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::prefilter::{
@@ -2030,7 +2032,12 @@ impl ParquetReader {
                 .await?;
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
                 self.context.clone(),
-                FlatRowGroupReader::new(self.context.clone(), parquet_reader, Vec::new()),
+                FlatRowGroupReader::new(
+                    self.context.clone(),
+                    row_group_idx,
+                    parquet_reader,
+                    Vec::new(),
+                ),
                 skip_fields,
             ));
         }
@@ -2062,7 +2069,7 @@ impl ParquetReader {
                 .await?;
             Some(FlatPruneReader::new_with_row_group_reader(
                 context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader, Vec::new()),
+                FlatRowGroupReader::new(context.clone(), row_group_idx, parquet_reader, Vec::new()),
                 skip_fields,
             ))
         } else {
@@ -2272,6 +2279,8 @@ fn make_value_column_nullable(schema: &SchemaRef) -> Option<SchemaRef> {
 pub(crate) struct FlatRowGroupReader {
     /// Context for file ranges.
     context: FileRangeContextRef,
+    /// Index of the row group being read.
+    row_group_idx: usize,
     /// Inner parquet record batch stream.
     stream: ParquetRecordBatchStream<SstAsyncFileReader>,
     /// Cached sequence array to override sequences.
@@ -2290,6 +2299,7 @@ impl FlatRowGroupReader {
     /// Creates a new flat reader from file range.
     pub(crate) fn new(
         context: FileRangeContextRef,
+        row_group_idx: usize,
         stream: ParquetRecordBatchStream<SstAsyncFileReader>,
         decode_buffers: Vec<Vec<u8>>,
     ) -> Self {
@@ -2311,6 +2321,7 @@ impl FlatRowGroupReader {
 
         Self {
             context,
+            row_group_idx,
             stream,
             override_sequence,
             nullable_value_schema,
@@ -2339,6 +2350,18 @@ impl FlatRowGroupReader {
                     record_batch,
                     self.override_sequence.as_ref(),
                     &mut self.decode_buffers,
+                    Some(PkAsBinaryConvertBatchLog {
+                        file_path: self.context.file_path(),
+                        row_group_idx: self.row_group_idx,
+                        column_metadata: self
+                            .context
+                            .reader_builder()
+                            .parquet_metadata()
+                            .row_group(self.row_group_idx)
+                            .columns()
+                            .iter()
+                            .find(|column| column.column_descr().name() == PRIMARY_KEY_COLUMN_NAME),
+                    }),
                 )?;
                 self.flat_convert_cost += convert_start.elapsed();
 
