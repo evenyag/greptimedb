@@ -126,8 +126,8 @@ pub(crate) fn primary_key_column_index(num_columns: usize) -> usize {
 
 /// Wraps the `__primary_key` column of `record_batch` (which must be a
 /// `BinaryArray` produced by the parquet decoder when `pk_as_binary` is set)
-/// into a `DictionaryArray<UInt32, Binary>` with identity keys (`0..n`),
-/// returning a record batch whose schema has `__primary_key` as
+/// into a `DictionaryArray<UInt32, Binary>` with equal adjacent binary values
+/// sharing the same key, returning a record batch whose schema has `__primary_key` as
 /// `Dictionary(UInt32, Binary)` so downstream code that expects a
 /// [`PrimaryKeyArray`] keeps working.
 pub(crate) fn wrap_pk_binary_to_dict(record_batch: RecordBatch) -> Result<RecordBatch> {
@@ -143,7 +143,12 @@ pub(crate) fn wrap_pk_binary_to_dict(record_batch: RecordBatch) -> Result<Record
             ),
         })?;
     let n = binary_array.len();
-    let keys = UInt32Array::from_iter_values(0..n as u32);
+    let keys = UInt32Array::from_iter_values((0..n).scan(0u32, |key, idx| {
+        if idx > 0 && binary_array.value(idx) != binary_array.value(idx - 1) {
+            *key = idx as u32;
+        }
+        Some(*key)
+    }));
     let dict_array: ArrayRef = Arc::new(DictionaryArray::new(keys, Arc::new(binary_array.clone())));
 
     let pk_field = record_batch.schema().field(pk_idx).clone();
@@ -955,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_pk_binary_to_dict_identity_keys() {
+    fn test_wrap_pk_binary_to_dict_reuses_keys_for_equal_values() {
         use std::sync::Arc;
 
         use datatypes::arrow::array::{
@@ -971,8 +976,7 @@ mod tests {
 
         // Build a record batch matching the layout
         // [time_index, __primary_key (Binary), __sequence, __op_type]
-        let pk_values: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
-        let n = pk_values.len();
+        let pk_values: Vec<&[u8]> = vec![b"a", b"a", b"b", b"b", b"b", b"d"];
         let pk_binary = BinaryArray::from(pk_values.clone());
 
         let fields = vec![
@@ -987,10 +991,10 @@ mod tests {
         ];
         let schema = Arc::new(Schema::new(fields));
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(TimestampMillisecondArray::from(vec![1, 2, 3, 4])),
+            Arc::new(TimestampMillisecondArray::from(vec![1, 2, 3, 4, 5, 6])),
             Arc::new(pk_binary.clone()),
-            Arc::new(UInt64Array::from(vec![10u64, 11, 12, 13])),
-            Arc::new(UInt8Array::from(vec![0u8, 0, 0, 0])),
+            Arc::new(UInt64Array::from(vec![10u64, 11, 12, 13, 14, 15])),
+            Arc::new(UInt8Array::from(vec![0u8, 0, 0, 0, 0, 0])),
         ];
         let record_batch = RecordBatch::try_new(schema, columns).unwrap();
 
@@ -1007,13 +1011,14 @@ mod tests {
             )
         );
 
-        // The __primary_key column is a DictionaryArray with identity keys.
+        // The __primary_key column is a DictionaryArray whose equal adjacent
+        // values share the same key into the original BinaryArray.
         let dict = wrapped
             .column(pk_idx)
             .as_any()
             .downcast_ref::<DictionaryArray<UInt32Type>>()
             .expect("dict array");
-        let expected_keys = UInt32Array::from_iter_values(0..n as u32);
+        let expected_keys = UInt32Array::from_iter_values([0, 0, 2, 2, 2, 5]);
         assert_eq!(dict.keys(), &expected_keys);
         let dict_values = dict
             .values()
@@ -1030,7 +1035,7 @@ mod tests {
                 .downcast_ref::<TimestampMillisecondArray>()
                 .unwrap()
                 .values(),
-            &[1, 2, 3, 4]
+            &[1, 2, 3, 4, 5, 6]
         );
         assert_eq!(
             wrapped
@@ -1039,7 +1044,7 @@ mod tests {
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
                 .values(),
-            &[10, 11, 12, 13]
+            &[10, 11, 12, 13, 14, 15]
         );
     }
 
