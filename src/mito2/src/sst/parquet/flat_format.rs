@@ -53,6 +53,7 @@ use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, InvalidParquetSnafu, InvalidRecordBatchSnafu,
     NewRecordBatchSnafu, Result,
 };
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::format::{
     FIXED_POS_COLUMN_NUM, FormatProjection, INTERNAL_COLUMN_NUM, PrimaryKeyArray,
     PrimaryKeyReadFormat, ReadFormat, StatValues,
@@ -130,7 +131,15 @@ pub(crate) fn primary_key_column_index(num_columns: usize) -> usize {
 /// returning a record batch whose schema has `__primary_key` as
 /// `Dictionary(UInt32, Binary)` so downstream code that expects a
 /// [`PrimaryKeyArray`] keeps working.
-pub(crate) fn wrap_pk_binary_to_dict(record_batch: RecordBatch) -> Result<RecordBatch> {
+///
+/// `cached_keys`, when provided, is a precomputed identity key array
+/// (`0..len`) reused across batches: slicing it at `[0, n)` still yields
+/// identity keys `0..n`, avoiding a per-batch allocation. It is only used
+/// when long enough for the batch (`len >= n`).
+pub(crate) fn wrap_pk_binary_to_dict(
+    record_batch: RecordBatch,
+    cached_keys: Option<&UInt32Array>,
+) -> Result<RecordBatch> {
     let pk_idx = primary_key_column_index(record_batch.num_columns());
     let pk_column = record_batch.column(pk_idx);
     let binary_array = pk_column
@@ -143,7 +152,10 @@ pub(crate) fn wrap_pk_binary_to_dict(record_batch: RecordBatch) -> Result<Record
             ),
         })?;
     let n = binary_array.len();
-    let keys = UInt32Array::from_iter_values(0..n as u32);
+    let keys = match cached_keys {
+        Some(cached) if cached.len() >= n => cached.slice(0, n),
+        _ => UInt32Array::from_iter_values(0..n as u32),
+    };
     let dict_array: ArrayRef = Arc::new(DictionaryArray::new(keys, Arc::new(binary_array.clone())));
 
     let pk_field = record_batch.schema().field(pk_idx).clone();
@@ -248,8 +260,8 @@ impl FlatReadFormat {
     /// (returned by [`FlatReadFormat::arrow_schema`]) is unchanged.
     pub(crate) fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
         match &mut self.parquet_adapter {
-            ParquetAdapter::Flat(p) => p.pk_as_binary = pk_as_binary,
-            ParquetAdapter::PrimaryKeyToFlat(p) => p.format.set_pk_as_binary(pk_as_binary),
+            ParquetAdapter::Flat(p) => p.set_pk_as_binary(pk_as_binary),
+            ParquetAdapter::PrimaryKeyToFlat(p) => p.set_pk_as_binary(pk_as_binary),
         }
     }
 
@@ -365,7 +377,7 @@ impl FlatReadFormat {
                     // Re-establish the dict-encoded __primary_key column so
                     // downstream code (filters, prefilter, etc.) sees the
                     // expected DictionaryArray.
-                    wrap_pk_binary_to_dict(record_batch)?
+                    wrap_pk_binary_to_dict(record_batch, p.pk_dict_keys.as_ref())?
                 } else {
                     record_batch
                 }
@@ -512,6 +524,13 @@ impl ParquetPrimaryKeyToFlat {
         }
     }
 
+    /// Sets whether the parquet decoder produces a plain `BinaryArray` for the
+    /// `__primary_key` column. The cached identity keys reused by
+    /// [`wrap_pk_binary_to_dict`] live on the inner [`PrimaryKeyReadFormat`].
+    fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
+        self.format.set_pk_as_binary(pk_as_binary);
+    }
+
     fn convert_batch(
         &self,
         record_batch: RecordBatch,
@@ -521,7 +540,7 @@ impl ParquetPrimaryKeyToFlat {
         // Binary, the legacy → flat conversion below still expects a
         // `DictionaryArray`, so wrap it back here first.
         let record_batch = if self.format.pk_as_binary() {
-            wrap_pk_binary_to_dict(record_batch)?
+            wrap_pk_binary_to_dict(record_batch, self.format.pk_dict_keys())?
         } else {
             record_batch
         };
@@ -548,6 +567,10 @@ struct ParquetFlat {
     /// wraps it back into a `DictionaryArray<UInt32>` with identity keys
     /// before forwarding the batch.
     pk_as_binary: bool,
+    /// Identity keys (`0..DEFAULT_READ_BATCH_SIZE`) cached for
+    /// [`wrap_pk_binary_to_dict`], reused across batches when `pk_as_binary`
+    /// is enabled. `None` when `pk_as_binary` is disabled.
+    pk_dict_keys: Option<UInt32Array>,
 }
 
 impl ParquetFlat {
@@ -567,7 +590,17 @@ impl ParquetFlat {
             format_projection,
             column_id_to_sst_index: id_to_index,
             pk_as_binary: false,
+            pk_dict_keys: None,
         }
+    }
+
+    /// Sets whether the parquet decoder produces a plain `BinaryArray` for the
+    /// `__primary_key` column, building (or clearing) the cached identity keys
+    /// reused by [`wrap_pk_binary_to_dict`].
+    fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
+        self.pk_as_binary = pk_as_binary;
+        self.pk_dict_keys = pk_as_binary
+            .then(|| UInt32Array::from_iter_values(0..DEFAULT_READ_BATCH_SIZE as u32));
     }
 
     /// Returns min values of specific column in row groups.
@@ -994,7 +1027,7 @@ mod tests {
         ];
         let record_batch = RecordBatch::try_new(schema, columns).unwrap();
 
-        let wrapped = wrap_pk_binary_to_dict(record_batch).unwrap();
+        let wrapped = wrap_pk_binary_to_dict(record_batch.clone(), None).unwrap();
 
         // Output schema should have __primary_key as Dictionary(UInt32, Binary).
         let pk_idx = primary_key_column_index(wrapped.num_columns());
@@ -1040,6 +1073,27 @@ mod tests {
                 .unwrap()
                 .values(),
             &[10, 11, 12, 13]
+        );
+
+        // Passing a longer cached identity key array yields the same result:
+        // the cache is sliced to `[0, n)`, which is still identity keys `0..n`.
+        let cached_keys = UInt32Array::from_iter_values(0..(n as u32 + 16));
+        let wrapped_cached =
+            wrap_pk_binary_to_dict(record_batch, Some(&cached_keys)).unwrap();
+        assert_eq!(wrapped_cached.schema(), wrapped.schema());
+        let dict_cached = wrapped_cached
+            .column(pk_idx)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .expect("dict array");
+        assert_eq!(dict_cached.keys(), &expected_keys);
+        assert_eq!(
+            dict_cached
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap(),
+            &pk_binary
         );
     }
 

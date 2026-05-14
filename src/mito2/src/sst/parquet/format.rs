@@ -34,7 +34,7 @@ use api::v1::SemanticType;
 use common_time::Timestamp;
 use datafusion_common::ScalarValue;
 use datatypes::arrow::array::{
-    ArrayRef, BinaryArray, BinaryDictionaryBuilder, DictionaryArray, UInt64Array,
+    ArrayRef, BinaryArray, BinaryDictionaryBuilder, DictionaryArray, UInt32Array, UInt64Array,
 };
 use datatypes::arrow::datatypes::{SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -55,6 +55,7 @@ use crate::error::{
 };
 use crate::read::{Batch, BatchBuilder, BatchColumn};
 use crate::sst::file::{FileMeta, FileTimeRange};
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::FlatReadFormat;
 use crate::sst::to_sst_arrow_schema;
 
@@ -423,6 +424,10 @@ pub struct PrimaryKeyReadFormat {
     /// wraps it back into a `DictionaryArray<UInt32>` with identity keys
     /// before the rest of the pipeline runs.
     pk_as_binary: bool,
+    /// Identity keys (`0..DEFAULT_READ_BATCH_SIZE`) cached for
+    /// [`wrap_pk_binary_to_dict`], reused across batches when `pk_as_binary`
+    /// is enabled. `None` when `pk_as_binary` is disabled.
+    pk_dict_keys: Option<UInt32Array>,
 }
 
 impl PrimaryKeyReadFormat {
@@ -453,6 +458,7 @@ impl PrimaryKeyReadFormat {
             override_sequence: None,
             primary_key_codec: None,
             pk_as_binary: false,
+            pk_dict_keys: None,
         }
     }
 
@@ -472,15 +478,24 @@ impl PrimaryKeyReadFormat {
 
     /// Configures whether the parquet decoder will produce a plain
     /// `BinaryArray` for the `__primary_key` column. See
-    /// [`PrimaryKeyReadFormat::pk_as_binary`].
+    /// [`PrimaryKeyReadFormat::pk_as_binary`]. Building (or clearing) the
+    /// cached identity keys reused by [`wrap_pk_binary_to_dict`].
     pub(crate) fn set_pk_as_binary(&mut self, pk_as_binary: bool) {
         self.pk_as_binary = pk_as_binary;
+        self.pk_dict_keys = pk_as_binary
+            .then(|| UInt32Array::from_iter_values(0..DEFAULT_READ_BATCH_SIZE as u32));
     }
 
     /// Returns whether `__primary_key` is read as a plain `BinaryArray`
     /// from parquet (and wrapped back into a dict in the convert path).
     pub(crate) fn pk_as_binary(&self) -> bool {
         self.pk_as_binary
+    }
+
+    /// Returns the cached identity key array reused by
+    /// [`wrap_pk_binary_to_dict`], if `pk_as_binary` is enabled.
+    pub(crate) fn pk_dict_keys(&self) -> Option<&UInt32Array> {
+        self.pk_dict_keys.as_ref()
     }
 
     /// Gets the arrow schema of the SST file.
@@ -540,8 +555,10 @@ impl PrimaryKeyReadFormat {
         // `DictionaryArray<UInt32>` shape the rest of this function expects.
         let wrapped_batch_owned;
         let record_batch = if self.pk_as_binary {
-            wrapped_batch_owned =
-                crate::sst::parquet::flat_format::wrap_pk_binary_to_dict(record_batch.clone())?;
+            wrapped_batch_owned = crate::sst::parquet::flat_format::wrap_pk_binary_to_dict(
+                record_batch.clone(),
+                self.pk_dict_keys.as_ref(),
+            )?;
             &wrapped_batch_owned
         } else {
             record_batch
