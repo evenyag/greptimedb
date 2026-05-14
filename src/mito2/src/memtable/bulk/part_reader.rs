@@ -423,7 +423,7 @@ fn apply_combined_filters(
 
     // Converts the format to the flat format.
     let format = context.read_format().as_flat().unwrap();
-    let record_batch = format.convert_batch(record_batch, None, decode_buffers, None)?;
+    let record_batch = format.convert_batch(record_batch, None, decode_buffers)?;
 
     let num_rows = record_batch.num_rows();
     let mut combined_filter = None;

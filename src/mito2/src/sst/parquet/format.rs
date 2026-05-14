@@ -1462,7 +1462,7 @@ mod tests {
 
         // Test without override sequence - should return clone
         let result = format
-            .convert_batch(record_batch.clone(), None, &mut Vec::new(), None)
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
             .unwrap();
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
         let sequence_array = sequence_column
@@ -1481,7 +1481,6 @@ mod tests {
                 record_batch,
                 Some(&override_sequence_array),
                 &mut Vec::new(),
-                None,
             )
             .unwrap();
         let sequence_column = result.column(sequence_column_index(result.num_columns()));
@@ -1717,7 +1716,7 @@ mod tests {
 
         // Test conversion with dense encoding
         let result = format
-            .convert_batch(record_batch, None, &mut Vec::new(), None)
+            .convert_batch(record_batch, None, &mut Vec::new())
             .unwrap();
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
@@ -1807,7 +1806,7 @@ mod tests {
 
         // Test conversion with sparse encoding
         let result = format
-            .convert_batch(record_batch.clone(), None, &mut Vec::new(), None)
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
             .unwrap();
 
         // Construct expected RecordBatch in flat format with decoded primary key columns
@@ -1843,7 +1842,7 @@ mod tests {
                 .unwrap();
         // Test conversion with sparse encoding and skip convert.
         let result = format
-            .convert_batch(record_batch.clone(), None, &mut Vec::new(), None)
+            .convert_batch(record_batch.clone(), None, &mut Vec::new())
             .unwrap();
         assert_eq!(record_batch, result);
     }

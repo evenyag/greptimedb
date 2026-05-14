@@ -285,7 +285,6 @@ impl FileRange {
         let flat_prune_reader = if use_last_row_reader {
             let flat_row_group_reader = FlatRowGroupReader::new(
                 self.context.clone(),
-                self.row_group_idx,
                 parquet_reader,
                 std::mem::take(decode_buffers),
             );
@@ -307,7 +306,6 @@ impl FileRange {
         } else {
             let flat_row_group_reader = FlatRowGroupReader::new(
                 self.context.clone(),
-                self.row_group_idx,
                 parquet_reader,
                 std::mem::take(decode_buffers),
             );
