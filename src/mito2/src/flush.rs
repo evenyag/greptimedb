@@ -50,6 +50,7 @@ use crate::metrics::{
 use crate::read::FlatSource;
 use crate::read::flat_dedup::{FlatDedupIterator, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeIterator;
+use crate::read::scan_util::maybe_split_iters_for_merge;
 use crate::region::options::{IndexOptions, MergeMode, RegionOptions};
 use crate::region::version::{VersionControlData, VersionControlRef, VersionRef};
 use crate::region::{ManifestContextRef, RegionLeaderState, RegionRoleState, parse_partition_expr};
@@ -816,12 +817,23 @@ fn memtable_flat_sources(
                     .max()
                     .unwrap_or(0);
 
+                // Splits record batches before merging when it is likely to speed up the merge.
+                let total_rows: u64 = current_ranges.iter().map(|r| r.num_rows() as u64).sum();
+                let total_series: u64 = current_ranges
+                    .iter()
+                    .map(|r| r.stats().series_count() as u64)
+                    .sum();
+                let merge_iters = maybe_split_iters_for_merge(
+                    total_rows,
+                    total_series,
+                    std::mem::replace(&mut input_iters, Vec::with_capacity(num_ranges)),
+                );
                 let maybe_dedup = merge_and_dedup(
                     &schema,
                     options.append_mode,
                     options.merge_mode(),
                     field_column_start,
-                    std::mem::replace(&mut input_iters, Vec::with_capacity(num_ranges)),
+                    merge_iters,
                 )?;
 
                 flat_sources.sources.push((
@@ -848,12 +860,19 @@ fn memtable_flat_sources(
                 .max()
                 .unwrap_or(0);
 
+            // Splits record batches before merging when it is likely to speed up the merge.
+            let total_rows: u64 = current_ranges.iter().map(|r| r.num_rows() as u64).sum();
+            let total_series: u64 = current_ranges
+                .iter()
+                .map(|r| r.stats().series_count() as u64)
+                .sum();
+            let merge_iters = maybe_split_iters_for_merge(total_rows, total_series, input_iters);
             let maybe_dedup = merge_and_dedup(
                 &schema,
                 options.append_mode,
                 options.merge_mode(),
                 field_column_start,
-                input_iters,
+                merge_iters,
             )?;
 
             flat_sources

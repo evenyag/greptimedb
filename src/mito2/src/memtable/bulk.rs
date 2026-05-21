@@ -59,6 +59,7 @@ use crate::memtable::{
 };
 use crate::read::flat_dedup::{FlatDedupIterator, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeIterator;
+use crate::read::scan_util::maybe_split_iters_for_merge;
 use crate::region::options::MergeMode;
 use crate::sst::parquet::flat_format::field_column_start;
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
@@ -1192,6 +1193,13 @@ impl MemtableCompactor {
         if iterators.is_empty() {
             return Ok(None);
         }
+
+        // Splits record batches before merging when it is likely to speed up the merge.
+        let iterators = maybe_split_iters_for_merge(
+            estimated_total_rows as u64,
+            estimated_series_count as u64,
+            iterators,
+        );
 
         let merged_iter =
             FlatMergeIterator::new(arrow_schema.clone(), iterators, DEFAULT_READ_BATCH_SIZE)?;

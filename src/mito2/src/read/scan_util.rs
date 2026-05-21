@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 use store_api::storage::RegionId;
 
 use crate::error::Result;
-use crate::memtable::MemScanMetrics;
+use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics};
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
     READ_ROWS_IN_ROW_GROUP_TOTAL, READ_ROWS_RETURN, READ_STAGE_ELAPSED,
@@ -1421,6 +1421,83 @@ mod split_tests {
         assert!(!can_split_series(1, 0));
         assert!(!can_split_series(0, 0));
     }
+
+    #[test]
+    fn can_split_mem_iters_handles_thresholds() {
+        // Zero rows or series is never splittable.
+        assert!(!can_split_mem_iters(0, 1));
+        assert!(!can_split_mem_iters(1, 0));
+        // Few series: always splittable.
+        assert!(can_split_mem_iters(1000, 100));
+        // Many series but enough rows per series.
+        assert!(can_split_mem_iters(
+            MEM_NUM_SERIES_THRESHOLD * MEM_BATCH_SIZE_THRESHOLD,
+            MEM_NUM_SERIES_THRESHOLD,
+        ));
+        // Many series and too few rows per series.
+        assert!(!can_split_mem_iters(
+            MEM_NUM_SERIES_THRESHOLD * 2,
+            MEM_NUM_SERIES_THRESHOLD,
+        ));
+    }
+
+    /// Builds a minimal flat-format record batch carrying the given timestamps.
+    fn flat_ts_batch(timestamps: &[i64]) -> RecordBatch {
+        use datatypes::arrow::array::builder::BinaryDictionaryBuilder;
+        use datatypes::arrow::array::{TimestampMillisecondArray, UInt8Array, UInt64Array};
+        use datatypes::arrow::datatypes::{DataType, Field, Schema, TimeUnit, UInt32Type};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "__primary_key",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
+                false,
+            ),
+            Field::new("__sequence", DataType::UInt64, false),
+            Field::new("__op_type", DataType::UInt8, false),
+        ]));
+        let ts = Arc::new(TimestampMillisecondArray::from_iter_values(
+            timestamps.iter().copied(),
+        ));
+        let mut pk = BinaryDictionaryBuilder::<UInt32Type>::new();
+        for _ in timestamps {
+            pk.append(b"k").unwrap();
+        }
+        let pk = Arc::new(pk.finish());
+        let sequence = Arc::new(UInt64Array::from_iter_values(timestamps.iter().map(|_| 0)));
+        let op_type = Arc::new(UInt8Array::from_iter_values(timestamps.iter().map(|_| 0)));
+        RecordBatch::try_new(schema, vec![ts, pk, sequence, op_type]).unwrap()
+    }
+
+    #[test]
+    fn split_record_batch_iterator_splits_at_inversions() {
+        // A batch with two monotonic runs is split into two batches.
+        let batch = flat_ts_batch(&[1, 2, 3, 1, 2]);
+        let out: Vec<RecordBatch> = SplitRecordBatchIterator::new(vec![Ok(batch)].into_iter())
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(out[1].num_rows(), 2);
+
+        // A monotonic batch passes through unchanged.
+        let batch = flat_ts_batch(&[1, 2, 3]);
+        let out: Vec<RecordBatch> = SplitRecordBatchIterator::new(vec![Ok(batch)].into_iter())
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), 3);
+
+        // Errors from the inner iterator are propagated.
+        let err = crate::error::UnexpectedSnafu { reason: "boom" }.build();
+        let mut iter = SplitRecordBatchIterator::new(vec![Err(err)].into_iter());
+        assert!(iter.next().unwrap().is_err());
+    }
 }
 
 /// Creates a new [ReaderFilterMetrics] with optional apply metrics initialized
@@ -1694,6 +1771,91 @@ pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeq
         let rows_in_batch = end - start;
         batches.push_back(record_batch.slice(start, rows_in_batch));
     }
+}
+
+/// An iterator wrapper that splits record batches from an inner iterator.
+///
+/// This is the synchronous counterpart of [`SplitRecordBatchStream`], used when merging
+/// memtable record batch iterators.
+pub(crate) struct SplitRecordBatchIterator<I> {
+    /// The inner iterator that yields record batches.
+    inner: I,
+    /// Buffer for split batches.
+    batches: VecDeque<RecordBatch>,
+}
+
+impl<I> SplitRecordBatchIterator<I> {
+    /// Creates a new splitting iterator wrapper.
+    pub(crate) fn new(inner: I) -> Self {
+        Self {
+            inner,
+            batches: VecDeque::new(),
+        }
+    }
+}
+
+impl<I> Iterator for SplitRecordBatchIterator<I>
+where
+    I: Iterator<Item = Result<RecordBatch>>,
+{
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // First, returns buffered split batches.
+            if let Some(batch) = self.batches.pop_front() {
+                return Some(Ok(batch));
+            }
+
+            // Pulls the next batch from the inner iterator.
+            match self.inner.next() {
+                Some(Ok(batch)) => split_record_batch(batch, &mut self.batches),
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            }
+            // Continues the loop to return the first split batch.
+        }
+    }
+}
+
+/// Series-count threshold for splitting record batches when merging memtable iterators.
+const MEM_NUM_SERIES_THRESHOLD: u64 = 10240;
+/// Minimum rows per series for splitting memtable iterators to be worthwhile.
+const MEM_BATCH_SIZE_THRESHOLD: u64 = 50;
+
+/// Returns whether splitting record batches is likely to speed up merging memtable
+/// iterators, given the estimated row and series counts.
+///
+/// This mirrors [`can_split_series`] but owns its own thresholds so the memtable merge
+/// path can be tuned independently of the file scan path.
+pub(crate) fn can_split_mem_iters(num_rows: u64, num_series: u64) -> bool {
+    if num_rows == 0 || num_series == 0 {
+        return false;
+    }
+
+    // It doesn't have too many series or it will have enough rows for each batch.
+    num_series < MEM_NUM_SERIES_THRESHOLD || num_rows / num_series >= MEM_BATCH_SIZE_THRESHOLD
+}
+
+/// Wraps each iterator with [`SplitRecordBatchIterator`] if splitting batches is likely
+/// to speed up merging them, based on the estimated row and series counts.
+///
+/// Returns the iterators unchanged when there is at most one source or splitting is not
+/// expected to help.
+pub(crate) fn maybe_split_iters_for_merge(
+    total_rows: u64,
+    total_series: u64,
+    iters: Vec<BoxedRecordBatchIterator>,
+) -> Vec<BoxedRecordBatchIterator> {
+    if iters.len() <= 1 || !can_split_mem_iters(total_rows, total_series) {
+        // A lone source is passed through by the merge, so splitting it has no benefit.
+        return iters;
+    }
+
+    iters
+        .into_iter()
+        .map(|it| Box::new(SplitRecordBatchIterator::new(it)) as BoxedRecordBatchIterator)
+        .collect()
 }
 
 #[cfg(test)]
