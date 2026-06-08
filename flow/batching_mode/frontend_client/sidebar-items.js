@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["FrontendClient","PeerDesc"],"fn":["build_flow_extensions","terminal_recordbatch_metrics_from_snapshots","wrap_standalone_output_with_terminal_metrics"],"struct":["DatabaseWithPeer","HandlerMutable"],"trait":["GrpcQueryHandlerWithBoxedError"]};
