@@ -2129,6 +2129,7 @@ dependencies = [
  "flow",
  "frontend",
  "futures",
+ "hex",
  "human-panic",
  "humantime",
  "lazy_static",

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[allow(clippy::print_stdout)]
+mod aggr_index;
 pub mod builder;
 #[allow(clippy::print_stdout)]
 mod objbench;
@@ -35,6 +37,7 @@ use snafu::{ResultExt, ensure};
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::App;
+use crate::datanode::aggr_index::AggrIndexCommand;
 use crate::datanode::builder::InstanceBuilder;
 use crate::datanode::objbench::ObjbenchCommand;
 use crate::datanode::scanbench::ScanbenchCommand;
@@ -108,7 +111,7 @@ impl Command {
     pub fn load_options(&self, global_options: &GlobalOptions) -> Result<DatanodeOptions> {
         match &self.subcmd {
             SubCommand::Start(cmd) => cmd.load_options(global_options),
-            SubCommand::Objbench(_) | SubCommand::Scanbench(_) => {
+            SubCommand::Objbench(_) | SubCommand::Scanbench(_) | SubCommand::AggrIndex(_) => {
                 // For bench commands, we don't need to load DatanodeOptions
                 // They are standalone utility commands
                 let mut opts = datanode::config::DatanodeOptions::default();
@@ -130,6 +133,8 @@ pub enum SubCommand {
     Objbench(ObjbenchCommand),
     /// Scan benchmark tool - benchmarks scanning a region directly from storage
     Scanbench(ScanbenchCommand),
+    /// Aggregate index POC tool
+    AggrIndex(AggrIndexCommand),
 }
 
 impl SubCommand {
@@ -144,6 +149,10 @@ impl SubCommand {
                 std::process::exit(0);
             }
             SubCommand::Scanbench(cmd) => {
+                cmd.run().await?;
+                std::process::exit(0);
+            }
+            SubCommand::AggrIndex(cmd) => {
                 cmd.run().await?;
                 std::process::exit(0);
             }
