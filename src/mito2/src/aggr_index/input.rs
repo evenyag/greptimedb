@@ -21,6 +21,7 @@ use crate::sst::file_purger::NoopFilePurger;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::FlatReadFormat;
 use crate::sst::parquet::reader::ParquetReaderBuilder;
+use crate::sst::{FlatSchemaOptions, flat_sst_arrow_schema_column_num};
 
 pub struct SstStream {
     pub stream: BoxedRecordBatchStream,
@@ -46,8 +47,7 @@ pub async fn open_sst_stream(
             reason: "SST has no readable row groups",
         })?;
     let metadata = reader.metadata().clone();
-    validate_sparse_flat_metadata(&metadata)?;
-    reject_legacy_format(
+    validate_sparse_flat_sst_schema(
         &metadata,
         reader
             .parquet_metadata()
@@ -80,21 +80,30 @@ pub async fn open_sst_stream(
     })
 }
 
-pub fn validate_sparse_flat_metadata(metadata: &RegionMetadataRef) -> Result<()> {
+pub fn validate_sparse_flat_sst_schema(
+    metadata: &RegionMetadataRef,
+    num_columns: usize,
+    file_path: &str,
+) -> Result<()> {
     ensure!(
         metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
         InvalidMetaSnafu {
             reason: "aggregate index only supports sparse primary-key encoding"
         }
     );
-    Ok(())
-}
 
-pub fn reject_legacy_format(
-    metadata: &RegionMetadataRef,
-    num_columns: usize,
-    file_path: &str,
-) -> Result<()> {
+    // Sparse flat SSTs intentionally omit raw primary-key columns, so their
+    // physical schema has the same column count as the legacy primary-key SST
+    // format. The aggregate index builder only needs the sparse __primary_key
+    // payload and timestamp, so this schema is valid here.
+    let sparse_flat_columns = flat_sst_arrow_schema_column_num(
+        metadata,
+        &FlatSchemaOptions::from_encoding(metadata.primary_key_encoding),
+    );
+    if num_columns == sparse_flat_columns {
+        return Ok(());
+    }
+
     let legacy = FlatReadFormat::is_legacy_format(metadata, num_columns, file_path)?;
     ensure!(
         !legacy,
@@ -127,4 +136,112 @@ pub fn validate_same_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use api::v1::SemanticType;
+    use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnSchema;
+    use store_api::codec::PrimaryKeyEncoding;
+    use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
+    use store_api::storage::RegionId;
+
+    use super::*;
+
+    fn build_metadata(encoding: PrimaryKeyEncoding) -> RegionMetadataRef {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 1));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "tag_0".to_string(),
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 0,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "tag_1".to_string(),
+                    ConcreteDataType::string_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "field_0".to_string(),
+                    ConcreteDataType::uint64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: ColumnSchema::new(
+                    "ts".to_string(),
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 3,
+            })
+            .primary_key(vec![0, 1])
+            .primary_key_encoding(encoding);
+
+        Arc::new(builder.build().unwrap())
+    }
+
+    #[test]
+    fn test_validate_sparse_flat_sst_schema_accepts_sparse_flat_schema() {
+        let metadata = build_metadata(PrimaryKeyEncoding::Sparse);
+        let num_columns = flat_sst_arrow_schema_column_num(
+            &metadata,
+            &FlatSchemaOptions::from_encoding(PrimaryKeyEncoding::Sparse),
+        );
+
+        validate_sparse_flat_sst_schema(&metadata, num_columns, "test.parquet").unwrap();
+    }
+
+    #[test]
+    fn test_validate_sparse_flat_sst_schema_accepts_full_flat_schema() {
+        let metadata = build_metadata(PrimaryKeyEncoding::Sparse);
+        let num_columns =
+            flat_sst_arrow_schema_column_num(&metadata, &FlatSchemaOptions::default());
+
+        validate_sparse_flat_sst_schema(&metadata, num_columns, "test.parquet").unwrap();
+    }
+
+    #[test]
+    fn test_validate_sparse_flat_sst_schema_rejects_dense_encoding() {
+        let metadata = build_metadata(PrimaryKeyEncoding::Dense);
+        let num_columns =
+            flat_sst_arrow_schema_column_num(&metadata, &FlatSchemaOptions::default());
+
+        let err =
+            validate_sparse_flat_sst_schema(&metadata, num_columns, "test.parquet").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("aggregate index only supports sparse primary-key encoding"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sparse_flat_sst_schema_rejects_invalid_column_count() {
+        let metadata = build_metadata(PrimaryKeyEncoding::Sparse);
+        let num_columns =
+            flat_sst_arrow_schema_column_num(&metadata, &FlatSchemaOptions::default()) - 1;
+
+        let err =
+            validate_sparse_flat_sst_schema(&metadata, num_columns, "test.parquet").unwrap_err();
+        assert!(
+            err.to_string().contains("Column number difference"),
+            "{err:?}"
+        );
+    }
 }
