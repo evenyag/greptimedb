@@ -45,7 +45,7 @@ struct BuildCommand {
     input: Vec<String>,
     #[clap(long)]
     output_dir: PathBuf,
-    #[clap(long, alias = "buffer-rows", default_value_t = 8 * 1024 * 1024)]
+    #[clap(long, default_value_t = 8 * 1024 * 1024)]
     buffer_bytes: usize,
 }
 
