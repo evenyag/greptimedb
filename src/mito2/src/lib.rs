@@ -25,6 +25,7 @@
 pub mod test_util;
 
 pub mod access_layer;
+pub mod aggr_index;
 pub mod cache;
 pub mod compaction;
 pub mod config;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[allow(clippy::print_stdout)]
+mod aggr_index;
 pub mod builder;
 #[allow(clippy::print_stdout)]
 pub(crate) mod objbench;
@@ -38,6 +40,7 @@ use snafu::{ResultExt, ensure};
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::App;
+use crate::datanode::aggr_index::AggrIndexCommand;
 use crate::datanode::builder::InstanceBuilder;
 use crate::datanode::objbench::ObjbenchCommand;
 #[cfg(feature = "dev-tools")]
@@ -114,7 +117,9 @@ impl Command {
         match &self.subcmd {
             SubCommand::Start(cmd) => cmd.load_options(global_options),
             // Bench commands are standalone utilities and don't need to load DatanodeOptions.
-            SubCommand::Objbench(_) | SubCommand::Scanbench(_) => Self::default_bench_options(),
+            SubCommand::Objbench(_) | SubCommand::Scanbench(_) | SubCommand::AggrIndex(_) => {
+                Self::default_bench_options()
+            }
             #[cfg(feature = "dev-tools")]
             SubCommand::Parquetbench(_) => Self::default_bench_options(),
         }
@@ -143,6 +148,8 @@ pub enum SubCommand {
     /// Benchmark scanning a single parquet SST.
     #[cfg(feature = "dev-tools")]
     Parquetbench(ParquetbenchCommand),
+    /// Aggregate index POC tool
+    AggrIndex(AggrIndexCommand),
 }
 
 impl SubCommand {
@@ -162,6 +169,10 @@ impl SubCommand {
             }
             #[cfg(feature = "dev-tools")]
             SubCommand::Parquetbench(cmd) => {
+                cmd.run().await?;
+                std::process::exit(0);
+            }
+            SubCommand::AggrIndex(cmd) => {
                 cmd.run().await?;
                 std::process::exit(0);
             }
