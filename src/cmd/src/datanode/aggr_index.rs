@@ -10,7 +10,7 @@ use datatypes::arrow::array::{BinaryArray, Int64Array, StringArray, UInt32Array,
 use mito2::aggr_index::index_io::IndexReader;
 use mito2::aggr_index::input::{merge_sources, open_sst_stream, validate_same_schema};
 use mito2::aggr_index::{IndexKind, build_indexes, merge_index_files};
-use mito2::sst::file::FileMeta;
+use mito2::sst::file::{FileMeta, RegionFileId};
 use snafu::OptionExt;
 use store_api::storage::FileId;
 
@@ -111,14 +111,14 @@ impl BuildCommand {
         let mut metadata = None;
         let mut schema = None;
         for input in &self.input {
-            let path = sst_path(&self.table_dir, path_type, input);
+            let file_id = parse_file_id(input)?;
+            let path = sst_path(&self.table_dir, region_id, path_type, file_id);
             let stat = object_store.stat(&path).await.map_err(|e| {
                 error::IllegalConfigSnafu {
                     msg: format!("stat {path} failed: {e}"),
                 }
                 .build()
             })?;
-            let file_id = parse_file_id(input)?;
             let file_meta = FileMeta {
                 region_id,
                 file_id,
@@ -271,12 +271,13 @@ fn col<T: 'static>(
         })
 }
 
-fn sst_path(table_dir: &str, path_type: store_api::region_request::PathType, file: &str) -> String {
-    match path_type {
-        store_api::region_request::PathType::Bare => format!("{table_dir}/{file}"),
-        store_api::region_request::PathType::Data => format!("{table_dir}/data/{file}"),
-        store_api::region_request::PathType::Metadata => format!("{table_dir}/metadata/{file}"),
-    }
+fn sst_path(
+    table_dir: &str,
+    region_id: store_api::storage::RegionId,
+    path_type: store_api::region_request::PathType,
+    file_id: FileId,
+) -> String {
+    mito2::sst::location::sst_file_path(table_dir, RegionFileId::new(region_id, file_id), path_type)
 }
 fn parse_file_id(input: &str) -> error::Result<FileId> {
     let stem = Path::new(input)
