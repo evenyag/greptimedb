@@ -115,6 +115,7 @@ async fn start(cli: Command) -> Result<()> {
             datanode::SubCommand::Scanbench(ref bench) => bench.run().await,
             #[cfg(feature = "dev-tools")]
             datanode::SubCommand::Parquetbench(ref bench) => bench.run().await,
+            datanode::SubCommand::AggrIndex(ref cmd) => cmd.run().await,
         },
         SubCommand::Flownode(cmd) => {
             cmd.build(cmd.load_options(&cli.global_options)?)

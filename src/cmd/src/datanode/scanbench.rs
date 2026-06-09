@@ -181,7 +181,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn parse_region_id(s: &str) -> error::Result<RegionId> {
+pub(super) fn parse_region_id(s: &str) -> error::Result<RegionId> {
     if s.contains(':') {
         let parts: Vec<&str> = s.splitn(2, ':').collect();
         let table_id: u32 = parts[0].parse().map_err(|e| {
@@ -208,7 +208,7 @@ fn parse_region_id(s: &str) -> error::Result<RegionId> {
     }
 }
 
-fn parse_path_type(s: &str) -> error::Result<PathType> {
+pub(super) fn parse_path_type(s: &str) -> error::Result<PathType> {
     match s.to_lowercase().as_str() {
         "bare" => Ok(PathType::Bare),
         "data" => Ok(PathType::Data),
