@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use datatypes::arrow::array::{
     Array, BinaryArray, DictionaryArray, Int64Array, StringArray, UInt32Array, UInt64Array,
@@ -28,6 +29,16 @@ use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_colu
 
 const PK_WRITE_BUFFER_ROWS: usize = 1024;
 
+#[derive(Debug, Clone, Default)]
+pub struct BuildCosts {
+    pub sst_iteration_decode_collect: Duration,
+    pub legacy_pk_write: Duration,
+    pub table_tag_run_write: Duration,
+    pub tag_run_write: Duration,
+    pub table_tag_merge_final_write: Duration,
+    pub tag_merge_final_write: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct BuildOutput {
     pub pk_path: String,
@@ -36,6 +47,7 @@ pub struct BuildOutput {
     pub pk_rows: usize,
     pub table_tag_rows: usize,
     pub tag_rows: usize,
+    pub costs: BuildCosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +91,8 @@ pub async fn build_indexes(
     let tag_path = format!("{output_dir}/{}", IndexKind::Tag.file_name());
     let mut pk_writer =
         IndexWriter::try_new(&object_store, &pk_path, IndexKind::Pk.schema()).await?;
+    let mut costs = BuildCosts::default();
+    let iteration_start = Instant::now();
     let codec = build_primary_key_codec(&metadata);
 
     let mut current_pk: Option<Vec<u8>> = None;
@@ -133,6 +147,7 @@ pub async fn build_indexes(
                         &mut table_tag_runs,
                         &mut tag_runs,
                         &mut run_id,
+                        &mut costs,
                     )
                     .await?;
                     tag_buffer_bytes = 0;
@@ -155,8 +170,11 @@ pub async fn build_indexes(
         .await?;
         pk_rows += 1;
     }
+    costs.sst_iteration_decode_collect = iteration_start.elapsed();
+    let pk_write_start = Instant::now();
     flush_pk_rows(&mut pk_writer, &mut pk_buffer).await?;
     pk_writer.close().await?;
+    costs.legacy_pk_write += pk_write_start.elapsed();
     flush_runs(
         &object_store,
         output_dir,
@@ -165,9 +183,11 @@ pub async fn build_indexes(
         &mut table_tag_runs,
         &mut tag_runs,
         &mut run_id,
+        &mut costs,
     )
     .await?;
 
+    let table_tag_merge_start = Instant::now();
     let table_tag_rows = merge_or_empty(
         IndexKind::TableTag,
         &object_store,
@@ -175,7 +195,10 @@ pub async fn build_indexes(
         &table_tag_path,
     )
     .await?;
+    costs.table_tag_merge_final_write = table_tag_merge_start.elapsed();
+    let tag_merge_start = Instant::now();
     let tag_rows = merge_or_empty(IndexKind::Tag, &object_store, &tag_runs, &tag_path).await?;
+    costs.tag_merge_final_write = tag_merge_start.elapsed();
     for path in table_tag_runs.into_iter().chain(tag_runs) {
         let _ = object_store.delete(&path).await;
     }
@@ -187,6 +210,7 @@ pub async fn build_indexes(
         pk_rows,
         table_tag_rows,
         tag_rows,
+        costs,
     })
 }
 
@@ -361,16 +385,21 @@ async fn flush_runs(
     table_tag_runs: &mut Vec<String>,
     tag_runs: &mut Vec<String>,
     run_id: &mut usize,
+    costs: &mut BuildCosts,
 ) -> Result<()> {
     if !table_tags.is_empty() {
         let path = format!("{output_dir}/.table_tag_run_{run_id}.parquet");
+        let start = Instant::now();
         write_table_tag_file(object_store, &path, table_tags.iter()).await?;
+        costs.table_tag_run_write += start.elapsed();
         table_tags.clear();
         table_tag_runs.push(path);
     }
     if !tags.is_empty() {
         let path = format!("{output_dir}/.tag_run_{run_id}.parquet");
+        let start = Instant::now();
         write_tag_file(object_store, &path, tags.iter()).await?;
+        costs.tag_run_write += start.elapsed();
         tags.clear();
         tag_runs.push(path);
     }

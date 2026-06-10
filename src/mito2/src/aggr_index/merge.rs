@@ -21,11 +21,11 @@ use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt};
 use object_store::ObjectStore;
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::aggr_index::index_io::{IndexReader, IndexWriter};
 use crate::aggr_index::schema::IndexKind;
-use crate::error::{InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
+use crate::error::{InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
 
 const MERGE_BATCH_SIZE: usize = 8192;
 
@@ -35,6 +35,12 @@ pub async fn merge_index_files(
     inputs: &[String],
     output: &str,
 ) -> Result<usize> {
+    ensure!(
+        kind != IndexKind::PkColumns,
+        InvalidMetaSnafu {
+            reason: "PkColumns has a dynamic metadata-derived schema and cannot be generically merged"
+        }
+    );
     if inputs.is_empty() {
         return IndexWriter::try_new(object_store, output, kind.schema())
             .await?
@@ -47,6 +53,9 @@ pub async fn merge_index_files(
         IndexKind::Pk => merge_pk(merged, object_store, output).await,
         IndexKind::TableTag => merge_table_tag(merged, object_store, output).await,
         IndexKind::Tag => merge_tag(merged, object_store, output).await,
+        IndexKind::TableTagTsid => merge_table_tag_tsid(merged, object_store, output).await,
+        IndexKind::PkMap => merge_passthrough(kind, merged, object_store, output).await,
+        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected above"),
     }
 }
 
@@ -85,6 +94,9 @@ fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
         IndexKind::Pk => 1,
         IndexKind::TableTag => 3,
         IndexKind::Tag => 2,
+        IndexKind::TableTagTsid => 4,
+        IndexKind::PkMap => 1,
+        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected before sorting"),
     };
     LexOrdering::new((0..columns).map(|idx| {
         PhysicalSortExpr::new(
@@ -197,6 +209,76 @@ async fn merge_tag(
         }
     }
     buffer.flush(&mut writer).await?;
+    writer.close().await
+}
+
+async fn merge_table_tag_tsid(
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer =
+        IndexWriter::try_new(object_store, output, IndexKind::TableTagTsid.schema()).await?;
+    let mut last: Option<(u32, u32, String, u64)> = None;
+
+    while let Some(batch) = merged.next().await {
+        let batch = batch.map_err(|e| {
+            external_error(e, "merge aggregate table-tag-tsid index stream".to_string())
+        })?;
+        let table = u32_col(&batch, 0)?;
+        let col = u32_col(&batch, 1)?;
+        let val = string_col(&batch, 2)?;
+        let tsid = u64_col(&batch, 3)?;
+        let mut rows = Vec::new();
+        for row in 0..batch.num_rows() {
+            let key = (
+                table.value(row),
+                col.value(row),
+                val.value(row).to_string(),
+                tsid.value(row),
+            );
+            if last.as_ref() != Some(&key) {
+                last = Some(key.clone());
+                rows.push(key);
+            }
+        }
+        if !rows.is_empty() {
+            let out = RecordBatch::try_new(
+                IndexKind::TableTagTsid.schema(),
+                vec![
+                    Arc::new(UInt32Array::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(UInt32Array::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|r| r.2.as_str()),
+                    )) as _,
+                    Arc::new(UInt64Array::from(
+                        rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )) as _,
+                ],
+            )
+            .context(NewRecordBatchSnafu)?;
+            writer.write(&out).await?;
+        }
+    }
+    writer.close().await
+}
+
+async fn merge_passthrough(
+    kind: IndexKind,
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer = IndexWriter::try_new(object_store, output, kind.schema()).await?;
+    while let Some(batch) = merged.next().await {
+        let batch = batch
+            .map_err(|e| external_error(e, format!("merge aggregate {kind:?} index stream")))?;
+        writer.write(&batch).await?;
+    }
     writer.close().await
 }
 
