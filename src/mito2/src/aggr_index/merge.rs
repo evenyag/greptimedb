@@ -2,7 +2,6 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -21,6 +20,7 @@ use datatypes::arrow::array::{
 use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt};
+use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt};
 
 use crate::aggr_index::index_io::{IndexReader, IndexWriter};
@@ -29,38 +29,41 @@ use crate::error::{InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
 
 const MERGE_BATCH_SIZE: usize = 8192;
 
-pub fn merge_index_files(
+pub async fn merge_index_files(
     kind: IndexKind,
-    inputs: &[impl AsRef<Path>],
-    output: impl AsRef<Path>,
+    object_store: &ObjectStore,
+    inputs: &[String],
+    output: &str,
 ) -> Result<usize> {
     if inputs.is_empty() {
-        return IndexWriter::try_new(output, kind.schema())?.close();
+        return IndexWriter::try_new(object_store, output, kind.schema())
+            .await?
+            .close()
+            .await;
     }
 
-    let merged = streaming_merge(kind, inputs)?;
+    let merged = streaming_merge(kind, object_store, inputs).await?;
     match kind {
-        IndexKind::Pk => merge_pk(merged, output),
-        IndexKind::TableTag => merge_table_tag(merged, output),
-        IndexKind::Tag => merge_tag(merged, output),
+        IndexKind::Pk => merge_pk(merged, object_store, output).await,
+        IndexKind::TableTag => merge_table_tag(merged, object_store, output).await,
+        IndexKind::Tag => merge_tag(merged, object_store, output).await,
     }
 }
 
-fn streaming_merge(
+async fn streaming_merge(
     kind: IndexKind,
-    inputs: &[impl AsRef<Path>],
+    object_store: &ObjectStore,
+    inputs: &[String],
 ) -> Result<SendableRecordBatchStream> {
     let schema = kind.schema();
-    let streams = inputs
-        .iter()
-        .map(|input| {
-            let reader = IndexReader::try_new(input, kind)?;
-            Ok(
-                Box::pin(IndexRecordBatchStream::new(schema.clone(), reader))
-                    as SendableRecordBatchStream,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut streams = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let reader = IndexReader::try_new(object_store, input, kind).await?;
+        streams.push(
+            Box::pin(IndexRecordBatchStream::new(schema.clone(), reader))
+                as SendableRecordBatchStream,
+        );
+    }
 
     let ordering = sort_ordering(kind, schema.clone());
     let metrics = ExecutionPlanMetricsSet::new();
@@ -92,106 +95,109 @@ fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
     .expect("aggregate index sort ordering is not empty")
 }
 
-fn merge_pk(mut merged: SendableRecordBatchStream, output: impl AsRef<Path>) -> Result<usize> {
-    let mut writer = IndexWriter::try_new(output, IndexKind::Pk.schema())?;
+async fn merge_pk(
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer = IndexWriter::try_new(object_store, output, IndexKind::Pk.schema()).await?;
     let mut buffer = PkOutputBuffer::default();
     let mut current: Option<PkRow> = None;
 
-    futures::executor::block_on(async {
-        while let Some(batch) = merged.next().await {
-            let batch = batch
-                .map_err(|e| external_error(e, "merge aggregate pk index stream".to_string()))?;
-            let pk = binary_col(&batch, 0)?;
-            let min = int64_col(&batch, 1)?;
-            let max = int64_col(&batch, 2)?;
-            let cnt = u64_col(&batch, 3)?;
-            for row in 0..batch.num_rows() {
-                let row = PkRow {
-                    pk: pk.value(row).to_vec(),
-                    min_ts: min.value(row),
-                    max_ts: max.value(row),
-                    row_count: cnt.value(row),
-                };
-                match current.as_mut() {
-                    Some(current) if current.pk == row.pk => {
-                        current.min_ts = current.min_ts.min(row.min_ts);
-                        current.max_ts = current.max_ts.max(row.max_ts);
-                        current.row_count += row.row_count;
-                    }
-                    Some(_) => {
-                        let finished = current.replace(row).expect("current row exists");
-                        buffer.push(&mut writer, finished)?;
-                    }
-                    None => current = Some(row),
+    while let Some(batch) = merged.next().await {
+        let batch =
+            batch.map_err(|e| external_error(e, "merge aggregate pk index stream".to_string()))?;
+        let pk = binary_col(&batch, 0)?;
+        let min = int64_col(&batch, 1)?;
+        let max = int64_col(&batch, 2)?;
+        let cnt = u64_col(&batch, 3)?;
+        for row in 0..batch.num_rows() {
+            let row = PkRow {
+                pk: pk.value(row).to_vec(),
+                min_ts: min.value(row),
+                max_ts: max.value(row),
+                row_count: cnt.value(row),
+            };
+            match current.as_mut() {
+                Some(current) if current.pk == row.pk => {
+                    current.min_ts = current.min_ts.min(row.min_ts);
+                    current.max_ts = current.max_ts.max(row.max_ts);
+                    current.row_count += row.row_count;
                 }
+                Some(_) => {
+                    let finished = current.replace(row).expect("current row exists");
+                    buffer.push(&mut writer, finished).await?;
+                }
+                None => current = Some(row),
             }
         }
-        if let Some(row) = current.take() {
-            buffer.push(&mut writer, row)?;
-        }
-        buffer.flush(&mut writer)
-    })?;
-    writer.close()
+    }
+    if let Some(row) = current.take() {
+        buffer.push(&mut writer, row).await?;
+    }
+    buffer.flush(&mut writer).await?;
+    writer.close().await
 }
 
-fn merge_table_tag(
+async fn merge_table_tag(
     mut merged: SendableRecordBatchStream,
-    output: impl AsRef<Path>,
+    object_store: &ObjectStore,
+    output: &str,
 ) -> Result<usize> {
-    let mut writer = IndexWriter::try_new(output, IndexKind::TableTag.schema())?;
+    let mut writer =
+        IndexWriter::try_new(object_store, output, IndexKind::TableTag.schema()).await?;
     let mut buffer = TableTagOutputBuffer::default();
     let mut last: Option<TableTagRow> = None;
 
-    futures::executor::block_on(async {
-        while let Some(batch) = merged.next().await {
-            let batch = batch.map_err(|e| {
-                external_error(e, "merge aggregate table-tag index stream".to_string())
-            })?;
-            let table = u32_col(&batch, 0)?;
-            let col = u32_col(&batch, 1)?;
-            let val = string_col(&batch, 2)?;
-            for row in 0..batch.num_rows() {
-                let row = TableTagRow {
-                    table_id: table.value(row),
-                    column_id: col.value(row),
-                    value: val.value(row).to_string(),
-                };
-                if last.as_ref() != Some(&row) {
-                    last = Some(row.clone());
-                    buffer.push(&mut writer, row)?;
-                }
+    while let Some(batch) = merged.next().await {
+        let batch = batch
+            .map_err(|e| external_error(e, "merge aggregate table-tag index stream".to_string()))?;
+        let table = u32_col(&batch, 0)?;
+        let col = u32_col(&batch, 1)?;
+        let val = string_col(&batch, 2)?;
+        for row in 0..batch.num_rows() {
+            let row = TableTagRow {
+                table_id: table.value(row),
+                column_id: col.value(row),
+                value: val.value(row).to_string(),
+            };
+            if last.as_ref() != Some(&row) {
+                last = Some(row.clone());
+                buffer.push(&mut writer, row).await?;
             }
         }
-        buffer.flush(&mut writer)
-    })?;
-    writer.close()
+    }
+    buffer.flush(&mut writer).await?;
+    writer.close().await
 }
 
-fn merge_tag(mut merged: SendableRecordBatchStream, output: impl AsRef<Path>) -> Result<usize> {
-    let mut writer = IndexWriter::try_new(output, IndexKind::Tag.schema())?;
+async fn merge_tag(
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer = IndexWriter::try_new(object_store, output, IndexKind::Tag.schema()).await?;
     let mut buffer = TagOutputBuffer::default();
     let mut last: Option<TagRow> = None;
 
-    futures::executor::block_on(async {
-        while let Some(batch) = merged.next().await {
-            let batch = batch
-                .map_err(|e| external_error(e, "merge aggregate tag index stream".to_string()))?;
-            let col = u32_col(&batch, 0)?;
-            let val = string_col(&batch, 1)?;
-            for row in 0..batch.num_rows() {
-                let row = TagRow {
-                    column_id: col.value(row),
-                    value: val.value(row).to_string(),
-                };
-                if last.as_ref() != Some(&row) {
-                    last = Some(row.clone());
-                    buffer.push(&mut writer, row)?;
-                }
+    while let Some(batch) = merged.next().await {
+        let batch =
+            batch.map_err(|e| external_error(e, "merge aggregate tag index stream".to_string()))?;
+        let col = u32_col(&batch, 0)?;
+        let val = string_col(&batch, 1)?;
+        for row in 0..batch.num_rows() {
+            let row = TagRow {
+                column_id: col.value(row),
+                value: val.value(row).to_string(),
+            };
+            if last.as_ref() != Some(&row) {
+                last = Some(row.clone());
+                buffer.push(&mut writer, row).await?;
             }
         }
-        buffer.flush(&mut writer)
-    })?;
-    writer.close()
+    }
+    buffer.flush(&mut writer).await?;
+    writer.close().await
 }
 
 struct IndexRecordBatchStream {
@@ -208,12 +214,10 @@ impl IndexRecordBatchStream {
 impl Stream for IndexRecordBatchStream {
     type Item = datafusion_common::Result<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(
-            self.reader
-                .next()
-                .map(|result| result.map_err(|e| DataFusionError::Execution(e.to_string()))),
-        )
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.reader.poll_next_unpin(cx).map(|opt| {
+            opt.map(|result| result.map_err(|e| DataFusionError::Execution(e.to_string())))
+        })
     }
 }
 
@@ -250,15 +254,15 @@ struct PkOutputBuffer {
 }
 
 impl PkOutputBuffer {
-    fn push(&mut self, writer: &mut IndexWriter, row: PkRow) -> Result<()> {
+    async fn push(&mut self, writer: &mut IndexWriter, row: PkRow) -> Result<()> {
         self.rows.push(row);
         if self.rows.len() >= MERGE_BATCH_SIZE {
-            self.flush(writer)?;
+            self.flush(writer).await?;
         }
         Ok(())
     }
 
-    fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
+    async fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -283,7 +287,7 @@ impl PkOutputBuffer {
             ],
         )
         .context(NewRecordBatchSnafu)?;
-        writer.write(&batch)?;
+        writer.write(&batch).await?;
         self.rows.clear();
         Ok(())
     }
@@ -295,15 +299,15 @@ struct TableTagOutputBuffer {
 }
 
 impl TableTagOutputBuffer {
-    fn push(&mut self, writer: &mut IndexWriter, row: TableTagRow) -> Result<()> {
+    async fn push(&mut self, writer: &mut IndexWriter, row: TableTagRow) -> Result<()> {
         self.rows.push(row);
         if self.rows.len() >= MERGE_BATCH_SIZE {
-            self.flush(writer)?;
+            self.flush(writer).await?;
         }
         Ok(())
     }
 
-    fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
+    async fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -325,7 +329,7 @@ impl TableTagOutputBuffer {
             ],
         )
         .context(NewRecordBatchSnafu)?;
-        writer.write(&batch)?;
+        writer.write(&batch).await?;
         self.rows.clear();
         Ok(())
     }
@@ -337,15 +341,15 @@ struct TagOutputBuffer {
 }
 
 impl TagOutputBuffer {
-    fn push(&mut self, writer: &mut IndexWriter, row: TagRow) -> Result<()> {
+    async fn push(&mut self, writer: &mut IndexWriter, row: TagRow) -> Result<()> {
         self.rows.push(row);
         if self.rows.len() >= MERGE_BATCH_SIZE {
-            self.flush(writer)?;
+            self.flush(writer).await?;
         }
         Ok(())
     }
 
-    fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
+    async fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
         if self.rows.is_empty() {
             return Ok(());
         }
@@ -364,7 +368,7 @@ impl TagOutputBuffer {
             ],
         )
         .context(NewRecordBatchSnafu)?;
-        writer.write(&batch)?;
+        writer.write(&batch).await?;
         self.rows.clear();
         Ok(())
     }
