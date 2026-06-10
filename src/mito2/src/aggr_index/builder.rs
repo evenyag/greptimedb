@@ -4,7 +4,6 @@
 
 use std::collections::BTreeSet;
 use std::mem;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datatypes::arrow::array::{
@@ -14,6 +13,7 @@ use datatypes::arrow::datatypes::{DataType, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use mito_codec::row_converter::{CompositeValues, build_primary_key_codec};
+use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
@@ -30,9 +30,9 @@ const PK_WRITE_BUFFER_ROWS: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct BuildOutput {
-    pub pk_path: PathBuf,
-    pub table_tag_path: PathBuf,
-    pub tag_path: PathBuf,
+    pub pk_path: String,
+    pub table_tag_path: String,
+    pub tag_path: String,
     pub pk_rows: usize,
     pub table_tag_rows: usize,
     pub tag_rows: usize,
@@ -62,7 +62,8 @@ struct PkIndexRow {
 pub async fn build_indexes(
     metadata: RegionMetadataRef,
     mut stream: BoxedRecordBatchStream,
-    output_dir: impl AsRef<Path>,
+    object_store: ObjectStore,
+    output_dir: &str,
     buffer_bytes: usize,
 ) -> Result<BuildOutput> {
     ensure!(
@@ -72,17 +73,12 @@ pub async fn build_indexes(
         }
     );
 
-    std::fs::create_dir_all(output_dir.as_ref()).map_err(|e| {
-        external_error(
-            e,
-            format!("create output dir {}", output_dir.as_ref().display()),
-        )
-    })?;
-
-    let pk_path = output_dir.as_ref().join(IndexKind::Pk.file_name());
-    let table_tag_path = output_dir.as_ref().join(IndexKind::TableTag.file_name());
-    let tag_path = output_dir.as_ref().join(IndexKind::Tag.file_name());
-    let mut pk_writer = IndexWriter::try_new(&pk_path, IndexKind::Pk.schema())?;
+    let output_dir = output_dir.trim_end_matches('/');
+    let pk_path = format!("{output_dir}/{}", IndexKind::Pk.file_name());
+    let table_tag_path = format!("{output_dir}/{}", IndexKind::TableTag.file_name());
+    let tag_path = format!("{output_dir}/{}", IndexKind::Tag.file_name());
+    let mut pk_writer =
+        IndexWriter::try_new(&object_store, &pk_path, IndexKind::Pk.schema()).await?;
     let codec = build_primary_key_codec(&metadata);
 
     let mut current_pk: Option<Vec<u8>> = None;
@@ -115,7 +111,8 @@ pub async fn build_indexes(
                         min_ts,
                         max_ts,
                         row_count,
-                    )?;
+                    )
+                    .await?;
                     pk_rows += 1;
                 }
                 min_ts = ts_value;
@@ -129,13 +126,15 @@ pub async fn build_indexes(
                 )?;
                 if tag_buffer_bytes >= tag_buffer_bytes_limit {
                     flush_runs(
-                        output_dir.as_ref(),
+                        &object_store,
+                        output_dir,
                         &mut table_tags,
                         &mut tags,
                         &mut table_tag_runs,
                         &mut tag_runs,
                         &mut run_id,
-                    )?;
+                    )
+                    .await?;
                     tag_buffer_bytes = 0;
                 }
             }
@@ -152,24 +151,33 @@ pub async fn build_indexes(
             min_ts,
             max_ts,
             row_count,
-        )?;
+        )
+        .await?;
         pk_rows += 1;
     }
-    flush_pk_rows(&mut pk_writer, &mut pk_buffer)?;
-    pk_writer.close()?;
+    flush_pk_rows(&mut pk_writer, &mut pk_buffer).await?;
+    pk_writer.close().await?;
     flush_runs(
-        output_dir.as_ref(),
+        &object_store,
+        output_dir,
         &mut table_tags,
         &mut tags,
         &mut table_tag_runs,
         &mut tag_runs,
         &mut run_id,
-    )?;
+    )
+    .await?;
 
-    let table_tag_rows = merge_or_empty(IndexKind::TableTag, &table_tag_runs, &table_tag_path)?;
-    let tag_rows = merge_or_empty(IndexKind::Tag, &tag_runs, &tag_path)?;
+    let table_tag_rows = merge_or_empty(
+        IndexKind::TableTag,
+        &object_store,
+        &table_tag_runs,
+        &table_tag_path,
+    )
+    .await?;
+    let tag_rows = merge_or_empty(IndexKind::Tag, &object_store, &tag_runs, &tag_path).await?;
     for path in table_tag_runs.into_iter().chain(tag_runs) {
-        let _ = std::fs::remove_file(path);
+        let _ = object_store.delete(&path).await;
     }
 
     Ok(BuildOutput {
@@ -296,7 +304,7 @@ fn timestamp_values(array: &Arc<dyn Array>) -> Result<Vec<i64>> {
     .fail()
 }
 
-fn buffer_pk_row(
+async fn buffer_pk_row(
     writer: &mut IndexWriter,
     buffer: &mut Vec<PkIndexRow>,
     pk: Vec<u8>,
@@ -311,12 +319,12 @@ fn buffer_pk_row(
         row_count,
     });
     if buffer.len() >= PK_WRITE_BUFFER_ROWS {
-        flush_pk_rows(writer, buffer)?;
+        flush_pk_rows(writer, buffer).await?;
     }
     Ok(())
 }
 
-fn flush_pk_rows(writer: &mut IndexWriter, buffer: &mut Vec<PkIndexRow>) -> Result<()> {
+async fn flush_pk_rows(writer: &mut IndexWriter, buffer: &mut Vec<PkIndexRow>) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
     }
@@ -339,28 +347,30 @@ fn flush_pk_rows(writer: &mut IndexWriter, buffer: &mut Vec<PkIndexRow>) -> Resu
         ],
     )
     .context(NewRecordBatchSnafu)?;
-    writer.write(&batch)?;
+    writer.write(&batch).await?;
     buffer.clear();
     Ok(())
 }
 
-fn flush_runs(
-    output_dir: &Path,
+#[allow(clippy::too_many_arguments)]
+async fn flush_runs(
+    object_store: &ObjectStore,
+    output_dir: &str,
     table_tags: &mut BTreeSet<TableTagKey>,
     tags: &mut BTreeSet<TagKey>,
-    table_tag_runs: &mut Vec<PathBuf>,
-    tag_runs: &mut Vec<PathBuf>,
+    table_tag_runs: &mut Vec<String>,
+    tag_runs: &mut Vec<String>,
     run_id: &mut usize,
 ) -> Result<()> {
     if !table_tags.is_empty() {
-        let path = output_dir.join(format!(".table_tag_run_{run_id}.parquet"));
-        write_table_tag_file(&path, table_tags.iter())?;
+        let path = format!("{output_dir}/.table_tag_run_{run_id}.parquet");
+        write_table_tag_file(object_store, &path, table_tags.iter()).await?;
         table_tags.clear();
         table_tag_runs.push(path);
     }
     if !tags.is_empty() {
-        let path = output_dir.join(format!(".tag_run_{run_id}.parquet"));
-        write_tag_file(&path, tags.iter())?;
+        let path = format!("{output_dir}/.tag_run_{run_id}.parquet");
+        write_tag_file(object_store, &path, tags.iter()).await?;
         tags.clear();
         tag_runs.push(path);
     }
@@ -368,12 +378,13 @@ fn flush_runs(
     Ok(())
 }
 
-fn write_table_tag_file<'a>(
-    path: &Path,
+async fn write_table_tag_file<'a>(
+    object_store: &ObjectStore,
+    path: &str,
     rows: impl Iterator<Item = &'a TableTagKey>,
 ) -> Result<usize> {
     let rows: Vec<_> = rows.collect();
-    let mut writer = IndexWriter::try_new(path, IndexKind::TableTag.schema())?;
+    let mut writer = IndexWriter::try_new(object_store, path, IndexKind::TableTag.schema()).await?;
     let batch = RecordBatch::try_new(
         IndexKind::TableTag.schema(),
         vec![
@@ -389,13 +400,17 @@ fn write_table_tag_file<'a>(
         ],
     )
     .context(NewRecordBatchSnafu)?;
-    writer.write(&batch)?;
-    writer.close()
+    writer.write(&batch).await?;
+    writer.close().await
 }
 
-fn write_tag_file<'a>(path: &Path, rows: impl Iterator<Item = &'a TagKey>) -> Result<usize> {
+async fn write_tag_file<'a>(
+    object_store: &ObjectStore,
+    path: &str,
+    rows: impl Iterator<Item = &'a TagKey>,
+) -> Result<usize> {
     let rows: Vec<_> = rows.collect();
-    let mut writer = IndexWriter::try_new(path, IndexKind::Tag.schema())?;
+    let mut writer = IndexWriter::try_new(object_store, path, IndexKind::Tag.schema()).await?;
     let batch = RecordBatch::try_new(
         IndexKind::Tag.schema(),
         vec![
@@ -408,24 +423,21 @@ fn write_tag_file<'a>(path: &Path, rows: impl Iterator<Item = &'a TagKey>) -> Re
         ],
     )
     .context(NewRecordBatchSnafu)?;
-    writer.write(&batch)?;
-    writer.close()
+    writer.write(&batch).await?;
+    writer.close().await
 }
 
-fn merge_or_empty(kind: IndexKind, runs: &[PathBuf], output: &Path) -> Result<usize> {
+async fn merge_or_empty(
+    kind: IndexKind,
+    object_store: &ObjectStore,
+    runs: &[String],
+    output: &str,
+) -> Result<usize> {
     if runs.is_empty() {
-        return IndexWriter::try_new(output, kind.schema())?.close();
+        return IndexWriter::try_new(object_store, output, kind.schema())
+            .await?
+            .close()
+            .await;
     }
-    merge_index_files(kind, runs, output)
-}
-
-fn external_error(error: impl std::fmt::Display, context: String) -> crate::error::Error {
-    let boxed = common_error::ext::BoxedError::new(common_error::ext::PlainError::new(
-        error.to_string(),
-        common_error::status_code::StatusCode::Unexpected,
-    ));
-    let result: std::result::Result<(), common_error::ext::BoxedError> = Err(boxed);
-    result
-        .context(crate::error::ExternalSnafu { context })
-        .unwrap_err()
+    merge_index_files(kind, object_store, runs, output).await
 }

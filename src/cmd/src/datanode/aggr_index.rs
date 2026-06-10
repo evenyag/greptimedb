@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use datatypes::arrow::array::{BinaryArray, Int64Array, StringArray, UInt32Array, UInt64Array};
+use futures::StreamExt;
 use mito2::aggr_index::index_io::IndexReader;
 use mito2::aggr_index::input::{merge_sources, open_sst_stream, validate_same_schema};
 use mito2::aggr_index::{IndexKind, build_indexes, merge_index_files};
 use mito2::sst::file::{FileMeta, RegionFileId};
+use object_store::ObjectStore;
+use object_store::services::Fs;
 use snafu::OptionExt;
 use store_api::storage::FileId;
 
@@ -95,10 +98,42 @@ impl AggrIndexCommand {
     pub async fn run(&self) -> error::Result<()> {
         match &self.subcmd {
             AggrIndexSubCommand::Build(cmd) => cmd.run().await,
-            AggrIndexSubCommand::Merge(cmd) => cmd.run(),
-            AggrIndexSubCommand::Read(cmd) => cmd.run(),
+            AggrIndexSubCommand::Merge(cmd) => cmd.run().await,
+            AggrIndexSubCommand::Read(cmd) => cmd.run().await,
         }
     }
+}
+
+/// Builds a dedicated local-filesystem object store rooted at the filesystem
+/// root, so any absolute local path can be addressed by stripping its leading
+/// `/` (see [`store_path`]).
+fn local_fs_store() -> error::Result<ObjectStore> {
+    ObjectStore::new(Fs::default().root("/"))
+        .map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("init local fs object store: {e}"),
+            }
+            .build()
+        })
+        .map(|builder| builder.finish())
+}
+
+/// Maps a local path to a path within the [`local_fs_store`] (rooted at `/`) by
+/// absolutizing it and stripping the leading `/`.
+fn store_path(p: &Path) -> error::Result<String> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("resolve current dir: {e}"),
+                }
+                .build()
+            })?
+            .join(p)
+    };
+    Ok(abs.to_string_lossy().trim_start_matches('/').to_string())
 }
 
 impl BuildCommand {
@@ -150,26 +185,46 @@ impl BuildCommand {
             msg: "no input SST metadata",
         })?;
         let merged = merge_sources(schema, streams).await.map_err(to_cmd_err)?;
-        let output = build_indexes(metadata, merged, &self.output_dir, self.buffer_bytes)
-            .await
-            .map_err(to_cmd_err)?;
-        print_file("pk", &output.pk_path, output.pk_rows)?;
-        print_file("table-tag", &output.table_tag_path, output.table_tag_rows)?;
-        print_file("tag", &output.tag_path, output.tag_rows)?;
+        let index_store = local_fs_store()?;
+        let output_dir = store_path(&self.output_dir)?;
+        let output = build_indexes(
+            metadata,
+            merged,
+            index_store,
+            &output_dir,
+            self.buffer_bytes,
+        )
+        .await
+        .map_err(to_cmd_err)?;
+        print_file("pk", &self.output_dir.join("pk.parquet"), output.pk_rows)?;
+        print_file(
+            "table-tag",
+            &self.output_dir.join("table_tag.parquet"),
+            output.table_tag_rows,
+        )?;
+        print_file("tag", &self.output_dir.join("tag.parquet"), output.tag_rows)?;
         Ok(())
     }
 }
 
 impl MergeCommand {
-    fn run(&self) -> error::Result<()> {
-        let rows =
-            merge_index_files(self.kind.into(), &self.input, &self.output).map_err(to_cmd_err)?;
+    async fn run(&self) -> error::Result<()> {
+        let index_store = local_fs_store()?;
+        let inputs = self
+            .input
+            .iter()
+            .map(|p| store_path(p))
+            .collect::<error::Result<Vec<_>>>()?;
+        let output = store_path(&self.output)?;
+        let rows = merge_index_files(self.kind.into(), &index_store, &inputs, &output)
+            .await
+            .map_err(to_cmd_err)?;
         print_file("merged", &self.output, rows)
     }
 }
 
 impl ReadCommand {
-    fn run(&self) -> error::Result<()> {
+    async fn run(&self) -> error::Result<()> {
         let kind = self.kind.into();
         let tag_value = self.tag_value.as_deref();
         let primary_key = self
@@ -183,8 +238,12 @@ impl ReadCommand {
                 }
                 .build()
             })?;
-        let mut reader = IndexReader::try_new(&self.input, kind).map_err(to_cmd_err)?;
-        for batch in &mut reader {
+        let index_store = local_fs_store()?;
+        let input = store_path(&self.input)?;
+        let mut reader = IndexReader::try_new(&index_store, &input, kind)
+            .await
+            .map_err(to_cmd_err)?;
+        while let Some(batch) = reader.next().await {
             let batch = batch.map_err(to_cmd_err)?;
             match kind {
                 IndexKind::Pk => print_pk(&batch, primary_key.as_deref())?,
