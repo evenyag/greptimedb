@@ -33,6 +33,7 @@ use crate::error::{InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnaf
 pub enum TransformFormat {
     TableTagTsid,
     PkMap,
+    PkMapName,
     PkColumns,
 }
 
@@ -41,12 +42,18 @@ impl TransformFormat {
         match self {
             Self::TableTagTsid => IndexKind::TableTagTsid,
             Self::PkMap => IndexKind::PkMap,
+            Self::PkMapName => IndexKind::PkMapName,
             Self::PkColumns => IndexKind::PkColumns,
         }
     }
 
     pub fn all() -> Vec<Self> {
-        vec![Self::TableTagTsid, Self::PkMap, Self::PkColumns]
+        vec![
+            Self::TableTagTsid,
+            Self::PkMap,
+            Self::PkMapName,
+            Self::PkColumns,
+        ]
     }
 }
 
@@ -56,6 +63,7 @@ pub struct TransformCosts {
     pub decode_transform: Duration,
     pub table_tag_tsid_write: Duration,
     pub pk_map_write: Duration,
+    pub pk_map_name_write: Duration,
     pub pk_columns_write: Duration,
 }
 
@@ -63,9 +71,11 @@ pub struct TransformCosts {
 pub struct TransformOutput {
     pub table_tag_tsid_path: Option<String>,
     pub pk_map_path: Option<String>,
+    pub pk_map_name_path: Option<String>,
     pub pk_columns_path: Option<String>,
     pub table_tag_tsid_rows: usize,
     pub pk_map_rows: usize,
+    pub pk_map_name_rows: usize,
     pub pk_columns_rows: usize,
     pub costs: TransformCosts,
 }
@@ -154,9 +164,11 @@ pub async fn transform_pk_index(
     let mut output = TransformOutput {
         table_tag_tsid_path: None,
         pk_map_path: None,
+        pk_map_name_path: None,
         pk_columns_path: None,
         table_tag_tsid_rows: 0,
         pk_map_rows: 0,
+        pk_map_name_rows: 0,
         pk_columns_rows: 0,
         costs: TransformCosts {
             read_iteration,
@@ -178,6 +190,14 @@ pub async fn transform_pk_index(
         output.pk_map_rows = write_pk_map(&object_store, &path, &rows).await?;
         output.costs.pk_map_write = start.elapsed();
         output.pk_map_path = Some(path);
+    }
+    if formats.contains(&TransformFormat::PkMapName) {
+        let path = format!("{output_dir}/{}", IndexKind::PkMapName.file_name());
+        let start = Instant::now();
+        output.pk_map_name_rows =
+            write_pk_map_name(&object_store, &path, &rows, &tag_columns).await?;
+        output.costs.pk_map_name_write = start.elapsed();
+        output.pk_map_name_path = Some(path);
     }
     if formats.contains(&TransformFormat::PkColumns) {
         let path = format!("{output_dir}/{}", IndexKind::PkColumns.file_name());
@@ -284,6 +304,82 @@ async fn write_pk_map(
     )
     .context(NewRecordBatchSnafu)?;
     write_one_batch(object_store, path, IndexKind::PkMap.schema(), batch).await
+}
+
+async fn write_pk_map_name(
+    object_store: &ObjectStore,
+    path: &str,
+    rows: &[DecodedPkRow],
+    tag_columns: &[(ColumnId, String)],
+) -> Result<usize> {
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut lengths = Vec::new();
+    let tag_column_names = tag_columns
+        .iter()
+        .map(|(column_id, column_name)| (*column_id, column_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for row in rows {
+        lengths.push(row.tags.len());
+        for (column_id, value) in &row.tags {
+            let column_name =
+                tag_column_names
+                    .get(column_id)
+                    .copied()
+                    .context(InvalidMetaSnafu {
+                        reason: format!("missing tag column name for column id {column_id}"),
+                    })?;
+            keys.push(column_name);
+            values.push(value.as_str());
+        }
+    }
+    let key_field = Arc::new(Field::new(MAP_KEY_FIELD, DataType::Utf8, false));
+    let value_field = Arc::new(Field::new(MAP_VALUE_FIELD, DataType::Utf8, false));
+    let struct_array = StructArray::from(vec![
+        (
+            key_field,
+            Arc::new(StringArray::from_iter_values(keys)) as ArrayRef,
+        ),
+        (
+            value_field,
+            Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
+        ),
+    ]);
+    let entries = match IndexKind::PkMapName.schema().field(5).data_type() {
+        DataType::Map(entries, _) => entries.clone(),
+        _ => unreachable!("pk_map_name tags field is a map"),
+    };
+    let map = MapArray::new(
+        entries,
+        OffsetBuffer::from_lengths(lengths),
+        struct_array,
+        None,
+        false,
+    );
+
+    let batch = RecordBatch::try_new(
+        IndexKind::PkMapName.schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.max_ts).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.row_count).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|row| row.table_id).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(UInt64Array::from(
+                rows.iter().map(|row| row.tsid).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(map) as _,
+        ],
+    )
+    .context(NewRecordBatchSnafu)?;
+    write_one_batch(object_store, path, IndexKind::PkMapName.schema(), batch).await
 }
 
 async fn write_pk_columns(
@@ -480,6 +576,7 @@ mod tests {
             .unwrap();
         assert_eq!(output.table_tag_tsid_rows, 3);
         assert_eq!(output.pk_map_rows, 2);
+        assert_eq!(output.pk_map_name_rows, 2);
         assert_eq!(output.pk_columns_rows, 2);
 
         let mut reader = IndexReader::try_new(
@@ -545,6 +642,32 @@ mod tests {
             .unwrap();
         assert_eq!(table.value(0), 11);
         assert_eq!(tsid.value(1), 102);
+
+        let mut reader =
+            IndexReader::try_new(&store, "new/pk_map_name.parquet", IndexKind::PkMapName)
+                .await
+                .unwrap();
+        let batch = reader.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema().field(0).name(), "min_ts");
+        assert_eq!(batch.schema().field(5).name(), "tags");
+        let tags = batch.column(5).as_any().downcast_ref::<MapArray>().unwrap();
+        let entries = tags.value(0);
+        let struct_array = entries.as_any().downcast_ref::<StructArray>().unwrap();
+        let keys = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), "tag_0");
+        assert_eq!(values.value(0), "a");
+        assert_eq!(keys.value(1), "tag_1");
+        assert_eq!(values.value(1), "x");
 
         let mut reader =
             IndexReader::try_new(&store, "new/pk_columns.parquet", IndexKind::PkColumns)

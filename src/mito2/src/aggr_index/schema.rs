@@ -27,6 +27,7 @@ pub enum IndexKind {
     Tag,
     TableTagTsid,
     PkMap,
+    PkMapName,
     PkColumns,
 }
 
@@ -38,6 +39,7 @@ impl IndexKind {
             IndexKind::Tag => tag_schema(),
             IndexKind::TableTagTsid => table_tag_tsid_schema(),
             IndexKind::PkMap => pk_map_schema(),
+            IndexKind::PkMapName => pk_map_name_schema(),
             IndexKind::PkColumns => pk_columns_base_schema(),
         }
     }
@@ -49,6 +51,7 @@ impl IndexKind {
             IndexKind::Tag => "tag.parquet",
             IndexKind::TableTagTsid => "table_tag_tsid.parquet",
             IndexKind::PkMap => "pk_map.parquet",
+            IndexKind::PkMapName => "pk_map_name.parquet",
             IndexKind::PkColumns => "pk_columns.parquet",
         }
     }
@@ -87,7 +90,18 @@ pub fn pk_map_schema() -> SchemaRef {
         Field::new(ROW_COUNT_COL, DataType::UInt64, false),
         Field::new(TABLE_ID_COL, DataType::UInt32, false),
         Field::new(TSID_COL, DataType::UInt64, false),
-        tags_map_field(),
+        tags_map_field(DataType::UInt32),
+    ]))
+}
+
+pub fn pk_map_name_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(MIN_TS_COL, DataType::Int64, false),
+        Field::new(MAX_TS_COL, DataType::Int64, false),
+        Field::new(ROW_COUNT_COL, DataType::UInt64, false),
+        Field::new(TABLE_ID_COL, DataType::UInt32, false),
+        Field::new(TSID_COL, DataType::UInt64, false),
+        tags_map_field(DataType::Utf8),
     ]))
 }
 
@@ -101,9 +115,9 @@ pub fn pk_columns_base_schema() -> SchemaRef {
     ]))
 }
 
-pub fn tags_map_field() -> Field {
+pub fn tags_map_field(key_type: DataType) -> Field {
     let entry_fields = Fields::from(vec![
-        Field::new(MAP_KEY_FIELD, DataType::UInt32, false),
+        Field::new(MAP_KEY_FIELD, key_type, false),
         Field::new(MAP_VALUE_FIELD, DataType::Utf8, false),
     ]);
     let entries = Field::new("entries", DataType::Struct(entry_fields), false);
@@ -174,6 +188,7 @@ mod tests {
     fn test_static_new_index_schemas_validate() {
         validate_schema(IndexKind::TableTagTsid, table_tag_tsid_schema().as_ref()).unwrap();
         validate_schema(IndexKind::PkMap, pk_map_schema().as_ref()).unwrap();
+        validate_schema(IndexKind::PkMapName, pk_map_name_schema().as_ref()).unwrap();
     }
 
     #[test]

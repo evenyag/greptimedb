@@ -38,9 +38,9 @@ pub async fn merge_index_files(
     output: &str,
 ) -> Result<usize> {
     ensure!(
-        kind != IndexKind::PkColumns,
+        kind != IndexKind::PkColumns && kind != IndexKind::PkMapName,
         InvalidMetaSnafu {
-            reason: "PkColumns has a dynamic metadata-derived schema and cannot be generically merged"
+            reason: format!("{kind:?} cannot be generically merged")
         }
     );
     if inputs.is_empty() {
@@ -57,7 +57,9 @@ pub async fn merge_index_files(
         IndexKind::Tag => merge_tag(merged, object_store, output).await,
         IndexKind::TableTagTsid => merge_table_tag_tsid(merged, object_store, output).await,
         IndexKind::PkMap => merge_pk_map(merged, object_store, output).await,
-        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected above"),
+        IndexKind::PkMapName | IndexKind::PkColumns => {
+            unreachable!("merge is rejected above for {kind:?}")
+        }
     }
 }
 
@@ -98,7 +100,9 @@ fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
         IndexKind::Tag => vec![0, 1],
         IndexKind::TableTagTsid => vec![0, 1, 2, 3],
         IndexKind::PkMap => vec![3, 4],
-        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected before sorting"),
+        IndexKind::PkMapName | IndexKind::PkColumns => {
+            unreachable!("merge is rejected before sorting for {kind:?}")
+        }
     };
     LexOrdering::new(columns.into_iter().map(|idx| {
         PhysicalSortExpr::new(

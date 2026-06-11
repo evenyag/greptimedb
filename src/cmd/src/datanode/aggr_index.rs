@@ -110,6 +110,7 @@ enum CliKind {
     Tag,
     TableTagTsid,
     PkMap,
+    PkMapName,
     PkColumns,
 }
 impl From<CliKind> for IndexKind {
@@ -120,6 +121,7 @@ impl From<CliKind> for IndexKind {
             CliKind::Tag => IndexKind::Tag,
             CliKind::TableTagTsid => IndexKind::TableTagTsid,
             CliKind::PkMap => IndexKind::PkMap,
+            CliKind::PkMapName => IndexKind::PkMapName,
             CliKind::PkColumns => IndexKind::PkColumns,
         }
     }
@@ -129,6 +131,7 @@ impl From<CliKind> for IndexKind {
 enum CliTransformFormat {
     TableTagTsid,
     Map,
+    MapName,
     Columns,
 }
 
@@ -137,6 +140,7 @@ impl From<CliTransformFormat> for TransformFormat {
         match v {
             CliTransformFormat::TableTagTsid => TransformFormat::TableTagTsid,
             CliTransformFormat::Map => TransformFormat::PkMap,
+            CliTransformFormat::MapName => TransformFormat::PkMapName,
             CliTransformFormat::Columns => TransformFormat::PkColumns,
         }
     }
@@ -316,6 +320,13 @@ impl TransformPkCommand {
                 output.pk_map_rows,
             )?;
         }
+        if output.pk_map_name_path.is_some() {
+            print_file(
+                "pk-map-name",
+                &self.output_dir.join("pk_map_name.parquet"),
+                output.pk_map_name_rows,
+            )?;
+        }
         if output.pk_columns_path.is_some() {
             print_file(
                 "pk-columns",
@@ -324,11 +335,12 @@ impl TransformPkCommand {
             )?;
         }
         println!(
-            "costs: old_pk_read_iter={:?} pk_decode_tag_extract={:?} table_tag_tsid_write={:?} pk_map_write={:?} pk_columns_write={:?}",
+            "costs: old_pk_read_iter={:?} pk_decode_tag_extract={:?} table_tag_tsid_write={:?} pk_map_write={:?} pk_map_name_write={:?} pk_columns_write={:?}",
             output.costs.read_iteration,
             output.costs.decode_transform,
             output.costs.table_tag_tsid_write,
             output.costs.pk_map_write,
+            output.costs.pk_map_name_write,
             output.costs.pk_columns_write
         );
         Ok(())
@@ -382,7 +394,7 @@ impl ReadCommand {
                 IndexKind::TableTagTsid => {
                     print_table_tag_tsid(&batch, self.table_id, self.column_id, tag_value)?
                 }
-                IndexKind::PkMap => print_pk_map(&batch)?,
+                IndexKind::PkMap | IndexKind::PkMapName => print_pk_map(&batch)?,
                 IndexKind::PkColumns => print_pk_columns(&batch)?,
             }
         }
@@ -518,25 +530,14 @@ fn print_pk_columns(batch: &datatypes::arrow::record_batch::RecordBatch) -> erro
 
 fn format_map(tags: &MapArray, row: usize) -> error::Result<String> {
     let entries = tags.value(row);
-    let keys = entries
+    let struct_array = entries
         .as_any()
         .downcast_ref::<datatypes::arrow::array::StructArray>()
         .context(error::IllegalConfigSnafu {
             msg: "invalid map entries".to_string(),
-        })?
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .context(error::IllegalConfigSnafu {
-            msg: "invalid map key column".to_string(),
-        })?
-        .clone();
-    let values = entries
-        .as_any()
-        .downcast_ref::<datatypes::arrow::array::StructArray>()
-        .context(error::IllegalConfigSnafu {
-            msg: "invalid map entries".to_string(),
-        })?
+        })?;
+    let key_array = struct_array.column(0);
+    let values = struct_array
         .column(1)
         .as_any()
         .downcast_ref::<StringArray>()
@@ -545,8 +546,19 @@ fn format_map(tags: &MapArray, row: usize) -> error::Result<String> {
         })?
         .clone();
     let mut parts = Vec::new();
-    for i in 0..entries.len() {
-        parts.push(format!("{}={}", keys.value(i), values.value(i)));
+    if let Some(keys) = key_array.as_any().downcast_ref::<UInt32Array>() {
+        for i in 0..entries.len() {
+            parts.push(format!("{}={}", keys.value(i), values.value(i)));
+        }
+    } else if let Some(keys) = key_array.as_any().downcast_ref::<StringArray>() {
+        for i in 0..entries.len() {
+            parts.push(format!("{}={}", keys.value(i), values.value(i)));
+        }
+    } else {
+        return Err(error::IllegalConfigSnafu {
+            msg: "invalid map key column".to_string(),
+        }
+        .build());
     }
     Ok(format!("{{{}}}", parts.join(",")))
 }
