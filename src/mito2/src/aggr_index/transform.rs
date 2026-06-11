@@ -196,25 +196,29 @@ async fn write_table_tag_tsid(
     path: &str,
     rows: &[DecodedPkRow],
 ) -> Result<usize> {
-    let mut table_ids = Vec::new();
-    let mut column_ids = Vec::new();
-    let mut values = Vec::new();
-    let mut tsids = Vec::new();
+    let mut expanded_rows = Vec::new();
     for row in rows {
         for (column_id, value) in &row.tags {
-            table_ids.push(row.table_id);
-            column_ids.push(*column_id);
-            values.push(value.as_str());
-            tsids.push(row.tsid);
+            expanded_rows.push((row.table_id, *column_id, value.as_str(), row.tsid));
         }
     }
+    expanded_rows.sort_unstable();
+
     let batch = RecordBatch::try_new(
         IndexKind::TableTagTsid.schema(),
         vec![
-            Arc::new(UInt32Array::from(table_ids)) as _,
-            Arc::new(UInt32Array::from(column_ids)) as _,
-            Arc::new(StringArray::from_iter_values(values)) as _,
-            Arc::new(UInt64Array::from(tsids)) as _,
+            Arc::new(UInt32Array::from(
+                expanded_rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(UInt32Array::from(
+                expanded_rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from_iter_values(
+                expanded_rows.iter().map(|row| row.2),
+            )) as _,
+            Arc::new(UInt64Array::from(
+                expanded_rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
         ],
     )
     .context(NewRecordBatchSnafu)?;
@@ -487,6 +491,40 @@ mod tests {
         .unwrap();
         let batch = reader.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
+        let table = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let column = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let value = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let tsid = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let rows = (0..batch.num_rows())
+            .map(|idx| {
+                (
+                    table.value(idx),
+                    column.value(idx),
+                    value.value(idx),
+                    tsid.value(idx),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![(11, 0, "a", 101), (11, 0, "b", 102), (11, 1, "x", 101)]
+        );
 
         let mut reader = IndexReader::try_new(&store, "new/pk_map.parquet", IndexKind::PkMap)
             .await
