@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use datatypes::arrow::array::{BinaryArray, Int64Array, StringArray, UInt32Array, UInt64Array};
+use datatypes::arrow::array::{
+    Array, BinaryArray, Int64Array, MapArray, StringArray, UInt32Array, UInt64Array,
+};
 use futures::StreamExt;
 use mito2::aggr_index::index_io::IndexReader;
 use mito2::aggr_index::input::{merge_sources, open_sst_stream, validate_same_schema};
-use mito2::aggr_index::{IndexKind, build_indexes, merge_index_files};
+use mito2::aggr_index::{
+    IndexKind, TransformFormat, build_indexes, merge_index_files, transform_pk_index,
+};
 use mito2::sst::file::{FileMeta, RegionFileId};
 use object_store::ObjectStore;
 use object_store::services::Fs;
@@ -32,6 +36,7 @@ enum AggrIndexSubCommand {
     Build(BuildCommand),
     Merge(MergeCommand),
     Read(ReadCommand),
+    TransformPk(TransformPkCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -63,6 +68,26 @@ struct MergeCommand {
 }
 
 #[derive(Debug, Parser)]
+struct TransformPkCommand {
+    #[clap(long, value_name = "FILE")]
+    config: PathBuf,
+    #[clap(long)]
+    table_dir: String,
+    #[clap(long, default_value = "bare")]
+    path_type: String,
+    #[clap(long)]
+    region_id: String,
+    #[clap(long)]
+    input: String,
+    #[clap(long)]
+    pk_input: PathBuf,
+    #[clap(long)]
+    output_dir: PathBuf,
+    #[clap(long, value_enum)]
+    format: Vec<CliTransformFormat>,
+}
+
+#[derive(Debug, Parser)]
 struct ReadCommand {
     #[clap(long, value_enum)]
     kind: CliKind,
@@ -83,6 +108,9 @@ enum CliKind {
     Pk,
     TableTag,
     Tag,
+    TableTagTsid,
+    PkMap,
+    PkColumns,
 }
 impl From<CliKind> for IndexKind {
     fn from(v: CliKind) -> Self {
@@ -90,6 +118,26 @@ impl From<CliKind> for IndexKind {
             CliKind::Pk => IndexKind::Pk,
             CliKind::TableTag => IndexKind::TableTag,
             CliKind::Tag => IndexKind::Tag,
+            CliKind::TableTagTsid => IndexKind::TableTagTsid,
+            CliKind::PkMap => IndexKind::PkMap,
+            CliKind::PkColumns => IndexKind::PkColumns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliTransformFormat {
+    TableTagTsid,
+    Map,
+    Columns,
+}
+
+impl From<CliTransformFormat> for TransformFormat {
+    fn from(v: CliTransformFormat) -> Self {
+        match v {
+            CliTransformFormat::TableTagTsid => TransformFormat::TableTagTsid,
+            CliTransformFormat::Map => TransformFormat::PkMap,
+            CliTransformFormat::Columns => TransformFormat::PkColumns,
         }
     }
 }
@@ -100,6 +148,7 @@ impl AggrIndexCommand {
             AggrIndexSubCommand::Build(cmd) => cmd.run().await,
             AggrIndexSubCommand::Merge(cmd) => cmd.run().await,
             AggrIndexSubCommand::Read(cmd) => cmd.run().await,
+            AggrIndexSubCommand::TransformPk(cmd) => cmd.run().await,
         }
     }
 }
@@ -203,6 +252,85 @@ impl BuildCommand {
             output.table_tag_rows,
         )?;
         print_file("tag", &self.output_dir.join("tag.parquet"), output.tag_rows)?;
+        println!(
+            "costs: sst_iter_decode_collect={:?} legacy_pk_write={:?} table_tag_run_write={:?} tag_run_write={:?} table_tag_merge_final_write={:?} tag_merge_final_write={:?}",
+            output.costs.sst_iteration_decode_collect,
+            output.costs.legacy_pk_write,
+            output.costs.table_tag_run_write,
+            output.costs.tag_run_write,
+            output.costs.table_tag_merge_final_write,
+            output.costs.tag_merge_final_write
+        );
+        Ok(())
+    }
+}
+
+impl TransformPkCommand {
+    async fn run(&self) -> error::Result<()> {
+        let (store_cfg, _, _) = parse_config(&self.config)?;
+        let object_store = build_object_store(&store_cfg).await?;
+        let region_id = parse_region_id(&self.region_id)?;
+        let path_type = parse_path_type(&self.path_type)?;
+        let file_id = parse_file_id(&self.input)?;
+        let path = sst_path(&self.table_dir, region_id, path_type, file_id);
+        let stat = object_store.stat(&path).await.map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("stat {path} failed: {e}"),
+            }
+            .build()
+        })?;
+        let file_meta = FileMeta {
+            region_id,
+            file_id,
+            file_size: stat.content_length(),
+            ..Default::default()
+        };
+        let sst = open_sst_stream(self.table_dir.clone(), path_type, object_store, file_meta)
+            .await
+            .map_err(to_cmd_err)?;
+        let index_store = local_fs_store()?;
+        let pk_input = store_path(&self.pk_input)?;
+        let output_dir = store_path(&self.output_dir)?;
+        let formats = self
+            .format
+            .iter()
+            .copied()
+            .map(TransformFormat::from)
+            .collect::<Vec<_>>();
+        let output =
+            transform_pk_index(sst.metadata, index_store, &pk_input, &output_dir, &formats)
+                .await
+                .map_err(to_cmd_err)?;
+
+        if output.table_tag_tsid_path.is_some() {
+            print_file(
+                "table-tag-tsid",
+                &self.output_dir.join("table_tag_tsid.parquet"),
+                output.table_tag_tsid_rows,
+            )?;
+        }
+        if output.pk_map_path.is_some() {
+            print_file(
+                "pk-map",
+                &self.output_dir.join("pk_map.parquet"),
+                output.pk_map_rows,
+            )?;
+        }
+        if output.pk_columns_path.is_some() {
+            print_file(
+                "pk-columns",
+                &self.output_dir.join("pk_columns.parquet"),
+                output.pk_columns_rows,
+            )?;
+        }
+        println!(
+            "costs: old_pk_read_iter={:?} pk_decode_tag_extract={:?} table_tag_tsid_write={:?} pk_map_write={:?} pk_columns_write={:?}",
+            output.costs.read_iteration,
+            output.costs.decode_transform,
+            output.costs.table_tag_tsid_write,
+            output.costs.pk_map_write,
+            output.costs.pk_columns_write
+        );
         Ok(())
     }
 }
@@ -251,6 +379,11 @@ impl ReadCommand {
                     print_table_tag(&batch, self.table_id, self.column_id, tag_value)?
                 }
                 IndexKind::Tag => print_tag(&batch, self.column_id, tag_value)?,
+                IndexKind::TableTagTsid => {
+                    print_table_tag_tsid(&batch, self.table_id, self.column_id, tag_value)?
+                }
+                IndexKind::PkMap => print_pk_map(&batch, primary_key.as_deref())?,
+                IndexKind::PkColumns => print_pk_columns(&batch, primary_key.as_deref())?,
             }
         }
         Ok(())
@@ -302,6 +435,136 @@ fn print_table_tag(
     }
     Ok(())
 }
+fn print_table_tag_tsid(
+    batch: &datatypes::arrow::record_batch::RecordBatch,
+    table_filter: Option<u32>,
+    col_filter: Option<u32>,
+    val_filter: Option<&str>,
+) -> error::Result<()> {
+    let t = col::<UInt32Array>(batch, 0)?;
+    let c = col::<UInt32Array>(batch, 1)?;
+    let v = col::<StringArray>(batch, 2)?;
+    let tsid = col::<UInt64Array>(batch, 3)?;
+    for i in 0..batch.num_rows() {
+        if table_filter.is_none_or(|x| x == t.value(i))
+            && col_filter.is_none_or(|x| x == c.value(i))
+            && val_filter.is_none_or(|x| x == v.value(i))
+        {
+            println!(
+                "table_id={} column_id={} tag_value={} tsid={}",
+                t.value(i),
+                c.value(i),
+                v.value(i),
+                tsid.value(i)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_pk_map(
+    batch: &datatypes::arrow::record_batch::RecordBatch,
+    filter: Option<&[u8]>,
+) -> error::Result<()> {
+    let pk = col::<BinaryArray>(batch, 0)?;
+    let min = col::<Int64Array>(batch, 1)?;
+    let max = col::<Int64Array>(batch, 2)?;
+    let cnt = col::<UInt64Array>(batch, 3)?;
+    let table = col::<UInt32Array>(batch, 4)?;
+    let tsid = col::<UInt64Array>(batch, 5)?;
+    let tags = col::<MapArray>(batch, 6)?;
+    for i in 0..batch.num_rows() {
+        if filter.is_none_or(|f| f == pk.value(i)) {
+            println!(
+                "pk={} min_ts={} max_ts={} row_count={} table_id={} tsid={} tags={}",
+                hex::encode(pk.value(i)),
+                min.value(i),
+                max.value(i),
+                cnt.value(i),
+                table.value(i),
+                tsid.value(i),
+                format_map(tags, i)?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_pk_columns(
+    batch: &datatypes::arrow::record_batch::RecordBatch,
+    filter: Option<&[u8]>,
+) -> error::Result<()> {
+    let pk = col::<BinaryArray>(batch, 0)?;
+    let min = col::<Int64Array>(batch, 1)?;
+    let max = col::<Int64Array>(batch, 2)?;
+    let cnt = col::<UInt64Array>(batch, 3)?;
+    let table = col::<UInt32Array>(batch, 4)?;
+    let tsid = col::<UInt64Array>(batch, 5)?;
+    for i in 0..batch.num_rows() {
+        if filter.is_none_or(|f| f == pk.value(i)) {
+            let mut tags = Vec::new();
+            for idx in 6..batch.num_columns() {
+                let array = col::<StringArray>(batch, idx)?;
+                if array.is_null(i) {
+                    tags.push(format!("{}=NULL", batch.schema().field(idx).name()));
+                } else {
+                    tags.push(format!(
+                        "{}={}",
+                        batch.schema().field(idx).name(),
+                        array.value(i)
+                    ));
+                }
+            }
+            println!(
+                "pk={} min_ts={} max_ts={} row_count={} table_id={} tsid={} {}",
+                hex::encode(pk.value(i)),
+                min.value(i),
+                max.value(i),
+                cnt.value(i),
+                table.value(i),
+                tsid.value(i),
+                tags.join(" ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_map(tags: &MapArray, row: usize) -> error::Result<String> {
+    let entries = tags.value(row);
+    let keys = entries
+        .as_any()
+        .downcast_ref::<datatypes::arrow::array::StructArray>()
+        .context(error::IllegalConfigSnafu {
+            msg: "invalid map entries".to_string(),
+        })?
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .context(error::IllegalConfigSnafu {
+            msg: "invalid map key column".to_string(),
+        })?
+        .clone();
+    let values = entries
+        .as_any()
+        .downcast_ref::<datatypes::arrow::array::StructArray>()
+        .context(error::IllegalConfigSnafu {
+            msg: "invalid map entries".to_string(),
+        })?
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .context(error::IllegalConfigSnafu {
+            msg: "invalid map value column".to_string(),
+        })?
+        .clone();
+    let mut parts = Vec::new();
+    for i in 0..entries.len() {
+        parts.push(format!("{}={}", keys.value(i), values.value(i)));
+    }
+    Ok(format!("{{{}}}", parts.join(",")))
+}
+
 fn print_tag(
     batch: &datatypes::arrow::record_batch::RecordBatch,
     col_filter: Option<u32>,

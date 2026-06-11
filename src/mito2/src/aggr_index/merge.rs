@@ -15,17 +15,19 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use datatypes::arrow::array::{
-    Array, BinaryArray, Int64Array, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, Int64Array, MapArray, StringArray, StructArray, UInt32Array,
+    UInt64Array,
 };
-use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::buffer::OffsetBuffer;
+use datatypes::arrow::datatypes::{DataType, Field, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt};
 use object_store::ObjectStore;
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 
 use crate::aggr_index::index_io::{IndexReader, IndexWriter};
-use crate::aggr_index::schema::IndexKind;
-use crate::error::{InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
+use crate::aggr_index::schema::{IndexKind, MAP_KEY_FIELD, MAP_VALUE_FIELD};
+use crate::error::{InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
 
 const MERGE_BATCH_SIZE: usize = 8192;
 
@@ -35,6 +37,12 @@ pub async fn merge_index_files(
     inputs: &[String],
     output: &str,
 ) -> Result<usize> {
+    ensure!(
+        kind != IndexKind::PkColumns,
+        InvalidMetaSnafu {
+            reason: "PkColumns has a dynamic metadata-derived schema and cannot be generically merged"
+        }
+    );
     if inputs.is_empty() {
         return IndexWriter::try_new(object_store, output, kind.schema())
             .await?
@@ -47,6 +55,9 @@ pub async fn merge_index_files(
         IndexKind::Pk => merge_pk(merged, object_store, output).await,
         IndexKind::TableTag => merge_table_tag(merged, object_store, output).await,
         IndexKind::Tag => merge_tag(merged, object_store, output).await,
+        IndexKind::TableTagTsid => merge_table_tag_tsid(merged, object_store, output).await,
+        IndexKind::PkMap => merge_pk_map(merged, object_store, output).await,
+        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected above"),
     }
 }
 
@@ -85,6 +96,9 @@ fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
         IndexKind::Pk => 1,
         IndexKind::TableTag => 3,
         IndexKind::Tag => 2,
+        IndexKind::TableTagTsid => 4,
+        IndexKind::PkMap => 1,
+        IndexKind::PkColumns => unreachable!("PkColumns merge is rejected before sorting"),
     };
     LexOrdering::new((0..columns).map(|idx| {
         PhysicalSortExpr::new(
@@ -200,6 +214,111 @@ async fn merge_tag(
     writer.close().await
 }
 
+async fn merge_table_tag_tsid(
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer =
+        IndexWriter::try_new(object_store, output, IndexKind::TableTagTsid.schema()).await?;
+    let mut last: Option<(u32, u32, String, u64)> = None;
+
+    while let Some(batch) = merged.next().await {
+        let batch = batch.map_err(|e| {
+            external_error(e, "merge aggregate table-tag-tsid index stream".to_string())
+        })?;
+        let table = u32_col(&batch, 0)?;
+        let col = u32_col(&batch, 1)?;
+        let val = string_col(&batch, 2)?;
+        let tsid = u64_col(&batch, 3)?;
+        let mut rows = Vec::new();
+        for row in 0..batch.num_rows() {
+            let key = (
+                table.value(row),
+                col.value(row),
+                val.value(row).to_string(),
+                tsid.value(row),
+            );
+            if last.as_ref() != Some(&key) {
+                last = Some(key.clone());
+                rows.push(key);
+            }
+        }
+        if !rows.is_empty() {
+            let out = RecordBatch::try_new(
+                IndexKind::TableTagTsid.schema(),
+                vec![
+                    Arc::new(UInt32Array::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(UInt32Array::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )) as _,
+                    Arc::new(StringArray::from_iter_values(
+                        rows.iter().map(|r| r.2.as_str()),
+                    )) as _,
+                    Arc::new(UInt64Array::from(
+                        rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                    )) as _,
+                ],
+            )
+            .context(NewRecordBatchSnafu)?;
+            writer.write(&out).await?;
+        }
+    }
+    writer.close().await
+}
+
+async fn merge_pk_map(
+    mut merged: SendableRecordBatchStream,
+    object_store: &ObjectStore,
+    output: &str,
+) -> Result<usize> {
+    let mut writer = IndexWriter::try_new(object_store, output, IndexKind::PkMap.schema()).await?;
+    let mut buffer = PkMapOutputBuffer::default();
+    let mut current: Option<PkMapRow> = None;
+
+    while let Some(batch) = merged.next().await {
+        let batch = batch
+            .map_err(|e| external_error(e, "merge aggregate pk-map index stream".to_string()))?;
+        let pk = binary_col(&batch, 0)?;
+        let min = int64_col(&batch, 1)?;
+        let max = int64_col(&batch, 2)?;
+        let cnt = u64_col(&batch, 3)?;
+        let table = u32_col(&batch, 4)?;
+        let tsid = u64_col(&batch, 5)?;
+        let tags = map_col(&batch, 6)?;
+        for row in 0..batch.num_rows() {
+            let row = PkMapRow {
+                pk: pk.value(row).to_vec(),
+                min_ts: min.value(row),
+                max_ts: max.value(row),
+                row_count: cnt.value(row),
+                table_id: table.value(row),
+                tsid: tsid.value(row),
+                tags: map_entries(tags, row)?,
+            };
+            match current.as_mut() {
+                Some(current) if current.pk == row.pk => {
+                    current.min_ts = current.min_ts.min(row.min_ts);
+                    current.max_ts = current.max_ts.max(row.max_ts);
+                    current.row_count += row.row_count;
+                }
+                Some(_) => {
+                    let finished = current.replace(row).expect("current row exists");
+                    buffer.push(&mut writer, finished).await?;
+                }
+                None => current = Some(row),
+            }
+        }
+    }
+    if let Some(row) = current.take() {
+        buffer.push(&mut writer, row).await?;
+    }
+    buffer.flush(&mut writer).await?;
+    writer.close().await
+}
+
 struct IndexRecordBatchStream {
     schema: SchemaRef,
     reader: IndexReader,
@@ -233,6 +352,17 @@ struct PkRow {
     min_ts: i64,
     max_ts: i64,
     row_count: u64,
+}
+
+#[derive(Debug)]
+struct PkMapRow {
+    pk: Vec<u8>,
+    min_ts: i64,
+    max_ts: i64,
+    row_count: u64,
+    table_id: u32,
+    tsid: u64,
+    tags: Vec<(u32, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +414,88 @@ impl PkOutputBuffer {
                         .map(|row| row.row_count)
                         .collect::<Vec<_>>(),
                 )) as _,
+            ],
+        )
+        .context(NewRecordBatchSnafu)?;
+        writer.write(&batch).await?;
+        self.rows.clear();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PkMapOutputBuffer {
+    rows: Vec<PkMapRow>,
+}
+
+impl PkMapOutputBuffer {
+    async fn push(&mut self, writer: &mut IndexWriter, row: PkMapRow) -> Result<()> {
+        self.rows.push(row);
+        if self.rows.len() >= MERGE_BATCH_SIZE {
+            self.flush(writer).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, writer: &mut IndexWriter) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut lengths = Vec::new();
+        for row in &self.rows {
+            lengths.push(row.tags.len());
+            for (key, value) in &row.tags {
+                keys.push(*key);
+                values.push(value.as_str());
+            }
+        }
+        let key_field = Arc::new(Field::new(MAP_KEY_FIELD, DataType::UInt32, false));
+        let value_field = Arc::new(Field::new(MAP_VALUE_FIELD, DataType::Utf8, false));
+        let struct_array = StructArray::from(vec![
+            (key_field, Arc::new(UInt32Array::from(keys)) as ArrayRef),
+            (
+                value_field,
+                Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
+            ),
+        ]);
+        let entries = match IndexKind::PkMap.schema().field(6).data_type() {
+            DataType::Map(entries, _) => entries.clone(),
+            _ => unreachable!("pk_map tags field is a map"),
+        };
+        let map = MapArray::new(
+            entries,
+            OffsetBuffer::from_lengths(lengths),
+            struct_array,
+            None,
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            IndexKind::PkMap.schema(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(
+                    self.rows.iter().map(|row| row.pk.as_slice()),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    self.rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    self.rows.iter().map(|row| row.max_ts).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt64Array::from(
+                    self.rows
+                        .iter()
+                        .map(|row| row.row_count)
+                        .collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt32Array::from(
+                    self.rows.iter().map(|row| row.table_id).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt64Array::from(
+                    self.rows.iter().map(|row| row.tsid).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(map) as _,
             ],
         )
         .context(NewRecordBatchSnafu)?;
@@ -421,6 +633,44 @@ fn string_col(batch: &RecordBatch, idx: usize) -> Result<&StringArray> {
         })
 }
 
+fn map_col(batch: &RecordBatch, idx: usize) -> Result<&MapArray> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .context(InvalidRecordBatchSnafu {
+            reason: format!("column {idx} is not Map"),
+        })
+}
+
+fn map_entries(array: &MapArray, row: usize) -> Result<Vec<(u32, String)>> {
+    let entries = array.value(row);
+    let entries =
+        entries
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .context(InvalidRecordBatchSnafu {
+                reason: "map entries are not StructArray".to_string(),
+            })?;
+    let keys = entries
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .context(InvalidRecordBatchSnafu {
+            reason: "map keys are not UInt32".to_string(),
+        })?;
+    let values = entries
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .context(InvalidRecordBatchSnafu {
+            reason: "map values are not Utf8".to_string(),
+        })?;
+    Ok((0..entries.len())
+        .map(|idx| (keys.value(idx), values.value(idx).to_string()))
+        .collect())
+}
+
 fn external_error(error: impl std::fmt::Display, context: String) -> crate::error::Error {
     let boxed = common_error::ext::BoxedError::new(common_error::ext::PlainError::new(
         error.to_string(),
@@ -430,4 +680,126 @@ fn external_error(error: impl std::fmt::Display, context: String) -> crate::erro
     result
         .context(crate::error::ExternalSnafu { context })
         .unwrap_err()
+}
+
+#[cfg(test)]
+mod tests {
+    use common_test_util::temp_dir::create_temp_dir;
+    use object_store::services::Fs;
+
+    use super::*;
+
+    fn temp_store(root: &str) -> ObjectStore {
+        ObjectStore::new(Fs::default().root(root)).unwrap().finish()
+    }
+
+    fn pk_map_batch(rows: &[(&[u8], i64, i64, u64, u32, u64, &[(u32, &str)])]) -> RecordBatch {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut lengths = Vec::new();
+        for row in rows {
+            lengths.push(row.6.len());
+            for (key, value) in row.6 {
+                keys.push(*key);
+                values.push(*value);
+            }
+        }
+        let key_field = Arc::new(Field::new(MAP_KEY_FIELD, DataType::UInt32, false));
+        let value_field = Arc::new(Field::new(MAP_VALUE_FIELD, DataType::Utf8, false));
+        let struct_array = StructArray::from(vec![
+            (key_field, Arc::new(UInt32Array::from(keys)) as ArrayRef),
+            (
+                value_field,
+                Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
+            ),
+        ]);
+        let entries = match IndexKind::PkMap.schema().field(6).data_type() {
+            DataType::Map(entries, _) => entries.clone(),
+            _ => unreachable!("pk_map tags field is a map"),
+        };
+        let map = MapArray::new(
+            entries,
+            OffsetBuffer::from_lengths(lengths),
+            struct_array,
+            None,
+            false,
+        );
+
+        RecordBatch::try_new(
+            IndexKind::PkMap.schema(),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(rows.iter().map(|row| row.0))) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt32Array::from(
+                    rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+                )) as _,
+                Arc::new(map) as _,
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn write_pk_map_file(object_store: &ObjectStore, path: &str, batch: &RecordBatch) {
+        let mut writer = IndexWriter::try_new(object_store, path, IndexKind::PkMap.schema())
+            .await
+            .unwrap();
+        writer.write(batch).await.unwrap();
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_merge_pk_map_aggregates_duplicate_primary_keys() {
+        let dir = create_temp_dir("aggr_index_merge_pk_map");
+        let store = temp_store(dir.path().to_str().unwrap());
+        let tags = &[(7, "host-a"), (8, "region-a")];
+        write_pk_map_file(
+            &store,
+            "run1.parquet",
+            &pk_map_batch(&[(b"pk-a", 10, 20, 3, 42, 100, tags)]),
+        )
+        .await;
+        write_pk_map_file(
+            &store,
+            "run2.parquet",
+            &pk_map_batch(&[(b"pk-a", 5, 30, 4, 42, 100, tags)]),
+        )
+        .await;
+
+        let rows = merge_index_files(
+            IndexKind::PkMap,
+            &store,
+            &["run1.parquet".to_string(), "run2.parquet".to_string()],
+            "merged.parquet",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, 1);
+
+        let mut reader = IndexReader::try_new(&store, "merged.parquet", IndexKind::PkMap)
+            .await
+            .unwrap();
+        let batch = reader.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(binary_col(&batch, 0).unwrap().value(0), b"pk-a");
+        assert_eq!(int64_col(&batch, 1).unwrap().value(0), 5);
+        assert_eq!(int64_col(&batch, 2).unwrap().value(0), 30);
+        assert_eq!(u64_col(&batch, 3).unwrap().value(0), 7);
+        assert_eq!(u32_col(&batch, 4).unwrap().value(0), 42);
+        assert_eq!(u64_col(&batch, 5).unwrap().value(0), 100);
+        assert_eq!(
+            map_entries(map_col(&batch, 6).unwrap(), 0).unwrap(),
+            vec![(7, "host-a".to_string()), (8, "region-a".to_string()),]
+        );
+    }
 }

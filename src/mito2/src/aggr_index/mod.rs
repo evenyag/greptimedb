@@ -9,8 +9,10 @@ pub mod index_io;
 pub mod input;
 pub mod merge;
 pub mod schema;
+pub mod transform;
 
 pub use builder::{BuildOutput, build_indexes};
 pub use index_io::{IndexReader, IndexWriter};
 pub use merge::merge_index_files;
 pub use schema::IndexKind;
+pub use transform::{TransformFormat, TransformOutput, transform_pk_index};
