@@ -382,8 +382,8 @@ impl ReadCommand {
                 IndexKind::TableTagTsid => {
                     print_table_tag_tsid(&batch, self.table_id, self.column_id, tag_value)?
                 }
-                IndexKind::PkMap => print_pk_map(&batch, primary_key.as_deref())?,
-                IndexKind::PkColumns => print_pk_columns(&batch, primary_key.as_deref())?,
+                IndexKind::PkMap => print_pk_map(&batch)?,
+                IndexKind::PkColumns => print_pk_columns(&batch)?,
             }
         }
         Ok(())
@@ -462,70 +462,56 @@ fn print_table_tag_tsid(
     Ok(())
 }
 
-fn print_pk_map(
-    batch: &datatypes::arrow::record_batch::RecordBatch,
-    filter: Option<&[u8]>,
-) -> error::Result<()> {
-    let pk = col::<BinaryArray>(batch, 0)?;
-    let min = col::<Int64Array>(batch, 1)?;
-    let max = col::<Int64Array>(batch, 2)?;
-    let cnt = col::<UInt64Array>(batch, 3)?;
-    let table = col::<UInt32Array>(batch, 4)?;
-    let tsid = col::<UInt64Array>(batch, 5)?;
-    let tags = col::<MapArray>(batch, 6)?;
+fn print_pk_map(batch: &datatypes::arrow::record_batch::RecordBatch) -> error::Result<()> {
+    let min = col::<Int64Array>(batch, 0)?;
+    let max = col::<Int64Array>(batch, 1)?;
+    let cnt = col::<UInt64Array>(batch, 2)?;
+    let table = col::<UInt32Array>(batch, 3)?;
+    let tsid = col::<UInt64Array>(batch, 4)?;
+    let tags = col::<MapArray>(batch, 5)?;
     for i in 0..batch.num_rows() {
-        if filter.is_none_or(|f| f == pk.value(i)) {
-            println!(
-                "pk={} min_ts={} max_ts={} row_count={} table_id={} tsid={} tags={}",
-                hex::encode(pk.value(i)),
-                min.value(i),
-                max.value(i),
-                cnt.value(i),
-                table.value(i),
-                tsid.value(i),
-                format_map(tags, i)?
-            );
-        }
+        println!(
+            "min_ts={} max_ts={} row_count={} table_id={} tsid={} tags={}",
+            min.value(i),
+            max.value(i),
+            cnt.value(i),
+            table.value(i),
+            tsid.value(i),
+            format_map(tags, i)?
+        );
     }
     Ok(())
 }
 
-fn print_pk_columns(
-    batch: &datatypes::arrow::record_batch::RecordBatch,
-    filter: Option<&[u8]>,
-) -> error::Result<()> {
-    let pk = col::<BinaryArray>(batch, 0)?;
-    let min = col::<Int64Array>(batch, 1)?;
-    let max = col::<Int64Array>(batch, 2)?;
-    let cnt = col::<UInt64Array>(batch, 3)?;
-    let table = col::<UInt32Array>(batch, 4)?;
-    let tsid = col::<UInt64Array>(batch, 5)?;
+fn print_pk_columns(batch: &datatypes::arrow::record_batch::RecordBatch) -> error::Result<()> {
+    let min = col::<Int64Array>(batch, 0)?;
+    let max = col::<Int64Array>(batch, 1)?;
+    let cnt = col::<UInt64Array>(batch, 2)?;
+    let table = col::<UInt32Array>(batch, 3)?;
+    let tsid = col::<UInt64Array>(batch, 4)?;
     for i in 0..batch.num_rows() {
-        if filter.is_none_or(|f| f == pk.value(i)) {
-            let mut tags = Vec::new();
-            for idx in 6..batch.num_columns() {
-                let array = col::<StringArray>(batch, idx)?;
-                if array.is_null(i) {
-                    tags.push(format!("{}=NULL", batch.schema().field(idx).name()));
-                } else {
-                    tags.push(format!(
-                        "{}={}",
-                        batch.schema().field(idx).name(),
-                        array.value(i)
-                    ));
-                }
+        let mut tags = Vec::new();
+        for idx in 5..batch.num_columns() {
+            let array = col::<StringArray>(batch, idx)?;
+            if array.is_null(i) {
+                tags.push(format!("{}=NULL", batch.schema().field(idx).name()));
+            } else {
+                tags.push(format!(
+                    "{}={}",
+                    batch.schema().field(idx).name(),
+                    array.value(i)
+                ));
             }
-            println!(
-                "pk={} min_ts={} max_ts={} row_count={} table_id={} tsid={} {}",
-                hex::encode(pk.value(i)),
-                min.value(i),
-                max.value(i),
-                cnt.value(i),
-                table.value(i),
-                tsid.value(i),
-                tags.join(" ")
-            );
         }
+        println!(
+            "min_ts={} max_ts={} row_count={} table_id={} tsid={} {}",
+            min.value(i),
+            max.value(i),
+            cnt.value(i),
+            table.value(i),
+            tsid.value(i),
+            tags.join(" ")
+        );
     }
     Ok(())
 }

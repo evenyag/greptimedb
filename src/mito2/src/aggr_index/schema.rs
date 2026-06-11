@@ -82,7 +82,6 @@ pub fn table_tag_tsid_schema() -> SchemaRef {
 
 pub fn pk_map_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(PRIMARY_KEY_COL, DataType::Binary, false),
         Field::new(MIN_TS_COL, DataType::Int64, false),
         Field::new(MAX_TS_COL, DataType::Int64, false),
         Field::new(ROW_COUNT_COL, DataType::UInt64, false),
@@ -94,7 +93,6 @@ pub fn pk_map_schema() -> SchemaRef {
 
 pub fn pk_columns_base_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(PRIMARY_KEY_COL, DataType::Binary, false),
         Field::new(MIN_TS_COL, DataType::Int64, false),
         Field::new(MAX_TS_COL, DataType::Int64, false),
         Field::new(ROW_COUNT_COL, DataType::UInt64, false),

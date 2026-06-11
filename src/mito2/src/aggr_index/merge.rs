@@ -92,15 +92,15 @@ async fn streaming_merge(
 }
 
 fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
-    let columns = match kind {
-        IndexKind::Pk => 1,
-        IndexKind::TableTag => 3,
-        IndexKind::Tag => 2,
-        IndexKind::TableTagTsid => 4,
-        IndexKind::PkMap => 1,
+    let columns: Vec<usize> = match kind {
+        IndexKind::Pk => vec![0],
+        IndexKind::TableTag => vec![0, 1, 2],
+        IndexKind::Tag => vec![0, 1],
+        IndexKind::TableTagTsid => vec![0, 1, 2, 3],
+        IndexKind::PkMap => vec![3, 4],
         IndexKind::PkColumns => unreachable!("PkColumns merge is rejected before sorting"),
     };
-    LexOrdering::new((0..columns).map(|idx| {
+    LexOrdering::new(columns.into_iter().map(|idx| {
         PhysicalSortExpr::new(
             Arc::new(Column::new(schema.field(idx).name(), idx)),
             SortOptions::default(),
@@ -281,16 +281,14 @@ async fn merge_pk_map(
     while let Some(batch) = merged.next().await {
         let batch = batch
             .map_err(|e| external_error(e, "merge aggregate pk-map index stream".to_string()))?;
-        let pk = binary_col(&batch, 0)?;
-        let min = int64_col(&batch, 1)?;
-        let max = int64_col(&batch, 2)?;
-        let cnt = u64_col(&batch, 3)?;
-        let table = u32_col(&batch, 4)?;
-        let tsid = u64_col(&batch, 5)?;
-        let tags = map_col(&batch, 6)?;
+        let min = int64_col(&batch, 0)?;
+        let max = int64_col(&batch, 1)?;
+        let cnt = u64_col(&batch, 2)?;
+        let table = u32_col(&batch, 3)?;
+        let tsid = u64_col(&batch, 4)?;
+        let tags = map_col(&batch, 5)?;
         for row in 0..batch.num_rows() {
             let row = PkMapRow {
-                pk: pk.value(row).to_vec(),
                 min_ts: min.value(row),
                 max_ts: max.value(row),
                 row_count: cnt.value(row),
@@ -299,7 +297,7 @@ async fn merge_pk_map(
                 tags: map_entries(tags, row)?,
             };
             match current.as_mut() {
-                Some(current) if current.pk == row.pk => {
+                Some(current) if current.same_key(&row) => {
                     current.min_ts = current.min_ts.min(row.min_ts);
                     current.max_ts = current.max_ts.max(row.max_ts);
                     current.row_count += row.row_count;
@@ -356,13 +354,18 @@ struct PkRow {
 
 #[derive(Debug)]
 struct PkMapRow {
-    pk: Vec<u8>,
     min_ts: i64,
     max_ts: i64,
     row_count: u64,
     table_id: u32,
     tsid: u64,
     tags: Vec<(u32, String)>,
+}
+
+impl PkMapRow {
+    fn same_key(&self, other: &Self) -> bool {
+        self.table_id == other.table_id && self.tsid == other.tsid && self.tags == other.tags
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,7 +463,7 @@ impl PkMapOutputBuffer {
                 Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
             ),
         ]);
-        let entries = match IndexKind::PkMap.schema().field(6).data_type() {
+        let entries = match IndexKind::PkMap.schema().field(5).data_type() {
             DataType::Map(entries, _) => entries.clone(),
             _ => unreachable!("pk_map tags field is a map"),
         };
@@ -474,9 +477,6 @@ impl PkMapOutputBuffer {
         let batch = RecordBatch::try_new(
             IndexKind::PkMap.schema(),
             vec![
-                Arc::new(BinaryArray::from_iter_values(
-                    self.rows.iter().map(|row| row.pk.as_slice()),
-                )) as _,
                 Arc::new(Int64Array::from(
                     self.rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
                 )) as _,
@@ -693,13 +693,13 @@ mod tests {
         ObjectStore::new(Fs::default().root(root)).unwrap().finish()
     }
 
-    fn pk_map_batch(rows: &[(&[u8], i64, i64, u64, u32, u64, &[(u32, &str)])]) -> RecordBatch {
+    fn pk_map_batch(rows: &[(i64, i64, u64, u32, u64, &[(u32, &str)])]) -> RecordBatch {
         let mut keys = Vec::new();
         let mut values = Vec::new();
         let mut lengths = Vec::new();
         for row in rows {
-            lengths.push(row.6.len());
-            for (key, value) in row.6 {
+            lengths.push(row.5.len());
+            for (key, value) in row.5 {
                 keys.push(*key);
                 values.push(*value);
             }
@@ -713,7 +713,7 @@ mod tests {
                 Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
             ),
         ]);
-        let entries = match IndexKind::PkMap.schema().field(6).data_type() {
+        let entries = match IndexKind::PkMap.schema().field(5).data_type() {
             DataType::Map(entries, _) => entries.clone(),
             _ => unreachable!("pk_map tags field is a map"),
         };
@@ -728,21 +728,20 @@ mod tests {
         RecordBatch::try_new(
             IndexKind::PkMap.schema(),
             vec![
-                Arc::new(BinaryArray::from_iter_values(rows.iter().map(|row| row.0))) as _,
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )) as _,
                 Arc::new(Int64Array::from(
                     rows.iter().map(|row| row.1).collect::<Vec<_>>(),
                 )) as _,
-                Arc::new(Int64Array::from(
+                Arc::new(UInt64Array::from(
                     rows.iter().map(|row| row.2).collect::<Vec<_>>(),
                 )) as _,
-                Arc::new(UInt64Array::from(
+                Arc::new(UInt32Array::from(
                     rows.iter().map(|row| row.3).collect::<Vec<_>>(),
                 )) as _,
-                Arc::new(UInt32Array::from(
-                    rows.iter().map(|row| row.4).collect::<Vec<_>>(),
-                )) as _,
                 Arc::new(UInt64Array::from(
-                    rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+                    rows.iter().map(|row| row.4).collect::<Vec<_>>(),
                 )) as _,
                 Arc::new(map) as _,
             ],
@@ -766,13 +765,13 @@ mod tests {
         write_pk_map_file(
             &store,
             "run1.parquet",
-            &pk_map_batch(&[(b"pk-a", 10, 20, 3, 42, 100, tags)]),
+            &pk_map_batch(&[(10, 20, 3, 42, 100, tags)]),
         )
         .await;
         write_pk_map_file(
             &store,
             "run2.parquet",
-            &pk_map_batch(&[(b"pk-a", 5, 30, 4, 42, 100, tags)]),
+            &pk_map_batch(&[(5, 30, 4, 42, 100, tags)]),
         )
         .await;
 
@@ -791,14 +790,14 @@ mod tests {
             .unwrap();
         let batch = reader.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(binary_col(&batch, 0).unwrap().value(0), b"pk-a");
-        assert_eq!(int64_col(&batch, 1).unwrap().value(0), 5);
-        assert_eq!(int64_col(&batch, 2).unwrap().value(0), 30);
-        assert_eq!(u64_col(&batch, 3).unwrap().value(0), 7);
-        assert_eq!(u32_col(&batch, 4).unwrap().value(0), 42);
-        assert_eq!(u64_col(&batch, 5).unwrap().value(0), 100);
+        assert_eq!(batch.schema().field(0).name(), "min_ts");
+        assert_eq!(int64_col(&batch, 0).unwrap().value(0), 5);
+        assert_eq!(int64_col(&batch, 1).unwrap().value(0), 30);
+        assert_eq!(u64_col(&batch, 2).unwrap().value(0), 7);
+        assert_eq!(u32_col(&batch, 3).unwrap().value(0), 42);
+        assert_eq!(u64_col(&batch, 4).unwrap().value(0), 100);
         assert_eq!(
-            map_entries(map_col(&batch, 6).unwrap(), 0).unwrap(),
+            map_entries(map_col(&batch, 5).unwrap(), 0).unwrap(),
             vec![(7, "host-a".to_string()), (8, "region-a".to_string()),]
         );
     }

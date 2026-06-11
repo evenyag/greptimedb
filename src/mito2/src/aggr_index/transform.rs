@@ -72,7 +72,6 @@ pub struct TransformOutput {
 
 #[derive(Debug, Clone)]
 struct DecodedPkRow {
-    pk: Vec<u8>,
     min_ts: i64,
     max_ts: i64,
     row_count: u64,
@@ -141,7 +140,6 @@ pub async fn transform_pk_index(
                 }
             }
             rows.push(DecodedPkRow {
-                pk: pk.value(row).to_vec(),
                 min_ts: min.value(row),
                 max_ts: max.value(row),
                 row_count: cnt.value(row),
@@ -247,7 +245,7 @@ async fn write_pk_map(
             Arc::new(StringArray::from_iter_values(values)) as ArrayRef,
         ),
     ]);
-    let entries = match IndexKind::PkMap.schema().field(6).data_type() {
+    let entries = match IndexKind::PkMap.schema().field(5).data_type() {
         DataType::Map(entries, _) => entries.clone(),
         _ => unreachable!("pk_map tags field is a map"),
     };
@@ -262,9 +260,6 @@ async fn write_pk_map(
     let batch = RecordBatch::try_new(
         IndexKind::PkMap.schema(),
         vec![
-            Arc::new(BinaryArray::from_iter_values(
-                rows.iter().map(|row| row.pk.as_slice()),
-            )) as _,
             Arc::new(Int64Array::from(
                 rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
             )) as _,
@@ -301,9 +296,6 @@ async fn write_pk_columns(
     );
     let schema = Arc::new(Schema::new(fields));
     let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(BinaryArray::from_iter_values(
-            rows.iter().map(|row| row.pk.as_slice()),
-        )) as _,
         Arc::new(Int64Array::from(
             rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
         )) as _,
@@ -501,13 +493,15 @@ mod tests {
             .unwrap();
         let batch = reader.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.schema().field(0).name(), "min_ts");
+        assert_eq!(batch.schema().field(5).name(), "tags");
         let table = batch
-            .column(4)
+            .column(3)
             .as_any()
             .downcast_ref::<UInt32Array>()
             .unwrap();
         let tsid = batch
-            .column(5)
+            .column(4)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
@@ -519,15 +513,16 @@ mod tests {
                 .await
                 .unwrap();
         let batch = reader.next().await.unwrap().unwrap();
-        assert_eq!(batch.schema().field(6).name(), "tag_0");
-        assert_eq!(batch.schema().field(7).name(), "tag_1");
+        assert_eq!(batch.schema().field(0).name(), "min_ts");
+        assert_eq!(batch.schema().field(5).name(), "tag_0");
+        assert_eq!(batch.schema().field(6).name(), "tag_1");
         let tag_0 = batch
-            .column(6)
+            .column(5)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let tag_1 = batch
-            .column(7)
+            .column(6)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
