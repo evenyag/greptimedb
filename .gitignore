@@ -67,7 +67,7 @@ greptimedb_data
 
 # AI related
 CLAUDE.md
-AGENTS.md
+# AGENTS.md
 .codex
 .gemini
 .opencode
