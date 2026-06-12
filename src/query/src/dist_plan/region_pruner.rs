@@ -123,6 +123,19 @@ impl ConstraintPruner {
         true
     }
 
+    fn normalize_hash_value(val: &mut Value) -> bool {
+        let Some(new_lit) = val.as_u64() else {
+            debug!("Hash value {:?} cannot be converted to u32", val);
+            return false;
+        };
+        let Ok(new_lit) = u32::try_from(new_lit) else {
+            debug!("Hash value {:?} is outside the u32 hash domain", val);
+            return false;
+        };
+        *val = Value::UInt32(new_lit);
+        true
+    }
+
     fn normalize_expr_datatype(
         lhs: &mut Operand,
         rhs: &mut Operand,
@@ -140,6 +153,8 @@ impl ConstraintPruner {
                     column_datatypes,
                 )
             }
+            (Operand::Hash(_), Operand::Value(val))
+            | (Operand::Value(val), Operand::Hash(_)) => Self::normalize_hash_value(val),
             (Operand::Column(col_name), Operand::Value(val))
             | (Operand::Value(val), Operand::Column(col_name)) => {
                 let Some(datatype) = column_datatypes.get(col_name) else {
@@ -212,7 +227,7 @@ impl ConstraintPruner {
 #[cfg(test)]
 mod tests {
     use datatypes::value::Value;
-    use partition::expr::{Operand, PartitionExpr, RestrictedOp, col};
+    use partition::expr::{Operand, PartitionExpr, RestrictedOp, col, hash_col};
     use store_api::storage::RegionId;
 
     use super::*;
@@ -222,6 +237,29 @@ mod tests {
             id: RegionId::new(1, region_id as u32),
             partition_expr: expr,
         }
+    }
+
+    #[test]
+    fn test_constraint_pruning_hash_equality() {
+        let partitions = vec![
+            create_test_partition_info(1, Some(hash_col("host").lt(Value::UInt32(100)))),
+            create_test_partition_info(
+                2,
+                Some(
+                    hash_col("host")
+                        .gt_eq(Value::UInt32(100))
+                        .and(hash_col("host").lt(Value::UInt32(200))),
+                ),
+            ),
+            create_test_partition_info(3, Some(hash_col("host").gt_eq(Value::UInt32(200)))),
+        ];
+
+        let query_exprs = vec![hash_col("host").eq(Value::UInt32(150))];
+        let column_datatypes = HashMap::default();
+        let pruned =
+            ConstraintPruner::prune_regions(&query_exprs, &partitions, column_datatypes).unwrap();
+
+        assert_eq!(pruned, vec![RegionId::new(1, 2)]);
     }
 
     #[test]
