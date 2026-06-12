@@ -29,6 +29,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion_common::{DataFusionError, TableReference};
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode};
+use partition::expr::Operand;
 use partition::manager::{PartitionRuleManagerRef, create_partitions_from_region_routes};
 use session::context::QueryContext;
 use snafu::{OptionExt, ResultExt};
@@ -252,27 +253,6 @@ impl DistExtensionPlanner {
             })
             .collect::<HashMap<_, _>>();
 
-        // Extract predicates from logical plan
-        let partition_expressions = match PredicateExtractor::extract_partition_expressions(
-            logical_plan,
-            &partition_columns,
-        ) {
-            Ok(expressions) => expressions,
-            Err(err) => {
-                common_telemetry::debug!(
-                    "Failed to extract partition expressions for table {} (id: {}), using all regions: {:?}",
-                    table_name,
-                    table.table_info().table_id(),
-                    err
-                );
-                return Ok(all_regions);
-            }
-        };
-
-        if partition_expressions.is_empty() {
-            return Ok(all_regions);
-        }
-
         // Get partition information for the table if partition rule manager is available
         let partitions = match create_partitions_from_region_routes(
             table_info.table_id(),
@@ -289,6 +269,36 @@ impl DistExtensionPlanner {
             }
         };
         if partitions.is_empty() {
+            return Ok(all_regions);
+        }
+
+        let mut hashed_columns = std::collections::HashSet::new();
+        for partition in &partitions {
+            if let Some(expr) = &partition.partition_expr {
+                collect_hash_columns(expr.lhs(), &mut hashed_columns);
+                collect_hash_columns(expr.rhs(), &mut hashed_columns);
+            }
+        }
+
+        // Extract predicates from logical plan
+        let partition_expressions = match PredicateExtractor::extract_partition_expressions(
+            logical_plan,
+            &partition_columns,
+            &hashed_columns,
+        ) {
+            Ok(expressions) => expressions,
+            Err(err) => {
+                common_telemetry::debug!(
+                    "Failed to extract partition expressions for table {} (id: {}), using all regions: {:?}",
+                    table_name,
+                    table.table_info().table_id(),
+                    err
+                );
+                return Ok(all_regions);
+            }
+        };
+
+        if partition_expressions.is_empty() {
             return Ok(all_regions);
         }
 
@@ -328,6 +338,20 @@ impl DistExtensionPlanner {
     ) -> Result<LogicalPlan> {
         let state = session_state.clone();
         state.optimizer().optimize(plan.clone(), &state, |_, _| {})
+    }
+}
+
+
+fn collect_hash_columns(operand: &Operand, hashed_columns: &mut std::collections::HashSet<String>) {
+    match operand {
+        Operand::Hash(column) => {
+            hashed_columns.insert(column.clone());
+        }
+        Operand::Expr(expr) => {
+            collect_hash_columns(expr.lhs(), hashed_columns);
+            collect_hash_columns(expr.rhs(), hashed_columns);
+        }
+        Operand::Column(_) | Operand::Value(_) => {}
     }
 }
 

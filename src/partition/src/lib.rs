@@ -19,6 +19,7 @@ pub mod checker;
 pub mod collider;
 pub mod error;
 pub mod expr;
+pub mod hash;
 pub mod manager;
 pub mod multi_dim;
 pub mod overlap;

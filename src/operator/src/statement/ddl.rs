@@ -62,6 +62,7 @@ use datatypes::value::Value;
 use datatypes::vectors::{StringVector, VectorRef};
 use humantime::parse_duration;
 use partition::expr::{Operand, PartitionExpr, RestrictedOp};
+use partition::hash::PARTITION_HASH_UDF_NAME;
 use partition::multi_dim::MultiDimPartitionRule;
 use query::parser::QueryStatement;
 use query::plan::extract_and_rewrite_full_table_names;
@@ -82,7 +83,9 @@ use sql::statements::create::{
     CreateExternalTable, CreateFlow, CreateTable, CreateTableLike, CreateView, Partitions,
 };
 use sql::statements::statement::Statement;
-use sqlparser::ast::{Expr, Ident, UnaryOperator, Value as ParserValue};
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, Ident, UnaryOperator, Value as ParserValue,
+};
 use store_api::metric_engine_consts::{LOGICAL_TABLE_METADATA_KEY, METRIC_ENGINE_NAME};
 use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 use table::TableRef;
@@ -2392,6 +2395,18 @@ fn convert_one_expr(
             let value = convert_value(&v.value, data_type, timezone, Some(*unary_op))?;
             (Operand::Column(column_name), op, Operand::Value(value))
         }
+        (Expr::Function(function), Expr::Value(value)) => {
+            let column_name = convert_partition_hash_function(function, column_name_and_type)?;
+            let value = convert_hash_value(&value.value, timezone, None)?;
+            (Operand::Hash(column_name), op, Operand::Value(value))
+        }
+        (Expr::Function(function), Expr::UnaryOp { op: unary_op, expr })
+            if let Expr::Value(v) = &**expr =>
+        {
+            let column_name = convert_partition_hash_function(function, column_name_and_type)?;
+            let value = convert_hash_value(&v.value, timezone, Some(*unary_op))?;
+            (Operand::Hash(column_name), op, Operand::Value(value))
+        }
         // val, col
         (Expr::Value(value), Expr::Identifier(ident)) => {
             let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
@@ -2404,6 +2419,18 @@ fn convert_one_expr(
             let (column_name, data_type) = convert_identifier(ident, column_name_and_type)?;
             let value = convert_value(&v.value, data_type, timezone, Some(*unary_op))?;
             (Operand::Value(value), op, Operand::Column(column_name))
+        }
+        (Expr::Value(value), Expr::Function(function)) => {
+            let column_name = convert_partition_hash_function(function, column_name_and_type)?;
+            let value = convert_hash_value(&value.value, timezone, None)?;
+            (Operand::Value(value), op, Operand::Hash(column_name))
+        }
+        (Expr::UnaryOp { op: unary_op, expr }, Expr::Function(function))
+            if let Expr::Value(v) = &**expr =>
+        {
+            let column_name = convert_partition_hash_function(function, column_name_and_type)?;
+            let value = convert_hash_value(&v.value, timezone, Some(*unary_op))?;
+            (Operand::Value(value), op, Operand::Hash(column_name))
         }
         (Expr::BinaryOp { .. }, Expr::BinaryOp { .. }) => {
             // sub-expr must against another sub-expr
@@ -2420,6 +2447,56 @@ fn convert_one_expr(
     };
 
     Ok(PartitionExpr::new(lhs, op, rhs))
+}
+
+
+fn convert_partition_hash_function(
+    function: &Function,
+    column_name_and_type: &HashMap<&String, ConcreteDataType>,
+) -> Result<String> {
+    let function_name = function.name.to_string();
+    ensure!(
+        function_name.eq_ignore_ascii_case(PARTITION_HASH_UDF_NAME),
+        InvalidPartitionRuleSnafu {
+            reason: format!("unsupported function {function_name} in partition expr"),
+        }
+    );
+    let args = match &function.args {
+        sqlparser::ast::FunctionArguments::List(args) => &args.args,
+        _ => {
+            return InvalidPartitionRuleSnafu {
+                reason: format!("{PARTITION_HASH_UDF_NAME} expects one column argument"),
+            }
+            .fail();
+        }
+    };
+    ensure!(
+        args.len() == 1,
+        InvalidPartitionRuleSnafu {
+            reason: format!("{PARTITION_HASH_UDF_NAME} expects one column argument"),
+        }
+    );
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) = &args[0] else {
+        return InvalidPartitionRuleSnafu {
+            reason: format!("{PARTITION_HASH_UDF_NAME} expects a partition column identifier"),
+        }
+        .fail();
+    };
+    let (column_name, _) = convert_identifier(ident, column_name_and_type)?;
+    Ok(column_name)
+}
+
+fn convert_hash_value(
+    value: &ParserValue,
+    timezone: &Timezone,
+    unary_op: Option<UnaryOperator>,
+) -> Result<Value> {
+    convert_value(
+        value,
+        ConcreteDataType::uint32_datatype(),
+        timezone,
+        unary_op,
+    )
 }
 
 fn convert_identifier(

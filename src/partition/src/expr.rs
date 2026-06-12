@@ -28,9 +28,13 @@ use datatypes::value::{
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use sql::statements::value_to_sql_value;
-use sqlparser::ast::{BinaryOperator as ParserBinaryOperator, Expr as ParserExpr, Ident};
+use sqlparser::ast::{
+    BinaryOperator as ParserBinaryOperator, Expr as ParserExpr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+};
 
 use crate::error;
+use crate::hash::{PARTITION_HASH_UDF_NAME, partition_hash_udf};
 use crate::partition::PartitionBound;
 
 /// Struct for partition expression. This can be converted back to sqlparser's [Expr].
@@ -49,10 +53,15 @@ pub enum Operand {
     Column(String),
     Value(Value),
     Expr(PartitionExpr),
+    Hash(String),
 }
 
 pub fn col(column_name: impl Into<String>) -> Operand {
     Operand::Column(column_name.into())
+}
+
+pub fn hash_col(column_name: impl Into<String>) -> Operand {
+    Operand::Hash(column_name.into())
 }
 
 impl From<Value> for Operand {
@@ -65,6 +74,10 @@ impl Operand {
     pub fn try_as_logical_expr(&self) -> error::Result<Expr> {
         match self {
             Self::Column(c) => Ok(datafusion_expr::col(format!(r#""{}""#, c))),
+            Self::Hash(c) => Ok(Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
+                func: partition_hash_udf(),
+                args: vec![datafusion_expr::col(format!(r#""{}""#, c))],
+            })),
             Self::Value(v) => {
                 let scalar_value = match v {
                     Value::Boolean(v) => ScalarValue::Boolean(Some(*v)),
@@ -139,6 +152,7 @@ impl Display for Operand {
             Self::Column(v) => write!(f, "{v}"),
             Self::Value(v) => write!(f, "{v}"),
             Self::Expr(v) => write!(f, "{v}"),
+            Self::Hash(v) => write!(f, "{PARTITION_HASH_UDF_NAME}({v})"),
         }
     }
 }
@@ -236,7 +250,9 @@ impl PartitionExpr {
             rhs: Box::new(rhs),
         };
 
-        if matches!(&*expr.lhs, Operand::Value(_)) && matches!(&*expr.rhs, Operand::Column(_)) {
+        if matches!(&*expr.lhs, Operand::Value(_))
+            && matches!(&*expr.rhs, Operand::Column(_) | Operand::Hash(_))
+        {
             std::mem::swap(&mut expr.lhs, &mut expr.rhs);
             expr.op = expr.op.invert_for_swap();
         }
@@ -257,17 +273,32 @@ impl PartitionExpr {
     pub fn to_parser_expr(&self) -> ParserExpr {
         // Safety: Partition rule won't contains unsupported value type.
         // Otherwise it will be rejected by the parser.
-        let lhs = match &*self.lhs {
+        let operand_to_parser_expr = |operand: &Operand| match operand {
             Operand::Column(c) => ParserExpr::Identifier(Ident::new(c.clone())),
+            Operand::Hash(c) => ParserExpr::Function(Function {
+                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                    PARTITION_HASH_UDF_NAME,
+                ))]),
+                args: FunctionArguments::List(FunctionArgumentList {
+                    args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                        ParserExpr::Identifier(Ident::new(c.clone())),
+                    ))],
+                    duplicate_treatment: None,
+                    clauses: vec![],
+                }),
+                filter: None,
+                null_treatment: None,
+                over: None,
+                within_group: vec![],
+                parameters: FunctionArguments::None,
+                uses_odbc_syntax: false,
+            }),
             Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap().into()),
             Operand::Expr(e) => e.to_parser_expr(),
         };
 
-        let rhs = match &*self.rhs {
-            Operand::Column(c) => ParserExpr::Identifier(Ident::new(c.clone())),
-            Operand::Value(v) => ParserExpr::Value(value_to_sql_value(v).unwrap().into()),
-            Operand::Expr(e) => e.to_parser_expr(),
-        };
+        let lhs = operand_to_parser_expr(&self.lhs);
+        let rhs = operand_to_parser_expr(&self.rhs);
 
         ParserExpr::BinaryOp {
             left: Box::new(lhs),
@@ -438,7 +469,7 @@ impl PartitionExpr {
 
     fn collect_operand_columns(operand: &Operand, columns: &mut HashSet<String>) {
         match operand {
-            Operand::Column(c) => {
+            Operand::Column(c) | Operand::Hash(c) => {
                 columns.insert(c.clone());
             }
             Operand::Expr(e) => {

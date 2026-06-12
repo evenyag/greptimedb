@@ -34,6 +34,7 @@ use crate::PartitionRule;
 use crate::checker::PartitionChecker;
 use crate::error::{self, Result, UndefinedColumnSnafu};
 use crate::expr::{Operand, PartitionExpr, RestrictedOp};
+use crate::hash::partition_hash_value;
 use crate::partition::RegionMask;
 
 /// The default region number when no partition exprs are matched.
@@ -129,6 +130,20 @@ impl MultiDimPartitionRule {
                 let index = self.name_to_index.get(name).unwrap();
                 let r = &values[*index];
                 Self::perform_op(l, &expr.op, r)
+            }
+            (Operand::Hash(name), Operand::Value(r)) => {
+                let index = self.name_to_index.get(name).unwrap();
+                let Some(hash) = partition_hash_value(&values[*index]) else {
+                    return Ok(false);
+                };
+                Self::perform_op(&Value::UInt32(hash), &expr.op, r)
+            }
+            (Operand::Value(l), Operand::Hash(name)) => {
+                let index = self.name_to_index.get(name).unwrap();
+                let Some(hash) = partition_hash_value(&values[*index]) else {
+                    return Ok(false);
+                };
+                Self::perform_op(l, &expr.op, &Value::UInt32(hash))
             }
             (Operand::Expr(lhs), Operand::Expr(rhs)) => {
                 let lhs = self.evaluate_expr(lhs, values)?;
