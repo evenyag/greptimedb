@@ -10208,6 +10208,7 @@ dependencies = [
  "sqlparser",
  "store-api",
  "table",
+ "xxhash-rust",
 ]
 
 [[package]]

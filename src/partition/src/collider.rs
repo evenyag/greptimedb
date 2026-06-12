@@ -38,6 +38,7 @@ use datatypes::value::{OrderedF64, OrderedFloat, Value};
 use crate::error;
 use crate::error::Result;
 use crate::expr::{Operand, PartitionExpr, RestrictedOp};
+use crate::hash::hash_column_key;
 
 const ZERO: OrderedF64 = OrderedFloat(0.0f64);
 pub(crate) const NORMALIZE_STEP: OrderedF64 = OrderedFloat(1.0f64);
@@ -224,6 +225,14 @@ impl<'a> Collider<'a> {
                 values.entry(col.clone()).or_default().push(val.clone());
                 Ok(())
             }
+            (Operand::Hash(col), Operand::Value(val))
+            | (Operand::Value(val), Operand::Hash(col)) => {
+                values
+                    .entry(hash_column_key(col))
+                    .or_default()
+                    .push(val.clone());
+                Ok(())
+            }
             (Operand::Expr(left_expr), Operand::Expr(right_expr)) => {
                 Self::collect_column_values_from_expr(left_expr, values)?;
                 Self::collect_column_values_from_expr(right_expr, values)
@@ -365,19 +374,29 @@ impl<'a> Collider<'a> {
         };
 
         match (lhs, rhs) {
-            (Operand::Column(col), Operand::Value(val)) => {
-                if let Some(column_values) = normalized_values.get(col)
+            (Operand::Column(col), Operand::Value(val))
+            | (Operand::Hash(col), Operand::Value(val)) => {
+                let key = match lhs {
+                    Operand::Hash(_) => hash_column_key(col),
+                    _ => col.clone(),
+                };
+                if let Some(column_values) = normalized_values.get(&key)
                     && let Some(&normalized_val) = column_values.get(val)
                 {
                     return Ok(NucleonExpr {
-                        column: col.clone(),
+                        column: key,
                         op: gluon_op,
                         value: normalized_val,
                     });
                 }
             }
-            (Operand::Value(val), Operand::Column(col)) => {
-                if let Some(column_values) = normalized_values.get(col)
+            (Operand::Value(val), Operand::Column(col))
+            | (Operand::Value(val), Operand::Hash(col)) => {
+                let key = match rhs {
+                    Operand::Hash(_) => hash_column_key(col),
+                    _ => col.clone(),
+                };
+                if let Some(column_values) = normalized_values.get(&key)
                     && let Some(&normalized_val) = column_values.get(val)
                 {
                     // Flip the operation for value op column
@@ -389,7 +408,7 @@ impl<'a> Collider<'a> {
                         op => op, // Eq and NotEq remain the same
                     };
                     return Ok(NucleonExpr {
-                        column: col.clone(),
+                        column: key,
                         op: flipped_op,
                         value: normalized_val,
                     });

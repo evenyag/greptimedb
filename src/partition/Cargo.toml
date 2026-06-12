@@ -29,6 +29,7 @@ sql.workspace = true
 sqlparser.workspace = true
 store-api.workspace = true
 table.workspace = true
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
 criterion.workspace = true

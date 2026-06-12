@@ -26,8 +26,8 @@ use datatypes::data_type::ConcreteDataType;
 use itertools::Itertools;
 use snafu::{OptionExt, ResultExt, ensure};
 use sqlparser::ast::{
-    ColumnOption, ColumnOptionDef, DataType, Expr, KeyOrIndexDisplay, NullsDistinctOption,
-    PrimaryKeyConstraint, UniqueConstraint,
+    ColumnOption, ColumnOptionDef, DataType, Expr, FunctionArg, FunctionArgExpr, KeyOrIndexDisplay,
+    NullsDistinctOption, PrimaryKeyConstraint, UniqueConstraint,
 };
 use sqlparser::dialect::keywords::Keyword;
 use sqlparser::keywords::ALL_KEYWORDS;
@@ -1234,6 +1234,49 @@ fn ensure_one_expr(expr: &Expr, columns: &[&Column]) -> Result<()> {
             Ok(())
         }
         Expr::Value(_) => Ok(()),
+        Expr::Function(function) => {
+            let function_name = function.name.to_string();
+            ensure!(
+                function_name.eq_ignore_ascii_case("partition_hash"),
+                error::InvalidSqlSnafu {
+                    msg: format!("Unsupported function {function_name:?} in partition rule expr"),
+                }
+            );
+            let args = match &function.args {
+                sqlparser::ast::FunctionArguments::List(args) => &args.args,
+                _ => {
+                    return error::InvalidSqlSnafu {
+                        msg: "partition_hash in partition rule expr expects one argument"
+                            .to_string(),
+                    }
+                    .fail();
+                }
+            };
+            ensure!(
+                args.len() == 1,
+                error::InvalidSqlSnafu {
+                    msg: "partition_hash in partition rule expr expects one argument".to_string(),
+                }
+            );
+            let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) = &args[0]
+            else {
+                return error::InvalidSqlSnafu {
+                    msg: "partition_hash in partition rule expr expects a partition column identifier".to_string(),
+                }
+                .fail();
+            };
+            let column_name = &ident.value;
+            ensure!(
+                columns.iter().any(|c| &c.name().value == column_name),
+                error::InvalidSqlSnafu {
+                    msg: format!(
+                        "Column {:?} in partition_hash is not referenced in PARTITION ON",
+                        column_name
+                    ),
+                }
+            );
+            Ok(())
+        }
         Expr::UnaryOp { expr, .. } => {
             ensure_one_expr(expr, columns)?;
             Ok(())
