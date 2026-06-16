@@ -299,14 +299,10 @@ fn convert_literal_types(
         .collect()
 }
 
-fn resolve_filters(
-    scan_config: &ScanConfig,
+pub(super) fn resolve_filter_exprs(
+    filters: &[String],
     metadata: &RegionMetadata,
 ) -> error::Result<Vec<DfExpr>> {
-    let Some(filters) = &scan_config.filters else {
-        return Ok(Vec::new());
-    };
-
     let df_schema = metadata
         .schema
         .arrow_schema()
@@ -371,6 +367,17 @@ fn resolve_filters(
         }
         .build()
     })
+}
+
+fn resolve_filters(
+    scan_config: &ScanConfig,
+    metadata: &RegionMetadata,
+) -> error::Result<Vec<DfExpr>> {
+    let Some(filters) = &scan_config.filters else {
+        return Ok(Vec::new());
+    };
+
+    resolve_filter_exprs(filters, metadata)
 }
 
 fn noop_partition_expr_fetcher() -> mito2::region::opener::PartitionExprFetcherRef {
