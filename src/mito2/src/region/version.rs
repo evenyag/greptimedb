@@ -23,15 +23,16 @@
 //! Reason: data may be flushed/compacted and some data with old sequence may be removed
 //! and became invisible between step 1 and 2, so need to acquire version at first.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use common_telemetry::info;
 use store_api::metadata::RegionMetadataRef;
-use store_api::storage::SequenceNumber;
+use store_api::storage::{FileId, SequenceNumber};
 
 use crate::error::Result;
-use crate::manifest::action::{RegionEdit, TruncateKind};
+use crate::manifest::action::{AggregatePkIndexMeta, RegionEdit, TruncateKind};
 use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
 use crate::memtable::version::{MemtableVersion, MemtableVersionRef};
 use crate::memtable::{MemtableBuilderRef, MemtableId};
@@ -342,6 +343,8 @@ pub(crate) struct Version {
     pub(crate) memtables: MemtableVersionRef,
     /// SSTs of the region.
     pub(crate) ssts: SstVersionRef,
+    /// Primary-key aggregate indexes of the region.
+    pub(crate) pk_indexes: Arc<HashMap<FileId, AggregatePkIndexMeta>>,
     /// Inclusive max WAL entry id of flushed data.
     pub(crate) flushed_entry_id: EntryId,
     /// Inclusive max sequence of flushed data.
@@ -366,6 +369,7 @@ pub(crate) struct VersionBuilder {
     metadata: RegionMetadataRef,
     memtables: MemtableVersionRef,
     ssts: SstVersionRef,
+    pk_indexes: Arc<HashMap<FileId, AggregatePkIndexMeta>>,
     flushed_entry_id: EntryId,
     flushed_sequence: SequenceNumber,
     truncated_entry_id: Option<EntryId>,
@@ -380,6 +384,7 @@ impl VersionBuilder {
             metadata,
             memtables: Arc::new(MemtableVersion::new(mutable)),
             ssts: Arc::new(SstVersion::new()),
+            pk_indexes: Arc::new(HashMap::new()),
             flushed_entry_id: 0,
             flushed_sequence: 0,
             truncated_entry_id: None,
@@ -394,6 +399,7 @@ impl VersionBuilder {
             metadata: version.metadata.clone(),
             memtables: version.memtables.clone(),
             ssts: version.ssts.clone(),
+            pk_indexes: version.pk_indexes.clone(),
             flushed_entry_id: version.flushed_entry_id,
             flushed_sequence: version.flushed_sequence,
             truncated_entry_id: version.truncated_entry_id,
@@ -461,6 +467,16 @@ impl VersionBuilder {
             ssts.remove_files(edit.files_to_remove.into_iter());
             self.ssts = Arc::new(ssts);
         }
+        if !edit.pk_indexes_to_add.is_empty() || !edit.pk_indexes_to_remove.is_empty() {
+            let mut pk_indexes = (*self.pk_indexes).clone();
+            for index in edit.pk_indexes_to_remove {
+                pk_indexes.remove(&index.index_file_id);
+            }
+            for index in edit.pk_indexes_to_add {
+                pk_indexes.insert(index.index_file_id, index);
+            }
+            self.pk_indexes = Arc::new(pk_indexes);
+        }
 
         self
     }
@@ -499,6 +515,13 @@ impl VersionBuilder {
     /// Clear all files in the builder.
     pub(crate) fn clear_files(mut self) -> Self {
         self.ssts = Arc::new(SstVersion::new());
+        self.pk_indexes = Arc::new(HashMap::new());
+        self
+    }
+
+    /// Sets primary-key aggregate indexes.
+    pub(crate) fn pk_indexes(mut self, pk_indexes: HashMap<FileId, AggregatePkIndexMeta>) -> Self {
+        self.pk_indexes = Arc::new(pk_indexes);
         self
     }
 
@@ -523,6 +546,7 @@ impl VersionBuilder {
             metadata: self.metadata,
             memtables: self.memtables,
             ssts: self.ssts,
+            pk_indexes: self.pk_indexes,
             flushed_entry_id: self.flushed_entry_id,
             flushed_sequence: self.flushed_sequence,
             truncated_entry_id: self.truncated_entry_id,

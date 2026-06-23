@@ -1845,6 +1845,8 @@ mod tests {
         RegionEdit {
             files_to_add: Vec::new(),
             files_to_remove: Vec::new(),
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -1868,6 +1870,8 @@ mod tests {
                 ..Default::default()
             }],
             files_to_remove: Vec::new(),
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,

@@ -142,6 +142,8 @@ pub(crate) struct WorkerGroup {
     compact_job_pool: SchedulerRef,
     /// Scheduler for index build jobs.
     index_build_job_pool: SchedulerRef,
+    /// Scheduler for primary-key aggregate index build jobs.
+    pk_index_build_job_pool: SchedulerRef,
     /// Scheduler for file purgers.
     purge_scheduler: SchedulerRef,
     /// Cache.
@@ -190,6 +192,8 @@ impl WorkerGroup {
             .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
+        let pk_index_build_job_pool =
+            Arc::new(LocalScheduler::new(config.max_background_pk_index_builds));
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -240,6 +244,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
+                    pk_index_build_job_pool: pk_index_build_job_pool.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -266,6 +271,7 @@ impl WorkerGroup {
             flush_job_pool,
             compact_job_pool,
             index_build_job_pool,
+            pk_index_build_job_pool,
             purge_scheduler,
             cache_manager,
             file_ref_manager,
@@ -290,6 +296,8 @@ impl WorkerGroup {
         self.purge_scheduler.stop(true).await?;
         // Stops the index build job pool gracefully.
         self.index_build_job_pool.stop(true).await?;
+        // Stops the primary-key aggregate index build job pool gracefully.
+        self.pk_index_build_job_pool.stop(true).await?;
 
         try_join_all(self.workers.iter().map(|worker| worker.stop())).await?;
 
@@ -397,6 +405,8 @@ impl WorkerGroup {
         });
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
+        let pk_index_build_job_pool =
+            Arc::new(LocalScheduler::new(config.max_background_pk_index_builds));
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -449,6 +459,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
+                    pk_index_build_job_pool: pk_index_build_job_pool.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -475,6 +486,7 @@ impl WorkerGroup {
             flush_job_pool,
             compact_job_pool,
             index_build_job_pool,
+            pk_index_build_job_pool,
             purge_scheduler,
             cache_manager,
             file_ref_manager,
@@ -541,6 +553,7 @@ struct WorkerStarter<S> {
     write_buffer_manager: WriteBufferManagerRef,
     compact_job_pool: SchedulerRef,
     index_build_job_pool: SchedulerRef,
+    pk_index_build_job_pool: SchedulerRef,
     flush_job_pool: SchedulerRef,
     purge_scheduler: SchedulerRef,
     listener: WorkerListener,
@@ -593,6 +606,9 @@ impl<S: LogStore> WorkerStarter<S> {
                 self.index_build_job_pool,
                 self.config.max_background_index_builds,
             ),
+            pk_index_build_scheduler: crate::sst::pk_index::PkIndexBuildScheduler::new(
+                self.pk_index_build_job_pool,
+            ),
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -617,6 +633,7 @@ impl<S: LogStore> WorkerStarter<S> {
             region_count: REGION_COUNT.with_label_values(&[&id_string]),
             request_wait_time: REQUEST_WAIT_TIME.with_label_values(&[&id_string]),
             region_edit_queues: RegionEditQueues::default(),
+            pending_pk_index_sequences: HashMap::new(),
             schema_metadata_manager: self.schema_metadata_manager,
             file_ref_manager: self.file_ref_manager.clone(),
             partition_expr_fetcher: self.partition_expr_fetcher,
@@ -857,6 +874,8 @@ struct RegionWorkerLoop<S> {
     write_buffer_manager: WriteBufferManagerRef,
     /// Scheduler for index build task.
     index_build_scheduler: IndexBuildScheduler,
+    /// Scheduler for primary-key aggregate index build task.
+    pk_index_build_scheduler: crate::sst::pk_index::PkIndexBuildScheduler,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
@@ -887,6 +906,8 @@ struct RegionWorkerLoop<S> {
     request_wait_time: Histogram,
     /// Queues for region edit requests.
     region_edit_queues: RegionEditQueues,
+    /// Sequence boundaries captured from manual compaction requests for PK index builds.
+    pending_pk_index_sequences: HashMap<RegionId, u64>,
     /// Database level metadata manager.
     schema_metadata_manager: SchemaMetadataManagerRef,
     /// Datanode level file references manager.
@@ -1235,6 +1256,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             BackgroundNotify::IndexBuildFailed(req) => {
                 self.handle_index_build_failed(region_id, req).await
             }
+            BackgroundNotify::PkIndexBuildFinished(req) => {
+                self.handle_pk_index_build_finished(region_id, req).await
+            }
             BackgroundNotify::CompactionFinished(req) => {
                 self.handle_compaction_finished(region_id, req).await
             }
@@ -1252,6 +1276,31 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 self.handle_copy_region_from_finished(req)
             }
         }
+    }
+
+    async fn handle_pk_index_build_finished(
+        &mut self,
+        region_id: RegionId,
+        req: crate::request::PkIndexBuildFinished,
+    ) {
+        let Some(region) = self.regions.get_region(region_id) else {
+            common_telemetry::warn!(
+                "Region {} not found when applying primary-key aggregate index edit",
+                region_id
+            );
+            return;
+        };
+        if req.region_id != region_id {
+            common_telemetry::warn!(
+                "Primary-key aggregate index notification region mismatch, expected: {}, actual: {}",
+                region_id,
+                req.region_id
+            );
+            return;
+        }
+        region
+            .version_control
+            .apply_edit(Some(req.edit), &[], region.file_purger.clone());
     }
 
     /// Handles `set_region_role_gracefully`.

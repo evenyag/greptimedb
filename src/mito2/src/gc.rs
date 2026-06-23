@@ -528,6 +528,7 @@ impl LocalGcWorker {
     )]
     async fn delete_files(&self, region_id: RegionId, removed_files: &[RemovedFile]) -> Result<()> {
         let mut index_ids = vec![];
+        let mut pk_index_ids = vec![];
         let file_pairs = removed_files
             .iter()
             .filter_map(|f| match f {
@@ -536,6 +537,10 @@ impl LocalGcWorker {
                     let region_index_id =
                         RegionIndexId::new(RegionFileId::new(region_id, *file_id), *index_version);
                     index_ids.push(region_index_id);
+                    None
+                }
+                RemovedFile::PkIndex(file_id) => {
+                    pk_index_ids.push(*file_id);
                     None
                 }
             })
@@ -566,6 +571,27 @@ impl LocalGcWorker {
                 })?;
             GC_FILES_DELETED_TOTAL
                 .with_label_values(&["index"])
+                .inc_by(deleted_count);
+            GC_DELETE_FILE_CNT.inc_by(deleted_count);
+        }
+
+        for file_id in &pk_index_ids {
+            let path = location::pk_index_file_path(
+                self.access_layer.table_dir(),
+                region_id,
+                *file_id,
+                self.access_layer.path_type(),
+            );
+            self.access_layer
+                .object_store()
+                .delete(&path)
+                .await
+                .context(OpenDalSnafu)?;
+        }
+        if !pk_index_ids.is_empty() {
+            let deleted_count = pk_index_ids.len() as u64;
+            GC_FILES_DELETED_TOTAL
+                .with_label_values(&["pk_index"])
                 .inc_by(deleted_count);
             GC_DELETE_FILE_CNT.inc_by(deleted_count);
         }
@@ -1008,6 +1034,7 @@ impl LocalGcWorker {
                             in_manifest.get(file_id) == Some(&Some(*index_version))
                                 || in_tmp_ref.contains(&(*file_id, Some(*index_version)))
                         }
+                        RemovedFile::PkIndex(_) => false,
                     };
                     !in_use
                 })

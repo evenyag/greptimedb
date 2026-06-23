@@ -215,6 +215,8 @@ impl RegionManifestManager {
             actions.push(RegionMetaAction::Edit(RegionEdit {
                 files_to_add: vec![],
                 files_to_remove: vec![],
+                pk_indexes_to_add: vec![],
+                pk_indexes_to_remove: vec![],
                 timestamp_ms: None,
                 compaction_time_window: None,
                 flushed_entry_id: Some(flushed_entry_id),
@@ -1001,6 +1003,8 @@ mod test {
                     RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
                         files_to_add: vec![],
                         files_to_remove: vec![],
+                        pk_indexes_to_add: vec![],
+                        pk_indexes_to_remove: vec![],
                         timestamp_ms: None,
                         compaction_time_window: None,
                         flushed_entry_id: None,

@@ -680,6 +680,7 @@ pub(crate) fn version_builder_from_manifest(
 ) -> VersionBuilder {
     VersionBuilder::new(metadata, mutable)
         .add_files(file_purger, manifest.files.values().cloned())
+        .pk_indexes(manifest.pk_indexes.clone())
         .flushed_entry_id(manifest.flushed_entry_id)
         .flushed_sequence(manifest.flushed_sequence)
         .truncated_entry_id(manifest.truncated_entry_id)
@@ -1273,6 +1274,7 @@ mod tests {
         RegionManifest {
             metadata: Arc::new(sst_region_metadata()),
             files: HashMap::new(),
+            pk_indexes: HashMap::new(),
             removed_files: RemovedFilesRecord::default(),
             flushed_entry_id: 0,
             flushed_sequence: 0,

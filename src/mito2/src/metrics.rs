@@ -31,6 +31,8 @@ pub const FILE_TYPE_LABEL: &str = "file_type";
 pub const WORKER_LABEL: &str = "worker";
 /// Partition label.
 pub const PARTITION_LABEL: &str = "partition";
+/// Status label.
+pub const STATUS_LABEL: &str = "status";
 /// Staging dir type label.
 pub const STAGING_TYPE: &str = "index_staging";
 /// Recycle bin type label.
@@ -363,6 +365,13 @@ lazy_static! {
         "index create memory usage",
         &[TYPE_LABEL],
     ).unwrap();
+    /// Counter of primary-key aggregate index background task status.
+    pub static ref PK_INDEX_TASK_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_pk_index_task_total",
+        "primary-key aggregate index task total",
+        &[STATUS_LABEL],
+    )
+    .unwrap();
     /// Counter of r/w bytes on index related IO operations.
     pub static ref INDEX_IO_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
         "greptime_index_io_bytes_total",

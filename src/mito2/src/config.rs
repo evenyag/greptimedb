@@ -84,6 +84,8 @@ pub struct MitoConfig {
     // Background job configs:
     /// Max number of running background index build jobs (default: 1/8 of cpu cores).
     pub max_background_index_builds: usize,
+    /// Max number of running background primary-key aggregate index build jobs.
+    pub max_background_pk_index_builds: usize,
     /// Max number of running background flush jobs (default: 1/2 of cpu cores).
     pub max_background_flushes: usize,
     /// Max number of running background compaction jobs (default: 1/4 of cpu cores).
@@ -194,6 +196,7 @@ impl Default for MitoConfig {
             experimental_manifest_keep_removed_file_ttl: Duration::from_secs(60 * 60),
             compress_manifest: false,
             max_background_index_builds: divide_num_cpus(8),
+            max_background_pk_index_builds: 1,
             max_background_flushes: divide_num_cpus(2),
             max_background_compactions: divide_num_cpus(4),
             max_background_purges: get_total_cpu_cores(),
@@ -271,6 +274,10 @@ impl MitoConfig {
                 divide_num_cpus(4)
             );
             self.max_background_compactions = divide_num_cpus(4);
+        }
+        if self.max_background_pk_index_builds == 0 {
+            warn!("Sanitize max background primary-key index builds 0 to 1");
+            self.max_background_pk_index_builds = 1;
         }
         if self.max_background_purges == 0 {
             let cpu_cores = get_total_cpu_cores();

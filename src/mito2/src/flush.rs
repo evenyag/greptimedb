@@ -435,6 +435,8 @@ impl RegionFlushTask {
         let edit = RegionEdit {
             files_to_add: file_metas,
             files_to_remove: Vec::new(),
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
             compaction_time_window: None,
             // The last entry has been flushed.
@@ -1520,6 +1522,8 @@ mod tests {
             Some(RegionEdit {
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
+                pk_indexes_to_add: Vec::new(),
+                pk_indexes_to_remove: Vec::new(),
                 timestamp_ms: None,
                 compaction_time_window: None,
                 flushed_entry_id: None,
@@ -1708,6 +1712,8 @@ mod tests {
             Some(RegionEdit {
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
+                pk_indexes_to_add: Vec::new(),
+                pk_indexes_to_remove: Vec::new(),
                 timestamp_ms: None,
                 compaction_time_window: None,
                 flushed_entry_id: None,

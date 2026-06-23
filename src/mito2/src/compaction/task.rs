@@ -129,6 +129,8 @@ impl CompactionTaskImpl {
         let edit = RegionEdit {
             files_to_add: Vec::new(),
             files_to_remove: expired_files,
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
             compaction_time_window: None,
             flushed_entry_id: None,

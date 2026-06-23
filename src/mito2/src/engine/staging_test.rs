@@ -983,6 +983,8 @@ async fn test_staging_exit_conflict_partition_expr_change_and_change_with_format
                 RegionMetaAction::Edit(RegionEdit {
                     files_to_add: Vec::new(),
                     files_to_remove: Vec::new(),
+                    pk_indexes_to_add: Vec::new(),
+                    pk_indexes_to_remove: Vec::new(),
                     timestamp_ms: None,
                     compaction_time_window: None,
                     flushed_entry_id: None,

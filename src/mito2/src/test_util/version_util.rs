@@ -217,6 +217,8 @@ pub(crate) fn apply_edit(
         Some(RegionEdit {
             files_to_add,
             files_to_remove: files_to_remove.to_vec(),
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,

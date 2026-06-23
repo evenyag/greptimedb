@@ -30,7 +30,7 @@ use crate::error::{RegionMetadataNotFoundSnafu, Result, SerdeJsonSnafu, Utf8Snaf
 use crate::manifest::manager::RemoveFileOptions;
 use crate::region::ManifestStats;
 use crate::sst::FormatType;
-use crate::sst::file::FileMeta;
+use crate::sst::file::{FileMeta, FileTimeRange};
 use crate::wal::EntryId;
 
 /// Actions that can be applied to region manifest.
@@ -87,6 +87,10 @@ pub struct RegionChange {
 pub struct RegionEdit {
     pub files_to_add: Vec<FileMeta>,
     pub files_to_remove: Vec<FileMeta>,
+    #[serde(default)]
+    pub pk_indexes_to_add: Vec<AggregatePkIndexMeta>,
+    #[serde(default)]
+    pub pk_indexes_to_remove: Vec<AggregatePkIndexMeta>,
     /// event unix timestamp in milliseconds, help to determine file deletion time.
     #[serde(default)]
     pub timestamp_ms: Option<i64>,
@@ -95,6 +99,26 @@ pub struct RegionEdit {
     pub flushed_entry_id: Option<EntryId>,
     pub flushed_sequence: Option<SequenceNumber>,
     pub committed_sequence: Option<SequenceNumber>,
+}
+
+/// Metadata of a primary-key aggregate index file.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AggregatePkIndexMeta {
+    /// Unique id of the `.pk` index file.
+    pub index_file_id: FileId,
+    /// Timestamp range covered by the index.
+    pub time_range: FileTimeRange,
+    /// Inclusive sequence boundary covered by the index.
+    pub max_sequence: SequenceNumber,
+    /// SST files used to build the index.
+    #[serde(default)]
+    pub source_file_ids: Vec<FileId>,
+    /// Size of the `.pk` file.
+    #[serde(default)]
+    pub file_size: u64,
+    /// Number of rows in the `.pk` index.
+    #[serde(default)]
+    pub row_count: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -137,6 +161,9 @@ pub struct RegionManifest {
     pub metadata: RegionMetadataRef,
     /// SST files.
     pub files: HashMap<FileId, FileMeta>,
+    /// Primary-key aggregate index files.
+    #[serde(default)]
+    pub pk_indexes: HashMap<FileId, AggregatePkIndexMeta>,
     /// Removed files, which are not in the current manifest but may still be kept for a while.
     /// This is a list of (set of files, timestamp) pairs, where the timestamp is the time when
     /// the files are removed from manifest. The timestamp is in milliseconds since unix epoch.
@@ -173,6 +200,7 @@ impl PartialEq for RegionManifest {
     fn eq(&self, other: &Self) -> bool {
         self.metadata == other.metadata
             && self.files == other.files
+            && self.pk_indexes == other.pk_indexes
             && self.flushed_entry_id == other.flushed_entry_id
             && self.flushed_sequence == other.flushed_sequence
             && self.manifest_version == other.manifest_version
@@ -186,6 +214,7 @@ impl PartialEq for RegionManifest {
 pub struct RegionManifestBuilder {
     metadata: Option<RegionMetadataRef>,
     files: HashMap<FileId, FileMeta>,
+    pk_indexes: HashMap<FileId, AggregatePkIndexMeta>,
     pub removed_files: RemovedFilesRecord,
     flushed_entry_id: EntryId,
     flushed_sequence: SequenceNumber,
@@ -204,6 +233,7 @@ impl RegionManifestBuilder {
             Self {
                 metadata: Some(s.metadata),
                 files: s.files,
+                pk_indexes: s.pk_indexes,
                 removed_files: s.removed_files,
                 flushed_entry_id: s.flushed_entry_id,
                 manifest_version: s.manifest_version,
@@ -268,6 +298,11 @@ impl RegionManifestBuilder {
                 .iter()
                 .map(|f| RemovedFile::File(f.file_id, f.index_version())),
         );
+        removed_files.extend(
+            edit.pk_indexes_to_remove
+                .iter()
+                .map(|index| RemovedFile::PkIndex(index.index_file_id)),
+        );
         let at = edit
             .timestamp_ms
             .unwrap_or_else(|| Utc::now().timestamp_millis());
@@ -275,6 +310,12 @@ impl RegionManifestBuilder {
 
         for file in edit.files_to_remove {
             self.files.remove(&file.file_id);
+        }
+        for index in edit.pk_indexes_to_remove {
+            self.pk_indexes.remove(&index.index_file_id);
+        }
+        for index in edit.pk_indexes_to_add {
+            self.pk_indexes.insert(index.index_file_id, index);
         }
         if let Some(flushed_entry_id) = edit.flushed_entry_id {
             self.flushed_entry_id = self.flushed_entry_id.max(flushed_entry_id);
@@ -308,12 +349,18 @@ impl RegionManifestBuilder {
                     self.files
                         .values()
                         .map(|f| RemovedFile::File(f.file_id, f.index_version()))
+                        .chain(
+                            self.pk_indexes
+                                .values()
+                                .map(|index| RemovedFile::PkIndex(index.index_file_id)),
+                        )
                         .collect(),
                     truncate
                         .timestamp_ms
                         .unwrap_or_else(|| Utc::now().timestamp_millis()),
                 );
                 self.files.clear();
+                self.pk_indexes.clear();
             }
             TruncateKind::Partial { files_to_remove } => {
                 self.removed_files.add_removed_files(
@@ -346,6 +393,7 @@ impl RegionManifestBuilder {
         Ok(RegionManifest {
             metadata,
             files: self.files,
+            pk_indexes: self.pk_indexes,
             removed_files: self.removed_files,
             flushed_entry_id: self.flushed_entry_id,
             flushed_sequence: self.flushed_sequence,
@@ -409,6 +457,7 @@ pub struct RemovedFiles {
 pub enum RemovedFile {
     File(FileId, Option<IndexVersion>),
     Index(FileId, IndexVersion),
+    PkIndex(FileId),
 }
 
 /// Support deserialize from old format(just FileId as string) for backward compatibility
@@ -430,6 +479,7 @@ impl<'de> Deserialize<'de> for RemovedFile {
         enum RemovedFileEnum {
             File(FileId, Option<IndexVersion>),
             Index(FileId, IndexVersion),
+            PkIndex(FileId),
         }
 
         let compat = CompatRemovedFile::deserialize(deserializer)?;
@@ -440,6 +490,7 @@ impl<'de> Deserialize<'de> for RemovedFile {
                 RemovedFileEnum::Index(file_id, version) => {
                     Ok(RemovedFile::Index(file_id, version))
                 }
+                RemovedFileEnum::PkIndex(file_id) => Ok(RemovedFile::PkIndex(file_id)),
             },
         }
     }
@@ -450,6 +501,7 @@ impl RemovedFile {
         match self {
             RemovedFile::File(file_id, _) => *file_id,
             RemovedFile::Index(file_id, _) => *file_id,
+            RemovedFile::PkIndex(file_id) => *file_id,
         }
     }
 
@@ -457,6 +509,7 @@ impl RemovedFile {
         match self {
             RemovedFile::File(_, index_version) => *index_version,
             RemovedFile::Index(_, index_version) => Some(*index_version),
+            RemovedFile::PkIndex(_) => None,
         }
     }
 }
@@ -544,6 +597,8 @@ impl RegionMetaActionList {
         let mut edit = RegionEdit {
             files_to_add: Vec::new(),
             files_to_remove: Vec::new(),
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -891,6 +946,7 @@ mod tests {
         let manifest = RegionManifest {
             metadata: metadata.clone(),
             files: HashMap::new(),
+            pk_indexes: HashMap::new(),
             flushed_entry_id: 0,
             flushed_sequence: 0,
             committed_sequence: None,
@@ -1002,6 +1058,7 @@ mod tests {
             RegionManifest {
                 metadata: metadata.clone(),
                 files: HashMap::new(),
+                pk_indexes: HashMap::new(),
                 removed_files: Default::default(),
                 flushed_entry_id: 0,
                 flushed_sequence: 0,
@@ -1017,6 +1074,7 @@ mod tests {
         let new_manifest = RegionManifest {
             metadata: metadata.clone(),
             files: HashMap::new(),
+            pk_indexes: HashMap::new(),
             removed_files: Default::default(),
             flushed_entry_id: 0,
             flushed_sequence: 0,
@@ -1065,6 +1123,8 @@ mod tests {
             RegionEdit {
                 files_to_add: vec![],
                 files_to_remove: vec![],
+                pk_indexes_to_add: vec![],
+                pk_indexes_to_remove: vec![],
                 timestamp_ms: None,
                 compaction_time_window: None,
                 flushed_entry_id: None,
@@ -1078,6 +1138,8 @@ mod tests {
         let new = RegionEdit {
             files_to_add: vec![],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: Some(42),
             compaction_time_window: None,
             flushed_entry_id: None,

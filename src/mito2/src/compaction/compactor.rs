@@ -622,6 +622,8 @@ where
         let edit = RegionEdit {
             files_to_add: merge_output.files_to_add,
             files_to_remove: merge_output.files_to_remove,
+            pk_indexes_to_add: Vec::new(),
+            pk_indexes_to_remove: Vec::new(),
             // Use current timestamp as the edit timestamp.
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
             compaction_time_window: merge_output

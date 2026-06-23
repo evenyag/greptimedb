@@ -898,6 +898,8 @@ pub(crate) enum BackgroundNotify {
     IndexBuildStopped(IndexBuildStopped),
     /// Index build has failed.
     IndexBuildFailed(IndexBuildFailed),
+    /// Primary-key aggregate index build has finished.
+    PkIndexBuildFinished(PkIndexBuildFinished),
     /// Compaction has finished.
     CompactionFinished(CompactionFinished),
     /// Compaction has been cancelled cooperatively.
@@ -983,6 +985,13 @@ pub(crate) struct IndexBuildStopped {
 #[derive(Debug)]
 pub(crate) struct IndexBuildFailed {
     pub(crate) err: Arc<Error>,
+}
+
+/// Notifies a primary-key aggregate index build job has finished.
+#[derive(Debug)]
+pub(crate) struct PkIndexBuildFinished {
+    pub(crate) region_id: RegionId,
+    pub(crate) edit: RegionEdit,
 }
 
 /// Notifies a compaction job has finished.

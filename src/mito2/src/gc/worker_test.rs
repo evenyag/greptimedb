@@ -403,9 +403,12 @@ async fn test_gc_worker_compact_with_ref() {
             manifest.removed_files.removed_files[0]
                 .files
                 .iter()
-                .map(|removed_file| match removed_file {
-                    RemovedFile::File(file_id, v) => FileRef::new(region_id, *file_id, *v),
-                    RemovedFile::Index(file_id, v) => FileRef::new(region_id, *file_id, Some(*v)),
+                .filter_map(|removed_file| match removed_file {
+                    RemovedFile::File(file_id, v) => Some(FileRef::new(region_id, *file_id, *v)),
+                    RemovedFile::Index(file_id, v) => {
+                        Some(FileRef::new(region_id, *file_id, Some(*v)))
+                    }
+                    RemovedFile::PkIndex(_) => None,
                 })
                 .collect(),
         )]),

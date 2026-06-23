@@ -107,6 +107,7 @@ impl RemapManifest {
             let manifest = RegionManifest {
                 metadata: Arc::new(new_metadata),
                 files: HashMap::new(),
+                pk_indexes: HashMap::new(),
                 removed_files: RemovedFilesRecord::default(),
                 flushed_entry_id: 0,
                 flushed_sequence: 0,
@@ -458,6 +459,7 @@ mod tests {
         RegionManifest {
             metadata: create_region_metadata(region_id),
             files,
+            pk_indexes: HashMap::new(),
             removed_files: RemovedFilesRecord::default(),
             flushed_entry_id,
             flushed_sequence,

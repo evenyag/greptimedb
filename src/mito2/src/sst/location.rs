@@ -60,6 +60,17 @@ pub fn index_file_path(table_dir: &str, index_id: RegionIndexId, path_type: Path
     util::join_path(&index_dir, &filename)
 }
 
+pub fn pk_index_file_path(
+    table_dir: &str,
+    region_id: RegionId,
+    file_id: FileId,
+    path_type: PathType,
+) -> String {
+    let region_dir = region_dir_from_table_dir(table_dir, region_id, path_type);
+    let index_dir = util::join_dir(&region_dir, "index");
+    util::join_path(&index_dir, &format!("{file_id}.pk"))
+}
+
 /// Legacy function for backward compatibility - creates index file path using RegionFileId with version 0
 pub fn index_file_path_legacy(
     table_dir: &str,

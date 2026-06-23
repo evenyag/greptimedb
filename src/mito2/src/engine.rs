@@ -1477,6 +1477,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -1489,6 +1491,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -1501,6 +1505,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![],
             files_to_remove: vec![FileMeta::default()],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -1513,6 +1519,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![FileMeta::default()],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,
@@ -1525,6 +1533,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: Some(Duration::from_secs(1)),
             flushed_entry_id: None,
@@ -1535,6 +1545,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: Some(1),
@@ -1545,6 +1557,8 @@ mod tests {
         let edit = RegionEdit {
             files_to_add: vec![FileMeta::default()],
             files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,

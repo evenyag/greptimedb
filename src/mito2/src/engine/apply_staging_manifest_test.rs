@@ -551,6 +551,8 @@ async fn test_apply_staging_manifest_change_edit_different_columns_fails_with_fo
                 RegionMetaAction::Edit(RegionEdit {
                     files_to_add: Vec::new(),
                     files_to_remove: Vec::new(),
+                    pk_indexes_to_add: Vec::new(),
+                    pk_indexes_to_remove: Vec::new(),
                     timestamp_ms: None,
                     compaction_time_window: None,
                     flushed_entry_id: None,

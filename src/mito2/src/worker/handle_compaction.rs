@@ -27,6 +27,7 @@ use crate::request::{
     OptionOutputTx,
 };
 use crate::sst::index::IndexBuildType;
+use crate::sst::pk_index::PkIndexBuildRequest;
 use crate::worker::RegionWorkerLoop;
 
 impl<S> RegionWorkerLoop<S> {
@@ -42,7 +43,8 @@ impl<S> RegionWorkerLoop<S> {
         };
         COMPACTION_REQUEST_COUNT.inc();
         let parallelism = req.parallelism.unwrap_or(1) as usize;
-        if let Err(e) = self
+        let max_sequence = region.version_control.committed_sequence();
+        match self
             .compaction_scheduler
             .schedule_compaction(
                 region.region_id,
@@ -56,12 +58,21 @@ impl<S> RegionWorkerLoop<S> {
             )
             .await
         {
-            error!(e; "Failed to schedule compaction task for region: {}", region_id);
-        } else {
-            info!(
-                "Successfully scheduled compaction task for region: {}",
-                region_id
-            );
+            Ok(scheduled) => {
+                if scheduled {
+                    self.pending_pk_index_sequences
+                        .insert(region_id, max_sequence);
+                } else {
+                    self.schedule_pk_index_build(region.clone(), max_sequence);
+                }
+                info!(
+                    "Successfully scheduled compaction task for region: {}",
+                    region_id
+                );
+            }
+            Err(e) => {
+                error!(e; "Failed to schedule compaction task for region: {}", region_id);
+            }
         }
     }
 
@@ -107,6 +118,10 @@ impl<S> RegionWorkerLoop<S> {
             .await;
         }
 
+        if let Some(max_sequence) = self.pending_pk_index_sequences.remove(&region_id) {
+            self.schedule_pk_index_build(region.clone(), max_sequence);
+        }
+
         // Schedule next compaction if necessary.
         let mut pending_ddls = self
             .compaction_scheduler
@@ -144,6 +159,29 @@ impl<S> RegionWorkerLoop<S> {
         }
     }
 
+    fn schedule_pk_index_build(&self, region: MitoRegionRef, max_sequence: u64) {
+        let version = region.version_control.current().version;
+        let files = version
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files.values().cloned())
+            .collect::<Vec<_>>();
+        let request = PkIndexBuildRequest {
+            region_id: region.region_id,
+            metadata: version.metadata.clone(),
+            access_layer: region.access_layer.clone(),
+            manifest_ctx: region.manifest_ctx.clone(),
+            files,
+            existing_indexes: (*version.pk_indexes).clone(),
+            max_sequence,
+            request_sender: self.sender.clone(),
+        };
+        if let Err(err) = self.pk_index_build_scheduler.schedule(request) {
+            error!(err; "Failed to schedule primary-key aggregate index task for region: {}", region.region_id);
+        }
+    }
+
     pub(crate) async fn handle_compaction_cancelled(
         &mut self,
         region_id: RegionId,
@@ -151,6 +189,7 @@ impl<S> RegionWorkerLoop<S> {
     ) where
         S: LogStore,
     {
+        self.pending_pk_index_sequences.remove(&region_id);
         request.on_success();
 
         // Reuse the scheduler's finish path to wake pending DDLs after a cooperative stop.
@@ -168,6 +207,7 @@ impl<S> RegionWorkerLoop<S> {
 
     /// When compaction fails, we simply log the error.
     pub(crate) async fn handle_compaction_failure(&mut self, req: CompactionFailed) {
+        self.pending_pk_index_sequences.remove(&req.region_id);
         error!(req.err; "Failed to compact region: {}", req.region_id);
 
         self.compaction_scheduler

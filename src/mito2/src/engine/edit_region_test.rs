@@ -129,6 +129,8 @@ async fn test_edit_region_schedule_compaction_with_format(
             })
             .collect(),
         files_to_remove: vec![],
+        pk_indexes_to_add: vec![],
+        pk_indexes_to_remove: vec![],
         timestamp_ms: None,
         compaction_time_window: None,
         flushed_entry_id: None,
@@ -236,6 +238,8 @@ async fn test_edit_region_fill_cache_with_format(flat_format: bool) {
             ..Default::default()
         }],
         files_to_remove: vec![],
+        pk_indexes_to_add: vec![],
+        pk_indexes_to_remove: vec![],
         timestamp_ms: None,
         compaction_time_window: None,
         flushed_entry_id: None,
@@ -624,6 +628,8 @@ fn test_region_edit(region_id: RegionId, file_id: FileId) -> RegionEdit {
             ..Default::default()
         }],
         files_to_remove: vec![],
+        pk_indexes_to_add: vec![],
+        pk_indexes_to_remove: vec![],
         timestamp_ms: None,
         compaction_time_window: None,
         flushed_entry_id: None,
@@ -712,6 +718,8 @@ async fn test_edit_region_concurrently_with_format(flat_format: bool) {
                 let edit = RegionEdit {
                     files_to_add: vec![sst],
                     files_to_remove: vec![],
+                    pk_indexes_to_add: vec![],
+                    pk_indexes_to_remove: vec![],
                     timestamp_ms: None,
                     compaction_time_window: None,
                     flushed_entry_id: None,

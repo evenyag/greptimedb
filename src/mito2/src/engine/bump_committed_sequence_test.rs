@@ -79,6 +79,8 @@ async fn test_bump_committed_sequence_with_format(flat_format: bool) {
             RegionEdit {
                 files_to_add: vec![FileMeta::default()],
                 files_to_remove: vec![],
+                pk_indexes_to_add: vec![],
+                pk_indexes_to_remove: vec![],
                 timestamp_ms: None,
                 compaction_time_window: None,
                 flushed_entry_id: None,
