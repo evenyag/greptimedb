@@ -372,6 +372,12 @@ lazy_static! {
         &[STATUS_LABEL],
     )
     .unwrap();
+    /// Counter of source rows processed by primary-key aggregate index tasks.
+    pub static ref PK_INDEX_SOURCE_ROWS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_pk_index_source_rows_total",
+        "primary-key aggregate index source rows total",
+    )
+    .unwrap();
     /// Counter of r/w bytes on index related IO operations.
     pub static ref INDEX_IO_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
         "greptime_index_io_bytes_total",

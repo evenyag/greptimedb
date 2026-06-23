@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use common_time::timestamp::{TimeUnit, Timestamp};
 use datatypes::arrow::array::{
@@ -15,6 +16,7 @@ use datatypes::arrow::array::{
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::value::Value;
+use futures::{StreamExt, stream};
 use mito_codec::row_converter::{
     CompositeValues, PrimaryKeyCodec, SparseValues, build_primary_key_codec,
 };
@@ -37,8 +39,12 @@ use crate::manifest::action::{
     AggregatePkIndexMeta, RegionEdit, RegionMetaAction, RegionMetaActionList,
 };
 use crate::metrics::{
-    INDEX_CREATE_BYTES_TOTAL, INDEX_CREATE_ELAPSED, INDEX_CREATE_ROWS_TOTAL, PK_INDEX_TASK_TOTAL,
+    INDEX_CREATE_BYTES_TOTAL, INDEX_CREATE_ELAPSED, INDEX_CREATE_ROWS_TOTAL,
+    PK_INDEX_SOURCE_ROWS_TOTAL, PK_INDEX_TASK_TOTAL,
 };
+use crate::read::BoxedRecordBatchStream;
+use crate::read::flat_merge::FlatMergeReader;
+use crate::read::read_columns::ReadColumns;
 use crate::region::{ManifestContextRef, RegionLeaderState};
 use crate::request::{
     BackgroundNotify, PkIndexBuildFinished, WorkerRequest, WorkerRequestWithTime,
@@ -46,7 +52,10 @@ use crate::request::{
 use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::{FileHandle, FileTimeRange};
 use crate::sst::location::pk_index_file_path;
-use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
+use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::flat_format::{
+    FlatReadFormat, primary_key_column_index, time_index_column_index,
+};
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 const PK_INDEX_WRITE_BATCH_ROWS: usize = 8192;
@@ -60,6 +69,12 @@ const ROW_COUNT_COL: &str = "row_count";
 const TABLE_ID_COL: &str = "__table_id";
 const TSID_COL: &str = "__tsid";
 const PK_INDEX_TYPE: &str = "pk_index";
+const OPEN_SOURCE_STAGE: &str = "open_source";
+const READ_SOURCE_STAGE: &str = "read_source";
+const AGGREGATE_STAGE: &str = "aggregate";
+const WRITE_PK_COLUMNS_STAGE: &str = "write_pk_columns";
+const STAT_OUTPUT_STAGE: &str = "stat_output";
+const TOTAL_STAGE: &str = "total";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PkIndexBuildOutput {
@@ -215,6 +230,41 @@ pub(crate) struct PkIndexBucket {
     pub(crate) files: Vec<FileHandle>,
 }
 
+struct SstStream {
+    stream: BoxedRecordBatchStream,
+    schema: SchemaRef,
+}
+
+#[derive(Debug, Default)]
+struct PkIndexBuildCosts {
+    open_source: Duration,
+    read_source: Duration,
+    aggregate: Duration,
+    write: Duration,
+    stat_output: Duration,
+}
+
+impl PkIndexBuildCosts {
+    fn total_tracked(&self) -> Duration {
+        self.open_source + self.read_source + self.aggregate + self.write + self.stat_output
+    }
+
+    fn observe(&self, total: Duration) {
+        observe_pk_index_stage(OPEN_SOURCE_STAGE, self.open_source);
+        observe_pk_index_stage(READ_SOURCE_STAGE, self.read_source);
+        observe_pk_index_stage(AGGREGATE_STAGE, self.aggregate);
+        observe_pk_index_stage(WRITE_PK_COLUMNS_STAGE, self.write);
+        observe_pk_index_stage(STAT_OUTPUT_STAGE, self.stat_output);
+        observe_pk_index_stage(TOTAL_STAGE, total);
+    }
+}
+
+fn observe_pk_index_stage(stage: &str, cost: Duration) {
+    INDEX_CREATE_ELAPSED
+        .with_label_values(&[stage, PK_INDEX_TYPE])
+        .observe(cost.as_secs_f64());
+}
+
 #[derive(Debug, Clone)]
 struct PkStat {
     min_ts: i64,
@@ -275,6 +325,8 @@ pub(crate) async fn build_pk_index(
     index_file_id: FileId,
     max_sequence: SequenceNumber,
 ) -> Result<PkIndexBuildOutput> {
+    let build_start = Instant::now();
+    let mut costs = PkIndexBuildCosts::default();
     ensure!(
         metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
         InvalidMetaSnafu {
@@ -289,7 +341,6 @@ pub(crate) async fn build_pk_index(
         access_layer.path_type(),
     );
     let schema = pk_columns_schema(&metadata);
-    let mut rows = BTreeMap::<Vec<u8>, PkStat>::new();
     let codec = build_primary_key_codec(&metadata);
     let tag_columns = tag_columns(&metadata);
     let source_file_ids = bucket
@@ -298,27 +349,51 @@ pub(crate) async fn build_pk_index(
         .map(|file| file.meta_ref().file_id)
         .collect::<Vec<_>>();
 
-    for file in &bucket.files {
-        let Some(mut reader) = access_layer.read_sst(file.clone()).build().await? else {
-            continue;
+    let stage_start = Instant::now();
+    let mut stream = merge_sst_streams(access_layer, bucket.files).await?;
+    costs.open_source += stage_start.elapsed();
+
+    let stage_start = Instant::now();
+    let mut writer =
+        PkIndexWriter::try_new(access_layer.object_store(), &path, schema.clone()).await?;
+    costs.write += stage_start.elapsed();
+
+    let mut batch_rows = Vec::with_capacity(PK_INDEX_WRITE_BATCH_ROWS);
+    let mut current_pk: Option<Vec<u8>> = None;
+    let mut current_stat: Option<PkStat> = None;
+    let mut row_count = 0;
+    let mut source_row_count = 0;
+
+    while let Some(stream) = stream.as_mut() {
+        let stage_start = Instant::now();
+        let Some(batch) = stream.next().await else {
+            costs.read_source += stage_start.elapsed();
+            break;
         };
-        while let Some(batch) = reader.next_record_batch().await? {
+        costs.read_source += stage_start.elapsed();
+
+        let batch = batch?;
+        source_row_count += batch.num_rows() as u64;
+        if batch.num_rows() > 0 {
+            let stage_start = Instant::now();
             let pk_idx = primary_key_column_index(batch.num_columns());
             let ts_idx = time_index_column_index(batch.num_columns());
             let timestamps = timestamp_values(batch.column(ts_idx))?;
+            costs.aggregate += stage_start.elapsed();
+
             for (row, ts) in timestamps
                 .iter()
                 .copied()
                 .enumerate()
                 .take(batch.num_rows())
             {
+                let stage_start = Instant::now();
                 let pk = primary_key_value(batch.column(pk_idx), row)?;
-                if !rows.contains_key(&pk) {
-                    let sparse = decode_sparse_pk(codec.as_ref(), &pk)?;
-                    let tags = collect_tags(&sparse, &tag_columns)?;
-                    rows.insert(
-                        pk.clone(),
-                        PkStat {
+                if let Some(stat) =
+                    apply_sorted_pk_row(&mut current_pk, &mut current_stat, pk, ts, |pk, ts| {
+                        let sparse = decode_sparse_pk(codec.as_ref(), pk)?;
+                        let tags = collect_tags(&sparse, &tag_columns)?;
+                        Ok(PkStat {
                             min_ts: ts,
                             max_ts: ts,
                             row_count: 0,
@@ -329,46 +404,79 @@ pub(crate) async fn build_pk_index(
                             )?,
                             tsid: required_u64(&sparse, ReservedColumnId::tsid(), "__tsid")?,
                             tags,
-                        },
-                    );
+                        })
+                    })?
+                {
+                    costs.aggregate += stage_start.elapsed();
+                    let stage_start = Instant::now();
+                    write_or_buffer_pk_stat(
+                        &mut writer,
+                        schema.clone(),
+                        &tag_columns,
+                        &mut batch_rows,
+                        stat,
+                    )
+                    .await?;
+                    costs.write += stage_start.elapsed();
+                    row_count += 1;
+                } else {
+                    costs.aggregate += stage_start.elapsed();
                 }
-                let stat = rows.get_mut(&pk).expect("inserted above");
-                stat.min_ts = stat.min_ts.min(ts);
-                stat.max_ts = stat.max_ts.max(ts);
-                stat.row_count += 1;
             }
         }
     }
 
-    let row_count = rows.len() as u64;
-    let _timer = INDEX_CREATE_ELAPSED
-        .with_label_values(&["write_pk_columns", PK_INDEX_TYPE])
-        .start_timer();
-    let mut writer =
-        PkIndexWriter::try_new(access_layer.object_store(), &path, schema.clone()).await?;
-    let mut batch_rows = Vec::with_capacity(PK_INDEX_WRITE_BATCH_ROWS);
-    for row in rows.values() {
-        batch_rows.push(row.clone());
-        if batch_rows.len() >= PK_INDEX_WRITE_BATCH_ROWS {
-            write_pk_columns_batch(&mut writer, schema.clone(), &tag_columns, &batch_rows).await?;
-            batch_rows.clear();
-        }
+    if let Some(stat) = current_stat.take() {
+        let stage_start = Instant::now();
+        write_or_buffer_pk_stat(
+            &mut writer,
+            schema.clone(),
+            &tag_columns,
+            &mut batch_rows,
+            stat,
+        )
+        .await?;
+        costs.write += stage_start.elapsed();
+        row_count += 1;
     }
+    let stage_start = Instant::now();
     write_pk_columns_batch(&mut writer, schema, &tag_columns, &batch_rows).await?;
     writer.close().await?;
+    costs.write += stage_start.elapsed();
 
+    let stage_start = Instant::now();
     let file_size = access_layer
         .object_store()
         .stat(&path)
         .await
         .context(OpenDalSnafu)?
         .content_length();
+    costs.stat_output += stage_start.elapsed();
+    let total_cost = build_start.elapsed();
+
+    costs.observe(total_cost);
+    PK_INDEX_SOURCE_ROWS_TOTAL.inc_by(source_row_count);
     INDEX_CREATE_ROWS_TOTAL
         .with_label_values(&[PK_INDEX_TYPE])
         .inc_by(row_count);
     INDEX_CREATE_BYTES_TOTAL
         .with_label_values(&[PK_INDEX_TYPE])
         .inc_by(file_size);
+    common_telemetry::info!(
+        "Built primary-key aggregate index file, region: {}, index_file_id: {}, source_rows: {}, output_rows: {}, file_size: {}, open_source_cost: {:?}, read_source_cost: {:?}, aggregate_cost: {:?}, write_cost: {:?}, stat_output_cost: {:?}, tracked_cost: {:?}, total_cost: {:?}",
+        metadata.region_id,
+        index_file_id,
+        source_row_count,
+        row_count,
+        file_size,
+        costs.open_source,
+        costs.read_source,
+        costs.aggregate,
+        costs.write,
+        costs.stat_output,
+        costs.total_tracked(),
+        total_cost,
+    );
 
     Ok(PkIndexBuildOutput {
         path,
@@ -381,6 +489,159 @@ pub(crate) async fn build_pk_index(
             row_count,
         },
     })
+}
+
+async fn merge_sst_streams(
+    access_layer: &AccessLayerRef,
+    files: Vec<FileHandle>,
+) -> Result<Option<BoxedRecordBatchStream>> {
+    let mut streams = Vec::with_capacity(files.len());
+    let mut schema = None;
+    for file in files {
+        let Some(sst_stream) = open_sst_stream(access_layer, file).await? else {
+            continue;
+        };
+        if let Some(expected) = &schema {
+            validate_same_schema(expected, &sst_stream.schema)?;
+        } else {
+            schema = Some(sst_stream.schema.clone());
+        }
+        streams.push(sst_stream.stream);
+    }
+
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    if streams.len() == 1 {
+        return Ok(streams.pop());
+    }
+
+    let reader = FlatMergeReader::new(schema, streams, DEFAULT_READ_BATCH_SIZE, None).await?;
+    Ok(Some(Box::pin(reader.into_stream())))
+}
+
+async fn open_sst_stream(
+    access_layer: &AccessLayerRef,
+    file: FileHandle,
+) -> Result<Option<SstStream>> {
+    let file_path = file.file_path(access_layer.table_dir(), access_layer.path_type());
+    let Some(mut reader) = access_layer
+        .read_sst(file)
+        .projection(Some(ReadColumns::from_deduped_column_ids(
+            std::iter::empty(),
+        )))
+        .build()
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    let metadata = reader.metadata().clone();
+    validate_sparse_flat_metadata(&metadata)?;
+    reject_legacy_format(
+        &metadata,
+        reader
+            .parquet_metadata()
+            .file_metadata()
+            .schema_descr()
+            .num_columns(),
+        &file_path,
+    )?;
+
+    let Some(first) = reader.next_record_batch().await? else {
+        return Ok(None);
+    };
+    let schema = first.schema();
+    let stream = Box::pin(stream::try_unfold(
+        (Some(first), reader),
+        |(pending, mut reader)| async move {
+            if let Some(batch) = pending {
+                return Ok(Some((batch, (None, reader))));
+            }
+            let batch = reader.next_record_batch().await?;
+            Ok(batch.map(|batch| (batch, (None, reader))))
+        },
+    ));
+
+    Ok(Some(SstStream { stream, schema }))
+}
+
+fn validate_sparse_flat_metadata(metadata: &RegionMetadataRef) -> Result<()> {
+    ensure!(
+        metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
+        InvalidMetaSnafu {
+            reason: "primary-key aggregate index only supports sparse primary-key encoding"
+        }
+    );
+    Ok(())
+}
+
+fn reject_legacy_format(
+    metadata: &RegionMetadataRef,
+    num_columns: usize,
+    file_path: &str,
+) -> Result<()> {
+    let legacy = FlatReadFormat::is_legacy_format(metadata, num_columns, file_path)?;
+    ensure!(
+        !legacy,
+        InvalidMetaSnafu {
+            reason: format!("legacy primary-key SST format is not supported: {file_path}")
+        }
+    );
+    Ok(())
+}
+
+fn validate_same_schema(expected: &SchemaRef, actual: &SchemaRef) -> Result<()> {
+    ensure!(
+        expected.as_ref() == actual.as_ref(),
+        InvalidMetaSnafu {
+            reason: "mixed sparse-flat SST schemas are not supported"
+        }
+    );
+    Ok(())
+}
+
+async fn write_or_buffer_pk_stat(
+    writer: &mut PkIndexWriter,
+    schema: SchemaRef,
+    tag_columns: &[(ColumnId, String)],
+    batch_rows: &mut Vec<PkStat>,
+    row: PkStat,
+) -> Result<()> {
+    batch_rows.push(row);
+    if batch_rows.len() >= PK_INDEX_WRITE_BATCH_ROWS {
+        write_pk_columns_batch(writer, schema, tag_columns, batch_rows).await?;
+        batch_rows.clear();
+    }
+    Ok(())
+}
+
+fn apply_sorted_pk_row(
+    current_pk: &mut Option<Vec<u8>>,
+    current_stat: &mut Option<PkStat>,
+    pk: Vec<u8>,
+    timestamp: i64,
+    build_stat: impl FnOnce(&[u8], i64) -> Result<PkStat>,
+) -> Result<Option<PkStat>> {
+    let completed = if current_pk.as_deref() == Some(pk.as_slice()) {
+        None
+    } else {
+        let completed = current_stat.take();
+        *current_pk = Some(pk);
+        let pk = current_pk
+            .as_deref()
+            .expect("current primary key initialized above");
+        *current_stat = Some(build_stat(pk, timestamp)?);
+        completed
+    };
+
+    let stat = current_stat
+        .as_mut()
+        .expect("current primary-key stat initialized above");
+    stat.min_ts = stat.min_ts.min(timestamp);
+    stat.max_ts = stat.max_ts.max(timestamp);
+    stat.row_count += 1;
+    Ok(completed)
 }
 
 pub(crate) async fn delete_pk_index_file(
@@ -675,5 +936,53 @@ mod tests {
                 Timestamp::new_millisecond(WINDOW_MILLIS - 1)
             )
         );
+    }
+
+    #[test]
+    fn test_apply_sorted_pk_row_merges_consecutive_primary_keys() {
+        let mut current_pk = None;
+        let mut current_stat = None;
+        let mut completed = Vec::new();
+
+        for (pk, timestamp) in [
+            (b"pk-1".to_vec(), 100),
+            (b"pk-1".to_vec(), 90),
+            (b"pk-2".to_vec(), 120),
+            (b"pk-2".to_vec(), 130),
+            (b"pk-3".to_vec(), 110),
+        ] {
+            if let Some(stat) = apply_sorted_pk_row(
+                &mut current_pk,
+                &mut current_stat,
+                pk,
+                timestamp,
+                |_pk, timestamp| {
+                    Ok(PkStat {
+                        min_ts: timestamp,
+                        max_ts: timestamp,
+                        row_count: 0,
+                        table_id: 1,
+                        tsid: 1,
+                        tags: BTreeMap::new(),
+                    })
+                },
+            )
+            .unwrap()
+            {
+                completed.push(stat);
+            }
+        }
+        completed.push(current_stat.take().unwrap());
+
+        assert_eq!(completed.len(), 3);
+        assert_eq!(completed[0].min_ts, 90);
+        assert_eq!(completed[0].max_ts, 100);
+        assert_eq!(completed[0].row_count, 2);
+        assert_eq!(completed[1].min_ts, 120);
+        assert_eq!(completed[1].max_ts, 130);
+        assert_eq!(completed[1].row_count, 2);
+        assert_eq!(completed[2].min_ts, 110);
+        assert_eq!(completed[2].max_ts, 110);
+        assert_eq!(completed[2].row_count, 1);
     }
 }
