@@ -94,6 +94,7 @@ use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_pla
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
+use crate::sst::pk_index::PkIndexTsidSet;
 use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
 const INDEX_TYPE_FULLTEXT: &str = "fulltext";
@@ -187,6 +188,10 @@ pub struct ParquetReaderBuilder {
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
     defer_optional_page_index: bool,
+    /// Matching tsid set from the primary-key aggregate index, set only when this
+    /// file is covered by an index. When present, the tag prefilter is replaced by
+    /// a tsid-membership filter.
+    pk_index_tsid_set: Option<PkIndexTsidSet>,
 }
 
 impl ParquetReaderBuilder {
@@ -218,7 +223,20 @@ impl ParquetReaderBuilder {
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
+            pk_index_tsid_set: None,
         }
+    }
+
+    /// Attaches the matching tsid set from the primary-key aggregate index.
+    ///
+    /// Only set this when the file is covered by the index.
+    #[must_use]
+    pub(crate) fn pk_index_tsid_set(
+        mut self,
+        pk_index_tsid_set: Option<PkIndexTsidSet>,
+    ) -> ParquetReaderBuilder {
+        self.pk_index_tsid_set = pk_index_tsid_set;
+        self
     }
 
     /// Attaches the predicate to the builder.
@@ -488,6 +506,7 @@ impl ParquetReaderBuilder {
             self.pre_filter_mode,
             &read_format,
             &codec,
+            self.pk_index_tsid_set.as_ref(),
         );
 
         if self.defer_optional_page_index

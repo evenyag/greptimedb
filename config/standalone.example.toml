@@ -682,6 +682,9 @@ schedule_compaction_after_edit = true
 ## Whether to enable flat format as the default SST format.
 default_flat_format = true
 
+## Whether the scanner may use the primary-key aggregate index to resolve the matching tsid set from tag filters.
+enable_pk_index_scan = false
+
 ## The options for index in Mito engine.
 [region_engine.mito.index]
 

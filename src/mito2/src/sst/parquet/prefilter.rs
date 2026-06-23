@@ -51,6 +51,7 @@ use crate::sst::parquet::reader::{
     MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
 };
+use crate::sst::pk_index::PkIndexTsidSet;
 
 pub(crate) fn matching_row_ranges_by_primary_key(
     input: &RecordBatch,
@@ -351,6 +352,7 @@ pub(crate) fn build_reader_filter_plan(
     pre_filter_mode: PreFilterMode,
     read_format: &FlatReadFormat,
     codec: &Arc<dyn PrimaryKeyCodec>,
+    pk_index_tsid_set: Option<&PkIndexTsidSet>,
 ) -> ReaderFilterPlan {
     let Some(predicate) = predicate else {
         return ReaderFilterPlan {
@@ -457,6 +459,7 @@ pub(crate) fn build_reader_filter_plan(
         prefilter_simple_filters.clone(),
         prefilter_physical_filters,
         schema_version,
+        pk_index_tsid_set.cloned(),
     );
 
     if prefilter_builder.is_some() {
@@ -507,6 +510,10 @@ pub(crate) struct PrefilterContextBuilder {
     metadata: RegionMetadataRef,
     schema_version: u64,
     arrow_schema: SchemaRef,
+    /// When set (file covered by the primary-key aggregate index), the PK group
+    /// filter is a tsid-membership filter instead of decoding and evaluating tag
+    /// predicates. The resulting row mask is identical for covered files.
+    pk_index_tsid_set: Option<PkIndexTsidSet>,
 }
 
 impl PrefilterContextBuilder {
@@ -516,6 +523,7 @@ impl PrefilterContextBuilder {
     /// - The read format doesn't use flat layout
     /// - No prefilter columns are selected
     /// - Prefilter would read the full projection without any PK filter
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         read_format: &FlatReadFormat,
         codec: &Arc<dyn PrimaryKeyCodec>,
@@ -524,6 +532,7 @@ impl PrefilterContextBuilder {
         filters: Vec<SimpleFilterContext>,
         physical_filters: Vec<PhysicalFilterContext>,
         schema_version: u64,
+        pk_index_tsid_set: Option<PkIndexTsidSet>,
     ) -> Option<Self> {
         let metadata = read_format.metadata();
         let use_raw_tag_columns = read_format.batch_has_raw_pk_columns();
@@ -570,6 +579,9 @@ impl PrefilterContextBuilder {
             return None;
         }
 
+        // Only keep the tsid set when there is a PK filter group to replace.
+        let pk_index_tsid_set = pk_filters.is_some().then_some(pk_index_tsid_set).flatten();
+
         Some(Self {
             pk_filters,
             pk_filter_expr_strs,
@@ -579,15 +591,21 @@ impl PrefilterContextBuilder {
             metadata: metadata.clone(),
             schema_version,
             arrow_schema: read_format.arrow_schema().clone(),
+            pk_index_tsid_set,
         })
     }
 
     /// Builds a [PrefilterContext] for a specific row group.
     pub(crate) fn build(&self) -> PrefilterContext {
         let pk_filter = self.pk_filters.as_ref().map(|pk_filters| {
-            let pk_filter = self
-                .codec
-                .primary_key_filter(&self.metadata, Arc::clone(pk_filters));
+            // For a covered file, the tsid-membership filter yields the same row
+            // mask as decoding tags, but avoids the per-pk tag decode.
+            let pk_filter = match &self.pk_index_tsid_set {
+                Some(tsid_set) => tsid_set.make_filter(&self.metadata),
+                None => self
+                    .codec
+                    .primary_key_filter(&self.metadata, Arc::clone(pk_filters)),
+            };
             Box::new(CachedPrimaryKeyFilter::new(pk_filter)) as Box<dyn PrimaryKeyFilter>
         });
         PrefilterContext {
@@ -1419,6 +1437,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             metadata.schema_version,
+            None,
         );
         assert!(builder.is_none());
     }
@@ -1523,6 +1542,7 @@ mod tests {
             PreFilterMode::SkipFields,
             &full_read_format,
             &codec,
+            None,
         );
         assert!(skip_fields_plan.prefilter_builder.is_some());
         assert_eq!(
@@ -1546,6 +1566,7 @@ mod tests {
             PreFilterMode::All,
             &projected_read_format,
             &codec,
+            None,
         );
         assert!(pk_prefilter_plan.prefilter_builder.is_some());
         assert!(pk_prefilter_plan.remaining_simple_filters.is_empty());
@@ -1576,6 +1597,7 @@ mod tests {
             PreFilterMode::All,
             &read_format,
             &codec,
+            None,
         );
         let plan_b_a = build_reader_filter_plan(
             Some(&Predicate::new(vec![expr_b, expr_a])),
@@ -1583,6 +1605,7 @@ mod tests {
             PreFilterMode::All,
             &read_format,
             &codec,
+            None,
         );
 
         let exprs_ab = plan_ab.prefilter_builder.unwrap().pk_filter_expr_strs;

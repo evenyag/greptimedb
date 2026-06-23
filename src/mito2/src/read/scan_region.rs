@@ -86,6 +86,8 @@ use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBui
 use crate::sst::index::vector_index::applier::{VectorIndexApplier, VectorIndexApplierRef};
 use crate::sst::parquet::file_range::PreFilterMode;
 use crate::sst::parquet::reader::ReaderMetrics;
+use crate::sst::pk_index;
+use crate::sst::pk_index::{PkIndexTsidSet, build_pk_index_tsid_set};
 
 #[cfg(feature = "vector_index")]
 const VECTOR_INDEX_OVERFETCH_MULTIPLIER: usize = 2;
@@ -246,6 +248,9 @@ pub(crate) struct ScanRegion {
     ignore_fulltext_index: bool,
     /// Whether to ignore bloom filter.
     ignore_bloom_filter: bool,
+    /// Whether the scanner may use the primary-key aggregate index to resolve
+    /// the matching tsid set from tag filters.
+    enable_pk_index_scan: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
     /// Whether to filter out the deleted rows.
@@ -272,6 +277,7 @@ impl ScanRegion {
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
+            enable_pk_index_scan: false,
             start_time: None,
             filter_deleted: true,
             #[cfg(feature = "enterprise")]
@@ -307,6 +313,13 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_ignore_bloom_filter(mut self, ignore: bool) -> Self {
         self.ignore_bloom_filter = ignore;
+        self
+    }
+
+    /// Sets whether the scanner may use the primary-key aggregate index.
+    #[must_use]
+    pub(crate) fn with_enable_pk_index_scan(mut self, enable: bool) -> Self {
+        self.enable_pk_index_scan = enable;
         self
     }
 
@@ -408,6 +421,23 @@ impl ScanRegion {
         let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
+
+        // Resolve the matching tsid set from the primary-key aggregate index so
+        // covered SST files can skip per-file tag decoding (see `build_pk_index_tsid_set`).
+        let pk_index_tsid_set = if self.enable_pk_index_scan {
+            let tag_filters =
+                pk_index::tag_filter_exprs(&self.version.metadata, &self.request.filters);
+            build_pk_index_tsid_set(
+                &self.access_layer,
+                &self.version.metadata,
+                &self.version.pk_indexes,
+                &tag_filters,
+                &time_range,
+            )
+            .await?
+        } else {
+            None
+        };
 
         let mut read_cols = match &self.request.projection_input {
             Some(p) => {
@@ -584,6 +614,7 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
+            .with_pk_index_tsid_set(pk_index_tsid_set)
             .with_explain_flat_format(
                 self.version.options.sst_format == Some(crate::sst::FormatType::Flat),
             )
@@ -831,6 +862,9 @@ pub struct ScanInput {
     pub(crate) distribution: Option<TimeSeriesDistribution>,
     /// Whether the region's configured SST format is flat.
     explain_flat_format: bool,
+    /// Matching tsid set resolved from the primary-key aggregate index, used to
+    /// replace the per-file tag prefilter for covered SST files.
+    pub(crate) pk_index_tsid_set: Option<PkIndexTsidSet>,
     /// Snapshot upper bound bound at scan open and propagated back to the caller.
     pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
@@ -869,11 +903,22 @@ impl ScanInput {
             series_row_selector: None,
             distribution: None,
             explain_flat_format: false,
+            pk_index_tsid_set: None,
             snapshot_sequence: None,
             compaction: false,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
         }
+    }
+
+    /// Sets the matching tsid set resolved from the primary-key aggregate index.
+    #[must_use]
+    pub(crate) fn with_pk_index_tsid_set(
+        mut self,
+        pk_index_tsid_set: Option<PkIndexTsidSet>,
+    ) -> Self {
+        self.pk_index_tsid_set = pk_index_tsid_set;
+        self
     }
 
     /// Sets time range filter for time index.
@@ -1135,6 +1180,13 @@ impl ScanInput {
                 .read_columns()
                 .column_ids_iter()
                 .any(|column_id| self.mapper.metadata().primary_key.contains(&column_id));
+        // Only covered files can use the tsid set as an exact substitute for the
+        // tag prefilter.
+        let pk_index_tsid_set = self
+            .pk_index_tsid_set
+            .as_ref()
+            .filter(|set| set.covers(file.meta_ref().file_id))
+            .cloned();
         let reader = self
             .access_layer
             .read_sst(file.clone())
@@ -1143,7 +1195,8 @@ impl ScanInput {
             .cache(self.cache_strategy.clone())
             .inverted_index_appliers(self.inverted_index_appliers.clone())
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
-            .fulltext_index_appliers(self.fulltext_index_appliers.clone());
+            .fulltext_index_appliers(self.fulltext_index_appliers.clone())
+            .pk_index_tsid_set(pk_index_tsid_set);
         let reader = if !self.compaction && may_build_selective_row_selection {
             reader.deferred_optional_page_index()
         } else {

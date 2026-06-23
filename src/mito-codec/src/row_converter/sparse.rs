@@ -438,6 +438,34 @@ impl SparsePrimaryKeyCodec {
         None
     }
 
+    /// Reads the reserved `table_id` and `tsid` from the fixed prefix of a
+    /// sparse primary key without decoding tag columns.
+    ///
+    /// The pk must start with the table_id + tsid prefix written by
+    /// [`Self::encode_internal`].
+    pub fn read_table_id_tsid(&self, pk: &[u8]) -> Result<(u32, u64)> {
+        let table_id =
+            match self.decode_value_at(pk, TABLE_ID_VALUE_OFFSET, RESERVED_COLUMN_ID_TABLE_ID)? {
+                Value::UInt32(v) => v,
+                other => {
+                    return UnsupportedOperationSnafu {
+                        err_msg: format!("expected uint32 table_id, got {other:?}"),
+                    }
+                    .fail();
+                }
+            };
+        let tsid = match self.decode_value_at(pk, TSID_VALUE_OFFSET, RESERVED_COLUMN_ID_TSID)? {
+            Value::UInt64(v) => v,
+            other => {
+                return UnsupportedOperationSnafu {
+                    err_msg: format!("expected uint64 tsid, got {other:?}"),
+                }
+                .fail();
+            }
+        };
+        Ok((table_id, tsid))
+    }
+
     /// Decode value at `offset` in `pk`.
     pub fn decode_value_at(&self, pk: &[u8], offset: usize, column_id: ColumnId) -> Result<Value> {
         let mut deserializer = Deserializer::new(pk);

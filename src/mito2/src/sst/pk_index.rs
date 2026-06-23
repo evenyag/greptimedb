@@ -4,11 +4,15 @@
 
 //! Primary-key aggregate index builder.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common_recordbatch::filter::SimpleFilterEvaluator;
+use common_time::range::TimestampRange;
 use common_time::timestamp::{TimeUnit, Timestamp};
+use datafusion_expr::Expr;
+use datafusion_expr::utils::expr_to_columns;
 use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, DictionaryArray, Int64Array, StringArray, UInt32Array,
     UInt64Array,
@@ -18,10 +22,12 @@ use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::value::Value;
 use futures::{StreamExt, stream};
 use mito_codec::row_converter::{
-    CompositeValues, PrimaryKeyCodec, SparseValues, build_primary_key_codec,
+    CompositeValues, PrimaryKeyCodec, PrimaryKeyFilter, SparsePrimaryKeyCodec, SparseValues,
+    build_primary_key_codec,
 };
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
@@ -33,14 +39,15 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 use crate::access_layer::AccessLayerRef;
 use crate::error::{
-    InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, OpenDalSnafu, Result,
-    WriteParquetSnafu,
+    InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, OpenDalSnafu, ReadParquetSnafu,
+    RecordBatchSnafu, Result, WriteParquetSnafu,
 };
 use crate::manifest::action::{
     AggregatePkIndexMeta, RegionEdit, RegionMetaAction, RegionMetaActionList,
 };
 use crate::metrics::{
     INDEX_CREATE_BYTES_TOTAL, INDEX_CREATE_ELAPSED, INDEX_CREATE_ROWS_TOTAL,
+    PK_INDEX_SCAN_BUILD_ELAPSED, PK_INDEX_SCAN_TOTAL, PK_INDEX_SCAN_TSIDS_TOTAL,
     PK_INDEX_SOURCE_ROWS_TOTAL, PK_INDEX_TASK_TOTAL,
 };
 use crate::read::BoxedRecordBatchStream;
@@ -879,6 +886,236 @@ impl PkIndexWriter {
     }
 }
 
+/// Set of `(table_id, tsid)` series that match a query's tag filters, resolved
+/// from the primary-key aggregate index files, together with the data SST files
+/// those index files cover.
+///
+/// Built by [`build_pk_index_tsid_set`]. For a covered SST file the membership
+/// test is an exact substitute for evaluating the tag predicates on that file,
+/// because the index was aggregated from the same data.
+#[derive(Debug, Clone)]
+pub(crate) struct PkIndexTsidSet {
+    tsids: Arc<HashSet<(u32, u64)>>,
+    covered_files: HashSet<FileId>,
+}
+
+impl PkIndexTsidSet {
+    /// Returns true if `file_id` is covered by one of the used index files.
+    pub(crate) fn covers(&self, file_id: FileId) -> bool {
+        self.covered_files.contains(&file_id)
+    }
+
+    /// Builds a [`PrimaryKeyFilter`] that keeps rows whose encoded primary key
+    /// resolves to a `(table_id, tsid)` in this set.
+    pub(crate) fn make_filter(&self, metadata: &RegionMetadataRef) -> Box<dyn PrimaryKeyFilter> {
+        Box::new(PkIndexTsidFilter {
+            codec: SparsePrimaryKeyCodec::new(metadata),
+            tsids: self.tsids.clone(),
+        })
+    }
+}
+
+/// A [`PrimaryKeyFilter`] backed by a tsid allow-set resolved from the pk index.
+struct PkIndexTsidFilter {
+    codec: SparsePrimaryKeyCodec,
+    tsids: Arc<HashSet<(u32, u64)>>,
+}
+
+impl PrimaryKeyFilter for PkIndexTsidFilter {
+    fn matches(&mut self, pk: &[u8]) -> mito_codec::error::Result<bool> {
+        let (table_id, tsid) = self.codec.read_table_id_tsid(pk)?;
+        Ok(self.tsids.contains(&(table_id, tsid)))
+    }
+}
+
+/// Resolves the matching tsid set by applying `tag_filters` to the primary-key
+/// aggregate index files that intersect `time_range`.
+///
+/// Returns `Ok(None)` (the scan then falls back to the normal tag prefilter) when:
+/// - the region does not use sparse primary-key encoding,
+/// - there are no tag filters,
+/// - any tag filter cannot be lowered to a [`SimpleFilterEvaluator`] or references
+///   a column that is not a tag column in the index (so the set could not be exact),
+/// - or no index file covers the scan time range.
+pub(crate) async fn build_pk_index_tsid_set(
+    access_layer: &AccessLayerRef,
+    metadata: &RegionMetadataRef,
+    pk_indexes: &HashMap<FileId, AggregatePkIndexMeta>,
+    tag_filters: &[Expr],
+    time_range: &TimestampRange,
+) -> Result<Option<PkIndexTsidSet>> {
+    if metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse
+        || tag_filters.is_empty()
+        || pk_indexes.is_empty()
+    {
+        PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
+        return Ok(None);
+    }
+
+    let start = Instant::now();
+
+    // Lower every tag filter to a SimpleFilterEvaluator. If any tag filter cannot
+    // be lowered, the tsid set would not be exact, so bail out to the normal path.
+    let tag_cols: HashSet<String> = tag_columns(metadata)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    let mut evaluators = Vec::with_capacity(tag_filters.len());
+    for expr in tag_filters {
+        let Some(evaluator) = SimpleFilterEvaluator::try_new(expr) else {
+            PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
+            return Ok(None);
+        };
+        // Only tag columns exist in the index file; a predicate on any other
+        // column cannot be enforced here.
+        if !tag_cols.contains(evaluator.column_name()) {
+            PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
+            return Ok(None);
+        }
+        evaluators.push(evaluator);
+    }
+
+    let metas: Vec<&AggregatePkIndexMeta> = pk_indexes
+        .values()
+        .filter(|meta| index_intersects_range(meta, time_range))
+        .collect();
+    if metas.is_empty() {
+        PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
+        return Ok(None);
+    }
+
+    let mut tsids = HashSet::new();
+    let mut covered_files = HashSet::new();
+    for meta in metas {
+        read_pk_index_file(access_layer, metadata, meta, &evaluators, &mut tsids).await?;
+        covered_files.extend(meta.source_file_ids.iter().copied());
+    }
+
+    PK_INDEX_SCAN_TOTAL.with_label_values(&["applied"]).inc();
+    PK_INDEX_SCAN_TSIDS_TOTAL.inc_by(tsids.len() as u64);
+    PK_INDEX_SCAN_BUILD_ELAPSED.observe(start.elapsed().as_secs_f64());
+
+    Ok(Some(PkIndexTsidSet {
+        tsids: Arc::new(tsids),
+        covered_files,
+    }))
+}
+
+fn index_intersects_range(meta: &AggregatePkIndexMeta, time_range: &TimestampRange) -> bool {
+    let (min, max) = meta.time_range;
+    TimestampRange::new_inclusive(Some(min), Some(max)).intersects(time_range)
+}
+
+async fn read_pk_index_file(
+    access_layer: &AccessLayerRef,
+    metadata: &RegionMetadataRef,
+    meta: &AggregatePkIndexMeta,
+    evaluators: &[SimpleFilterEvaluator],
+    tsids: &mut HashSet<(u32, u64)>,
+) -> Result<()> {
+    let path = pk_index_file_path(
+        access_layer.table_dir(),
+        metadata.region_id,
+        meta.index_file_id,
+        access_layer.path_type(),
+    );
+    let bytes = access_layer
+        .object_store()
+        .read(&path)
+        .await
+        .context(OpenDalSnafu)?
+        .to_bytes();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .and_then(|builder| builder.build())
+        .context(ReadParquetSnafu { path })?;
+    for batch in reader {
+        let batch = batch.context(NewRecordBatchSnafu)?;
+        collect_matching_tsids(&batch, evaluators, tsids)?;
+    }
+    Ok(())
+}
+
+fn collect_matching_tsids(
+    batch: &RecordBatch,
+    evaluators: &[SimpleFilterEvaluator],
+    tsids: &mut HashSet<(u32, u64)>,
+) -> Result<()> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(());
+    }
+
+    let mut mask = datatypes::arrow::buffer::BooleanBuffer::new_set(num_rows);
+    for evaluator in evaluators {
+        let column = pk_index_column(batch, evaluator.column_name())?;
+        let evaluated = evaluator.evaluate_array(column).context(RecordBatchSnafu)?;
+        mask = &mask & &evaluated;
+    }
+
+    let table_ids = pk_index_column(batch, TABLE_ID_COL)?
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .context(InvalidRecordBatchSnafu {
+            reason: "pk index __table_id is not UInt32Array",
+        })?;
+    let series_ids = pk_index_column(batch, TSID_COL)?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .context(InvalidRecordBatchSnafu {
+            reason: "pk index __tsid is not UInt64Array",
+        })?;
+
+    for (row, matched) in mask.iter().enumerate() {
+        if matched {
+            tsids.insert((table_ids.value(row), series_ids.value(row)));
+        }
+    }
+    Ok(())
+}
+
+fn pk_index_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef> {
+    let index = batch
+        .schema()
+        .index_of(name)
+        .ok()
+        .context(InvalidRecordBatchSnafu {
+            reason: format!("pk index file is missing column {name}"),
+        })?;
+    Ok(batch.column(index))
+}
+
+/// Collects the tag predicates from `filters` that reference at least one tag
+/// (primary-key) column of `metadata`.
+///
+/// A predicate touching a field/timestamp column in addition to a tag column is
+/// still returned here; [`build_pk_index_tsid_set`] then rejects it because it
+/// cannot be lowered to a tag-only [`SimpleFilterEvaluator`].
+pub(crate) fn tag_filter_exprs(metadata: &RegionMetadataRef, filters: &[Expr]) -> Vec<Expr> {
+    let tag_cols: HashSet<&str> = metadata
+        .primary_key_columns()
+        .filter(|col| {
+            col.column_id != ReservedColumnId::table_id()
+                && col.column_id != ReservedColumnId::tsid()
+        })
+        .map(|col| col.column_schema.name.as_str())
+        .collect();
+
+    let mut columns = HashSet::new();
+    filters
+        .iter()
+        .filter(|expr| {
+            columns.clear();
+            if expr_to_columns(expr, &mut columns).is_err() {
+                return false;
+            }
+            columns
+                .iter()
+                .any(|column| tag_cols.contains(column.name.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -995,5 +1232,209 @@ mod tests {
         assert_eq!(completed[2].min_ts, 110);
         assert_eq!(completed[2].max_ts, 110);
         assert_eq!(completed[2].row_count, 1);
+    }
+
+    #[test]
+    fn test_collect_matching_tsids_applies_tag_filters() {
+        use datafusion_expr::{col, lit};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TABLE_ID_COL, DataType::UInt32, false),
+            Field::new(TSID_COL, DataType::UInt64, false),
+            Field::new("host", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![1, 1, 2])),
+                Arc::new(UInt64Array::from(vec![10_u64, 11, 12])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")])),
+            ],
+        )
+        .unwrap();
+
+        let evaluator = SimpleFilterEvaluator::try_new(&col("host").eq(lit("a"))).unwrap();
+        let mut tsids = HashSet::new();
+        collect_matching_tsids(&batch, &[evaluator], &mut tsids).unwrap();
+
+        assert_eq!(tsids, HashSet::from([(1, 10), (2, 12)]));
+    }
+
+    #[test]
+    fn test_pk_index_tsid_filter_matches_table_id_and_tsid() {
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let codec = SparsePrimaryKeyCodec::new(&metadata);
+
+        let encode = |table_id: u32, tsid: u64| {
+            let mut pk = Vec::new();
+            codec.encode_internal(table_id, tsid, &mut pk).unwrap();
+            pk
+        };
+
+        let set = PkIndexTsidSet {
+            tsids: Arc::new(HashSet::from([(7, 42)])),
+            covered_files: HashSet::new(),
+        };
+        let mut filter = set.make_filter(&metadata);
+
+        assert!(filter.matches(&encode(7, 42)).unwrap());
+        // Same table, different tsid.
+        assert!(!filter.matches(&encode(7, 43)).unwrap());
+        // Same tsid, different table.
+        assert!(!filter.matches(&encode(8, 42)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_build_pk_index_tsid_set_reads_and_filters() {
+        use common_test_util::temp_dir::create_temp_dir;
+        use datafusion_expr::{col, lit};
+        use object_store::services::Fs;
+        use store_api::region_request::PathType;
+
+        use crate::access_layer::AccessLayer;
+        use crate::sst::index::intermediate::IntermediateManager;
+        use crate::sst::index::puffin_manager::PuffinManagerFactory;
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let dir = create_temp_dir("pk-index-scan");
+        let dir_path = dir.path().display().to_string();
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let object_store = ObjectStore::new(Fs::default().root(&dir_path))
+            .unwrap()
+            .finish();
+
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let table_dir = "test_table";
+        let access_layer: AccessLayerRef = Arc::new(AccessLayer::new(
+            table_dir,
+            PathType::Bare,
+            object_store,
+            puffin_mgr,
+            intm_mgr,
+        ));
+
+        // Write a `.pk` index file with three series under one source SST.
+        let index_file_id = FileId::random();
+        let source_file_id = FileId::random();
+        let path = pk_index_file_path(
+            access_layer.table_dir(),
+            metadata.region_id,
+            index_file_id,
+            access_layer.path_type(),
+        );
+        let schema = pk_columns_schema(&metadata);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64, 0, 0])),
+                Arc::new(Int64Array::from(vec![100_i64, 100, 100])),
+                Arc::new(UInt64Array::from(vec![1_u64, 1, 1])),
+                Arc::new(UInt32Array::from(vec![1_u32, 1, 1])),
+                Arc::new(UInt64Array::from(vec![100_u64, 101, 102])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("x"), Some("y")])),
+            ],
+        )
+        .unwrap();
+        let mut writer = PkIndexWriter::try_new(access_layer.object_store(), &path, schema)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let mut pk_indexes = HashMap::new();
+        pk_indexes.insert(
+            index_file_id,
+            AggregatePkIndexMeta {
+                index_file_id,
+                time_range: (
+                    Timestamp::new_millisecond(0),
+                    Timestamp::new_millisecond(1000),
+                ),
+                max_sequence: 10,
+                source_file_ids: vec![source_file_id],
+                file_size: 0,
+                row_count: 3,
+            },
+        );
+
+        let tag_filters = vec![col("tag_0").eq(lit("a"))];
+        let time_range = TimestampRange::new_inclusive(
+            Some(Timestamp::new_millisecond(0)),
+            Some(Timestamp::new_millisecond(1000)),
+        );
+        let set = build_pk_index_tsid_set(
+            &access_layer,
+            &metadata,
+            &pk_indexes,
+            &tag_filters,
+            &time_range,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(set.tsids.as_ref(), &HashSet::from([(1, 100), (1, 102)]));
+        assert!(set.covers(source_file_id));
+        assert!(!set.covers(FileId::random()));
+
+        // A filter touching the time index cannot be enforced on the index file.
+        let non_intersecting = TimestampRange::new_inclusive(
+            Some(Timestamp::new_millisecond(2000)),
+            Some(Timestamp::new_millisecond(3000)),
+        );
+        let none = build_pk_index_tsid_set(
+            &access_layer,
+            &metadata,
+            &pk_indexes,
+            &tag_filters,
+            &non_intersecting,
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_tag_filter_exprs_keeps_only_tag_touching_filters() {
+        use datafusion_expr::{col, lit};
+
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let tag_name = metadata
+            .primary_key_columns()
+            .find(|col| {
+                col.column_id != ReservedColumnId::table_id()
+                    && col.column_id != ReservedColumnId::tsid()
+            })
+            .map(|col| col.column_schema.name.clone())
+            .unwrap();
+        let field_name = metadata
+            .field_columns()
+            .next()
+            .map(|col| col.column_schema.name.clone())
+            .unwrap();
+
+        let tag_expr = col(&tag_name).eq(lit("a"));
+        let field_expr = col(&field_name).gt(lit(1_u64));
+        let filters = vec![tag_expr.clone(), field_expr];
+
+        let kept = tag_filter_exprs(&metadata, &filters);
+        assert_eq!(kept, vec![tag_expr]);
     }
 }

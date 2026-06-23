@@ -1080,6 +1080,7 @@ impl EngineInner {
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
+        .with_enable_pk_index_scan(self.config.enable_pk_index_scan)
         .with_start_time(query_start);
 
         #[cfg(feature = "enterprise")]

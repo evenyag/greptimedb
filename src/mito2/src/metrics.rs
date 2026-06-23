@@ -378,6 +378,26 @@ lazy_static! {
         "primary-key aggregate index source rows total",
     )
     .unwrap();
+    /// Counter of primary-key aggregate index scan usage, labeled by `result`
+    /// (`applied` when a covering tsid set was built, `skipped` otherwise).
+    pub static ref PK_INDEX_SCAN_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_pk_index_scan_total",
+        "primary-key aggregate index scan usage total",
+        &["result"],
+    )
+    .unwrap();
+    /// Counter of tsids selected from the primary-key aggregate index at scan time.
+    pub static ref PK_INDEX_SCAN_TSIDS_TOTAL: IntCounter = register_int_counter!(
+        "greptime_pk_index_scan_tsids_total",
+        "tsids selected from the primary-key aggregate index at scan time",
+    )
+    .unwrap();
+    /// Elapsed time building the tsid set from the primary-key aggregate index at scan time.
+    pub static ref PK_INDEX_SCAN_BUILD_ELAPSED: Histogram = register_histogram!(
+        "greptime_pk_index_scan_build_elapsed",
+        "elapsed building the tsid set from the primary-key aggregate index at scan time",
+    )
+    .unwrap();
     /// Counter of r/w bytes on index related IO operations.
     pub static ref INDEX_IO_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
         "greptime_index_io_bytes_total",

@@ -182,6 +182,10 @@ pub struct MitoConfig {
     /// When enabled, forces using BulkMemtable and BulkMemtableBuilder.
     pub default_flat_format: bool,
 
+    /// Whether the scanner may use the primary-key aggregate index to resolve
+    /// the matching tsid set from tag filters (default false).
+    pub enable_pk_index_scan: bool,
+
     pub gc: GcConfig,
 }
 
@@ -233,6 +237,7 @@ impl Default for MitoConfig {
             min_compaction_interval: Duration::from_secs(0),
             schedule_compaction_after_edit: true,
             default_flat_format: true,
+            enable_pk_index_scan: false,
             gc: GcConfig::default(),
         };
 

@@ -1939,6 +1939,7 @@ scan_memory_on_exhausted = "fail"
 min_compaction_interval = "0s"
 schedule_compaction_after_edit = true
 default_flat_format = true
+enable_pk_index_scan = false
 
 [region_engine.mito.index]
 aux_path = ""
