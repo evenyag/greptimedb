@@ -142,8 +142,6 @@ pub(crate) struct WorkerGroup {
     compact_job_pool: SchedulerRef,
     /// Scheduler for index build jobs.
     index_build_job_pool: SchedulerRef,
-    /// Scheduler for primary-key aggregate index build jobs.
-    pk_index_build_job_pool: SchedulerRef,
     /// Scheduler for file purgers.
     purge_scheduler: SchedulerRef,
     /// Cache.
@@ -192,8 +190,6 @@ impl WorkerGroup {
             .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
-        let pk_index_build_job_pool =
-            Arc::new(LocalScheduler::new(config.max_background_pk_index_builds));
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -244,7 +240,6 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
-                    pk_index_build_job_pool: pk_index_build_job_pool.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -271,7 +266,6 @@ impl WorkerGroup {
             flush_job_pool,
             compact_job_pool,
             index_build_job_pool,
-            pk_index_build_job_pool,
             purge_scheduler,
             cache_manager,
             file_ref_manager,
@@ -296,8 +290,6 @@ impl WorkerGroup {
         self.purge_scheduler.stop(true).await?;
         // Stops the index build job pool gracefully.
         self.index_build_job_pool.stop(true).await?;
-        // Stops the primary-key aggregate index build job pool gracefully.
-        self.pk_index_build_job_pool.stop(true).await?;
 
         try_join_all(self.workers.iter().map(|worker| worker.stop())).await?;
 
@@ -405,8 +397,6 @@ impl WorkerGroup {
         });
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
-        let pk_index_build_job_pool =
-            Arc::new(LocalScheduler::new(config.max_background_pk_index_builds));
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -459,7 +449,6 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
-                    pk_index_build_job_pool: pk_index_build_job_pool.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -486,7 +475,6 @@ impl WorkerGroup {
             flush_job_pool,
             compact_job_pool,
             index_build_job_pool,
-            pk_index_build_job_pool,
             purge_scheduler,
             cache_manager,
             file_ref_manager,
@@ -553,7 +541,6 @@ struct WorkerStarter<S> {
     write_buffer_manager: WriteBufferManagerRef,
     compact_job_pool: SchedulerRef,
     index_build_job_pool: SchedulerRef,
-    pk_index_build_job_pool: SchedulerRef,
     flush_job_pool: SchedulerRef,
     purge_scheduler: SchedulerRef,
     listener: WorkerListener,
@@ -606,9 +593,7 @@ impl<S: LogStore> WorkerStarter<S> {
                 self.index_build_job_pool,
                 self.config.max_background_index_builds,
             ),
-            pk_index_build_scheduler: crate::sst::pk_index::PkIndexBuildScheduler::new(
-                self.pk_index_build_job_pool,
-            ),
+            pk_index_build_scheduler: crate::sst::pk_index::PkIndexBuildScheduler::new(),
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,

@@ -117,6 +117,8 @@ impl MetricEngineInner {
         let edit = RegionEdit {
             files_to_add: vec![],
             files_to_remove: files_to_remove.clone(),
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
             compaction_time_window: None,
             flushed_entry_id: None,

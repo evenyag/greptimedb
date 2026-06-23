@@ -27,6 +27,7 @@ use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::ReservedColumnId;
 use store_api::storage::{ColumnId, FileId, RegionId, SequenceNumber};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
@@ -49,7 +50,6 @@ use crate::region::{ManifestContextRef, RegionLeaderState};
 use crate::request::{
     BackgroundNotify, PkIndexBuildFinished, WorkerRequest, WorkerRequestWithTime,
 };
-use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::{FileHandle, FileTimeRange};
 use crate::sst::location::pk_index_file_path;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
@@ -95,30 +95,41 @@ pub(crate) struct PkIndexBuildRequest {
 }
 
 pub(crate) struct PkIndexBuildScheduler {
-    scheduler: SchedulerRef,
+    semaphore: Arc<Semaphore>,
 }
 
 impl PkIndexBuildScheduler {
-    pub(crate) fn new(scheduler: SchedulerRef) -> Self {
-        Self { scheduler }
+    pub(crate) fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(1)),
+        }
     }
 
     pub(crate) fn schedule(&self, request: PkIndexBuildRequest) -> Result<()> {
-        let job = request.into_job();
         PK_INDEX_TASK_TOTAL.with_label_values(&["scheduled"]).inc();
-        self.scheduler.schedule(job)
+
+        let semaphore = self.semaphore.clone();
+        common_runtime::spawn_global(async move {
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                PK_INDEX_TASK_TOTAL.with_label_values(&["failed"]).inc();
+                common_telemetry::warn!(
+                    "Primary-key aggregate index task failed to acquire scheduler permit"
+                );
+                return;
+            };
+            request.run_with_metrics().await;
+        });
+        Ok(())
     }
 }
 
 impl PkIndexBuildRequest {
-    fn into_job(self) -> Job {
-        Box::pin(async move {
-            let region_id = self.region_id;
-            if let Err(err) = self.run().await {
-                PK_INDEX_TASK_TOTAL.with_label_values(&["failed"]).inc();
-                common_telemetry::warn!(err; "Primary-key aggregate index task failed, region: {}", region_id);
-            }
-        })
+    async fn run_with_metrics(self) {
+        let region_id = self.region_id;
+        if let Err(err) = self.run().await {
+            PK_INDEX_TASK_TOTAL.with_label_values(&["failed"]).inc();
+            common_telemetry::warn!(err; "Primary-key aggregate index task failed, region: {}", region_id);
+        }
     }
 
     async fn run(self) -> Result<()> {
