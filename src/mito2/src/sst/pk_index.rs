@@ -901,6 +901,42 @@ impl PrimaryKeyFilter for PkIndexTsidFilter {
     }
 }
 
+#[derive(Debug, Default)]
+struct PkIndexScanCosts {
+    lower_filter: Duration,
+    select_indexes: Duration,
+    read_indexes: Duration,
+}
+
+impl PkIndexScanCosts {
+    fn total_tracked(&self) -> Duration {
+        self.lower_filter + self.select_indexes + self.read_indexes
+    }
+}
+
+#[derive(Debug, Default)]
+struct PkIndexReadStats {
+    scanned_rows: usize,
+    matched_rows: usize,
+    read_cost: Duration,
+    evaluate_cost: Duration,
+}
+
+impl PkIndexReadStats {
+    fn add_batch(&mut self, batch: PkIndexBatchStats) {
+        self.scanned_rows += batch.scanned_rows;
+        self.matched_rows += batch.matched_rows;
+        self.evaluate_cost += batch.evaluate_cost;
+    }
+}
+
+#[derive(Debug)]
+struct PkIndexBatchStats {
+    scanned_rows: usize,
+    matched_rows: usize,
+    evaluate_cost: Duration,
+}
+
 /// Resolves the matching tsid set by applying `tag_filters` to the primary-key
 /// aggregate index files that intersect `time_range`.
 ///
@@ -926,9 +962,11 @@ pub(crate) async fn build_pk_index_tsid_set(
     }
 
     let start = Instant::now();
+    let mut costs = PkIndexScanCosts::default();
 
     // Lower every tag filter to a SimpleFilterEvaluator. If any tag filter cannot
     // be lowered, the tsid set would not be exact, so bail out to the normal path.
+    let stage_start = Instant::now();
     let tag_cols: HashSet<String> = tag_columns(metadata)
         .into_iter()
         .map(|(_, name)| name)
@@ -936,22 +974,27 @@ pub(crate) async fn build_pk_index_tsid_set(
     let mut evaluators = Vec::with_capacity(tag_filters.len());
     for expr in tag_filters {
         let Some(evaluator) = SimpleFilterEvaluator::try_new(expr) else {
+            costs.lower_filter += stage_start.elapsed();
             PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
             return Ok(None);
         };
         // Only tag columns exist in the index file; a predicate on any other
         // column cannot be enforced here.
         if !tag_cols.contains(evaluator.column_name()) {
+            costs.lower_filter += stage_start.elapsed();
             PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
             return Ok(None);
         }
         evaluators.push(evaluator);
     }
+    costs.lower_filter += stage_start.elapsed();
 
+    let stage_start = Instant::now();
     let metas: Vec<&AggregatePkIndexMeta> = pk_indexes
         .values()
         .filter(|meta| index_intersects_range(meta, time_range))
         .collect();
+    costs.select_indexes += stage_start.elapsed();
     if metas.is_empty() {
         PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
         return Ok(None);
@@ -959,14 +1002,39 @@ pub(crate) async fn build_pk_index_tsid_set(
 
     let mut tsids = HashSet::new();
     let mut covered_files = HashSet::new();
-    for meta in metas {
-        read_pk_index_file(access_layer, metadata, meta, &evaluators, &mut tsids).await?;
+    let index_count = metas.len();
+    let mut scanned_rows = 0;
+    let mut matched_rows = 0;
+    for meta in &metas {
+        let stage_start = Instant::now();
+        let stats =
+            read_pk_index_file(access_layer, metadata, meta, &evaluators, &mut tsids).await?;
+        costs.read_indexes += stage_start.elapsed();
+        scanned_rows += stats.scanned_rows;
+        matched_rows += stats.matched_rows;
         covered_files.extend(meta.source_file_ids.iter().copied());
     }
 
     PK_INDEX_SCAN_TOTAL.with_label_values(&["applied"]).inc();
     PK_INDEX_SCAN_TSIDS_TOTAL.inc_by(tsids.len() as u64);
-    PK_INDEX_SCAN_BUILD_ELAPSED.observe(start.elapsed().as_secs_f64());
+    let total_cost = start.elapsed();
+    PK_INDEX_SCAN_BUILD_ELAPSED.observe(total_cost.as_secs_f64());
+
+    common_telemetry::info!(
+        "Scanned primary-key aggregate indexes, region: {}, tag_filters: {}, index_files: {}, covered_files: {}, scanned_rows: {}, matched_rows: {}, matched_tsids: {}, lower_filter_cost: {:?}, select_indexes_cost: {:?}, read_indexes_cost: {:?}, tracked_cost: {:?}, total_cost: {:?}",
+        metadata.region_id,
+        tag_filters.len(),
+        index_count,
+        covered_files.len(),
+        scanned_rows,
+        matched_rows,
+        tsids.len(),
+        costs.lower_filter,
+        costs.select_indexes,
+        costs.read_indexes,
+        costs.total_tracked(),
+        total_cost,
+    );
 
     Ok(Some(PkIndexTsidSet {
         tsids: Arc::new(tsids),
@@ -985,13 +1053,15 @@ async fn read_pk_index_file(
     meta: &AggregatePkIndexMeta,
     evaluators: &[SimpleFilterEvaluator],
     tsids: &mut HashSet<(u32, u64)>,
-) -> Result<()> {
+) -> Result<PkIndexReadStats> {
     let path = pk_index_file_path(
         access_layer.table_dir(),
         metadata.region_id,
         meta.index_file_id,
         access_layer.path_type(),
     );
+    let start = Instant::now();
+    let stage_start = Instant::now();
     let bytes = access_layer
         .object_store()
         .read(&path)
@@ -1000,22 +1070,45 @@ async fn read_pk_index_file(
         .to_bytes();
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .and_then(|builder| builder.build())
-        .context(ReadParquetSnafu { path })?;
+        .context(ReadParquetSnafu { path: &path })?;
+    let mut stats = PkIndexReadStats {
+        read_cost: stage_start.elapsed(),
+        ..Default::default()
+    };
     for batch in reader {
         let batch = batch.context(NewRecordBatchSnafu)?;
-        collect_matching_tsids(&batch, evaluators, tsids)?;
+        stats.add_batch(collect_matching_tsids(&batch, evaluators, tsids)?);
     }
-    Ok(())
+    common_telemetry::info!(
+        "Read primary-key aggregate index file, region: {}, index_file_id: {}, path: {}, time_range: {:?}, source_files: {}, index_rows: {}, scanned_rows: {}, matched_rows: {}, read_cost: {:?}, evaluate_cost: {:?}, total_cost: {:?}",
+        metadata.region_id,
+        meta.index_file_id,
+        path,
+        meta.time_range,
+        meta.source_file_ids.len(),
+        meta.row_count,
+        stats.scanned_rows,
+        stats.matched_rows,
+        stats.read_cost,
+        stats.evaluate_cost,
+        start.elapsed(),
+    );
+    Ok(stats)
 }
 
 fn collect_matching_tsids(
     batch: &RecordBatch,
     evaluators: &[SimpleFilterEvaluator],
     tsids: &mut HashSet<(u32, u64)>,
-) -> Result<()> {
+) -> Result<PkIndexBatchStats> {
+    let start = Instant::now();
     let num_rows = batch.num_rows();
     if num_rows == 0 {
-        return Ok(());
+        return Ok(PkIndexBatchStats {
+            scanned_rows: 0,
+            matched_rows: 0,
+            evaluate_cost: start.elapsed(),
+        });
     }
 
     let mut mask = datatypes::arrow::buffer::BooleanBuffer::new_set(num_rows);
@@ -1043,7 +1136,12 @@ fn collect_matching_tsids(
             tsids.insert((table_ids.value(row), series_ids.value(row)));
         }
     }
-    Ok(())
+    let matched_rows = mask.iter().filter(|matched| *matched).count();
+    Ok(PkIndexBatchStats {
+        scanned_rows: num_rows,
+        matched_rows,
+        evaluate_cost: start.elapsed(),
+    })
 }
 
 fn pk_index_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef> {
