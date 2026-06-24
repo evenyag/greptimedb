@@ -60,9 +60,7 @@ use crate::request::{
 use crate::sst::file::{FileHandle, FileTimeRange};
 use crate::sst::location::pk_index_file_path;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
-use crate::sst::parquet::flat_format::{
-    FlatReadFormat, primary_key_column_index, time_index_column_index,
-};
+use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 const PK_INDEX_WRITE_BATCH_ROWS: usize = 8192;
@@ -542,7 +540,6 @@ async fn open_sst_stream(
     access_layer: &AccessLayerRef,
     file: FileHandle,
 ) -> Result<Option<SstStream>> {
-    let file_path = file.file_path(access_layer.table_dir(), access_layer.path_type());
     let Some(mut reader) = access_layer
         .read_sst(file)
         .projection(Some(ReadColumns::from_deduped_column_ids(
@@ -556,15 +553,6 @@ async fn open_sst_stream(
 
     let metadata = reader.metadata().clone();
     validate_sparse_flat_metadata(&metadata)?;
-    reject_legacy_format(
-        &metadata,
-        reader
-            .parquet_metadata()
-            .file_metadata()
-            .schema_descr()
-            .num_columns(),
-        &file_path,
-    )?;
 
     let Some(first) = reader.next_record_batch().await? else {
         return Ok(None);
@@ -589,21 +577,6 @@ fn validate_sparse_flat_metadata(metadata: &RegionMetadataRef) -> Result<()> {
         metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse,
         InvalidMetaSnafu {
             reason: "primary-key aggregate index only supports sparse primary-key encoding"
-        }
-    );
-    Ok(())
-}
-
-fn reject_legacy_format(
-    metadata: &RegionMetadataRef,
-    num_columns: usize,
-    file_path: &str,
-) -> Result<()> {
-    let legacy = FlatReadFormat::is_legacy_format(metadata, num_columns, file_path)?;
-    ensure!(
-        !legacy,
-        InvalidMetaSnafu {
-            reason: format!("legacy primary-key SST format is not supported: {file_path}")
         }
     );
     Ok(())
@@ -1120,9 +1093,31 @@ pub(crate) fn tag_filter_exprs(metadata: &RegionMetadataRef, filters: &[Expr]) -
 mod tests {
     use std::num::NonZeroU64;
 
+    use api::v1::OpType;
+    use datatypes::arrow::array::{
+        BinaryDictionaryBuilder, StringDictionaryBuilder, TimestampMillisecondArray, UInt8Array,
+    };
+
     use super::*;
+    use crate::access_layer::{Metrics, RegionFilePathFactory, WriteType};
+    use crate::config::IndexConfig;
+    use crate::read::FlatSource;
     use crate::sst::file::{FileMeta, Level};
     use crate::sst::file_purger::NoopFilePurger;
+    use crate::sst::index::{Indexer, IndexerBuilder};
+    use crate::sst::parquet::WriteOptions;
+    use crate::sst::parquet::writer::ParquetWriter;
+    use crate::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
+    use crate::test_util::sst_util::new_sparse_primary_key;
+
+    struct NoopIndexBuilder;
+
+    #[async_trait::async_trait]
+    impl IndexerBuilder for NoopIndexBuilder {
+        async fn build(&self, _file_id: FileId, _index_version: u64) -> Indexer {
+            Indexer::default()
+        }
+    }
 
     fn file(region_id: RegionId, start_ms: i64, sequence: Option<u64>) -> FileHandle {
         FileHandle::new(
@@ -1139,6 +1134,70 @@ mod tests {
             },
             Arc::new(NoopFilePurger),
         )
+    }
+
+    fn file_handle_from_sst_info(
+        region_id: RegionId,
+        info: crate::sst::parquet::SstInfo,
+        sequence: u64,
+    ) -> FileHandle {
+        FileHandle::new(
+            FileMeta {
+                region_id,
+                file_id: info.file_id,
+                time_range: info.time_range,
+                level: 0 as Level,
+                file_size: info.file_size,
+                max_row_group_uncompressed_size: info.max_row_group_uncompressed_size,
+                num_rows: info.num_rows as u64,
+                num_row_groups: info.num_row_groups,
+                num_series: info.num_series,
+                sequence: NonZeroU64::new(sequence),
+                ..Default::default()
+            },
+            Arc::new(NoopFilePurger),
+        )
+    }
+
+    fn sparse_flat_batch(metadata: &RegionMetadataRef) -> RecordBatch {
+        let schema = to_flat_sst_arrow_schema(metadata, &FlatSchemaOptions::default());
+        let table_ids = [1_u32, 1, 1];
+        let tsids = [100_u64, 100, 101];
+        let tag_0 = ["host-a", "host-a", "host-b"];
+        let tag_1 = ["region-a", "region-a", "region-b"];
+        let timestamps = [0_i64, 10, 20];
+        let num_rows = timestamps.len();
+
+        let mut tag_0_builder = StringDictionaryBuilder::<UInt32Type>::new();
+        let mut tag_1_builder = StringDictionaryBuilder::<UInt32Type>::new();
+        let mut pk_builder = BinaryDictionaryBuilder::<UInt32Type>::new();
+        for row in 0..num_rows {
+            tag_0_builder.append_value(tag_0[row]);
+            tag_1_builder.append_value(tag_1[row]);
+            let pk = new_sparse_primary_key(
+                &[tag_0[row], tag_1[row]],
+                metadata,
+                table_ids[row],
+                tsids[row],
+            );
+            pk_builder.append(&pk).unwrap();
+        }
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(table_ids.to_vec())) as ArrayRef,
+                Arc::new(UInt64Array::from(tsids.to_vec())) as ArrayRef,
+                Arc::new(tag_0_builder.finish()) as ArrayRef,
+                Arc::new(tag_1_builder.finish()) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3])) as ArrayRef,
+                Arc::new(TimestampMillisecondArray::from(timestamps.to_vec())) as ArrayRef,
+                Arc::new(pk_builder.finish()) as ArrayRef,
+                Arc::new(UInt64Array::from_value(10, num_rows)) as ArrayRef,
+                Arc::new(UInt8Array::from_value(OpType::Put as u8, num_rows)) as ArrayRef,
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1286,6 +1345,78 @@ mod tests {
         assert!(!filter.matches(&encode(7, 43)).unwrap());
         // Same tsid, different table.
         assert!(!filter.matches(&encode(8, 42)).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_build_pk_index_reads_legacy_sparse_sst() {
+        use common_test_util::temp_dir::create_temp_dir;
+        use object_store::services::Fs;
+        use store_api::region_request::PathType;
+
+        use crate::access_layer::AccessLayer;
+        use crate::sst::index::intermediate::IntermediateManager;
+        use crate::sst::index::puffin_manager::PuffinManagerFactory;
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let dir = create_temp_dir("pk-index-legacy-sparse-sst");
+        let dir_path = dir.path().display().to_string();
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let object_store = ObjectStore::new(Fs::default().root(&dir_path))
+            .unwrap()
+            .finish();
+
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let table_dir = "test_table";
+        let access_layer: AccessLayerRef = Arc::new(AccessLayer::new(
+            table_dir,
+            PathType::Bare,
+            object_store.clone(),
+            puffin_mgr,
+            intm_mgr,
+        ));
+
+        let mut metrics = Metrics::new(WriteType::Flush);
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store,
+            metadata.clone(),
+            IndexConfig::default(),
+            NoopIndexBuilder,
+            RegionFilePathFactory::new(table_dir.to_string(), PathType::Bare),
+            &mut metrics,
+        )
+        .await;
+        let batch = sparse_flat_batch(&metadata);
+        let source = FlatSource::new_iter(batch.schema(), Box::new(std::iter::once(Ok(batch))));
+        let sst_info = writer
+            .write_all_flat_as_primary_key(source, None, &WriteOptions::default())
+            .await
+            .unwrap()
+            .remove(0);
+        let source_file_id = sst_info.file_id;
+        let source_file = file_handle_from_sst_info(metadata.region_id, sst_info, 10);
+
+        let bucket = PkIndexBucket {
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(WINDOW_MILLIS - 1),
+            ),
+            files: vec![source_file],
+        };
+        let output = build_pk_index(&access_layer, metadata, bucket, FileId::random(), 10)
+            .await
+            .unwrap();
+
+        assert_eq!(output.meta.source_file_ids, vec![source_file_id]);
+        assert_eq!(output.meta.row_count, 2);
+        assert!(output.meta.file_size > 0);
     }
 
     #[tokio::test]
