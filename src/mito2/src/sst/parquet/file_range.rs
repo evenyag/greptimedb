@@ -238,6 +238,11 @@ impl FileRange {
     pub(crate) fn file_handle(&self) -> &FileHandle {
         self.context.reader_builder.file_handle()
     }
+
+    /// Returns the row group index of the file range.
+    pub(crate) fn row_group_idx(&self) -> usize {
+        self.row_group_idx
+    }
 }
 
 /// Context shared by ranges of the same parquet SST.

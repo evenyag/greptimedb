@@ -14,7 +14,7 @@
 
 //! Utilities for scanners.
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,8 @@ pub struct FileScanMetrics {
     pub num_ranges: usize,
     /// Number of rows read from this file.
     pub num_rows: usize,
+    /// Row groups read from this file.
+    pub row_groups: BTreeSet<usize>,
     /// Time spent building file ranges/parts (file-level preparation).
     pub build_part_cost: Duration,
     /// Time spent building readers for this file (accumulated across all ranges).
@@ -77,6 +79,10 @@ impl fmt::Debug for FileScanMetrics {
         }
         if self.num_rows > 0 {
             write!(f, ", \"num_rows\":{}", self.num_rows)?;
+        }
+        if !self.row_groups.is_empty() {
+            write!(f, ", \"row_groups\":")?;
+            f.debug_list().entries(self.row_groups.iter()).finish()?;
         }
         if !self.build_reader_cost.is_zero() {
             write!(
@@ -98,6 +104,7 @@ impl FileScanMetrics {
     pub(crate) fn merge_from(&mut self, other: &FileScanMetrics) {
         self.num_ranges += other.num_ranges;
         self.num_rows += other.num_rows;
+        self.row_groups.extend(other.row_groups.iter().copied());
         self.build_part_cost += other.build_part_cost;
         self.build_reader_cost += other.build_reader_cost;
         self.scan_cost += other.scan_cost;
@@ -1567,6 +1574,7 @@ pub fn build_flat_file_range_scan_stream(
 
                 file_metrics.num_ranges += 1;
                 file_metrics.num_rows += prune_metrics.num_rows;
+                file_metrics.row_groups.insert(range.row_group_idx());
                 file_metrics.build_reader_cost += build_cost;
                 file_metrics.scan_cost += prune_metrics.scan_cost;
             }
