@@ -27,6 +27,7 @@ vector_index = ["mito2/vector_index", "query/vector_index"]
 workspace = true
 
 [dependencies]
+arrow-array.workspace = true
 async-trait.workspace = true
 auth.workspace = true
 base64.workspace = true
