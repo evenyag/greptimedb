@@ -1899,6 +1899,10 @@ impl RowGroupReaderBuilder {
         projection: ProjectionMask,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<ProjectedRecordBatchStream> {
+        if let (Some(metrics), Some(selection)) = (fetch_metrics, row_selection.as_ref()) {
+            self.record_pages_skipped(row_group_idx, selection, &projection, metrics);
+        }
+
         let range_fetcher = SstParquetRangeFetcher::new(
             self.file_handle.file_id(),
             self.file_path.clone(),
@@ -1917,6 +1921,48 @@ impl RowGroupReaderBuilder {
             self.file_path.clone(),
             DEFAULT_READ_BATCH_SIZE,
         )
+    }
+
+    /// Records the number of parquet data pages skipped by `selection` into `metrics`.
+    ///
+    /// For each projected leaf column, the number of selected pages equals the number of
+    /// byte ranges returned by [`RowSelection::scan_ranges`] (it emits one range per
+    /// selected data page without coalescing), so skipped pages are the remaining ones.
+    /// Requires the offset (page) index to be present, which holds whenever a row-level
+    /// selection or prefilter is active. No-op otherwise.
+    fn record_pages_skipped(
+        &self,
+        row_group_idx: usize,
+        selection: &RowSelection,
+        projection: &ProjectionMask,
+        metrics: &ParquetFetchMetrics,
+    ) {
+        let Some(rg_cols) = self
+            .arrow_metadata
+            .metadata()
+            .offset_index()
+            .and_then(|offset_index| offset_index.get(row_group_idx))
+        else {
+            return;
+        };
+
+        let mut total = 0;
+        let mut selected = 0;
+        for (leaf_idx, col) in rg_cols.iter().enumerate() {
+            if !projection.leaf_included(leaf_idx) {
+                continue;
+            }
+            let locations = col.page_locations();
+            if locations.is_empty() {
+                continue;
+            }
+            total += locations.len();
+            selected += selection.scan_ranges(locations).len();
+        }
+
+        let mut data = metrics.data.lock().unwrap();
+        data.pages_total += total;
+        data.pages_skipped += total - selected;
     }
 }
 
@@ -2986,5 +3032,41 @@ mod tests {
         let meta = load_parquet_meta(bytes);
 
         assert!(should_read_pk_as_binary_with_limit(&meta, 1024));
+    }
+
+    #[test]
+    fn test_pages_skipped_formula() {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        use parquet::file::page_index::offset_index::PageLocation;
+
+        let page = |offset, first_row_index| PageLocation {
+            offset,
+            compressed_page_size: 100,
+            first_row_index,
+        };
+        // Three data pages, 100 rows each.
+        let locations = vec![page(0, 0), page(100, 100), page(200, 200)];
+
+        // Skip the whole first page, select the rest. Only the first page is skippable.
+        let selection = RowSelection::from(vec![RowSelector::skip(100), RowSelector::select(200)]);
+        let selected = selection.scan_ranges(&locations).len();
+        assert_eq!(locations.len() - selected, 1);
+
+        // A selection touching every page skips nothing.
+        let selection = RowSelection::from(vec![
+            RowSelector::select(1),
+            RowSelector::skip(99),
+            RowSelector::select(1),
+            RowSelector::skip(99),
+            RowSelector::select(1),
+            RowSelector::skip(99),
+        ]);
+        let selected = selection.scan_ranges(&locations).len();
+        assert_eq!(locations.len() - selected, 0);
+
+        // Selecting nothing skips all pages.
+        let selection = RowSelection::from(vec![RowSelector::skip(300)]);
+        let selected = selection.scan_ranges(&locations).len();
+        assert_eq!(locations.len() - selected, 3);
     }
 }

@@ -52,6 +52,10 @@ pub struct ParquetFetchMetricsData {
     pub prefilter_cost: std::time::Duration,
     /// Number of rows filtered out by prefiltering.
     pub prefilter_filtered_rows: usize,
+    /// Number of data pages skipped by row selection (summed over projected leaf columns).
+    pub pages_skipped: usize,
+    /// Total number of data pages over projected leaf columns (skipped + read).
+    pub pages_total: usize,
 }
 
 impl ParquetFetchMetricsData {
@@ -90,6 +94,8 @@ impl std::fmt::Debug for ParquetFetchMetrics {
             total_fetch_elapsed,
             prefilter_cost,
             prefilter_filtered_rows,
+            pages_skipped,
+            pages_total,
         } = *data;
 
         write!(f, "{{")?;
@@ -158,6 +164,12 @@ impl std::fmt::Debug for ParquetFetchMetrics {
                 prefilter_filtered_rows
             )?;
         }
+        if pages_skipped > 0 {
+            write!(f, ", \"pages_skipped\":{}", pages_skipped)?;
+        }
+        if pages_total > 0 {
+            write!(f, ", \"pages_total\":{}", pages_total)?;
+        }
 
         write!(f, "}}")
     }
@@ -187,6 +199,8 @@ impl ParquetFetchMetrics {
             total_fetch_elapsed,
             prefilter_cost,
             prefilter_filtered_rows,
+            pages_skipped,
+            pages_total,
         } = *other.data.lock().unwrap();
 
         let mut data = self.data.lock().unwrap();
@@ -205,6 +219,8 @@ impl ParquetFetchMetrics {
         data.total_fetch_elapsed += total_fetch_elapsed;
         data.prefilter_cost += prefilter_cost;
         data.prefilter_filtered_rows += prefilter_filtered_rows;
+        data.pages_skipped += pages_skipped;
+        data.pages_total += pages_total;
     }
 }
 
