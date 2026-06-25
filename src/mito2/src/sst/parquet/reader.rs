@@ -1946,8 +1946,13 @@ impl RowGroupReaderBuilder {
             return;
         };
 
-        let mut total = 0;
-        let mut selected = 0;
+        let file_id = self.file_handle.file_id();
+        let schema_descr = self.arrow_metadata.metadata().file_metadata().schema_descr();
+
+        let mut data = metrics.data.lock().unwrap();
+        let file_columns = data.per_file_column_pages.entry(file_id).or_default();
+        let mut total_pages = 0;
+        let mut skipped_pages = 0;
         for (leaf_idx, col) in rg_cols.iter().enumerate() {
             if !projection.leaf_included(leaf_idx) {
                 continue;
@@ -1956,13 +1961,19 @@ impl RowGroupReaderBuilder {
             if locations.is_empty() {
                 continue;
             }
-            total += locations.len();
-            selected += selection.scan_ranges(locations).len();
+            let total = locations.len();
+            let skipped = total - selection.scan_ranges(locations).len();
+            let column_stats = file_columns
+                .entry(schema_descr.column(leaf_idx).name().to_string())
+                .or_default();
+            column_stats.pages_total += total;
+            column_stats.pages_skipped += skipped;
+            total_pages += total;
+            skipped_pages += skipped;
         }
 
-        let mut data = metrics.data.lock().unwrap();
-        data.pages_total += total;
-        data.pages_skipped += total - selected;
+        data.pages_total += total_pages;
+        data.pages_skipped += skipped_pages;
     }
 }
 

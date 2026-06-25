@@ -14,10 +14,21 @@
 
 //! Parquet row group reading utilities.
 
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::sst::file::RegionFileId;
 use crate::sst::parquet::helper::MERGE_GAP;
+
+/// Page skip/total stats for a single column.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ColumnPageStats {
+    /// Number of data pages skipped by row selection.
+    pub pages_skipped: usize,
+    /// Total number of data pages (skipped + read).
+    pub pages_total: usize,
+}
 
 /// Inner data for ParquetFetchMetrics.
 #[derive(Default, Debug, Clone)]
@@ -56,6 +67,11 @@ pub struct ParquetFetchMetricsData {
     pub pages_skipped: usize,
     /// Total number of data pages over projected leaf columns (skipped + read).
     pub pages_total: usize,
+    /// Per-file, per-column page skip/total stats. Keyed by file id then leaf column name.
+    ///
+    /// Used to surface a per-column breakdown in the per-file scan metrics. Not printed in
+    /// the aggregate fetch-metrics output.
+    pub per_file_column_pages: HashMap<RegionFileId, BTreeMap<String, ColumnPageStats>>,
 }
 
 impl ParquetFetchMetricsData {
@@ -96,7 +112,8 @@ impl std::fmt::Debug for ParquetFetchMetrics {
             prefilter_filtered_rows,
             pages_skipped,
             pages_total,
-        } = *data;
+            per_file_column_pages: _,
+        } = data.clone();
 
         write!(f, "{{")?;
 
@@ -201,7 +218,8 @@ impl ParquetFetchMetrics {
             prefilter_filtered_rows,
             pages_skipped,
             pages_total,
-        } = *other.data.lock().unwrap();
+            per_file_column_pages,
+        } = other.data.lock().unwrap().clone();
 
         let mut data = self.data.lock().unwrap();
         data.page_cache_hit += page_cache_hit;
@@ -221,6 +239,14 @@ impl ParquetFetchMetrics {
         data.prefilter_filtered_rows += prefilter_filtered_rows;
         data.pages_skipped += pages_skipped;
         data.pages_total += pages_total;
+        for (file_id, columns) in per_file_column_pages {
+            let file_entry = data.per_file_column_pages.entry(file_id).or_default();
+            for (column, stats) in columns {
+                let entry = file_entry.entry(column).or_default();
+                entry.pages_skipped += stats.pages_skipped;
+                entry.pages_total += stats.pages_total;
+            }
+        }
     }
 }
 

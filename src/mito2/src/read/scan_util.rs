@@ -14,7 +14,7 @@
 
 //! Utilities for scanners.
 
-use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -50,7 +50,7 @@ use crate::sst::index::inverted_index::applier::InvertedIndexApplyMetrics;
 use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
 use crate::sst::parquet::flat_format::time_index_column_index;
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderFilterMetrics, ReaderMetrics};
-use crate::sst::parquet::row_group::ParquetFetchMetrics;
+use crate::sst::parquet::row_group::{ColumnPageStats, ParquetFetchMetrics};
 use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
 
 /// Per-file scan metrics.
@@ -62,6 +62,8 @@ pub struct FileScanMetrics {
     pub num_rows: usize,
     /// Row groups read from this file.
     pub row_groups: BTreeSet<usize>,
+    /// Per-column page skip/total stats for this file, keyed by leaf column name.
+    pub pages_per_column: BTreeMap<String, ColumnPageStats>,
     /// Time spent building file ranges/parts (file-level preparation).
     pub build_part_cost: Duration,
     /// Time spent building readers for this file (accumulated across all ranges).
@@ -84,6 +86,20 @@ impl fmt::Debug for FileScanMetrics {
             write!(f, ", \"row_groups\":")?;
             f.debug_list().entries(self.row_groups.iter()).finish()?;
         }
+        if !self.pages_per_column.is_empty() {
+            write!(f, ", \"pages_per_column\": {{")?;
+            for (i, (column, stats)) in self.pages_per_column.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(
+                    f,
+                    "\"{}\": {{\"skipped\": {}, \"total\": {}}}",
+                    column, stats.pages_skipped, stats.pages_total
+                )?;
+            }
+            write!(f, "}}")?;
+        }
         if !self.build_reader_cost.is_zero() {
             write!(
                 f,
@@ -105,6 +121,11 @@ impl FileScanMetrics {
         self.num_ranges += other.num_ranges;
         self.num_rows += other.num_rows;
         self.row_groups.extend(other.row_groups.iter().copied());
+        for (column, stats) in &other.pages_per_column {
+            let entry = self.pages_per_column.entry(column.clone()).or_default();
+            entry.pages_skipped += stats.pages_skipped;
+            entry.pages_total += stats.pages_total;
+        }
         self.build_part_cost += other.build_part_cost;
         self.build_reader_cost += other.build_reader_cost;
         self.scan_cost += other.scan_cost;
@@ -1577,6 +1598,16 @@ pub fn build_flat_file_range_scan_stream(
                 file_metrics.row_groups.insert(range.row_group_idx());
                 file_metrics.build_reader_cost += build_cost;
                 file_metrics.scan_cost += prune_metrics.scan_cost;
+
+                // Snapshot this file's accumulated per-column page stats. The fetch metrics
+                // accumulate per file, so the latest snapshot after a range is the running
+                // total for this file.
+                if let Some(fetch) = fetch_metrics.as_deref()
+                    && let Some(columns) =
+                        fetch.data.lock().unwrap().per_file_column_pages.get(&file_id)
+                {
+                    file_metrics.pages_per_column = columns.clone();
+                }
             }
 
             reader_metrics.merge_from(&prune_metrics);
