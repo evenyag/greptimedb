@@ -176,6 +176,7 @@ impl<S> RegionWorkerLoop<S> {
             existing_indexes: (*version.pk_indexes).clone(),
             max_sequence,
             request_sender: self.sender.clone(),
+            cache_manager: self.cache_manager.clone(),
         };
         if let Err(err) = self.pk_index_build_scheduler.schedule(request) {
             error!(err; "Failed to schedule primary-key aggregate index task for region: {}", region.region_id);

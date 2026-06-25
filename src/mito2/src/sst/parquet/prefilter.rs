@@ -51,7 +51,9 @@ use crate::sst::parquet::reader::{
     MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
 };
+use crate::sst::parquet::row_selection::intersect_row_selections;
 use crate::sst::pk_index::PkIndexTsidSet;
+use crate::sst::range_index::SstRangesIndex;
 
 pub(crate) fn matching_row_ranges_by_primary_key(
     input: &RecordBatch,
@@ -353,6 +355,7 @@ pub(crate) fn build_reader_filter_plan(
     read_format: &FlatReadFormat,
     codec: &Arc<dyn PrimaryKeyCodec>,
     pk_index_tsid_set: Option<&PkIndexTsidSet>,
+    pk_range_index: Option<Arc<SstRangesIndex>>,
 ) -> ReaderFilterPlan {
     let Some(predicate) = predicate else {
         return ReaderFilterPlan {
@@ -460,6 +463,7 @@ pub(crate) fn build_reader_filter_plan(
         prefilter_physical_filters,
         schema_version,
         pk_index_tsid_set.cloned(),
+        pk_range_index,
     );
 
     if prefilter_builder.is_some() {
@@ -494,6 +498,12 @@ pub(crate) struct PrefilterContext {
     pk_filter_expr_strs: Option<SmallVec<[String; 1]>>,
     /// Arrow schema used to build narrowed prefilter projections.
     arrow_schema: SchemaRef,
+    /// When set, the PK-group row selection is derived from this per-SST ranges
+    /// index instead of reading and decoding the `__primary_key` column. Paired
+    /// with `pk_index_tsids`; both are present together.
+    pk_range_index: Option<Arc<SstRangesIndex>>,
+    /// The `(table_id, tsid)` membership set used with `pk_range_index`.
+    pk_index_tsids: Option<Arc<HashSet<(u32, u64)>>>,
 }
 
 /// Pre-built state for constructing [PrefilterContext] per row group.
@@ -514,6 +524,9 @@ pub(crate) struct PrefilterContextBuilder {
     /// filter is a tsid-membership filter instead of decoding and evaluating tag
     /// predicates. The resulting row mask is identical for covered files.
     pk_index_tsid_set: Option<PkIndexTsidSet>,
+    /// When set alongside `pk_index_tsid_set`, the PK-group row selection is built
+    /// directly from this per-SST ranges index, skipping the `__primary_key` read.
+    pk_range_index: Option<Arc<SstRangesIndex>>,
 }
 
 impl PrefilterContextBuilder {
@@ -533,6 +546,7 @@ impl PrefilterContextBuilder {
         physical_filters: Vec<PhysicalFilterContext>,
         schema_version: u64,
         pk_index_tsid_set: Option<PkIndexTsidSet>,
+        pk_range_index: Option<Arc<SstRangesIndex>>,
     ) -> Option<Self> {
         let metadata = read_format.metadata();
         let use_raw_tag_columns = read_format.batch_has_raw_pk_columns();
@@ -579,8 +593,13 @@ impl PrefilterContextBuilder {
             return None;
         }
 
-        // Only keep the tsid set when there is a PK filter group to replace.
+        // Only keep the tsid set / ranges index when there is a PK filter group to replace.
         let pk_index_tsid_set = pk_filters.is_some().then_some(pk_index_tsid_set).flatten();
+        // The ranges index is only usable when the tsid set is present.
+        let pk_range_index = pk_index_tsid_set
+            .is_some()
+            .then_some(pk_range_index)
+            .flatten();
 
         Some(Self {
             pk_filters,
@@ -592,22 +611,37 @@ impl PrefilterContextBuilder {
             schema_version,
             arrow_schema: read_format.arrow_schema().clone(),
             pk_index_tsid_set,
+            pk_range_index,
         })
     }
 
     /// Builds a [PrefilterContext] for a specific row group.
     pub(crate) fn build(&self) -> PrefilterContext {
-        let pk_filter = self.pk_filters.as_ref().map(|pk_filters| {
-            // For a covered file, the tsid-membership filter yields the same row
-            // mask as decoding tags, but avoids the per-pk tag decode.
-            let pk_filter = match &self.pk_index_tsid_set {
-                Some(tsid_set) => tsid_set.make_filter(&self.metadata),
-                None => self
-                    .codec
-                    .primary_key_filter(&self.metadata, Arc::clone(pk_filters)),
-            };
-            Box::new(CachedPrimaryKeyFilter::new(pk_filter)) as Box<dyn PrimaryKeyFilter>
-        });
+        // When a ranges index is available, the PK-group row selection is built
+        // directly from it in `execute_prefilter`, so we skip the `__primary_key`
+        // decode entirely (no `pk_filter`).
+        let pk_index_tsids = self
+            .pk_range_index
+            .is_some()
+            .then(|| self.pk_index_tsid_set.as_ref().map(|set| set.tsids()))
+            .flatten();
+        let use_range_index = pk_index_tsids.is_some();
+
+        let pk_filter = (!use_range_index)
+            .then(|| {
+                self.pk_filters.as_ref().map(|pk_filters| {
+                    // For a covered file, the tsid-membership filter yields the same row
+                    // mask as decoding tags, but avoids the per-pk tag decode.
+                    let pk_filter = match &self.pk_index_tsid_set {
+                        Some(tsid_set) => tsid_set.make_filter(&self.metadata),
+                        None => self
+                            .codec
+                            .primary_key_filter(&self.metadata, Arc::clone(pk_filters)),
+                    };
+                    Box::new(CachedPrimaryKeyFilter::new(pk_filter)) as Box<dyn PrimaryKeyFilter>
+                })
+            })
+            .flatten();
         PrefilterContext {
             pk_filter,
             filters: self.filters.clone(),
@@ -615,6 +649,10 @@ impl PrefilterContextBuilder {
             schema_version: self.schema_version,
             pk_filter_expr_strs: self.pk_filter_expr_strs.clone(),
             arrow_schema: self.arrow_schema.clone(),
+            pk_range_index: use_range_index
+                .then(|| self.pk_range_index.clone())
+                .flatten(),
+            pk_index_tsids,
         }
     }
 }
@@ -683,6 +721,65 @@ fn should_use_prefilter(
 }
 
 pub(crate) async fn execute_prefilter(
+    prefilter_ctx: &mut PrefilterContext,
+    reader_builder: &RowGroupReaderBuilder,
+    build_ctx: &RowGroupBuildContext<'_>,
+) -> Result<PrefilterResult> {
+    // PK-index-driven path: derive the PK-group selection from the per-SST ranges
+    // index instead of reading and decoding the `__primary_key` column.
+    if let (Some(index), Some(tsids)) = (
+        prefilter_ctx.pk_range_index.clone(),
+        prefilter_ctx.pk_index_tsids.clone(),
+    ) {
+        let refined = pk_index_refined_selection(&index, &tsids, reader_builder, build_ctx);
+
+        // Fast path: no other prefilter columns, so the PK-index selection is the
+        // final refined selection and we read no columns at all.
+        if prefilter_ctx.filters.is_empty() && prefilter_ctx.physical_filters.is_empty() {
+            let rows_before = rows_before_filter(reader_builder, build_ctx);
+            let filtered_rows = rows_before.saturating_sub(refined.row_count());
+            return Ok(PrefilterResult {
+                refined_selection: refined,
+                filtered_rows,
+            });
+        }
+
+        // Otherwise read the remaining prefilter columns under the refined PK
+        // selection (the PK group is already applied, `pk_filter` is `None`).
+        let narrowed_ctx = RowGroupBuildContext {
+            row_group_idx: build_ctx.row_group_idx,
+            row_selection: Some(refined),
+            fetch_metrics: build_ctx.fetch_metrics,
+        };
+        return execute_prefilter_inner(prefilter_ctx, reader_builder, &narrowed_ctx).await;
+    }
+
+    execute_prefilter_inner(prefilter_ctx, reader_builder, build_ctx).await
+}
+
+/// Builds the PK-group row selection for a row group from the ranges index,
+/// intersected with the incoming row selection (both over the full row group).
+fn pk_index_refined_selection(
+    index: &SstRangesIndex,
+    tsids: &HashSet<(u32, u64)>,
+    reader_builder: &RowGroupReaderBuilder,
+    build_ctx: &RowGroupBuildContext<'_>,
+) -> RowSelection {
+    let total_rows = reader_builder
+        .parquet_metadata()
+        .row_group(build_ctx.row_group_idx)
+        .num_rows() as usize;
+    let ranges = index.row_ranges(build_ctx.row_group_idx, tsids);
+    // `from_consecutive_ranges` pads gaps and the tail with skips so the selection
+    // spans the full row group, matching the incoming selection's domain.
+    let pk_selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+    match &build_ctx.row_selection {
+        Some(original) => intersect_row_selections(original, &pk_selection),
+        None => pk_selection,
+    }
+}
+
+async fn execute_prefilter_inner(
     prefilter_ctx: &mut PrefilterContext,
     reader_builder: &RowGroupReaderBuilder,
     build_ctx: &RowGroupBuildContext<'_>,
@@ -1438,6 +1535,7 @@ mod tests {
             Vec::new(),
             metadata.schema_version,
             None,
+            None,
         );
         assert!(builder.is_none());
     }
@@ -1543,6 +1641,7 @@ mod tests {
             &full_read_format,
             &codec,
             None,
+            None,
         );
         assert!(skip_fields_plan.prefilter_builder.is_some());
         assert_eq!(
@@ -1566,6 +1665,7 @@ mod tests {
             PreFilterMode::All,
             &projected_read_format,
             &codec,
+            None,
             None,
         );
         assert!(pk_prefilter_plan.prefilter_builder.is_some());
@@ -1598,6 +1698,7 @@ mod tests {
             &read_format,
             &codec,
             None,
+            None,
         );
         let plan_b_a = build_reader_filter_plan(
             Some(&Predicate::new(vec![expr_b, expr_a])),
@@ -1605,6 +1706,7 @@ mod tests {
             PreFilterMode::All,
             &read_format,
             &codec,
+            None,
             None,
         );
 

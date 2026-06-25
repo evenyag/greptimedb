@@ -937,6 +937,9 @@ impl LocalGcWorker {
                         unknown_file_may_linger_until,
                     )
                 }
+                // Range index files only live in the local write cache, never in
+                // the object store region dir scanned here, so never delete them.
+                FileType::Range => false,
             };
 
             if should_delete {
@@ -950,6 +953,8 @@ impl LocalGcWorker {
                         GC_ORPHANED_INDEX_FILES.inc();
                         RemovedFile::Index(file_id, version)
                     }
+                    // Unreachable: `should_delete` is always false for range files.
+                    FileType::Range => continue,
                 };
                 ready_for_delete.push(removed_file);
             }

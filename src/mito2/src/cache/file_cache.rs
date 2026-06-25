@@ -83,7 +83,7 @@ impl FileCacheInner {
     fn memory_index(&self, file_type: FileType) -> &Cache<IndexKey, IndexValue> {
         match file_type {
             FileType::Parquet => &self.parquet_index,
-            FileType::Puffin { .. } => &self.puffin_index,
+            FileType::Puffin { .. } | FileType::Range => &self.puffin_index,
         }
     }
 
@@ -142,7 +142,7 @@ impl FileCacheInner {
             // Track sizes separately for each file type
             match key.file_type {
                 FileType::Parquet => parquet_size += size,
-                FileType::Puffin { .. } => puffin_size += size,
+                FileType::Puffin { .. } | FileType::Range => puffin_size += size,
             }
         }
         // The metrics is a signed int gauge so we can updates it finally.
@@ -190,7 +190,7 @@ impl FileCacheInner {
         let timer = WRITE_CACHE_DOWNLOAD_ELAPSED
             .with_label_values(&[match file_type {
                 FileType::Parquet => "download_parquet",
-                FileType::Puffin { .. } => "download_puffin",
+                FileType::Puffin { .. } | FileType::Range => "download_puffin",
             }])
             .start_timer();
 
@@ -759,6 +759,9 @@ pub enum FileType {
     Parquet,
     /// Puffin file.
     Puffin(u64),
+    /// Per-SST `(table_id, tsid)` -> row ranges index (parquet). Regenerable,
+    /// kept only in the local cache and never tracked in the manifest.
+    Range,
 }
 
 impl fmt::Display for FileType {
@@ -766,6 +769,7 @@ impl fmt::Display for FileType {
         match self {
             FileType::Parquet => write!(f, "parquet"),
             FileType::Puffin(version) => write!(f, "{}.puffin", version),
+            FileType::Range => write!(f, "range"),
         }
     }
 }
@@ -776,6 +780,7 @@ impl FileType {
         match s {
             "parquet" => Some(FileType::Parquet),
             "puffin" => Some(FileType::Puffin(0)),
+            "range" => Some(FileType::Range),
             _ => {
                 // if post-fix with .puffin, try to parse the version
                 if let Some(version_str) = s.strip_suffix(".puffin") {
@@ -792,7 +797,7 @@ impl FileType {
     fn metric_label(&self) -> &'static str {
         match self {
             FileType::Parquet => FILE_TYPE,
-            FileType::Puffin(_) => INDEX_TYPE,
+            FileType::Puffin(_) | FileType::Range => INDEX_TYPE,
         }
     }
 }

@@ -49,7 +49,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ConcreteDataType, FileId, RegionId, TimeSeriesRowSelector};
 
 use crate::cache::cache_size::parquet_meta_size;
-use crate::cache::file_cache::{FileType, IndexKey};
+use crate::cache::file_cache::{FileType, IndexKey, IndexValue};
 use crate::cache::index::inverted_index::{InvertedIndexCache, InvertedIndexCacheRef};
 #[cfg(feature = "vector_index")]
 use crate::cache::index::vector_index::{VectorIndexCache, VectorIndexCacheRef};
@@ -63,6 +63,7 @@ use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
 use crate::sst::parquet::reader::MetadataCacheMetrics;
+use crate::sst::range_index::{SstRangesIndex, parse_sst_ranges_index, write_sst_ranges_index};
 
 /// Metrics type key for sst meta.
 const SST_META_TYPE: &str = "sst_meta";
@@ -80,6 +81,10 @@ const SELECTOR_RESULT_TYPE: &str = "selector_result";
 const RANGE_RESULT_TYPE: &str = "range_result";
 /// Metrics type key for prefilter result cache.
 const PREFILTER_RESULT_TYPE: &str = "prefilter_result";
+/// Metrics type key for the per-SST ranges index cache.
+const PK_RANGE_INDEX_TYPE: &str = "pk_range_index";
+/// Max number of parsed ranges indexes kept in memory.
+const PK_RANGE_INDEX_CACHE_CAPACITY: u64 = 1024;
 const RANGE_RESULT_CONCAT_MEMORY_LIMIT: ReadableSize = ReadableSize::mb(512);
 const RANGE_RESULT_CONCAT_MEMORY_PERMIT: ReadableSize = ReadableSize::kb(1);
 
@@ -492,6 +497,20 @@ impl CacheStrategy {
         }
     }
 
+    /// Calls [CacheManager::load_pk_range_index()].
+    /// Returns None when caching is disabled.
+    pub(crate) async fn load_pk_range_index(
+        &self,
+        file_id: RegionFileId,
+    ) -> Option<Arc<SstRangesIndex>> {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) | CacheStrategy::Compaction(cache_manager) => {
+                cache_manager.load_pk_range_index(file_id).await
+            }
+            CacheStrategy::Disabled => None,
+        }
+    }
+
     /// Calls [CacheManager::remove_parquet_meta_data()].
     pub fn remove_parquet_meta_data(&self, file_id: RegionFileId) {
         match self {
@@ -759,6 +778,8 @@ pub struct CacheManager {
     index_result_cache: Option<IndexResultCache>,
     /// Cache for prefilter result.
     prefilter_result_cache: Option<PrefilterResultCache>,
+    /// In-memory cache for parsed per-SST ranges indexes, keyed by SST file id.
+    pk_range_index_cache: Option<Cache<RegionFileId, Arc<SstRangesIndex>>>,
 }
 
 pub type CacheManagerRef = Arc<CacheManager>;
@@ -1086,6 +1107,94 @@ impl CacheManager {
             cache.insert(key, result);
         }
     }
+
+    /// Gets a parsed ranges index from the in-memory cache only (no IO).
+    pub(crate) fn get_pk_range_index(&self, file_id: RegionFileId) -> Option<Arc<SstRangesIndex>> {
+        let cache = self.pk_range_index_cache.as_ref()?;
+        update_hit_miss(cache.get(&file_id), PK_RANGE_INDEX_TYPE)
+    }
+
+    /// Returns true if a ranges index for `file_id` is present in memory or in the
+    /// local file cache, without parsing it.
+    pub(crate) fn has_pk_range_index(&self, file_id: RegionFileId) -> bool {
+        if let Some(cache) = &self.pk_range_index_cache
+            && cache.contains_key(&file_id)
+        {
+            return true;
+        }
+        if let Some(write_cache) = &self.write_cache {
+            let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
+            return write_cache.file_cache().contains_key(&key);
+        }
+        false
+    }
+
+    /// Loads a parsed ranges index, trying the in-memory cache first and then the
+    /// local file cache. Returns `None` (the scan falls back to reading the
+    /// `__primary_key` column) when the index is not cached or fails to parse.
+    pub(crate) async fn load_pk_range_index(
+        &self,
+        file_id: RegionFileId,
+    ) -> Option<Arc<SstRangesIndex>> {
+        if let Some(index) = self.get_pk_range_index(file_id) {
+            return Some(index);
+        }
+
+        let file_cache = self.write_cache.as_ref()?.file_cache();
+        let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
+        if !file_cache.contains_key(&key) {
+            return None;
+        }
+        let path = file_cache.cache_file_path(key);
+        let bytes = match file_cache.local_store().read(&path).await {
+            Ok(buffer) => buffer.to_bytes(),
+            Err(err) => {
+                warn!(err; "Failed to read ranges index from file cache, path: {path}");
+                return None;
+            }
+        };
+        let index = match parse_sst_ranges_index(bytes) {
+            Ok(index) => Arc::new(index),
+            Err(err) => {
+                warn!(err; "Failed to parse ranges index, path: {path}");
+                return None;
+            }
+        };
+        if let Some(cache) = &self.pk_range_index_cache {
+            cache.insert(file_id, index.clone());
+        }
+        Some(index)
+    }
+
+    /// Writes a ranges index to the local file cache and the in-memory cache.
+    ///
+    /// Does nothing on disk when no write cache is configured, but still keeps the
+    /// parsed index in memory for the current process.
+    pub(crate) async fn store_pk_range_index(
+        &self,
+        file_id: RegionFileId,
+        index: Arc<SstRangesIndex>,
+    ) -> Result<()> {
+        if let Some(write_cache) = &self.write_cache {
+            let file_cache = write_cache.file_cache();
+            let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
+            let path = file_cache.cache_file_path(key);
+            let file_size =
+                write_sst_ranges_index(&file_cache.local_store(), &path, &index).await?;
+            file_cache
+                .put(
+                    key,
+                    IndexValue {
+                        file_size: file_size as u32,
+                    },
+                )
+                .await;
+        }
+        if let Some(cache) = &self.pk_range_index_cache {
+            cache.insert(file_id, index);
+        }
+        Ok(())
+    }
 }
 
 /// Increases selector cache miss metrics.
@@ -1291,6 +1400,7 @@ impl CacheManagerBuilder {
             )),
             index_result_cache,
             prefilter_result_cache,
+            pk_range_index_cache: Some(Cache::new(PK_RANGE_INDEX_CACHE_CAPACITY)),
         }
     }
 }

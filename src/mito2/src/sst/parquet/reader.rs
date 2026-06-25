@@ -500,6 +500,18 @@ impl ParquetReaderBuilder {
 
         let codec = build_primary_key_codec(read_format.metadata());
 
+        // When this file is covered by the pk aggregate index, try to load its
+        // per-SST ranges index so the prefilter can build the PK-group selection
+        // without reading the `__primary_key` column. A cache miss falls back to
+        // the normal tsid-membership prefilter.
+        let pk_range_index = if self.pk_index_tsid_set.is_some() {
+            self.cache_strategy
+                .load_pk_range_index(self.file_handle.file_id())
+                .await
+        } else {
+            None
+        };
+
         let filter_plan = build_reader_filter_plan(
             self.predicate.as_ref(),
             self.expected_metadata.as_deref(),
@@ -507,6 +519,7 @@ impl ParquetReaderBuilder {
             &read_format,
             &codec,
             self.pk_index_tsid_set.as_ref(),
+            pk_range_index,
         );
 
         if self.defer_optional_page_index

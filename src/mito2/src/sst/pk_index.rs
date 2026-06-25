@@ -38,6 +38,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
 use crate::access_layer::AccessLayerRef;
+use crate::cache::{CacheManagerRef, CacheStrategy};
 use crate::error::{
     InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, OpenDalSnafu, ReadParquetSnafu,
     RecordBatchSnafu, Result, WriteParquetSnafu,
@@ -57,10 +58,11 @@ use crate::region::{ManifestContextRef, RegionLeaderState};
 use crate::request::{
     BackgroundNotify, PkIndexBuildFinished, WorkerRequest, WorkerRequestWithTime,
 };
-use crate::sst::file::{FileHandle, FileTimeRange};
+use crate::sst::file::{FileHandle, FileTimeRange, RegionFileId};
 use crate::sst::location::pk_index_file_path;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
+use crate::sst::range_index::build_sst_ranges_index;
 use crate::sst::{DEFAULT_WRITE_BUFFER_SIZE, DEFAULT_WRITE_CONCURRENCY};
 
 const PK_INDEX_WRITE_BATCH_ROWS: usize = 8192;
@@ -87,7 +89,6 @@ pub(crate) struct PkIndexBuildOutput {
     pub(crate) path: String,
 }
 
-#[derive(Debug)]
 pub(crate) struct PkIndexBuildRequest {
     pub(crate) region_id: RegionId,
     pub(crate) metadata: RegionMetadataRef,
@@ -97,6 +98,7 @@ pub(crate) struct PkIndexBuildRequest {
     pub(crate) existing_indexes: HashMap<FileId, AggregatePkIndexMeta>,
     pub(crate) max_sequence: SequenceNumber,
     pub(crate) request_sender: Sender<WorkerRequestWithTime>,
+    pub(crate) cache_manager: CacheManagerRef,
 }
 
 pub(crate) struct PkIndexBuildScheduler {
@@ -138,6 +140,11 @@ impl PkIndexBuildRequest {
     }
 
     async fn run(self) -> Result<()> {
+        // Build per-SST ranges indexes (cache-only, never in the manifest) for the
+        // sparse source files this pk-index pass covers. Done here, independent of
+        // bucket selection, so files keep an index even when the `.pk` is up to date.
+        self.ensure_range_indexes().await;
+
         let buckets = select_pk_index_buckets(
             self.region_id,
             self.files.clone().into_iter(),
@@ -208,6 +215,60 @@ impl PkIndexBuildRequest {
         }
         PK_INDEX_TASK_TOTAL.with_label_values(&["succeeded"]).inc();
         Ok(())
+    }
+
+    /// Builds and caches the per-SST ranges index for each eligible sparse source
+    /// file that does not already have one cached. Best-effort: failures are logged
+    /// and skipped because the index is purely a scan optimization.
+    async fn ensure_range_indexes(&self) {
+        if self.metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse {
+            return;
+        }
+
+        for file in &self.files {
+            let meta = file.meta_ref();
+            if meta.region_id != self.region_id || file.is_deleted() || file.compacting() {
+                continue;
+            }
+            // Only files covered by the pk index (sequence within bound) can use the
+            // ranges index at scan time, so skip the rest.
+            let covered = meta
+                .sequence
+                .map(|seq| seq.get() <= self.max_sequence)
+                .unwrap_or(false);
+            if !covered {
+                continue;
+            }
+
+            let region_file_id = RegionFileId::new(self.region_id, meta.file_id);
+            if self.cache_manager.has_pk_range_index(region_file_id) {
+                continue;
+            }
+
+            let cache_strategy = CacheStrategy::Compaction(self.cache_manager.clone());
+            match build_sst_ranges_index(&self.access_layer, &self.metadata, file, cache_strategy)
+                .await
+            {
+                Ok(index) => {
+                    if let Err(err) = self
+                        .cache_manager
+                        .store_pk_range_index(region_file_id, Arc::new(index))
+                        .await
+                    {
+                        common_telemetry::warn!(
+                            err; "Failed to store ranges index, region: {}, file: {}",
+                            self.region_id, meta.file_id
+                        );
+                    }
+                }
+                Err(err) => {
+                    common_telemetry::warn!(
+                        err; "Failed to build ranges index, region: {}, file: {}",
+                        self.region_id, meta.file_id
+                    );
+                }
+            }
+        }
     }
 
     async fn update_manifest(&self, edit: RegionEdit) -> Result<()> {
@@ -878,6 +939,11 @@ impl PkIndexTsidSet {
         self.covered_files.contains(&file_id)
     }
 
+    /// Returns the resolved `(table_id, tsid)` membership set.
+    pub(crate) fn tsids(&self) -> Arc<HashSet<(u32, u64)>> {
+        self.tsids.clone()
+    }
+
     /// Builds a [`PrimaryKeyFilter`] that keeps rows whose encoded primary key
     /// resolves to a `(table_id, tsid)` in this set.
     pub(crate) fn make_filter(&self, metadata: &RegionMetadataRef) -> Box<dyn PrimaryKeyFilter> {
@@ -1515,6 +1581,84 @@ mod tests {
         assert_eq!(output.meta.source_file_ids, vec![source_file_id]);
         assert_eq!(output.meta.row_count, 2);
         assert!(output.meta.file_size > 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_sst_ranges_index_matches_series_runs() {
+        use common_test_util::temp_dir::create_temp_dir;
+        use object_store::services::Fs;
+        use store_api::region_request::PathType;
+
+        use crate::access_layer::AccessLayer;
+        use crate::cache::CacheStrategy;
+        use crate::sst::index::intermediate::IntermediateManager;
+        use crate::sst::index::puffin_manager::PuffinManagerFactory;
+        use crate::sst::range_index::build_sst_ranges_index;
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let dir = create_temp_dir("range-index-build");
+        let dir_path = dir.path().display().to_string();
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let object_store = ObjectStore::new(Fs::default().root(&dir_path))
+            .unwrap()
+            .finish();
+
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let table_dir = "test_table";
+        let access_layer: AccessLayerRef = Arc::new(AccessLayer::new(
+            table_dir,
+            PathType::Bare,
+            object_store.clone(),
+            puffin_mgr,
+            intm_mgr,
+        ));
+
+        let mut metrics = Metrics::new(WriteType::Flush);
+        let mut writer = ParquetWriter::new_with_object_store(
+            object_store,
+            metadata.clone(),
+            IndexConfig::default(),
+            NoopIndexBuilder,
+            RegionFilePathFactory::new(table_dir.to_string(), PathType::Bare),
+            &mut metrics,
+        )
+        .await;
+        // table_id=1, tsids=[100, 100, 101]: series (1,100) at rows 0..2, (1,101) at 2..3.
+        let batch = sparse_flat_batch(&metadata);
+        let source = FlatSource::new_iter(batch.schema(), Box::new(std::iter::once(Ok(batch))));
+        let sst_info = writer
+            .write_all_flat_as_primary_key(source, None, &WriteOptions::default())
+            .await
+            .unwrap()
+            .remove(0);
+        let source_file = file_handle_from_sst_info(metadata.region_id, sst_info, 10);
+
+        let index = build_sst_ranges_index(
+            &access_layer,
+            &metadata,
+            &source_file,
+            CacheStrategy::Disabled,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.row_ranges(0, &HashSet::from([(1, 100)])), vec![0..2]);
+        assert_eq!(index.row_ranges(0, &HashSet::from([(1, 101)])), vec![2..3]);
+        // Both series are adjacent, so they coalesce into a single range.
+        assert_eq!(
+            index.row_ranges(0, &HashSet::from([(1, 100), (1, 101)])),
+            vec![0..3]
+        );
+        // A series not present in the file selects nothing.
+        assert!(index.row_ranges(0, &HashSet::from([(2, 100)])).is_empty());
     }
 
     #[tokio::test]
