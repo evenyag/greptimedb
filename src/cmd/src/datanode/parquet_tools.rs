@@ -20,7 +20,7 @@ use arrow_array::RecordBatchReader;
 use clap::{Parser, ValueEnum};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+use parquet::basic::{BrotliLevel, Compression, Encoding, GzipLevel, ZstdLevel};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::FileReader;
@@ -123,20 +123,11 @@ struct ColumnChunkMetaView {
     bloom_filter_length: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 struct RewriteProperties {
     writer: WriterConfig,
     columns: Vec<ColumnConfig>,
-}
-
-impl Default for RewriteProperties {
-    fn default() -> Self {
-        Self {
-            writer: WriterConfig::default(),
-            columns: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -145,30 +136,21 @@ struct WriterConfig {
     dictionary_enabled: Option<bool>,
     compression: Option<CompressionConfig>,
     compression_level: Option<u32>,
+    encoding: Option<EncodingConfig>,
     max_row_group_row_count: Option<usize>,
     data_page_size_limit: Option<usize>,
     data_page_row_count_limit: Option<usize>,
     dictionary_page_size_limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 struct ColumnConfig {
     path: Vec<String>,
     dictionary_enabled: Option<bool>,
     compression: Option<CompressionConfig>,
     compression_level: Option<u32>,
-}
-
-impl Default for ColumnConfig {
-    fn default() -> Self {
-        Self {
-            path: Vec::new(),
-            dictionary_enabled: None,
-            compression: None,
-            compression_level: None,
-        }
-    }
+    encoding: Option<EncodingConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +164,16 @@ enum CompressionConfig {
     Lz4,
     Zstd,
     Lz4Raw,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum EncodingConfig {
+    Plain,
+    DeltaBinaryPacked,
+    DeltaLengthByteArray,
+    DeltaByteArray,
+    ByteStreamSplit,
 }
 
 impl ParquetMetaCommand {
@@ -278,7 +270,7 @@ impl ParquetRewriteCommand {
 fn load_metadata_with_page_index(path: &Path) -> error::Result<ParquetMetaData> {
     ParquetMetaDataReader::new()
         .with_page_index_policy(PageIndexPolicy::Optional)
-        .parse_and_finish(&mut open_file(path)?)
+        .parse_and_finish(&open_file(path)?)
         .map_err(|e| parquet_error("read parquet metadata", path, e))
 }
 
@@ -432,6 +424,10 @@ fn infer_rewrite_properties(metadata: &ParquetMetaData) -> RewriteProperties {
         .first()
         .and_then(|row_group| row_group.columns().first());
     let compression = first_column.map(|column| compression_to_config(column.compression()));
+    let max_row_group_row_count = metadata
+        .row_groups()
+        .first()
+        .and_then(|row_group| usize::try_from(row_group.num_rows()).ok());
     let dictionary_enabled = first_column
         .map(|column| column.dictionary_page_offset().is_some())
         .or(Some(true));
@@ -453,6 +449,7 @@ fn infer_rewrite_properties(metadata: &ParquetMetaData) -> RewriteProperties {
                     .map(|chunk| chunk.dictionary_page_offset().is_some()),
                 compression: first_chunk.map(|chunk| compression_to_config(chunk.compression())),
                 compression_level: None,
+                encoding: first_chunk.and_then(infer_data_encoding),
             }
         })
         .collect();
@@ -462,7 +459,8 @@ fn infer_rewrite_properties(metadata: &ParquetMetaData) -> RewriteProperties {
             dictionary_enabled,
             compression,
             compression_level: None,
-            max_row_group_row_count: None,
+            encoding: first_column.and_then(infer_data_encoding),
+            max_row_group_row_count,
             data_page_size_limit: None,
             data_page_row_count_limit: None,
             dictionary_page_size_limit: None,
@@ -495,6 +493,9 @@ fn build_writer_properties(
             config.writer.compression_level,
         )?);
     }
+    if let Some(encoding) = config.writer.encoding {
+        builder = builder.set_encoding(to_parquet_encoding(encoding));
+    }
     if let Some(max_row_group_row_count) = config.writer.max_row_group_row_count {
         if max_row_group_row_count == 0 {
             return illegal_config("max_row_group_row_count must be greater than 0".to_string());
@@ -521,9 +522,12 @@ fn build_writer_properties(
         }
         if let Some(compression) = column.compression {
             builder = builder.set_column_compression(
-                path,
+                path.clone(),
                 to_parquet_compression(compression, column.compression_level)?,
             );
+        }
+        if let Some(encoding) = column.encoding {
+            builder = builder.set_column_encoding(path, to_parquet_encoding(encoding));
         }
     }
 
@@ -636,6 +640,35 @@ fn to_parquet_compression(
         }),
         CompressionConfig::Lz4Raw => Compression::LZ4_RAW,
     })
+}
+
+fn to_parquet_encoding(encoding: EncodingConfig) -> Encoding {
+    match encoding {
+        EncodingConfig::Plain => Encoding::PLAIN,
+        EncodingConfig::DeltaBinaryPacked => Encoding::DELTA_BINARY_PACKED,
+        EncodingConfig::DeltaLengthByteArray => Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        EncodingConfig::DeltaByteArray => Encoding::DELTA_BYTE_ARRAY,
+        EncodingConfig::ByteStreamSplit => Encoding::BYTE_STREAM_SPLIT,
+    }
+}
+
+fn infer_data_encoding(
+    column: &parquet::file::metadata::ColumnChunkMetaData,
+) -> Option<EncodingConfig> {
+    let encodings: Vec<_> = column.encodings().collect();
+    if encodings.contains(&Encoding::DELTA_BINARY_PACKED) {
+        Some(EncodingConfig::DeltaBinaryPacked)
+    } else if encodings.contains(&Encoding::DELTA_LENGTH_BYTE_ARRAY) {
+        Some(EncodingConfig::DeltaLengthByteArray)
+    } else if encodings.contains(&Encoding::DELTA_BYTE_ARRAY) {
+        Some(EncodingConfig::DeltaByteArray)
+    } else if encodings.contains(&Encoding::BYTE_STREAM_SPLIT) {
+        Some(EncodingConfig::ByteStreamSplit)
+    } else if encodings.contains(&Encoding::PLAIN) {
+        Some(EncodingConfig::Plain)
+    } else {
+        None
+    }
 }
 
 fn compression_to_config(compression: Compression) -> CompressionConfig {
