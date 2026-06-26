@@ -57,6 +57,8 @@ use store_api::storage::{FileId, RegionId};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 
+use crate::access_layer::new_fs_cache_store;
+use crate::cache::file_cache::{FileCache, FileCacheRef, RANGE_FILE_DIR};
 use crate::cache::write_cache::{WriteCache, WriteCacheRef};
 use crate::cache::{CacheManager, CacheManagerRef};
 use crate::compaction::CompactionScheduler;
@@ -201,6 +203,7 @@ impl WorkerGroup {
             intermediate_manager.clone(),
         )
         .await?;
+        let range_index_cache = range_index_cache_from_config(&config).await?;
         let cache_manager = Arc::new(
             CacheManager::builder()
                 .sst_meta_cache_size(config.sst_meta_cache_size.as_bytes())
@@ -215,6 +218,7 @@ impl WorkerGroup {
                 .index_result_cache_size(config.index.result_cache_size.as_bytes())
                 .puffin_metadata_size(config.index.metadata_cache_size.as_bytes())
                 .write_cache(write_cache)
+                .range_index_file_cache(Some(range_index_cache))
                 .build(),
         );
         let time_provider = Arc::new(StdTimeProvider);
@@ -417,6 +421,7 @@ impl WorkerGroup {
             intermediate_manager.clone(),
         )
         .await?;
+        let range_index_cache = range_index_cache_from_config(&config).await?;
         let cache_manager = Arc::new(
             CacheManager::builder()
                 .sst_meta_cache_size(config.sst_meta_cache_size.as_bytes())
@@ -426,6 +431,7 @@ impl WorkerGroup {
                 .range_result_cache_size(config.range_result_cache_size.as_bytes())
                 .prefilter_result_cache_size(config.prefilter_result_cache_size.as_bytes())
                 .write_cache(write_cache)
+                .range_index_file_cache(Some(range_index_cache))
                 .build(),
         );
         let total_memory = get_total_memory_bytes();
@@ -524,6 +530,31 @@ pub async fn write_cache_from_config(
     )
     .await?;
     Ok(Some(Arc::new(cache)))
+}
+
+/// Builds the dedicated, always-on file cache for per-SST ranges indexes.
+///
+/// Unlike the write cache, this cache is created regardless of
+/// `enable_write_cache` so the ranges index always persists on disk (under
+/// `{range_index_cache_path}/cache/object/range/`).
+pub(crate) async fn range_index_cache_from_config(config: &MitoConfig) -> Result<FileCacheRef> {
+    tokio::fs::create_dir_all(Path::new(&config.range_index_cache_path))
+        .await
+        .context(CreateDirSnafu {
+            dir: &config.range_index_cache_path,
+        })?;
+
+    let local_store = new_fs_cache_store(&config.range_index_cache_path).await?;
+    let cache = FileCache::new_with_file_dir(
+        local_store,
+        config.range_index_cache_size,
+        None,
+        None,
+        false,
+        RANGE_FILE_DIR,
+    );
+    cache.recover(false, None).await;
+    Ok(Arc::new(cache))
 }
 
 /// Computes a initial check delay for a worker.

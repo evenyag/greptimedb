@@ -50,6 +50,13 @@ use crate::sst::parquet::reader::MetadataCacheMetrics;
 /// This must contain three layers, corresponding to [`build_prometheus_metrics_layer`](object_store::layers::build_prometheus_metrics_layer).
 const FILE_DIR: &str = "cache/object/write/";
 
+/// Subdirectory of cached files for the per-SST ranges index.
+///
+/// Used by the dedicated, always-on ranges index file cache so it can coexist
+/// with the write cache under the same root. Like [`FILE_DIR`], this must contain
+/// three layers.
+pub(crate) const RANGE_FILE_DIR: &str = "cache/object/range/";
+
 /// Default percentage for index (puffin) cache (20% of total capacity).
 pub(crate) const DEFAULT_INDEX_CACHE_PERCENT: u8 = 20;
 
@@ -72,6 +79,8 @@ struct DownloadTask {
 struct FileCacheInner {
     /// Local store to cache files.
     local_store: ObjectStore,
+    /// Subdirectory under the local store root where cached files live.
+    file_dir: &'static str,
     /// Index to track cached Parquet files.
     parquet_index: Cache<IndexKey, IndexValue>,
     /// Index to track cached Puffin files.
@@ -89,7 +98,7 @@ impl FileCacheInner {
 
     /// Returns the cache file path for the key.
     fn cache_file_path(&self, key: IndexKey) -> String {
-        cache_file_path(FILE_DIR, key)
+        cache_file_path(self.file_dir, key)
     }
 
     /// Puts a file into the cache index.
@@ -111,7 +120,7 @@ impl FileCacheInner {
         let now = Instant::now();
         let mut lister = self
             .local_store
-            .lister_with(FILE_DIR)
+            .lister_with(self.file_dir)
             .await
             .context(OpenDalSnafu)?;
         // Use i64 for total_size to reduce the risk of overflow.
@@ -299,13 +308,35 @@ impl FileCache {
         (parquet_capacity, puffin_capacity)
     }
 
-    /// Creates a new file cache.
+    /// Creates a new file cache that stores files under [`FILE_DIR`].
     pub(crate) fn new(
         local_store: ObjectStore,
         capacity: ReadableSize,
         ttl: Option<Duration>,
         index_cache_percent: Option<u8>,
         enable_background_worker: bool,
+    ) -> FileCache {
+        Self::new_with_file_dir(
+            local_store,
+            capacity,
+            ttl,
+            index_cache_percent,
+            enable_background_worker,
+            FILE_DIR,
+        )
+    }
+
+    /// Creates a new file cache that stores files under `file_dir`.
+    ///
+    /// Use this to run a second cache (e.g. the ranges index cache) alongside the
+    /// write cache under the same local store root but a distinct subdirectory.
+    pub(crate) fn new_with_file_dir(
+        local_store: ObjectStore,
+        capacity: ReadableSize,
+        ttl: Option<Duration>,
+        index_cache_percent: Option<u8>,
+        enable_background_worker: bool,
+        file_dir: &'static str,
     ) -> FileCache {
         // Validate and use the provided percent or default
         let index_percent = index_cache_percent
@@ -317,19 +348,23 @@ impl FileCache {
             Self::split_cache_capacities(total_capacity, index_percent);
 
         info!(
-            "Initializing file cache with index_percent: {}%, total_capacity: {}, parquet_capacity: {}, puffin_capacity: {}",
+            "Initializing file cache at {} with index_percent: {}%, total_capacity: {}, parquet_capacity: {}, puffin_capacity: {}",
+            file_dir,
             index_percent,
             ReadableSize(total_capacity),
             ReadableSize(parquet_capacity),
             ReadableSize(puffin_capacity)
         );
 
-        let parquet_index = Self::build_cache(local_store.clone(), parquet_capacity, ttl, "file");
-        let puffin_index = Self::build_cache(local_store.clone(), puffin_capacity, ttl, "index");
+        let parquet_index =
+            Self::build_cache(local_store.clone(), parquet_capacity, ttl, "file", file_dir);
+        let puffin_index =
+            Self::build_cache(local_store.clone(), puffin_capacity, ttl, "index", file_dir);
 
         // Create inner cache shared with background worker
         let inner = Arc::new(FileCacheInner {
             local_store,
+            file_dir,
             parquet_index,
             puffin_index,
         });
@@ -388,6 +423,7 @@ impl FileCache {
         capacity: u64,
         ttl: Option<Duration>,
         label: &'static str,
+        file_dir: &'static str,
     ) -> Cache<IndexKey, IndexValue> {
         let cache_store = local_store;
         let mut builder = Cache::builder()
@@ -399,8 +435,8 @@ impl FileCache {
             .max_capacity(capacity)
             .async_eviction_listener(move |key, value, cause| {
                 let store = cache_store.clone();
-                // Stores files under FILE_DIR.
-                let file_path = cache_file_path(FILE_DIR, *key);
+                // Stores files under the configured file dir.
+                let file_path = cache_file_path(file_dir, *key);
                 async move {
                     if let RemovalCause::Replaced = cause {
                         // The cache is replaced by another file (maybe download again). We don't remove the same

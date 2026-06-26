@@ -166,6 +166,8 @@
 | `region_engine.mito.index_cache_percent` | Integer | `20` | Percentage of write cache capacity allocated for index (puffin) files (default: 20).<br/>The remaining capacity is used for data (parquet) files.<br/>Must be between 0 and 100 (exclusive). For example, with a 5GiB write cache and 20% allocation,<br/>1GiB is reserved for index files and 4GiB for data files. |
 | `region_engine.mito.enable_refill_cache_on_read` | Bool | `true` | Enable refilling cache on read operations (default: true).<br/>When disabled, cache refilling on read won't happen. |
 | `region_engine.mito.manifest_cache_size` | String | `256MB` | Capacity for manifest cache (default: 256MB). |
+| `region_engine.mito.range_index_cache_path` | String | `""` | File system path for the ranges index cache dir's root, defaults to `{data_home}`.<br/>The per-SST ranges index is always cached on disk here (independent of `enable_write_cache`), under the `cache/object/range/` subdirectory. |
+| `region_engine.mito.range_index_cache_size` | String | `1GiB` | Capacity for the ranges index cache (default: 1GB). |
 | `region_engine.mito.sst_write_buffer_size` | String | `8MB` | Buffer size for SST writing. |
 | `region_engine.mito.max_concurrent_scan_files` | Integer | `384` | Maximum number of SST files to scan concurrently. |
 | `region_engine.mito.allow_stale_entries` | Bool | `false` | Whether to allow stale WAL entries read during replay. |
@@ -174,6 +176,7 @@
 | `region_engine.mito.min_compaction_interval` | String | `0m` | Minimum time interval between two compactions.<br/>To align with the old behavior, the default value is 0 (no restrictions). |
 | `region_engine.mito.schedule_compaction_after_edit` | Bool | `true` | Whether to allow to schedule a compaction after a successful region edit.<br/><br/>Setting this to "true" is a necessary but not sufficient condition for scheduling compaction after a region edit.<br/>Other constraints, such as "min_compaction_interval", may still prevent compaction from being scheduled.<br/>Setting this to "false", however, guarantees that compaction will not be scheduled after a region edit. |
 | `region_engine.mito.default_flat_format` | Bool | `true` | Whether to enable flat format as the default SST format. |
+| `region_engine.mito.enable_pk_index_scan` | Bool | `false` | Whether the scanner may use the primary-key aggregate index to resolve the matching tsid set from tag filters. |
 | `region_engine.mito.index` | -- | -- | The options for index in Mito engine. |
 | `region_engine.mito.index.aux_path` | String | `""` | Auxiliary directory path for the index in filesystem, used to store intermediate files for<br/>creating the index and staging files for searching the index, defaults to `{data_home}/index_intermediate`.<br/>The default name for this directory is `index_intermediate` for backward compatibility.<br/><br/>This path contains two subdirectories:<br/>- `__intm`: for storing intermediate files used during creating index.<br/>- `staging`: for storing staging files used during searching index. |
 | `region_engine.mito.index.staging_size` | String | `2GB` | The max capacity of the staging directory. |
@@ -564,6 +567,8 @@
 | `region_engine.mito.index_cache_percent` | Integer | `20` | Percentage of write cache capacity allocated for index (puffin) files (default: 20).<br/>The remaining capacity is used for data (parquet) files.<br/>Must be between 0 and 100 (exclusive). For example, with a 5GiB write cache and 20% allocation,<br/>1GiB is reserved for index files and 4GiB for data files. |
 | `region_engine.mito.enable_refill_cache_on_read` | Bool | `true` | Enable refilling cache on read operations (default: true).<br/>When disabled, cache refilling on read won't happen. |
 | `region_engine.mito.manifest_cache_size` | String | `256MB` | Capacity for manifest cache (default: 256MB). |
+| `region_engine.mito.range_index_cache_path` | String | `""` | File system path for the ranges index cache dir's root, defaults to `{data_home}`.<br/>The per-SST ranges index is always cached on disk here (independent of `enable_write_cache`), under the `cache/object/range/` subdirectory. |
+| `region_engine.mito.range_index_cache_size` | String | `1GiB` | Capacity for the ranges index cache (default: 1GB). |
 | `region_engine.mito.sst_write_buffer_size` | String | `8MB` | Buffer size for SST writing. |
 | `region_engine.mito.max_concurrent_scan_files` | Integer | `384` | Maximum number of SST files to scan concurrently. |
 | `region_engine.mito.allow_stale_entries` | Bool | `false` | Whether to allow stale WAL entries read during replay. |
@@ -572,6 +577,7 @@
 | `region_engine.mito.min_compaction_interval` | String | `0m` | Minimum time interval between two compactions.<br/>To align with the old behavior, the default value is 0 (no restrictions). |
 | `region_engine.mito.schedule_compaction_after_edit` | Bool | `true` | Whether to allow to schedule a compaction after a successful region edit.<br/><br/>Setting this to "true" is a necessary but not sufficient condition for scheduling compaction after a region edit.<br/>Other constraints, such as "min_compaction_interval", may still prevent compaction from being scheduled.<br/>Setting this to "false", however, guarantees that compaction will not be scheduled after a region edit. |
 | `region_engine.mito.default_flat_format` | Bool | `true` | Whether to enable flat format as the default SST format. |
+| `region_engine.mito.enable_pk_index_scan` | Bool | `false` | Whether the scanner may use the primary-key aggregate index to resolve the matching tsid set from tag filters. |
 | `region_engine.mito.index` | -- | -- | The options for index in Mito engine. |
 | `region_engine.mito.index.aux_path` | String | `""` | Auxiliary directory path for the index in filesystem, used to store intermediate files for<br/>creating the index and staging files for searching the index, defaults to `{data_home}/index_intermediate`.<br/>The default name for this directory is `index_intermediate` for backward compatibility.<br/><br/>This path contains two subdirectories:<br/>- `__intm`: for storing intermediate files used during creating index.<br/>- `staging`: for storing staging files used during searching index. |
 | `region_engine.mito.index.staging_size` | String | `2GB` | The max capacity of the staging directory. |

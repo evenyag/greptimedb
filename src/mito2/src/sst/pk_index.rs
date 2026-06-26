@@ -225,6 +225,11 @@ impl PkIndexBuildRequest {
             return;
         }
 
+        let start = Instant::now();
+        let mut candidates = 0;
+        let mut built = 0;
+        let mut skipped_cached = 0;
+        let mut failed = 0;
         for file in &self.files {
             let meta = file.meta_ref();
             if meta.region_id != self.region_id || file.is_deleted() || file.compacting() {
@@ -239,9 +244,11 @@ impl PkIndexBuildRequest {
             if !covered {
                 continue;
             }
+            candidates += 1;
 
             let region_file_id = RegionFileId::new(self.region_id, meta.file_id);
             if self.cache_manager.has_pk_range_index(region_file_id) {
+                skipped_cached += 1;
                 continue;
             }
 
@@ -255,19 +262,35 @@ impl PkIndexBuildRequest {
                         .store_pk_range_index(region_file_id, Arc::new(index))
                         .await
                     {
+                        failed += 1;
                         common_telemetry::warn!(
                             err; "Failed to store ranges index, region: {}, file: {}",
                             self.region_id, meta.file_id
                         );
+                    } else {
+                        built += 1;
                     }
                 }
                 Err(err) => {
+                    failed += 1;
                     common_telemetry::warn!(
                         err; "Failed to build ranges index, region: {}, file: {}",
                         self.region_id, meta.file_id
                     );
                 }
             }
+        }
+
+        if candidates > 0 {
+            common_telemetry::info!(
+                "Ensured per-SST ranges indexes, region: {}, candidates: {}, built: {}, skipped_cached: {}, failed: {}, cost: {:?}",
+                self.region_id,
+                candidates,
+                built,
+                skipped_cached,
+                failed,
+                start.elapsed(),
+            );
         }
     }
 

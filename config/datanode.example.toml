@@ -529,6 +529,13 @@ enable_refill_cache_on_read = true
 ## Capacity for manifest cache (default: 256MB).
 manifest_cache_size = "256MB"
 
+## File system path for the ranges index cache dir's root, defaults to `{data_home}`.
+## The per-SST ranges index is always cached on disk here (independent of `enable_write_cache`), under the `cache/object/range/` subdirectory.
+range_index_cache_path = ""
+
+## Capacity for the ranges index cache (default: 1GB).
+range_index_cache_size = "1GiB"
+
 ## Buffer size for SST writing.
 sst_write_buffer_size = "8MB"
 

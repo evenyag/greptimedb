@@ -49,7 +49,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ConcreteDataType, FileId, RegionId, TimeSeriesRowSelector};
 
 use crate::cache::cache_size::parquet_meta_size;
-use crate::cache::file_cache::{FileType, IndexKey, IndexValue};
+use crate::cache::file_cache::{FileCacheRef, FileType, IndexKey, IndexValue};
 use crate::cache::index::inverted_index::{InvertedIndexCache, InvertedIndexCacheRef};
 #[cfg(feature = "vector_index")]
 use crate::cache::index::vector_index::{VectorIndexCache, VectorIndexCacheRef};
@@ -780,6 +780,8 @@ pub struct CacheManager {
     prefilter_result_cache: Option<PrefilterResultCache>,
     /// In-memory cache for parsed per-SST ranges indexes, keyed by SST file id.
     pk_range_index_cache: Option<Cache<RegionFileId, Arc<SstRangesIndex>>>,
+    /// Dedicated, always-on local file cache for per-SST ranges index files.
+    range_index_file_cache: Option<FileCacheRef>,
 }
 
 pub type CacheManagerRef = Arc<CacheManager>;
@@ -1122,9 +1124,9 @@ impl CacheManager {
         {
             return true;
         }
-        if let Some(write_cache) = &self.write_cache {
+        if let Some(file_cache) = &self.range_index_file_cache {
             let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
-            return write_cache.file_cache().contains_key(&key);
+            return file_cache.contains_key(&key);
         }
         false
     }
@@ -1140,7 +1142,7 @@ impl CacheManager {
             return Some(index);
         }
 
-        let file_cache = self.write_cache.as_ref()?.file_cache();
+        let file_cache = self.range_index_file_cache.as_ref()?;
         let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
         if !file_cache.contains_key(&key) {
             return None;
@@ -1166,17 +1168,17 @@ impl CacheManager {
         Some(index)
     }
 
-    /// Writes a ranges index to the local file cache and the in-memory cache.
+    /// Writes a ranges index to the dedicated ranges index file cache and the
+    /// in-memory cache.
     ///
-    /// Does nothing on disk when no write cache is configured, but still keeps the
-    /// parsed index in memory for the current process.
+    /// Does nothing on disk when no ranges index file cache is configured (e.g. in
+    /// tests), but still keeps the parsed index in memory for the current process.
     pub(crate) async fn store_pk_range_index(
         &self,
         file_id: RegionFileId,
         index: Arc<SstRangesIndex>,
     ) -> Result<()> {
-        if let Some(write_cache) = &self.write_cache {
-            let file_cache = write_cache.file_cache();
+        if let Some(file_cache) = &self.range_index_file_cache {
             let key = IndexKey::new(file_id.region_id(), file_id.file_id(), FileType::Range);
             let path = file_cache.cache_file_path(key);
             let file_size =
@@ -1220,6 +1222,7 @@ pub struct CacheManagerBuilder {
     prefilter_result_cache_size: u64,
     puffin_metadata_size: u64,
     write_cache: Option<WriteCacheRef>,
+    range_index_file_cache: Option<FileCacheRef>,
     selector_result_cache_size: u64,
     range_result_cache_size: u64,
 }
@@ -1246,6 +1249,12 @@ impl CacheManagerBuilder {
     /// Sets write cache.
     pub fn write_cache(mut self, cache: Option<WriteCacheRef>) -> Self {
         self.write_cache = cache;
+        self
+    }
+
+    /// Sets the dedicated file cache for per-SST ranges indexes.
+    pub(crate) fn range_index_file_cache(mut self, cache: Option<FileCacheRef>) -> Self {
+        self.range_index_file_cache = cache;
         self
     }
 
@@ -1401,6 +1410,7 @@ impl CacheManagerBuilder {
             index_result_cache,
             prefilter_result_cache,
             pk_range_index_cache: Some(Cache::new(PK_RANGE_INDEX_CACHE_CAPACITY)),
+            range_index_file_cache: self.range_index_file_cache,
         }
     }
 }

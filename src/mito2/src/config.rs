@@ -141,6 +141,13 @@ pub struct MitoConfig {
     pub enable_refill_cache_on_read: bool,
     /// Capacity for manifest cache (default: 256MB).
     pub manifest_cache_size: ReadableSize,
+    /// File system path for the ranges index cache dir's root, defaults to `{data_home}`.
+    ///
+    /// The per-SST ranges index is always cached on disk here (independent of
+    /// `enable_write_cache`), under the `cache/object/range/` subdirectory.
+    pub range_index_cache_path: String,
+    /// Capacity for the ranges index cache (default: 1GB).
+    pub range_index_cache_size: ReadableSize,
 
     // Other configs:
     /// Buffer size for SST writing.
@@ -223,6 +230,8 @@ impl Default for MitoConfig {
             index_cache_percent: DEFAULT_INDEX_CACHE_PERCENT,
             enable_refill_cache_on_read: true,
             manifest_cache_size: ReadableSize::mb(256),
+            range_index_cache_path: String::new(),
+            range_index_cache_size: ReadableSize::gb(1),
             sst_write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             allow_stale_entries: false,
@@ -309,6 +318,13 @@ impl MitoConfig {
         // Sets write cache path if it is empty.
         if self.write_cache_path.trim().is_empty() {
             self.write_cache_path = data_home.to_string();
+        }
+
+        // Sets ranges index cache path if it is empty. Files are stored under the
+        // `cache/object/range/` subdirectory of this root, so it can share the
+        // data home with the write cache without colliding.
+        if self.range_index_cache_path.trim().is_empty() {
+            self.range_index_cache_path = data_home.to_string();
         }
 
         // Validate index_cache_percent is within valid range (0, 100)

@@ -1947,7 +1947,11 @@ impl RowGroupReaderBuilder {
         };
 
         let file_id = self.file_handle.file_id();
-        let schema_descr = self.arrow_metadata.metadata().file_metadata().schema_descr();
+        let schema_descr = self
+            .arrow_metadata
+            .metadata()
+            .file_metadata()
+            .schema_descr();
 
         let mut data = metrics.data.lock().unwrap();
         let file_columns = data.per_file_column_pages.entry(file_id).or_default();
