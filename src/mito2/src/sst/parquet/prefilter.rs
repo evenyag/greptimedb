@@ -370,6 +370,10 @@ pub(crate) fn build_reader_filter_plan(
     let mut prefilter_physical_filters = Vec::new();
     let mut primary_key_filters = Vec::new();
     let mut pk_filter_contexts = Vec::new();
+    // Directly-prefilterable simple filters (tags in raw mode, fields, timestamp).
+    // Routed to either the prefilter or the post-filter after the loop, depending
+    // on whether the pk-aggr ranges index drives the prefilter.
+    let mut direct_simple_filters = Vec::new();
 
     // `SkipFields` keeps field predicates in the normal read path to avoid a
     // second read of projected field columns, while tags/timestamp can still
@@ -415,7 +419,7 @@ pub(crate) fn build_reader_filter_plan(
                     filter.column_name(),
                     read_format.arrow_schema(),
                 );
-                prefilter_simple_filters.push(filter_ctx);
+                direct_simple_filters.push(filter_ctx);
                 continue;
             }
 
@@ -439,6 +443,22 @@ pub(crate) fn build_reader_filter_plan(
         {
             prefilter_physical_filters.push(filter);
         }
+    }
+
+    // When the pk-aggr ranges index drives the prefilter, it yields the PK-group
+    // selection without reading any column. Keep the directly-prefilterable simple
+    // filters off the prefilter so `execute_prefilter` can take its zero-read fast
+    // path; they are enforced precisely later by the post-filter
+    // (`compute_filter_mask_flat`), which avoids re-reading columns the main read
+    // loads anyway (e.g. the timestamp column). On a ranges-index cache miss
+    // (`pk_range_index` is `None`) the prefilter still reads `__primary_key`, so
+    // the simple filters stay in the prefilter to keep refining the selection.
+    let use_range_index_path =
+        pk_index_tsid_set.is_some() && pk_range_index.is_some() && !primary_key_filters.is_empty();
+    if use_range_index_path {
+        remaining_simple_filters.extend(direct_simple_filters);
+    } else {
+        prefilter_simple_filters.extend(direct_simple_filters);
     }
 
     let pk_filter_expr_strs = (!pk_filter_contexts.is_empty()).then(|| {
@@ -1714,6 +1734,78 @@ mod tests {
         let exprs_b_a = plan_b_a.prefilter_builder.unwrap().pk_filter_expr_strs;
         assert!(exprs_ab.is_some());
         assert_eq!(exprs_ab, exprs_b_a);
+    }
+
+    #[test]
+    fn test_build_reader_filter_plan_routes_timestamp_to_post_filter_on_pk_index_path() {
+        use std::collections::HashSet;
+
+        use datafusion_common::ScalarValue;
+
+        use crate::sst::pk_index::PkIndexTsidSet;
+        use crate::sst::range_index::SstRangesIndex;
+
+        let metadata: RegionMetadataRef = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::from_deduped_column_ids(
+                metadata.column_metadatas.iter().map(|c| c.column_id),
+            ),
+            None,
+            "test",
+            false,
+        )
+        .unwrap();
+        assert!(!read_format.batch_has_raw_pk_columns());
+        let codec = build_primary_key_codec(metadata.as_ref());
+
+        // Tag predicate lowers to the PK group; timestamp predicate is directly
+        // prefilterable.
+        let ts_lit = lit(ScalarValue::TimestampMillisecond(Some(0), None));
+        let predicate = Predicate::new(vec![col("tag_0").eq(lit("a")), col("ts").gt(ts_lit)]);
+        let tsid_set = PkIndexTsidSet::new_for_test(HashSet::from([(1, 1)]));
+        let range_index = Arc::new(SstRangesIndex::default());
+
+        // With the ranges index available, the timestamp filter is moved to the
+        // post-filter and the prefilter does only the tsid/PK-group selection.
+        let plan = build_reader_filter_plan(
+            Some(&predicate),
+            None,
+            PreFilterMode::All,
+            &read_format,
+            &codec,
+            Some(&tsid_set),
+            Some(range_index.clone()),
+        );
+        let builder = plan.prefilter_builder.as_ref().expect("builder present");
+        assert!(builder.filters.is_empty());
+        assert_eq!(
+            remaining_simple_filter_columns(&plan.remaining_simple_filters),
+            vec!["ts"]
+        );
+
+        // Without the ranges index (cache miss), the timestamp filter stays in the
+        // prefilter exactly as before.
+        let plan_no_index = build_reader_filter_plan(
+            Some(&predicate),
+            None,
+            PreFilterMode::All,
+            &read_format,
+            &codec,
+            Some(&tsid_set),
+            None,
+        );
+        let builder = plan_no_index
+            .prefilter_builder
+            .as_ref()
+            .expect("builder present");
+        assert_eq!(
+            remaining_simple_filter_columns(&builder.filters),
+            vec!["ts"]
+        );
+        assert!(plan_no_index.remaining_simple_filters.is_empty());
     }
 
     #[test]

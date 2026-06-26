@@ -957,6 +957,16 @@ pub(crate) struct PkIndexTsidSet {
 }
 
 impl PkIndexTsidSet {
+    /// Builds a set from an explicit `(table_id, tsid)` membership set, used by
+    /// tests in other modules that need a non-empty tsid set.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(tsids: HashSet<(u32, u64)>) -> Self {
+        Self {
+            tsids: Arc::new(tsids),
+            covered_files: HashSet::new(),
+        }
+    }
+
     /// Returns true if `file_id` is covered by one of the used index files.
     pub(crate) fn covers(&self, file_id: FileId) -> bool {
         self.covered_files.contains(&file_id)
