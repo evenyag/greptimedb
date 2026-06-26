@@ -31,6 +31,7 @@ use mito2::sst::parquet::push_decoder::{
     SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
 };
 use mito2::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
+use mito2::sst::parquet::row_selection::{RowGroupSelection, RowGroupSelectionDump};
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -116,6 +117,9 @@ enum ReaderMode {
 struct ParquetScanConfig {
     projection_names: Option<Vec<String>>,
     row_groups: Option<Vec<usize>>,
+    /// Exact per-row-group row selection captured from a real scan. When present it
+    /// overrides `row_groups` and replays the precise rows the original query read.
+    row_selection: Option<RowGroupSelectionDump>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -191,8 +195,22 @@ impl ParquetbenchCommand {
         } else {
             None
         };
-        let row_groups = resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?;
-        let read_all_row_groups = scan_config.row_groups.is_none();
+        // A captured row selection (post-prefilter) takes precedence over `row_groups`:
+        // it pins both the row groups and the exact rows within them.
+        let row_selection = resolve_row_selection(&scan_config, parquet_meta.num_row_groups())?;
+        let row_groups = if let Some(selection) = &row_selection {
+            if scan_config.row_groups.is_some() {
+                println!(
+                    "{} row_selection overrides row_groups; ignoring row_groups",
+                    "ℹ".blue()
+                );
+            }
+            selection.iter().map(|(rg, _)| *rg).collect::<Vec<_>>()
+        } else {
+            resolve_row_groups(&scan_config, parquet_meta.num_row_groups())?
+        };
+        // With an explicit row selection we always scan the selected row groups, never all.
+        let read_all_row_groups = scan_config.row_groups.is_none() && row_selection.is_none();
         let scanned_bytes = scanned_row_group_bytes(&parquet_meta, &row_groups);
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
@@ -226,6 +244,14 @@ impl ParquetbenchCommand {
             projected_columns.as_deref().unwrap_or("all columns").cyan()
         );
         println!("{} Row groups: {}", "✓".green(), row_groups_display.cyan());
+        if let Some(selection) = &row_selection {
+            println!(
+                "{} Row selection: {} rows across {} row groups",
+                "✓".green(),
+                selection.row_count().to_string().cyan(),
+                selection.row_group_count().to_string().cyan(),
+            );
+        }
         if !read_all_row_groups {
             println!(
                 "{} Scanned bytes (selected row groups): {}",
@@ -338,6 +364,7 @@ impl ParquetbenchCommand {
                         parquet_meta.clone(),
                         projection.clone(),
                         row_groups.clone(),
+                        row_selection.clone(),
                         sst_schema.clone(),
                         self.batch_size,
                     )
@@ -352,6 +379,7 @@ impl ParquetbenchCommand {
                         region_meta.clone(),
                         projection_column_ids.clone(),
                         row_groups.clone(),
+                        row_selection.clone(),
                         read_all_row_groups,
                     )
                     .await?
@@ -470,6 +498,7 @@ async fn run_direct_iteration(
     parquet_meta: parquet::file::metadata::ParquetMetaData,
     projection: Option<Vec<usize>>,
     row_groups: Vec<usize>,
+    row_selection: Option<RowGroupSelection>,
     sst_schema: SchemaRef,
     batch_size: usize,
 ) -> error::Result<IterationStats> {
@@ -504,10 +533,14 @@ async fn run_direct_iteration(
             row_group_idx,
             None,
         );
+        // Replay the exact rows for this row group when a captured selection is present.
+        let rg_selection = row_selection
+            .as_ref()
+            .and_then(|selection| selection.get(row_group_idx).cloned());
         let mut stream = build_sst_parquet_record_batch_stream(
             arrow_metadata.clone(),
             row_group_idx,
-            None,
+            rg_selection,
             projection_mask.clone(),
             fetcher,
             file_path.clone(),
@@ -549,6 +582,7 @@ async fn run_flat_prune_iteration(
     region_meta: RegionMetadataRef,
     projection: Option<Vec<ColumnId>>,
     row_groups: Vec<usize>,
+    row_selection: Option<RowGroupSelection>,
     read_all_row_groups: bool,
 ) -> error::Result<IterationStats> {
     let reader_builder = ParquetReaderBuilder::new(table_dir, path_type, file_handle, object_store)
@@ -558,7 +592,7 @@ async fn run_flat_prune_iteration(
     let mut reader_metrics = ReaderMetrics::default();
     let start = Instant::now();
     let mut stats = IterationStats::default();
-    let Some((context, selection)) = reader_builder
+    let Some((context, builder_selection)) = reader_builder
         .build_reader_input(&mut reader_metrics)
         .await
         .map_err(|e| {
@@ -572,6 +606,9 @@ async fn run_flat_prune_iteration(
         return Ok(stats);
     };
 
+    // Replay the captured selection when present; otherwise use the builder's selection
+    // (without a predicate this selects all rows of the requested row groups).
+    let selection = row_selection.unwrap_or(builder_selection);
     let range_builder = FileRangeBuilder::new(Arc::new(context), selection);
     let mut ranges = SmallVec::new();
     if read_all_row_groups {
@@ -711,6 +748,29 @@ fn resolve_row_groups(
         }
         None => Ok((0..num_row_groups).collect()),
     }
+}
+
+/// Reconstructs the captured row selection from the scan config, validating its row
+/// group indices against the parquet file. Returns `None` when no selection is configured.
+fn resolve_row_selection(
+    scan_config: &ParquetScanConfig,
+    num_row_groups: usize,
+) -> error::Result<Option<RowGroupSelection>> {
+    let Some(dump) = &scan_config.row_selection else {
+        return Ok(None);
+    };
+    for row_group_idx in dump.ranges.keys() {
+        if *row_group_idx >= num_row_groups {
+            return Err(error::IllegalConfigSnafu {
+                msg: format!(
+                    "Invalid row group {} in row_selection, parquet file has row groups [0, {})",
+                    row_group_idx, num_row_groups
+                ),
+            }
+            .build());
+        }
+    }
+    Ok(Some(dump.clone().into_selection()))
 }
 
 /// Sums the compressed byte size of the selected row groups, used as the denominator for
@@ -915,12 +975,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scan_config_row_selection() {
+        let config: ParquetScanConfig = serde_json::from_value(json!({
+            "projection_names": ["host"],
+            "row_selection": {
+                "row_group_size": 100,
+                "ranges": { "0": [[5, 15], [25, 35]], "2": [[0, 10]] }
+            }
+        }))
+        .unwrap();
+        let dump = config.row_selection.expect("row_selection present");
+        assert_eq!(dump.row_group_size, 100);
+        assert_eq!(dump.ranges.len(), 2);
+
+        let selection = dump.into_selection();
+        assert_eq!(selection.row_count(), 30);
+        assert_eq!(selection.row_group_count(), 2);
+        assert!(selection.get(0).is_some());
+        assert!(selection.get(2).is_some());
+    }
+
+    #[test]
+    fn test_resolve_row_selection_invalid_row_group() {
+        let config: ParquetScanConfig = serde_json::from_value(json!({
+            "row_selection": { "row_group_size": 100, "ranges": { "5": [[0, 10]] } }
+        }))
+        .unwrap();
+        let err = resolve_row_selection(&config, 3).unwrap_err();
+        assert!(err.to_string().contains("Invalid row group 5"));
+    }
+
+    #[test]
     fn test_resolve_projection_names() {
         let metadata = new_test_metadata();
         let projection = resolve_projection_names(
             &ParquetScanConfig {
                 projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
                 row_groups: None,
+                row_selection: None,
             },
             &metadata,
         )
@@ -935,6 +1027,7 @@ mod tests {
             &ParquetScanConfig {
                 projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
                 row_groups: None,
+                row_selection: None,
             },
             &metadata,
         )
@@ -954,6 +1047,7 @@ mod tests {
                     "__op_type".to_string(),
                 ]),
                 row_groups: None,
+                row_selection: None,
             },
             &metadata,
         )
@@ -968,6 +1062,7 @@ mod tests {
             &ParquetScanConfig {
                 projection_names: Some(vec!["memory".to_string()]),
                 row_groups: None,
+                row_selection: None,
             },
             &metadata,
         )
@@ -992,6 +1087,7 @@ mod tests {
         let config = ParquetScanConfig {
             projection_names: None,
             row_groups: Some(vec![2, 0]),
+            row_selection: None,
         };
         assert_eq!(resolve_row_groups(&config, 4).unwrap(), vec![2, 0]);
     }
@@ -1001,6 +1097,7 @@ mod tests {
         let config = ParquetScanConfig {
             projection_names: None,
             row_groups: Some(vec![3]),
+            row_selection: None,
         };
         let err = resolve_row_groups(&config, 3).unwrap_err();
         assert!(err.to_string().contains("Invalid row group 3"));

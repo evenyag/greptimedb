@@ -18,8 +18,9 @@ mod stream;
 
 #[cfg(feature = "vector_index")]
 use std::collections::BTreeSet;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
@@ -65,7 +66,7 @@ use crate::metrics::{
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::prune::FlatPruneReader;
 use crate::read::read_columns::ReadColumns;
-use crate::sst::file::FileHandle;
+use crate::sst::file::{FileHandle, RegionFileId};
 use crate::sst::index::bloom_filter::applier::{
     BloomFilterIndexApplierRef, BloomFilterIndexApplyMetrics,
 };
@@ -92,12 +93,124 @@ use crate::sst::parquet::push_decoder::{
 };
 use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_plan};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
-use crate::sst::parquet::row_selection::RowGroupSelection;
+use crate::sst::parquet::row_selection::{RowGroupSelection, row_selection_to_ranges};
 use crate::sst::parquet::stats::RowGroupPruningStats;
 use crate::sst::pk_index::PkIndexTsidSet;
 use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
 const INDEX_TYPE_FULLTEXT: &str = "fulltext";
+
+/// Environment variable that enables dumping the per-SST post-prefilter row selection.
+///
+/// When set to a directory path, each scanned SST writes a `parquetbench`-compatible
+/// scan-config JSON (`<dir>/<region_id>_<file_id>.json`) describing the exact rows the
+/// scan read. Unset (the default) disables the dump entirely with zero overhead.
+const ROW_SELECTION_DUMP_ENV: &str = "MITO_ROW_SELECTION_DUMP_DIR";
+
+/// Per-file accumulated state for the row-selection dump.
+struct FileDumpState {
+    /// Number of rows in each row group (all but the last have this size).
+    row_group_size: usize,
+    /// Names of the data columns the reader actually reads (excludes internal columns).
+    projection_names: Vec<String>,
+    /// Maps a row group index to its post-prefilter `[start, end)` ranges.
+    ranges: BTreeMap<usize, Vec<(usize, usize)>>,
+}
+
+/// Process-global registry for the row-selection dump. `None` when the env var is unset.
+#[allow(clippy::type_complexity)]
+static ROW_SELECTION_DUMP: OnceLock<
+    Option<(PathBuf, Mutex<HashMap<RegionFileId, FileDumpState>>)>,
+> = OnceLock::new();
+
+/// Returns the dump target (output dir + registry) if `ROW_SELECTION_DUMP_ENV` is set.
+///
+/// The env var is read once on first access.
+#[allow(clippy::type_complexity)]
+fn row_selection_dump_target()
+-> Option<&'static (PathBuf, Mutex<HashMap<RegionFileId, FileDumpState>>)> {
+    ROW_SELECTION_DUMP
+        .get_or_init(|| {
+            std::env::var_os(ROW_SELECTION_DUMP_ENV)
+                .map(|dir| (PathBuf::from(dir), Mutex::new(HashMap::new())))
+        })
+        .as_ref()
+}
+
+/// Registers the static info (row group size and projected column names) for `file_id`.
+///
+/// Called once per file before its row groups are read so the info is present when
+/// ranges accumulate. No-op when the dump is disabled.
+fn row_selection_dump_register(
+    file_id: RegionFileId,
+    row_group_size: usize,
+    projection_names: Vec<String>,
+) {
+    let Some((_, registry)) = row_selection_dump_target() else {
+        return;
+    };
+    let mut map = registry.lock().unwrap();
+    map.insert(
+        file_id,
+        FileDumpState {
+            row_group_size,
+            projection_names,
+            ranges: BTreeMap::new(),
+        },
+    );
+}
+
+/// Records the post-prefilter `ranges` of one row group and rewrites the file's JSON.
+///
+/// No-op when the dump is disabled. Errors are logged and never fail the scan.
+fn row_selection_dump_record(
+    file_id: RegionFileId,
+    row_group_idx: usize,
+    ranges: Vec<(usize, usize)>,
+) {
+    let Some((dir, registry)) = row_selection_dump_target() else {
+        return;
+    };
+
+    // Update the registry and take a snapshot to serialize without holding the lock.
+    let (row_group_size, projection_names, all_ranges) = {
+        let mut map = registry.lock().unwrap();
+        let state = map.entry(file_id).or_insert_with(|| FileDumpState {
+            row_group_size: 0,
+            projection_names: Vec::new(),
+            ranges: BTreeMap::new(),
+        });
+        state.ranges.insert(row_group_idx, ranges);
+        (
+            state.row_group_size,
+            state.projection_names.clone(),
+            state.ranges.clone(),
+        )
+    };
+
+    // Skip empty groups so the replayed selection only contains rows that were read.
+    let ranges: BTreeMap<usize, Vec<(usize, usize)>> = all_ranges
+        .into_iter()
+        .filter(|(_, r)| !r.is_empty())
+        .collect();
+
+    let value = serde_json::json!({
+        "projection_names": projection_names,
+        "row_selection": {
+            "row_group_size": row_group_size,
+            "ranges": ranges,
+        },
+    });
+
+    let path = dir.join(format!(
+        "{}_{}.json",
+        file_id.region_id().as_u64(),
+        file_id.file_id()
+    ));
+    if let Err(e) = std::fs::write(&path, format!("{value:#}")) {
+        warn!(e; "failed to write row-selection dump to {}", path.display());
+    }
+}
 
 /// Number of leading row groups sampled by [`should_read_pk_as_binary`].
 const MAX_ROW_GROUPS_TO_CHECK_PK: usize = 4;
@@ -456,6 +569,20 @@ impl ParquetReaderBuilder {
             )
         };
 
+        // Capture the projected data column names for the optional row-selection dump
+        // before `read_cols` is moved into the read format. Internal columns are not in
+        // `read_cols` and are always read, matching parquetbench's projection handling.
+        let dump_projection_names = row_selection_dump_target().map(|_| {
+            read_cols
+                .column_ids_iter()
+                .filter_map(|id| {
+                    region_meta
+                        .column_by_id(id)
+                        .map(|col| col.column_schema.name.clone())
+                })
+                .collect::<Vec<_>>()
+        });
+
         let file_metadata = parquet_meta.file_metadata();
         let parquet_schema_desc = file_metadata.schema_descr();
         let file_schema =
@@ -484,6 +611,21 @@ impl ParquetReaderBuilder {
         if selection.is_empty() {
             metrics.build_cost += start.elapsed();
             return Ok(None);
+        }
+
+        // Register the file's static info so the per-row-group dump hook can attach
+        // ranges to it as they are refined during the scan.
+        if let Some(projection_names) = dump_projection_names
+            && parquet_meta.num_row_groups() > 0
+        {
+            let row_group_size = parquet_meta.row_group(0).num_rows() as usize;
+            if row_group_size > 0 {
+                row_selection_dump_register(
+                    self.file_handle.file_id(),
+                    row_group_size,
+                    projection_names,
+                );
+            }
         }
 
         let prune_schema = self
@@ -1842,7 +1984,9 @@ impl RowGroupReaderBuilder {
         let prefilter_ctx = self.prefilter_builder.as_ref().map(|b| b.build());
 
         let Some(mut prefilter_ctx) = prefilter_ctx else {
-            // No prefilter applicable, build stream with full projection.
+            // No prefilter applicable, build stream with full projection. The final
+            // selection is exactly the input selection.
+            self.dump_row_selection(build_ctx.row_group_idx, build_ctx.row_selection.as_ref());
             let stream = self
                 .build_with_projection(
                     build_ctx.row_group_idx,
@@ -1863,6 +2007,7 @@ impl RowGroupReaderBuilder {
         }
 
         let refined_selection = Some(prefilter_result.refined_selection);
+        self.dump_row_selection(build_ctx.row_group_idx, refined_selection.as_ref());
 
         let stream = self
             .build_with_projection(
@@ -1873,6 +2018,22 @@ impl RowGroupReaderBuilder {
             )
             .await?;
         self.make_projected_stream(stream)
+    }
+
+    /// Records the post-prefilter row selection of `row_group_idx` for the optional
+    /// row-selection dump. `None` means the whole row group is read.
+    fn dump_row_selection(&self, row_group_idx: usize, selection: Option<&RowSelection>) {
+        if row_selection_dump_target().is_none() {
+            return;
+        }
+        let ranges = match selection {
+            Some(sel) => row_selection_to_ranges(sel),
+            None => {
+                let rg_rows = self.parquet_meta.row_group(row_group_idx).num_rows() as usize;
+                vec![(0, rg_rows)]
+            }
+        };
+        row_selection_dump_record(self.file_handle.file_id(), row_group_idx, ranges);
     }
 
     fn make_projected_stream(

@@ -18,6 +18,7 @@ use std::ops::Range;
 use index::inverted_index::search::index_apply::ApplyOutput;
 use itertools::Itertools;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use serde::{Deserialize, Serialize};
 
 /// A selection of row groups.
 #[derive(Debug, Clone, Default)]
@@ -483,6 +484,51 @@ impl RowGroupSelection {
             selection_in_rg.entry(rg_id).or_default();
         }
     }
+}
+
+/// A serializable dump of a per-SST row selection.
+///
+/// This is the on-disk shape written by the scan-path dump hook and consumed by the
+/// `parquetbench` dev tool to replay the exact rows a real query read. Only row groups
+/// that have at least one selected row are present in `ranges`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RowGroupSelectionDump {
+    /// Number of rows in each row group (all but the last row group have this size).
+    pub row_group_size: usize,
+    /// Maps a row group index to a list of `[start, end)` row ranges within that row group.
+    pub ranges: BTreeMap<usize, Vec<(usize, usize)>>,
+}
+
+impl RowGroupSelectionDump {
+    /// Reconstructs a [`RowGroupSelection`] from this dump.
+    pub fn into_selection(self) -> RowGroupSelection {
+        let row_ranges = self
+            .ranges
+            .into_iter()
+            .map(|(rg_id, ranges)| {
+                let ranges = ranges.into_iter().map(|(start, end)| start..end).collect();
+                (rg_id, ranges)
+            })
+            .collect();
+        RowGroupSelection::from_row_ranges(row_ranges, self.row_group_size)
+    }
+}
+
+/// Converts a [`RowSelection`] into a list of `[start, end)` row ranges.
+///
+/// Walks the selectors, tracking a running offset, and emits one range per non-skip
+/// selector. Returns an empty vector for an all-skip or empty selection.
+pub(crate) fn row_selection_to_ranges(selection: &RowSelection) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for selector in selection.iter() {
+        let end = offset + selector.row_count;
+        if !selector.skip && selector.row_count > 0 {
+            ranges.push((offset, end));
+        }
+        offset = end;
+    }
+    ranges
 }
 
 /// Ported from `parquet` but trailing rows are removed.
@@ -1227,6 +1273,56 @@ mod tests {
         // Test empty selection
         let empty_selection = RowGroupSelection::from_row_ranges(vec![], row_group_size);
         assert!(!empty_selection.contains_row_group(0));
+    }
+
+    #[test]
+    fn test_row_selection_to_ranges() {
+        // Mixed skip/select.
+        let selection = RowSelection::from(vec![
+            RowSelector::skip(5),
+            RowSelector::select(10),
+            RowSelector::skip(2),
+            RowSelector::select(3),
+        ]);
+        assert_eq!(row_selection_to_ranges(&selection), vec![(5, 15), (17, 20)]);
+
+        // All select.
+        let selection = RowSelection::from(vec![RowSelector::select(10)]);
+        assert_eq!(row_selection_to_ranges(&selection), vec![(0, 10)]);
+
+        // All skip / empty.
+        let selection = RowSelection::from(vec![RowSelector::skip(10)]);
+        assert!(row_selection_to_ranges(&selection).is_empty());
+        let selection = RowSelection::from(vec![]);
+        assert!(row_selection_to_ranges(&selection).is_empty());
+    }
+
+    #[test]
+    fn test_dump_round_trip() {
+        let row_group_size = 100;
+        let ranges = vec![
+            (0, vec![5..15, 25..35]),
+            (1, vec![5..15]),
+            (2, vec![0..5, 10..15]),
+        ];
+        let selection = RowGroupSelection::from_row_ranges(ranges, row_group_size);
+
+        // Build a dump out of the selection by converting each row group's selection.
+        let dump = RowGroupSelectionDump {
+            row_group_size,
+            ranges: selection
+                .iter()
+                .map(|(rg_id, rs)| (*rg_id, row_selection_to_ranges(rs)))
+                .filter(|(_, ranges)| !ranges.is_empty())
+                .collect(),
+        };
+
+        let restored = dump.into_selection();
+        assert_eq!(restored.row_count(), selection.row_count());
+        assert_eq!(restored.row_group_count(), selection.row_group_count());
+        assert_eq!(restored.get(0).unwrap().row_count(), 20);
+        assert_eq!(restored.get(1).unwrap().row_count(), 10);
+        assert_eq!(restored.get(2).unwrap().row_count(), 10);
     }
 
     #[test]
