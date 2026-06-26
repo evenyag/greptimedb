@@ -35,6 +35,7 @@ use mito2::sst::parquet::row_selection::{RowGroupSelection, RowGroupSelectionDum
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::file::metadata::PageIndexPolicy;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use snafu::ResultExt;
@@ -71,7 +72,7 @@ pub struct ParquetbenchCommand {
     #[clap(long, value_name = "FILE")]
     file_path: Option<PathBuf>,
 
-    /// Path to scan request JSON config file (supports projection_names only)
+    /// Path to scan request JSON config file.
     #[clap(long, value_name = "FILE")]
     scan_config: Option<PathBuf>,
 
@@ -121,6 +122,8 @@ enum ReaderMode {
 struct ParquetScanConfig {
     projection_names: Option<Vec<String>>,
     row_groups: Option<Vec<usize>>,
+    /// Enable loading Parquet page indexes for the direct reader.
+    enable_page_index: Option<bool>,
     /// Exact per-row-group row selection captured from a real scan. When present it
     /// overrides `row_groups` and replays the precise rows the original query read.
     row_selection: Option<RowGroupSelectionDump>,
@@ -240,6 +243,7 @@ impl ParquetbenchCommand {
         };
         // With an explicit row selection we always scan the selected row groups, never all.
         let read_all_row_groups = scan_config.row_groups.is_none() && row_selection.is_none();
+        let enable_page_index = scan_config.enable_page_index.unwrap_or(false);
         let scanned_bytes = scanned_row_group_bytes(&parquet_meta, &row_groups);
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
@@ -301,6 +305,16 @@ impl ParquetbenchCommand {
         match self.reader {
             ReaderMode::Direct => {
                 println!("{} Batch size: {}", "✓".green(), self.batch_size);
+                println!(
+                    "{} Page index: {}",
+                    "✓".green(),
+                    if enable_page_index {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                    .cyan()
+                );
             }
             ReaderMode::FlatPrune => {
                 println!(
@@ -396,6 +410,7 @@ impl ParquetbenchCommand {
                         row_selection.clone(),
                         sst_schema.clone(),
                         self.batch_size,
+                        enable_page_index,
                     )
                     .await?
                 }
@@ -715,13 +730,14 @@ async fn run_direct_iteration(
     row_selection: Option<RowGroupSelection>,
     sst_schema: SchemaRef,
     batch_size: usize,
+    enable_page_index: bool,
 ) -> error::Result<IterationStats> {
     let parquet_meta = Arc::new(parquet_meta);
-    let arrow_metadata = ArrowReaderMetadata::try_new(
-        parquet_meta.clone(),
-        ArrowReaderOptions::new().with_schema(sst_schema),
-    )
-    .map_err(|e| {
+    let arrow_reader_options = ArrowReaderOptions::new()
+        .with_schema(sst_schema)
+        .with_page_index_policy(PageIndexPolicy::from(enable_page_index));
+    let arrow_metadata = ArrowReaderMetadata::try_new(parquet_meta.clone(), arrow_reader_options)
+        .map_err(|e| {
         error::IllegalConfigSnafu {
             msg: format!(
                 "Failed to build parquet arrow metadata for {}: {}",
@@ -1281,6 +1297,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scan_config_enable_page_index() {
+        let config: ParquetScanConfig =
+            serde_json::from_value(json!({ "enable_page_index": true })).unwrap();
+        assert_eq!(config.enable_page_index, Some(true));
+    }
+
+    #[test]
+    fn test_default_scan_config_disables_page_index() {
+        assert!(
+            !ParquetScanConfig::default()
+                .enable_page_index
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
     fn test_parse_scan_config_row_selection() {
         let config: ParquetScanConfig = serde_json::from_value(json!({
             "projection_names": ["host"],
@@ -1318,6 +1350,7 @@ mod tests {
             &ParquetScanConfig {
                 projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
                 row_groups: None,
+                enable_page_index: None,
                 row_selection: None,
             },
             &metadata,
@@ -1333,6 +1366,7 @@ mod tests {
             &ParquetScanConfig {
                 projection_names: Some(vec!["cpu".to_string(), "host".to_string()]),
                 row_groups: None,
+                enable_page_index: None,
                 row_selection: None,
             },
             &metadata,
@@ -1353,6 +1387,7 @@ mod tests {
                     "__op_type".to_string(),
                 ]),
                 row_groups: None,
+                enable_page_index: None,
                 row_selection: None,
             },
             &metadata,
@@ -1368,6 +1403,7 @@ mod tests {
             &ParquetScanConfig {
                 projection_names: Some(vec!["memory".to_string()]),
                 row_groups: None,
+                enable_page_index: None,
                 row_selection: None,
             },
             &metadata,
@@ -1393,6 +1429,7 @@ mod tests {
         let config = ParquetScanConfig {
             projection_names: None,
             row_groups: Some(vec![2, 0]),
+            enable_page_index: None,
             row_selection: None,
         };
         assert_eq!(resolve_row_groups(&config, 4).unwrap(), vec![2, 0]);
@@ -1403,6 +1440,7 @@ mod tests {
         let config = ParquetScanConfig {
             projection_names: None,
             row_groups: Some(vec![3]),
+            enable_page_index: None,
             row_selection: None,
         };
         let err = resolve_row_groups(&config, 3).unwrap_err();
