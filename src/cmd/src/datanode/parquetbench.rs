@@ -199,27 +199,34 @@ impl ParquetbenchCommand {
                 .build()
             })?
             .content_length();
+        let scan_config = self.load_scan_config().await?;
+        let enable_page_index = scan_config.enable_page_index.unwrap_or(false);
+        let direct_page_index_enabled = self.reader == ReaderMode::Direct
+            && (enable_page_index || scan_config.row_selection.is_some());
         let mut metadata_metrics = MetadataCacheMetrics::default();
-        let parquet_meta =
-            MetadataLoader::new(source.object_store.clone(), &source.file_path, file_size)
-                .load(&mut metadata_metrics)
-                .await
-                .map_err(|e| {
-                    error::IllegalConfigSnafu {
-                        msg: format!(
-                            "read parquet metadata failed for {}: {:?}",
-                            source.display_path, e
-                        ),
-                    }
-                    .build()
-                })?;
+        let mut metadata_loader =
+            MetadataLoader::new(source.object_store.clone(), &source.file_path, file_size);
+        if direct_page_index_enabled {
+            metadata_loader.with_page_index_policy(PageIndexPolicy::Optional);
+        }
+        let parquet_meta = metadata_loader
+            .load(&mut metadata_metrics)
+            .await
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!(
+                        "read parquet metadata failed for {}: {:?}",
+                        source.display_path, e
+                    ),
+                }
+                .build()
+            })?;
         let region_meta = extract_region_metadata(&source.display_path, &parquet_meta)?;
         if source.table_dir.is_none() {
             source.region_id = region_meta.region_id;
             source.region_id_label = source.region_id.as_u64().to_string();
             source.region_file_id = RegionFileId::new(source.region_id, source.file_id);
         }
-        let scan_config = self.load_scan_config().await?;
         let projection = if self.reader == ReaderMode::Direct {
             resolve_projection_names(&scan_config, &region_meta)?
         } else {
@@ -246,8 +253,6 @@ impl ParquetbenchCommand {
         };
         // With an explicit row selection we always scan the selected row groups, never all.
         let read_all_row_groups = scan_config.row_groups.is_none() && row_selection.is_none();
-        let enable_page_index = scan_config.enable_page_index.unwrap_or(false);
-        let direct_page_index_enabled = enable_page_index || row_selection.is_some();
         let scanned_bytes = scanned_row_group_bytes(&parquet_meta, &row_groups);
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
