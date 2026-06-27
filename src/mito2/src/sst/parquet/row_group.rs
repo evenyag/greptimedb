@@ -18,6 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
+
 use crate::sst::file::RegionFileId;
 use crate::sst::parquet::helper::MERGE_GAP;
 
@@ -28,6 +31,54 @@ pub struct ColumnPageStats {
     pub pages_skipped: usize,
     /// Total number of data pages (skipped + read).
     pub pages_total: usize,
+}
+
+/// Collects Parquet data page skip/total stats for projected leaf columns in a row group.
+///
+/// For each projected leaf column, the number of selected pages equals the number of
+/// byte ranges returned by [`RowSelection::scan_ranges`] (it emits one range per
+/// selected data page without coalescing), so skipped pages are the remaining ones.
+/// Returns an empty map when the offset index is unavailable.
+pub fn collect_column_page_stats_for_row_group(
+    arrow_metadata: &ArrowReaderMetadata,
+    row_group_idx: usize,
+    selection: Option<&RowSelection>,
+    projection: &ProjectionMask,
+) -> BTreeMap<String, ColumnPageStats> {
+    let Some(rg_cols) = arrow_metadata
+        .metadata()
+        .offset_index()
+        .and_then(|offset_index| offset_index.get(row_group_idx))
+    else {
+        return BTreeMap::new();
+    };
+
+    let schema_descr = arrow_metadata.metadata().file_metadata().schema_descr();
+    let mut stats = BTreeMap::new();
+    for (leaf_idx, col) in rg_cols.iter().enumerate() {
+        if !projection.leaf_included(leaf_idx) {
+            continue;
+        }
+
+        let locations = col.page_locations();
+        if locations.is_empty() {
+            continue;
+        }
+
+        let pages_total = locations.len();
+        let pages_skipped = selection
+            .map(|selection| pages_total - selection.scan_ranges(locations).len())
+            .unwrap_or(0);
+        stats.insert(
+            schema_descr.column(leaf_idx).name().to_string(),
+            ColumnPageStats {
+                pages_skipped,
+                pages_total,
+            },
+        );
+    }
+
+    stats
 }
 
 /// Inner data for ParquetFetchMetrics.

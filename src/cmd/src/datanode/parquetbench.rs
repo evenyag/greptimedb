@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +32,7 @@ use mito2::sst::parquet::push_decoder::{
     SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
 };
 use mito2::sst::parquet::reader::{MetadataCacheMetrics, ParquetReaderBuilder, ReaderMetrics};
+use mito2::sst::parquet::row_group::{ColumnPageStats, collect_column_page_stats_for_row_group};
 use mito2::sst::parquet::row_selection::{RowGroupSelection, RowGroupSelectionDump};
 use mito2::sst::{FlatSchemaOptions, to_flat_sst_arrow_schema};
 use parquet::arrow::ProjectionMask;
@@ -137,6 +139,7 @@ struct IterationStats {
     columns: usize,
     /// Schema of the output record batches, captured from the first batch.
     schema: Option<SchemaRef>,
+    column_page_stats: BTreeMap<String, ColumnPageStats>,
     elapsed: Duration,
 }
 
@@ -244,6 +247,7 @@ impl ParquetbenchCommand {
         // With an explicit row selection we always scan the selected row groups, never all.
         let read_all_row_groups = scan_config.row_groups.is_none() && row_selection.is_none();
         let enable_page_index = scan_config.enable_page_index.unwrap_or(false);
+        let direct_page_index_enabled = enable_page_index || row_selection.is_some();
         let scanned_bytes = scanned_row_group_bytes(&parquet_meta, &row_groups);
         let projected_columns = projection_names_display(&scan_config);
         let row_groups_display = row_groups_display(&row_groups, parquet_meta.num_row_groups());
@@ -310,6 +314,8 @@ impl ParquetbenchCommand {
                     "✓".green(),
                     if enable_page_index {
                         "enabled"
+                    } else if direct_page_index_enabled {
+                        "auto-enabled for row selection"
                     } else {
                         "disabled"
                     }
@@ -374,6 +380,7 @@ impl ParquetbenchCommand {
         let mut total_rows_all = 0usize;
         let mut total_batches_all = 0usize;
         let mut schema_printed = false;
+        let mut direct_column_page_stats = BTreeMap::new();
         let file_handle = FileHandle::new(
             FileMeta {
                 region_id: source.region_id,
@@ -410,7 +417,7 @@ impl ParquetbenchCommand {
                         row_selection.clone(),
                         sst_schema.clone(),
                         self.batch_size,
-                        enable_page_index,
+                        direct_page_index_enabled,
                     )
                     .await?
                 }
@@ -443,6 +450,9 @@ impl ParquetbenchCommand {
             total_elapsed_all += stats.elapsed;
             total_rows_all += stats.rows;
             total_batches_all += stats.record_batches;
+            if self.reader == ReaderMode::Direct && !stats.column_page_stats.is_empty() {
+                direct_column_page_stats = stats.column_page_stats.clone();
+            }
 
             if !schema_printed && let Some(schema) = &stats.schema {
                 println!(
@@ -526,6 +536,11 @@ impl ParquetbenchCommand {
                 avg_elapsed,
                 self.iterations
             );
+        }
+
+        if self.reader == ReaderMode::Direct && !direct_column_page_stats.is_empty() {
+            println!("\n{} Column page stats:", "✓".green());
+            print_column_page_stats(&direct_column_page_stats);
         }
 
         println!("\n{}", "Benchmark completed!".green().bold());
@@ -767,6 +782,15 @@ async fn run_direct_iteration(
         let rg_selection = row_selection
             .as_ref()
             .and_then(|selection| selection.get(row_group_idx).cloned());
+        merge_column_page_stats(
+            &mut stats.column_page_stats,
+            collect_column_page_stats_for_row_group(
+                &arrow_metadata,
+                row_group_idx,
+                rg_selection.as_ref(),
+                &projection_mask,
+            ),
+        );
         let mut stream = build_sst_parquet_record_batch_stream(
             arrow_metadata.clone(),
             row_group_idx,
@@ -801,6 +825,29 @@ async fn run_direct_iteration(
     }
     stats.elapsed = start.elapsed();
     Ok(stats)
+}
+
+fn merge_column_page_stats(
+    target: &mut BTreeMap<String, ColumnPageStats>,
+    source: BTreeMap<String, ColumnPageStats>,
+) {
+    for (column, stats) in source {
+        let entry = target.entry(column).or_default();
+        entry.pages_total += stats.pages_total;
+        entry.pages_skipped += stats.pages_skipped;
+    }
+}
+
+fn print_column_page_stats(stats: &BTreeMap<String, ColumnPageStats>) {
+    for (column, stats) in stats {
+        println!(
+            "    - {}: pages_total={}, pages_skipped={}, pages_read={}",
+            column.cyan(),
+            stats.pages_total,
+            stats.pages_skipped,
+            stats.pages_total - stats.pages_skipped
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1445,6 +1492,43 @@ mod tests {
         };
         let err = resolve_row_groups(&config, 3).unwrap_err();
         assert!(err.to_string().contains("Invalid row group 3"));
+    }
+
+    #[test]
+    fn test_merge_column_page_stats() {
+        let mut target = BTreeMap::from([(
+            "cpu".to_string(),
+            ColumnPageStats {
+                pages_skipped: 1,
+                pages_total: 4,
+            },
+        )]);
+        let source = BTreeMap::from([
+            (
+                "cpu".to_string(),
+                ColumnPageStats {
+                    pages_skipped: 2,
+                    pages_total: 5,
+                },
+            ),
+            (
+                "host".to_string(),
+                ColumnPageStats {
+                    pages_skipped: 0,
+                    pages_total: 3,
+                },
+            ),
+        ]);
+
+        merge_column_page_stats(&mut target, source);
+
+        let cpu = target.get("cpu").unwrap();
+        assert_eq!(cpu.pages_skipped, 3);
+        assert_eq!(cpu.pages_total, 9);
+
+        let host = target.get("host").unwrap();
+        assert_eq!(host.pages_skipped, 0);
+        assert_eq!(host.pages_total, 3);
     }
 
     #[test]

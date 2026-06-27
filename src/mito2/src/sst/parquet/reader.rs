@@ -92,7 +92,9 @@ use crate::sst::parquet::push_decoder::{
     SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
 };
 use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_plan};
-use crate::sst::parquet::row_group::ParquetFetchMetrics;
+use crate::sst::parquet::row_group::{
+    ParquetFetchMetrics, collect_column_page_stats_for_row_group,
+};
 use crate::sst::parquet::row_selection::{RowGroupSelection, row_selection_to_ranges};
 use crate::sst::parquet::stats::RowGroupPruningStats;
 use crate::sst::pk_index::PkIndexTsidSet;
@@ -2098,47 +2100,30 @@ impl RowGroupReaderBuilder {
         projection: &ProjectionMask,
         metrics: &ParquetFetchMetrics,
     ) {
-        let Some(rg_cols) = self
-            .arrow_metadata
-            .metadata()
-            .offset_index()
-            .and_then(|offset_index| offset_index.get(row_group_idx))
-        else {
+        let column_page_stats = collect_column_page_stats_for_row_group(
+            &self.arrow_metadata,
+            row_group_idx,
+            Some(selection),
+            projection,
+        );
+        if column_page_stats.is_empty() {
             return;
-        };
-
-        let file_id = self.file_handle.file_id();
-        let schema_descr = self
-            .arrow_metadata
-            .metadata()
-            .file_metadata()
-            .schema_descr();
-
-        let mut data = metrics.data.lock().unwrap();
-        let file_columns = data.per_file_column_pages.entry(file_id).or_default();
-        let mut total_pages = 0;
-        let mut skipped_pages = 0;
-        for (leaf_idx, col) in rg_cols.iter().enumerate() {
-            if !projection.leaf_included(leaf_idx) {
-                continue;
-            }
-            let locations = col.page_locations();
-            if locations.is_empty() {
-                continue;
-            }
-            let total = locations.len();
-            let skipped = total - selection.scan_ranges(locations).len();
-            let column_stats = file_columns
-                .entry(schema_descr.column(leaf_idx).name().to_string())
-                .or_default();
-            column_stats.pages_total += total;
-            column_stats.pages_skipped += skipped;
-            total_pages += total;
-            skipped_pages += skipped;
         }
 
-        data.pages_total += total_pages;
-        data.pages_skipped += skipped_pages;
+        let file_id = self.file_handle.file_id();
+        let mut data = metrics.data.lock().unwrap();
+        let file_columns = data.per_file_column_pages.entry(file_id).or_default();
+        let mut pages_total = 0;
+        let mut pages_skipped = 0;
+        for (column, stats) in column_page_stats {
+            let column_stats = file_columns.entry(column).or_default();
+            column_stats.pages_total += stats.pages_total;
+            column_stats.pages_skipped += stats.pages_skipped;
+            pages_total += stats.pages_total;
+            pages_skipped += stats.pages_skipped;
+        }
+        data.pages_total += pages_total;
+        data.pages_skipped += pages_skipped;
     }
 }
 
