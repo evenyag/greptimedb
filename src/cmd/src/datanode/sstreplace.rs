@@ -88,13 +88,13 @@ impl SstReplaceCommand {
         let object_store = build_object_store(&store_cfg).await?;
         println!("{} Object store initialized", "[ok]".green());
 
-        let stats = ManifestStats::default();
         let candidates = path_type
             .map(|path_type| vec![path_type])
             .unwrap_or_else(|| vec![PathType::Bare, PathType::Data, PathType::Metadata]);
         let mut found = None;
         let mut existing_manifests = Vec::new();
         for candidate in candidates {
+            let stats = ManifestStats::default();
             let region_dir = region_dir_from_table_dir(&self.table_dir, region_id, candidate);
             let manifest_opts = RegionManifestOptions {
                 manifest_dir: mito2::manifest::storage::manifest_dir(&region_dir),
