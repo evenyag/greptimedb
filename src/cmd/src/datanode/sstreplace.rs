@@ -25,7 +25,6 @@ use mito2::sst::location::{region_dir_from_table_dir, sst_file_path};
 use object_store::ObjectStore;
 use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
-use snafu::OptionExt;
 use store_api::region_request::PathType;
 use store_api::storage::{FileId, RegionId};
 
@@ -59,8 +58,8 @@ pub struct SstReplaceCommand {
     #[clap(long, value_name = "PATH", conflicts_with = "replacement_file")]
     replacement_object: Option<String>,
 
-    /// Path type for the region: bare, data, metadata.
-    #[clap(long, default_value = "bare")]
+    /// Path type for the region: auto, bare, data, metadata.
+    #[clap(long, default_value = "auto")]
     path_type: String,
 
     /// Actually overwrite the SST object and append a manifest delta.
@@ -89,40 +88,65 @@ impl SstReplaceCommand {
         let object_store = build_object_store(&store_cfg).await?;
         println!("{} Object store initialized", "[ok]".green());
 
-        let region_dir = region_dir_from_table_dir(&self.table_dir, region_id, path_type);
-        let manifest_opts = RegionManifestOptions {
-            manifest_dir: mito2::manifest::storage::manifest_dir(&region_dir),
-            object_store: object_store.clone(),
-            compress_type: manifest_compress_type(mito_config.compress_manifest),
-            checkpoint_distance: mito_config.manifest_checkpoint_distance,
-            remove_file_options: RemoveFileOptions {
-                enable_gc: mito_config.gc.enable,
-            },
-            manifest_cache: None,
-        };
-
         let stats = ManifestStats::default();
-        let mut manifest_manager = RegionManifestManager::open(manifest_opts, &stats)
-            .await
-            .map_err(|e| {
+        let candidates = path_type
+            .map(|path_type| vec![path_type])
+            .unwrap_or_else(|| vec![PathType::Bare, PathType::Data, PathType::Metadata]);
+        let mut found = None;
+        let mut existing_manifests = Vec::new();
+        for candidate in candidates {
+            let region_dir = region_dir_from_table_dir(&self.table_dir, region_id, candidate);
+            let manifest_opts = RegionManifestOptions {
+                manifest_dir: mito2::manifest::storage::manifest_dir(&region_dir),
+                object_store: object_store.clone(),
+                compress_type: manifest_compress_type(mito_config.compress_manifest),
+                checkpoint_distance: mito_config.manifest_checkpoint_distance,
+                remove_file_options: RemoveFileOptions {
+                    enable_gc: mito_config.gc.enable,
+                },
+                manifest_cache: None,
+            };
+            let Some(manifest_manager) = RegionManifestManager::open(manifest_opts, &stats)
+                .await
+                .map_err(|e| {
                 error::IllegalConfigSnafu {
-                    msg: format!("open manifest failed: {e:?}"),
+                    msg: format!("open {} manifest failed: {e:?}", path_type_name(candidate)),
                 }
                 .build()
             })?
-            .with_context(|| error::IllegalConfigSnafu {
-                msg: format!("region manifest not found for {}", region_id),
-            })?;
-        let manifest = manifest_manager.manifest();
-        let old_file = manifest
-            .files
-            .get(&file_id)
-            .with_context(|| error::IllegalConfigSnafu {
-                msg: format!(
-                    "file {} not found in manifest for region {}",
-                    file_id, region_id
-                ),
-            })?;
+            else {
+                continue;
+            };
+            existing_manifests.push(path_type_name(candidate));
+            let manifest = manifest_manager.manifest();
+            if let Some(file) = manifest.files.get(&file_id) {
+                if found.is_some() {
+                    return error::IllegalConfigSnafu {
+                        msg: format!(
+                            "file {} exists in multiple manifests under region {}; specify --path-type",
+                            file_id, region_id
+                        ),
+                    }
+                    .fail();
+                }
+                found = Some((candidate, manifest_manager, file.clone()));
+            }
+        }
+        let Some((path_type, mut manifest_manager, old_file)) = found else {
+            let suffix = if existing_manifests.is_empty() {
+                "no manifest found".to_string()
+            } else {
+                format!(
+                    "manifests found for [{}], but none contains file {}",
+                    existing_manifests.join(", "),
+                    file_id
+                )
+            };
+            return error::IllegalConfigSnafu {
+                msg: format!("region manifest not found for {}: {}", region_id, suffix),
+            }
+            .fail();
+        };
 
         let region_file_id = RegionFileId::new(old_file.region_id, old_file.file_id);
         let target_path = sst_file_path(&self.table_dir, region_file_id, path_type);
@@ -142,7 +166,7 @@ impl SstReplaceCommand {
         })?;
         let new_num_rows = parquet_meta.file_metadata().num_rows() as u64;
         let new_num_row_groups = parquet_meta.num_row_groups() as u64;
-        validate_replacement(old_file, new_num_rows, new_num_row_groups)?;
+        validate_replacement(&old_file, new_num_rows, new_num_row_groups)?;
 
         let mut new_file = old_file.clone();
         new_file.file_size = new_file_size;
@@ -354,14 +378,26 @@ fn parse_region_id(s: &str) -> error::Result<RegionId> {
     }
 }
 
-fn parse_path_type(s: &str) -> error::Result<PathType> {
+fn parse_path_type(s: &str) -> error::Result<Option<PathType>> {
     match s.to_lowercase().as_str() {
-        "bare" => Ok(PathType::Bare),
-        "data" => Ok(PathType::Data),
-        "metadata" => Ok(PathType::Metadata),
+        "auto" => Ok(None),
+        "bare" => Ok(Some(PathType::Bare)),
+        "data" => Ok(Some(PathType::Data)),
+        "metadata" => Ok(Some(PathType::Metadata)),
         _ => error::IllegalConfigSnafu {
-            msg: format!("invalid path_type '{}', expected: bare, data, metadata", s),
+            msg: format!(
+                "invalid path_type '{}', expected: auto, bare, data, metadata",
+                s
+            ),
         }
         .fail(),
+    }
+}
+
+fn path_type_name(path_type: PathType) -> &'static str {
+    match path_type {
+        PathType::Bare => "bare",
+        PathType::Data => "data",
+        PathType::Metadata => "metadata",
     }
 }
