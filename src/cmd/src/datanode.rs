@@ -20,6 +20,8 @@ pub(crate) mod objbench;
 mod parquetbench;
 #[allow(clippy::print_stdout)]
 mod scanbench;
+#[allow(clippy::print_stdout)]
+mod sstreplace;
 
 use std::path::Path;
 use std::time::Duration;
@@ -43,6 +45,7 @@ use crate::datanode::objbench::ObjbenchCommand;
 #[cfg(feature = "dev-tools")]
 use crate::datanode::parquetbench::ParquetbenchCommand;
 use crate::datanode::scanbench::ScanbenchCommand;
+use crate::datanode::sstreplace::SstReplaceCommand;
 use crate::error::{
     LoadLayeredConfigSnafu, MissingConfigSnafu, Result, ShutdownDatanodeSnafu, StartDatanodeSnafu,
 };
@@ -114,7 +117,9 @@ impl Command {
         match &self.subcmd {
             SubCommand::Start(cmd) => cmd.load_options(global_options),
             // Bench commands are standalone utilities and don't need to load DatanodeOptions.
-            SubCommand::Objbench(_) | SubCommand::Scanbench(_) => Self::default_bench_options(),
+            SubCommand::Objbench(_) | SubCommand::Scanbench(_) | SubCommand::SstReplace(_) => {
+                Self::default_bench_options()
+            }
             #[cfg(feature = "dev-tools")]
             SubCommand::Parquetbench(_) => Self::default_bench_options(),
         }
@@ -140,6 +145,8 @@ pub enum SubCommand {
     Objbench(ObjbenchCommand),
     /// Scan benchmark tool - benchmarks scanning a region directly from storage
     Scanbench(ScanbenchCommand),
+    /// Replace a mito region SST and update its manifest metadata
+    SstReplace(SstReplaceCommand),
     /// Benchmark scanning a single parquet SST.
     #[cfg(feature = "dev-tools")]
     Parquetbench(ParquetbenchCommand),
@@ -157,6 +164,10 @@ impl SubCommand {
                 std::process::exit(0);
             }
             SubCommand::Scanbench(cmd) => {
+                cmd.run().await?;
+                std::process::exit(0);
+            }
+            SubCommand::SstReplace(cmd) => {
                 cmd.run().await?;
                 std::process::exit(0);
             }

@@ -1,0 +1,367 @@
+// Copyright 2023 Greptime Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::path::PathBuf;
+
+use clap::Parser;
+use colored::Colorize;
+use mito2::manifest::action::{RegionEdit, RegionMetaAction, RegionMetaActionList};
+use mito2::manifest::manager::{RegionManifestManager, RegionManifestOptions, RemoveFileOptions};
+use mito2::manifest::storage::manifest_compress_type;
+use mito2::region::ManifestStats;
+use mito2::sst::file::RegionFileId;
+use mito2::sst::location::{region_dir_from_table_dir, sst_file_path};
+use object_store::ObjectStore;
+use parquet::file::FOOTER_SIZE;
+use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
+use snafu::OptionExt;
+use store_api::region_request::PathType;
+use store_api::storage::{FileId, RegionId};
+
+use crate::datanode::objbench::{build_object_store, parse_config};
+use crate::error;
+
+/// Replace a mito region SST and update the corresponding manifest metadata.
+#[derive(Debug, Parser)]
+pub struct SstReplaceCommand {
+    /// Path to config TOML file (same format as standalone/datanode config).
+    #[clap(long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Region ID: either numeric u64 (e.g. "4398046511104") or "table_id:region_num" (e.g. "1024:0").
+    #[clap(long)]
+    region_id: String,
+
+    /// Table directory relative to data home (e.g. "data/greptime/public/1024/").
+    #[clap(long)]
+    table_dir: String,
+
+    /// SST file id to replace.
+    #[clap(long)]
+    file_id: String,
+
+    /// Local parquet file used as the replacement.
+    #[clap(long, value_name = "FILE", conflicts_with = "replacement_object")]
+    replacement_file: Option<PathBuf>,
+
+    /// Object-store parquet path used as the replacement.
+    #[clap(long, value_name = "PATH", conflicts_with = "replacement_file")]
+    replacement_object: Option<String>,
+
+    /// Path type for the region: bare, data, metadata.
+    #[clap(long, default_value = "bare")]
+    path_type: String,
+
+    /// Actually overwrite the SST object and append a manifest delta.
+    #[clap(long, default_value_t = false)]
+    confirm: bool,
+
+    /// Verbose output.
+    #[clap(short, long, default_value_t = false)]
+    verbose: bool,
+}
+
+impl SstReplaceCommand {
+    pub async fn run(&self) -> error::Result<()> {
+        if self.verbose {
+            common_telemetry::init_default_ut_logging();
+        }
+
+        println!("{}", "Starting sstreplace...".cyan().bold());
+
+        let region_id = parse_region_id(&self.region_id)?;
+        let file_id = parse_file_id(&self.file_id)?;
+        let path_type = parse_path_type(&self.path_type)?;
+        let replacement = self.replacement()?;
+
+        let (store_cfg, mito_config, _wal_config) = parse_config(&self.config)?;
+        let object_store = build_object_store(&store_cfg).await?;
+        println!("{} Object store initialized", "[ok]".green());
+
+        let region_dir = region_dir_from_table_dir(&self.table_dir, region_id, path_type);
+        let manifest_opts = RegionManifestOptions {
+            manifest_dir: mito2::manifest::storage::manifest_dir(&region_dir),
+            object_store: object_store.clone(),
+            compress_type: manifest_compress_type(mito_config.compress_manifest),
+            checkpoint_distance: mito_config.manifest_checkpoint_distance,
+            remove_file_options: RemoveFileOptions {
+                enable_gc: mito_config.gc.enable,
+            },
+            manifest_cache: None,
+        };
+
+        let stats = ManifestStats::default();
+        let mut manifest_manager = RegionManifestManager::open(manifest_opts, &stats)
+            .await
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("open manifest failed: {e:?}"),
+                }
+                .build()
+            })?
+            .with_context(|| error::IllegalConfigSnafu {
+                msg: format!("region manifest not found for {}", region_id),
+            })?;
+        let manifest = manifest_manager.manifest();
+        let old_file = manifest
+            .files
+            .get(&file_id)
+            .with_context(|| error::IllegalConfigSnafu {
+                msg: format!(
+                    "file {} not found in manifest for region {}",
+                    file_id, region_id
+                ),
+            })?;
+
+        let region_file_id = RegionFileId::new(old_file.region_id, old_file.file_id);
+        let target_path = sst_file_path(&self.table_dir, region_file_id, path_type);
+        let target_stat = object_store.stat(&target_path).await.map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("stat target SST {} failed: {e}", target_path),
+            }
+            .build()
+        })?;
+        let replacement_bytes = load_replacement_bytes(&object_store, replacement).await?;
+        let new_file_size = replacement_bytes.len() as u64;
+        let parquet_meta = decode_parquet_metadata(&replacement_bytes).map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("read replacement parquet metadata failed: {e}"),
+            }
+            .build()
+        })?;
+        let new_num_rows = parquet_meta.file_metadata().num_rows() as u64;
+        let new_num_row_groups = parquet_meta.num_row_groups() as u64;
+        validate_replacement(old_file, new_num_rows, new_num_row_groups)?;
+
+        let mut new_file = old_file.clone();
+        new_file.file_size = new_file_size;
+        new_file.num_rows = new_num_rows;
+        new_file.num_row_groups = new_num_row_groups;
+        new_file.max_row_group_uncompressed_size = max_row_group_uncompressed_size(&parquet_meta);
+
+        println!("{} Region: {}", "[ok]".green(), region_id);
+        println!("{} Target SST: {}", "[ok]".green(), target_path.cyan());
+        println!(
+            "{} Size: {} -> {} bytes",
+            "[ok]".green(),
+            target_stat.content_length(),
+            new_file_size
+        );
+        println!(
+            "{} Rows: {}, row groups: {}",
+            "[ok]".green(),
+            new_num_rows,
+            new_num_row_groups
+        );
+
+        if !self.confirm {
+            println!(
+                "{} Dry run only. Re-run with --confirm to overwrite the SST and update the manifest.",
+                "[dry-run]".yellow()
+            );
+            return Ok(());
+        }
+
+        object_store
+            .write(&target_path, replacement_bytes)
+            .await
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("write replacement SST {} failed: {e}", target_path),
+                }
+                .build()
+            })?;
+
+        let edit = RegionEdit {
+            files_to_add: vec![new_file],
+            files_to_remove: vec![],
+            pk_indexes_to_add: vec![],
+            pk_indexes_to_remove: vec![],
+            timestamp_ms: None,
+            compaction_time_window: None,
+            flushed_entry_id: None,
+            flushed_sequence: None,
+            committed_sequence: None,
+        };
+        let version = manifest_manager
+            .update(
+                RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
+                false,
+            )
+            .await
+            .map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("update manifest failed: {e:?}"),
+                }
+                .build()
+            })?;
+
+        println!(
+            "{} Replacement committed, manifest version {}",
+            "[ok]".green(),
+            version
+        );
+        Ok(())
+    }
+
+    fn replacement(&self) -> error::Result<Replacement<'_>> {
+        match (&self.replacement_file, &self.replacement_object) {
+            (Some(path), None) => Ok(Replacement::Local(path)),
+            (None, Some(path)) => Ok(Replacement::Object(path)),
+            _ => error::IllegalConfigSnafu {
+                msg: "specify exactly one of --replacement-file or --replacement-object"
+                    .to_string(),
+            }
+            .fail(),
+        }
+    }
+}
+
+enum Replacement<'a> {
+    Local(&'a PathBuf),
+    Object(&'a str),
+}
+
+async fn load_replacement_bytes(
+    object_store: &ObjectStore,
+    replacement: Replacement<'_>,
+) -> error::Result<Vec<u8>> {
+    match replacement {
+        Replacement::Local(path) => tokio::fs::read(path).await.map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("read replacement file {} failed: {e}", path.display()),
+            }
+            .build()
+        }),
+        Replacement::Object(path) => {
+            object_store
+                .read(path)
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| {
+                    error::IllegalConfigSnafu {
+                        msg: format!("read replacement object {} failed: {e}", path),
+                    }
+                    .build()
+                })
+        }
+    }
+}
+
+fn validate_replacement(
+    old_file: &mito2::sst::file::FileMeta,
+    new_num_rows: u64,
+    new_num_row_groups: u64,
+) -> error::Result<()> {
+    if old_file.num_rows != 0 && old_file.num_rows != new_num_rows {
+        return error::IllegalConfigSnafu {
+            msg: format!(
+                "replacement row count mismatch: manifest has {}, replacement has {}",
+                old_file.num_rows, new_num_rows
+            ),
+        }
+        .fail();
+    }
+    if old_file.num_row_groups != 0 && old_file.num_row_groups != new_num_row_groups {
+        return error::IllegalConfigSnafu {
+            msg: format!(
+                "replacement row group count mismatch: manifest has {}, replacement has {}",
+                old_file.num_row_groups, new_num_row_groups
+            ),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
+fn max_row_group_uncompressed_size(meta: &parquet::file::metadata::ParquetMetaData) -> u64 {
+    meta.row_groups()
+        .iter()
+        .map(|rg| {
+            rg.columns()
+                .iter()
+                .map(|c| c.uncompressed_size() as u64)
+                .sum::<u64>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn decode_parquet_metadata(
+    data: &[u8],
+) -> Result<parquet::file::metadata::ParquetMetaData, Box<dyn std::error::Error + Send + Sync>> {
+    if data.len() < FOOTER_SIZE {
+        return Err("file too small".into());
+    }
+    let footer_start = data.len() - FOOTER_SIZE;
+    let mut footer = [0; FOOTER_SIZE];
+    footer.copy_from_slice(&data[footer_start..]);
+    let footer = FooterTail::try_new(&footer)?;
+    let metadata_len = footer.metadata_length() as usize;
+    if footer_start < metadata_len {
+        return Err("invalid footer/metadata length".into());
+    }
+    let metadata_start = footer_start - metadata_len;
+    Ok(ParquetMetaDataReader::decode_metadata(
+        &data[metadata_start..footer_start],
+    )?)
+}
+
+fn parse_file_id(s: &str) -> error::Result<FileId> {
+    FileId::parse_str(s).map_err(|e| {
+        error::IllegalConfigSnafu {
+            msg: format!("invalid file_id '{}': {}", s, e),
+        }
+        .build()
+    })
+}
+
+fn parse_region_id(s: &str) -> error::Result<RegionId> {
+    if s.contains(':') {
+        let parts: Vec<&str> = s.splitn(2, ':').collect();
+        let table_id: u32 = parts[0].parse().map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("invalid table_id in region_id '{}': {}", s, e),
+            }
+            .build()
+        })?;
+        let region_num: u32 = parts[1].parse().map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("invalid region_num in region_id '{}': {}", s, e),
+            }
+            .build()
+        })?;
+        Ok(RegionId::new(table_id, region_num))
+    } else {
+        let id: u64 = s.parse().map_err(|e| {
+            error::IllegalConfigSnafu {
+                msg: format!("invalid region_id '{}': {}", s, e),
+            }
+            .build()
+        })?;
+        Ok(RegionId::from_u64(id))
+    }
+}
+
+fn parse_path_type(s: &str) -> error::Result<PathType> {
+    match s.to_lowercase().as_str() {
+        "bare" => Ok(PathType::Bare),
+        "data" => Ok(PathType::Data),
+        "metadata" => Ok(PathType::Metadata),
+        _ => error::IllegalConfigSnafu {
+            msg: format!("invalid path_type '{}', expected: bare, data, metadata", s),
+        }
+        .fail(),
+    }
+}

@@ -117,6 +117,7 @@ async fn start(cli: Command) -> Result<()> {
             }
             datanode::SubCommand::Objbench(ref bench) => bench.run().await,
             datanode::SubCommand::Scanbench(ref bench) => bench.run().await,
+            datanode::SubCommand::SstReplace(ref cmd) => cmd.run().await,
             #[cfg(feature = "dev-tools")]
             datanode::SubCommand::Parquetbench(ref bench) => bench.run().await,
         },

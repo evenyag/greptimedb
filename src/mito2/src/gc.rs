@@ -312,7 +312,7 @@ impl LocalGcWorker {
                 .into_iter()
                 .filter_map(|f| match f {
                     RemovedFile::File(file_id, _) => Some(file_id),
-                    RemovedFile::Index(_, _) => None,
+                    RemovedFile::Index(_, _) | RemovedFile::PkIndex(_) => None,
                 })
                 .collect();
             deleted_files.insert(*region_id, data_files);
