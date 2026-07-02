@@ -957,6 +957,15 @@ pub(crate) struct PkIndexTsidSet {
 }
 
 impl PkIndexTsidSet {
+    /// Builds a set from an explicit `(table_id, tsid)` membership set and the
+    /// SST files the set may be applied to.
+    pub(crate) fn new(tsids: HashSet<(u32, u64)>, covered_files: HashSet<FileId>) -> Self {
+        Self {
+            tsids: Arc::new(tsids),
+            covered_files,
+        }
+    }
+
     /// Builds a set from an explicit `(table_id, tsid)` membership set, used by
     /// tests in other modules that need a non-empty tsid set.
     #[cfg(test)]

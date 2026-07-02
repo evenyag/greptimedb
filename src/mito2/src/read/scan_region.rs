@@ -921,6 +921,48 @@ impl ScanInput {
         self
     }
 
+    /// Clones this input with a different tsid allow-list.
+    ///
+    /// Used by per-series partition readers that share the same snapshot and
+    /// scan request but read different `(table_id, tsid)` assignments.
+    pub(crate) fn clone_with_pk_index_tsid_set(
+        &self,
+        pk_index_tsid_set: Option<PkIndexTsidSet>,
+    ) -> Self {
+        Self {
+            access_layer: self.access_layer.clone(),
+            mapper: self.mapper.clone(),
+            read_cols: self.read_cols.clone(),
+            time_range: self.time_range,
+            predicate: self.predicate.clone(),
+            region_partition_expr: self.region_partition_expr.clone(),
+            memtables: self.memtables.clone(),
+            files: self.files.clone(),
+            cache_strategy: self.cache_strategy.clone(),
+            ignore_file_not_found: self.ignore_file_not_found,
+            max_concurrent_scan_files: self.max_concurrent_scan_files,
+            inverted_index_appliers: self.inverted_index_appliers.clone(),
+            bloom_filter_index_appliers: self.bloom_filter_index_appliers.clone(),
+            fulltext_index_appliers: self.fulltext_index_appliers.clone(),
+            #[cfg(feature = "vector_index")]
+            vector_index_applier: self.vector_index_applier.clone(),
+            #[cfg(feature = "vector_index")]
+            vector_index_k: self.vector_index_k,
+            query_start: self.query_start,
+            append_mode: self.append_mode,
+            filter_deleted: self.filter_deleted,
+            merge_mode: self.merge_mode,
+            series_row_selector: self.series_row_selector,
+            distribution: self.distribution,
+            explain_flat_format: self.explain_flat_format,
+            pk_index_tsid_set,
+            snapshot_sequence: self.snapshot_sequence,
+            compaction: self.compaction,
+            #[cfg(feature = "enterprise")]
+            extension_ranges: Vec::new(),
+        }
+    }
+
     /// Sets time range filter for time index.
     #[must_use]
     pub(crate) fn with_time_range(mut self, time_range: Option<TimestampRange>) -> Self {

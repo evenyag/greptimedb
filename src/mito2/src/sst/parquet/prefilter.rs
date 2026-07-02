@@ -358,9 +358,28 @@ pub(crate) fn build_reader_filter_plan(
     pk_range_index: Option<Arc<SstRangesIndex>>,
 ) -> ReaderFilterPlan {
     let Some(predicate) = predicate else {
+        let Some(pk_index_tsid_set) = pk_index_tsid_set.cloned() else {
+            return ReaderFilterPlan {
+                remaining_simple_filters: Vec::new(),
+                prefilter_builder: None,
+            };
+        };
+        let prefilter_builder = PrefilterContextBuilder::new(
+            read_format,
+            codec,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            expected_metadata
+                .map(|metadata| metadata.schema_version)
+                .unwrap_or_else(|| read_format.metadata().schema_version),
+            Some(pk_index_tsid_set),
+            pk_range_index,
+        );
         return ReaderFilterPlan {
             remaining_simple_filters: Vec::new(),
-            prefilter_builder: None,
+            prefilter_builder,
         };
     };
 
@@ -453,8 +472,7 @@ pub(crate) fn build_reader_filter_plan(
     // loads anyway (e.g. the timestamp column). On a ranges-index cache miss
     // (`pk_range_index` is `None`) the prefilter still reads `__primary_key`, so
     // the simple filters stay in the prefilter to keep refining the selection.
-    let use_range_index_path =
-        pk_index_tsid_set.is_some() && pk_range_index.is_some() && !primary_key_filters.is_empty();
+    let use_range_index_path = pk_index_tsid_set.is_some() && pk_range_index.is_some();
     if use_range_index_path {
         remaining_simple_filters.extend(direct_simple_filters);
     } else {
@@ -586,7 +604,9 @@ impl PrefilterContextBuilder {
             }
         }
 
-        if pk_filters.is_some() {
+        let has_tsid_filter = pk_index_tsid_set.is_some();
+
+        if pk_filters.is_some() || (has_tsid_filter && pk_range_index.is_none()) {
             prefilter_column_names.insert(PRIMARY_KEY_COLUMN_NAME.to_string());
         }
 
@@ -603,18 +623,22 @@ impl PrefilterContextBuilder {
 
         let total_count = read_format.parquet_read_columns().root_indices().len();
         let remaining_count = total_count.saturating_sub(prefilter_count);
-        if pk_filters.is_none() && prefilter_count >= total_count {
+        if pk_filters.is_none() && !has_tsid_filter && prefilter_count >= total_count {
             return None;
         }
 
         if pk_filters.is_none()
+            && !has_tsid_filter
             && !should_use_prefilter(prefilter_count, remaining_count, total_count)
         {
             return None;
         }
 
-        // Only keep the tsid set / ranges index when there is a PK filter group to replace.
-        let pk_index_tsid_set = pk_filters.is_some().then_some(pk_index_tsid_set).flatten();
+        // Keep the tsid set either as an accelerator for a PK filter group or as
+        // a partition-local series allow-list.
+        let pk_index_tsid_set = (pk_filters.is_some() || has_tsid_filter)
+            .then_some(pk_index_tsid_set)
+            .flatten();
         // The ranges index is only usable when the tsid set is present.
         let pk_range_index = pk_index_tsid_set
             .is_some()
@@ -649,17 +673,19 @@ impl PrefilterContextBuilder {
 
         let pk_filter = (!use_range_index)
             .then(|| {
-                self.pk_filters.as_ref().map(|pk_filters| {
-                    // For a covered file, the tsid-membership filter yields the same row
-                    // mask as decoding tags, but avoids the per-pk tag decode.
-                    let pk_filter = match &self.pk_index_tsid_set {
-                        Some(tsid_set) => tsid_set.make_filter(&self.metadata),
-                        None => self
+                if let Some(tsid_set) = &self.pk_index_tsid_set {
+                    let pk_filter = tsid_set.make_filter(&self.metadata);
+                    Some(Box::new(CachedPrimaryKeyFilter::new(pk_filter))
+                        as Box<dyn PrimaryKeyFilter>)
+                } else {
+                    self.pk_filters.as_ref().map(|pk_filters| {
+                        let pk_filter = self
                             .codec
-                            .primary_key_filter(&self.metadata, Arc::clone(pk_filters)),
-                    };
-                    Box::new(CachedPrimaryKeyFilter::new(pk_filter)) as Box<dyn PrimaryKeyFilter>
-                })
+                            .primary_key_filter(&self.metadata, Arc::clone(pk_filters));
+                        Box::new(CachedPrimaryKeyFilter::new(pk_filter))
+                            as Box<dyn PrimaryKeyFilter>
+                    })
+                }
             })
             .flatten();
         PrefilterContext {
