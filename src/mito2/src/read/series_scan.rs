@@ -14,7 +14,7 @@
 
 //! Per-series scan implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,17 +49,21 @@ use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, Error, InvalidSenderSnafu, JoinSnafu, PartitionOutOfRangeSnafu,
     Result, ScanMultiTimesSnafu, ScanSeriesSnafu, TooManyFilesToReadSnafu, UnexpectedSnafu,
 };
-use crate::read::ScannerMetrics;
 use crate::read::pruner::{PartitionPruner, Pruner};
+use crate::read::range::{FileRangeBuilder, RowGroupIndex};
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
-    PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics, compute_average_batch_size,
-    compute_parallel_channel_size,
+    PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics,
+    build_flat_file_range_scan_stream, compute_average_batch_size, compute_parallel_channel_size,
+    new_filter_metrics, scan_flat_mem_ranges,
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
+use crate::read::{BoxedRecordBatchStream, ScannerMetrics};
+use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
+use crate::sst::parquet::reader::ReaderMetrics;
 use crate::sst::pk_index::PkIndexTsidSet;
 
 /// Timeout to send a batch to a sender.
@@ -663,9 +667,9 @@ impl SeriesKeyScan {
         _pruner: Arc<Pruner>,
         _partitions: Vec<Vec<PartitionRange>>,
         senders: SenderList,
-        _metrics_set: ExecutionPlanMetricsSet,
-        _metrics_list: Arc<PartitionMetricsList>,
-        _explain_verbose: bool,
+        metrics_set: ExecutionPlanMetricsSet,
+        metrics_list: Arc<PartitionMetricsList>,
+        explain_verbose: bool,
     ) {
         let num_partitions = senders.senders.len();
         let mut key_senders = Vec::with_capacity(num_partitions);
@@ -677,7 +681,20 @@ impl SeriesKeyScan {
             };
             let (key_sender, key_receiver) = mpsc::channel(1);
             key_senders.push(Some(key_sender));
-            SeriesKeyPartitionReader::start(stream_ctx.clone(), partition, key_receiver, sender);
+            let part_metrics = new_partition_metrics(
+                &stream_ctx,
+                explain_verbose,
+                &metrics_set,
+                partition,
+                &metrics_list,
+            );
+            SeriesKeyPartitionReader::start(
+                stream_ctx.clone(),
+                partition,
+                key_receiver,
+                sender,
+                part_metrics,
+            );
         }
 
         let worker = SeriesKeyWorker {
@@ -786,6 +803,7 @@ impl SeriesKeyPartitionReader {
         partition: usize,
         mut key_receiver: Receiver<Result<SeriesKeyBatch>>,
         sender: Sender<Result<ScanBatch>>,
+        part_metrics: PartitionMetrics,
     ) {
         let region_id = stream_ctx.input.mapper.metadata().region_id;
         let span = tracing::info_span!(
@@ -795,8 +813,13 @@ impl SeriesKeyPartitionReader {
         );
         common_runtime::spawn_query(
             async move {
-                let result =
-                    Self::read_partition(stream_ctx, &mut key_receiver, sender.clone()).await;
+                let result = Self::read_partition(
+                    stream_ctx,
+                    &mut key_receiver,
+                    sender.clone(),
+                    part_metrics,
+                )
+                .await;
                 if let Err(error) = result {
                     let _ = sender.send(Err(error)).await;
                 }
@@ -809,6 +832,7 @@ impl SeriesKeyPartitionReader {
         stream_ctx: Arc<StreamContext>,
         key_receiver: &mut Receiver<Result<SeriesKeyBatch>>,
         sender: Sender<Result<ScanBatch>>,
+        part_metrics: PartitionMetrics,
     ) -> Result<()> {
         let mut keys = HashSet::new();
         while let Some(batch) = key_receiver.recv().await {
@@ -830,18 +854,29 @@ impl SeriesKeyPartitionReader {
         let input = stream_ctx
             .input
             .clone_with_pk_index_tsid_set(Some(tsid_set));
-        let seq_scan = SeqScan::new(input);
-        let mut stream = seq_scan.scan_all_partitions()?;
-        let codec = SparsePrimaryKeyCodec::new(stream_ctx.input.region_metadata());
+        let filtered_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
+        let sources = Self::build_filtered_sources(&filtered_ctx, &part_metrics, &keys).await?;
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        let channel_size =
+            compute_parallel_channel_size(crate::sst::parquet::DEFAULT_READ_BATCH_SIZE);
+        let mut stream = SeqScan::build_flat_reader_from_sources(
+            &filtered_ctx,
+            sources,
+            Some(Arc::new(Semaphore::new(
+                filtered_ctx.input.max_concurrent_scan_files,
+            ))),
+            Some(&part_metrics),
+            false,
+            channel_size,
+        )
+        .await?;
+
         while let Some(batch) = stream.try_next().await? {
-            let ScanBatch::RecordBatch(record_batch) = batch else {
-                continue;
-            };
-            let Some(filtered) = filter_batch_by_series_keys(&record_batch, &keys, &codec)? else {
-                continue;
-            };
             if sender
-                .send(Ok(ScanBatch::RecordBatch(filtered)))
+                .send(Ok(ScanBatch::RecordBatch(batch)))
                 .await
                 .is_err()
             {
@@ -850,6 +885,96 @@ impl SeriesKeyPartitionReader {
         }
 
         Ok(())
+    }
+
+    async fn build_filtered_sources(
+        stream_ctx: &Arc<StreamContext>,
+        part_metrics: &PartitionMetrics,
+        keys: &HashSet<(u32, u64)>,
+    ) -> Result<Vec<BoxedRecordBatchStream>> {
+        let mut sources = Vec::new();
+        let mut file_builders = HashMap::new();
+        let codec = Arc::new(SparsePrimaryKeyCodec::new(
+            stream_ctx.input.region_metadata(),
+        ));
+        let keys = Arc::new(keys.clone());
+
+        for part_range in stream_ctx.partition_ranges() {
+            let range_meta = &stream_ctx.ranges[part_range.identifier];
+            let pre_filter_mode = stream_ctx.range_pre_filter_mode(&part_range);
+
+            for index in &range_meta.row_group_indices {
+                if stream_ctx.is_mem_range_index(*index) {
+                    let stream = scan_flat_mem_ranges(
+                        stream_ctx.clone(),
+                        part_metrics.clone(),
+                        *index,
+                        range_meta.time_range,
+                    );
+                    let stream = filter_mem_stream_by_series_keys(
+                        Box::pin(stream),
+                        Arc::clone(&codec),
+                        Arc::clone(&keys),
+                    );
+                    sources.push(stream);
+                } else if stream_ctx.is_file_range_index(*index) {
+                    let ranges = Self::build_series_file_ranges(
+                        stream_ctx,
+                        *index,
+                        pre_filter_mode,
+                        part_metrics,
+                        &mut file_builders,
+                    )
+                    .await?;
+                    if ranges.is_empty() {
+                        continue;
+                    }
+                    part_metrics.inc_num_file_ranges(ranges.len());
+                    let stream = build_flat_file_range_scan_stream(
+                        stream_ctx.clone(),
+                        part_metrics.clone(),
+                        "series_key_scan_files",
+                        ranges,
+                        None,
+                    );
+                    sources.push(Box::pin(stream));
+                }
+            }
+        }
+
+        Ok(sources)
+    }
+
+    async fn build_series_file_ranges(
+        stream_ctx: &Arc<StreamContext>,
+        index: RowGroupIndex,
+        pre_filter_mode: PreFilterMode,
+        part_metrics: &PartitionMetrics,
+        file_builders: &mut HashMap<(usize, bool), Arc<FileRangeBuilder>>,
+    ) -> Result<SmallVec<[FileRange; 2]>> {
+        let file_index = index.index - stream_ctx.input.num_memtables();
+        let cache_key = (file_index, pre_filter_mode.skip_fields());
+        let builder = if let Some(builder) = file_builders.get(&cache_key) {
+            builder.clone()
+        } else {
+            let mut reader_metrics = ReaderMetrics {
+                filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
+                ..Default::default()
+            };
+            let file = &stream_ctx.input.files[file_index];
+            let builder = stream_ctx
+                .input
+                .prune_file(file, pre_filter_mode, &mut reader_metrics)
+                .await?;
+            part_metrics.merge_reader_metrics(&reader_metrics, None);
+            let builder = Arc::new(builder);
+            file_builders.insert(cache_key, builder.clone());
+            builder
+        };
+
+        let mut ranges = SmallVec::new();
+        builder.build_ranges(index.row_group_index, &mut ranges);
+        Ok(ranges)
     }
 }
 
@@ -931,6 +1056,21 @@ fn filter_batch_by_series_keys(
     filter_record_batch(record_batch, &BooleanArray::from(mask))
         .map(Some)
         .context(ComputeArrowSnafu)
+}
+
+fn filter_mem_stream_by_series_keys(
+    mut input: BoxedRecordBatchStream,
+    codec: Arc<SparsePrimaryKeyCodec>,
+    keys: Arc<HashSet<(u32, u64)>>,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        while let Some(record_batch) = input.try_next().await? {
+            let Some(filtered) = filter_batch_by_series_keys(&record_batch, &keys, &codec)? else {
+                continue;
+            };
+            yield filtered;
+        }
+    })
 }
 
 /// Batches of the same series.
