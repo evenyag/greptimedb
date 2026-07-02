@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::range::TimestampRange;
 use common_time::timestamp::{TimeUnit, Timestamp};
+use datafusion_common::pruning::PruningStatistics;
+use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::Expr;
 use datafusion_expr::utils::expr_to_columns;
 use datatypes::arrow::array::{
-    Array, ArrayRef, BinaryArray, DictionaryArray, Int64Array, StringArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, Int64Array, StringArray,
+    UInt32Array, UInt64Array,
 };
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -28,11 +30,14 @@ use mito_codec::row_converter::{
 use object_store::{FuturesAsyncWriter, ObjectStore};
 use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use parquet::file::statistics::Statistics;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::consts::ReservedColumnId;
 use store_api::storage::{ColumnId, FileId, RegionId, SequenceNumber};
+use table::predicate::Predicate;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
@@ -1045,6 +1050,134 @@ struct PkIndexBatchStats {
     evaluate_cost: Duration,
 }
 
+struct PkIndexPruningStats<'a> {
+    row_groups: &'a [RowGroupMetaData],
+    schema: SchemaRef,
+}
+
+impl<'a> PkIndexPruningStats<'a> {
+    fn new(row_groups: &'a [RowGroupMetaData], schema: SchemaRef) -> Self {
+        Self { row_groups, schema }
+    }
+
+    fn column_index(&self, column: &Column) -> Option<usize> {
+        self.schema.index_of(&column.name).ok()
+    }
+
+    fn column_values(&self, column: &Column, is_min: bool) -> Option<ArrayRef> {
+        let column_index = self.column_index(column)?;
+        let null_scalar: ScalarValue = self
+            .schema
+            .field(column_index)
+            .data_type()
+            .try_into()
+            .ok()?;
+        let scalar_values = self
+            .row_groups
+            .iter()
+            .map(|row_group| {
+                let stats = row_group.column(column_index).statistics()?;
+                stats_scalar_value(stats, is_min)
+            })
+            .map(|maybe_scalar| maybe_scalar.unwrap_or_else(|| null_scalar.clone()))
+            .collect::<Vec<_>>();
+        ScalarValue::iter_to_array(scalar_values).ok()
+    }
+}
+
+impl PruningStatistics for PkIndexPruningStats<'_> {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.column_values(column, true)
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.column_values(column, false)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.row_groups.len()
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        let column_index = self.column_index(column)?;
+        let null_counts = self
+            .row_groups
+            .iter()
+            .map(|row_group| {
+                row_group
+                    .column(column_index)
+                    .statistics()?
+                    .null_count_opt()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Arc::new(UInt64Array::from(null_counts)))
+    }
+
+    fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
+    }
+}
+
+fn stats_scalar_value(stats: &Statistics, is_min: bool) -> Option<ScalarValue> {
+    match stats {
+        Statistics::Boolean(s) => Some(ScalarValue::Boolean(Some(if is_min {
+            *s.min_opt()?
+        } else {
+            *s.max_opt()?
+        }))),
+        Statistics::Int32(s) => Some(ScalarValue::Int32(Some(if is_min {
+            *s.min_opt()?
+        } else {
+            *s.max_opt()?
+        }))),
+        Statistics::Int64(s) => Some(ScalarValue::Int64(Some(if is_min {
+            *s.min_opt()?
+        } else {
+            *s.max_opt()?
+        }))),
+        Statistics::Int96(_) => None,
+        Statistics::Float(s) => Some(ScalarValue::Float32(Some(if is_min {
+            *s.min_opt()?
+        } else {
+            *s.max_opt()?
+        }))),
+        Statistics::Double(s) => Some(ScalarValue::Float64(Some(if is_min {
+            *s.min_opt()?
+        } else {
+            *s.max_opt()?
+        }))),
+        Statistics::ByteArray(s) => {
+            let bytes = if is_min {
+                s.min_bytes_opt()?
+            } else {
+                s.max_bytes_opt()?
+            };
+            Some(ScalarValue::Utf8(String::from_utf8(bytes.to_vec()).ok()))
+        }
+        Statistics::FixedLenByteArray(_) => None,
+    }
+}
+
+fn pk_index_row_groups_to_read(
+    parquet_meta: &ParquetMetaData,
+    schema: SchemaRef,
+    tag_filters: &[Expr],
+) -> Vec<usize> {
+    let row_groups = parquet_meta.row_groups();
+    let predicate = Predicate::new(tag_filters.to_vec());
+    let stats = PkIndexPruningStats::new(row_groups, schema.clone());
+    predicate
+        .prune_with_stats(&stats, &schema)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(row_group, keep)| keep.then_some(row_group))
+        .collect()
+}
+
 /// Resolves the matching tsid set by applying `tag_filters` to the primary-key
 /// aggregate index files that intersect `time_range`.
 ///
@@ -1115,8 +1248,15 @@ pub(crate) async fn build_pk_index_tsid_set(
     let mut matched_rows = 0;
     for meta in &metas {
         let stage_start = Instant::now();
-        let stats =
-            read_pk_index_file(access_layer, metadata, meta, &evaluators, &mut tsids).await?;
+        let stats = read_pk_index_file(
+            access_layer,
+            metadata,
+            meta,
+            &evaluators,
+            &tag_filters,
+            &mut tsids,
+        )
+        .await?;
         costs.read_indexes += stage_start.elapsed();
         scanned_rows += stats.scanned_rows;
         matched_rows += stats.matched_rows;
@@ -1160,6 +1300,7 @@ async fn read_pk_index_file(
     metadata: &RegionMetadataRef,
     meta: &AggregatePkIndexMeta,
     evaluators: &[SimpleFilterEvaluator],
+    tag_filters: &[Expr],
     tsids: &mut HashSet<(u32, u64)>,
 ) -> Result<PkIndexReadStats> {
     let path = pk_index_file_path(
@@ -1176,8 +1317,15 @@ async fn read_pk_index_file(
         .await
         .context(OpenDalSnafu)?
         .to_bytes();
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .and_then(|builder| builder.build())
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .context(ReadParquetSnafu { path: &path })?;
+    let row_groups_total = builder.metadata().num_row_groups();
+    let row_groups =
+        pk_index_row_groups_to_read(builder.metadata(), builder.schema().clone(), tag_filters);
+    let row_groups_pruned = row_groups_total.saturating_sub(row_groups.len());
+    let reader = builder
+        .with_row_groups(row_groups)
+        .build()
         .context(ReadParquetSnafu { path: &path })?;
     let mut stats = PkIndexReadStats {
         read_cost: stage_start.elapsed(),
@@ -1188,13 +1336,15 @@ async fn read_pk_index_file(
         stats.add_batch(collect_matching_tsids(&batch, evaluators, tsids)?);
     }
     common_telemetry::info!(
-        "Read primary-key aggregate index file, region: {}, index_file_id: {}, path: {}, time_range: {:?}, source_files: {}, index_rows: {}, scanned_rows: {}, matched_rows: {}, read_cost: {:?}, evaluate_cost: {:?}, total_cost: {:?}",
+        "Read primary-key aggregate index file, region: {}, index_file_id: {}, path: {}, time_range: {:?}, source_files: {}, index_rows: {}, row_groups_total: {}, row_groups_pruned: {}, scanned_rows: {}, matched_rows: {}, read_cost: {:?}, evaluate_cost: {:?}, total_cost: {:?}",
         metadata.region_id,
         meta.index_file_id,
         path,
         meta.time_range,
         meta.source_file_ids.len(),
         meta.row_count,
+        row_groups_total,
+        row_groups_pruned,
         stats.scanned_rows,
         stats.matched_rows,
         stats.read_cost,
@@ -1303,13 +1453,19 @@ mod tests {
     use datatypes::arrow::array::{
         BinaryDictionaryBuilder, StringDictionaryBuilder, TimestampMillisecondArray, UInt8Array,
     };
+    use object_store::services::Fs;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use store_api::region_request::PathType;
 
     use super::*;
-    use crate::access_layer::{Metrics, RegionFilePathFactory, WriteType};
+    use crate::access_layer::{AccessLayer, Metrics, RegionFilePathFactory, WriteType};
     use crate::config::IndexConfig;
     use crate::read::FlatSource;
     use crate::sst::file::{FileMeta, Level};
     use crate::sst::file_purger::NoopFilePurger;
+    use crate::sst::index::intermediate::IntermediateManager;
+    use crate::sst::index::puffin_manager::PuffinManagerFactory;
     use crate::sst::index::{Indexer, IndexerBuilder};
     use crate::sst::parquet::WriteOptions;
     use crate::sst::parquet::writer::ParquetWriter;
@@ -1323,6 +1479,63 @@ mod tests {
         async fn build(&self, _file_id: FileId, _index_version: u64) -> Indexer {
             Indexer::default()
         }
+    }
+
+    async fn new_test_access_layer(
+        name: &str,
+    ) -> (common_test_util::temp_dir::TempDir, AccessLayerRef) {
+        let dir = common_test_util::temp_dir::create_temp_dir(name);
+        let dir_path = dir.path().display().to_string();
+        let index_aux_path = dir.path().join("index_aux");
+        let puffin_mgr = PuffinManagerFactory::new(&index_aux_path, 4096, None, None)
+            .await
+            .unwrap();
+        let intm_mgr = IntermediateManager::init_fs(index_aux_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let object_store = ObjectStore::new(Fs::default().root(&dir_path))
+            .unwrap()
+            .finish();
+        let access_layer: AccessLayerRef = Arc::new(AccessLayer::new(
+            "test_table",
+            PathType::Bare,
+            object_store,
+            puffin_mgr,
+            intm_mgr,
+        ));
+        (dir, access_layer)
+    }
+
+    async fn write_pk_index_batches(
+        access_layer: &AccessLayerRef,
+        metadata: &RegionMetadataRef,
+        index_file_id: FileId,
+        batches: Vec<RecordBatch>,
+        max_row_group_rows: usize,
+    ) {
+        let path = pk_index_file_path(
+            access_layer.table_dir(),
+            metadata.region_id,
+            index_file_id,
+            access_layer.path_type(),
+        );
+        let schema = pk_columns_schema(metadata);
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(max_row_group_rows))
+            .build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+            for batch in batches {
+                writer.write(&batch).unwrap();
+            }
+            writer.close().unwrap();
+        }
+        access_layer
+            .object_store()
+            .write(&path, bytes)
+            .await
+            .unwrap();
     }
 
     fn file(region_id: RegionId, start_ms: i64, sequence: Option<u64>) -> FileHandle {
@@ -1820,6 +2033,213 @@ mod tests {
         .await
         .unwrap();
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_pk_index_file_prunes_row_groups_by_stats() {
+        use datafusion_expr::{col, lit};
+
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let (_dir, access_layer) = new_test_access_layer("pk-index-rg-prune").await;
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let index_file_id = FileId::random();
+        let schema = pk_columns_schema(&metadata);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64; 6])),
+                Arc::new(Int64Array::from(vec![100_i64; 6])),
+                Arc::new(UInt64Array::from(vec![1_u64; 6])),
+                Arc::new(UInt32Array::from(vec![1_u32; 6])),
+                Arc::new(UInt64Array::from(vec![100_u64, 101, 102, 103, 104, 105])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("m"),
+                    Some("m"),
+                    Some("z"),
+                    Some("z"),
+                ])),
+                Arc::new(StringArray::from(vec![Some("x"); 6])),
+            ],
+        )
+        .unwrap();
+        write_pk_index_batches(&access_layer, &metadata, index_file_id, vec![batch], 2).await;
+
+        let meta = AggregatePkIndexMeta {
+            index_file_id,
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(1000),
+            ),
+            max_sequence: 10,
+            source_file_ids: vec![FileId::random()],
+            file_size: 0,
+            row_count: 6,
+        };
+        let tag_filters = vec![col("tag_0").eq(lit("m"))];
+        let evaluators = tag_filters
+            .iter()
+            .map(SimpleFilterEvaluator::try_new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let mut tsids = HashSet::new();
+
+        let stats = read_pk_index_file(
+            &access_layer,
+            &metadata,
+            &meta,
+            &evaluators,
+            &tag_filters,
+            &mut tsids,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.scanned_rows, 2);
+        assert_eq!(stats.matched_rows, 2);
+        assert_eq!(tsids, HashSet::from([(1, 102), (1, 103)]));
+    }
+
+    #[tokio::test]
+    async fn test_read_pk_index_file_skips_all_pruned_row_groups() {
+        use datafusion_expr::{col, lit};
+
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let (_dir, access_layer) = new_test_access_layer("pk-index-rg-prune-all").await;
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let index_file_id = FileId::random();
+        let schema = pk_columns_schema(&metadata);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64; 4])),
+                Arc::new(Int64Array::from(vec![100_i64; 4])),
+                Arc::new(UInt64Array::from(vec![1_u64; 4])),
+                Arc::new(UInt32Array::from(vec![1_u32; 4])),
+                Arc::new(UInt64Array::from(vec![100_u64, 101, 102, 103])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("y"),
+                    Some("z"),
+                ])),
+                Arc::new(StringArray::from(vec![Some("x"); 4])),
+            ],
+        )
+        .unwrap();
+        write_pk_index_batches(&access_layer, &metadata, index_file_id, vec![batch], 2).await;
+
+        let meta = AggregatePkIndexMeta {
+            index_file_id,
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(1000),
+            ),
+            max_sequence: 10,
+            source_file_ids: vec![FileId::random()],
+            file_size: 0,
+            row_count: 4,
+        };
+        let tag_filters = vec![col("tag_0").eq(lit("m"))];
+        let evaluators = tag_filters
+            .iter()
+            .map(SimpleFilterEvaluator::try_new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let mut tsids = HashSet::new();
+
+        let stats = read_pk_index_file(
+            &access_layer,
+            &metadata,
+            &meta,
+            &evaluators,
+            &tag_filters,
+            &mut tsids,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.scanned_rows, 0);
+        assert_eq!(stats.matched_rows, 0);
+        assert!(tsids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_pk_index_file_keeps_row_groups_for_regex_filter() {
+        use datafusion_expr::{BinaryExpr, Operator, col, lit};
+
+        use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+        let (_dir, access_layer) = new_test_access_layer("pk-index-rg-regex").await;
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let index_file_id = FileId::random();
+        let schema = pk_columns_schema(&metadata);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64; 4])),
+                Arc::new(Int64Array::from(vec![100_i64; 4])),
+                Arc::new(UInt64Array::from(vec![1_u64; 4])),
+                Arc::new(UInt32Array::from(vec![1_u32; 4])),
+                Arc::new(UInt64Array::from(vec![100_u64, 101, 102, 103])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("m"),
+                    Some("n"),
+                ])),
+                Arc::new(StringArray::from(vec![Some("x"); 4])),
+            ],
+        )
+        .unwrap();
+        write_pk_index_batches(&access_layer, &metadata, index_file_id, vec![batch], 2).await;
+
+        let meta = AggregatePkIndexMeta {
+            index_file_id,
+            time_range: (
+                Timestamp::new_millisecond(0),
+                Timestamp::new_millisecond(1000),
+            ),
+            max_sequence: 10,
+            source_file_ids: vec![FileId::random()],
+            file_size: 0,
+            row_count: 4,
+        };
+        let tag_filters = vec![Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("tag_0")),
+            op: Operator::RegexMatch,
+            right: Box::new(lit("^m$")),
+        })];
+        let evaluators = tag_filters
+            .iter()
+            .map(SimpleFilterEvaluator::try_new)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        let mut tsids = HashSet::new();
+
+        let stats = read_pk_index_file(
+            &access_layer,
+            &metadata,
+            &meta,
+            &evaluators,
+            &tag_filters,
+            &mut tsids,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.scanned_rows, 4);
+        assert_eq!(stats.matched_rows, 1);
+        assert_eq!(tsids, HashSet::from([(1, 102)]));
     }
 
     #[test]
