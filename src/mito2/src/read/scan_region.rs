@@ -53,7 +53,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheStrategy;
-use crate::config::DEFAULT_MAX_CONCURRENT_SCAN_FILES;
+use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SERIES_KEY_BATCH_SIZE};
 use crate::error::{InvalidPartitionExprSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
@@ -242,6 +242,8 @@ pub(crate) struct ScanRegion {
     cache_strategy: CacheStrategy,
     /// Maximum number of SST files to scan concurrently.
     max_concurrent_scan_files: usize,
+    /// Number of series keys in each per-series key distribution batch.
+    series_key_batch_size: usize,
     /// Whether to ignore inverted index.
     ignore_inverted_index: bool,
     /// Whether to ignore fulltext index.
@@ -274,6 +276,7 @@ impl ScanRegion {
             request,
             cache_strategy,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            series_key_batch_size: DEFAULT_SERIES_KEY_BATCH_SIZE,
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
@@ -292,6 +295,13 @@ impl ScanRegion {
         max_concurrent_scan_files: usize,
     ) -> Self {
         self.max_concurrent_scan_files = max_concurrent_scan_files;
+        self
+    }
+
+    /// Sets number of series keys in each per-series key distribution batch.
+    #[must_use]
+    pub(crate) fn with_series_key_batch_size(mut self, series_key_batch_size: usize) -> Self {
+        self.series_key_batch_size = series_key_batch_size;
         self
     }
 
@@ -608,6 +618,7 @@ impl ScanRegion {
             .with_bloom_filter_index_appliers(bloom_filter_appliers)
             .with_fulltext_index_appliers(fulltext_index_appliers)
             .with_max_concurrent_scan_files(self.max_concurrent_scan_files)
+            .with_series_key_batch_size(self.series_key_batch_size)
             .with_start_time(self.start_time)
             .with_append_mode(self.version.options.append_mode)
             .with_filter_deleted(self.filter_deleted)
@@ -838,6 +849,8 @@ pub struct ScanInput {
     ignore_file_not_found: bool,
     /// Maximum number of SST files to scan concurrently.
     pub(crate) max_concurrent_scan_files: usize,
+    /// Number of series keys in each per-series key distribution batch.
+    pub(crate) series_key_batch_size: usize,
     /// Index appliers.
     inverted_index_appliers: [Option<InvertedIndexApplierRef>; 2],
     bloom_filter_index_appliers: [Option<BloomFilterIndexApplierRef>; 2],
@@ -889,6 +902,7 @@ impl ScanInput {
             cache_strategy: CacheStrategy::Disabled,
             ignore_file_not_found: false,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            series_key_batch_size: DEFAULT_SERIES_KEY_BATCH_SIZE,
             inverted_index_appliers: [None, None],
             bloom_filter_index_appliers: [None, None],
             fulltext_index_appliers: [None, None],
@@ -941,6 +955,7 @@ impl ScanInput {
             cache_strategy: self.cache_strategy.clone(),
             ignore_file_not_found: self.ignore_file_not_found,
             max_concurrent_scan_files: self.max_concurrent_scan_files,
+            series_key_batch_size: self.series_key_batch_size,
             inverted_index_appliers: self.inverted_index_appliers.clone(),
             bloom_filter_index_appliers: self.bloom_filter_index_appliers.clone(),
             fulltext_index_appliers: self.fulltext_index_appliers.clone(),
@@ -1013,6 +1028,13 @@ impl ScanInput {
         max_concurrent_scan_files: usize,
     ) -> Self {
         self.max_concurrent_scan_files = max_concurrent_scan_files;
+        self
+    }
+
+    /// Sets number of series keys in each per-series key distribution batch.
+    #[must_use]
+    pub(crate) fn with_series_key_batch_size(mut self, series_key_batch_size: usize) -> Self {
+        self.series_key_batch_size = series_key_batch_size;
         self
     }
 

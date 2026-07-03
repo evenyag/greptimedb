@@ -542,6 +542,9 @@ sst_write_buffer_size = "8MB"
 ## Maximum number of SST files to scan concurrently.
 max_concurrent_scan_files = 384
 
+## Number of series keys in each per-series key distribution batch.
+series_key_batch_size = 500
+
 ## Whether to allow stale WAL entries read during replay.
 allow_stale_entries = false
 

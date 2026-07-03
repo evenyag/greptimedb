@@ -714,25 +714,20 @@ struct SeriesKeyBatch {
     keys: Vec<SeriesKey>,
 }
 
-fn partition_series_keys(
+fn build_series_key_batches(
     keys: impl IntoIterator<Item = (u32, u64)>,
-    num_partitions: usize,
+    batch_size: usize,
 ) -> Vec<Vec<SeriesKey>> {
-    if num_partitions == 0 {
-        return Vec::new();
-    }
-
+    let batch_size = batch_size.max(1);
     let mut keys = keys
         .into_iter()
         .map(|(table_id, tsid)| SeriesKey { table_id, tsid })
         .collect::<Vec<_>>();
     keys.sort_unstable();
 
-    let mut partitions = vec![Vec::new(); num_partitions];
-    for (idx, key) in keys.into_iter().enumerate() {
-        partitions[idx % num_partitions].push(key);
-    }
-    partitions
+    keys.chunks(batch_size)
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 struct SeriesKeyScan;
@@ -788,13 +783,13 @@ impl SeriesKeyWorker {
             }
             .fail();
         };
-        let partitions =
-            partition_series_keys(tsid_set.tsids().iter().copied(), self.key_senders.len());
-        for (partition, keys) in partitions.into_iter().enumerate() {
-            if keys.is_empty() {
-                continue;
-            }
-            self.send_key_batch(partition, keys).await?;
+        let key_batches = build_series_key_batches(
+            tsid_set.tsids().iter().copied(),
+            self.stream_ctx.input.series_key_batch_size,
+        );
+        let num_partitions = self.key_senders.len();
+        for (idx, keys) in key_batches.into_iter().enumerate() {
+            self.send_key_batch(idx % num_partitions, keys).await?;
         }
         self.key_senders.clear();
         Ok(())
@@ -1385,61 +1380,62 @@ mod tests {
         Arc::new(Schema::new(fields))
     }
 
-    #[test]
-    fn test_partition_series_keys_empty() {
-        let partitions = partition_series_keys(std::iter::empty::<(u32, u64)>(), 3);
-        assert_eq!(vec![Vec::<SeriesKey>::new(), vec![], vec![]], partitions);
-
-        let partitions = partition_series_keys([(1, 1)], 0);
-        assert!(partitions.is_empty());
+    fn series_key(table_id: u32, tsid: u64) -> SeriesKey {
+        SeriesKey { table_id, tsid }
     }
 
     #[test]
-    fn test_partition_series_keys_sorts_and_distributes() {
-        let partitions = partition_series_keys([(2, 3), (1, 3), (1, 1), (2, 1), (1, 2)], 3);
+    fn test_build_series_key_batches_empty() {
+        let batches = build_series_key_batches(std::iter::empty::<(u32, u64)>(), 500);
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_build_series_key_batches_sorts_and_chunks() {
+        let batches = build_series_key_batches([(2, 3), (1, 3), (1, 1), (2, 1), (1, 2), (3, 1)], 2);
 
         assert_eq!(
             vec![
-                vec![
-                    SeriesKey {
-                        table_id: 1,
-                        tsid: 1
-                    },
-                    SeriesKey {
-                        table_id: 2,
-                        tsid: 1
-                    },
-                ],
-                vec![
-                    SeriesKey {
-                        table_id: 1,
-                        tsid: 2
-                    },
-                    SeriesKey {
-                        table_id: 2,
-                        tsid: 3
-                    },
-                ],
-                vec![SeriesKey {
-                    table_id: 1,
-                    tsid: 3
-                }],
+                vec![series_key(1, 1), series_key(1, 2)],
+                vec![series_key(1, 3), series_key(2, 1)],
+                vec![series_key(2, 3), series_key(3, 1)],
             ],
-            partitions
+            batches
         );
     }
 
     #[test]
-    fn test_partition_series_keys_has_no_duplicates_or_missing_keys() {
-        let input = [(1, 10), (1, 11), (2, 10), (2, 11), (2, 12)];
-        let partitions = partition_series_keys(input, 8);
+    fn test_build_series_key_batches_batch_larger_than_keys() {
+        let batches = build_series_key_batches([(2, 1), (1, 1)], 500);
 
-        let mut actual = partitions.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(vec![vec![series_key(1, 1), series_key(2, 1)]], batches);
+    }
+
+    #[test]
+    fn test_build_series_key_batches_zero_batch_size() {
+        let batches = build_series_key_batches([(1, 1), (1, 2), (1, 3)], 0);
+
+        assert_eq!(
+            vec![
+                vec![series_key(1, 1)],
+                vec![series_key(1, 2)],
+                vec![series_key(1, 3)],
+            ],
+            batches
+        );
+    }
+
+    #[test]
+    fn test_build_series_key_batches_has_no_duplicates_or_missing_keys() {
+        let input = [(1, 10), (1, 11), (2, 10), (2, 11), (2, 12)];
+        let batches = build_series_key_batches(input, 2);
+
+        let mut actual = batches.into_iter().flatten().collect::<Vec<_>>();
         actual.sort_unstable();
 
         let mut expected = input
             .into_iter()
-            .map(|(table_id, tsid)| SeriesKey { table_id, tsid })
+            .map(|(table_id, tsid)| series_key(table_id, tsid))
             .collect::<Vec<_>>();
         expected.sort_unstable();
 
