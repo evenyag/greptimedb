@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
-use common_telemetry::{error, tracing, warn};
+use common_telemetry::{error, info, tracing, warn};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::utils::expr_to_columns;
@@ -658,10 +658,25 @@ impl ParquetReaderBuilder {
         // without reading the `__primary_key` column. A cache miss falls back to
         // the normal tsid-membership prefilter.
         let pk_range_index = if self.pk_index_tsid_set.is_some() && self.use_pk_range_index {
-            self.cache_strategy
+            let pk_range_index = self
+                .cache_strategy
                 .load_pk_range_index(self.file_handle.file_id())
-                .await
+                .await;
+            info!(
+                "Selected pk range index path, region_id: {}, file_id: {}, use_range_index: {}",
+                self.file_handle.region_id(),
+                self.file_handle.file_id().file_id(),
+                pk_range_index.is_some()
+            );
+            pk_range_index
         } else {
+            if self.pk_index_tsid_set.is_some() {
+                info!(
+                    "Selected pk range index path, region_id: {}, file_id: {}, use_range_index: false",
+                    self.file_handle.region_id(),
+                    self.file_handle.file_id().file_id()
+                );
+            }
             None
         };
 

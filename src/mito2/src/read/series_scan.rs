@@ -303,7 +303,7 @@ impl SeriesScan {
         }
 
         if self.use_series_key_path() {
-            debug!(
+            info!(
                 "Selected SeriesScan path, region_id: {}, series_scan_path: series_key",
                 self.stream_ctx.input.mapper.metadata().region_id
             );
@@ -312,7 +312,7 @@ impl SeriesScan {
             return;
         }
 
-        debug!(
+        info!(
             "Selected SeriesScan path, region_id: {}, series_scan_path: distributor",
             self.stream_ctx.input.mapper.metadata().region_id
         );
@@ -808,8 +808,9 @@ impl SeriesKeyWorker {
             self.stream_ctx.input.series_key_batch_size,
         );
         info!(
-            "Resolved series keys for SeriesScan, region_id: {}, matched_tsids: {}, pk_index_files: {}, parquet_files: {}, key_batches: {}",
+            "Resolved series keys for SeriesScan, region_id: {}, use_pk_index: {}, matched_tsids: {}, pk_index_files: {}, parquet_files: {}, key_batches: {}",
             self.stream_ctx.input.region_metadata().region_id,
+            resolved.use_pk_index,
             resolved.tsids.len(),
             resolved.pk_index_files,
             resolved.parquet_files,
@@ -849,6 +850,7 @@ impl SeriesKeyWorker {
 #[derive(Debug, Default)]
 struct ResolvedSeriesKeys {
     tsids: HashSet<(u32, u64)>,
+    use_pk_index: bool,
     pk_index_files: usize,
     parquet_files: usize,
 }
@@ -866,7 +868,8 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
         .time_range
         .unwrap_or_else(common_time::range::TimestampRange::min_to_max);
 
-    if !input.pk_indexes.is_empty()
+    if input.enable_pk_index_scan
+        && !input.pk_indexes.is_empty()
         && let Some(tsid_set) = build_pk_index_tsid_set(
             input.access_layer(),
             metadata,
@@ -876,6 +879,7 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
         )
         .await?
     {
+        resolved.use_pk_index = true;
         for file in &input.files {
             if tsid_set.covers(file.meta_ref().file_id) {
                 covered_files.insert(file.meta_ref().file_id);
