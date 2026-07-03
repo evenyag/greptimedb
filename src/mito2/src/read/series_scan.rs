@@ -70,9 +70,12 @@ use crate::sst::pk_index::PkIndexTsidSet;
 const SEND_TIMEOUT: Duration = Duration::from_micros(100);
 
 /// List of receivers.
-type ReceiverList = Vec<Option<Receiver<Result<ScanBatch>>>>;
+type ReceiverList = Vec<Option<PartitionReceiver>>;
 
-const SERIES_KEY_BATCH_SIZE: usize = 1024;
+enum PartitionReceiver {
+    ScanBatch(Receiver<Result<ScanBatch>>),
+    SeriesKey(Receiver<Result<SeriesKeyBatch>>),
+}
 
 /// Scans a region and returns sorted rows of a series in the same partition.
 ///
@@ -185,7 +188,30 @@ impl SeriesScan {
 
         self.maybe_start_distributor(metrics_set, &self.metrics_list, ctx.explain_verbose);
 
-        let mut receiver = self.take_receiver(partition)?;
+        match self.take_receiver(partition)? {
+            PartitionReceiver::ScanBatch(receiver) => {
+                Ok(Self::scan_distributed_batches(receiver, part_metrics))
+            }
+            PartitionReceiver::SeriesKey(receiver) => Ok(Self::scan_series_key_partition(
+                self.stream_ctx.clone(),
+                receiver,
+                part_metrics,
+            )),
+        }
+    }
+
+    /// Takes the receiver for the partition.
+    fn take_receiver(&self, partition: usize) -> Result<PartitionReceiver> {
+        let mut rx_list = self.receivers.lock().unwrap();
+        rx_list[partition]
+            .take()
+            .context(ScanMultiTimesSnafu { partition })
+    }
+
+    fn scan_distributed_batches(
+        mut receiver: Receiver<Result<ScanBatch>>,
+        part_metrics: PartitionMetrics,
+    ) -> ScanBatchStream {
         let stream = try_stream! {
             part_metrics.on_first_poll();
 
@@ -217,15 +243,43 @@ impl SeriesScan {
 
             part_metrics.on_finish();
         };
-        Ok(Box::pin(stream))
+        Box::pin(stream)
     }
 
-    /// Takes the receiver for the partition.
-    fn take_receiver(&self, partition: usize) -> Result<Receiver<Result<ScanBatch>>> {
-        let mut rx_list = self.receivers.lock().unwrap();
-        rx_list[partition]
-            .take()
-            .context(ScanMultiTimesSnafu { partition })
+    fn scan_series_key_partition(
+        stream_ctx: Arc<StreamContext>,
+        mut receiver: Receiver<Result<SeriesKeyBatch>>,
+        part_metrics: PartitionMetrics,
+    ) -> ScanBatchStream {
+        let stream = try_stream! {
+            part_metrics.on_first_poll();
+
+            let mut fetch_start = Instant::now();
+            let mut reader =
+                SeriesKeyPartitionReader::build_partition_reader(
+                    stream_ctx,
+                    &mut receiver,
+                    &part_metrics,
+                )
+                .await?;
+
+            while let Some(batch) = reader.try_next().await? {
+                let mut metrics = ScannerMetrics::default();
+                metrics.scan_cost += fetch_start.elapsed();
+                metrics.num_batches += 1;
+                metrics.num_rows += batch.num_rows();
+                fetch_start = Instant::now();
+
+                let yield_start = Instant::now();
+                yield ScanBatch::RecordBatch(batch);
+                metrics.yield_cost += yield_start.elapsed();
+
+                part_metrics.merge_metrics(&metrics);
+            }
+
+            part_metrics.on_finish();
+        };
+        Box::pin(stream)
     }
 
     /// Starts the distributor if the receiver list is empty.
@@ -244,21 +298,13 @@ impl SeriesScan {
             return;
         }
 
-        let (senders, receivers) = new_channel_list(self.properties.num_partitions());
         if self.use_series_key_path() {
-            SeriesKeyScan::start(
-                self.stream_ctx.clone(),
-                self.pruner.clone(),
-                self.properties.partitions.clone(),
-                senders,
-                metrics_set.clone(),
-                metrics_list.clone(),
-                explain_verbose,
-            );
-            *rx_list = receivers;
+            *rx_list =
+                SeriesKeyScan::start(self.stream_ctx.clone(), self.properties.num_partitions());
             return;
         }
 
+        let (senders, receivers) = new_channel_list(self.properties.num_partitions());
         let mut distributor = SeriesDistributor {
             stream_ctx: self.stream_ctx.clone(),
             range_semaphore: Some(Arc::new(Semaphore::new(self.properties.num_partitions()))),
@@ -289,7 +335,16 @@ impl SeriesScan {
             return false;
         }
 
+        let Some(tsid_set) = input.pk_index_tsid_set.as_ref() else {
+            return false;
+        };
+
         !input.compaction
+            && input.memtables.is_empty()
+            && input
+                .files
+                .iter()
+                .all(|file| tsid_set.covers(file.meta_ref().file_id))
             && input.region_metadata().primary_key_encoding == PrimaryKeyEncoding::Sparse
             && input.region_metadata().primary_key.len() >= 2
     }
@@ -366,7 +421,7 @@ fn new_channel_list(num_partitions: usize) -> (SenderList, ReceiverList) {
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..num_partitions)
         .map(|_| {
             let (sender, receiver) = mpsc::channel(1);
-            (Some(sender), Some(receiver))
+            (Some(sender), Some(PartitionReceiver::ScanBatch(receiver)))
         })
         .unzip();
     (SenderList::new(senders), receivers)
@@ -659,48 +714,43 @@ struct SeriesKeyBatch {
     keys: Vec<SeriesKey>,
 }
 
+fn partition_series_keys(
+    keys: impl IntoIterator<Item = (u32, u64)>,
+    num_partitions: usize,
+) -> Vec<Vec<SeriesKey>> {
+    if num_partitions == 0 {
+        return Vec::new();
+    }
+
+    let mut keys = keys
+        .into_iter()
+        .map(|(table_id, tsid)| SeriesKey { table_id, tsid })
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    let mut partitions = vec![Vec::new(); num_partitions];
+    for (idx, key) in keys.into_iter().enumerate() {
+        partitions[idx % num_partitions].push(key);
+    }
+    partitions
+}
+
 struct SeriesKeyScan;
 
 impl SeriesKeyScan {
-    fn start(
-        stream_ctx: Arc<StreamContext>,
-        _pruner: Arc<Pruner>,
-        _partitions: Vec<Vec<PartitionRange>>,
-        senders: SenderList,
-        metrics_set: ExecutionPlanMetricsSet,
-        metrics_list: Arc<PartitionMetricsList>,
-        explain_verbose: bool,
-    ) {
-        let num_partitions = senders.senders.len();
+    fn start(stream_ctx: Arc<StreamContext>, num_partitions: usize) -> ReceiverList {
         let mut key_senders = Vec::with_capacity(num_partitions);
+        let mut receivers = Vec::with_capacity(num_partitions);
 
-        for (partition, sender) in senders.senders.into_iter().enumerate() {
-            let Some(sender) = sender else {
-                key_senders.push(None);
-                continue;
-            };
+        for _ in 0..num_partitions {
             let (key_sender, key_receiver) = mpsc::channel(1);
             key_senders.push(Some(key_sender));
-            let part_metrics = new_partition_metrics(
-                &stream_ctx,
-                explain_verbose,
-                &metrics_set,
-                partition,
-                &metrics_list,
-            );
-            SeriesKeyPartitionReader::start(
-                stream_ctx.clone(),
-                partition,
-                key_receiver,
-                sender,
-                part_metrics,
-            );
+            receivers.push(Some(PartitionReceiver::SeriesKey(key_receiver)));
         }
 
         let worker = SeriesKeyWorker {
             stream_ctx,
             key_senders,
-            sender_idx: 0,
         };
         let region_id = worker.stream_ctx.input.mapper.metadata().region_id;
         let span = tracing::info_span!("SeriesScan::series_key_worker", region_id = %region_id);
@@ -710,18 +760,19 @@ impl SeriesKeyScan {
             }
             .instrument(span),
         );
+
+        receivers
     }
 }
 
 struct SeriesKeyWorker {
     stream_ctx: Arc<StreamContext>,
     key_senders: Vec<Option<Sender<Result<SeriesKeyBatch>>>>,
-    sender_idx: usize,
 }
 
 impl SeriesKeyWorker {
     async fn execute(mut self) {
-        if let Err(error) = self.discover_and_send_keys().await {
+        if let Err(error) = self.distribute_keys().await {
             let error = Arc::new(error);
             for sender in self.key_senders.iter().flatten() {
                 let result = Err(error.clone()).context(ScanSeriesSnafu);
@@ -730,55 +781,32 @@ impl SeriesKeyWorker {
         }
     }
 
-    async fn discover_and_send_keys(&mut self) -> Result<()> {
-        let input = self
-            .stream_ctx
-            .input
-            .clone_with_pk_index_tsid_set(self.stream_ctx.input.pk_index_tsid_set.clone());
-        let seq_scan = SeqScan::new(input);
-        let mut stream = seq_scan.scan_all_partitions()?;
-        let codec = SparsePrimaryKeyCodec::new(self.stream_ctx.input.region_metadata());
-        let mut last_key = None;
-        let mut batch = Vec::with_capacity(SERIES_KEY_BATCH_SIZE);
-
-        while let Some(scan_batch) = stream.try_next().await? {
-            let ScanBatch::RecordBatch(record_batch) = scan_batch else {
-                continue;
-            };
-            for key in series_keys_in_batch(&record_batch, &codec)? {
-                if last_key == Some(key) {
-                    continue;
-                }
-                last_key = Some(key);
-                batch.push(key);
-                if batch.len() >= SERIES_KEY_BATCH_SIZE {
-                    self.send_key_batch(std::mem::take(&mut batch)).await?;
-                }
+    async fn distribute_keys(&mut self) -> Result<()> {
+        let Some(tsid_set) = self.stream_ctx.input.pk_index_tsid_set.as_ref() else {
+            return UnexpectedSnafu {
+                reason: "missing primary-key index tsid set for SeriesKeyScan",
             }
+            .fail();
+        };
+        let partitions =
+            partition_series_keys(tsid_set.tsids().iter().copied(), self.key_senders.len());
+        for (partition, keys) in partitions.into_iter().enumerate() {
+            if keys.is_empty() {
+                continue;
+            }
+            self.send_key_batch(partition, keys).await?;
         }
-
-        if !batch.is_empty() {
-            self.send_key_batch(batch).await?;
-        }
-
         self.key_senders.clear();
         Ok(())
     }
 
-    async fn send_key_batch(&mut self, keys: Vec<SeriesKey>) -> Result<()> {
+    async fn send_key_batch(&mut self, partition: usize, keys: Vec<SeriesKey>) -> Result<()> {
         ensure!(!self.key_senders.is_empty(), InvalidSenderSnafu);
 
         let mut batch = SeriesKeyBatch { keys };
         loop {
-            ensure!(
-                self.key_senders.iter().any(Option::is_some),
-                InvalidSenderSnafu
-            );
-
-            let sender_idx = self.sender_idx;
-            self.sender_idx = (self.sender_idx + 1) % self.key_senders.len();
-            let Some(sender) = &self.key_senders[sender_idx] else {
-                continue;
+            let Some(sender) = &self.key_senders[partition] else {
+                return Ok(());
             };
 
             match sender.send_timeout(Ok(batch), SEND_TIMEOUT).await {
@@ -787,7 +815,7 @@ impl SeriesKeyWorker {
                     batch = res.unwrap();
                 }
                 Err(SendTimeoutError::Closed(res)) => {
-                    self.key_senders[sender_idx] = None;
+                    self.key_senders[partition] = None;
                     batch = res.unwrap();
                 }
             }
@@ -798,42 +826,11 @@ impl SeriesKeyWorker {
 struct SeriesKeyPartitionReader;
 
 impl SeriesKeyPartitionReader {
-    fn start(
-        stream_ctx: Arc<StreamContext>,
-        partition: usize,
-        mut key_receiver: Receiver<Result<SeriesKeyBatch>>,
-        sender: Sender<Result<ScanBatch>>,
-        part_metrics: PartitionMetrics,
-    ) {
-        let region_id = stream_ctx.input.mapper.metadata().region_id;
-        let span = tracing::info_span!(
-            "SeriesScan::series_key_partition_reader",
-            region_id = %region_id,
-            partition = partition
-        );
-        common_runtime::spawn_query(
-            async move {
-                let result = Self::read_partition(
-                    stream_ctx,
-                    &mut key_receiver,
-                    sender.clone(),
-                    part_metrics,
-                )
-                .await;
-                if let Err(error) = result {
-                    let _ = sender.send(Err(error)).await;
-                }
-            }
-            .instrument(span),
-        );
-    }
-
-    async fn read_partition(
+    async fn build_partition_reader(
         stream_ctx: Arc<StreamContext>,
         key_receiver: &mut Receiver<Result<SeriesKeyBatch>>,
-        sender: Sender<Result<ScanBatch>>,
-        part_metrics: PartitionMetrics,
-    ) -> Result<()> {
+        part_metrics: &PartitionMetrics,
+    ) -> Result<BoxedRecordBatchStream> {
         let mut keys = HashSet::new();
         while let Some(batch) = key_receiver.recv().await {
             let batch = batch?;
@@ -841,7 +838,7 @@ impl SeriesKeyPartitionReader {
         }
 
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Box::pin(futures::stream::empty()));
         }
 
         let covered_files = stream_ctx
@@ -855,36 +852,24 @@ impl SeriesKeyPartitionReader {
             .input
             .clone_with_pk_index_tsid_set(Some(tsid_set));
         let filtered_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
-        let sources = Self::build_filtered_sources(&filtered_ctx, &part_metrics, &keys).await?;
+        let sources = Self::build_filtered_sources(&filtered_ctx, part_metrics, &keys).await?;
         if sources.is_empty() {
-            return Ok(());
+            return Ok(Box::pin(futures::stream::empty()));
         }
 
         let channel_size =
             compute_parallel_channel_size(crate::sst::parquet::DEFAULT_READ_BATCH_SIZE);
-        let mut stream = SeqScan::build_flat_reader_from_sources(
+        SeqScan::build_flat_reader_from_sources(
             &filtered_ctx,
             sources,
             Some(Arc::new(Semaphore::new(
                 filtered_ctx.input.max_concurrent_scan_files,
             ))),
-            Some(&part_metrics),
+            Some(part_metrics),
             false,
             channel_size,
         )
-        .await?;
-
-        while let Some(batch) = stream.try_next().await? {
-            if sender
-                .send(Ok(ScanBatch::RecordBatch(batch)))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        Ok(())
+        .await
     }
 
     async fn build_filtered_sources(
@@ -976,39 +961,6 @@ impl SeriesKeyPartitionReader {
         builder.build_ranges(index.row_group_index, &mut ranges);
         Ok(ranges)
     }
-}
-
-fn series_keys_in_batch(
-    record_batch: &RecordBatch,
-    codec: &SparsePrimaryKeyCodec,
-) -> Result<Vec<SeriesKey>> {
-    if record_batch.num_rows() == 0 {
-        return Ok(Vec::new());
-    }
-
-    let pk_column_idx = primary_key_column_index(record_batch.num_columns());
-    let pk_array = record_batch
-        .column(pk_column_idx)
-        .as_any()
-        .downcast_ref::<PrimaryKeyArray>()
-        .context(UnexpectedSnafu {
-            reason: "primary key column is not a dictionary array",
-        })?;
-    let pk_values = pk_array
-        .values()
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .context(UnexpectedSnafu {
-            reason: "primary key dictionary values are not binary",
-        })?;
-
-    let mut keys = Vec::with_capacity(record_batch.num_rows());
-    for row in 0..record_batch.num_rows() {
-        let pk = primary_key_at(pk_array, pk_values, row);
-        let (table_id, tsid) = codec.read_table_id_tsid(pk).context(DecodeSnafu)?;
-        keys.push(SeriesKey { table_id, tsid });
-    }
-    Ok(keys)
 }
 
 fn filter_batch_by_series_keys(
@@ -1431,6 +1383,67 @@ mod tests {
             Field::new("__op_type", DataType::UInt8, false),
         ];
         Arc::new(Schema::new(fields))
+    }
+
+    #[test]
+    fn test_partition_series_keys_empty() {
+        let partitions = partition_series_keys(std::iter::empty::<(u32, u64)>(), 3);
+        assert_eq!(vec![Vec::<SeriesKey>::new(), vec![], vec![]], partitions);
+
+        let partitions = partition_series_keys([(1, 1)], 0);
+        assert!(partitions.is_empty());
+    }
+
+    #[test]
+    fn test_partition_series_keys_sorts_and_distributes() {
+        let partitions = partition_series_keys([(2, 3), (1, 3), (1, 1), (2, 1), (1, 2)], 3);
+
+        assert_eq!(
+            vec![
+                vec![
+                    SeriesKey {
+                        table_id: 1,
+                        tsid: 1
+                    },
+                    SeriesKey {
+                        table_id: 2,
+                        tsid: 1
+                    },
+                ],
+                vec![
+                    SeriesKey {
+                        table_id: 1,
+                        tsid: 2
+                    },
+                    SeriesKey {
+                        table_id: 2,
+                        tsid: 3
+                    },
+                ],
+                vec![SeriesKey {
+                    table_id: 1,
+                    tsid: 3
+                }],
+            ],
+            partitions
+        );
+    }
+
+    #[test]
+    fn test_partition_series_keys_has_no_duplicates_or_missing_keys() {
+        let input = [(1, 10), (1, 11), (2, 10), (2, 11), (2, 12)];
+        let partitions = partition_series_keys(input, 8);
+
+        let mut actual = partitions.into_iter().flatten().collect::<Vec<_>>();
+        actual.sort_unstable();
+
+        let mut expected = input
+            .into_iter()
+            .map(|(table_id, tsid)| SeriesKey { table_id, tsid })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        assert_eq!(expected, actual);
     }
 
     #[test]
