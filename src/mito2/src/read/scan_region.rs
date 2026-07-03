@@ -44,8 +44,8 @@ use snafu::ResultExt;
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::region_engine::{PartitionRange, RegionScannerRef};
 use store_api::storage::{
-    NestedPath, RegionId, ScanRequest, SequenceNumber, SequenceRange, TimeSeriesDistribution,
-    TimeSeriesRowSelector,
+    FileId, NestedPath, RegionId, ScanRequest, SequenceNumber, SequenceRange,
+    TimeSeriesDistribution, TimeSeriesRowSelector,
 };
 use table::predicate::{Predicate, build_time_range_predicate, extract_time_range_from_expr};
 use tokio::sync::{Semaphore, mpsc};
@@ -57,6 +57,7 @@ use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SERIES_KEY_BATCH_
 use crate::error::{InvalidPartitionExprSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
+use crate::manifest::action::AggregatePkIndexMeta;
 use crate::memtable::{MemtableRange, RangesOptions};
 use crate::metrics::READ_SST_COUNT;
 use crate::read::compat::{self, FlatCompatBatch};
@@ -86,8 +87,7 @@ use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBui
 use crate::sst::index::vector_index::applier::{VectorIndexApplier, VectorIndexApplierRef};
 use crate::sst::parquet::file_range::PreFilterMode;
 use crate::sst::parquet::reader::ReaderMetrics;
-use crate::sst::pk_index;
-use crate::sst::pk_index::{PkIndexTsidSet, build_pk_index_tsid_set};
+use crate::sst::pk_index::PkIndexTsidSet;
 
 #[cfg(feature = "vector_index")]
 const VECTOR_INDEX_OVERFETCH_MULTIPLIER: usize = 2;
@@ -253,6 +253,12 @@ pub(crate) struct ScanRegion {
     /// Whether the scanner may use the primary-key aggregate index to resolve
     /// the matching tsid set from tag filters.
     enable_pk_index_scan: bool,
+    /// Whether the scanner may use the experimental per-series key scan path
+    /// even when `enable_pk_index_scan` is disabled.
+    experimental_series_key_scan: bool,
+    /// Whether the per-series key scan path may use cached per-SST range indexes
+    /// to build parquet row selections.
+    series_key_scan_use_range_index: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
     /// Whether to filter out the deleted rows.
@@ -281,6 +287,8 @@ impl ScanRegion {
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
             enable_pk_index_scan: false,
+            experimental_series_key_scan: false,
+            series_key_scan_use_range_index: false,
             start_time: None,
             filter_deleted: true,
             #[cfg(feature = "enterprise")]
@@ -330,6 +338,20 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_enable_pk_index_scan(mut self, enable: bool) -> Self {
         self.enable_pk_index_scan = enable;
+        self
+    }
+
+    /// Sets whether to enable the experimental per-series key scan path.
+    #[must_use]
+    pub(crate) fn with_experimental_series_key_scan(mut self, enable: bool) -> Self {
+        self.experimental_series_key_scan = enable;
+        self
+    }
+
+    /// Sets whether the per-series key scan path may use cached range indexes.
+    #[must_use]
+    pub(crate) fn with_series_key_scan_use_range_index(mut self, enable: bool) -> Self {
+        self.series_key_scan_use_range_index = enable;
         self
     }
 
@@ -431,23 +453,6 @@ impl ScanRegion {
         let sst_min_sequence = self.request.sst_min_sequence.and_then(NonZeroU64::new);
         let time_range = self.build_time_range_predicate();
         let predicate = PredicateGroup::new(&self.version.metadata, &self.request.filters)?;
-
-        // Resolve the matching tsid set from the primary-key aggregate index so
-        // covered SST files can skip per-file tag decoding (see `build_pk_index_tsid_set`).
-        let pk_index_tsid_set = if self.enable_pk_index_scan {
-            let tag_filters =
-                pk_index::tag_filter_exprs(&self.version.metadata, &self.request.filters);
-            build_pk_index_tsid_set(
-                &self.access_layer,
-                &self.version.metadata,
-                &self.version.pk_indexes,
-                &tag_filters,
-                &time_range,
-            )
-            .await?
-        } else {
-            None
-        };
 
         let mut read_cols = match &self.request.projection_input {
             Some(p) => {
@@ -625,7 +630,10 @@ impl ScanRegion {
             .with_merge_mode(self.version.options.merge_mode())
             .with_series_row_selector(self.request.series_row_selector)
             .with_distribution(self.request.distribution)
-            .with_pk_index_tsid_set(pk_index_tsid_set)
+            .with_pk_index_scan_enabled(self.enable_pk_index_scan)
+            .with_experimental_series_key_scan(self.experimental_series_key_scan)
+            .with_series_key_scan_use_range_index(self.series_key_scan_use_range_index)
+            .with_pk_indexes(self.version.pk_indexes.clone())
             .with_explain_flat_format(
                 self.version.options.sst_format == Some(crate::sst::FormatType::Flat),
             )
@@ -878,6 +886,14 @@ pub struct ScanInput {
     /// Matching tsid set resolved from the primary-key aggregate index, used to
     /// replace the per-file tag prefilter for covered SST files.
     pub(crate) pk_index_tsid_set: Option<PkIndexTsidSet>,
+    /// Whether primary-key index scan is enabled.
+    pub(crate) enable_pk_index_scan: bool,
+    /// Whether the experimental per-series key scan path is enabled.
+    pub(crate) experimental_series_key_scan: bool,
+    /// Whether the per-series key scan path may use cached range indexes.
+    pub(crate) series_key_scan_use_range_index: bool,
+    /// Primary-key aggregate index metadata from the region snapshot.
+    pub(crate) pk_indexes: Arc<HashMap<FileId, AggregatePkIndexMeta>>,
     /// Snapshot upper bound bound at scan open and propagated back to the caller.
     pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
@@ -918,6 +934,10 @@ impl ScanInput {
             distribution: None,
             explain_flat_format: false,
             pk_index_tsid_set: None,
+            enable_pk_index_scan: false,
+            experimental_series_key_scan: false,
+            series_key_scan_use_range_index: false,
+            pk_indexes: Arc::new(HashMap::new()),
             snapshot_sequence: None,
             compaction: false,
             #[cfg(feature = "enterprise")]
@@ -925,13 +945,30 @@ impl ScanInput {
         }
     }
 
-    /// Sets the matching tsid set resolved from the primary-key aggregate index.
     #[must_use]
-    pub(crate) fn with_pk_index_tsid_set(
+    pub(crate) fn with_pk_index_scan_enabled(mut self, enable: bool) -> Self {
+        self.enable_pk_index_scan = enable;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_experimental_series_key_scan(mut self, enable: bool) -> Self {
+        self.experimental_series_key_scan = enable;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_series_key_scan_use_range_index(mut self, enable: bool) -> Self {
+        self.series_key_scan_use_range_index = enable;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_pk_indexes(
         mut self,
-        pk_index_tsid_set: Option<PkIndexTsidSet>,
+        pk_indexes: Arc<HashMap<FileId, AggregatePkIndexMeta>>,
     ) -> Self {
-        self.pk_index_tsid_set = pk_index_tsid_set;
+        self.pk_indexes = pk_indexes;
         self
     }
 
@@ -971,6 +1008,10 @@ impl ScanInput {
             distribution: self.distribution,
             explain_flat_format: self.explain_flat_format,
             pk_index_tsid_set,
+            enable_pk_index_scan: self.enable_pk_index_scan,
+            experimental_series_key_scan: self.experimental_series_key_scan,
+            series_key_scan_use_range_index: self.series_key_scan_use_range_index,
+            pk_indexes: self.pk_indexes.clone(),
             snapshot_sequence: self.snapshot_sequence,
             compaction: self.compaction,
             #[cfg(feature = "enterprise")]
@@ -1260,7 +1301,8 @@ impl ScanInput {
             .inverted_index_appliers(self.inverted_index_appliers.clone())
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
             .fulltext_index_appliers(self.fulltext_index_appliers.clone())
-            .pk_index_tsid_set(pk_index_tsid_set);
+            .pk_index_tsid_set(pk_index_tsid_set)
+            .use_pk_range_index(self.series_key_scan_use_range_index);
         let reader = if !self.compaction && may_build_selective_row_selection {
             reader.deferred_optional_page_index()
         } else {
@@ -1427,6 +1469,10 @@ impl ScanInput {
 
     pub fn region_metadata(&self) -> &RegionMetadataRef {
         self.mapper.metadata()
+    }
+
+    pub(crate) fn access_layer(&self) -> &AccessLayerRef {
+        &self.access_layer
     }
 
     fn range_pre_filter_mode(&self, source_count: usize) -> PreFilterMode {

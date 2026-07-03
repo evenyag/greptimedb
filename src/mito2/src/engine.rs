@@ -1082,6 +1082,10 @@ impl EngineInner {
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
         .with_enable_pk_index_scan(self.config.enable_pk_index_scan)
+        .with_experimental_series_key_scan(self.config.experimental_series_key_scan)
+        .with_series_key_scan_use_range_index(
+            self.config.experimental_series_key_scan_use_range_index,
+        )
         .with_start_time(query_start);
 
         #[cfg(feature = "enterprise")]

@@ -1178,6 +1178,28 @@ fn pk_index_row_groups_to_read(
         .collect()
 }
 
+/// Lowers tag filters for use by primary-key-index and series-key scans.
+///
+/// Returns `None` if any filter cannot be evaluated exactly from tag columns.
+pub(crate) fn tag_filter_evaluators(
+    metadata: &RegionMetadataRef,
+    tag_filters: &[Expr],
+) -> Option<Vec<SimpleFilterEvaluator>> {
+    let tag_cols: HashSet<String> = tag_columns(metadata)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    let mut evaluators = Vec::with_capacity(tag_filters.len());
+    for expr in tag_filters {
+        let evaluator = SimpleFilterEvaluator::try_new(expr)?;
+        if !tag_cols.contains(evaluator.column_name()) {
+            return None;
+        }
+        evaluators.push(evaluator);
+    }
+    Some(evaluators)
+}
+
 /// Resolves the matching tsid set by applying `tag_filters` to the primary-key
 /// aggregate index files that intersect `time_range`.
 ///
@@ -1194,10 +1216,7 @@ pub(crate) async fn build_pk_index_tsid_set(
     tag_filters: &[Expr],
     time_range: &TimestampRange,
 ) -> Result<Option<PkIndexTsidSet>> {
-    if metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse
-        || tag_filters.is_empty()
-        || pk_indexes.is_empty()
-    {
+    if metadata.primary_key_encoding != PrimaryKeyEncoding::Sparse || pk_indexes.is_empty() {
         PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
         return Ok(None);
     }
@@ -1208,26 +1227,11 @@ pub(crate) async fn build_pk_index_tsid_set(
     // Lower every tag filter to a SimpleFilterEvaluator. If any tag filter cannot
     // be lowered, the tsid set would not be exact, so bail out to the normal path.
     let stage_start = Instant::now();
-    let tag_cols: HashSet<String> = tag_columns(metadata)
-        .into_iter()
-        .map(|(_, name)| name)
-        .collect();
-    let mut evaluators = Vec::with_capacity(tag_filters.len());
-    for expr in tag_filters {
-        let Some(evaluator) = SimpleFilterEvaluator::try_new(expr) else {
-            costs.lower_filter += stage_start.elapsed();
-            PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
-            return Ok(None);
-        };
-        // Only tag columns exist in the index file; a predicate on any other
-        // column cannot be enforced here.
-        if !tag_cols.contains(evaluator.column_name()) {
-            costs.lower_filter += stage_start.elapsed();
-            PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
-            return Ok(None);
-        }
-        evaluators.push(evaluator);
-    }
+    let Some(evaluators) = tag_filter_evaluators(metadata, tag_filters) else {
+        costs.lower_filter += stage_start.elapsed();
+        PK_INDEX_SCAN_TOTAL.with_label_values(&["skipped"]).inc();
+        return Ok(None);
+    };
     costs.lower_filter += stage_start.elapsed();
 
     let stage_start = Instant::now();

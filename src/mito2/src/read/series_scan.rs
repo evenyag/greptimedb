@@ -24,15 +24,16 @@ use common_error::ext::BoxedError;
 use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
-use common_telemetry::warn;
+use common_telemetry::{debug, info, warn};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
-use datatypes::arrow::array::{BinaryArray, BooleanArray};
+use datatypes::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray};
 use datatypes::arrow::compute::filter_record_batch;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
-use mito_codec::row_converter::SparsePrimaryKeyCodec;
+use mito_codec::row_converter::{PrimaryKeyCodec, SparsePrimaryKeyCodec};
+use parquet::arrow::ProjectionMask;
 use smallvec::SmallVec;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
@@ -41,6 +42,7 @@ use store_api::region_engine::{
     PartitionRange, PrepareRequest, QueryScanContext, RegionScanner, ScannerProperties,
 };
 use store_api::storage::FileId;
+use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -64,7 +66,9 @@ use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::reader::ReaderMetrics;
-use crate::sst::pk_index::PkIndexTsidSet;
+use crate::sst::pk_index::{
+    PkIndexTsidSet, build_pk_index_tsid_set, tag_filter_evaluators, tag_filter_exprs,
+};
 
 /// Timeout to send a batch to a sender.
 const SEND_TIMEOUT: Duration = Duration::from_micros(100);
@@ -299,11 +303,19 @@ impl SeriesScan {
         }
 
         if self.use_series_key_path() {
+            debug!(
+                "Selected SeriesScan path, region_id: {}, series_scan_path: series_key",
+                self.stream_ctx.input.mapper.metadata().region_id
+            );
             *rx_list =
                 SeriesKeyScan::start(self.stream_ctx.clone(), self.properties.num_partitions());
             return;
         }
 
+        debug!(
+            "Selected SeriesScan path, region_id: {}, series_scan_path: distributor",
+            self.stream_ctx.input.mapper.metadata().region_id
+        );
         let (senders, receivers) = new_channel_list(self.properties.num_partitions());
         let mut distributor = SeriesDistributor {
             stream_ctx: self.stream_ctx.clone(),
@@ -332,19 +344,24 @@ impl SeriesScan {
         let input = &self.stream_ctx.input;
         #[cfg(feature = "enterprise")]
         if !input.extension_ranges().is_empty() {
+            debug!("Series key scan is ineligible: extension ranges are present");
             return false;
         }
 
-        let Some(tsid_set) = input.pk_index_tsid_set.as_ref() else {
+        if !input.enable_pk_index_scan && !input.experimental_series_key_scan {
+            debug!("Series key scan is ineligible: disabled");
             return false;
-        };
+        }
+
+        let metadata = input.region_metadata();
+        let tag_filters = series_key_tag_filters(input);
+        if tag_filter_evaluators(metadata, &tag_filters).is_none() {
+            debug!("Series key scan is ineligible: unsupported tag filter");
+            return false;
+        }
 
         !input.compaction
             && input.memtables.is_empty()
-            && input
-                .files
-                .iter()
-                .all(|file| tsid_set.covers(file.meta_ref().file_id))
             && input.region_metadata().primary_key_encoding == PrimaryKeyEncoding::Sparse
             && input.region_metadata().primary_key.len() >= 2
     }
@@ -730,6 +747,14 @@ fn build_series_key_batches(
         .collect()
 }
 
+fn series_key_tag_filters(input: &ScanInput) -> Vec<datafusion_expr::Expr> {
+    input
+        .predicate_group()
+        .predicate_without_region()
+        .map(|predicate| tag_filter_exprs(input.region_metadata(), predicate.exprs()))
+        .unwrap_or_default()
+}
+
 struct SeriesKeyScan;
 
 impl SeriesKeyScan {
@@ -777,15 +802,18 @@ impl SeriesKeyWorker {
     }
 
     async fn distribute_keys(&mut self) -> Result<()> {
-        let Some(tsid_set) = self.stream_ctx.input.pk_index_tsid_set.as_ref() else {
-            return UnexpectedSnafu {
-                reason: "missing primary-key index tsid set for SeriesKeyScan",
-            }
-            .fail();
-        };
+        let resolved = resolve_series_key_tsids(&self.stream_ctx.input).await?;
         let key_batches = build_series_key_batches(
-            tsid_set.tsids().iter().copied(),
+            resolved.tsids.iter().copied(),
             self.stream_ctx.input.series_key_batch_size,
+        );
+        info!(
+            "Resolved series keys for SeriesScan, region_id: {}, matched_tsids: {}, pk_index_files: {}, parquet_files: {}, key_batches: {}",
+            self.stream_ctx.input.region_metadata().region_id,
+            resolved.tsids.len(),
+            resolved.pk_index_files,
+            resolved.parquet_files,
+            key_batches.len()
         );
         let num_partitions = self.key_senders.len();
         for (idx, keys) in key_batches.into_iter().enumerate() {
@@ -816,6 +844,166 @@ impl SeriesKeyWorker {
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct ResolvedSeriesKeys {
+    tsids: HashSet<(u32, u64)>,
+    pk_index_files: usize,
+    parquet_files: usize,
+}
+
+async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKeys> {
+    let metadata = input.region_metadata();
+    let tag_filters = series_key_tag_filters(input);
+    let evaluators = tag_filter_evaluators(metadata, &tag_filters).context(UnexpectedSnafu {
+        reason: "unsupported tag filters for SeriesKeyScan",
+    })?;
+
+    let mut resolved = ResolvedSeriesKeys::default();
+    let mut covered_files = HashSet::new();
+    let time_range = input
+        .time_range
+        .unwrap_or_else(common_time::range::TimestampRange::min_to_max);
+
+    if !input.pk_indexes.is_empty()
+        && let Some(tsid_set) = build_pk_index_tsid_set(
+            input.access_layer(),
+            metadata,
+            &input.pk_indexes,
+            &tag_filters,
+            &time_range,
+        )
+        .await?
+    {
+        for file in &input.files {
+            if tsid_set.covers(file.meta_ref().file_id) {
+                covered_files.insert(file.meta_ref().file_id);
+            }
+        }
+        resolved.pk_index_files = covered_files.len();
+        resolved.tsids.extend(tsid_set.tsids().iter().copied());
+    }
+
+    let parquet_files = input
+        .files
+        .iter()
+        .filter(|file| !covered_files.contains(&file.meta_ref().file_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    resolved.parquet_files = parquet_files.len();
+    for file in parquet_files {
+        collect_file_series_keys(input, &file, &evaluators, &mut resolved.tsids).await?;
+    }
+
+    Ok(resolved)
+}
+
+async fn collect_file_series_keys(
+    input: &ScanInput,
+    file: &crate::sst::file::FileHandle,
+    evaluators: &[common_recordbatch::filter::SimpleFilterEvaluator],
+    tsids: &mut HashSet<(u32, u64)>,
+) -> Result<()> {
+    let metadata = input.region_metadata();
+    let codec = SparsePrimaryKeyCodec::new(metadata);
+    let mut pk_filter = (!evaluators.is_empty())
+        .then(|| codec.primary_key_filter(metadata, Arc::new(evaluators.to_vec())));
+
+    let mut metrics = ReaderMetrics::default();
+    let Some((context, selection)) = input
+        .access_layer()
+        .read_sst(file.clone())
+        .cache(input.cache_strategy.clone())
+        .expected_metadata(Some(metadata.clone()))
+        .pre_filter_mode(PreFilterMode::All)
+        .build_reader_input(&mut metrics)
+        .await?
+    else {
+        return Ok(());
+    };
+
+    let reader_builder = context.reader_builder();
+    let arrow_schema = context.read_format().arrow_schema();
+    let (pk_idx, _) = arrow_schema
+        .column_with_name(PRIMARY_KEY_COLUMN_NAME)
+        .context(UnexpectedSnafu {
+            reason: "primary key column not found in SST schema",
+        })?;
+    let projection = ProjectionMask::roots(
+        reader_builder
+            .parquet_metadata()
+            .file_metadata()
+            .schema_descr(),
+        [pk_idx],
+    );
+
+    for (row_group_idx, row_selection) in selection.iter() {
+        let mut stream = reader_builder
+            .build_with_projection(
+                *row_group_idx,
+                Some(row_selection.clone()),
+                projection.clone(),
+                None,
+            )
+            .await?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            collect_batch_series_keys(&codec, &mut pk_filter, batch.column(0), tsids)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_batch_series_keys(
+    codec: &SparsePrimaryKeyCodec,
+    pk_filter: &mut Option<Box<dyn mito_codec::row_converter::PrimaryKeyFilter>>,
+    pk_col: &ArrayRef,
+    tsids: &mut HashSet<(u32, u64)>,
+) -> Result<()> {
+    if let Some(dict) = pk_col.as_any().downcast_ref::<PrimaryKeyArray>() {
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .context(UnexpectedSnafu {
+                reason: "primary key dictionary values are not binary",
+            })?;
+        for key in dict.keys().values() {
+            let pk = values.value(*key as usize);
+            collect_primary_key_series_key(codec, pk_filter, pk, tsids)?;
+        }
+    } else if let Some(binary) = pk_col.as_any().downcast_ref::<BinaryArray>() {
+        for row in 0..binary.len() {
+            collect_primary_key_series_key(codec, pk_filter, binary.value(row), tsids)?;
+        }
+    } else {
+        return UnexpectedSnafu {
+            reason: format!(
+                "primary key column is neither a dictionary nor binary array, got {:?}",
+                pk_col.data_type()
+            ),
+        }
+        .fail();
+    }
+    Ok(())
+}
+
+fn collect_primary_key_series_key(
+    codec: &SparsePrimaryKeyCodec,
+    pk_filter: &mut Option<Box<dyn mito_codec::row_converter::PrimaryKeyFilter>>,
+    pk: &[u8],
+    tsids: &mut HashSet<(u32, u64)>,
+) -> Result<()> {
+    if let Some(filter) = pk_filter.as_deref_mut()
+        && !filter.matches(pk).context(DecodeSnafu)?
+    {
+        return Ok(());
+    }
+    let key = codec.read_table_id_tsid(pk).context(DecodeSnafu)?;
+    tsids.insert(key);
+    Ok(())
 }
 
 struct SeriesKeyPartitionReader;

@@ -577,6 +577,12 @@ default_flat_format = true
 ## Whether the scanner may use the primary-key aggregate index to resolve the matching tsid set from tag filters.
 enable_pk_index_scan = false
 
+## Whether to enable the experimental per-series key scan path.
+experimental_series_key_scan = false
+
+## Whether the experimental per-series key scan path may use cached per-SST range indexes to build row selections.
+experimental_series_key_scan_use_range_index = false
+
 ## The options for index in Mito engine.
 [region_engine.mito.index]
 

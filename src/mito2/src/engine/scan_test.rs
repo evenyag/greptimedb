@@ -735,6 +735,59 @@ async fn test_series_scan_with_format(flat_format: bool) {
     assert_eq!(expected_rows, actual_rows);
 }
 
+#[tokio::test]
+async fn test_series_key_scan_parquet_fallback() {
+    let mut env = TestEnv::with_prefix("test_series_key_scan_parquet_fallback").await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: true,
+            enable_pk_index_scan: false,
+            experimental_series_key_scan: true,
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new()
+        .insert_option("compaction.type", "twcs")
+        .insert_option("compaction.twcs.time_window", "1h")
+        .build();
+    let column_schemas = test_util::rows_schema(&request);
+
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let rows = Rows {
+        schema: column_schemas,
+        rows: test_util::build_rows(0, 6),
+    };
+    test_util::put_rows(&engine, region_id, rows).await;
+    test_util::flush_region(&engine, region_id, None).await;
+
+    let request = ScanRequest {
+        filters: vec![col("tag_0").eq(lit("3"))],
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+        ..Default::default()
+    };
+    let scanner = engine.scanner(region_id, request).await.unwrap();
+    let Scanner::Series(scanner) = scanner else {
+        panic!("Scanner should be series scan");
+    };
+
+    let stream = scanner.build_stream().await.unwrap();
+    let batches = RecordBatches::try_collect(stream).await.unwrap();
+    let expected = r#"
++-------+---------+---------------------+
+| tag_0 | field_0 | ts                  |
++-------+---------+---------------------+
+| 3     | 3.0     | 1970-01-01T00:00:03 |
++-------+---------+---------------------+
+"#;
+    assert_eq!(batches.pretty_print().unwrap(), expected.trim());
+}
+
 /// Scans all partitions in round-robin fashion and returns rows sorted by (tag, ts).
 /// Also asserts that each series appears in only one partition.
 async fn collect_partition_rows_round_robin(

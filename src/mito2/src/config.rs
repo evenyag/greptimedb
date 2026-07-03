@@ -196,6 +196,12 @@ pub struct MitoConfig {
     /// Whether the scanner may use the primary-key aggregate index to resolve
     /// the matching tsid set from tag filters (default false).
     pub enable_pk_index_scan: bool,
+    /// Whether to enable the experimental per-series key scan path. When
+    /// `enable_pk_index_scan` is true this path is enabled regardless of this flag.
+    pub experimental_series_key_scan: bool,
+    /// Whether the experimental per-series key scan path may use cached per-SST
+    /// range indexes to build row selections.
+    pub experimental_series_key_scan_use_range_index: bool,
 
     pub gc: GcConfig,
 }
@@ -252,6 +258,8 @@ impl Default for MitoConfig {
             schedule_compaction_after_edit: true,
             default_flat_format: true,
             enable_pk_index_scan: false,
+            experimental_series_key_scan: false,
+            experimental_series_key_scan_use_range_index: false,
             gc: GcConfig::default(),
         };
 

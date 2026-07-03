@@ -307,6 +307,8 @@ pub struct ParquetReaderBuilder {
     /// file is covered by an index. When present, the tag prefilter is replaced by
     /// a tsid-membership filter.
     pk_index_tsid_set: Option<PkIndexTsidSet>,
+    /// Whether to use cached per-SST range indexes with `pk_index_tsid_set`.
+    use_pk_range_index: bool,
 }
 
 impl ParquetReaderBuilder {
@@ -339,6 +341,7 @@ impl ParquetReaderBuilder {
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
             pk_index_tsid_set: None,
+            use_pk_range_index: true,
         }
     }
 
@@ -351,6 +354,12 @@ impl ParquetReaderBuilder {
         pk_index_tsid_set: Option<PkIndexTsidSet>,
     ) -> ParquetReaderBuilder {
         self.pk_index_tsid_set = pk_index_tsid_set;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn use_pk_range_index(mut self, enable: bool) -> ParquetReaderBuilder {
+        self.use_pk_range_index = enable;
         self
     }
 
@@ -648,7 +657,7 @@ impl ParquetReaderBuilder {
         // per-SST ranges index so the prefilter can build the PK-group selection
         // without reading the `__primary_key` column. A cache miss falls back to
         // the normal tsid-membership prefilter.
-        let pk_range_index = if self.pk_index_tsid_set.is_some() {
+        let pk_range_index = if self.pk_index_tsid_set.is_some() && self.use_pk_range_index {
             self.cache_strategy
                 .load_pk_range_index(self.file_handle.file_id())
                 .await
