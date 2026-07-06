@@ -974,13 +974,24 @@ fn collect_batch_series_keys(
             .context(UnexpectedSnafu {
                 reason: "primary key dictionary values are not binary",
             })?;
-        for key in dict.keys().values() {
-            let pk = values.value(*key as usize);
+        let mut last_key = None;
+        for key in dict.keys().values().iter().copied() {
+            if last_key == Some(key) {
+                continue;
+            }
+            last_key = Some(key);
+            let pk = values.value(key as usize);
             collect_primary_key_series_key(codec, pk_filter, pk, tsids)?;
         }
     } else if let Some(binary) = pk_col.as_any().downcast_ref::<BinaryArray>() {
-        for row in 0..binary.len() {
-            collect_primary_key_series_key(codec, pk_filter, binary.value(row), tsids)?;
+        let mut row = 0;
+        while row < binary.len() {
+            let pk = binary.value(row);
+            collect_primary_key_series_key(codec, pk_filter, pk, tsids)?;
+            row += 1;
+            while row < binary.len() && binary.value(row) == pk {
+                row += 1;
+            }
         }
     } else {
         return UnexpectedSnafu {
@@ -1489,16 +1500,19 @@ fn primary_key_at<'a>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use api::v1::OpType;
     use datatypes::arrow::array::{
-        ArrayRef, BinaryDictionaryBuilder, Int64Array, StringDictionaryBuilder,
+        ArrayRef, BinaryArray, BinaryDictionaryBuilder, Int64Array, StringDictionaryBuilder,
         TimestampMillisecondArray, UInt8Array, UInt64Array,
     };
     use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, UInt32Type};
     use datatypes::arrow::record_batch::RecordBatch;
+    use mito_codec::row_converter::PrimaryKeyFilter;
 
     use super::*;
+    use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 
     fn new_test_record_batch(
         primary_keys: &[&[u8]],
@@ -1574,6 +1588,114 @@ mod tests {
 
     fn series_key(table_id: u32, tsid: u64) -> SeriesKey {
         SeriesKey { table_id, tsid }
+    }
+
+    struct CountingPrimaryKeyFilter {
+        count: Arc<AtomicUsize>,
+        allowed: Option<HashSet<Vec<u8>>>,
+    }
+
+    impl PrimaryKeyFilter for CountingPrimaryKeyFilter {
+        fn matches(&mut self, pk: &[u8]) -> mito_codec::error::Result<bool> {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .allowed
+                .as_ref()
+                .is_none_or(|allowed| allowed.contains(pk)))
+        }
+    }
+
+    fn counting_filter(count: Arc<AtomicUsize>) -> Box<dyn PrimaryKeyFilter> {
+        Box::new(CountingPrimaryKeyFilter {
+            count,
+            allowed: None,
+        })
+    }
+
+    fn selective_counting_filter(
+        count: Arc<AtomicUsize>,
+        allowed: HashSet<Vec<u8>>,
+    ) -> Box<dyn PrimaryKeyFilter> {
+        Box::new(CountingPrimaryKeyFilter {
+            count,
+            allowed: Some(allowed),
+        })
+    }
+
+    fn sparse_test_keys() -> (SparsePrimaryKeyCodec, Vec<Vec<u8>>) {
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let codec = SparsePrimaryKeyCodec::new(&metadata);
+        let keys = vec![
+            new_sparse_primary_key(&["host-a", "db"], &metadata, 1, 10),
+            new_sparse_primary_key(&["host-b", "db"], &metadata, 1, 11),
+            new_sparse_primary_key(&["host-c", "db"], &metadata, 2, 10),
+        ];
+        (codec, keys)
+    }
+
+    #[test]
+    fn test_collect_batch_series_keys_dedups_dictionary_keys() {
+        let (codec, keys) = sparse_test_keys();
+        let pk_col = build_test_pk_array(&[
+            keys[0].as_slice(),
+            keys[0].as_slice(),
+            keys[1].as_slice(),
+            keys[1].as_slice(),
+            keys[2].as_slice(),
+        ]);
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut pk_filter = Some(counting_filter(Arc::clone(&count)));
+        let mut tsids = HashSet::new();
+
+        collect_batch_series_keys(&codec, &mut pk_filter, &pk_col, &mut tsids).unwrap();
+
+        assert_eq!(3, count.load(Ordering::Relaxed));
+        assert_eq!(HashSet::from([(1, 10), (1, 11), (2, 10)]), tsids);
+    }
+
+    #[test]
+    fn test_collect_batch_series_keys_dedups_binary_runs() {
+        let (codec, keys) = sparse_test_keys();
+        let pk_col: ArrayRef = Arc::new(BinaryArray::from_iter_values([
+            keys[0].as_slice(),
+            keys[0].as_slice(),
+            keys[1].as_slice(),
+            keys[1].as_slice(),
+            keys[2].as_slice(),
+        ]));
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut pk_filter = Some(counting_filter(Arc::clone(&count)));
+        let mut tsids = HashSet::new();
+
+        collect_batch_series_keys(&codec, &mut pk_filter, &pk_col, &mut tsids).unwrap();
+
+        assert_eq!(3, count.load(Ordering::Relaxed));
+        assert_eq!(HashSet::from([(1, 10), (1, 11), (2, 10)]), tsids);
+    }
+
+    #[test]
+    fn test_collect_batch_series_keys_applies_primary_key_filter() {
+        let (codec, keys) = sparse_test_keys();
+        let pk_col = build_test_pk_array(&[
+            keys[0].as_slice(),
+            keys[0].as_slice(),
+            keys[1].as_slice(),
+            keys[2].as_slice(),
+            keys[2].as_slice(),
+        ]);
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut pk_filter = Some(selective_counting_filter(
+            Arc::clone(&count),
+            HashSet::from([keys[1].clone(), keys[2].clone()]),
+        ));
+        let mut tsids = HashSet::new();
+
+        collect_batch_series_keys(&codec, &mut pk_filter, &pk_col, &mut tsids).unwrap();
+
+        assert_eq!(3, count.load(Ordering::Relaxed));
+        assert_eq!(HashSet::from([(1, 11), (2, 10)]), tsids);
     }
 
     #[test]
