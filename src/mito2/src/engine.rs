@@ -1086,6 +1086,9 @@ impl EngineInner {
         .with_series_key_scan_use_range_index(
             self.config.experimental_series_key_scan_use_range_index,
         )
+        .with_series_key_scan_use_streaming_merge(
+            self.config.experimental_series_key_scan_use_streaming_merge,
+        )
         .with_start_time(query_start);
 
         #[cfg(feature = "enterprise")]

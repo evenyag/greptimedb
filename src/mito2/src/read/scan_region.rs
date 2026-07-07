@@ -259,6 +259,9 @@ pub(crate) struct ScanRegion {
     /// Whether the per-series key scan path may use cached per-SST range indexes
     /// to build parquet row selections.
     series_key_scan_use_range_index: bool,
+    /// Whether the per-series key scan path may use DataFusion streaming merge
+    /// to resolve sorted series keys.
+    series_key_scan_use_streaming_merge: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
     /// Whether to filter out the deleted rows.
@@ -289,6 +292,7 @@ impl ScanRegion {
             enable_pk_index_scan: false,
             experimental_series_key_scan: false,
             series_key_scan_use_range_index: false,
+            series_key_scan_use_streaming_merge: false,
             start_time: None,
             filter_deleted: true,
             #[cfg(feature = "enterprise")]
@@ -352,6 +356,13 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_series_key_scan_use_range_index(mut self, enable: bool) -> Self {
         self.series_key_scan_use_range_index = enable;
+        self
+    }
+
+    /// Sets whether the per-series key scan path may merge sorted key streams.
+    #[must_use]
+    pub(crate) fn with_series_key_scan_use_streaming_merge(mut self, enable: bool) -> Self {
+        self.series_key_scan_use_streaming_merge = enable;
         self
     }
 
@@ -633,6 +644,7 @@ impl ScanRegion {
             .with_pk_index_scan_enabled(self.enable_pk_index_scan)
             .with_experimental_series_key_scan(self.experimental_series_key_scan)
             .with_series_key_scan_use_range_index(self.series_key_scan_use_range_index)
+            .with_series_key_scan_use_streaming_merge(self.series_key_scan_use_streaming_merge)
             .with_pk_indexes(self.version.pk_indexes.clone())
             .with_explain_flat_format(
                 self.version.options.sst_format == Some(crate::sst::FormatType::Flat),
@@ -892,6 +904,8 @@ pub struct ScanInput {
     pub(crate) experimental_series_key_scan: bool,
     /// Whether the per-series key scan path may use cached range indexes.
     pub(crate) series_key_scan_use_range_index: bool,
+    /// Whether the per-series key scan path may merge sorted key streams.
+    pub(crate) series_key_scan_use_streaming_merge: bool,
     /// Primary-key aggregate index metadata from the region snapshot.
     pub(crate) pk_indexes: Arc<HashMap<FileId, AggregatePkIndexMeta>>,
     /// Snapshot upper bound bound at scan open and propagated back to the caller.
@@ -937,6 +951,7 @@ impl ScanInput {
             enable_pk_index_scan: false,
             experimental_series_key_scan: false,
             series_key_scan_use_range_index: false,
+            series_key_scan_use_streaming_merge: false,
             pk_indexes: Arc::new(HashMap::new()),
             snapshot_sequence: None,
             compaction: false,
@@ -960,6 +975,12 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_series_key_scan_use_range_index(mut self, enable: bool) -> Self {
         self.series_key_scan_use_range_index = enable;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_series_key_scan_use_streaming_merge(mut self, enable: bool) -> Self {
+        self.series_key_scan_use_streaming_merge = enable;
         self
     }
 
@@ -1011,6 +1032,7 @@ impl ScanInput {
             enable_pk_index_scan: self.enable_pk_index_scan,
             experimental_series_key_scan: self.experimental_series_key_scan,
             series_key_scan_use_range_index: self.series_key_scan_use_range_index,
+            series_key_scan_use_streaming_merge: self.series_key_scan_use_streaming_merge,
             pk_indexes: self.pk_indexes.clone(),
             snapshot_sequence: self.snapshot_sequence,
             compaction: self.compaction,

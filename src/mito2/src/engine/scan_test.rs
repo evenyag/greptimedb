@@ -737,12 +737,25 @@ async fn test_series_scan_with_format(flat_format: bool) {
 
 #[tokio::test]
 async fn test_series_key_scan_parquet_fallback() {
-    let mut env = TestEnv::with_prefix("test_series_key_scan_parquet_fallback").await;
+    test_series_key_scan_parquet_fallback_with_streaming_merge(false).await;
+}
+
+#[tokio::test]
+async fn test_series_key_scan_parquet_fallback_streaming_merge() {
+    test_series_key_scan_parquet_fallback_with_streaming_merge(true).await;
+}
+
+async fn test_series_key_scan_parquet_fallback_with_streaming_merge(use_streaming_merge: bool) {
+    let mut env = TestEnv::with_prefix(&format!(
+        "test_series_key_scan_parquet_fallback_streaming_merge_{use_streaming_merge}"
+    ))
+    .await;
     let engine = env
         .create_engine(MitoConfig {
             default_flat_format: true,
             enable_pk_index_scan: false,
             experimental_series_key_scan: true,
+            experimental_series_key_scan_use_streaming_merge: use_streaming_merge,
             ..Default::default()
         })
         .await;

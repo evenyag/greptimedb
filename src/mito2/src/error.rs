@@ -443,6 +443,14 @@ pub enum Error {
         error: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("DataFusion execution error"))]
+    Datafusion {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to compute vector"))]
     ComputeVector {
         #[snafu(implicit)]
@@ -1380,6 +1388,7 @@ impl ErrorExt for Error {
             | DecodeWal { .. }
             | ComputeArrow { .. }
             | EvalPartitionFilter { .. }
+            | Datafusion { .. }
             | BiErrors { .. }
             | StopScheduler { .. }
             | ComputeVector { .. }

@@ -202,6 +202,9 @@ pub struct MitoConfig {
     /// Whether the experimental per-series key scan path may use cached per-SST
     /// range indexes to build row selections.
     pub experimental_series_key_scan_use_range_index: bool,
+    /// Whether the experimental per-series key scan path should merge sorted
+    /// per-SST primary-key streams instead of materializing and sorting keys.
+    pub experimental_series_key_scan_use_streaming_merge: bool,
 
     pub gc: GcConfig,
 }
@@ -260,6 +263,7 @@ impl Default for MitoConfig {
             enable_pk_index_scan: false,
             experimental_series_key_scan: false,
             experimental_series_key_scan_use_range_index: false,
+            experimental_series_key_scan_use_streaming_merge: false,
             gc: GcConfig::default(),
         };
 

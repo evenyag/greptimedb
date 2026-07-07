@@ -25,10 +25,19 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
 use common_telemetry::{debug, info, warn};
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool};
+use datafusion::physical_expr::expressions::col as physical_col;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DfRecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, SendableRecordBatchStream as DfSendableRecordBatchStream,
+};
 use datatypes::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray};
 use datatypes::arrow::compute::filter_record_batch;
+use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::SchemaRef;
 use futures::{StreamExt, TryStreamExt};
@@ -48,8 +57,9 @@ use tokio::sync::mpsc::error::{SendTimeoutError, TrySendError};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::error::{
-    ComputeArrowSnafu, DecodeSnafu, Error, InvalidSenderSnafu, JoinSnafu, PartitionOutOfRangeSnafu,
-    Result, ScanMultiTimesSnafu, ScanSeriesSnafu, TooManyFilesToReadSnafu, UnexpectedSnafu,
+    ComputeArrowSnafu, DatafusionSnafu, DecodeSnafu, Error, InvalidSenderSnafu, JoinSnafu,
+    NewRecordBatchSnafu, PartitionOutOfRangeSnafu, Result, ScanMultiTimesSnafu, ScanSeriesSnafu,
+    TooManyFilesToReadSnafu, UnexpectedSnafu,
 };
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::{FileRangeBuilder, RowGroupIndex};
@@ -803,6 +813,13 @@ impl SeriesKeyWorker {
     }
 
     async fn distribute_keys(&mut self) -> Result<()> {
+        if self.stream_ctx.input.series_key_scan_use_streaming_merge
+            && !(self.stream_ctx.input.enable_pk_index_scan
+                && !self.stream_ctx.input.pk_indexes.is_empty())
+        {
+            return self.distribute_keys_by_streaming_merge().await;
+        }
+
         let resolved = resolve_series_key_tsids(&self.stream_ctx.input).await?;
         let key_batches = build_series_key_batches(
             resolved.tsids.iter().copied(),
@@ -821,6 +838,64 @@ impl SeriesKeyWorker {
         for (idx, keys) in key_batches.into_iter().enumerate() {
             self.send_key_batch(idx % num_partitions, keys).await?;
         }
+        self.key_senders.clear();
+        Ok(())
+    }
+
+    async fn distribute_keys_by_streaming_merge(&mut self) -> Result<()> {
+        let mut merged_stream = resolve_series_key_stream(&self.stream_ctx.input).await?;
+        let Some(mut merged_stream) = merged_stream.take() else {
+            self.key_senders.clear();
+            return Ok(());
+        };
+
+        let codec = SparsePrimaryKeyCodec::new(self.stream_ctx.input.region_metadata());
+        let num_partitions = self.key_senders.len();
+        let batch_size = self.stream_ctx.input.series_key_batch_size.max(1);
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut batch_idx = 0;
+        let mut last_key = None;
+        let mut emitted_keys = 0usize;
+
+        while let Some(record_batch) = merged_stream.next().await {
+            let record_batch = record_batch.context(DatafusionSnafu)?;
+            let pk_col = record_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu {
+                    reason: "merged primary key column is not a binary array",
+                })?;
+
+            for row in 0..pk_col.len() {
+                let pk = pk_col.value(row);
+                if last_key.as_deref() == Some(pk) {
+                    continue;
+                }
+                last_key = Some(pk.to_vec());
+                let (table_id, tsid) = codec.read_table_id_tsid(pk).context(DecodeSnafu)?;
+                batch.push(SeriesKey { table_id, tsid });
+                emitted_keys += 1;
+
+                if batch.len() == batch_size {
+                    self.send_key_batch(batch_idx % num_partitions, std::mem::take(&mut batch))
+                        .await?;
+                    batch_idx += 1;
+                    batch = Vec::with_capacity(batch_size);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            self.send_key_batch(batch_idx % num_partitions, batch)
+                .await?;
+        }
+        info!(
+            "Distributed streaming-merged series keys for SeriesScan, region_id: {}, emitted_keys: {}, key_batches: {}",
+            self.stream_ctx.input.region_metadata().region_id,
+            emitted_keys,
+            batch_idx + usize::from(emitted_keys > batch_idx * batch_size)
+        );
         self.key_senders.clear();
         Ok(())
     }
@@ -984,6 +1059,123 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
     Ok(resolved)
 }
 
+async fn resolve_series_key_stream(
+    input: &ScanInput,
+) -> Result<Option<DfSendableRecordBatchStream>> {
+    let metadata = input.region_metadata();
+    let tag_filters = series_key_tag_filters(input);
+    let evaluators = tag_filter_evaluators(metadata, &tag_filters).context(UnexpectedSnafu {
+        reason: "unsupported tag filters for streaming SeriesKeyScan",
+    })?;
+
+    let start = Instant::now();
+    let mut collect_stats = SeriesKeyCollectStats::default();
+    let mut prepared_files = Vec::with_capacity(input.files.len());
+    for file in input.files.iter().cloned() {
+        match build_file_series_key_reader(input, &file).await? {
+            SeriesKeyFileReader::Prepared(prepared) => prepared_files.push(prepared),
+            SeriesKeyFileReader::Pruned(stats) => collect_stats.merge(stats),
+        }
+    }
+
+    if prepared_files.is_empty() {
+        info!(
+            "Resolved streaming SeriesKeyScan series keys, region_id: {}, parquet_files: 0, total_cost: {:?}",
+            metadata.region_id,
+            start.elapsed()
+        );
+        return Ok(None);
+    }
+
+    let key_schema = series_key_stream_schema();
+    let metadata = metadata.clone();
+    let evaluators = Arc::new(evaluators);
+    let mut mito_key_streams = Vec::with_capacity(prepared_files.len());
+    for prepared in prepared_files {
+        let stream = build_prepared_file_series_key_stream(
+            prepared,
+            metadata.clone(),
+            Arc::clone(&evaluators),
+            key_schema.clone(),
+        );
+        mito_key_streams.push(stream);
+    }
+    let channel_size = compute_parallel_channel_size(input.series_key_batch_size.max(1));
+    let mito_key_streams = input.create_parallel_flat_sources(
+        mito_key_streams,
+        Arc::new(Semaphore::new(input.max_concurrent_scan_files.max(1))),
+        channel_size,
+    )?;
+    let key_streams = mito_key_streams
+        .into_iter()
+        .map(|stream| mito_to_df_stream(key_schema.clone(), stream))
+        .collect();
+
+    let merged_stream =
+        build_streaming_merge_key_stream(key_schema, key_streams, input.series_key_batch_size)?;
+    info!(
+        "Resolved streaming SeriesKeyScan series keys, region_id: {}, parquet_files: {}, pruned_row_groups: {}, pruned_batches: {}, pruned_rows: {}, total_cost: {:?}",
+        metadata.region_id,
+        input.files.len(),
+        collect_stats.row_groups,
+        collect_stats.batches,
+        collect_stats.rows,
+        start.elapsed()
+    );
+
+    Ok(Some(merged_stream))
+}
+
+fn build_streaming_merge_key_stream(
+    schema: ArrowSchemaRef,
+    streams: Vec<DfSendableRecordBatchStream>,
+    batch_size: usize,
+) -> Result<DfSendableRecordBatchStream> {
+    if streams.is_empty() {
+        return Ok(Box::pin(DfRecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::empty(),
+        )));
+    }
+
+    let sort_expr = physical_col(PRIMARY_KEY_COLUMN_NAME, schema.as_ref())
+        .map(PhysicalSortExpr::new_default)
+        .context(DatafusionSnafu)?;
+    let ordering = LexOrdering::from([sort_expr]);
+    let metrics_set = ExecutionPlanMetricsSet::new();
+    let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+    let reservation = MemoryConsumer::new("SeriesKeyScanStreamingMerge").register(&memory_pool);
+
+    StreamingMergeBuilder::new()
+        .with_streams(streams)
+        .with_schema(schema)
+        .with_expressions(&ordering)
+        .with_metrics(BaselineMetrics::new(&metrics_set, 0))
+        .with_batch_size(batch_size.max(1))
+        .with_fetch(None)
+        .with_reservation(reservation)
+        .build()
+        .context(DatafusionSnafu)
+}
+
+fn mito_to_df_stream(
+    schema: ArrowSchemaRef,
+    stream: BoxedRecordBatchStream,
+) -> DfSendableRecordBatchStream {
+    Box::pin(DfRecordBatchStreamAdapter::new(
+        schema,
+        stream.map_err(|error| DataFusionError::External(Box::new(error))),
+    ))
+}
+
+fn series_key_stream_schema() -> ArrowSchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        PRIMARY_KEY_COLUMN_NAME,
+        DataType::Binary,
+        false,
+    )]))
+}
+
 async fn build_file_series_key_reader(
     input: &ScanInput,
     file: &crate::sst::file::FileHandle,
@@ -1105,6 +1297,162 @@ async fn collect_prepared_file_series_keys(
     );
 
     Ok((stats, tsids))
+}
+
+fn build_prepared_file_series_key_stream(
+    prepared: PreparedSeriesKeyFile,
+    metadata: RegionMetadataRef,
+    evaluators: Arc<Vec<common_recordbatch::filter::SimpleFilterEvaluator>>,
+    output_schema: ArrowSchemaRef,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        let PreparedSeriesKeyFile {
+            file,
+            context,
+            selection,
+            mut stats,
+            start,
+        } = prepared;
+
+        let codec = SparsePrimaryKeyCodec::new(&metadata);
+        let mut pk_filter =
+            (!evaluators.is_empty()).then(|| codec.primary_key_filter(&metadata, evaluators));
+        let reader_builder = context.reader_builder();
+        let arrow_schema = context.read_format().arrow_schema();
+        let (pk_idx, _) = arrow_schema
+            .column_with_name(PRIMARY_KEY_COLUMN_NAME)
+            .context(UnexpectedSnafu {
+                reason: "primary key column not found in SST schema",
+            })?;
+        let projection = ProjectionMask::roots(
+            reader_builder
+                .parquet_metadata()
+                .file_metadata()
+                .schema_descr(),
+            [pk_idx],
+        );
+        let mut last_pk = None;
+
+        for (row_group_idx, row_selection) in selection.iter() {
+            stats.row_groups += 1;
+            let scan_start = Instant::now();
+            let mut stream = reader_builder
+                .build_with_projection(
+                    *row_group_idx,
+                    Some(row_selection.clone()),
+                    projection.clone(),
+                    None,
+                )
+                .await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                stats.batches += 1;
+                stats.rows += batch.num_rows();
+
+                let primary_keys = collect_batch_primary_key_bytes(
+                    &mut pk_filter,
+                    batch.column(0),
+                    &mut last_pk,
+                )?;
+                stats.primary_keys += primary_keys.len();
+                if primary_keys.is_empty() {
+                    continue;
+                }
+
+                let pk_array = BinaryArray::from_iter_values(
+                    primary_keys.iter().map(Vec::as_slice),
+                );
+                let record_batch = RecordBatch::try_new(
+                    output_schema.clone(),
+                    vec![Arc::new(pk_array) as ArrayRef],
+                )
+                .context(NewRecordBatchSnafu)?;
+                yield record_batch;
+            }
+            stats.scan_cost += scan_start.elapsed();
+        }
+
+        info!(
+            "Collected streaming SeriesKeyScan primary keys from parquet file, region_id: {}, file_id: {}, row_groups: {}, batches: {}, rows: {}, primary_keys: {}, build_reader_cost: {:?}, scan_cost: {:?}, total_cost: {:?}",
+            metadata.region_id,
+            file.meta_ref().file_id,
+            stats.row_groups,
+            stats.batches,
+            stats.rows,
+            stats.primary_keys,
+            stats.build_reader_cost,
+            stats.scan_cost,
+            start.elapsed()
+        );
+    })
+}
+
+fn collect_batch_primary_key_bytes(
+    pk_filter: &mut Option<Box<dyn mito_codec::row_converter::PrimaryKeyFilter>>,
+    pk_col: &ArrayRef,
+    last_pk: &mut Option<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>> {
+    let mut primary_keys = Vec::new();
+    if let Some(dict) = pk_col.as_any().downcast_ref::<PrimaryKeyArray>() {
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .context(UnexpectedSnafu {
+                reason: "primary key dictionary values are not binary",
+            })?;
+        let mut last_dict_key = None;
+        for key in dict.keys().values().iter().copied() {
+            if last_dict_key == Some(key) {
+                continue;
+            }
+            last_dict_key = Some(key);
+            push_primary_key_bytes(
+                pk_filter,
+                values.value(key as usize),
+                last_pk,
+                &mut primary_keys,
+            )?;
+        }
+    } else if let Some(binary) = pk_col.as_any().downcast_ref::<BinaryArray>() {
+        let mut row = 0;
+        while row < binary.len() {
+            let pk = binary.value(row);
+            push_primary_key_bytes(pk_filter, pk, last_pk, &mut primary_keys)?;
+            row += 1;
+            while row < binary.len() && binary.value(row) == pk {
+                row += 1;
+            }
+        }
+    } else {
+        return UnexpectedSnafu {
+            reason: format!(
+                "primary key column is neither a dictionary nor binary array, got {:?}",
+                pk_col.data_type()
+            ),
+        }
+        .fail();
+    }
+    Ok(primary_keys)
+}
+
+fn push_primary_key_bytes(
+    pk_filter: &mut Option<Box<dyn mito_codec::row_converter::PrimaryKeyFilter>>,
+    pk: &[u8],
+    last_pk: &mut Option<Vec<u8>>,
+    primary_keys: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if last_pk.as_deref() == Some(pk) {
+        return Ok(());
+    }
+    *last_pk = Some(pk.to_vec());
+    if let Some(filter) = pk_filter.as_deref_mut()
+        && !filter.matches(pk).context(DecodeSnafu)?
+    {
+        return Ok(());
+    }
+    primary_keys.push(pk.to_vec());
+    Ok(())
 }
 
 fn collect_batch_series_keys(
@@ -1664,6 +2012,58 @@ mod tests {
     use super::*;
     use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 
+    fn new_test_key_record_batch(schema: ArrowSchemaRef, primary_keys: &[&[u8]]) -> RecordBatch {
+        let pk_array = BinaryArray::from_iter_values(primary_keys.iter().copied());
+        RecordBatch::try_new(schema, vec![Arc::new(pk_array) as ArrayRef]).unwrap()
+    }
+
+    fn new_test_df_key_stream(
+        schema: ArrowSchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> DfSendableRecordBatchStream {
+        Box::pin(DfRecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+
+    async fn collect_test_merged_series_key_batches(
+        mut stream: DfSendableRecordBatchStream,
+        codec: &SparsePrimaryKeyCodec,
+        batch_size: usize,
+    ) -> Vec<Vec<SeriesKey>> {
+        let mut batches = Vec::new();
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut last_key = None;
+
+        while let Some(record_batch) = stream.next().await {
+            let record_batch = record_batch.unwrap();
+            let primary_keys = record_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            for row in 0..primary_keys.len() {
+                let pk = primary_keys.value(row);
+                if last_key.as_deref() == Some(pk) {
+                    continue;
+                }
+                last_key = Some(pk.to_vec());
+                let (table_id, tsid) = codec.read_table_id_tsid(pk).unwrap();
+                batch.push(series_key(table_id, tsid));
+                if batch.len() == batch_size {
+                    batches.push(std::mem::take(&mut batch));
+                    batch = Vec::with_capacity(batch_size);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
+        batches
+    }
+
     fn new_test_record_batch(
         primary_keys: &[&[u8]],
         timestamps: &[i64],
@@ -1904,6 +2304,38 @@ mod tests {
         expected.sort_unstable();
 
         assert_eq!(expected, actual);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_merge_series_keys_sorts_dedups_and_chunks() {
+        let (codec, keys) = sparse_test_keys();
+        let schema = series_key_stream_schema();
+        let streams = vec![
+            new_test_df_key_stream(
+                schema.clone(),
+                vec![
+                    new_test_key_record_batch(schema.clone(), &[&keys[0], &keys[1]]),
+                    new_test_key_record_batch(schema.clone(), &[&keys[2]]),
+                ],
+            ),
+            new_test_df_key_stream(
+                schema.clone(),
+                vec![new_test_key_record_batch(
+                    schema.clone(),
+                    &[&keys[0], &keys[2]],
+                )],
+            ),
+        ];
+        let merged = build_streaming_merge_key_stream(schema, streams, 2).unwrap();
+        let batches = collect_test_merged_series_key_batches(merged, &codec, 2).await;
+
+        assert_eq!(
+            vec![
+                vec![series_key(1, 10), series_key(1, 11)],
+                vec![series_key(2, 10)],
+            ],
+            batches
+        );
     }
 
     #[test]
