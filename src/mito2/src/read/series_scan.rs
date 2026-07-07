@@ -994,15 +994,24 @@ async fn build_file_series_key_reader(
 
     let mut metrics = ReaderMetrics::default();
     let build_reader_start = Instant::now();
-    let Some((context, selection)) = input
-        .access_layer()
-        .read_sst(file.clone())
-        .cache(input.cache_strategy.clone())
+    let predicate = input.predicate_for_sst_file(file);
+    let may_build_selective_row_selection = predicate.is_some();
+    let reader = input.apply_index_appliers(
+        input
+            .access_layer()
+            .read_sst(file.clone())
+            .cache(input.cache_strategy.clone())
+            .predicate(predicate),
+    );
+    let reader = reader
         .expected_metadata(Some(metadata.clone()))
-        .pre_filter_mode(PreFilterMode::All)
-        .build_reader_input(&mut metrics)
-        .await?
-    else {
+        .pre_filter_mode(PreFilterMode::All);
+    let reader = if may_build_selective_row_selection {
+        reader.deferred_optional_page_index()
+    } else {
+        reader
+    };
+    let Some((context, selection)) = reader.build_reader_input(&mut metrics).await? else {
         stats.build_reader_cost += build_reader_start.elapsed();
         info!(
             "Collected SeriesKeyScan series keys from parquet file, region_id: {}, file_id: {}, pruned: true, row_groups: {}, batches: {}, rows: {}, primary_keys: {}, build_reader_cost: {:?}, scan_cost: {:?}, total_cost: {:?}",

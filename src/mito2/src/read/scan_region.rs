@@ -86,7 +86,7 @@ use crate::sst::index::inverted_index::applier::builder::InvertedIndexApplierBui
 #[cfg(feature = "vector_index")]
 use crate::sst::index::vector_index::applier::{VectorIndexApplier, VectorIndexApplierRef};
 use crate::sst::parquet::file_range::PreFilterMode;
-use crate::sst::parquet::reader::ReaderMetrics;
+use crate::sst::parquet::reader::{ParquetReaderBuilder, ReaderMetrics};
 use crate::sst::pk_index::PkIndexTsidSet;
 
 #[cfg(feature = "vector_index")]
@@ -1449,6 +1449,22 @@ impl ScanInput {
 
     pub(crate) fn predicate_group(&self) -> &PredicateGroup {
         &self.predicate
+    }
+
+    /// Returns the predicate to use when reading a specific SST file.
+    pub(crate) fn predicate_for_sst_file(&self, file: &FileHandle) -> Option<Predicate> {
+        self.predicate_for_file(file)
+    }
+
+    /// Applies configured secondary index appliers to an SST reader.
+    pub(crate) fn apply_index_appliers(
+        &self,
+        reader: ParquetReaderBuilder,
+    ) -> ParquetReaderBuilder {
+        reader
+            .inverted_index_appliers(self.inverted_index_appliers.clone())
+            .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
+            .fulltext_index_appliers(self.fulltext_index_appliers.clone())
     }
 
     /// Returns number of memtables to scan.
