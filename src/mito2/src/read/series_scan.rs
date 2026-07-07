@@ -62,10 +62,11 @@ use crate::read::scan_util::{
 use crate::read::seq_scan::SeqScan;
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{BoxedRecordBatchStream, ScannerMetrics};
-use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
+use crate::sst::parquet::file_range::{FileRange, FileRangeContext, PreFilterMode};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::reader::ReaderMetrics;
+use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::pk_index::{
     PkIndexTsidSet, build_pk_index_tsid_set, tag_filter_evaluators, tag_filter_exprs,
 };
@@ -865,6 +866,19 @@ struct SeriesKeyCollectStats {
     scan_cost: Duration,
 }
 
+struct PreparedSeriesKeyFile {
+    file: crate::sst::file::FileHandle,
+    context: FileRangeContext,
+    selection: RowGroupSelection,
+    stats: SeriesKeyCollectStats,
+    start: Instant,
+}
+
+enum SeriesKeyFileReader {
+    Prepared(PreparedSeriesKeyFile),
+    Pruned(SeriesKeyCollectStats),
+}
+
 impl SeriesKeyCollectStats {
     fn merge(&mut self, other: SeriesKeyCollectStats) {
         self.row_groups += other.row_groups;
@@ -925,10 +939,29 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
         .cloned()
         .collect::<Vec<_>>();
     resolved.parquet_files = parquet_files.len();
+    let mut prepared_files = Vec::with_capacity(parquet_files.len());
     for file in parquet_files {
-        let stats =
-            collect_file_series_keys(input, &file, &evaluators, &mut resolved.tsids).await?;
+        match build_file_series_key_reader(input, &file).await? {
+            SeriesKeyFileReader::Prepared(prepared) => prepared_files.push(prepared),
+            SeriesKeyFileReader::Pruned(stats) => parquet_collect_stats.merge(stats),
+        }
+    }
+
+    let max_concurrent_files = input.max_concurrent_scan_files.max(1);
+    let metadata = metadata.clone();
+    let evaluators = Arc::new(evaluators);
+    let file_results = futures::stream::iter(prepared_files.into_iter().map(|prepared| {
+        let metadata = metadata.clone();
+        let evaluators = Arc::clone(&evaluators);
+        async move { collect_prepared_file_series_keys(prepared, metadata, evaluators).await }
+    }))
+    .buffer_unordered(max_concurrent_files)
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    for (stats, file_tsids) in file_results {
         parquet_collect_stats.merge(stats);
+        resolved.tsids.extend(file_tsids);
     }
 
     info!(
@@ -951,18 +984,13 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
     Ok(resolved)
 }
 
-async fn collect_file_series_keys(
+async fn build_file_series_key_reader(
     input: &ScanInput,
     file: &crate::sst::file::FileHandle,
-    evaluators: &[common_recordbatch::filter::SimpleFilterEvaluator],
-    tsids: &mut HashSet<(u32, u64)>,
-) -> Result<SeriesKeyCollectStats> {
+) -> Result<SeriesKeyFileReader> {
     let mut stats = SeriesKeyCollectStats::default();
     let metadata = input.region_metadata();
     let start = Instant::now();
-    let codec = SparsePrimaryKeyCodec::new(metadata);
-    let mut pk_filter = (!evaluators.is_empty())
-        .then(|| codec.primary_key_filter(metadata, Arc::new(evaluators.to_vec())));
 
     let mut metrics = ReaderMetrics::default();
     let build_reader_start = Instant::now();
@@ -988,10 +1016,36 @@ async fn collect_file_series_keys(
             stats.scan_cost,
             start.elapsed()
         );
-        return Ok(stats);
+        return Ok(SeriesKeyFileReader::Pruned(stats));
     };
     stats.build_reader_cost += build_reader_start.elapsed();
 
+    Ok(SeriesKeyFileReader::Prepared(PreparedSeriesKeyFile {
+        file: file.clone(),
+        context,
+        selection,
+        stats,
+        start,
+    }))
+}
+
+async fn collect_prepared_file_series_keys(
+    prepared: PreparedSeriesKeyFile,
+    metadata: RegionMetadataRef,
+    evaluators: Arc<Vec<common_recordbatch::filter::SimpleFilterEvaluator>>,
+) -> Result<(SeriesKeyCollectStats, HashSet<(u32, u64)>)> {
+    let PreparedSeriesKeyFile {
+        file,
+        context,
+        selection,
+        mut stats,
+        start,
+    } = prepared;
+
+    let codec = SparsePrimaryKeyCodec::new(&metadata);
+    let mut pk_filter =
+        (!evaluators.is_empty()).then(|| codec.primary_key_filter(&metadata, evaluators));
+    let mut tsids = HashSet::new();
     let reader_builder = context.reader_builder();
     let arrow_schema = context.read_format().arrow_schema();
     let (pk_idx, _) = arrow_schema
@@ -1023,7 +1077,7 @@ async fn collect_file_series_keys(
             stats.batches += 1;
             stats.rows += batch.num_rows();
             stats.primary_keys +=
-                collect_batch_series_keys(&codec, &mut pk_filter, batch.column(0), tsids)?;
+                collect_batch_series_keys(&codec, &mut pk_filter, batch.column(0), &mut tsids)?;
         }
         stats.scan_cost += scan_start.elapsed();
     }
@@ -1041,7 +1095,7 @@ async fn collect_file_series_keys(
         start.elapsed()
     );
 
-    Ok(stats)
+    Ok((stats, tsids))
 }
 
 fn collect_batch_series_keys(
