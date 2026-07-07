@@ -1300,7 +1300,6 @@ impl ScanInput {
             }
         }
 
-        let may_build_selective_row_selection = predicate.is_some();
         let decode_pk_values = !self.compaction
             && self
                 .mapper
@@ -1314,6 +1313,7 @@ impl ScanInput {
             .as_ref()
             .filter(|set| set.covers(file.meta_ref().file_id))
             .cloned();
+        let may_build_selective_row_selection = predicate.is_some() || pk_index_tsid_set.is_some();
         let reader = self
             .access_layer
             .read_sst(file.clone())
@@ -1743,8 +1743,18 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanFingerprin
         }
     }
 
-    if !has_tag_filter {
-        // We only cache requests that have tag filters to avoid caching all series.
+    let series_key_filter = input
+        .pk_index_tsid_set
+        .as_ref()
+        .map_or_else(Vec::new, |set| {
+            let mut tsids = set.tsids().iter().copied().collect::<Vec<_>>();
+            tsids.sort_unstable();
+            tsids
+        });
+
+    if !has_tag_filter && series_key_filter.is_empty() {
+        // We only cache requests that have tag filters or an explicit series-key
+        // allow-list to avoid caching all series.
         return None;
     }
 
@@ -1773,6 +1783,7 @@ pub(crate) fn build_scan_fingerprint(input: &ScanInput) -> Option<ScanFingerprin
         filter_deleted: input.filter_deleted,
         merge_mode: input.merge_mode,
         partition_expr_version: metadata.partition_expr_version,
+        series_key_filter,
     }
     .build();
 
@@ -2153,6 +2164,7 @@ impl PredicateGroup {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use common_time::timestamp::{TimeUnit, Timestamp};
@@ -2176,6 +2188,7 @@ mod tests {
     use crate::read::range_cache::ScanRequestFingerprintBuilder;
     use crate::read::read_columns::ReadColumn;
     use crate::sst::file::FileMeta;
+    use crate::sst::pk_index::PkIndexTsidSet;
     use crate::test_util::memtable_util::metadata_with_primary_key;
     use crate::test_util::scheduler_util::SchedulerEnv;
 
@@ -2384,6 +2397,7 @@ mod tests {
             filter_deleted: false,
             merge_mode: MergeMode::LastNonNull,
             partition_expr_version: 0,
+            series_key_filter: vec![],
         }
         .build();
         assert_eq!(expected, fingerprint.fingerprint);
@@ -2399,6 +2413,27 @@ mod tests {
         .await;
 
         assert!(build_scan_fingerprint(&input).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_scan_fingerprint_allows_series_key_filter() {
+        let metadata = Arc::new(metadata_with_primary_key(vec![0, 1], false));
+        let input = new_scan_input(
+            metadata,
+            vec![col("ts").gt_eq(lit(1000)), col("v0").gt(lit(1))],
+        )
+        .await
+        .clone_with_pk_index_tsid_set(Some(PkIndexTsidSet::new(
+            HashSet::from([(2, 10), (1, 10)]),
+            HashSet::new(),
+        )));
+
+        let fingerprint = build_scan_fingerprint(&input).unwrap();
+
+        assert_eq!(
+            &[(1, 10), (2, 10)],
+            fingerprint.fingerprint.series_key_filter()
+        );
     }
 
     #[tokio::test]
@@ -2457,6 +2492,7 @@ mod tests {
             filter_deleted: true,
             merge_mode: MergeMode::LastRow,
             partition_expr_version: metadata.partition_expr_version,
+            series_key_filter: vec![],
         }
         .build();
         assert_eq!(expected, fingerprint.fingerprint);

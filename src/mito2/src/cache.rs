@@ -2366,6 +2366,7 @@ mod tests {
                 filter_deleted: true,
                 merge_mode: crate::region::options::MergeMode::LastRow,
                 partition_expr_version: 0,
+                series_key_filter: vec![],
             }
             .build(),
         };

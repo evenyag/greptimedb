@@ -14,6 +14,7 @@
 
 //! Utilities for the partition range scan result cache.
 
+use std::collections::HashSet;
 use std::mem;
 use std::sync::Arc;
 
@@ -65,6 +66,8 @@ pub(crate) struct ScanRequestFingerprint {
     /// We keep the partition expr version to ensure we won't reuse the fingerprint after we change the partition expr.
     /// We store the version instead of the whole partition expr or partition expr filters.
     partition_expr_version: u64,
+    /// Partition-local series keys used by the series-key scan path.
+    series_key_filter: Option<Arc<Vec<(u32, u64)>>>,
 }
 
 #[derive(Debug)]
@@ -78,6 +81,7 @@ pub(crate) struct ScanRequestFingerprintBuilder {
     pub(crate) filter_deleted: bool,
     pub(crate) merge_mode: MergeMode,
     pub(crate) partition_expr_version: u64,
+    pub(crate) series_key_filter: Vec<(u32, u64)>,
 }
 
 impl ScanRequestFingerprintBuilder {
@@ -92,8 +96,11 @@ impl ScanRequestFingerprintBuilder {
             filter_deleted,
             merge_mode,
             partition_expr_version,
+            mut series_key_filter,
         } = self;
 
+        series_key_filter.sort_unstable();
+        series_key_filter.dedup();
         ScanRequestFingerprint {
             inner: Arc::new(SharedScanRequestFingerprint {
                 read_columns,
@@ -106,6 +113,7 @@ impl ScanRequestFingerprintBuilder {
             filter_deleted,
             merge_mode,
             partition_expr_version,
+            series_key_filter: (!series_key_filter.is_empty()).then(|| Arc::new(series_key_filter)),
         }
     }
 }
@@ -146,6 +154,14 @@ impl ScanRequestFingerprint {
             .unwrap_or(&[])
     }
 
+    #[cfg(test)]
+    pub(crate) fn series_key_filter(&self) -> &[(u32, u64)] {
+        self.series_key_filter
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub(crate) fn without_time_filters(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -155,6 +171,7 @@ impl ScanRequestFingerprint {
             filter_deleted: self.filter_deleted,
             merge_mode: self.merge_mode,
             partition_expr_version: self.partition_expr_version,
+            series_key_filter: self.series_key_filter.clone(),
         }
     }
 
@@ -176,6 +193,9 @@ impl ScanRequestFingerprint {
                         .iter()
                         .map(|filter| filter.capacity())
                         .sum::<usize>()
+            })
+            + self.series_key_filter.as_ref().map_or(0, |keys| {
+                mem::size_of::<Vec<(u32, u64)>>() + keys.capacity() * mem::size_of::<(u32, u64)>()
             })
     }
 }
@@ -467,6 +487,16 @@ pub(crate) fn build_range_cache_key(
     let rg = collect_partition_range_row_groups(stream_ctx, part_range);
     if !rg.only_file_sources || rg.row_groups.is_empty() {
         return None;
+    }
+    if let Some(tsid_set) = &stream_ctx.input.pk_index_tsid_set {
+        let covered_files = rg.row_groups.iter().map(|(file_id, _)| *file_id);
+        let mut visited = HashSet::new();
+        if !covered_files
+            .filter(|file_id| visited.insert(*file_id))
+            .all(|file_id| tsid_set.covers(file_id))
+        {
+            return None;
+        }
     }
 
     // If the implied range covers this partition's `FileTimeRange`, drop
@@ -786,6 +816,7 @@ pub fn bench_cache_flat_range_stream(
         filter_deleted: false,
         merge_mode: MergeMode::LastRow,
         partition_expr_version: 0,
+        series_key_filter: vec![],
     }
     .build();
 
@@ -822,6 +853,7 @@ mod tests {
     use crate::read::range::{RangeMeta, RowGroupIndex, SourceIndex};
     use crate::read::scan_region::{PredicateGroup, ScanInput};
     use crate::sst::file::FileTimeRange;
+    use crate::sst::pk_index::PkIndexTsidSet;
     use crate::test_util::memtable_util::metadata_with_primary_key;
     use crate::test_util::scheduler_util::SchedulerEnv;
     use crate::test_util::sst_util::sst_file_handle_with_file_id;
@@ -852,6 +884,7 @@ mod tests {
             filter_deleted,
             merge_mode: MergeMode::LastRow,
             partition_expr_version,
+            series_key_filter: vec![],
         }
         .build()
     }
@@ -968,6 +1001,28 @@ mod tests {
             key.scan.time_filters(),
             normalized_exprs(expected_time_filters).as_slice()
         );
+    }
+
+    fn with_tsid_set(
+        mut stream_ctx: StreamContext,
+        tsids: impl IntoIterator<Item = (u32, u64)>,
+        covered_files: impl IntoIterator<Item = FileId>,
+    ) -> StreamContext {
+        let tsid_set = PkIndexTsidSet::new(
+            tsids.into_iter().collect(),
+            covered_files.into_iter().collect(),
+        );
+        stream_ctx.input = stream_ctx
+            .input
+            .clone_with_pk_index_tsid_set(Some(tsid_set));
+        let (scan_fingerprint, scan_implied_time_range) =
+            match crate::read::scan_region::build_scan_fingerprint(&stream_ctx.input) {
+                Some(b) => (Some(b.fingerprint), b.implied_time_range),
+                None => (None, None),
+            };
+        stream_ctx.scan_fingerprint = scan_fingerprint;
+        stream_ctx.scan_implied_time_range = scan_implied_time_range;
+        stream_ctx
     }
 
     #[tokio::test]
@@ -1088,6 +1143,73 @@ mod tests {
         let key_b = build_range_cache_key(&ctx_b, &part_b).unwrap();
         assert_eq!(key_a.scan, key_b.scan);
         assert!(key_a.scan.time_filters().is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_key_filter_participates_in_cache_key() {
+        let partition_range = (
+            Timestamp::new_millisecond(1000),
+            Timestamp::new_millisecond(2000),
+        );
+        let filters = vec![col("k0").eq(lit("foo"))];
+
+        let (ctx, part_range) = new_stream_context(filters.clone(), None, partition_range).await;
+        let file_id = ctx.input.files[0].meta_ref().file_id;
+        let key_a = build_range_cache_key(
+            &with_tsid_set(ctx, [(1, 10), (1, 11)], [file_id]),
+            &part_range,
+        )
+        .unwrap();
+
+        let (ctx, part_range) = new_stream_context(filters, None, partition_range).await;
+        let file_id = ctx.input.files[0].meta_ref().file_id;
+        let key_b =
+            build_range_cache_key(&with_tsid_set(ctx, [(2, 10)], [file_id]), &part_range).unwrap();
+
+        assert_ne!(key_a.scan, key_b.scan);
+        assert_eq!(&[(1, 10), (1, 11)], key_a.scan.series_key_filter());
+        assert_eq!(&[(2, 10)], key_b.scan.series_key_filter());
+    }
+
+    #[tokio::test]
+    async fn series_key_filter_is_order_independent() {
+        let partition_range = (
+            Timestamp::new_millisecond(1000),
+            Timestamp::new_millisecond(2000),
+        );
+
+        let (ctx, part_range) = new_stream_context(vec![], None, partition_range).await;
+        let file_id = ctx.input.files[0].meta_ref().file_id;
+        let key_a = build_range_cache_key(
+            &with_tsid_set(ctx, [(2, 10), (1, 11), (1, 10)], [file_id]),
+            &part_range,
+        )
+        .unwrap();
+
+        let (ctx, part_range) = new_stream_context(vec![], None, partition_range).await;
+        let file_id = ctx.input.files[0].meta_ref().file_id;
+        let key_b = build_range_cache_key(
+            &with_tsid_set(ctx, [(1, 10), (2, 10), (1, 11)], [file_id]),
+            &part_range,
+        )
+        .unwrap();
+
+        assert_eq!(key_a.scan, key_b.scan);
+        assert_eq!(&[(1, 10), (1, 11), (2, 10)], key_a.scan.series_key_filter());
+    }
+
+    #[tokio::test]
+    async fn series_key_filter_requires_covered_files() {
+        let partition_range = (
+            Timestamp::new_millisecond(1000),
+            Timestamp::new_millisecond(2000),
+        );
+
+        let (ctx, part_range) = new_stream_context(vec![], None, partition_range).await;
+        let uncovered_ctx = with_tsid_set(ctx, [(1, 10)], [FileId::random()]);
+
+        assert!(uncovered_ctx.scan_fingerprint.is_some());
+        assert!(build_range_cache_key(&uncovered_ctx, &part_range).is_none());
     }
 
     #[tokio::test]
