@@ -855,6 +855,27 @@ struct ResolvedSeriesKeys {
     parquet_files: usize,
 }
 
+#[derive(Debug, Default)]
+struct SeriesKeyCollectStats {
+    row_groups: usize,
+    batches: usize,
+    rows: usize,
+    primary_keys: usize,
+    build_reader_cost: Duration,
+    scan_cost: Duration,
+}
+
+impl SeriesKeyCollectStats {
+    fn merge(&mut self, other: SeriesKeyCollectStats) {
+        self.row_groups += other.row_groups;
+        self.batches += other.batches;
+        self.rows += other.rows;
+        self.primary_keys += other.primary_keys;
+        self.build_reader_cost += other.build_reader_cost;
+        self.scan_cost += other.scan_cost;
+    }
+}
+
 async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKeys> {
     let metadata = input.region_metadata();
     let tag_filters = series_key_tag_filters(input);
@@ -864,20 +885,28 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
 
     let mut resolved = ResolvedSeriesKeys::default();
     let mut covered_files = HashSet::new();
+    let mut pk_index_cost = Duration::ZERO;
+    let mut parquet_collect_stats = SeriesKeyCollectStats::default();
+    let start = Instant::now();
     let time_range = input
         .time_range
         .unwrap_or_else(common_time::range::TimestampRange::min_to_max);
 
     if input.enable_pk_index_scan
         && !input.pk_indexes.is_empty()
-        && let Some(tsid_set) = build_pk_index_tsid_set(
-            input.access_layer(),
-            metadata,
-            &input.pk_indexes,
-            &tag_filters,
-            &time_range,
-        )
-        .await?
+        && let Some(tsid_set) = {
+            let stage_start = Instant::now();
+            let tsid_set = build_pk_index_tsid_set(
+                input.access_layer(),
+                metadata,
+                &input.pk_indexes,
+                &tag_filters,
+                &time_range,
+            )
+            .await?;
+            pk_index_cost += stage_start.elapsed();
+            tsid_set
+        }
     {
         resolved.use_pk_index = true;
         for file in &input.files {
@@ -897,8 +926,27 @@ async fn resolve_series_key_tsids(input: &ScanInput) -> Result<ResolvedSeriesKey
         .collect::<Vec<_>>();
     resolved.parquet_files = parquet_files.len();
     for file in parquet_files {
-        collect_file_series_keys(input, &file, &evaluators, &mut resolved.tsids).await?;
+        let stats =
+            collect_file_series_keys(input, &file, &evaluators, &mut resolved.tsids).await?;
+        parquet_collect_stats.merge(stats);
     }
+
+    info!(
+        "Resolved SeriesKeyScan series keys, region_id: {}, use_pk_index: {}, matched_tsids: {}, pk_index_files: {}, parquet_files: {}, pk_index_cost: {:?}, parquet_build_reader_cost: {:?}, parquet_scan_cost: {:?}, parquet_row_groups: {}, parquet_batches: {}, parquet_rows: {}, parquet_primary_keys: {}, total_cost: {:?}",
+        metadata.region_id,
+        resolved.use_pk_index,
+        resolved.tsids.len(),
+        resolved.pk_index_files,
+        resolved.parquet_files,
+        pk_index_cost,
+        parquet_collect_stats.build_reader_cost,
+        parquet_collect_stats.scan_cost,
+        parquet_collect_stats.row_groups,
+        parquet_collect_stats.batches,
+        parquet_collect_stats.rows,
+        parquet_collect_stats.primary_keys,
+        start.elapsed()
+    );
 
     Ok(resolved)
 }
@@ -908,13 +956,16 @@ async fn collect_file_series_keys(
     file: &crate::sst::file::FileHandle,
     evaluators: &[common_recordbatch::filter::SimpleFilterEvaluator],
     tsids: &mut HashSet<(u32, u64)>,
-) -> Result<()> {
+) -> Result<SeriesKeyCollectStats> {
+    let mut stats = SeriesKeyCollectStats::default();
     let metadata = input.region_metadata();
+    let start = Instant::now();
     let codec = SparsePrimaryKeyCodec::new(metadata);
     let mut pk_filter = (!evaluators.is_empty())
         .then(|| codec.primary_key_filter(metadata, Arc::new(evaluators.to_vec())));
 
     let mut metrics = ReaderMetrics::default();
+    let build_reader_start = Instant::now();
     let Some((context, selection)) = input
         .access_layer()
         .read_sst(file.clone())
@@ -924,8 +975,22 @@ async fn collect_file_series_keys(
         .build_reader_input(&mut metrics)
         .await?
     else {
-        return Ok(());
+        stats.build_reader_cost += build_reader_start.elapsed();
+        info!(
+            "Collected SeriesKeyScan series keys from parquet file, region_id: {}, file_id: {}, pruned: true, row_groups: {}, batches: {}, rows: {}, primary_keys: {}, build_reader_cost: {:?}, scan_cost: {:?}, total_cost: {:?}",
+            metadata.region_id,
+            file.meta_ref().file_id,
+            stats.row_groups,
+            stats.batches,
+            stats.rows,
+            stats.primary_keys,
+            stats.build_reader_cost,
+            stats.scan_cost,
+            start.elapsed()
+        );
+        return Ok(stats);
     };
+    stats.build_reader_cost += build_reader_start.elapsed();
 
     let reader_builder = context.reader_builder();
     let arrow_schema = context.read_format().arrow_schema();
@@ -943,6 +1008,8 @@ async fn collect_file_series_keys(
     );
 
     for (row_group_idx, row_selection) in selection.iter() {
+        stats.row_groups += 1;
+        let scan_start = Instant::now();
         let mut stream = reader_builder
             .build_with_projection(
                 *row_group_idx,
@@ -953,11 +1020,28 @@ async fn collect_file_series_keys(
             .await?;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            collect_batch_series_keys(&codec, &mut pk_filter, batch.column(0), tsids)?;
+            stats.batches += 1;
+            stats.rows += batch.num_rows();
+            stats.primary_keys +=
+                collect_batch_series_keys(&codec, &mut pk_filter, batch.column(0), tsids)?;
         }
+        stats.scan_cost += scan_start.elapsed();
     }
 
-    Ok(())
+    info!(
+        "Collected SeriesKeyScan series keys from parquet file, region_id: {}, file_id: {}, pruned: false, row_groups: {}, batches: {}, rows: {}, primary_keys: {}, build_reader_cost: {:?}, scan_cost: {:?}, total_cost: {:?}",
+        metadata.region_id,
+        file.meta_ref().file_id,
+        stats.row_groups,
+        stats.batches,
+        stats.rows,
+        stats.primary_keys,
+        stats.build_reader_cost,
+        stats.scan_cost,
+        start.elapsed()
+    );
+
+    Ok(stats)
 }
 
 fn collect_batch_series_keys(
@@ -965,7 +1049,8 @@ fn collect_batch_series_keys(
     pk_filter: &mut Option<Box<dyn mito_codec::row_converter::PrimaryKeyFilter>>,
     pk_col: &ArrayRef,
     tsids: &mut HashSet<(u32, u64)>,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut primary_keys = 0;
     if let Some(dict) = pk_col.as_any().downcast_ref::<PrimaryKeyArray>() {
         let values = dict
             .values()
@@ -982,12 +1067,14 @@ fn collect_batch_series_keys(
             last_key = Some(key);
             let pk = values.value(key as usize);
             collect_primary_key_series_key(codec, pk_filter, pk, tsids)?;
+            primary_keys += 1;
         }
     } else if let Some(binary) = pk_col.as_any().downcast_ref::<BinaryArray>() {
         let mut row = 0;
         while row < binary.len() {
             let pk = binary.value(row);
             collect_primary_key_series_key(codec, pk_filter, pk, tsids)?;
+            primary_keys += 1;
             row += 1;
             while row < binary.len() && binary.value(row) == pk {
                 row += 1;
@@ -1002,7 +1089,7 @@ fn collect_batch_series_keys(
         }
         .fail();
     }
-    Ok(())
+    Ok(primary_keys)
 }
 
 fn collect_primary_key_series_key(
