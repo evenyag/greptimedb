@@ -534,6 +534,8 @@ pub(crate) struct PrefilterContext {
     schema_version: u64,
     /// Sorted expression strings for the encoded-PK filter group.
     pk_filter_expr_strs: Option<SmallVec<[String; 1]>>,
+    /// Whether the PK-group filter result can be keyed only by `pk_filter_expr_strs`.
+    pk_group_cacheable: bool,
     /// Arrow schema used to build narrowed prefilter projections.
     arrow_schema: SchemaRef,
     /// When set, the PK-group row selection is derived from this per-SST ranges
@@ -694,6 +696,10 @@ impl PrefilterContextBuilder {
             physical_filters: self.physical_filters.clone(),
             schema_version: self.schema_version,
             pk_filter_expr_strs: self.pk_filter_expr_strs.clone(),
+            // A partition-local tsid set replaces the tag PK filter with a
+            // different membership set for each SeriesScan partition. The tag
+            // expression strings alone are not enough to identify the mask.
+            pk_group_cacheable: self.pk_index_tsid_set.is_none(),
             arrow_schema: self.arrow_schema.clone(),
             pk_range_index: use_range_index
                 .then(|| self.pk_range_index.clone())
@@ -1112,7 +1118,8 @@ fn build_prefilter_cache_entries(
         });
     }
 
-    if prefilter_ctx.pk_filter.is_some()
+    if prefilter_ctx.pk_group_cacheable
+        && prefilter_ctx.pk_filter.is_some()
         && let Some(exprs) = &prefilter_ctx.pk_filter_expr_strs
     {
         entries.push(PrefilterEntry {
@@ -1832,6 +1839,66 @@ mod tests {
             vec!["ts"]
         );
         assert!(plan_no_index.remaining_simple_filters.is_empty());
+    }
+
+    #[test]
+    fn test_pk_index_tsid_prefilter_disables_pk_group_cache() {
+        use std::collections::HashSet;
+
+        use crate::sst::pk_index::PkIndexTsidSet;
+
+        let metadata: RegionMetadataRef = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::from_deduped_column_ids(
+                metadata.column_metadatas.iter().map(|c| c.column_id),
+            ),
+            None,
+            "test",
+            false,
+        )
+        .unwrap();
+        let codec = build_primary_key_codec(metadata.as_ref());
+        let predicate = Predicate::new(vec![col("tag_0").eq(lit("a"))]);
+
+        let normal_plan = build_reader_filter_plan(
+            Some(&predicate),
+            None,
+            PreFilterMode::All,
+            &read_format,
+            &codec,
+            None,
+            None,
+        );
+        let normal_ctx = normal_plan
+            .prefilter_builder
+            .as_ref()
+            .expect("builder present")
+            .build();
+        assert!(normal_ctx.pk_filter.is_some());
+        assert!(normal_ctx.pk_group_cacheable);
+        assert!(normal_ctx.pk_filter_expr_strs.is_some());
+
+        let tsid_set = PkIndexTsidSet::new_for_test(HashSet::from([(1, 1)]));
+        let pk_index_plan = build_reader_filter_plan(
+            Some(&predicate),
+            None,
+            PreFilterMode::All,
+            &read_format,
+            &codec,
+            Some(&tsid_set),
+            None,
+        );
+        let pk_index_ctx = pk_index_plan
+            .prefilter_builder
+            .as_ref()
+            .expect("builder present")
+            .build();
+        assert!(pk_index_ctx.pk_filter.is_some());
+        assert!(!pk_index_ctx.pk_group_cacheable);
+        assert!(pk_index_ctx.pk_filter_expr_strs.is_some());
     }
 
     #[test]
