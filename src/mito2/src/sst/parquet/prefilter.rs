@@ -36,10 +36,11 @@ use parquet::schema::types::SchemaDescriptor;
 use smallvec::{SmallVec, smallvec};
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
+use store_api::storage::FileId;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use table::predicate::Predicate;
 
-use crate::cache::PrefilterKey;
+use crate::cache::{PrefilterKey, PrefilterRowSelector};
 use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, EvalPartitionFilterSnafu, NewRecordBatchSnafu,
     RecordBatchSnafu, Result, UnexpectedSnafu,
@@ -1118,11 +1119,27 @@ fn build_prefilter_cache_entries(
         });
     }
 
+    if let Some(entry) =
+        pk_group_prefilter_entry(prefilter_ctx, file_id, row_group_idx, row_selection)
+    {
+        entries.push(entry);
+    }
+
+    entries
+}
+
+fn pk_group_prefilter_entry(
+    prefilter_ctx: &PrefilterContext,
+    file_id: FileId,
+    row_group_idx: u32,
+    row_selection: Option<Arc<Vec<PrefilterRowSelector>>>,
+) -> Option<PrefilterEntry> {
+    prefilter_ctx.pk_filter.as_ref()?;
+
     if prefilter_ctx.pk_group_cacheable
-        && prefilter_ctx.pk_filter.is_some()
         && let Some(exprs) = &prefilter_ctx.pk_filter_expr_strs
     {
-        entries.push(PrefilterEntry {
+        return Some(PrefilterEntry {
             kind: PrefilterEntryKind::PkGroup,
             key: Some(PrefilterKey::new(
                 file_id,
@@ -1134,7 +1151,7 @@ fn build_prefilter_cache_entries(
         });
     }
 
-    entries
+    Some(PrefilterEntry::without_cache(PrefilterEntryKind::PkGroup))
 }
 
 fn rows_before_filter(
@@ -1880,6 +1897,10 @@ mod tests {
         assert!(normal_ctx.pk_filter.is_some());
         assert!(normal_ctx.pk_group_cacheable);
         assert!(normal_ctx.pk_filter_expr_strs.is_some());
+        let normal_entry = pk_group_prefilter_entry(&normal_ctx, FileId::random(), 0, None)
+            .expect("pk group entry");
+        assert!(matches!(normal_entry.kind, PrefilterEntryKind::PkGroup));
+        assert!(normal_entry.key.is_some());
 
         let tsid_set = PkIndexTsidSet::new_for_test(HashSet::from([(1, 1)]));
         let pk_index_plan = build_reader_filter_plan(
@@ -1899,6 +1920,10 @@ mod tests {
         assert!(pk_index_ctx.pk_filter.is_some());
         assert!(!pk_index_ctx.pk_group_cacheable);
         assert!(pk_index_ctx.pk_filter_expr_strs.is_some());
+        let pk_index_entry = pk_group_prefilter_entry(&pk_index_ctx, FileId::random(), 0, None)
+            .expect("pk group entry");
+        assert!(matches!(pk_index_entry.kind, PrefilterEntryKind::PkGroup));
+        assert!(pk_index_entry.key.is_none());
     }
 
     #[test]
