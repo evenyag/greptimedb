@@ -93,6 +93,7 @@ use crate::sst::parquet::push_decoder::{
 use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_plan};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::row_selection::RowGroupSelection;
+use crate::sst::parquet::series_key_filter::SeriesKeyFilter;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
@@ -187,6 +188,7 @@ pub struct ParquetReaderBuilder {
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
     defer_optional_page_index: bool,
+    may_apply_series_key_filter: bool,
 }
 
 impl ParquetReaderBuilder {
@@ -218,6 +220,7 @@ impl ParquetReaderBuilder {
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
+            may_apply_series_key_filter: false,
         }
     }
 
@@ -312,6 +315,13 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub(crate) fn decode_primary_key_values(mut self, decode: bool) -> Self {
         self.decode_primary_key_values = decode;
+        self
+    }
+
+    /// Allows row-group reads from this reader to apply an extra SeriesScan-by-key filter.
+    #[must_use]
+    pub(crate) fn may_apply_series_key_filter(mut self, enable: bool) -> Self {
+        self.may_apply_series_key_filter = enable;
         self
     }
 
@@ -488,6 +498,7 @@ impl ParquetReaderBuilder {
             self.pre_filter_mode,
             &read_format,
             &codec,
+            self.may_apply_series_key_filter,
         );
 
         if self.defer_optional_page_index
@@ -1760,6 +1771,8 @@ pub(crate) struct RowGroupBuildContext<'a> {
     pub(crate) row_selection: Option<RowSelection>,
     /// Metrics for tracking fetch operations.
     pub(crate) fetch_metrics: Option<&'a ParquetFetchMetrics>,
+    /// Optional partition-local SeriesScan-by-key filter.
+    pub(crate) series_key_filter: Option<&'a SeriesKeyFilter>,
 }
 
 impl RowGroupReaderBuilder {
@@ -1807,7 +1820,10 @@ impl RowGroupReaderBuilder {
         &self,
         build_ctx: RowGroupBuildContext<'_>,
     ) -> Result<ProjectedRecordBatchStream> {
-        let prefilter_ctx = self.prefilter_builder.as_ref().map(|b| b.build());
+        let prefilter_ctx = self
+            .prefilter_builder
+            .as_ref()
+            .map(|b| b.build(build_ctx.series_key_filter));
 
         let Some(mut prefilter_ctx) = prefilter_ctx else {
             // No prefilter applicable, build stream with full projection.
@@ -2214,6 +2230,7 @@ impl ParquetReader {
                     row_group_idx,
                     Some(row_selection),
                     Some(&self.fetch_metrics),
+                    None,
                 ))
                 .await?;
             self.reader = Some(FlatPruneReader::new_with_row_group_reader(
@@ -2244,6 +2261,7 @@ impl ParquetReader {
                     row_group_idx,
                     Some(row_selection),
                     Some(&fetch_metrics),
+                    None,
                 ))
                 .await?;
             Some(FlatPruneReader::new_with_row_group_reader(

@@ -51,6 +51,7 @@ use crate::sst::parquet::reader::{
     MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
 };
+use crate::sst::parquet::series_key_filter::SeriesKeyFilter;
 
 pub(crate) fn matching_row_ranges_by_primary_key(
     input: &RecordBatch,
@@ -351,11 +352,21 @@ pub(crate) fn build_reader_filter_plan(
     pre_filter_mode: PreFilterMode,
     read_format: &FlatReadFormat,
     codec: &Arc<dyn PrimaryKeyCodec>,
+    may_apply_series_key_filter: bool,
 ) -> ReaderFilterPlan {
     let Some(predicate) = predicate else {
         return ReaderFilterPlan {
             remaining_simple_filters: Vec::new(),
-            prefilter_builder: None,
+            prefilter_builder: PrefilterContextBuilder::new(
+                read_format,
+                codec,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                schema_version_for_prefilter(expected_metadata, read_format),
+                may_apply_series_key_filter,
+            ),
         };
     };
 
@@ -446,9 +457,7 @@ pub(crate) fn build_reader_filter_plan(
     });
     let pk_filter_exprs =
         (!primary_key_filters.is_empty()).then_some(Arc::new(primary_key_filters));
-    let schema_version = expected_metadata
-        .map(|metadata| metadata.schema_version)
-        .unwrap_or_else(|| read_format.metadata().schema_version);
+    let schema_version = schema_version_for_prefilter(expected_metadata, read_format);
     let prefilter_builder = PrefilterContextBuilder::new(
         read_format,
         codec,
@@ -457,6 +466,7 @@ pub(crate) fn build_reader_filter_plan(
         prefilter_simple_filters.clone(),
         prefilter_physical_filters,
         schema_version,
+        may_apply_series_key_filter,
     );
 
     if prefilter_builder.is_some() {
@@ -476,10 +486,21 @@ pub(crate) fn build_reader_filter_plan(
     }
 }
 
+fn schema_version_for_prefilter(
+    expected_metadata: Option<&RegionMetadata>,
+    read_format: &FlatReadFormat,
+) -> u64 {
+    expected_metadata
+        .map(|metadata| metadata.schema_version)
+        .unwrap_or_else(|| read_format.metadata().schema_version)
+}
+
 /// Context for prefiltering a row group.
 pub(crate) struct PrefilterContext {
     /// Optional PK filter for legacy primary-key-format parquet.
     pk_filter: Option<Box<dyn PrimaryKeyFilter>>,
+    /// Optional partition-local SeriesScan-by-key filter.
+    series_key_filter: Option<Box<dyn PrimaryKeyFilter>>,
     /// Simple filters that can be evaluated directly from the prefilter batch.
     filters: Vec<SimpleFilterContext>,
     /// Physical filters that can be evaluated directly from the prefilter batch.
@@ -507,6 +528,7 @@ pub(crate) struct PrefilterContextBuilder {
     metadata: RegionMetadataRef,
     schema_version: u64,
     arrow_schema: SchemaRef,
+    may_apply_series_key_filter: bool,
 }
 
 impl PrefilterContextBuilder {
@@ -524,6 +546,7 @@ impl PrefilterContextBuilder {
         filters: Vec<SimpleFilterContext>,
         physical_filters: Vec<PhysicalFilterContext>,
         schema_version: u64,
+        may_apply_series_key_filter: bool,
     ) -> Option<Self> {
         let metadata = read_format.metadata();
         let use_raw_tag_columns = read_format.batch_has_raw_pk_columns();
@@ -543,7 +566,7 @@ impl PrefilterContextBuilder {
             }
         }
 
-        if pk_filters.is_some() {
+        if pk_filters.is_some() || may_apply_series_key_filter {
             prefilter_column_names.insert(PRIMARY_KEY_COLUMN_NAME.to_string());
         }
 
@@ -579,19 +602,26 @@ impl PrefilterContextBuilder {
             metadata: metadata.clone(),
             schema_version,
             arrow_schema: read_format.arrow_schema().clone(),
+            may_apply_series_key_filter,
         })
     }
 
     /// Builds a [PrefilterContext] for a specific row group.
-    pub(crate) fn build(&self) -> PrefilterContext {
+    pub(crate) fn build(&self, series_key_filter: Option<&SeriesKeyFilter>) -> PrefilterContext {
         let pk_filter = self.pk_filters.as_ref().map(|pk_filters| {
             let pk_filter = self
                 .codec
                 .primary_key_filter(&self.metadata, Arc::clone(pk_filters));
             Box::new(CachedPrimaryKeyFilter::new(pk_filter)) as Box<dyn PrimaryKeyFilter>
         });
+        let series_key_filter = self
+            .may_apply_series_key_filter
+            .then(|| series_key_filter.cloned())
+            .flatten()
+            .map(|filter| filter.make_primary_key_filter(&self.metadata));
         PrefilterContext {
             pk_filter,
+            series_key_filter,
             filters: self.filters.clone(),
             physical_filters: self.physical_filters.clone(),
             schema_version: self.schema_version,
@@ -844,7 +874,7 @@ fn prefilter_column_names_for_entries(
                         .to_string(),
                 );
             }
-            PrefilterEntryKind::PkGroup => {
+            PrefilterEntryKind::PkGroup | PrefilterEntryKind::SeriesKeyGroup => {
                 prefilter_column_names.insert(PRIMARY_KEY_COLUMN_NAME.to_string());
             }
         }
@@ -877,6 +907,11 @@ fn all_prefilter_entries(prefilter_ctx: &PrefilterContext) -> Vec<PrefilterEntry
     if prefilter_ctx.pk_filter.is_some() {
         entries.push(PrefilterEntry::without_cache(PrefilterEntryKind::PkGroup));
     }
+    if prefilter_ctx.series_key_filter.is_some() {
+        entries.push(PrefilterEntry::without_cache(
+            PrefilterEntryKind::SeriesKeyGroup,
+        ));
+    }
     entries.extend(
         prefilter_ctx
             .filters
@@ -899,6 +934,7 @@ enum PrefilterEntryKind {
     Simple(usize),
     Physical(usize),
     PkGroup,
+    SeriesKeyGroup,
 }
 
 struct PrefilterEntry {
@@ -965,6 +1001,11 @@ fn build_prefilter_cache_entries(
             )),
         });
     }
+    if prefilter_ctx.series_key_filter.is_some() {
+        entries.push(PrefilterEntry::without_cache(
+            PrefilterEntryKind::SeriesKeyGroup,
+        ));
+    }
 
     entries
 }
@@ -1017,6 +1058,16 @@ fn eval_entry_mask(
                 reason: "Missing primary key filter for prefilter cache entry",
             })?;
             eval_pk_group_mask(batch, pk_filter.as_mut())
+        }
+        PrefilterEntryKind::SeriesKeyGroup => {
+            let series_key_filter =
+                prefilter_ctx
+                    .series_key_filter
+                    .as_mut()
+                    .context(UnexpectedSnafu {
+                        reason: "Missing series key filter for prefilter cache entry",
+                    })?;
+            eval_pk_group_mask(batch, series_key_filter.as_mut())
         }
     }
 }
@@ -1419,6 +1470,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             metadata.schema_version,
+            false,
         );
         assert!(builder.is_none());
     }
@@ -1523,6 +1575,7 @@ mod tests {
             PreFilterMode::SkipFields,
             &full_read_format,
             &codec,
+            false,
         );
         assert!(skip_fields_plan.prefilter_builder.is_some());
         assert_eq!(
@@ -1546,6 +1599,7 @@ mod tests {
             PreFilterMode::All,
             &projected_read_format,
             &codec,
+            false,
         );
         assert!(pk_prefilter_plan.prefilter_builder.is_some());
         assert!(pk_prefilter_plan.remaining_simple_filters.is_empty());
@@ -1576,6 +1630,7 @@ mod tests {
             PreFilterMode::All,
             &read_format,
             &codec,
+            false,
         );
         let plan_b_a = build_reader_filter_plan(
             Some(&Predicate::new(vec![expr_b, expr_a])),
@@ -1583,6 +1638,7 @@ mod tests {
             PreFilterMode::All,
             &read_format,
             &codec,
+            false,
         );
 
         let exprs_ab = plan_ab.prefilter_builder.unwrap().pk_filter_expr_strs;

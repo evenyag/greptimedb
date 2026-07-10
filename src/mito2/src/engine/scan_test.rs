@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
-use api::helper::encode_json_value;
-use api::v1::Rows;
+use api::helper::{ColumnDataTypeWrapper, encode_json_value};
 use api::v1::helper::row;
 use api::v1::value::ValueData;
+use api::v1::{ColumnSchema, Rows, WriteHint};
 use common_base::readable_size::ReadableSize;
 use common_error::ext::{ErrorExt, WhateverResult};
 use common_error::status_code::StatusCode;
@@ -30,16 +31,20 @@ use datatypes::arrow::datatypes::{Float64Type, TimestampMillisecondType};
 use datatypes::json::value::JsonValue;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::types::json_type::{JsonNativeType, JsonObjectType};
+use datatypes::value::Value;
 use futures::TryStreamExt;
+use mito_codec::row_converter::{PrimaryKeyCodec, SparsePrimaryKeyCodec};
 use serde_json::json;
 use store_api::region_engine::{PrepareRequest, RegionEngine, RegionScanner};
 use store_api::region_request::RegionRequest;
+use store_api::storage::consts::{PRIMARY_KEY_COLUMN_NAME, ReservedColumnId};
 use store_api::storage::{ProjectionInput, RegionId, ScanRequest, TimeSeriesDistribution};
 
 use crate::config::MitoConfig;
 use crate::error::Error;
 use crate::read::read_columns::{ReadColumn, ReadColumns};
 use crate::read::scan_region::Scanner;
+use crate::read::series_by_key::can_use_series_scan_by_key;
 use crate::test_util;
 use crate::test_util::{CreateRequestBuilder, TestEnv};
 
@@ -1012,4 +1017,164 @@ async fn test_range_cache_separates_or_equality_time_filters() {
         "expected empty result, got: {}",
         batches.pretty_print().unwrap()
     );
+}
+
+#[tokio::test]
+async fn test_series_scan_by_key_sparse_only() {
+    let mut env = TestEnv::with_prefix("test_series_scan_by_key_sparse_only").await;
+    let engine = env
+        .create_engine(MitoConfig {
+            default_flat_format: true,
+            experimental_series_scan_by_key: true,
+            ..Default::default()
+        })
+        .await;
+
+    let region_id = RegionId::new(1, 1);
+    let request = CreateRequestBuilder::new()
+        .tag_num(2)
+        .insert_option("primary_key_encoding", "sparse")
+        .build();
+    engine
+        .handle_request(region_id, RegionRequest::Create(request))
+        .await
+        .unwrap();
+
+    let metadata = engine.get_metadata(region_id).await.unwrap();
+    let codec = SparsePrimaryKeyCodec::new(&metadata);
+    let encode_key = |table_id, tsid, tag_0: &str, tag_1: &str| {
+        let pk_values = vec![
+            (ReservedColumnId::table_id(), Value::UInt32(table_id)),
+            (ReservedColumnId::tsid(), Value::UInt64(tsid)),
+            (0, Value::String(tag_0.into())),
+            (1, Value::String(tag_1.into())),
+        ];
+        let mut encoded = Vec::new();
+        codec.encode_values(&pk_values, &mut encoded).unwrap();
+        encoded
+    };
+    let mut pk_filter = codec.primary_key_filter(
+        &metadata,
+        Arc::new(vec![
+            common_recordbatch::filter::SimpleFilterEvaluator::try_new(&col("tag_0").eq(lit("a")))
+                .unwrap(),
+        ]),
+    );
+    assert!(pk_filter.matches(&encode_key(0, 1, "a", "x")).unwrap());
+    let rows = Rows {
+        schema: vec![
+            ColumnSchema {
+                column_name: PRIMARY_KEY_COLUMN_NAME.to_string(),
+                datatype: ColumnDataTypeWrapper::binary_datatype().datatype() as i32,
+                semantic_type: api::v1::SemanticType::Tag as i32,
+                ..Default::default()
+            },
+            ColumnSchema {
+                column_name: "ts".to_string(),
+                datatype: ColumnDataTypeWrapper::timestamp_millisecond_datatype().datatype() as i32,
+                semantic_type: api::v1::SemanticType::Timestamp as i32,
+                ..Default::default()
+            },
+            ColumnSchema {
+                column_name: "field_0".to_string(),
+                datatype: ColumnDataTypeWrapper::float64_datatype().datatype() as i32,
+                semantic_type: api::v1::SemanticType::Field as i32,
+                ..Default::default()
+            },
+        ],
+        rows: vec![
+            row(vec![
+                ValueData::BinaryValue(encode_key(0, 1, "a", "x")),
+                ValueData::TimestampMillisecondValue(1000),
+                ValueData::F64Value(1.0),
+            ]),
+            row(vec![
+                ValueData::BinaryValue(encode_key(0, 2, "b", "y")),
+                ValueData::TimestampMillisecondValue(2000),
+                ValueData::F64Value(2.0),
+            ]),
+            row(vec![
+                ValueData::BinaryValue(encode_key(0, 3, "a", "z")),
+                ValueData::TimestampMillisecondValue(3000),
+                ValueData::F64Value(3.0),
+            ]),
+        ],
+    };
+    let num_rows = rows.rows.len();
+    let result = engine
+        .handle_request(
+            region_id,
+            RegionRequest::Put(store_api::region_request::RegionPutRequest {
+                rows,
+                hint: Some(WriteHint {
+                    primary_key_encoding: api::v1::PrimaryKeyEncoding::Sparse.into(),
+                }),
+                partition_expr_version: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(num_rows, result.affected_rows);
+    test_util::flush_region(&engine, region_id, None).await;
+
+    let request = ScanRequest {
+        filters: vec![col("tag_0").eq(lit("a"))],
+        distribution: Some(TimeSeriesDistribution::PerSeries),
+        ..Default::default()
+    };
+    let scanner = engine.scanner(region_id, request.clone()).await.unwrap();
+    let Scanner::Series(scanner) = scanner else {
+        panic!("Scanner should be series scan");
+    };
+    assert!(can_use_series_scan_by_key(scanner.input()));
+
+    let stream = engine.scan_to_stream(region_id, request).await.unwrap();
+    let batches = RecordBatches::try_collect(stream).await.unwrap();
+    let expected = "\
++-------+-------+---------+---------------------+
+| tag_0 | tag_1 | field_0 | ts                  |
++-------+-------+---------+---------------------+
+| a     | x     | 1.0     | 1970-01-01T00:00:01 |
+| a     | z     | 3.0     | 1970-01-01T00:00:03 |
++-------+-------+---------+---------------------+";
+    assert_eq!(expected, batches.pretty_print().unwrap());
+
+    let dense_region_id = RegionId::new(1, 2);
+    let dense_request = CreateRequestBuilder::new().tag_num(2).build();
+    let dense_schema = test_util::rows_schema(&dense_request);
+    engine
+        .handle_request(dense_region_id, RegionRequest::Create(dense_request))
+        .await
+        .unwrap();
+    test_util::put_rows(
+        &engine,
+        dense_region_id,
+        Rows {
+            schema: dense_schema,
+            rows: vec![row(vec![
+                ValueData::StringValue("a".to_string()),
+                ValueData::StringValue("x".to_string()),
+                ValueData::F64Value(1.0),
+                ValueData::TimestampMillisecondValue(1000),
+            ])],
+        },
+    )
+    .await;
+    test_util::flush_region(&engine, dense_region_id, None).await;
+
+    let dense_scanner = engine
+        .scanner(
+            dense_region_id,
+            ScanRequest {
+                filters: vec![col("tag_0").eq(lit("a"))],
+                distribution: Some(TimeSeriesDistribution::PerSeries),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let Scanner::Series(dense_scanner) = dense_scanner else {
+        panic!("Scanner should be series scan");
+    };
+    assert!(!can_use_series_scan_by_key(dense_scanner.input()));
 }

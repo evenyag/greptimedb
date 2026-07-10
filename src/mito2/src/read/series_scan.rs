@@ -23,7 +23,7 @@ use common_error::ext::BoxedError;
 use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
-use common_telemetry::warn;
+use common_telemetry::{info, warn};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::array::BinaryArray;
@@ -52,6 +52,7 @@ use crate::read::scan_util::{
     compute_parallel_channel_size,
 };
 use crate::read::seq_scan::SeqScan;
+use crate::read::series_by_key::{can_use_series_scan_by_key, start_series_scan_by_key};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
@@ -60,7 +61,7 @@ use crate::sst::parquet::format::PrimaryKeyArray;
 const SEND_TIMEOUT: Duration = Duration::from_micros(100);
 
 /// List of receivers.
-type ReceiverList = Vec<Option<Receiver<Result<SeriesBatch>>>>;
+type ReceiverList = Vec<Option<Receiver<Result<ScanBatch>>>>;
 
 /// Scans a region and returns sorted rows of a series in the same partition.
 ///
@@ -181,18 +182,26 @@ impl SeriesScan {
             part_metrics.on_first_poll();
 
             let mut fetch_start = Instant::now();
-            while let Some(series) = receiver.recv().await {
-                let series = series?;
+            while let Some(scan_batch) = receiver.recv().await {
+                let scan_batch = scan_batch?;
 
                 let mut metrics = ScannerMetrics::default();
                 metrics.scan_cost += fetch_start.elapsed();
                 fetch_start = Instant::now();
 
-                metrics.num_batches += series.num_batches();
-                metrics.num_rows += series.num_rows();
+                match &scan_batch {
+                    ScanBatch::Series(series) => {
+                        metrics.num_batches += series.num_batches();
+                        metrics.num_rows += series.num_rows();
+                    }
+                    ScanBatch::RecordBatch(batch) => {
+                        metrics.num_batches += 1;
+                        metrics.num_rows += batch.num_rows();
+                    }
+                }
 
                 let yield_start = Instant::now();
-                yield ScanBatch::Series(series);
+                yield scan_batch;
                 metrics.yield_cost += yield_start.elapsed();
 
                 part_metrics.merge_metrics(&metrics);
@@ -204,7 +213,7 @@ impl SeriesScan {
     }
 
     /// Takes the receiver for the partition.
-    fn take_receiver(&self, partition: usize) -> Result<Receiver<Result<SeriesBatch>>> {
+    fn take_receiver(&self, partition: usize) -> Result<Receiver<Result<ScanBatch>>> {
         let mut rx_list = self.receivers.lock().unwrap();
         rx_list[partition]
             .take()
@@ -227,6 +236,20 @@ impl SeriesScan {
             return;
         }
 
+        if can_use_series_scan_by_key(&self.stream_ctx.input) {
+            info!(
+                "Selected SeriesScan path, region_id: {}, series_scan_path: by_key",
+                self.stream_ctx.input.mapper.metadata().region_id
+            );
+            *rx_list =
+                start_series_scan_by_key(self.stream_ctx.clone(), self.properties.num_partitions());
+            return;
+        }
+
+        info!(
+            "Selected SeriesScan path, region_id: {}, series_scan_path: distributor",
+            self.stream_ctx.input.mapper.metadata().region_id
+        );
         let (senders, receivers) = new_channel_list(self.properties.num_partitions());
         let mut distributor = SeriesDistributor {
             stream_ctx: self.stream_ctx.clone(),
@@ -575,7 +598,7 @@ impl SeriesDistributor {
             if let Some(series_batch) = series_batch {
                 let yield_start = Instant::now();
                 self.senders
-                    .send_batch(SeriesBatch::Flat(series_batch))
+                    .send_batch(ScanBatch::Series(SeriesBatch::Flat(series_batch)))
                     .await?;
                 metrics.yield_cost += yield_start.elapsed();
             }
@@ -589,7 +612,7 @@ impl SeriesDistributor {
         if let Some(series_batch) = series_batch {
             let yield_start = Instant::now();
             self.senders
-                .send_batch(SeriesBatch::Flat(series_batch))
+                .send_batch(ScanBatch::Series(SeriesBatch::Flat(series_batch)))
                 .await?;
             metrics.yield_cost += yield_start.elapsed();
         }
@@ -635,7 +658,7 @@ pub struct FlatSeriesBatch {
 
 /// List of senders.
 struct SenderList {
-    senders: Vec<Option<Sender<Result<SeriesBatch>>>>,
+    senders: Vec<Option<Sender<Result<ScanBatch>>>>,
     /// Number of None senders.
     num_nones: usize,
     /// Index of the current partition to send.
@@ -647,7 +670,7 @@ struct SenderList {
 }
 
 impl SenderList {
-    fn new(senders: Vec<Option<Sender<Result<SeriesBatch>>>>) -> Self {
+    fn new(senders: Vec<Option<Sender<Result<ScanBatch>>>>) -> Self {
         let num_nones = senders.iter().filter(|sender| sender.is_none()).count();
         Self {
             senders,
@@ -660,7 +683,7 @@ impl SenderList {
 
     /// Finds a partition and tries to send the batch to the partition.
     /// Returns None if it sends successfully.
-    fn try_send_batch(&mut self, mut batch: SeriesBatch) -> Result<Option<SeriesBatch>> {
+    fn try_send_batch(&mut self, mut batch: ScanBatch) -> Result<Option<ScanBatch>> {
         for _ in 0..self.senders.len() {
             ensure!(self.num_nones < self.senders.len(), InvalidSenderSnafu);
 
@@ -689,7 +712,7 @@ impl SenderList {
     }
 
     /// Finds a partition and sends the batch to the partition.
-    async fn send_batch(&mut self, mut batch: SeriesBatch) -> Result<()> {
+    async fn send_batch(&mut self, mut batch: ScanBatch) -> Result<()> {
         // Sends the batch without blocking first.
         match self.try_send_batch(batch)? {
             Some(b) => {

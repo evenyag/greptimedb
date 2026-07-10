@@ -260,6 +260,12 @@ impl SparsePrimaryKeyCodec {
 
     /// Returns the field of the given column id.
     fn get_field(&self, column_id: ColumnId) -> Option<&SortField> {
+        match column_id {
+            RESERVED_COLUMN_ID_TABLE_ID => return Some(&self.inner.table_id_field),
+            RESERVED_COLUMN_ID_TSID => return Some(&self.inner.tsid_field),
+            _ => {}
+        }
+
         // if the `columns` is not specified, all unknown columns is primary key(label field).
         if let Some(columns) = &self.inner.columns
             && !columns.contains(&column_id)
@@ -267,11 +273,7 @@ impl SparsePrimaryKeyCodec {
             return None;
         }
 
-        match column_id {
-            RESERVED_COLUMN_ID_TABLE_ID => Some(&self.inner.table_id_field),
-            RESERVED_COLUMN_ID_TSID => Some(&self.inner.tsid_field),
-            _ => Some(&self.inner.label_field),
-        }
+        Some(&self.inner.label_field)
     }
 
     /// Encodes the given bytes into a [`SparseValues`].
@@ -344,6 +346,37 @@ impl SparsePrimaryKeyCodec {
         buffer.put_u8(1);
         buffer.put_u64(tsid);
         Ok(())
+    }
+
+    /// Reads the reserved `(table_id, tsid)` prefix from a sparse primary key.
+    pub fn read_table_id_tsid(&self, bytes: &[u8]) -> Result<(u32, u64)> {
+        let mut deserializer = Deserializer::new(bytes);
+
+        let _column_id = u32::deserialize(&mut deserializer).context(DeserializeFieldSnafu)?;
+        let table_id = self.inner.table_id_field.deserialize(&mut deserializer)?;
+        let _column_id = u32::deserialize(&mut deserializer).context(DeserializeFieldSnafu)?;
+        let tsid = self.inner.tsid_field.deserialize(&mut deserializer)?;
+
+        let table_id = match table_id.as_value_ref() {
+            ValueRef::UInt32(value) => value,
+            value => {
+                return UnsupportedOperationSnafu {
+                    err_msg: format!("unexpected sparse table id value: {value:?}"),
+                }
+                .fail();
+            }
+        };
+        let tsid = match tsid.as_value_ref() {
+            ValueRef::UInt64(value) => value,
+            value => {
+                return UnsupportedOperationSnafu {
+                    err_msg: format!("unexpected sparse tsid value: {value:?}"),
+                }
+                .fail();
+            }
+        };
+
+        Ok((table_id, tsid))
     }
 
     /// Decodes the given bytes into a [`SparseValues`].

@@ -54,7 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::access_layer::AccessLayerRef;
 use crate::cache::CacheStrategy;
-use crate::config::DEFAULT_MAX_CONCURRENT_SCAN_FILES;
+use crate::config::{DEFAULT_MAX_CONCURRENT_SCAN_FILES, DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE};
 use crate::error::{InvalidPartitionExprSnafu, Result};
 #[cfg(feature = "enterprise")]
 use crate::extension::{BoxedExtensionRange, BoxedExtensionRangeProvider};
@@ -241,12 +241,16 @@ pub(crate) struct ScanRegion {
     cache_strategy: CacheStrategy,
     /// Maximum number of SST files to scan concurrently.
     max_concurrent_scan_files: usize,
+    /// Number of series keys in each SeriesScan-by-key distribution batch.
+    series_scan_by_key_batch_size: usize,
     /// Whether to ignore inverted index.
     ignore_inverted_index: bool,
     /// Whether to ignore fulltext index.
     ignore_fulltext_index: bool,
     /// Whether to ignore bloom filter.
     ignore_bloom_filter: bool,
+    /// Whether the scanner may use the experimental SeriesScan-by-key strategy.
+    experimental_series_scan_by_key: bool,
     /// Start time of the scan task.
     start_time: Option<Instant>,
     /// Whether to filter out the deleted rows.
@@ -272,9 +276,11 @@ impl ScanRegion {
             request,
             cache_strategy,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            series_scan_by_key_batch_size: DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE,
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
             ignore_bloom_filter: false,
+            experimental_series_scan_by_key: false,
             start_time: None,
             filter_deleted: true,
             query_stat_counters: None,
@@ -300,6 +306,13 @@ impl ScanRegion {
         self
     }
 
+    /// Sets number of series keys in each SeriesScan-by-key distribution batch.
+    #[must_use]
+    pub(crate) fn with_series_scan_by_key_batch_size(mut self, batch_size: usize) -> Self {
+        self.series_scan_by_key_batch_size = batch_size;
+        self
+    }
+
     /// Sets whether to ignore inverted index.
     #[must_use]
     pub(crate) fn with_ignore_inverted_index(mut self, ignore: bool) -> Self {
@@ -318,6 +331,13 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_ignore_bloom_filter(mut self, ignore: bool) -> Self {
         self.ignore_bloom_filter = ignore;
+        self
+    }
+
+    /// Sets whether to enable the experimental SeriesScan-by-key strategy.
+    #[must_use]
+    pub(crate) fn with_experimental_series_scan_by_key(mut self, enable: bool) -> Self {
+        self.experimental_series_scan_by_key = enable;
         self
     }
 
@@ -589,6 +609,7 @@ impl ScanRegion {
             .with_bloom_filter_index_appliers(bloom_filter_appliers)
             .with_fulltext_index_appliers(fulltext_index_appliers)
             .with_max_concurrent_scan_files(self.max_concurrent_scan_files)
+            .with_series_scan_by_key_batch_size(self.series_scan_by_key_batch_size)
             .with_start_time(self.start_time)
             .with_append_mode(self.version.options.append_mode)
             .with_filter_deleted(self.filter_deleted)
@@ -598,6 +619,7 @@ impl ScanRegion {
             .with_explain_flat_format(
                 self.version.options.sst_format == Some(crate::sst::FormatType::Flat),
             )
+            .with_experimental_series_scan_by_key(self.experimental_series_scan_by_key)
             .with_snapshot_sequence(
                 self.request
                     .snapshot_on_scan
@@ -819,6 +841,8 @@ pub struct ScanInput {
     ignore_file_not_found: bool,
     /// Maximum number of SST files to scan concurrently.
     pub(crate) max_concurrent_scan_files: usize,
+    /// Number of series keys in each SeriesScan-by-key distribution batch.
+    pub(crate) series_scan_by_key_batch_size: usize,
     /// Index appliers.
     inverted_index_appliers: [Option<InvertedIndexApplierRef>; 2],
     bloom_filter_index_appliers: [Option<BloomFilterIndexApplierRef>; 2],
@@ -843,6 +867,8 @@ pub struct ScanInput {
     pub(crate) distribution: Option<TimeSeriesDistribution>,
     /// Whether the region's configured SST format is flat.
     explain_flat_format: bool,
+    /// Whether the experimental SeriesScan-by-key strategy is enabled.
+    pub(crate) experimental_series_scan_by_key: bool,
     /// Snapshot upper bound bound at scan open and propagated back to the caller.
     pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
@@ -869,6 +895,7 @@ impl ScanInput {
             cache_strategy: CacheStrategy::Disabled,
             ignore_file_not_found: false,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            series_scan_by_key_batch_size: DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE,
             inverted_index_appliers: [None, None],
             bloom_filter_index_appliers: [None, None],
             fulltext_index_appliers: [None, None],
@@ -883,6 +910,7 @@ impl ScanInput {
             series_row_selector: None,
             distribution: None,
             explain_flat_format: false,
+            experimental_series_scan_by_key: false,
             snapshot_sequence: None,
             compaction: false,
             query_stat_counters: None,
@@ -941,6 +969,13 @@ impl ScanInput {
         max_concurrent_scan_files: usize,
     ) -> Self {
         self.max_concurrent_scan_files = max_concurrent_scan_files;
+        self
+    }
+
+    /// Sets number of series keys in each SeriesScan-by-key distribution batch.
+    #[must_use]
+    pub(crate) fn with_series_scan_by_key_batch_size(mut self, batch_size: usize) -> Self {
+        self.series_scan_by_key_batch_size = batch_size;
         self
     }
 
@@ -1042,6 +1077,13 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_explain_flat_format(mut self, explain_flat_format: bool) -> Self {
         self.explain_flat_format = explain_flat_format;
+        self
+    }
+
+    /// Sets whether to enable the experimental SeriesScan-by-key strategy.
+    #[must_use]
+    pub(crate) fn with_experimental_series_scan_by_key(mut self, enable: bool) -> Self {
+        self.experimental_series_scan_by_key = enable;
         self
     }
 
@@ -1168,8 +1210,34 @@ impl ScanInput {
             return Ok(FileRangeBuilder::default());
         }
 
-        self.prune_file_after_manifest_check(file, pre_filter_mode, predicate, reader_metrics)
-            .await
+        self.prune_file_after_manifest_check_inner(
+            file,
+            pre_filter_mode,
+            predicate,
+            reader_metrics,
+            false,
+        )
+        .await
+    }
+
+    /// Prunes a file for SeriesScan-by-key.
+    ///
+    /// This keeps the row-group pruning result in the returned builder and also
+    /// prepares the reader filter plan to accept a later series-key filter.
+    pub(crate) async fn prune_file_for_series_scan_by_key(
+        &self,
+        file: &FileHandle,
+        pre_filter_mode: PreFilterMode,
+        reader_metrics: &mut ReaderMetrics,
+    ) -> Result<FileRangeBuilder> {
+        self.prune_file_after_manifest_check_inner(
+            file,
+            pre_filter_mode,
+            None,
+            reader_metrics,
+            true,
+        )
+        .await
     }
 
     /// Second half of `prune_file` — performs the actual parquet metadata /
@@ -1185,6 +1253,24 @@ impl ScanInput {
         pre_filter_mode: PreFilterMode,
         predicate: Option<Predicate>,
         reader_metrics: &mut ReaderMetrics,
+    ) -> Result<FileRangeBuilder> {
+        self.prune_file_after_manifest_check_inner(
+            file,
+            pre_filter_mode,
+            predicate,
+            reader_metrics,
+            false,
+        )
+        .await
+    }
+
+    async fn prune_file_after_manifest_check_inner(
+        &self,
+        file: &FileHandle,
+        pre_filter_mode: PreFilterMode,
+        predicate: Option<Predicate>,
+        reader_metrics: &mut ReaderMetrics,
+        may_apply_series_key_filter: bool,
     ) -> Result<FileRangeBuilder> {
         let may_build_selective_row_selection = predicate.is_some();
         let decode_pk_values = !self.compaction
@@ -1218,6 +1304,7 @@ impl ScanInput {
             .expected_metadata(Some(self.mapper.metadata().clone()))
             .compaction(self.compaction)
             .pre_filter_mode(pre_filter_mode)
+            .may_apply_series_key_filter(may_apply_series_key_filter)
             .decode_primary_key_values(decode_pk_values)
             .build_reader_input(reader_metrics)
             .await;

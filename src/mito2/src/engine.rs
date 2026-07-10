@@ -1083,9 +1083,11 @@ impl EngineInner {
         )
         .with_query_stat_counters(region.region_stats.query_stat_counters())
         .with_max_concurrent_scan_files(self.config.max_concurrent_scan_files)
+        .with_series_scan_by_key_batch_size(self.config.series_scan_by_key_batch_size)
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())
+        .with_experimental_series_scan_by_key(self.config.experimental_series_scan_by_key)
         .with_start_time(query_start);
 
         #[cfg(feature = "enterprise")]

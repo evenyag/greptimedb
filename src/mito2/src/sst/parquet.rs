@@ -35,6 +35,7 @@ pub mod read_columns;
 pub mod reader;
 pub mod row_group;
 pub mod row_selection;
+pub(crate) mod series_key_filter;
 pub(crate) mod stats;
 pub mod writer;
 

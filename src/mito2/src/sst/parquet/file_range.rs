@@ -54,6 +54,7 @@ use crate::sst::parquet::reader::{
     SimpleFilterContext,
 };
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
+use crate::sst::parquet::series_key_filter::SeriesKeyFilter;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 
 /// Checks if a row group contains delete operations by examining the min value of op_type column.
@@ -108,6 +109,21 @@ impl FileRange {
         }
     }
 
+    /// Returns the shared context.
+    pub(crate) fn context(&self) -> &FileRangeContextRef {
+        &self.context
+    }
+
+    /// Returns the row selection of this range.
+    pub(crate) fn row_selection(&self) -> Option<&RowSelection> {
+        self.row_selection.as_ref()
+    }
+
+    /// Returns the row group index.
+    pub(crate) fn row_group_idx(&self) -> usize {
+        self.row_group_idx
+    }
+
     /// Returns true if [FileRange] selects all rows in row group.
     fn select_all(&self) -> bool {
         let rows_in_group = self
@@ -160,6 +176,17 @@ impl FileRange {
         selector: Option<TimeSeriesRowSelector>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<FlatPruneReader>> {
+        self.flat_reader_with_series_key_filter(selector, fetch_metrics, None)
+            .await
+    }
+
+    /// Creates a flat reader with an optional SeriesScan-by-key filter.
+    pub(crate) async fn flat_reader_with_series_key_filter(
+        &self,
+        selector: Option<TimeSeriesRowSelector>,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+        series_key_filter: Option<&SeriesKeyFilter>,
+    ) -> Result<Option<FlatPruneReader>> {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
@@ -172,6 +199,7 @@ impl FileRange {
                 self.row_group_idx,
                 self.row_selection.clone(),
                 fetch_metrics,
+                series_key_filter,
             ))
             .await?;
 
@@ -321,11 +349,13 @@ impl FileRangeContext {
         row_group_idx: usize,
         row_selection: Option<RowSelection>,
         fetch_metrics: Option<&'a ParquetFetchMetrics>,
+        series_key_filter: Option<&'a SeriesKeyFilter>,
     ) -> RowGroupBuildContext<'a> {
         RowGroupBuildContext {
             row_group_idx,
             row_selection,
             fetch_metrics,
+            series_key_filter,
         }
     }
 

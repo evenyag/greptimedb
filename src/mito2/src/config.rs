@@ -34,6 +34,8 @@ use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 const MULTIPART_UPLOAD_MINIMUM_SIZE: ReadableSize = ReadableSize::mb(5);
 /// Default maximum number of SST files to scan concurrently.
 pub(crate) const DEFAULT_MAX_CONCURRENT_SCAN_FILES: usize = 384;
+/// Default number of series keys in each SeriesScan-by-key batch.
+pub(crate) const DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE: usize = 500;
 
 // Use `1/GLOBAL_WRITE_BUFFER_SIZE_FACTOR` of OS memory as global write buffer size in default mode
 const GLOBAL_WRITE_BUFFER_SIZE_FACTOR: u64 = 8;
@@ -153,6 +155,8 @@ pub struct MitoConfig {
     pub sst_write_buffer_size: ReadableSize,
     /// Maximum number of SST files to scan concurrently (default 384).
     pub max_concurrent_scan_files: usize,
+    /// Number of series keys in each SeriesScan-by-key distribution batch (default 500).
+    pub series_scan_by_key_batch_size: usize,
     /// Whether to allow stale entries read during replay.
     pub allow_stale_entries: bool,
     /// Memory limit for table scans across all queries.
@@ -187,6 +191,9 @@ pub struct MitoConfig {
     /// Whether to enable flat format as the default SST format.
     /// When enabled, forces using BulkMemtable and BulkMemtableBuilder.
     pub default_flat_format: bool,
+
+    /// Whether to enable the experimental SeriesScan-by-key strategy.
+    pub experimental_series_scan_by_key: bool,
 
     pub gc: GcConfig,
 }
@@ -227,6 +234,7 @@ impl Default for MitoConfig {
             manifest_cache_size: ReadableSize::mb(256),
             sst_write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            series_scan_by_key_batch_size: DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE,
             allow_stale_entries: false,
             scan_memory_limit: MemoryLimit::default(),
             scan_memory_on_exhausted: OnExhaustedPolicy::Fail,
@@ -239,6 +247,7 @@ impl Default for MitoConfig {
             min_compaction_interval: Duration::from_secs(0),
             schedule_compaction_after_edit: true,
             default_flat_format: true,
+            experimental_series_scan_by_key: false,
             gc: GcConfig::default(),
         };
 
@@ -301,6 +310,14 @@ impl MitoConfig {
                 "Sanitize sst write buffer size to {}",
                 self.sst_write_buffer_size
             );
+        }
+
+        if self.series_scan_by_key_batch_size == 0 {
+            warn!(
+                "Sanitize series scan by key batch size 0 to {}",
+                DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE
+            );
+            self.series_scan_by_key_batch_size = DEFAULT_SERIES_SCAN_BY_KEY_BATCH_SIZE;
         }
 
         // Sets write cache path if it is empty.
