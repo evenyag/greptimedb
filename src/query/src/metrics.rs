@@ -486,6 +486,7 @@ mod tests {
                 query_ctx,
                 1,
                 BTreeMap::<String, BTreeSet<datafusion_common::Column>>::new(),
+                ahash::HashSet::default(),
                 Some(RemoteDynFilterProducerId::new(0)),
                 false,
             )

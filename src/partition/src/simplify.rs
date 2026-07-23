@@ -24,7 +24,8 @@ use std::ops::Bound;
 use datatypes::value::{OrderedF64, Value};
 
 use crate::collider::{AtomicExpr, Collider, GluonOp, NucleonExpr};
-use crate::expr::{Operand, PartitionExpr, RestrictedOp, col};
+use crate::expr::{Operand, PartitionExpr, RestrictedOp, col, hash_col};
+use crate::hash::hash_column_key;
 
 /// Attempts to simplify a merged partition expression (typically an `OR` of multiple partitions)
 /// into an equivalent but shorter expression.
@@ -39,6 +40,10 @@ pub fn simplify_merged_partition_expr(expr: PartitionExpr) -> PartitionExpr {
 type DenormValues = BTreeMap<String, BTreeMap<OrderedF64, Value>>;
 
 fn try_simplify_merged_partition_expr(expr: &PartitionExpr) -> Option<PartitionExpr> {
+    let mut hash_columns = BTreeMap::new();
+    collect_hash_columns(expr.lhs(), &mut hash_columns);
+    collect_hash_columns(expr.rhs(), &mut hash_columns);
+
     let collider = Collider::new(std::slice::from_ref(expr)).ok()?;
     if collider.atomic_exprs.len() <= 1 {
         return None;
@@ -52,7 +57,20 @@ fn try_simplify_merged_partition_expr(expr: &PartitionExpr) -> Option<PartitionE
     }
 
     let terms = simplify_terms(terms)?;
-    build_expr_from_terms(&terms, &denorm_values)
+    build_expr_from_terms(&terms, &denorm_values, &hash_columns)
+}
+
+fn collect_hash_columns(operand: &Operand, hash_columns: &mut BTreeMap<String, String>) {
+    match operand {
+        Operand::Hash(column) => {
+            hash_columns.insert(hash_column_key(column), column.clone());
+        }
+        Operand::Expr(expr) => {
+            collect_hash_columns(expr.lhs(), hash_columns);
+            collect_hash_columns(expr.rhs(), hash_columns);
+        }
+        Operand::Column(_) | Operand::Value(_) => {}
+    }
 }
 
 fn build_denorm_values(collider: &Collider<'_>) -> Option<DenormValues> {
@@ -394,10 +412,14 @@ fn try_merge_terms(a: &Term, b: &Term) -> Option<Term> {
     Some(Term { constraints })
 }
 
-fn build_expr_from_terms(terms: &[Term], denorm_values: &DenormValues) -> Option<PartitionExpr> {
+fn build_expr_from_terms(
+    terms: &[Term],
+    denorm_values: &DenormValues,
+    hash_columns: &BTreeMap<String, String>,
+) -> Option<PartitionExpr> {
     let mut term_exprs = Vec::with_capacity(terms.len());
     for term in terms {
-        let expr = term_to_expr(term, denorm_values)?;
+        let expr = term_to_expr(term, denorm_values, hash_columns)?;
         term_exprs.push(expr);
     }
 
@@ -420,7 +442,11 @@ fn build_expr_from_terms(terms: &[Term], denorm_values: &DenormValues) -> Option
     Some(acc)
 }
 
-fn term_to_expr(term: &Term, denorm_values: &DenormValues) -> Option<PartitionExpr> {
+fn term_to_expr(
+    term: &Term,
+    denorm_values: &DenormValues,
+    hash_columns: &BTreeMap<String, String>,
+) -> Option<PartitionExpr> {
     // Empty term would represent a tautology which can't be expressed here.
     if term.constraints.is_empty() {
         return None;
@@ -428,7 +454,12 @@ fn term_to_expr(term: &Term, denorm_values: &DenormValues) -> Option<PartitionEx
 
     let mut exprs = Vec::new();
     for (column, interval) in &term.constraints {
-        exprs.extend(interval_to_exprs(column, interval, denorm_values)?);
+        exprs.extend(interval_to_exprs(
+            column,
+            interval,
+            denorm_values,
+            hash_columns,
+        )?);
     }
 
     let mut iter = exprs.into_iter();
@@ -443,6 +474,7 @@ fn interval_to_exprs(
     column: &str,
     interval: &Interval,
     denorm_values: &DenormValues,
+    hash_columns: &BTreeMap<String, String>,
 ) -> Option<Vec<PartitionExpr>> {
     use Bound::*;
 
@@ -454,10 +486,16 @@ fn interval_to_exprs(
 
     let lower = &interval.lower;
     let upper = &interval.upper;
+    let operand = || {
+        hash_columns
+            .get(column)
+            .map(hash_col)
+            .unwrap_or_else(|| col(column))
+    };
 
     match (lower, upper) {
         (Included(lv), Included(uv)) if lv == uv => {
-            return Some(vec![col(column).eq(col_values.get(lv)?.clone())]);
+            return Some(vec![operand().eq(col_values.get(lv)?.clone())]);
         }
         (Excluded(lv), Excluded(uv)) if lv == uv => return None,
         (Included(lv), Excluded(uv)) if lv == uv => return None,
@@ -468,13 +506,13 @@ fn interval_to_exprs(
     let mut exprs = Vec::new();
     match lower {
         Unbounded => {}
-        Included(v) => exprs.push(col(column).gt_eq(col_values.get(v)?.clone())),
-        Excluded(v) => exprs.push(col(column).gt(col_values.get(v)?.clone())),
+        Included(v) => exprs.push(operand().gt_eq(col_values.get(v)?.clone())),
+        Excluded(v) => exprs.push(operand().gt(col_values.get(v)?.clone())),
     }
     match upper {
         Unbounded => {}
-        Included(v) => exprs.push(col(column).lt_eq(col_values.get(v)?.clone())),
-        Excluded(v) => exprs.push(col(column).lt(col_values.get(v)?.clone())),
+        Included(v) => exprs.push(operand().lt_eq(col_values.get(v)?.clone())),
+        Excluded(v) => exprs.push(operand().lt(col_values.get(v)?.clone())),
     }
 
     Some(exprs)
@@ -518,6 +556,17 @@ mod tests {
         let merged = or(left, right);
         let simplified = simplify_merged_partition_expr(merged);
         assert_eq!(simplified.to_string(), "host < h1");
+    }
+
+    #[test]
+    fn simplify_preserves_hash_operand() {
+        let left = hash_col("host").lt(Value::UInt32(100));
+        let right = hash_col("host")
+            .gt_eq(Value::UInt32(100))
+            .and(hash_col("host").lt(Value::UInt32(200)));
+        let simplified = simplify_merged_partition_expr(or(left, right));
+
+        assert_eq!(simplified, hash_col("host").lt(Value::UInt32(200)));
     }
 
     #[test]

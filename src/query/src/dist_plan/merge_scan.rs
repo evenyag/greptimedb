@@ -225,6 +225,7 @@ pub struct MergeScanExec {
     captured_remote_dyn_filters: Arc<Mutex<Vec<CapturedDynFilter>>>,
     target_partition: usize,
     partition_cols: AliasMapping,
+    hashed_partition_cols: HashSet<String>,
     enable_per_region_metrics: bool,
 }
 
@@ -250,6 +251,7 @@ impl MergeScanExec {
         query_ctx: QueryContextRef,
         target_partition: usize,
         partition_cols: AliasMapping,
+        hashed_partition_cols: HashSet<String>,
         remote_dyn_filter_producer_id: Option<RemoteDynFilterProducerId>,
         enable_per_region_metrics: bool,
     ) -> Result<Self> {
@@ -290,15 +292,20 @@ impl MergeScanExec {
 
         let partition_exprs = partition_cols
             .iter()
-            .filter_map(|col| {
-                if let Some(first_alias) = col.1.first() {
+            .filter_map(|(source_column, aliases)| {
+                if let Some(first_alias) = aliases.first() {
+                    let column_expr =
+                        Expr::Column(ColumnExpr::new_unqualified(first_alias.name().to_string()));
+                    let partition_expr = if hashed_partition_cols.contains(source_column) {
+                        Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
+                            func: partition::hash::partition_hash_udf(),
+                            args: vec![column_expr],
+                        })
+                    } else {
+                        column_expr
+                    };
                     session_state
-                        .create_physical_expr(
-                            Expr::Column(ColumnExpr::new_unqualified(
-                                first_alias.name().to_string(),
-                            )),
-                            plan.schema(),
-                        )
+                        .create_physical_expr(partition_expr, plan.schema())
                         .ok()
                 } else {
                     None
@@ -328,6 +335,7 @@ impl MergeScanExec {
             captured_remote_dyn_filters: Arc::default(),
             target_partition,
             partition_cols,
+            hashed_partition_cols,
             enable_per_region_metrics,
         })
     }
@@ -647,6 +655,7 @@ impl MergeScanExec {
             captured_remote_dyn_filters: self.captured_remote_dyn_filters.clone(),
             target_partition: self.target_partition,
             partition_cols: self.partition_cols.clone(),
+            hashed_partition_cols: self.hashed_partition_cols.clone(),
             enable_per_region_metrics: self.enable_per_region_metrics,
         })
     }
@@ -1069,10 +1078,10 @@ mod tests {
     use datafusion::physical_plan::filter_pushdown::ChildFilterPushdownResult;
     use datafusion_common::TableReference;
     use datafusion_expr::{LogicalPlanBuilder, col, lit};
-    use datafusion_physical_expr::Distribution;
     use datafusion_physical_expr::expressions::{
         Column, DynamicFilterPhysicalExpr, lit as physical_lit,
     };
+    use datafusion_physical_expr::{Distribution, ScalarFunctionExpr};
     use session::ReadPreference;
     use session::context::QueryContext;
     use session::query_id::QueryId;
@@ -1117,10 +1126,50 @@ mod tests {
             QueryContext::arc(),
             target_partition,
             AliasMapping::new(),
+            HashSet::default(),
             None,
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn hash_partition_column_is_declared_as_hashed_distribution() {
+        let session_state = SessionStateBuilder::new().build();
+        let plan = LogicalPlanBuilder::empty(true)
+            .project(vec![lit("host-a").alias("host")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let schema = plan.schema().as_arrow().clone();
+        let partition_cols = AliasMapping::from([(
+            "host".to_string(),
+            BTreeSet::from([ColumnExpr::new_unqualified("host")]),
+        )]);
+        let exec = MergeScanExec::new(
+            &session_state,
+            TableName::new("catalog", "schema", "table"),
+            vec![RegionId::new(1024, 0)],
+            plan,
+            &schema,
+            Arc::new(TestRegionQueryHandler),
+            QueryContext::arc(),
+            1,
+            partition_cols,
+            HashSet::from_iter(["host".to_string()]),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let Partitioning::Hash(expressions, _) = &exec.properties().partitioning else {
+            panic!("expected hash partitioning");
+        };
+        let hash_expr = expressions[0]
+            .as_any()
+            .downcast_ref::<ScalarFunctionExpr>()
+            .expect("partition expression should be a scalar function");
+        assert_eq!(hash_expr.name(), partition::hash::PARTITION_HASH_UDF_NAME);
     }
 
     #[test]
@@ -1325,6 +1374,7 @@ mod tests {
             query_ctx,
             target_partition,
             partition_cols,
+            HashSet::default(),
             Some(remote_dyn_filter_producer_id),
             false,
         )
@@ -1379,6 +1429,7 @@ mod tests {
             query_ctx,
             1,
             AliasMapping::new(),
+            HashSet::default(),
             Some(remote_dyn_filter_producer_id),
             false,
         )
@@ -1485,6 +1536,7 @@ mod tests {
             QueryContext::arc(),
             1,
             AliasMapping::new(),
+            HashSet::default(),
             None,
             true,
         )
@@ -1554,6 +1606,7 @@ mod tests {
             QueryContext::arc(),
             1,
             AliasMapping::new(),
+            HashSet::default(),
             None,
             true,
         )

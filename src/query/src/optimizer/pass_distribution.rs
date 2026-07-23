@@ -322,6 +322,7 @@ mod tests {
             QueryContext::arc(),
             32,
             partition_cols,
+            ahash::HashSet::default(),
             Some(RemoteDynFilterProducerId::new(1)),
             false,
         )

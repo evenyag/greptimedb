@@ -17,6 +17,7 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
 
+use common_time::timestamp::TimeUnit;
 use datafusion_common::arrow::array::{ArrayRef, UInt32Builder};
 use datafusion_common::arrow::datatypes::DataType;
 use datafusion_common::{DataFusionError, ScalarValue};
@@ -25,13 +26,19 @@ use datafusion_expr::{
 };
 use datatypes::value::Value;
 use datatypes::vectors::Helper;
-use xxhash_rust::xxh3::xxh3_64_with_seed;
+use twox_hash::XxHash32;
 
 pub const PARTITION_HASH_UDF_NAME: &str = "partition_hash";
-pub const PARTITION_HASH_SEED: u64 = 0;
+pub const PARTITION_HASH_SEED: u32 = 0;
 
 pub fn hash_column_key(column: &str) -> String {
-    format!("{PARTITION_HASH_UDF_NAME}({column})")
+    // The collider represents both real columns and computed hash dimensions
+    // with string keys. Real columns use their names directly, so a display-like
+    // key such as `partition_hash(host)` could collide with a quoted column that
+    // has that exact name. SQL identifiers cannot contain NUL; use it to put
+    // computed dimensions in a private namespace while leaving ordinary column
+    // keys unchanged for existing collider consumers.
+    format!("\0{PARTITION_HASH_UDF_NAME}:{column}")
 }
 
 pub fn partition_hash_value(value: &Value) -> Option<u32> {
@@ -40,8 +47,8 @@ pub fn partition_hash_value(value: &Value) -> Option<u32> {
     }
 
     let mut bytes = Vec::new();
-    encode_value(value, &mut bytes);
-    Some(xxh3_64_with_seed(&bytes, PARTITION_HASH_SEED) as u32)
+    encode_value(value, &mut bytes)?;
+    Some(XxHash32::oneshot(PARTITION_HASH_SEED, &bytes))
 }
 
 fn push_len_and_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -49,17 +56,16 @@ fn push_len_and_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn encode_time_unit(out: &mut Vec<u8>, unit: impl std::fmt::Debug) {
-    out.push(match format!("{unit:?}").as_str() {
-        "Second" => 0,
-        "Millisecond" => 1,
-        "Microsecond" => 2,
-        "Nanosecond" => 3,
-        other => panic!("unsupported time unit {other}"),
+fn encode_time_unit(out: &mut Vec<u8>, unit: TimeUnit) {
+    out.push(match unit {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
     });
 }
 
-fn encode_value(value: &Value, out: &mut Vec<u8>) {
+fn encode_value(value: &Value, out: &mut Vec<u8>) -> Option<()> {
     match value {
         Value::Null => out.push(0),
         Value::Boolean(v) => out.extend_from_slice(&[1, u8::from(*v)]),
@@ -145,10 +151,11 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
         // Complex values are not accepted by partition DDL today, but keep a stable fallback.
         Value::List(_) | Value::Struct(_) | Value::Json(_) => {
             out.push(255);
-            let json = serde_json::to_vec(value).expect("Value serialization must succeed");
+            let json = serde_json::to_vec(value).ok()?;
             push_len_and_bytes(out, &json);
         }
     }
+    Some(())
 }
 
 #[derive(Eq)]
@@ -181,7 +188,7 @@ impl ScalarUDFImpl for PartitionHashUdf {
     }
     fn signature(&self) -> &Signature {
         static SIGNATURE: LazyLock<Signature> =
-            LazyLock::new(|| Signature::variadic_any(Volatility::Immutable));
+            LazyLock::new(|| Signature::any(1, Volatility::Immutable));
         &SIGNATURE
     }
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion_common::Result<DataType> {
@@ -229,17 +236,34 @@ pub fn partition_hash_udf() -> Arc<ScalarUDF> {
 
 #[cfg(test)]
 mod tests {
-    use datatypes::value::StringBytes;
+    use datafusion_common::arrow::array::{Array, StringArray, UInt32Array};
 
     use super::*;
 
     #[test]
     fn test_partition_hash_is_stable() {
         assert_eq!(
-            partition_hash_value(&Value::String(StringBytes::from("a"))),
-            Some(285125897)
+            partition_hash_value(&Value::String("a".into())),
+            Some(1099135740)
         );
-        assert_eq!(partition_hash_value(&Value::UInt32(42)), Some(1600987295));
+        assert_eq!(partition_hash_value(&Value::UInt32(42)), Some(3010843987));
         assert_eq!(partition_hash_value(&Value::Null), None);
+    }
+
+    #[test]
+    fn test_hash_array_matches_scalar_hashing() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("b")]));
+        let output = hash_array(input).unwrap();
+        let output = output.as_any().downcast_ref::<UInt32Array>().unwrap();
+
+        assert_eq!(
+            output.value(0),
+            partition_hash_value(&Value::String("a".into())).unwrap()
+        );
+        assert!(output.is_null(1));
+        assert_eq!(
+            output.value(2),
+            partition_hash_value(&Value::String("b".into())).unwrap()
+        );
     }
 }

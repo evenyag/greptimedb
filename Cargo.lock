@@ -10193,6 +10193,7 @@ dependencies = [
  "common-meta",
  "common-query",
  "common-telemetry",
+ "common-time",
  "criterion 0.7.0",
  "datafusion-common",
  "datafusion-expr",
@@ -10208,7 +10209,7 @@ dependencies = [
  "sqlparser",
  "store-api",
  "table",
- "xxhash-rust",
+ "twox-hash",
 ]
 
 [[package]]

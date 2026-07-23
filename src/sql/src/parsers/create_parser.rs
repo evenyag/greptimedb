@@ -2579,6 +2579,43 @@ ENGINE=mito";
     }
 
     #[test]
+    fn test_parse_hash_partition_rule() {
+        let sql = r"
+CREATE TABLE rcx (host STRING, ts TIMESTAMP TIME INDEX)
+PARTITION ON COLUMNS(host) (
+    partition_hash(host) < 2147483648,
+    partition_hash(host) >= 2147483648
+)
+ENGINE=mito";
+        ParserContext::create_with_dialect(sql, &GreptimeDbDialect {}, ParseOptions::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_reject_invalid_hash_partition_function() {
+        for expr in [
+            "partition_hash() < 10",
+            "partition_hash(host, host) < 10",
+            "partition_hash('host') < 10",
+            "partition_hash(other) < 10",
+        ] {
+            let sql = format!(
+                "CREATE TABLE rcx (host STRING, ts TIMESTAMP TIME INDEX) \
+                 PARTITION ON COLUMNS(host) ({expr}) ENGINE=mito"
+            );
+            assert!(
+                ParserContext::create_with_dialect(
+                    &sql,
+                    &GreptimeDbDialect {},
+                    ParseOptions::default()
+                )
+                .is_err(),
+                "{expr} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_partitions_unreferenced_column() {
         let sql = r"
 CREATE TABLE rcx ( ts TIMESTAMP TIME INDEX, a INT, b STRING, c INT )

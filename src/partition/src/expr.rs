@@ -493,6 +493,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hash_partition_expr_round_trip() {
+        let expr = hash_col("host").lt(Value::UInt32(100));
+        assert_eq!(expr.to_string(), "partition_hash(host) < 100");
+        assert_eq!(
+            expr.to_parser_expr().to_string(),
+            "partition_hash(host) < 100"
+        );
+        assert_eq!(
+            PartitionExpr::from_json_str(&expr.as_json_str().unwrap())
+                .unwrap()
+                .unwrap(),
+            expr
+        );
+    }
+
+    #[test]
     fn test_partition_expr() {
         let cases = [
             (

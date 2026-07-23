@@ -16,12 +16,13 @@
 //!
 //! [`PredicateExtractor`] extract a list of [`PartitionExpr`] from given [`LogicalPlan`].
 
-use std::collections::HashSet;
-
+use ahash::{HashMap, HashSet};
 use arrow::datatypes::DataType;
 use common_telemetry::debug;
 use datafusion_common::Result as DfResult;
 use datafusion_expr::{Expr, LogicalPlan, Operator};
+use datatypes::prelude::ConcreteDataType;
+use datatypes::types::cast::cast;
 use datatypes::value::Value;
 use partition::expr::{Operand, PartitionExpr, RestrictedOp};
 use partition::hash::partition_hash_value;
@@ -36,6 +37,7 @@ impl PredicateExtractor {
         plan: &LogicalPlan,
         partition_columns: &[String],
         hashed_columns: &HashSet<String>,
+        partition_column_types: &HashMap<String, ConcreteDataType>,
     ) -> DfResult<Vec<PartitionExpr>> {
         // Collect all filter expressions from the logical plan
         let mut filter_exprs = Vec::new();
@@ -48,9 +50,13 @@ impl PredicateExtractor {
         // Convert each DataFusion filter expression to PartitionExpr
         let mut partition_exprs = Vec::with_capacity(filter_exprs.len());
         let partition_set: HashSet<String> = partition_columns.iter().cloned().collect();
+        let hash_context = HashPartitionContext {
+            hashed_columns,
+            partition_column_types,
+        };
 
         for filter_expr in filter_exprs {
-            match DataFusionExprConverter::convert(&filter_expr, hashed_columns) {
+            match DataFusionExprConverter::convert(&filter_expr, &hash_context) {
                 Ok(partition_expr) => {
                     // Check expression for safe partition pruning
                     match ExpressionChecker::check_expression_for_pruning(
@@ -253,29 +259,34 @@ impl ExpressionChecker {
 /// Converts DataFusion expressions to PartitionExpr
 struct DataFusionExprConverter;
 
+struct HashPartitionContext<'a> {
+    hashed_columns: &'a HashSet<String>,
+    partition_column_types: &'a HashMap<String, ConcreteDataType>,
+}
+
 impl DataFusionExprConverter {
     /// Convert DataFusion Expr to PartitionExpr
-    pub fn convert(expr: &Expr, hashed_columns: &HashSet<String>) -> DfResult<PartitionExpr> {
+    pub fn convert(expr: &Expr, context: &HashPartitionContext<'_>) -> DfResult<PartitionExpr> {
         match expr {
             Expr::BinaryExpr(binary_expr) => {
                 let op = Self::convert_operator(&binary_expr.op)?;
                 if matches!(op, RestrictedOp::And | RestrictedOp::Or) {
-                    let lhs = Self::convert(&binary_expr.left, hashed_columns)?;
-                    let rhs = Self::convert(&binary_expr.right, hashed_columns)?;
+                    let lhs = Self::convert(&binary_expr.left, context)?;
+                    let rhs = Self::convert(&binary_expr.right, context)?;
                     return Ok(PartitionExpr::new(
                         Operand::Expr(lhs),
                         op,
                         Operand::Expr(rhs),
                     ));
                 }
-                let lhs = Self::convert_to_operand(&binary_expr.left, hashed_columns)?;
-                let rhs = Self::convert_to_operand(&binary_expr.right, hashed_columns)?;
-                Self::convert_hash_column_comparison(lhs, op, rhs, hashed_columns)
+                let lhs = Self::convert_to_operand(&binary_expr.left, context)?;
+                let rhs = Self::convert_to_operand(&binary_expr.right, context)?;
+                Self::convert_hash_column_comparison(lhs, op, rhs, context)
             }
             Expr::InList(inlist_expr) => {
                 // Convert col IN (val1, val2, val3) to col = val1 OR col = val2 OR col = val3
                 // Handle negation: col NOT IN (val1, val2) to col != val1 AND col != val2
-                let column_operand = Self::convert_to_operand(&inlist_expr.expr, hashed_columns)?;
+                let column_operand = Self::convert_to_operand(&inlist_expr.expr, context)?;
 
                 if inlist_expr.list.is_empty() {
                     return Err(datafusion_common::DataFusionError::Plan(
@@ -284,7 +295,7 @@ impl DataFusionExprConverter {
                 }
 
                 if inlist_expr.negated
-                    && matches!(column_operand, Operand::Column(ref col) if hashed_columns.contains(col))
+                    && matches!(column_operand, Operand::Column(ref col) if context.hashed_columns.contains(col))
                 {
                     return Err(datafusion_common::DataFusionError::Plan(
                         "NOT IN on hash partition column is not supported for partition pruning"
@@ -307,12 +318,12 @@ impl DataFusionExprConverter {
                 // Convert each value in the list to an equality/inequality expression
                 let mut expressions = Vec::new();
                 for value_expr in &inlist_expr.list {
-                    let value_operand = Self::convert_to_operand(value_expr, hashed_columns)?;
+                    let value_operand = Self::convert_to_operand(value_expr, context)?;
                     expressions.push(Self::convert_hash_column_comparison(
                         column_operand.clone(),
                         op.clone(),
                         value_operand,
-                        hashed_columns,
+                        context,
                     )?);
                 }
 
@@ -332,11 +343,11 @@ impl DataFusionExprConverter {
             Expr::Between(between_expr) => {
                 // Convert col BETWEEN low AND high to col >= low AND col <= high
                 // Handle negation: col NOT BETWEEN low AND high to col < low OR col > high
-                let column_operand = Self::convert_to_operand(&between_expr.expr, hashed_columns)?;
-                let low_operand = Self::convert_to_operand(&between_expr.low, hashed_columns)?;
-                let high_operand = Self::convert_to_operand(&between_expr.high, hashed_columns)?;
+                let column_operand = Self::convert_to_operand(&between_expr.expr, context)?;
+                let low_operand = Self::convert_to_operand(&between_expr.low, context)?;
+                let high_operand = Self::convert_to_operand(&between_expr.high, context)?;
 
-                if matches!(column_operand, Operand::Column(ref col) if hashed_columns.contains(col))
+                if matches!(column_operand, Operand::Column(ref col) if context.hashed_columns.contains(col))
                 {
                     return Err(datafusion_common::DataFusionError::Plan(
                         "BETWEEN on hash partition column is not supported for partition pruning"
@@ -370,52 +381,52 @@ impl DataFusionExprConverter {
             }
             Expr::IsNull(expr) => {
                 // Convert col IS NULL to a PartitionExpr
-                let column_operand = Self::convert_to_operand(expr, hashed_columns)?;
+                let column_operand = Self::convert_to_operand(expr, context)?;
                 Self::convert_hash_column_comparison(
                     column_operand,
                     RestrictedOp::Eq,
                     Operand::Value(Value::Null),
-                    hashed_columns,
+                    context,
                 )
             }
             Expr::IsNotNull(expr) => {
                 // Convert col IS NOT NULL to a PartitionExpr
-                let column_operand = Self::convert_to_operand(expr, hashed_columns)?;
+                let column_operand = Self::convert_to_operand(expr, context)?;
                 Self::convert_hash_column_comparison(
                     column_operand,
                     RestrictedOp::NotEq,
                     Operand::Value(Value::Null),
-                    hashed_columns,
+                    context,
                 )
             }
             Expr::Not(expr) => {
                 // Handle NOT expressions by inverting the inner expression
                 match expr.as_ref() {
                     Expr::BinaryExpr(binary_expr) => {
-                        let lhs = Self::convert_to_operand(&binary_expr.left, hashed_columns)?;
-                        let rhs = Self::convert_to_operand(&binary_expr.right, hashed_columns)?;
+                        let lhs = Self::convert_to_operand(&binary_expr.left, context)?;
+                        let rhs = Self::convert_to_operand(&binary_expr.right, context)?;
                         let inverted_op = Self::invert_operator(&binary_expr.op)?;
 
-                        Self::convert_hash_column_comparison(lhs, inverted_op, rhs, hashed_columns)
+                        Self::convert_hash_column_comparison(lhs, inverted_op, rhs, context)
                     }
                     Expr::IsNull(inner_expr) => {
                         // NOT (col IS NULL) becomes col IS NOT NULL
-                        let column_operand = Self::convert_to_operand(inner_expr, hashed_columns)?;
+                        let column_operand = Self::convert_to_operand(inner_expr, context)?;
                         Self::convert_hash_column_comparison(
                             column_operand,
                             RestrictedOp::NotEq,
                             Operand::Value(Value::Null),
-                            hashed_columns,
+                            context,
                         )
                     }
                     Expr::IsNotNull(inner_expr) => {
                         // NOT (col IS NOT NULL) becomes col IS NULL
-                        let column_operand = Self::convert_to_operand(inner_expr, hashed_columns)?;
+                        let column_operand = Self::convert_to_operand(inner_expr, context)?;
                         Self::convert_hash_column_comparison(
                             column_operand,
                             RestrictedOp::Eq,
                             Operand::Value(Value::Null),
-                            hashed_columns,
+                            context,
                         )
                     }
                     _ => {
@@ -441,39 +452,33 @@ impl DataFusionExprConverter {
         lhs: Operand,
         op: RestrictedOp,
         rhs: Operand,
-        hashed_columns: &HashSet<String>,
+        context: &HashPartitionContext<'_>,
     ) -> DfResult<PartitionExpr> {
         match (&lhs, &rhs) {
-            (Operand::Column(col), Operand::Value(value)) if hashed_columns.contains(col) => {
+            (Operand::Column(col), Operand::Value(value))
+                if context.hashed_columns.contains(col) =>
+            {
                 if op != RestrictedOp::Eq {
                     return Err(datafusion_common::DataFusionError::Plan(format!(
                         "operator {op:?} on hash partition column is not supported for partition pruning"
                     )));
                 }
-                let Some(hash) = partition_hash_value(value) else {
-                    return Err(datafusion_common::DataFusionError::Plan(
-                        "NULL on hash partition column is not supported for partition pruning"
-                            .to_string(),
-                    ));
-                };
+                let hash = Self::hash_partition_literal(col, value, context)?;
                 Ok(PartitionExpr::new(
                     Operand::Hash(col.clone()),
                     RestrictedOp::Eq,
                     Operand::Value(Value::UInt32(hash)),
                 ))
             }
-            (Operand::Value(value), Operand::Column(col)) if hashed_columns.contains(col) => {
+            (Operand::Value(value), Operand::Column(col))
+                if context.hashed_columns.contains(col) =>
+            {
                 if op != RestrictedOp::Eq {
                     return Err(datafusion_common::DataFusionError::Plan(format!(
                         "operator {op:?} on hash partition column is not supported for partition pruning"
                     )));
                 }
-                let Some(hash) = partition_hash_value(value) else {
-                    return Err(datafusion_common::DataFusionError::Plan(
-                        "NULL on hash partition column is not supported for partition pruning"
-                            .to_string(),
-                    ));
-                };
+                let hash = Self::hash_partition_literal(col, value, context)?;
                 Ok(PartitionExpr::new(
                     Operand::Hash(col.clone()),
                     RestrictedOp::Eq,
@@ -484,8 +489,27 @@ impl DataFusionExprConverter {
         }
     }
 
+    fn hash_partition_literal(
+        column: &str,
+        value: &Value,
+        context: &HashPartitionContext<'_>,
+    ) -> DfResult<u32> {
+        let data_type = context.partition_column_types.get(column).ok_or_else(|| {
+            datafusion_common::DataFusionError::Plan(format!(
+                "type of hash partition column {column} is unavailable"
+            ))
+        })?;
+        let value = cast(value.clone(), data_type)
+            .map_err(|error| datafusion_common::DataFusionError::External(Box::new(error)))?;
+        partition_hash_value(&value).ok_or_else(|| {
+            datafusion_common::DataFusionError::Plan(format!(
+                "value {value:?} on hash partition column {column} cannot be hashed for partition pruning"
+            ))
+        })
+    }
+
     /// Convert DataFusion Expr to Operand
-    fn convert_to_operand(expr: &Expr, hashed_columns: &HashSet<String>) -> DfResult<Operand> {
+    fn convert_to_operand(expr: &Expr, context: &HashPartitionContext<'_>) -> DfResult<Operand> {
         match expr {
             Expr::Column(col) => {
                 // Handle qualified column names (table.column) by extracting just the column name
@@ -507,13 +531,13 @@ impl DataFusionExprConverter {
             }
             Expr::Alias(alias_expr) => {
                 // Unwrap alias to get the actual expression
-                Self::convert_to_operand(&alias_expr.expr, hashed_columns)
+                Self::convert_to_operand(&alias_expr.expr, context)
             }
             Expr::Cast(cast_expr) => {
                 // For safe casts, unwrap to the inner expression
                 // For unsafe casts, skip with debug logging
                 if Self::is_safe_cast_for_partition_pruning(&cast_expr.data_type) {
-                    Self::convert_to_operand(&cast_expr.expr, hashed_columns)
+                    Self::convert_to_operand(&cast_expr.expr, context)
                 } else {
                     debug!(
                         "Skipping unsafe cast for partition pruning: {:?}",
@@ -526,7 +550,7 @@ impl DataFusionExprConverter {
                 }
             }
             other => {
-                let partition_expr = Self::convert(other, hashed_columns)?;
+                let partition_expr = Self::convert(other, context)?;
                 Ok(Operand::Expr(partition_expr))
             }
         }
@@ -679,7 +703,8 @@ mod tests {
             let partition_exprs = PredicateExtractor::extract_partition_expressions(
                 &plan,
                 &partition_columns,
-                &HashSet::new(),
+                &HashSet::default(),
+                &HashMap::default(),
             )
             .unwrap();
             let expected = case.expected_partition_exprs.clone();
@@ -703,9 +728,13 @@ mod tests {
             ..scan
         });
 
-        let partition_exprs =
-            PredicateExtractor::extract_partition_expressions(&plan, &["user_id".to_string()])
-                .unwrap();
+        let partition_exprs = PredicateExtractor::extract_partition_expressions(
+            &plan,
+            &["user_id".to_string()],
+            &HashSet::default(),
+            &HashMap::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             partition_exprs,
@@ -726,7 +755,13 @@ mod tests {
             data_type: dictionary_type,
         }));
 
-        let partition_expr = DataFusionExprConverter::convert(&filter).unwrap();
+        let hashed_columns = HashSet::default();
+        let partition_column_types = HashMap::default();
+        let hash_context = HashPartitionContext {
+            hashed_columns: &hashed_columns,
+            partition_column_types: &partition_column_types,
+        };
+        let partition_expr = DataFusionExprConverter::convert(&filter, &hash_context).unwrap();
         assert_eq!(
             partition_expr,
             PartitionExpr::new(
@@ -753,6 +788,8 @@ mod tests {
         let partition_exprs = PredicateExtractor::extract_partition_expressions(
             &plan,
             &["user_id".to_string(), "value".to_string()],
+            &HashSet::default(),
+            &HashMap::default(),
         )
         .unwrap();
 
@@ -772,6 +809,64 @@ mod tests {
                 )),
             )]
         );
+    }
+
+    #[test]
+    fn test_hash_partition_equality_casts_literal_to_column_type() {
+        let plan = LogicalPlanBuilder::from(create_test_table_scan())
+            .filter(col("user_id").eq(lit(42i64)))
+            .unwrap()
+            .build()
+            .unwrap();
+        let hashed_columns = HashSet::from_iter(["user_id".to_string()]);
+        let partition_column_types =
+            HashMap::from_iter([("user_id".to_string(), ConcreteDataType::uint32_datatype())]);
+
+        let partition_exprs = PredicateExtractor::extract_partition_expressions(
+            &plan,
+            &["user_id".to_string()],
+            &hashed_columns,
+            &partition_column_types,
+        )
+        .unwrap();
+        let expected_hash = partition_hash_value(&Value::UInt32(42)).unwrap();
+
+        assert_eq!(
+            partition_exprs,
+            vec![PartitionExpr::new(
+                Operand::Hash("user_id".to_string()),
+                RestrictedOp::Eq,
+                Operand::Value(Value::UInt32(expected_hash)),
+            )]
+        );
+    }
+
+    #[test]
+    fn test_hash_partition_in_list_and_unsupported_range() {
+        let hashed_columns = HashSet::from_iter(["user_id".to_string()]);
+        let partition_column_types =
+            HashMap::from_iter([("user_id".to_string(), ConcreteDataType::int64_datatype())]);
+        let extract = |filter| {
+            let plan = LogicalPlanBuilder::from(create_test_table_scan())
+                .filter(filter)
+                .unwrap()
+                .build()
+                .unwrap();
+            PredicateExtractor::extract_partition_expressions(
+                &plan,
+                &["user_id".to_string()],
+                &hashed_columns,
+                &partition_column_types,
+            )
+            .unwrap()
+        };
+
+        let exprs = extract(col("user_id").in_list(vec![lit(1i64), lit(2i64)], false));
+        assert_eq!(exprs.len(), 1);
+        assert!(matches!(exprs[0].op(), RestrictedOp::Or));
+
+        assert!(extract(col("user_id").gt(lit(1i64))).is_empty());
+        assert!(extract(col("user_id").in_list(vec![lit(1i64), lit(2i64)], true)).is_empty());
     }
 
     #[test]

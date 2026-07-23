@@ -122,24 +122,36 @@ impl MultiDimPartitionRule {
     fn evaluate_expr(&self, expr: &PartitionExpr, values: &[Value]) -> Result<bool> {
         match (expr.lhs.as_ref(), expr.rhs.as_ref()) {
             (Operand::Column(name), Operand::Value(r)) => {
-                let index = self.name_to_index.get(name).unwrap();
+                let index = self
+                    .name_to_index
+                    .get(name)
+                    .context(UndefinedColumnSnafu { column: name })?;
                 let l = &values[*index];
                 Self::perform_op(l, &expr.op, r)
             }
             (Operand::Value(l), Operand::Column(name)) => {
-                let index = self.name_to_index.get(name).unwrap();
+                let index = self
+                    .name_to_index
+                    .get(name)
+                    .context(UndefinedColumnSnafu { column: name })?;
                 let r = &values[*index];
                 Self::perform_op(l, &expr.op, r)
             }
             (Operand::Hash(name), Operand::Value(r)) => {
-                let index = self.name_to_index.get(name).unwrap();
+                let index = self
+                    .name_to_index
+                    .get(name)
+                    .context(UndefinedColumnSnafu { column: name })?;
                 let Some(hash) = partition_hash_value(&values[*index]) else {
                     return Ok(false);
                 };
                 Self::perform_op(&Value::UInt32(hash), &expr.op, r)
             }
             (Operand::Value(l), Operand::Hash(name)) => {
-                let index = self.name_to_index.get(name).unwrap();
+                let index = self
+                    .name_to_index
+                    .get(name)
+                    .context(UndefinedColumnSnafu { column: name })?;
                 let Some(hash) = partition_hash_value(&values[*index]) else {
                     return Ok(false);
                 };

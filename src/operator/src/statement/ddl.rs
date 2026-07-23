@@ -2601,7 +2601,7 @@ fn ensure_partition_operand_columns_in_target(
     target_partition_columns: &HashSet<&String>,
 ) -> Result<()> {
     match operand {
-        Operand::Column(column) => ensure!(
+        Operand::Column(column) | Operand::Hash(column) => ensure!(
             target_partition_columns.contains(column),
             InvalidPartitionRuleSnafu {
                 reason: format!(
@@ -3289,6 +3289,41 @@ SELECT max(c1), min(c2) FROM schema_2.table_2;";
         physical_partition_exprs.sort_unstable();
         logical_partition_exprs.sort_unstable();
         assert_eq!(physical_partition_exprs, logical_partition_exprs);
+    }
+
+    #[test]
+    fn test_convert_hash_partition_expr() {
+        let column_name = "host".to_string();
+        let column_name_and_type =
+            HashMap::from([(&column_name, ConcreteDataType::string_datatype())]);
+        let timezone = Timezone::from_tz_string("UTC").unwrap();
+        let dialect = GreptimeDbDialect {};
+
+        let parse = |sql| {
+            Parser::new(&dialect)
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let left = convert_one_expr(
+            &parse("partition_hash(host) < 100"),
+            &column_name_and_type,
+            &timezone,
+        )
+        .unwrap();
+        let right = convert_one_expr(
+            &parse("100 > partition_hash(host)"),
+            &column_name_and_type,
+            &timezone,
+        )
+        .unwrap();
+
+        assert_eq!(
+            left,
+            partition::expr::hash_col("host").lt(Value::UInt32(100))
+        );
+        assert_eq!(left, right);
     }
 
     #[test]

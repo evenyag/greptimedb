@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use arrow_schema::SortOptions;
 use async_trait::async_trait;
 use catalog::CatalogManagerRef;
@@ -137,6 +137,11 @@ pub struct DistExtensionPlanner {
     enable_per_region_metrics: bool,
 }
 
+struct RegionSelection {
+    regions: Vec<RegionId>,
+    hashed_columns: HashSet<String>,
+}
+
 impl DistExtensionPlanner {
     pub fn new(
         catalog_manager: CatalogManagerRef,
@@ -187,7 +192,7 @@ impl ExtensionPlanner for DistExtensionPlanner {
             return fallback(optimized_plan).await;
         };
 
-        let Ok(regions) = self.get_regions(&table_name, input_plan).await else {
+        let Ok(selection) = self.get_regions(&table_name, input_plan).await else {
             // no peers found, going to execute them locally
             return fallback(optimized_plan).await;
         };
@@ -201,13 +206,14 @@ impl ExtensionPlanner for DistExtensionPlanner {
         let merge_scan_plan = MergeScanExec::new(
             session_state,
             table_name,
-            regions,
+            selection.regions,
             input_plan.clone(),
             schema,
             self.region_query_handler.clone(),
             query_ctx,
             session_state.config().target_partitions(),
             merge_scan.partition_cols().clone(),
+            selection.hashed_columns,
             merge_scan.remote_dyn_filter_producer_id(),
             self.enable_per_region_metrics,
         )?;
@@ -227,7 +233,7 @@ impl DistExtensionPlanner {
         &self,
         table_name: &TableName,
         logical_plan: &LogicalPlan,
-    ) -> Result<Vec<RegionId>> {
+    ) -> Result<RegionSelection> {
         let table = self
             .catalog_manager
             .table(
@@ -265,7 +271,10 @@ impl DistExtensionPlanner {
             all_regions,
         );
         if partition_columns.is_empty() {
-            return Ok(all_regions);
+            return Ok(RegionSelection {
+                regions: all_regions,
+                hashed_columns: HashSet::default(),
+            });
         }
         let partition_column_types = partition_columns
             .iter()
@@ -294,14 +303,20 @@ impl DistExtensionPlanner {
                     table_name,
                     err
                 );
-                return Ok(all_regions);
+                return Ok(RegionSelection {
+                    regions: all_regions,
+                    hashed_columns: HashSet::default(),
+                });
             }
         };
         if partitions.is_empty() {
-            return Ok(all_regions);
+            return Ok(RegionSelection {
+                regions: all_regions,
+                hashed_columns: HashSet::default(),
+            });
         }
 
-        let mut hashed_columns = std::collections::HashSet::new();
+        let mut hashed_columns = HashSet::default();
         for partition in &partitions {
             if let Some(expr) = &partition.partition_expr {
                 collect_hash_columns(expr.lhs(), &mut hashed_columns);
@@ -314,6 +329,7 @@ impl DistExtensionPlanner {
             logical_plan,
             &partition_columns,
             &hashed_columns,
+            &partition_column_types,
         ) {
             Ok(expressions) => expressions,
             Err(err) => {
@@ -323,12 +339,18 @@ impl DistExtensionPlanner {
                     table.table_info().table_id(),
                     err
                 );
-                return Ok(all_regions);
+                return Ok(RegionSelection {
+                    regions: all_regions,
+                    hashed_columns,
+                });
             }
         };
 
         if partition_expressions.is_empty() {
-            return Ok(all_regions);
+            return Ok(RegionSelection {
+                regions: all_regions,
+                hashed_columns,
+            });
         }
 
         // Apply region pruning based on partition rules
@@ -344,7 +366,10 @@ impl DistExtensionPlanner {
                     table_name,
                     err
                 );
-                return Ok(all_regions);
+                return Ok(RegionSelection {
+                    regions: all_regions,
+                    hashed_columns,
+                });
             }
         };
 
@@ -356,7 +381,10 @@ impl DistExtensionPlanner {
             pruned_regions.len()
         );
 
-        Ok(pruned_regions)
+        Ok(RegionSelection {
+            regions: pruned_regions,
+            hashed_columns,
+        })
     }
 
     /// Input logical plan is analyzed. Thus only call logical optimizer to optimize it.
@@ -370,7 +398,7 @@ impl DistExtensionPlanner {
     }
 }
 
-fn collect_hash_columns(operand: &Operand, hashed_columns: &mut std::collections::HashSet<String>) {
+fn collect_hash_columns(operand: &Operand, hashed_columns: &mut HashSet<String>) {
     match operand {
         Operand::Hash(column) => {
             hashed_columns.insert(column.clone());
