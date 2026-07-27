@@ -1176,19 +1176,15 @@ mod tests {
 
         let data_key = build_range_cache_key(&ctx, &part_range).unwrap();
         let candidate_key = build_candidate_range_cache_key(&ctx, &part_range).unwrap();
-        let range_0 = SeriesRange::new(1, 0, 2).unwrap();
-        let range_1 = SeriesRange::new(1, 1, 2).unwrap();
-        let other_table_range = SeriesRange::new(2, 0, 2).unwrap();
+        let range_0 = SeriesRange::new(0, 2).unwrap();
+        let range_1 = SeriesRange::new(1, 2).unwrap();
         let series_key_0 = build_series_range_cache_key(&ctx, &part_range, range_0).unwrap();
         let series_key_1 = build_series_range_cache_key(&ctx, &part_range, range_1).unwrap();
-        let other_table_key =
-            build_series_range_cache_key(&ctx, &part_range, other_table_range).unwrap();
 
         assert_ne!(data_key.scan, candidate_key.scan);
         assert_ne!(data_key.scan, series_key_0.scan);
         assert_ne!(candidate_key.scan, series_key_0.scan);
         assert_ne!(series_key_0.scan, series_key_1.scan);
-        assert_ne!(series_key_0.scan, other_table_key.scan);
         assert_eq!(data_key.row_groups, candidate_key.row_groups);
         assert_eq!(data_key.row_groups, series_key_0.row_groups);
     }

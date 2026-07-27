@@ -53,16 +53,15 @@ use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
 const TSID_DOMAIN_END: u128 = 1u128 << u64::BITS;
 
-/// A stable partition of the TSID integer domain for one logical table.
+/// A stable partition of the TSID integer domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SeriesRange {
-    table_id: u32,
     start: u128,
     end: u128,
 }
 
 impl SeriesRange {
-    pub(crate) fn new(table_id: u32, partition: usize, partitions: usize) -> Option<Self> {
+    pub(crate) fn new(partition: usize, partitions: usize) -> Option<Self> {
         if partitions == 0 || partition >= partitions {
             return None;
         }
@@ -74,7 +73,6 @@ impl SeriesRange {
             numerator / partitions + u128::from(numerator % partitions != 0)
         };
         Some(Self {
-            table_id,
             start: boundary(partition),
             end: boundary(partition + 1),
         })
@@ -90,21 +88,12 @@ impl SeriesRange {
 pub(crate) struct AssignedSeriesBatch {
     range: SeriesRange,
     series: Vec<MetricSeriesId>,
-    tsid_bounds: Option<(u64, u64)>,
 }
 
 #[allow(dead_code)]
 impl AssignedSeriesBatch {
-    fn with_bounds(
-        range: SeriesRange,
-        series: Vec<MetricSeriesId>,
-        tsid_bounds: Option<(u64, u64)>,
-    ) -> Self {
-        Self {
-            range,
-            series,
-            tsid_bounds,
-        }
+    fn new(range: SeriesRange, series: Vec<MetricSeriesId>) -> Self {
+        Self { range, series }
     }
 
     pub(crate) fn range(&self) -> SeriesRange {
@@ -114,27 +103,19 @@ impl AssignedSeriesBatch {
     pub(crate) fn series(&self) -> &[MetricSeriesId] {
         &self.series
     }
-
-    pub(crate) fn tsid_bounds(&self) -> Option<(u64, u64)> {
-        self.tsid_bounds
-    }
 }
 
 /// Collects candidate batches and assigns every TSID by its integer range.
 #[allow(dead_code)]
 pub(crate) struct SeriesBatchCollector {
-    table_id: u32,
     assignments: Vec<Vec<MetricSeriesId>>,
-    tsid_bounds: Vec<Option<(u64, u64)>>,
 }
 
 #[allow(dead_code)]
 impl SeriesBatchCollector {
-    pub(crate) fn new(table_id: u32, partitions: usize) -> Option<Self> {
+    pub(crate) fn new(partitions: usize) -> Option<Self> {
         (partitions > 0).then(|| Self {
-            table_id,
             assignments: (0..partitions).map(|_| Vec::new()).collect(),
-            tsid_bounds: vec![None; partitions],
         })
     }
 
@@ -143,10 +124,6 @@ impl SeriesBatchCollector {
         for series in batch {
             let partition = SeriesRange::partition_for(series.tsid, partitions);
             self.assignments[partition].push(series);
-            self.tsid_bounds[partition] = Some(match self.tsid_bounds[partition] {
-                Some((min, max)) => (min.min(series.tsid), max.max(series.tsid)),
-                None => (series.tsid, series.tsid),
-            });
         }
     }
 
@@ -154,14 +131,9 @@ impl SeriesBatchCollector {
         let partitions = self.assignments.len();
         self.assignments
             .into_iter()
-            .zip(self.tsid_bounds)
             .enumerate()
-            .map(|(partition, (series, tsid_bounds))| {
-                AssignedSeriesBatch::with_bounds(
-                    SeriesRange::new(self.table_id, partition, partitions).unwrap(),
-                    series,
-                    tsid_bounds,
-                )
+            .map(|(partition, series)| {
+                AssignedSeriesBatch::new(SeriesRange::new(partition, partitions).unwrap(), series)
             })
             .collect()
     }
@@ -171,25 +143,22 @@ impl SeriesBatchCollector {
 #[derive(Clone, Debug)]
 struct MetricSeriesFilter {
     range: SeriesRange,
-    tsids: Arc<HashSet<u64>>,
-    tsid_bounds: Option<(u64, u64)>,
+    series: Arc<HashSet<MetricSeriesId>>,
 }
 
 impl MetricSeriesFilter {
-    fn new(series: &AssignedSeriesBatch) -> Self {
-        let tsids = series.series.iter().map(|series| series.tsid).collect();
+    fn new(assigned: &AssignedSeriesBatch) -> Self {
+        let series = assigned.series.iter().copied().collect();
         Self {
-            range: series.range,
-            tsids: Arc::new(tsids),
-            tsid_bounds: series.tsid_bounds,
+            range: assigned.range,
+            series: Arc::new(series),
         }
     }
 
     fn primary_key_filter(&self, codec: SparsePrimaryKeyCodec) -> Box<dyn PrimaryKeyFilter> {
         Box::new(MetricSeriesPrimaryKeyFilter {
             codec,
-            table_id: self.range.table_id,
-            tsids: self.tsids.clone(),
+            series: self.series.clone(),
             last_primary_key: Vec::new(),
             last_match: None,
         })
@@ -201,7 +170,6 @@ impl MetricSeriesFilter {
         encoded_min: &[u8],
         encoded_max: &[u8],
     ) -> Option<bool> {
-        let (assigned_min_tsid, assigned_max_tsid) = self.tsid_bounds?;
         let (min_table_id, min_tsid) = codec.decode_ids(encoded_min).ok()?;
         let (max_table_id, max_tsid) = codec.decode_ids(encoded_max).ok()?;
         let min = MetricSeriesId {
@@ -215,23 +183,17 @@ impl MetricSeriesFilter {
         if min > max {
             return None;
         }
+        if min_table_id != max_table_id {
+            return Some(true);
+        }
 
-        let assigned_min = MetricSeriesId {
-            table_id: self.range.table_id,
-            tsid: assigned_min_tsid,
-        };
-        let assigned_max = MetricSeriesId {
-            table_id: self.range.table_id,
-            tsid: assigned_max_tsid,
-        };
-        Some(min <= assigned_max && max >= assigned_min)
+        Some(u128::from(min_tsid) < self.range.end && u128::from(max_tsid) >= self.range.start)
     }
 }
 
 struct MetricSeriesPrimaryKeyFilter {
     codec: SparsePrimaryKeyCodec,
-    table_id: u32,
-    tsids: Arc<HashSet<u64>>,
+    series: Arc<HashSet<MetricSeriesId>>,
     last_primary_key: Vec<u8>,
     last_match: Option<bool>,
 }
@@ -245,7 +207,7 @@ impl PrimaryKeyFilter for MetricSeriesPrimaryKeyFilter {
         }
 
         let (table_id, tsid) = self.codec.decode_ids(primary_key)?;
-        let matched = table_id == self.table_id && self.tsids.contains(&tsid);
+        let matched = self.series.contains(&MetricSeriesId { table_id, tsid });
         self.last_primary_key.clear();
         self.last_primary_key.extend_from_slice(primary_key);
         self.last_match = Some(matched);
@@ -424,7 +386,7 @@ impl SeriesReader {
     }
 
     pub(crate) async fn build_stream(&self) -> Result<BoxedRecordBatchStream> {
-        if self.partition_ranges.is_empty() || self.filter.tsids.is_empty() {
+        if self.partition_ranges.is_empty() || self.filter.series.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
         }
 
@@ -694,12 +656,11 @@ mod tests {
     }
 
     fn assigned_batch(
-        table_id: u32,
         partitions: usize,
         partition: usize,
         series: Vec<MetricSeriesId>,
     ) -> AssignedSeriesBatch {
-        let mut collector = SeriesBatchCollector::new(table_id, partitions).unwrap();
+        let mut collector = SeriesBatchCollector::new(partitions).unwrap();
         collector.push(series);
         collector.finish().remove(partition)
     }
@@ -708,16 +669,17 @@ mod tests {
     fn series_range_assignment_is_stable_across_batch_boundaries() {
         let input = vec![
             series(1, 0),
-            series(1, 1u64 << 62),
+            series(2, 1u64 << 62),
             series(1, 1u64 << 63),
-            series(1, 3u64 << 62),
+            series(2, 3u64 << 62),
             series(1, u64::MAX),
+            series(3, 0),
         ];
-        let mut first = SeriesBatchCollector::new(1, 4).unwrap();
+        let mut first = SeriesBatchCollector::new(4).unwrap();
         first.push(input.clone());
         let first = first.finish();
 
-        let mut second = SeriesBatchCollector::new(1, 4).unwrap();
+        let mut second = SeriesBatchCollector::new(4).unwrap();
         for chunk in input.chunks(2) {
             second.push(chunk.to_vec());
         }
@@ -733,28 +695,8 @@ mod tests {
                 .map(AssignedSeriesBatch::series)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            first
-                .iter()
-                .map(AssignedSeriesBatch::tsid_bounds)
-                .collect::<Vec<_>>(),
-            second
-                .iter()
-                .map(AssignedSeriesBatch::tsid_bounds)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            vec![
-                Some((0, 0)),
-                Some((1u64 << 62, 1u64 << 62)),
-                Some((1u64 << 63, 1u64 << 63)),
-                Some((3u64 << 62, u64::MAX)),
-            ],
-            first
-                .iter()
-                .map(AssignedSeriesBatch::tsid_bounds)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(&[series(1, 0), series(3, 0)], first[0].series());
+        assert_eq!(&[series(2, 1u64 << 62)], first[1].series());
         assert_eq!(
             input.len(),
             first
@@ -767,7 +709,7 @@ mod tests {
     #[test]
     fn series_ranges_cover_the_tsid_domain() {
         let ranges = (0..3)
-            .map(|partition| SeriesRange::new(1, partition, 3).unwrap())
+            .map(|partition| SeriesRange::new(partition, 3).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(0, ranges[0].start);
         assert_eq!(TSID_DOMAIN_END, ranges[2].end);
@@ -788,34 +730,35 @@ mod tests {
     }
 
     #[test]
-    fn series_batch_collector_computes_actual_bounds() {
-        let mut collector = SeriesBatchCollector::new(1, 2).unwrap();
-        collector.push(vec![series(1, 20), series(1, 10), series(1, u64::MAX)]);
-        let assigned = collector.finish();
-        assert_eq!(Some((10, 20)), assigned[0].tsid_bounds());
-        assert_eq!(Some((u64::MAX, u64::MAX)), assigned[1].tsid_bounds());
-
-        let empty = SeriesBatchCollector::new(1, 1).unwrap().finish();
-        assert_eq!(None, empty[0].tsid_bounds());
-    }
-
-    #[test]
     fn metric_series_filter_matches_encoded_primary_key() {
         let metadata = Arc::new(sst_region_metadata_with_encoding(
             PrimaryKeyEncoding::Sparse,
         ));
-        let assigned = assigned_batch(2, 1, 0, vec![series(2, 10)]);
+        let assigned = assigned_batch(1, 0, vec![series(1, 10), series(2, 20)]);
         let filter = MetricSeriesFilter::new(&assigned);
         let codec = SparsePrimaryKeyCodec::new(&metadata);
-        let mut primary_key = Vec::new();
-        codec.encode_internal(2, 10, &mut primary_key).unwrap();
-        assert!(
-            filter
-                .primary_key_filter(codec.clone())
-                .matches(&primary_key)
-                .context(DecodeSnafu)
-                .unwrap()
-        );
+        let mut primary_key_filter = filter.primary_key_filter(codec);
+
+        for selected in [series(1, 10), series(2, 20)] {
+            assert!(
+                primary_key_filter
+                    .matches(&encode_series(&metadata, selected.table_id, selected.tsid))
+                    .context(DecodeSnafu)
+                    .unwrap()
+            );
+        }
+        for unselected in [series(2, 10), series(1, 20)] {
+            assert!(
+                !primary_key_filter
+                    .matches(&encode_series(
+                        &metadata,
+                        unselected.table_id,
+                        unselected.tsid,
+                    ))
+                    .context(DecodeSnafu)
+                    .unwrap()
+            );
+        }
     }
 
     fn encode_series(
@@ -832,11 +775,47 @@ mod tests {
     }
 
     #[test]
-    fn actual_series_bounds_overlap_encoded_primary_key_bounds() {
+    fn series_range_overlaps_single_table_primary_key_bounds() {
         let metadata = Arc::new(sst_region_metadata_with_encoding(
             PrimaryKeyEncoding::Sparse,
         ));
-        let assigned = assigned_batch(1, 2, 0, vec![series(1, 10), series(1, 20)]);
+        let assigned = assigned_batch(2, 0, vec![series(1, 10), series(2, 20)]);
+        let filter = MetricSeriesFilter::new(&assigned);
+        let codec = SparsePrimaryKeyCodec::new(&metadata);
+
+        // The full assigned range overlaps even though the actual candidate bounds do not.
+        assert_eq!(
+            Some(true),
+            filter.overlaps_encoded_bounds(
+                &codec,
+                &encode_series(&metadata, 1, 100),
+                &encode_series(&metadata, 1, 200),
+            )
+        );
+        assert_eq!(
+            Some(false),
+            filter.overlaps_encoded_bounds(
+                &codec,
+                &encode_series(&metadata, 1, 1u64 << 63),
+                &encode_series(&metadata, 1, u64::MAX),
+            )
+        );
+        assert_eq!(
+            Some(true),
+            filter.overlaps_encoded_bounds(
+                &codec,
+                &encode_series(&metadata, 3, 10),
+                &encode_series(&metadata, 3, 20),
+            )
+        );
+    }
+
+    #[test]
+    fn series_range_keeps_multiple_table_primary_key_bounds() {
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let assigned = assigned_batch(2, 0, vec![series(1, 10), series(2, 20)]);
         let filter = MetricSeriesFilter::new(&assigned);
         let codec = SparsePrimaryKeyCodec::new(&metadata);
 
@@ -844,32 +823,8 @@ mod tests {
             Some(true),
             filter.overlaps_encoded_bounds(
                 &codec,
-                &encode_series(&metadata, 1, 10),
-                &encode_series(&metadata, 1, 10),
-            )
-        );
-        assert_eq!(
-            Some(false),
-            filter.overlaps_encoded_bounds(
-                &codec,
-                &encode_series(&metadata, 1, 21),
-                &encode_series(&metadata, 1, 30),
-            )
-        );
-        assert_eq!(
-            Some(true),
-            filter.overlaps_encoded_bounds(
-                &codec,
-                &encode_series(&metadata, 0, u64::MAX),
-                &encode_series(&metadata, 1, 10),
-            )
-        );
-        assert_eq!(
-            Some(false),
-            filter.overlaps_encoded_bounds(
-                &codec,
-                &encode_series(&metadata, 2, 0),
-                &encode_series(&metadata, 2, 8),
+                &encode_series(&metadata, 1, 1u64 << 63),
+                &encode_series(&metadata, 2, u64::MAX),
             )
         );
     }
@@ -879,7 +834,7 @@ mod tests {
         let metadata = Arc::new(sst_region_metadata_with_encoding(
             PrimaryKeyEncoding::Sparse,
         ));
-        let assigned = assigned_batch(1, 2, 0, vec![series(1, 10)]);
+        let assigned = assigned_batch(2, 0, vec![series(1, 10)]);
         let filter = MetricSeriesFilter::new(&assigned);
         let codec = SparsePrimaryKeyCodec::new(&metadata);
 

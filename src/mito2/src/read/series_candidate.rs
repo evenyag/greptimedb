@@ -62,7 +62,7 @@ use crate::sst::parquet::row_group::ParquetFetchMetrics;
 const CANDIDATE_SERIES_BATCH_SIZE: usize = 500;
 
 /// Identifies one series in a physical metric region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetricSeriesId {
     pub(crate) table_id: u32,
     pub(crate) tsid: u64,
