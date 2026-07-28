@@ -24,7 +24,6 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
 use common_telemetry::warn;
-use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::array::BinaryArray;
@@ -53,8 +52,6 @@ use crate::read::scan_util::{
     compute_parallel_channel_size,
 };
 use crate::read::seq_scan::SeqScan;
-use crate::read::series_candidate::SeriesCandidateScanner;
-use crate::read::series_reader::{SeriesBatchCollector, SeriesReader};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
@@ -65,29 +62,12 @@ const SEND_TIMEOUT: Duration = Duration::from_micros(100);
 /// List of receivers.
 type ReceiverList = Vec<Option<Receiver<Result<SeriesBatch>>>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeriesScanMode {
-    Legacy,
-    TwoStage,
-}
-
-impl SeriesScanMode {
-    fn scanner_name(self) -> &'static str {
-        match self {
-            Self::Legacy => "SeriesScan",
-            Self::TwoStage => "SeriesScanV2",
-        }
-    }
-}
-
 /// Scans a region and returns sorted rows of a series in the same partition.
 ///
 /// The output order is always order by `(primary key, time index)` inside every
 /// partition.
 /// Always returns the same series (primary key) to the same partition.
 pub struct SeriesScan {
-    /// Implementation used by this scan.
-    mode: SeriesScanMode,
     /// Properties of the scanner.
     properties: ScannerProperties,
     /// Context of streams.
@@ -122,20 +102,12 @@ impl SeriesScan {
         ));
 
         Self {
-            mode: SeriesScanMode::Legacy,
             properties,
             stream_ctx,
             pruner,
             receivers: Mutex::new(Vec::new()),
             metrics_list: Arc::new(PartitionMetricsList::default()),
         }
-    }
-
-    /// Creates an experimental two-stage series scan.
-    pub(crate) fn new_two_stage(input: ScanInput) -> Self {
-        let mut scan = Self::new(input);
-        scan.mode = SeriesScanMode::TwoStage;
-        scan
     }
 
     #[tracing::instrument(
@@ -157,7 +129,6 @@ impl SeriesScan {
             metrics_set,
             partition,
             &self.metrics_list,
-            self.mode.scanner_name(),
         );
 
         let batch_stream =
@@ -193,8 +164,7 @@ impl SeriesScan {
     ) -> Result<ScanBatchStream> {
         if ctx.explain_verbose {
             common_telemetry::info!(
-                "{} partition {}, region_id: {}",
-                self.mode.scanner_name(),
+                "SeriesScan partition {}, region_id: {}",
                 partition,
                 self.stream_ctx.input.region_metadata().region_id
             );
@@ -272,15 +242,9 @@ impl SeriesScan {
             metrics_set: metrics_set.clone(),
             metrics_list: metrics_list.clone(),
             explain_verbose,
-            mode: self.mode,
         };
         let region_id = distributor.stream_ctx.input.mapper.metadata().region_id;
-        let scanner_name = self.mode.scanner_name();
-        let span = tracing::info_span!(
-            "SeriesScan::distributor",
-            region_id = %region_id,
-            scanner = scanner_name,
-        );
+        let span = tracing::info_span!("SeriesScan::distributor", region_id = %region_id);
         common_runtime::spawn_query(
             async move {
                 distributor.execute().await;
@@ -318,7 +282,6 @@ impl SeriesScan {
                     &metrics_set,
                     partition,
                     &self.metrics_list,
-                    self.mode.scanner_name(),
                 );
 
                 self.scan_batch_in_partition(
@@ -372,7 +335,7 @@ fn new_channel_list(num_partitions: usize) -> (SenderList, ReceiverList) {
 
 impl RegionScanner for SeriesScan {
     fn name(&self) -> &str {
-        self.mode.scanner_name()
+        "SeriesScan"
     }
 
     fn properties(&self) -> &ScannerProperties {
@@ -438,8 +401,7 @@ impl DisplayAs for SeriesScan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{}: region={}, ",
-            self.mode.scanner_name(),
+            "SeriesScan: region={}, ",
             self.stream_ctx.input.mapper.metadata().region_id
         )?;
         match t {
@@ -457,7 +419,6 @@ impl DisplayAs for SeriesScan {
 impl fmt::Debug for SeriesScan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SeriesScan")
-            .field("mode", &self.mode)
             .field("num_ranges", &self.stream_ctx.ranges.len())
             .finish()
     }
@@ -473,8 +434,6 @@ impl SeriesScan {
 
 /// The distributor scans series and distributes them to different partitions.
 struct SeriesDistributor {
-    /// Implementation used by this scan.
-    mode: SeriesScanMode,
     /// Context for the scan stream.
     stream_ctx: Arc<StreamContext>,
     /// Semaphore for file scanning and range-level merging.
@@ -508,10 +467,7 @@ impl SeriesDistributor {
         fields(region_id = %self.stream_ctx.input.mapper.metadata().region_id)
     )]
     async fn execute(&mut self) {
-        let result = match self.mode {
-            SeriesScanMode::Legacy => self.scan_partitions_flat().await,
-            SeriesScanMode::TwoStage => self.scan_partitions_two_stage().await,
-        };
+        let result = self.scan_partitions_flat().await;
 
         if let Err(e) = result {
             self.senders.send_error(e).await;
@@ -542,7 +498,6 @@ impl SeriesDistributor {
             &self.metrics_set,
             self.partitions.len(),
             &self.metrics_list,
-            self.mode.scanner_name(),
         );
         part_metrics.on_first_poll();
         // Start fetch time before building sources so scan cost contains
@@ -652,96 +607,6 @@ impl SeriesDistributor {
 
         Ok(())
     }
-
-    /// Discovers metric series first, then reads each TSID-domain assignment.
-    async fn scan_partitions_two_stage(&mut self) -> Result<()> {
-        let part_metrics = new_partition_metrics(
-            &self.stream_ctx,
-            self.explain_verbose,
-            &self.metrics_set,
-            self.partitions.len(),
-            &self.metrics_list,
-            self.mode.scanner_name(),
-        );
-        part_metrics.on_first_poll();
-
-        let range_semaphore = self.range_semaphore.clone().context(InvalidSenderSnafu)?;
-        let final_merge_semaphore = self
-            .final_merge_semaphore
-            .clone()
-            .context(InvalidSenderSnafu)?;
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let candidate_scanner = SeriesCandidateScanner::try_new(
-            self.stream_ctx.clone(),
-            self.partitions.clone(),
-            self.pruner.clone(),
-            range_semaphore.clone(),
-            memory_pool,
-            self.metrics_set.clone(),
-            part_metrics.clone(),
-        )?;
-        let partition_pruner = candidate_scanner.partition_pruner();
-        let mut candidates = candidate_scanner.build_stream().await?;
-        let mut collector =
-            SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
-        while let Some(batch) = candidates.try_next().await? {
-            collector.push(batch);
-        }
-
-        let all_ranges = self
-            .partitions
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        let assignments = collector.finish();
-        let readers = assignments
-            .into_iter()
-            .map(|assigned_series| {
-                SeriesReader::try_new(
-                    self.stream_ctx.clone(),
-                    all_ranges.clone(),
-                    assigned_series,
-                    partition_pruner.clone(),
-                    range_semaphore.clone(),
-                    final_merge_semaphore.clone(),
-                    part_metrics.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut tasks = Vec::with_capacity(readers.len());
-        for (partition, reader) in readers.into_iter().enumerate() {
-            let Some(sender) = self.senders.take_sender(partition) else {
-                continue;
-            };
-            tasks.push(common_runtime::spawn_query(async move {
-                let result = async {
-                    let mut stream = reader.build_stream().await?;
-                    while let Some(batch) = stream.try_next().await? {
-                        let series = SeriesBatch::Flat(FlatSeriesBatch {
-                            batches: smallvec::smallvec![batch],
-                        });
-                        if sender.send(Ok(series)).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    Ok(())
-                }
-                .await;
-
-                if let Err(error) = result {
-                    let _ = sender.send(Err(error)).await;
-                }
-            }));
-        }
-
-        for task in tasks {
-            task.await.context(JoinSnafu)?;
-        }
-        part_metrics.on_finish();
-        Ok(())
-    }
 }
 
 /// Batches of the same series.
@@ -795,14 +660,6 @@ impl SenderList {
             num_timeout: 0,
             num_full: 0,
         }
-    }
-
-    fn take_sender(&mut self, partition: usize) -> Option<Sender<Result<SeriesBatch>>> {
-        let sender = self.senders.get_mut(partition)?.take();
-        if sender.is_some() {
-            self.num_nones += 1;
-        }
-        sender
     }
 
     /// Finds a partition and tries to send the batch to the partition.
@@ -899,12 +756,11 @@ fn new_partition_metrics(
     metrics_set: &ExecutionPlanMetricsSet,
     partition: usize,
     metrics_list: &PartitionMetricsList,
-    scanner_type: &'static str,
 ) -> PartitionMetrics {
     let metrics = PartitionMetrics::new(
         stream_ctx.input.mapper.metadata().region_id,
         partition,
-        scanner_type,
+        "SeriesScan",
         stream_ctx.query_start,
         explain_verbose,
         metrics_set,

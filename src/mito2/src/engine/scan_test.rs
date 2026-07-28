@@ -651,37 +651,6 @@ async fn test_series_scan() {
     test_series_scan_with_format(true).await;
 }
 
-#[tokio::test]
-async fn test_experimental_series_scan_rejects_dense_metadata() {
-    let mut env = TestEnv::with_prefix("test_experimental_series_scan").await;
-    let engine = env.create_engine(MitoConfig::default()).await;
-    let region_id = RegionId::new(1, 1);
-    engine
-        .handle_request(
-            region_id,
-            RegionRequest::Create(CreateRequestBuilder::new().build()),
-        )
-        .await
-        .unwrap();
-
-    let request = ScanRequest {
-        distribution: Some(TimeSeriesDistribution::PerSeries),
-        ..Default::default()
-    };
-    let scanner = engine
-        .experimental_series_scanner(region_id, request)
-        .await
-        .unwrap();
-    assert_eq!("SeriesScanV2", scanner.name());
-
-    let metrics_set = ExecutionPlanMetricsSet::default();
-    let mut stream = scanner
-        .scan_partition(&Default::default(), &metrics_set, 0)
-        .unwrap();
-    let error = stream.try_next().await.unwrap_err();
-    assert_eq!(StatusCode::InvalidArguments, error.status_code());
-}
-
 async fn test_series_scan_with_format(flat_format: bool) {
     let mut env = TestEnv::with_prefix("test_series_scan").await;
     let engine = env
