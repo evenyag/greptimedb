@@ -441,6 +441,19 @@ impl MitoEngine {
         scan_region.scanner().await?.scan_batch()
     }
 
+    /// Returns the experimental two-stage series scanner.
+    #[doc(hidden)]
+    pub async fn experimental_series_scanner(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+    ) -> Result<RegionScannerRef> {
+        self.scan_region(region_id, request)?
+            .experimental_series_scan()
+            .await
+            .map(|scanner| Box::new(scanner) as _)
+    }
+
     /// Returns a scanner to scan for `request`.
     pub(crate) async fn scanner(
         &self,

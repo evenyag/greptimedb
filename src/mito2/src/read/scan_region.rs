@@ -394,6 +394,12 @@ impl ScanRegion {
         Ok(SeriesScan::new(input))
     }
 
+    /// Scans by series using the experimental two-stage implementation.
+    pub(crate) async fn experimental_series_scan(self) -> Result<SeriesScan> {
+        let input = self.scan_input().await?;
+        Ok(SeriesScan::new_two_stage(input))
+    }
+
     /// Returns true if the region can use unordered scan for current request.
     fn use_unordered_scan(&self) -> bool {
         // We use unordered scan when:

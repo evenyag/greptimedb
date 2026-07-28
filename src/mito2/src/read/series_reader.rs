@@ -70,7 +70,7 @@ impl SeriesRange {
         let partition = partition as u128;
         let boundary = |partition: u128| {
             let numerator = partition * TSID_DOMAIN_END;
-            numerator / partitions + u128::from(numerator % partitions != 0)
+            numerator / partitions + u128::from(!numerator.is_multiple_of(partitions))
         };
         Some(Self {
             start: boundary(partition),
