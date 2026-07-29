@@ -95,11 +95,7 @@ impl SeriesScan {
 
         // Create the shared pruner with number of workers equal to CPU cores.
         let num_workers = common_stat::get_total_cpu_cores().max(1);
-        let pruner = Arc::new(Pruner::new_with_retained_builders(
-            stream_ctx.clone(),
-            num_workers,
-            true,
-        ));
+        let pruner = Arc::new(Pruner::new(stream_ctx.clone(), num_workers));
 
         Self {
             properties,
