@@ -76,7 +76,7 @@ pub struct ScanbenchCommand {
     #[clap(long)]
     table_dir: String,
 
-    /// Scanner type: seq, unordered, series
+    /// Scanner type: seq, unordered, series, series-v2
     #[clap(long, default_value = "seq")]
     scanner: String,
 
@@ -555,11 +555,11 @@ impl ScanbenchCommand {
         let distribution = match self.scanner.as_str() {
             "seq" => None,
             "unordered" => Some(TimeSeriesDistribution::TimeWindowed),
-            "series" => Some(TimeSeriesDistribution::PerSeries),
+            "series" | "series-v2" => Some(TimeSeriesDistribution::PerSeries),
             other => {
                 return Err(error::IllegalConfigSnafu {
                     msg: format!(
-                        "Unknown scanner type '{}', expected: seq, unordered, series",
+                        "Unknown scanner type '{}', expected: seq, unordered, series, series-v2",
                         other
                     ),
                 }
@@ -631,11 +631,19 @@ impl ScanbenchCommand {
             let start = Instant::now();
 
             // Get scanner
-            let mut scanner = engine
-                .handle_query(region_id, request)
-                .await
-                .map_err(BoxedError::new)
-                .context(error::BuildCliSnafu)?;
+            let mut scanner = if self.scanner == "series-v2" {
+                engine
+                    .experimental_series_scanner(region_id, request)
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(error::BuildCliSnafu)?
+            } else {
+                engine
+                    .handle_query(region_id, request)
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(error::BuildCliSnafu)?
+            };
 
             // Get partition ranges and apply parallelism
             let original_partitions = scanner.properties().partitions.clone();

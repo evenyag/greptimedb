@@ -341,7 +341,6 @@ pub(crate) struct SeriesReader {
     non_tag_filters: Arc<[PreparedNonTagFilter]>,
     partition_pruner: Arc<PartitionPruner>,
     file_scan_semaphore: Arc<Semaphore>,
-    final_merge_semaphore: Arc<Semaphore>,
     part_metrics: PartitionMetrics,
 }
 
@@ -354,7 +353,6 @@ impl SeriesReader {
         assigned_series: AssignedSeriesBatch,
         partition_pruner: Arc<PartitionPruner>,
         file_scan_semaphore: Arc<Semaphore>,
-        final_merge_semaphore: Arc<Semaphore>,
         part_metrics: PartitionMetrics,
     ) -> Result<Self> {
         validate_metric_metadata(&stream_ctx)?;
@@ -380,7 +378,6 @@ impl SeriesReader {
             non_tag_filters,
             partition_pruner,
             file_scan_semaphore,
-            final_merge_semaphore,
             part_metrics,
         })
     }
@@ -398,7 +395,6 @@ impl SeriesReader {
             let non_tag_filters = self.non_tag_filters.clone();
             let partition_pruner = self.partition_pruner.clone();
             let file_scan_semaphore = self.file_scan_semaphore.clone();
-            let final_merge_semaphore = self.final_merge_semaphore.clone();
             let part_metrics = self.part_metrics.clone();
             let range = self.range;
             tasks.push(common_runtime::spawn_query(async move {
@@ -411,7 +407,6 @@ impl SeriesReader {
                     non_tag_filters,
                     partition_pruner,
                     file_scan_semaphore,
-                    final_merge_semaphore,
                     part_metrics,
                 )
                 .await
@@ -430,7 +425,7 @@ impl SeriesReader {
         SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             range_streams,
-            Some(self.final_merge_semaphore.clone()),
+            None,
             Some(&self.part_metrics),
             true,
             compute_parallel_channel_size(estimated_batch_size),
@@ -449,7 +444,6 @@ async fn build_series_partition_range(
     non_tag_filters: Arc<[PreparedNonTagFilter]>,
     partition_pruner: Arc<PartitionPruner>,
     file_scan_semaphore: Arc<Semaphore>,
-    merge_semaphore: Arc<Semaphore>,
     part_metrics: PartitionMetrics,
 ) -> Result<(BoxedRecordBatchStream, usize)> {
     let cache_key = build_series_range_cache_key(&stream_ctx, &part_range, range);
@@ -563,7 +557,7 @@ async fn build_series_partition_range(
     let stream = SeqScan::build_flat_reader_from_sources(
         &stream_ctx,
         sources,
-        Some(merge_semaphore),
+        None,
         Some(&part_metrics),
         false,
         compute_parallel_channel_size(estimated_batch_size),
