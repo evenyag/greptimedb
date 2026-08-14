@@ -38,7 +38,9 @@ pub async fn merge_index_files(
     output: &str,
 ) -> Result<usize> {
     ensure!(
-        kind != IndexKind::PkColumns && kind != IndexKind::PkMapName,
+        kind != IndexKind::PkColumns
+            && kind != IndexKind::PkColumnsV2
+            && kind != IndexKind::PkMapName,
         InvalidMetaSnafu {
             reason: format!("{kind:?} cannot be generically merged")
         }
@@ -57,7 +59,7 @@ pub async fn merge_index_files(
         IndexKind::Tag => merge_tag(merged, object_store, output).await,
         IndexKind::TableTagTsid => merge_table_tag_tsid(merged, object_store, output).await,
         IndexKind::PkMap => merge_pk_map(merged, object_store, output).await,
-        IndexKind::PkMapName | IndexKind::PkColumns => {
+        IndexKind::PkMapName | IndexKind::PkColumns | IndexKind::PkColumnsV2 => {
             unreachable!("merge is rejected above for {kind:?}")
         }
     }
@@ -100,7 +102,7 @@ fn sort_ordering(kind: IndexKind, schema: SchemaRef) -> LexOrdering {
         IndexKind::Tag => vec![0, 1],
         IndexKind::TableTagTsid => vec![0, 1, 2, 3],
         IndexKind::PkMap => vec![3, 4],
-        IndexKind::PkMapName | IndexKind::PkColumns => {
+        IndexKind::PkMapName | IndexKind::PkColumns | IndexKind::PkColumnsV2 => {
             unreachable!("merge is rejected before sorting for {kind:?}")
         }
     };

@@ -17,6 +17,7 @@ pub const COLUMN_ID_COL: &str = "column_id";
 pub const TAG_VALUE_COL: &str = "tag_value";
 pub const TSID_COL: &str = "__tsid";
 pub const TAGS_COL: &str = "tags";
+pub const TAG_POSITIONS_COL: &str = "__pk_tag_positions";
 pub const MAP_KEY_FIELD: &str = "key";
 pub const MAP_VALUE_FIELD: &str = "value";
 
@@ -29,6 +30,7 @@ pub enum IndexKind {
     PkMap,
     PkMapName,
     PkColumns,
+    PkColumnsV2,
 }
 
 impl IndexKind {
@@ -41,6 +43,7 @@ impl IndexKind {
             IndexKind::PkMap => pk_map_schema(),
             IndexKind::PkMapName => pk_map_name_schema(),
             IndexKind::PkColumns => pk_columns_base_schema(),
+            IndexKind::PkColumnsV2 => pk_columns_v2_base_schema(),
         }
     }
 
@@ -53,6 +56,7 @@ impl IndexKind {
             IndexKind::PkMap => "pk_map.parquet",
             IndexKind::PkMapName => "pk_map_name.parquet",
             IndexKind::PkColumns => "pk_columns.parquet",
+            IndexKind::PkColumnsV2 => "pk_columns_v2.parquet",
         }
     }
 }
@@ -115,6 +119,16 @@ pub fn pk_columns_base_schema() -> SchemaRef {
     ]))
 }
 
+pub fn pk_columns_v2_base_schema() -> SchemaRef {
+    let mut fields = pk_columns_base_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        TAG_POSITIONS_COL,
+        DataType::new_list(DataType::Int32, false),
+        false,
+    )));
+    Arc::new(Schema::new(fields))
+}
+
 pub fn tags_map_field(key_type: DataType) -> Field {
     let entry_fields = Fields::from(vec![
         Field::new(MAP_KEY_FIELD, key_type, false),
@@ -132,8 +146,10 @@ pub fn tag_schema() -> SchemaRef {
 }
 
 pub fn validate_schema(kind: IndexKind, schema: &Schema) -> crate::error::Result<()> {
-    if kind == IndexKind::PkColumns {
-        return validate_pk_columns_schema(schema);
+    match kind {
+        IndexKind::PkColumns => return validate_pk_columns_schema(schema),
+        IndexKind::PkColumnsV2 => return validate_pk_columns_v2_schema(schema),
+        _ => {}
     }
     if schema != kind.schema().as_ref() {
         return crate::error::InvalidMetaSnafu {
@@ -145,10 +161,21 @@ pub fn validate_schema(kind: IndexKind, schema: &Schema) -> crate::error::Result
 }
 
 fn validate_pk_columns_schema(schema: &Schema) -> crate::error::Result<()> {
-    let base = pk_columns_base_schema();
+    validate_dynamic_pk_columns_schema(IndexKind::PkColumns, schema, pk_columns_base_schema())
+}
+
+fn validate_pk_columns_v2_schema(schema: &Schema) -> crate::error::Result<()> {
+    validate_dynamic_pk_columns_schema(IndexKind::PkColumnsV2, schema, pk_columns_v2_base_schema())
+}
+
+fn validate_dynamic_pk_columns_schema(
+    kind: IndexKind,
+    schema: &Schema,
+    base: SchemaRef,
+) -> crate::error::Result<()> {
     if schema.fields().len() < base.fields().len() {
         return crate::error::InvalidMetaSnafu {
-            reason: format!("invalid PkColumns index schema: {schema:?}"),
+            reason: format!("invalid {kind:?} index schema: {schema:?}"),
         }
         .fail();
     }
@@ -160,7 +187,7 @@ fn validate_pk_columns_schema(schema: &Schema) -> crate::error::Result<()> {
     {
         if actual.as_ref() != expected.as_ref() {
             return crate::error::InvalidMetaSnafu {
-                reason: format!("invalid PkColumns index schema: {schema:?}"),
+                reason: format!("invalid {kind:?} index schema: {schema:?}"),
             }
             .fail();
         }
@@ -168,7 +195,7 @@ fn validate_pk_columns_schema(schema: &Schema) -> crate::error::Result<()> {
     for field in schema.fields().iter().skip(base.fields().len()) {
         if field.data_type() != &DataType::Utf8 || !field.is_nullable() {
             return crate::error::InvalidMetaSnafu {
-                reason: format!("invalid PkColumns tag field: {field:?}"),
+                reason: format!("invalid {kind:?} tag field: {field:?}"),
             }
             .fail();
         }
@@ -203,5 +230,24 @@ mod tests {
         fields.push(Arc::new(Field::new("bad_tag", DataType::Utf8, false)));
         let schema = Schema::new(fields);
         assert!(validate_schema(IndexKind::PkColumns, &schema).is_err());
+    }
+
+    #[test]
+    fn test_pk_columns_v2_dynamic_schema_validation() {
+        let mut fields = pk_columns_v2_base_schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("tag_0", DataType::Utf8, true)));
+        fields.push(Arc::new(Field::new("tag_1", DataType::Utf8, true)));
+        let schema = Schema::new(fields);
+        validate_schema(IndexKind::PkColumnsV2, &schema).unwrap();
+        assert!(validate_schema(IndexKind::PkColumns, &schema).is_err());
+
+        let mut fields = pk_columns_base_schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            TAG_POSITIONS_COL,
+            DataType::new_list(DataType::UInt32, false),
+            false,
+        )));
+        let schema = Schema::new(fields);
+        assert!(validate_schema(IndexKind::PkColumnsV2, &schema).is_err());
     }
 }

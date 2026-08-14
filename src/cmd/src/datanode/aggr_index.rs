@@ -12,7 +12,8 @@ use colored::Colorize;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use datafusion_common::ScalarValue;
 use datatypes::arrow::array::{
-    Array, BinaryArray, Int64Array, MapArray, StringArray, UInt32Array, UInt64Array,
+    Array, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray, UInt32Array,
+    UInt64Array,
 };
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::value::Value;
@@ -164,6 +165,7 @@ enum CliKind {
     PkMap,
     PkMapName,
     PkColumns,
+    PkColumnsV2,
 }
 impl From<CliKind> for IndexKind {
     fn from(v: CliKind) -> Self {
@@ -175,6 +177,7 @@ impl From<CliKind> for IndexKind {
             CliKind::PkMap => IndexKind::PkMap,
             CliKind::PkMapName => IndexKind::PkMapName,
             CliKind::PkColumns => IndexKind::PkColumns,
+            CliKind::PkColumnsV2 => IndexKind::PkColumnsV2,
         }
     }
 }
@@ -185,6 +188,7 @@ enum CliTransformFormat {
     Map,
     MapName,
     Columns,
+    ColumnsV2,
 }
 
 impl From<CliTransformFormat> for TransformFormat {
@@ -194,6 +198,7 @@ impl From<CliTransformFormat> for TransformFormat {
             CliTransformFormat::Map => TransformFormat::PkMap,
             CliTransformFormat::MapName => TransformFormat::PkMapName,
             CliTransformFormat::Columns => TransformFormat::PkColumns,
+            CliTransformFormat::ColumnsV2 => TransformFormat::PkColumnsV2,
         }
     }
 }
@@ -387,14 +392,22 @@ impl TransformPkCommand {
                 output.pk_columns_rows,
             )?;
         }
+        if output.pk_columns_v2_path.is_some() {
+            print_file(
+                "pk-columns-v2",
+                &self.output_dir.join("pk_columns_v2.parquet"),
+                output.pk_columns_v2_rows,
+            )?;
+        }
         println!(
-            "costs: old_pk_read_iter={:?} pk_decode_tag_extract={:?} table_tag_tsid_write={:?} pk_map_write={:?} pk_map_name_write={:?} pk_columns_write={:?}",
+            "costs: old_pk_read_iter={:?} pk_decode_tag_extract={:?} table_tag_tsid_write={:?} pk_map_write={:?} pk_map_name_write={:?} pk_columns_write={:?} pk_columns_v2_write={:?}",
             output.costs.read_iteration,
             output.costs.decode_transform,
             output.costs.table_tag_tsid_write,
             output.costs.pk_map_write,
             output.costs.pk_map_name_write,
-            output.costs.pk_columns_write
+            output.costs.pk_columns_write,
+            output.costs.pk_columns_v2_write
         );
         Ok(())
     }
@@ -449,6 +462,7 @@ impl ReadCommand {
                 }
                 IndexKind::PkMap | IndexKind::PkMapName => print_pk_map(&batch)?,
                 IndexKind::PkColumns => print_pk_columns(&batch)?,
+                IndexKind::PkColumnsV2 => print_pk_columns_v2(&batch)?,
             }
         }
         Ok(())
@@ -590,7 +604,7 @@ async fn bench_filter_once(
             costs.pk_decode_tsid = start.elapsed();
             tsids.len()
         }
-        IndexKind::PkColumns => {
+        IndexKind::PkColumns | IndexKind::PkColumnsV2 => {
             let start = Instant::now();
             let tsids = filter_pk_columns(&batches, &filters)?;
             costs.tag_filter = start.elapsed();
@@ -797,6 +811,7 @@ async fn read_detected_index(
     for kind in [
         IndexKind::Pk,
         IndexKind::TableTagTsid,
+        IndexKind::PkColumnsV2,
         IndexKind::PkColumns,
         IndexKind::PkMapName,
         IndexKind::PkMap,
@@ -1133,6 +1148,66 @@ fn print_pk_columns(batch: &datatypes::arrow::record_batch::RecordBatch) -> erro
     Ok(())
 }
 
+fn print_pk_columns_v2(batch: &RecordBatch) -> error::Result<()> {
+    let min = col::<Int64Array>(batch, 0)?;
+    let max = col::<Int64Array>(batch, 1)?;
+    let cnt = col::<UInt64Array>(batch, 2)?;
+    let table = col::<UInt32Array>(batch, 3)?;
+    let tsid = col::<UInt64Array>(batch, 4)?;
+    let positions = col::<ListArray>(batch, 5)?;
+    for row in 0..batch.num_rows() {
+        let row_positions = positions.value(row);
+        let row_positions = row_positions
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context(error::IllegalConfigSnafu {
+                msg: "invalid pk_columns_v2 tag position values".to_string(),
+            })?;
+        let mut position_values = Vec::with_capacity(row_positions.len());
+        let mut tags = Vec::with_capacity(row_positions.len());
+        for position in row_positions.values() {
+            let position = usize::try_from(*position).map_err(|_| {
+                error::IllegalConfigSnafu {
+                    msg: format!("invalid negative pk_columns_v2 tag position {position}"),
+                }
+                .build()
+            })?;
+            if position < 6 || position >= batch.num_columns() {
+                return error::IllegalConfigSnafu {
+                    msg: format!("invalid pk_columns_v2 tag position {position}"),
+                }
+                .fail();
+            }
+            let array = col::<StringArray>(batch, position)?;
+            if array.is_null(row) {
+                return error::IllegalConfigSnafu {
+                    msg: format!(
+                        "pk_columns_v2 tag position {position} references a null value at row {row}"
+                    ),
+                }
+                .fail();
+            }
+            position_values.push(position);
+            tags.push(format!(
+                "{}={}",
+                batch.schema().field(position).name(),
+                array.value(row)
+            ));
+        }
+        println!(
+            "min_ts={} max_ts={} row_count={} table_id={} tsid={} tag_positions={:?} {}",
+            min.value(row),
+            max.value(row),
+            cnt.value(row),
+            table.value(row),
+            tsid.value(row),
+            position_values,
+            tags.join(" ")
+        );
+    }
+    Ok(())
+}
+
 fn format_map(tags: &MapArray, row: usize) -> error::Result<String> {
     let entries = tags.value(row);
     let struct_array = entries
@@ -1240,12 +1315,15 @@ mod tests {
     use std::sync::Arc;
 
     use api::v1::SemanticType;
-    use datatypes::arrow::array::{Int64Array, StringArray, UInt32Array, UInt64Array};
+    use datatypes::arrow::array::{
+        Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
+    };
+    use datatypes::arrow::buffer::OffsetBuffer;
     use datatypes::arrow::datatypes::{DataType, Field, Schema};
     use datatypes::arrow::record_batch::RecordBatch;
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::ColumnSchema;
-    use mito2::aggr_index::schema::pk_columns_base_schema;
+    use mito2::aggr_index::schema::{pk_columns_base_schema, pk_columns_v2_base_schema};
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder, RegionMetadataRef};
     use store_api::storage::RegionId;
 
@@ -1305,6 +1383,50 @@ mod tests {
                 Arc::new(UInt64Array::from(vec![10, 10, 10])) as _,
                 Arc::new(UInt32Array::from(vec![11, 11, 11])) as _,
                 Arc::new(UInt64Array::from(vec![101, 102, 101])) as _,
+                Arc::new(StringArray::from(vec!["web-1", "web-2", "web-1"])) as _,
+                Arc::new(StringArray::from(vec!["us-west", "us-west", "us-west"])) as _,
+            ],
+        )
+        .unwrap();
+        let filters = build_simple_filters(
+            &[
+                "host = 'web-1'".to_string(),
+                "region = 'us-west'".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+
+        let tsids = filter_pk_columns(&[batch], &filters).unwrap();
+        assert_eq!(tsids.len(), 1);
+        assert!(tsids.contains(&101));
+    }
+
+    #[test]
+    fn test_filter_pk_columns_v2_counts_distinct_matching_tsids() {
+        let mut fields = pk_columns_v2_base_schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("host", DataType::Utf8, true)));
+        fields.push(Arc::new(Field::new("region", DataType::Utf8, true)));
+        let schema = Arc::new(Schema::new(fields));
+        let position_field = match schema.field(5).data_type() {
+            DataType::List(field) => field.clone(),
+            _ => unreachable!("pk_columns_v2 tag positions field is a list"),
+        };
+        let positions = ListArray::new(
+            position_field,
+            OffsetBuffer::from_lengths([2, 2, 2]),
+            Arc::new(Int32Array::from(vec![6, 7, 6, 7, 6, 7])),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+                Arc::new(Int64Array::from(vec![2, 2, 2])) as _,
+                Arc::new(UInt64Array::from(vec![10, 10, 10])) as _,
+                Arc::new(UInt32Array::from(vec![11, 11, 11])) as _,
+                Arc::new(UInt64Array::from(vec![101, 102, 101])) as _,
+                Arc::new(positions) as _,
                 Arc::new(StringArray::from(vec!["web-1", "web-2", "web-1"])) as _,
                 Arc::new(StringArray::from(vec!["us-west", "us-west", "us-west"])) as _,
             ],

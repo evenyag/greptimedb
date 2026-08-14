@@ -2,13 +2,13 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use datatypes::arrow::array::{
-    Array, ArrayRef, BinaryArray, Int64Array, MapArray, StringArray, StructArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, ListArray, MapArray, StringArray,
+    StructArray, UInt32Array, UInt64Array,
 };
 use datatypes::arrow::buffer::OffsetBuffer;
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -26,6 +26,7 @@ use store_api::storage::consts::ReservedColumnId;
 use crate::aggr_index::index_io::{IndexReader, IndexWriter};
 use crate::aggr_index::schema::{
     IndexKind, MAP_KEY_FIELD, MAP_VALUE_FIELD, is_reserved_tag_column, pk_columns_base_schema,
+    pk_columns_v2_base_schema,
 };
 use crate::error::{InvalidMetaSnafu, InvalidRecordBatchSnafu, NewRecordBatchSnafu, Result};
 
@@ -35,6 +36,7 @@ pub enum TransformFormat {
     PkMap,
     PkMapName,
     PkColumns,
+    PkColumnsV2,
 }
 
 impl TransformFormat {
@@ -44,6 +46,7 @@ impl TransformFormat {
             Self::PkMap => IndexKind::PkMap,
             Self::PkMapName => IndexKind::PkMapName,
             Self::PkColumns => IndexKind::PkColumns,
+            Self::PkColumnsV2 => IndexKind::PkColumnsV2,
         }
     }
 
@@ -53,6 +56,7 @@ impl TransformFormat {
             Self::PkMap,
             Self::PkMapName,
             Self::PkColumns,
+            Self::PkColumnsV2,
         ]
     }
 }
@@ -65,6 +69,7 @@ pub struct TransformCosts {
     pub pk_map_write: Duration,
     pub pk_map_name_write: Duration,
     pub pk_columns_write: Duration,
+    pub pk_columns_v2_write: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -73,10 +78,12 @@ pub struct TransformOutput {
     pub pk_map_path: Option<String>,
     pub pk_map_name_path: Option<String>,
     pub pk_columns_path: Option<String>,
+    pub pk_columns_v2_path: Option<String>,
     pub table_tag_tsid_rows: usize,
     pub pk_map_rows: usize,
     pub pk_map_name_rows: usize,
     pub pk_columns_rows: usize,
+    pub pk_columns_v2_rows: usize,
     pub costs: TransformCosts,
 }
 
@@ -88,6 +95,7 @@ struct DecodedPkRow {
     table_id: u32,
     tsid: u64,
     tags: BTreeMap<ColumnId, String>,
+    tag_column_ids: Vec<ColumnId>,
 }
 
 pub async fn transform_pk_index(
@@ -112,6 +120,10 @@ pub async fn transform_pk_index(
     let output_dir = output_dir.trim_end_matches('/');
     let codec = build_primary_key_codec(&metadata);
     let tag_columns = tag_columns(&metadata);
+    let known_tag_columns = tag_columns
+        .iter()
+        .map(|(column_id, _)| *column_id)
+        .collect::<HashSet<_>>();
 
     let read_start = Instant::now();
     let mut reader = IndexReader::try_new(&object_store, pk_input, IndexKind::Pk).await?;
@@ -144,10 +156,13 @@ pub async fn transform_pk_index(
             let table_id = required_u32(&sparse, ReservedColumnId::table_id(), "__table_id")?;
             let tsid = required_u64(&sparse, ReservedColumnId::tsid(), "__tsid")?;
             let mut tags = BTreeMap::new();
-            for (column_id, _) in &tag_columns {
-                if let Some(value) = sparse.get(column_id) {
-                    tags.insert(*column_id, string_value(*column_id, value)?);
+            let mut tag_column_ids = Vec::new();
+            for (column_id, value) in sparse.iter() {
+                if is_reserved_tag_column(*column_id) || !known_tag_columns.contains(column_id) {
+                    continue;
                 }
+                tags.insert(*column_id, string_value(*column_id, value)?);
+                tag_column_ids.push(*column_id);
             }
             rows.push(DecodedPkRow {
                 min_ts: min.value(row),
@@ -156,6 +171,7 @@ pub async fn transform_pk_index(
                 table_id,
                 tsid,
                 tags,
+                tag_column_ids,
             });
         }
     }
@@ -166,10 +182,12 @@ pub async fn transform_pk_index(
         pk_map_path: None,
         pk_map_name_path: None,
         pk_columns_path: None,
+        pk_columns_v2_path: None,
         table_tag_tsid_rows: 0,
         pk_map_rows: 0,
         pk_map_name_rows: 0,
         pk_columns_rows: 0,
+        pk_columns_v2_rows: 0,
         costs: TransformCosts {
             read_iteration,
             decode_transform,
@@ -206,6 +224,14 @@ pub async fn transform_pk_index(
             write_pk_columns(&object_store, &path, &rows, &tag_columns).await?;
         output.costs.pk_columns_write = start.elapsed();
         output.pk_columns_path = Some(path);
+    }
+    if formats.contains(&TransformFormat::PkColumnsV2) {
+        let path = format!("{output_dir}/{}", IndexKind::PkColumnsV2.file_name());
+        let start = Instant::now();
+        output.pk_columns_v2_rows =
+            write_pk_columns_v2(&object_store, &path, &rows, &tag_columns).await?;
+        output.costs.pk_columns_v2_write = start.elapsed();
+        output.pk_columns_v2_path = Some(path);
     }
 
     Ok(output)
@@ -423,6 +449,89 @@ async fn write_pk_columns(
     write_one_batch(object_store, path, schema, batch).await
 }
 
+async fn write_pk_columns_v2(
+    object_store: &ObjectStore,
+    path: &str,
+    rows: &[DecodedPkRow],
+    tag_columns: &[(ColumnId, String)],
+) -> Result<usize> {
+    let mut fields = pk_columns_v2_base_schema().fields().to_vec();
+    fields.extend(
+        tag_columns
+            .iter()
+            .map(|(_, name)| Arc::new(Field::new(name, DataType::Utf8, true))),
+    );
+    let schema = Arc::new(Schema::new(fields));
+    let first_tag_position = pk_columns_v2_base_schema().fields().len();
+    let tag_positions = tag_columns
+        .iter()
+        .enumerate()
+        .map(|(offset, (column_id, _))| (*column_id, (first_tag_position + offset) as i32))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut position_values = Vec::new();
+    let mut position_lengths = Vec::with_capacity(rows.len());
+    for row in rows {
+        let start = position_values.len();
+        for column_id in &row.tag_column_ids {
+            if let Some(position) = tag_positions.get(column_id) {
+                position_values.push(*position);
+            }
+        }
+        position_lengths.push(position_values.len() - start);
+    }
+    let position_field = match schema.field(5).data_type() {
+        DataType::List(field) => field.clone(),
+        _ => unreachable!("pk_columns_v2 tag positions field is a list"),
+    };
+    let position_array = ListArray::new(
+        position_field,
+        OffsetBuffer::from_lengths(position_lengths),
+        Arc::new(Int32Array::from(position_values)),
+        None,
+    );
+
+    let mut arrays = fixed_pk_columns_arrays(rows);
+    arrays.push(Arc::new(position_array));
+    append_tag_arrays(&mut arrays, rows, tag_columns);
+    let batch = RecordBatch::try_new(schema.clone(), arrays).context(NewRecordBatchSnafu)?;
+    write_one_batch(object_store, path, schema, batch).await
+}
+
+fn fixed_pk_columns_arrays(rows: &[DecodedPkRow]) -> Vec<ArrayRef> {
+    vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.min_ts).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.max_ts).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.row_count).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|row| row.table_id).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.tsid).collect::<Vec<_>>(),
+        )),
+    ]
+}
+
+fn append_tag_arrays(
+    arrays: &mut Vec<ArrayRef>,
+    rows: &[DecodedPkRow],
+    tag_columns: &[(ColumnId, String)],
+) {
+    for (column_id, _) in tag_columns {
+        let values = rows
+            .iter()
+            .map(|row| row.tags.get(column_id).map(|v| v.as_str()))
+            .collect::<Vec<_>>();
+        arrays.push(Arc::new(StringArray::from(values)));
+    }
+}
+
 async fn write_one_batch(
     object_store: &ObjectStore,
     path: &str,
@@ -578,6 +687,7 @@ mod tests {
         assert_eq!(output.pk_map_rows, 2);
         assert_eq!(output.pk_map_name_rows, 2);
         assert_eq!(output.pk_columns_rows, 2);
+        assert_eq!(output.pk_columns_v2_rows, 2);
 
         let mut reader = IndexReader::try_new(
             &store,
@@ -689,6 +799,47 @@ mod tests {
             .unwrap();
         assert_eq!(tag_0.value(0), "a");
         assert!(tag_1.is_null(1));
+
+        let mut reader =
+            IndexReader::try_new(&store, "new/pk_columns_v2.parquet", IndexKind::PkColumnsV2)
+                .await
+                .unwrap();
+        let batch = reader.next().await.unwrap().unwrap();
+        assert_eq!(batch.schema().field(5).name(), "__pk_tag_positions");
+        assert_eq!(batch.schema().field(6).name(), "tag_0");
+        assert_eq!(batch.schema().field(7).name(), "tag_1");
+        let positions = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let first = positions.value(0);
+        let first = first.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(first.values(), &[6, 7]);
+        let second = positions.value(1);
+        let second = second.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(second.values(), &[6]);
+        let schema = batch.schema();
+        assert_eq!(
+            first
+                .values()
+                .iter()
+                .map(|position| schema.field(*position as usize).name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["tag_0", "tag_1"]
+        );
+        let tag_0 = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let tag_1 = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(tag_0.value(0), "a");
+        assert!(tag_1.is_null(1));
     }
 
     #[tokio::test]
@@ -711,8 +862,44 @@ mod tests {
         .unwrap();
         assert!(output.table_tag_tsid_path.is_none());
         assert!(output.pk_columns_path.is_none());
+        assert!(output.pk_columns_v2_path.is_none());
         assert_eq!(output.pk_map_rows, 2);
         assert!(store.stat("new/pk_map.parquet").await.is_ok());
         assert!(store.stat("new/table_tag_tsid.parquet").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pk_columns_v2_writes_empty_tag_positions() {
+        let dir = create_temp_dir("aggr_index_pk_columns_v2_empty_tags");
+        let store = temp_store(dir.path().to_str().unwrap());
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let tag_columns = tag_columns(&metadata);
+        let rows = vec![DecodedPkRow {
+            min_ts: 1,
+            max_ts: 2,
+            row_count: 3,
+            table_id: 11,
+            tsid: 101,
+            tags: BTreeMap::new(),
+            tag_column_ids: Vec::new(),
+        }];
+
+        write_pk_columns_v2(&store, "pk_columns_v2.parquet", &rows, &tag_columns)
+            .await
+            .unwrap();
+        let mut reader =
+            IndexReader::try_new(&store, "pk_columns_v2.parquet", IndexKind::PkColumnsV2)
+                .await
+                .unwrap();
+        let batch = reader.next().await.unwrap().unwrap();
+        let positions = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(positions.null_count(), 0);
+        assert!(positions.value(0).is_empty());
     }
 }
