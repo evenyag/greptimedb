@@ -345,6 +345,7 @@ impl SeqScan {
         }
 
         let metrics = self.new_partition_metrics(ctx.explain_verbose, metrics_set, partition);
+        metrics.set_assigned_workload(&self.stream_ctx, &self.properties.partitions[partition]);
         let input = &self.stream_ctx.input;
 
         let batch_stream = self.scan_flat_batch_in_partition(partition, metrics.clone())?;

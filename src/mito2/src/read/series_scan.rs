@@ -210,6 +210,7 @@ impl SeriesScan {
             partition,
             &self.metrics_list,
         );
+        metrics.set_assigned_workload(&self.stream_ctx, &self.properties.partitions[partition]);
 
         let batch_stream =
             self.scan_batch_in_partition(ctx, partition, metrics.clone(), metrics_set)?;

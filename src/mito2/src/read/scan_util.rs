@@ -29,6 +29,7 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
 use prometheus::IntGauge;
 use smallvec::SmallVec;
+use store_api::region_engine::PartitionRange;
 use store_api::storage::RegionId;
 
 use crate::error::Result;
@@ -66,6 +67,66 @@ pub struct FileScanMetrics {
     pub build_reader_cost: Duration,
     /// Time spent scanning this file (accumulated across all ranges).
     pub scan_cost: Duration,
+}
+
+/// Workload assigned to an output partition before pruning and scanning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AssignedWorkloadMetrics {
+    num_ranges: usize,
+    estimated_rows: usize,
+    num_source_refs: usize,
+    num_mem_source_refs: usize,
+    num_file_source_refs: usize,
+    num_other_source_refs: usize,
+    num_multi_source_ranges: usize,
+    largest_range_rows: usize,
+    largest_range_source_refs: usize,
+    largest_range_id: Option<usize>,
+}
+
+impl AssignedWorkloadMetrics {
+    fn collect(stream_ctx: &StreamContext, partition_ranges: &[PartitionRange]) -> Self {
+        let mut metrics = Self {
+            num_ranges: partition_ranges.len(),
+            estimated_rows: partition_ranges.iter().map(|range| range.num_rows).sum(),
+            ..Default::default()
+        };
+
+        let num_memtables = stream_ctx.input.num_memtables();
+        let num_files = stream_ctx.input.num_files();
+        for partition_range in partition_ranges {
+            let Some(range_meta) = stream_ctx.ranges.get(partition_range.identifier) else {
+                continue;
+            };
+
+            let num_sources = range_meta.indices.len();
+            metrics.num_source_refs += num_sources;
+            if num_sources > 1 {
+                metrics.num_multi_source_ranges += 1;
+            }
+
+            for source in &range_meta.indices {
+                if source.index < num_memtables {
+                    metrics.num_mem_source_refs += 1;
+                } else if source.index < num_memtables + num_files {
+                    metrics.num_file_source_refs += 1;
+                } else {
+                    metrics.num_other_source_refs += 1;
+                }
+            }
+
+            if partition_range.num_rows > metrics.largest_range_rows
+                || (partition_range.num_rows == metrics.largest_range_rows
+                    && num_sources > metrics.largest_range_source_refs)
+            {
+                metrics.largest_range_rows = partition_range.num_rows;
+                metrics.largest_range_source_refs = num_sources;
+                metrics.largest_range_id = Some(partition_range.identifier);
+            }
+        }
+
+        metrics
+    }
 }
 
 impl fmt::Debug for FileScanMetrics {
@@ -243,6 +304,8 @@ pub(crate) struct ScanMetricsSet {
     metadata_cache_metrics: Option<MetadataCacheMetrics>,
     /// Per-file scan metrics, only populated when explain_verbose is true.
     per_file_metrics: Option<HashMap<RegionFileId, FileScanMetrics>>,
+    /// Workload assigned to this output partition before pruning.
+    assigned_workload: Option<AssignedWorkloadMetrics>,
 
     /// Current memory usage for file range builders.
     build_ranges_mem_size: isize,
@@ -355,6 +418,7 @@ impl fmt::Debug for ScanMetricsSet {
             fetch_metrics,
             metadata_cache_metrics,
             per_file_metrics,
+            assigned_workload,
             build_ranges_mem_size: _,
             build_ranges_peak_mem_size,
             num_range_builders: _,
@@ -385,6 +449,30 @@ impl fmt::Debug for ScanMetricsSet {
             \"num_sst_rows\":{num_sst_rows}, \
             \"first_poll\":\"{first_poll:?}\""
         )?;
+
+        if let Some(workload) = assigned_workload {
+            write!(
+                f,
+                ", \"assigned_workload\":{{\"num_ranges\":{}, \"estimated_rows\":{}, \
+                 \"num_source_refs\":{}, \"num_mem_source_refs\":{}, \
+                 \"num_file_source_refs\":{}, \"num_other_source_refs\":{}, \
+                 \"num_multi_source_ranges\":{}, \"largest_range_rows\":{}, \
+                 \"largest_range_source_refs\":{}",
+                workload.num_ranges,
+                workload.estimated_rows,
+                workload.num_source_refs,
+                workload.num_mem_source_refs,
+                workload.num_file_source_refs,
+                workload.num_other_source_refs,
+                workload.num_multi_source_ranges,
+                workload.largest_range_rows,
+                workload.largest_range_source_refs,
+            )?;
+            if let Some(range_id) = workload.largest_range_id {
+                write!(f, ", \"largest_range_id\":{range_id}")?;
+            }
+            write!(f, "}}")?;
+        }
 
         // Write convert_cost if present
         if let Some(time) = convert_cost {
@@ -1045,6 +1133,20 @@ impl PartitionMetrics {
     pub(crate) fn on_first_poll(&self) {
         let mut metrics = self.0.metrics.lock().unwrap();
         metrics.first_poll = self.0.query_start.elapsed();
+    }
+
+    /// Records the workload assigned to this output partition.
+    pub(crate) fn set_assigned_workload(
+        &self,
+        stream_ctx: &StreamContext,
+        partition_ranges: &[PartitionRange],
+    ) {
+        if !self.0.explain_verbose {
+            return;
+        }
+
+        let workload = AssignedWorkloadMetrics::collect(stream_ctx, partition_ranges);
+        self.0.metrics.lock().unwrap().assigned_workload = Some(workload);
     }
 
     pub(crate) fn inc_num_mem_ranges(&self, num: usize) {
@@ -1824,6 +1926,51 @@ mod tests {
             row_group_indices,
             num_rows: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn test_collect_assigned_workload_metrics() {
+        let mut stream_ctx =
+            new_test_stream_ctx(vec![new_test_file(400, 4)], vec![new_test_memtable(100, 1)]).await;
+        let ranges = vec![
+            RangeMeta {
+                num_rows: 300,
+                ..new_test_range_meta(smallvec![
+                    RowGroupIndex {
+                        index: 0,
+                        row_group_index: 0,
+                    },
+                    RowGroupIndex {
+                        index: 1,
+                        row_group_index: 0,
+                    }
+                ])
+            },
+            RangeMeta {
+                num_rows: 100,
+                ..new_test_range_meta(smallvec![RowGroupIndex {
+                    index: 1,
+                    row_group_index: 1,
+                }])
+            },
+        ];
+        let partition_ranges = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| range.new_partition_range(index))
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut stream_ctx).unwrap().ranges = ranges;
+
+        let metrics = AssignedWorkloadMetrics::collect(&stream_ctx, &partition_ranges);
+        assert_eq!(2, metrics.num_ranges);
+        assert_eq!(400, metrics.estimated_rows);
+        assert_eq!(3, metrics.num_source_refs);
+        assert_eq!(1, metrics.num_mem_source_refs);
+        assert_eq!(2, metrics.num_file_source_refs);
+        assert_eq!(1, metrics.num_multi_source_ranges);
+        assert_eq!(300, metrics.largest_range_rows);
+        assert_eq!(2, metrics.largest_range_source_refs);
+        assert_eq!(Some(0), metrics.largest_range_id);
     }
 
     #[tokio::test]
