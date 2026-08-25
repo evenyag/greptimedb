@@ -20,6 +20,7 @@ cargo build -p cmd --bin greptime
   --region-id <REGION_ID> \
   --table-dir <TABLE_DIR> \
   [--scanner <seq|unordered|series>] \
+  [--disable-seq-scan-split] \
   [--scan-config <SCAN_CONFIG_JSON>] \
   [--parallelism <N>] \
   [--iterations <N>] \
@@ -41,10 +42,11 @@ cargo build -p cmd --bin greptime
 
 ## Optional Arguments
 
-- `--scanner`: Scan strategy. Default: `seq`.
-  - `seq`: default scan
-  - `unordered`: time-windowed distribution
-  - `series`: per-series distribution
+- `--scanner`: Exact Mito scanner implementation. Default: `seq`.
+  - `seq`: sequential scan
+  - `unordered`: unordered scan with time-windowed distribution
+  - `series`: per-series scan
+- `--disable-seq-scan-split`: Keep SeqScan partition ranges grouped instead of splitting them by SST row group. This only applies with `--scanner seq` and defaults to disabled.
 - `--scan-config`: JSON file to tune scan request.
 - `--parallelism`: Simulated scan parallelism. Default: `1`.
 - `--iterations`: Benchmark iterations. Default: `1`.
@@ -94,6 +96,19 @@ Unordered scan with parallelism:
   --scanner unordered \
   --parallelism 8 \
   --iterations 5
+```
+
+`--scanner unordered` bypasses Mito's normal append-mode eligibility check. It is intended for benchmarking; forcing unordered scans on non-append regions bypasses the normal merge and deduplication scanner selection. Unordered scans reject per-series distribution and `last_row` selection.
+
+Sequential scan without row-group range splitting:
+
+```bash
+./target/debug/greptime datanode scanbench \
+  --config /path/to/config.toml \
+  --region-id 1024:0 \
+  --table-dir greptime/public/1024 \
+  --scanner seq \
+  --disable-seq-scan-split
 ```
 
 Series scan with scan config and flamegraph:

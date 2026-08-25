@@ -41,6 +41,7 @@ use log_store::noop::log_store::NoopLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use mito2::config::MitoConfig;
 use mito2::engine::MitoEngine;
+use mito2::read::scan_region::{MitoScanOptions, MitoScannerType};
 use mito2::sst::file_ref::FileReferenceManager;
 use moka::future::CacheBuilder;
 use object_store::manager::ObjectStoreManager;
@@ -90,6 +91,10 @@ pub struct ScanbenchCommand {
     /// Scanner type: seq, unordered, series
     #[clap(long, default_value = "seq")]
     scanner: String,
+
+    /// Keep SeqScan partition ranges grouped instead of splitting them by row group.
+    #[clap(long, default_value_t = false)]
+    disable_seq_scan_split: bool,
 
     /// Path to scan request JSON config file (optional)
     #[clap(long, value_name = "FILE")]
@@ -509,10 +514,16 @@ impl ScanbenchCommand {
         let filters = resolve_filters(&scan_config, &metadata)?;
 
         // Build scan request
-        let distribution = match self.scanner.as_str() {
-            "seq" => None,
-            "unordered" => Some(TimeSeriesDistribution::TimeWindowed),
-            "series" => Some(TimeSeriesDistribution::PerSeries),
+        let (scanner_type, distribution) = match self.scanner.as_str() {
+            "seq" => (MitoScannerType::Seq, None),
+            "unordered" => (
+                MitoScannerType::Unordered,
+                Some(TimeSeriesDistribution::TimeWindowed),
+            ),
+            "series" => (
+                MitoScannerType::Series,
+                Some(TimeSeriesDistribution::PerSeries),
+            ),
             other => {
                 return Err(error::IllegalConfigSnafu {
                     msg: format!(
@@ -523,6 +534,14 @@ impl ScanbenchCommand {
                 .build());
             }
         };
+        if self.disable_seq_scan_split && scanner_type != MitoScannerType::Seq {
+            return Err(error::IllegalConfigSnafu {
+                msg: "--disable-seq-scan-split requires --scanner seq".to_string(),
+            }
+            .build());
+        }
+        let scan_options = MitoScanOptions::new(scanner_type)
+            .with_disable_seq_scan_range_split(self.disable_seq_scan_split);
 
         let series_row_selector = match scan_config.series_row_selector.as_deref() {
             Some("last_row") => Some(TimeSeriesRowSelector::LastRow),
@@ -536,11 +555,16 @@ impl ScanbenchCommand {
         };
 
         println!(
-            "{} Scanner: {}, Parallelism: {}, Iterations: {}",
+            "{} Scanner: {}, Parallelism: {}, Iterations: {}, SeqScan range split: {}",
             "ℹ".blue(),
             self.scanner,
             self.parallelism,
             self.iterations,
+            if self.disable_seq_scan_split {
+                "disabled"
+            } else {
+                "enabled"
+            },
         );
 
         // Start profiling if pprof_file is specified (unless pprof_after_warmup is set)
@@ -588,9 +612,8 @@ impl ScanbenchCommand {
 
             // Get scanner
             let mut scanner = engine
-                .handle_query(region_id, request)
+                .handle_query_with_scan_options(region_id, request, scan_options)
                 .await
-                .map_err(BoxedError::new)
                 .context(error::BuildCliSnafu)?;
 
             // Get partition ranges and apply parallelism
@@ -792,8 +815,26 @@ mod tests {
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
-    use super::{ScanConfig, resolve_filters, resolve_projection};
+    use super::{ScanConfig, ScanbenchCommand, resolve_filters, resolve_projection};
     use crate::error;
+
+    #[test]
+    fn test_parse_disable_seq_scan_split() {
+        let command = <ScanbenchCommand as clap::Parser>::try_parse_from([
+            "scanbench",
+            "--config",
+            "config.toml",
+            "--region-id",
+            "1024:0",
+            "--table-dir",
+            "greptime/public/1024",
+            "--disable-seq-scan-split",
+        ])
+        .unwrap();
+
+        assert_eq!("seq", command.scanner);
+        assert!(command.disable_seq_scan_split);
+    }
 
     #[test]
     fn test_parse_scan_config_projection_names() {

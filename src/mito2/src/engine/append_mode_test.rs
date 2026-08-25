@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use api::v1::Rows;
 use common_recordbatch::RecordBatches;
-use store_api::region_engine::RegionEngine;
+use store_api::region_engine::{RegionEngine, RegionScanner};
 use store_api::region_request::{
     AlterKind, PathType, RegionAlterRequest, RegionCompactRequest, RegionOpenRequest,
     RegionRequest, SetRegionOption,
@@ -26,6 +26,7 @@ use store_api::region_request::{
 use store_api::storage::{RegionId, ScanRequest};
 
 use crate::config::MitoConfig;
+use crate::read::scan_region::{MitoScanOptions, MitoScannerType};
 use crate::test_util::batch_util::sort_batches_and_print;
 use crate::test_util::{
     CreateRequestBuilder, TestEnv, build_rows, build_rows_for_key, flush_region, put_rows,
@@ -59,6 +60,16 @@ async fn test_append_mode_write_query_with_format(flat_format: bool) {
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
+
+    let scanner = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest::default(),
+            MitoScanOptions::new(MitoScannerType::Seq),
+        )
+        .await
+        .unwrap();
+    assert_eq!("SeqScan", scanner.name());
 
     // rows 1, 2
     let rows = build_rows(1, 3);

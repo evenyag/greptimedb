@@ -39,15 +39,92 @@ use store_api::metric_engine_consts::PRIMARY_KEY_ENCODING;
 use store_api::region_engine::{PrepareRequest, RegionEngine, RegionScanner};
 use store_api::region_request::{RegionPutRequest, RegionRequest};
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
-use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution};
+use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 
 use crate::config::MitoConfig;
 use crate::error::Error;
 use crate::read::read_columns::ReadColumns;
-use crate::read::scan_region::Scanner;
+use crate::read::scan_region::{MitoScanOptions, MitoScannerType, Scanner};
 use crate::test_util;
 use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 use crate::test_util::{CreateRequestBuilder, TestEnv};
+
+#[tokio::test]
+async fn test_exact_mito_scanner_selection() {
+    let mut env = TestEnv::new().await;
+    let engine = env.create_engine(MitoConfig::default()).await;
+    let region_id = RegionId::new(1024, 0);
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Create(CreateRequestBuilder::new().build()),
+        )
+        .await
+        .unwrap();
+
+    let scanner = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest {
+                distribution: Some(TimeSeriesDistribution::TimeWindowed),
+                ..Default::default()
+            },
+            MitoScanOptions::new(MitoScannerType::Unordered),
+        )
+        .await
+        .unwrap();
+    assert_eq!("UnorderedScan", scanner.name());
+
+    let scanner = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest::default(),
+            MitoScanOptions::new(MitoScannerType::Seq),
+        )
+        .await
+        .unwrap();
+    assert_eq!("SeqScan", scanner.name());
+
+    let scanner = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest {
+                distribution: Some(TimeSeriesDistribution::PerSeries),
+                ..Default::default()
+            },
+            MitoScanOptions::new(MitoScannerType::Series),
+        )
+        .await
+        .unwrap();
+    assert_eq!("SeriesScan", scanner.name());
+
+    let err = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest {
+                series_row_selector: Some(TimeSeriesRowSelector::LastRow),
+                ..Default::default()
+            },
+            MitoScanOptions::new(MitoScannerType::Unordered),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("time-series row selector"));
+
+    let err = engine
+        .handle_query_with_scan_options(
+            region_id,
+            ScanRequest::default(),
+            MitoScanOptions::new(MitoScannerType::Unordered)
+                .with_disable_seq_scan_range_split(true),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("disable_seq_scan_range_split requires SeqScan")
+    );
+}
 
 #[tokio::test]
 async fn test_json_type_hint_pushdown_scanner_returns_batches() -> WhateverResult<()> {

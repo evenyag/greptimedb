@@ -87,7 +87,7 @@ impl RangeMeta {
     }
 
     /// Creates a list of ranges from the `input` for seq scan.
-    /// If `input.compaction` is true, it doesn't split the ranges.
+    /// It keeps ranges intact for compaction and when range splitting is disabled.
     pub(crate) fn seq_scan_ranges(input: &ScanInput) -> Vec<RangeMeta> {
         let mut ranges = Vec::with_capacity(input.memtables.len() + input.files.len());
         Self::push_seq_mem_ranges(&input.memtables, &mut ranges);
@@ -97,8 +97,13 @@ impl RangeMeta {
         Self::push_extension_ranges(input, &mut ranges);
 
         let ranges = group_ranges_for_seq_scan(ranges);
-        if input.compaction || input.distribution == Some(TimeSeriesDistribution::PerSeries) {
-            // We don't split ranges in compaction or TimeSeriesDistribution::PerSeries.
+        if !should_split_ranges_for_seq_scan(
+            input.compaction,
+            input.disable_seq_scan_range_split,
+            input.distribution,
+        ) {
+            // We don't split ranges in compaction, when explicitly disabled, or for
+            // TimeSeriesDistribution::PerSeries.
             return ranges;
         }
         maybe_split_ranges_for_seq_scan(ranges)
@@ -336,6 +341,14 @@ impl RangeMeta {
     }
 }
 
+fn should_split_ranges_for_seq_scan(
+    compaction: bool,
+    disable_range_split: bool,
+    distribution: Option<TimeSeriesDistribution>,
+) -> bool {
+    !compaction && !disable_range_split && distribution != Some(TimeSeriesDistribution::PerSeries)
+}
+
 /// Groups ranges by time range.
 /// It assumes each input range only contains a file or a memtable.
 fn group_ranges_for_seq_scan(mut ranges: Vec<RangeMeta>) -> Vec<RangeMeta> {
@@ -488,6 +501,18 @@ mod tests {
     use super::*;
 
     type Output = (Vec<usize>, i64, i64);
+
+    #[test]
+    fn test_should_split_ranges_for_seq_scan() {
+        assert!(should_split_ranges_for_seq_scan(false, false, None));
+        assert!(!should_split_ranges_for_seq_scan(true, false, None));
+        assert!(!should_split_ranges_for_seq_scan(false, true, None));
+        assert!(!should_split_ranges_for_seq_scan(
+            false,
+            false,
+            Some(TimeSeriesDistribution::PerSeries),
+        ));
+    }
 
     fn run_group_ranges_test(input: &[(usize, i64, i64)], expect: &[Output]) {
         let ranges = input

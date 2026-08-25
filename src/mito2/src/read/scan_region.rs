@@ -89,6 +89,41 @@ use crate::sst::parquet::reader::ReaderMetrics;
 #[cfg(feature = "vector_index")]
 const VECTOR_INDEX_OVERFETCH_MULTIPLIER: usize = 2;
 
+/// Mito scanner implementation to use for a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MitoScannerType {
+    /// Sequential scan.
+    Seq,
+    /// Unordered scan.
+    Unordered,
+    /// Per-series scan.
+    Series,
+}
+
+/// Mito-specific options for selecting and configuring a scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MitoScanOptions {
+    scanner_type: MitoScannerType,
+    disable_seq_scan_range_split: bool,
+}
+
+impl MitoScanOptions {
+    /// Creates options that select `scanner_type` exactly.
+    pub fn new(scanner_type: MitoScannerType) -> Self {
+        Self {
+            scanner_type,
+            disable_seq_scan_range_split: false,
+        }
+    }
+
+    /// Sets whether SeqScan should keep grouped partition ranges intact.
+    #[must_use]
+    pub fn with_disable_seq_scan_range_split(mut self, disable: bool) -> Self {
+        self.disable_seq_scan_range_split = disable;
+        self
+    }
+}
+
 /// A scanner scans a region and returns a [SendableRecordBatchStream].
 pub(crate) enum Scanner {
     /// Sequential scan.
@@ -235,6 +270,8 @@ pub(crate) struct ScanRegion {
     access_layer: AccessLayerRef,
     /// Scan request.
     request: ScanRequest,
+    /// Optional exact Mito scanner selection and scanner-specific options.
+    scan_options: Option<MitoScanOptions>,
     /// Cache.
     cache_strategy: CacheStrategy,
     /// Maximum number of SST files to scan concurrently.
@@ -272,6 +309,7 @@ impl ScanRegion {
             version,
             access_layer,
             request,
+            scan_options: None,
             cache_strategy,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             scan_memory_pool: Arc::new(UnboundedMemoryPool::default()),
@@ -291,6 +329,13 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_query_stat_counters(mut self, counters: RegionQueryStatCounters) -> Self {
         self.query_stat_counters = Some(counters);
+        self
+    }
+
+    /// Sets Mito-specific scanner options.
+    #[must_use]
+    pub(crate) fn with_scan_options(mut self, options: MitoScanOptions) -> Self {
+        self.scan_options = Some(options);
         self
     }
 
@@ -360,14 +405,10 @@ impl ScanRegion {
     /// Returns a [Scanner] to scan the region.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn scanner(self) -> Result<Scanner> {
-        if self.use_series_scan() {
-            self.series_scan().await.map(Scanner::Series)
-        } else if self.use_unordered_scan() {
-            // If table is append only and there is no series row selector, we use unordered scan in query.
-            // We still use seq scan in compaction.
-            self.unordered_scan().await.map(Scanner::Unordered)
-        } else {
-            self.seq_scan().await.map(Scanner::Seq)
+        match self.scanner_type()? {
+            MitoScannerType::Seq => self.seq_scan().await.map(Scanner::Seq),
+            MitoScannerType::Unordered => self.unordered_scan().await.map(Scanner::Unordered),
+            MitoScannerType::Series => self.series_scan().await.map(Scanner::Series),
         }
     }
 
@@ -378,23 +419,31 @@ impl ScanRegion {
         fields(region_id = %self.region_id())
     )]
     pub(crate) async fn region_scanner(self) -> Result<RegionScannerRef> {
-        if self.use_series_scan() {
-            self.series_scan()
+        match self.scanner_type()? {
+            MitoScannerType::Seq => self.seq_scan().await.map(|scanner| Box::new(scanner) as _),
+            MitoScannerType::Unordered => self
+                .unordered_scan()
                 .await
-                .map(|scanner| Box::new(scanner) as _)
-        } else if self.use_unordered_scan() {
-            self.unordered_scan()
+                .map(|scanner| Box::new(scanner) as _),
+            MitoScannerType::Series => self
+                .series_scan()
                 .await
-                .map(|scanner| Box::new(scanner) as _)
-        } else {
-            self.seq_scan().await.map(|scanner| Box::new(scanner) as _)
+                .map(|scanner| Box::new(scanner) as _),
         }
     }
 
     /// Scan sequentially.
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn seq_scan(self) -> Result<SeqScan> {
-        let input = self.scan_input().await?.with_compaction(false);
+        let disable_range_split = self
+            .scan_options
+            .map(|options| options.disable_seq_scan_range_split)
+            .unwrap_or(false);
+        let input = self
+            .scan_input()
+            .await?
+            .with_compaction(false)
+            .with_disable_seq_scan_range_split(disable_range_split);
         Ok(SeqScan::new(input))
     }
 
@@ -430,6 +479,46 @@ impl ScanRegion {
     /// Returns true if the region can use series scan for current request.
     fn use_series_scan(&self) -> bool {
         self.request.distribution == Some(TimeSeriesDistribution::PerSeries)
+    }
+
+    /// Returns the scanner implementation selected for this scan.
+    fn scanner_type(&self) -> Result<MitoScannerType> {
+        let Some(options) = self.scan_options else {
+            if self.use_series_scan() {
+                return Ok(MitoScannerType::Series);
+            }
+            if self.use_unordered_scan() {
+                return Ok(MitoScannerType::Unordered);
+            }
+            return Ok(MitoScannerType::Seq);
+        };
+
+        ensure!(
+            !options.disable_seq_scan_range_split || options.scanner_type == MitoScannerType::Seq,
+            InvalidRequestSnafu {
+                region_id: self.region_id(),
+                reason: "disable_seq_scan_range_split requires SeqScan",
+            }
+        );
+
+        if options.scanner_type == MitoScannerType::Unordered {
+            ensure!(
+                self.request.series_row_selector.is_none(),
+                InvalidRequestSnafu {
+                    region_id: self.region_id(),
+                    reason: "UnorderedScan does not support a time-series row selector",
+                }
+            );
+            ensure!(
+                self.request.distribution != Some(TimeSeriesDistribution::PerSeries),
+                InvalidRequestSnafu {
+                    region_id: self.region_id(),
+                    reason: "UnorderedScan does not support per-series distribution",
+                }
+            );
+        }
+
+        Ok(options.scanner_type)
     }
 
     /// Creates a scan input.
@@ -952,6 +1041,8 @@ pub struct ScanInput {
     pub(crate) snapshot_sequence: Option<SequenceNumber>,
     /// Whether this scan is for compaction.
     pub(crate) compaction: bool,
+    /// Whether SeqScan should keep grouped ranges intact.
+    pub(crate) disable_seq_scan_range_split: bool,
     /// Counters that should receive query-load metrics.
     pub(crate) query_stat_counters: Option<RegionQueryStatCounters>,
     #[cfg(feature = "enterprise")]
@@ -992,6 +1083,7 @@ impl ScanInput {
             explain_flat_format: false,
             snapshot_sequence: None,
             compaction: false,
+            disable_seq_scan_range_split: false,
             query_stat_counters: None,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
@@ -1194,6 +1286,13 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_compaction(mut self, compaction: bool) -> Self {
         self.compaction = compaction;
+        self
+    }
+
+    /// Sets whether SeqScan should keep grouped ranges intact.
+    #[must_use]
+    pub(crate) fn with_disable_seq_scan_range_split(mut self, disable: bool) -> Self {
+        self.disable_seq_scan_range_split = disable;
         self
     }
 

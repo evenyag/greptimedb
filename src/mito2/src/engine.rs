@@ -148,7 +148,7 @@ use crate::metrics::{
     HANDLE_REQUEST_ELAPSED, SCAN_MEMORY_EXHAUSTED_TOTAL, SCAN_MEMORY_USAGE_BYTES,
     SCAN_REQUESTS_REJECTED_TOTAL,
 };
-use crate::read::scan_region::{ScanRegion, Scanner};
+use crate::read::scan_region::{MitoScanOptions, ScanRegion, Scanner};
 use crate::read::stream::ScanBatchStream;
 use crate::region::MitoRegionRef;
 use crate::region::opener::PartitionExprFetcherRef;
@@ -451,6 +451,24 @@ impl MitoEngine {
         request: ScanRequest,
     ) -> Result<Scanner> {
         self.scan_region(region_id, request)?.scanner().await
+    }
+
+    /// Returns a region scanner using an exact Mito scanner selection.
+    ///
+    /// This is intended for development tools and benchmarks. Forcing an unordered scan on a
+    /// non-append region bypasses Mito's normal merge and deduplication scanner selection.
+    pub async fn handle_query_with_scan_options(
+        &self,
+        region_id: RegionId,
+        request: ScanRequest,
+        options: MitoScanOptions,
+    ) -> Result<RegionScannerRef, BoxedError> {
+        self.scan_region(region_id, request)
+            .map_err(BoxedError::new)?
+            .with_scan_options(options)
+            .region_scanner()
+            .await
+            .map_err(BoxedError::new)
     }
 
     /// Scans a region.
