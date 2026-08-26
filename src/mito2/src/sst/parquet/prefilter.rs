@@ -793,15 +793,15 @@ pub(crate) fn build_prefilter_read_plan(
     reader_builder: &RowGroupReaderBuilder,
     build_ctx: &RowGroupBuildContext<'_>,
 ) -> Result<PrefilterReadPlan> {
-    let entries = build_prefilter_cache_entries(&prefilter_ctx, reader_builder, build_ctx);
+    let groups = build_prefilter_groups(&prefilter_ctx);
     let expected_rows = rows_before_filter(reader_builder, build_ctx);
+    let prefix_keys = build_prefix_cache_keys(&groups, &prefilter_ctx, reader_builder, build_ctx);
     if expected_rows == 0 {
-        for entry in entries {
-            if let Some(key) = entry.key {
-                reader_builder
-                    .cache_strategy()
-                    .put_prefilter_result(key, Arc::new(BooleanBuffer::new_set(0)));
-            }
+        let empty_mask = Arc::new(BooleanBuffer::new_set(0));
+        for key in prefix_keys.into_iter().flatten() {
+            reader_builder
+                .cache_strategy()
+                .put_prefilter_result(key, empty_mask.clone());
         }
         return Ok(PrefilterReadPlan {
             row_selection: Some(RowSelection::from(vec![])),
@@ -811,31 +811,38 @@ pub(crate) fn build_prefilter_read_plan(
         });
     }
 
-    let mut hit_mask: Option<BooleanBuffer> = None;
-    let mut misses = Vec::new();
-    for entry in entries {
-        let Some(key) = &entry.key else {
-            misses.push(entry);
-            continue;
-        };
+    let cached_prefix = prefix_keys
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(idx, key)| key.as_ref().map(|key| (idx, key)))
+        .find_map(|(idx, key)| {
+            reader_builder
+                .cache_strategy()
+                .get_prefilter_result(key)
+                .filter(|mask| mask.len() == expected_rows)
+                .map(|mask| (idx + 1, mask.as_ref().clone()))
+        });
+    let (first_missing_group, initial_mask) = cached_prefix
+        .map(|(prefix_len, mask)| (prefix_len, Some(mask)))
+        .unwrap_or((0, None));
+    let initial_survivor_count = initial_mask
+        .as_ref()
+        .map(|mask| mask.count_set_bits())
+        .unwrap_or(expected_rows);
 
-        if let Some(mask) = reader_builder.cache_strategy().get_prefilter_result(key)
-            && mask.len() == expected_rows
-        {
-            hit_mask = Some(match hit_mask {
-                Some(hit_mask) => hit_mask.bitand(mask.as_ref()),
-                None => mask.as_ref().clone(),
-            });
-        } else {
-            misses.push(entry);
+    if first_missing_group == groups.len() || initial_survivor_count == 0 {
+        let combined_mask = initial_mask.unwrap_or_else(|| BooleanBuffer::new_set(expected_rows));
+        if initial_survivor_count == 0 {
+            let empty_mask = Arc::new(BooleanBuffer::new_unset(expected_rows));
+            for key in prefix_keys.into_iter().skip(first_missing_group).flatten() {
+                reader_builder
+                    .cache_strategy()
+                    .put_prefilter_result(key, empty_mask.clone());
+            }
         }
-    }
-
-    if misses.is_empty() {
-        let combined_mask = hit_mask.unwrap_or_else(|| BooleanBuffer::new_set(expected_rows));
-        debug_assert_eq!(combined_mask.len(), expected_rows);
         let row_selection = refined_selection_from_mask(&combined_mask, &build_ctx.row_selection);
-        let filtered_rows = expected_rows.saturating_sub(row_selection.row_count());
+        let filtered_rows = expected_rows.saturating_sub(combined_mask.count_set_bits());
         return Ok(PrefilterReadPlan {
             row_selection: Some(row_selection),
             row_filter: None,
@@ -844,64 +851,55 @@ pub(crate) fn build_prefilter_read_plan(
         });
     }
 
-    let prefilter_column_names = prefilter_column_names_for_entries(&prefilter_ctx, &misses);
     let parquet_schema = reader_builder
         .parquet_metadata()
         .file_metadata()
         .schema_descr();
-    let projection = compute_projection_mask(
-        &prefilter_column_names,
-        &prefilter_ctx.arrow_schema,
-        parquet_schema,
-    );
     let metrics_tracker = build_ctx
         .fetch_metrics
         .cloned()
         .map(PrefilterMetricsTracker::new);
-    let predicate = PrefilterPredicate::new(
-        projection,
+    let arrow_schema = prefilter_ctx.arrow_schema.clone();
+    let shared = Arc::new(Mutex::new(ProgressivePrefilterShared {
         prefilter_ctx,
-        misses,
-        hit_mask,
-        expected_rows,
-        reader_builder.cache_strategy().clone(),
-        reader_builder.file_path().to_string(),
-        metrics_tracker.clone(),
-    );
+        progress: ProgressivePrefilterProgress {
+            original_rows: expected_rows,
+            cumulative_mask: initial_mask
+                .clone()
+                .unwrap_or_else(|| BooleanBuffer::new_set(expected_rows)),
+            current_group: 0,
+            prefix_keys: prefix_keys.into_iter().skip(first_missing_group).collect(),
+            cache_strategy: reader_builder.cache_strategy().clone(),
+            metrics_tracker: metrics_tracker.clone(),
+        },
+    }));
+    let predicates = groups
+        .into_iter()
+        .skip(first_missing_group)
+        .enumerate()
+        .map(|(group_idx, group)| {
+            let column_names = HashSet::from([group.column_name]);
+            let projection = compute_projection_mask(&column_names, &arrow_schema, parquet_schema);
+            Box::new(ColumnGroupPredicate::new(
+                projection,
+                group.entries,
+                group_idx,
+                shared.clone(),
+                reader_builder.file_path().to_string(),
+            )) as Box<dyn ArrowPredicate>
+        })
+        .collect();
+    let row_selection = initial_mask
+        .as_ref()
+        .map(|mask| refined_selection_from_mask(mask, &build_ctx.row_selection))
+        .or_else(|| build_ctx.row_selection.clone());
 
     Ok(PrefilterReadPlan {
-        row_selection: build_ctx.row_selection.clone(),
-        row_filter: Some(RowFilter::new(vec![Box::new(predicate)])),
+        row_selection,
+        row_filter: Some(RowFilter::new(predicates)),
         metrics_tracker,
         eagerly_filtered_rows: None,
     })
-}
-
-fn prefilter_column_names_for_entries(
-    prefilter_ctx: &PrefilterContext,
-    entries: &[PrefilterEntry],
-) -> HashSet<String> {
-    let mut prefilter_column_names = HashSet::new();
-    for entry in entries {
-        match entry.kind {
-            PrefilterEntryKind::Simple(idx) => {
-                if let MaybeFilter::Filter(filter) = prefilter_ctx.filters[idx].filter() {
-                    prefilter_column_names.insert(filter.column_name().to_string());
-                }
-            }
-            PrefilterEntryKind::Physical(idx) => {
-                prefilter_column_names.insert(
-                    prefilter_ctx.physical_filters[idx]
-                        .column_name()
-                        .to_string(),
-                );
-            }
-            PrefilterEntryKind::PkGroup => {
-                prefilter_column_names.insert(PRIMARY_KEY_COLUMN_NAME.to_string());
-            }
-        }
-    }
-    prefilter_column_names
 }
 
 #[derive(Clone, Copy)]
@@ -913,102 +911,194 @@ enum PrefilterEntryKind {
 
 struct PrefilterEntry {
     kind: PrefilterEntryKind,
-    key: Option<PrefilterKey>,
+    exprs: SmallVec<[String; 1]>,
+    cacheable: bool,
 }
 
-struct PrefilterPredicate {
-    projection: ProjectionMask,
-    prefilter_ctx: PrefilterContext,
+struct PrefilterGroup {
+    column_name: String,
+    semantic_type: SemanticType,
     entries: Vec<PrefilterEntry>,
-    hit_mask: Option<BooleanBuffer>,
-    cache_builders: Vec<Option<BooleanBufferBuilder>>,
-    processed_rows: usize,
-    expected_rows: usize,
-    filtered_rows: usize,
+    exprs: SmallVec<[String; 1]>,
+    cacheable: bool,
+    original_order: usize,
+}
+
+impl PrefilterGroup {
+    fn add_entry(&mut self, entry: PrefilterEntry) {
+        self.cacheable &= entry.cacheable;
+        self.exprs.extend(entry.exprs.iter().cloned());
+        self.entries.push(entry);
+    }
+}
+
+struct ProgressivePrefilterShared {
+    prefilter_ctx: PrefilterContext,
+    progress: ProgressivePrefilterProgress,
+}
+
+struct ProgressivePrefilterProgress {
+    original_rows: usize,
+    cumulative_mask: BooleanBuffer,
+    current_group: usize,
+    prefix_keys: Vec<Option<PrefilterKey>>,
     cache_strategy: CacheStrategy,
-    file_path: String,
     metrics_tracker: Option<PrefilterMetricsTracker>,
 }
 
-impl PrefilterPredicate {
-    #[expect(clippy::too_many_arguments)]
+impl ProgressivePrefilterProgress {
+    fn expected_rows(&self, group_idx: usize) -> Result<usize> {
+        if group_idx != self.current_group {
+            return UnexpectedSnafu {
+                reason: format!(
+                    "Expected prefilter group {}, got {}",
+                    self.current_group, group_idx
+                ),
+            }
+            .fail();
+        }
+        Ok(self.cumulative_mask.count_set_bits())
+    }
+
+    fn complete_group(&mut self, group_idx: usize, mask: &BooleanBuffer) -> Result<()> {
+        let expected_rows = self.expected_rows(group_idx)?;
+        if mask.len() != expected_rows {
+            return UnexpectedSnafu {
+                reason: format!(
+                    "Prefilter group {} produced {} rows, expected {}",
+                    group_idx,
+                    mask.len(),
+                    expected_rows
+                ),
+            }
+            .fail();
+        }
+
+        let mut compact_idx = 0;
+        let cumulative_mask = BooleanBuffer::collect_bool(self.original_rows, |idx| {
+            if !self.cumulative_mask.value(idx) {
+                return false;
+            }
+            let selected = mask.value(compact_idx);
+            compact_idx += 1;
+            selected
+        });
+        debug_assert_eq!(compact_idx, mask.len());
+        self.cumulative_mask = cumulative_mask.clone();
+        if let Some(key) = self.prefix_keys[group_idx].clone() {
+            self.cache_strategy
+                .put_prefilter_result(key, Arc::new(cumulative_mask));
+        }
+
+        self.current_group += 1;
+        if self.cumulative_mask.count_set_bits() == 0 {
+            let empty_mask = Arc::new(BooleanBuffer::new_unset(self.original_rows));
+            for key in self.prefix_keys.iter().skip(self.current_group).flatten() {
+                self.cache_strategy
+                    .put_prefilter_result(key.clone(), empty_mask.clone());
+            }
+            self.current_group = self.prefix_keys.len();
+        }
+
+        if self.current_group == self.prefix_keys.len()
+            && let Some(tracker) = &self.metrics_tracker
+        {
+            tracker.finish(
+                self.original_rows
+                    .saturating_sub(self.cumulative_mask.count_set_bits()),
+            );
+        }
+        Ok(())
+    }
+}
+
+struct ColumnGroupPredicate {
+    projection: ProjectionMask,
+    entries: Vec<PrefilterEntry>,
+    group_idx: usize,
+    shared: Arc<Mutex<ProgressivePrefilterShared>>,
+    file_path: String,
+    expected_rows: Option<usize>,
+    processed_rows: usize,
+    mask_builder: BooleanBufferBuilder,
+}
+
+impl ColumnGroupPredicate {
     fn new(
         projection: ProjectionMask,
-        prefilter_ctx: PrefilterContext,
         entries: Vec<PrefilterEntry>,
-        hit_mask: Option<BooleanBuffer>,
-        expected_rows: usize,
-        cache_strategy: CacheStrategy,
+        group_idx: usize,
+        shared: Arc<Mutex<ProgressivePrefilterShared>>,
         file_path: String,
-        metrics_tracker: Option<PrefilterMetricsTracker>,
     ) -> Self {
-        let cache_builders = entries
-            .iter()
-            .map(|entry| entry.key.is_some().then(|| BooleanBufferBuilder::new(0)))
-            .collect();
         Self {
             projection,
-            prefilter_ctx,
             entries,
-            hit_mask,
-            cache_builders,
-            processed_rows: 0,
-            expected_rows,
-            filtered_rows: 0,
-            cache_strategy,
+            group_idx,
+            shared,
             file_path,
-            metrics_tracker,
+            expected_rows: None,
+            processed_rows: 0,
+            mask_builder: BooleanBufferBuilder::new(0),
         }
     }
 
     fn evaluate_batch(&mut self, batch: &RecordBatch) -> Result<BooleanBuffer> {
         let num_rows = batch.num_rows();
-        if self.processed_rows.saturating_add(num_rows) > self.expected_rows {
+        let expected_rows = match self.expected_rows {
+            Some(expected_rows) => expected_rows,
+            None => {
+                let expected_rows = self
+                    .shared
+                    .lock()
+                    .unwrap()
+                    .progress
+                    .expected_rows(self.group_idx)?;
+                self.expected_rows = Some(expected_rows);
+                expected_rows
+            }
+        };
+        if self.processed_rows.saturating_add(num_rows) > expected_rows {
             return UnexpectedSnafu {
                 reason: format!(
-                    "Prefilter received more rows than expected for {}: processed {}, batch {}, expected {}",
-                    self.file_path, self.processed_rows, num_rows, self.expected_rows
+                    "Prefilter group {} received more rows than expected for {}: processed {}, batch {}, expected {}",
+                    self.group_idx, self.file_path, self.processed_rows, num_rows, expected_rows
                 ),
             }
             .fail();
         }
-        let mut combined_mask = self
-            .hit_mask
-            .as_ref()
-            .map(|mask| mask.slice(self.processed_rows, num_rows))
-            .unwrap_or_else(|| BooleanBuffer::new_set(num_rows));
 
-        for (idx, entry) in self.entries.iter().enumerate() {
-            let mask =
-                eval_entry_mask(batch, &mut self.prefilter_ctx, entry.kind, &self.file_path)?;
-            combined_mask = combined_mask.bitand(&mask);
-            if let Some(Some(builder)) = self.cache_builders.get_mut(idx) {
-                builder.append_buffer(&mask);
+        let mut combined_mask = BooleanBuffer::new_set(num_rows);
+        {
+            let mut shared = self.shared.lock().unwrap();
+            for entry in &self.entries {
+                let mask = eval_entry_mask(
+                    batch,
+                    &mut shared.prefilter_ctx,
+                    entry.kind,
+                    &self.file_path,
+                )?;
+                combined_mask = combined_mask.bitand(&mask);
             }
         }
 
+        self.mask_builder.append_buffer(&combined_mask);
         self.processed_rows += num_rows;
-        self.filtered_rows += num_rows.saturating_sub(combined_mask.count_set_bits());
-        if self.processed_rows == self.expected_rows {
-            self.finish();
+        if self.processed_rows == expected_rows {
+            let mut builder =
+                std::mem::replace(&mut self.mask_builder, BooleanBufferBuilder::new(0));
+            let mask = builder.finish();
+            self.shared
+                .lock()
+                .unwrap()
+                .progress
+                .complete_group(self.group_idx, &mask)?;
         }
         Ok(combined_mask)
     }
-
-    fn finish(&mut self) {
-        for (entry, builder) in self.entries.iter().zip(&mut self.cache_builders) {
-            if let (Some(key), Some(mut builder)) = (&entry.key, builder.take()) {
-                self.cache_strategy
-                    .put_prefilter_result(key.clone(), Arc::new(builder.finish()));
-            }
-        }
-        if let Some(tracker) = &self.metrics_tracker {
-            tracker.finish(self.filtered_rows);
-        }
-    }
 }
 
-impl ArrowPredicate for PrefilterPredicate {
+impl ArrowPredicate for ColumnGroupPredicate {
     fn projection(&self) -> &ProjectionMask {
         &self.projection
     }
@@ -1020,60 +1110,126 @@ impl ArrowPredicate for PrefilterPredicate {
     }
 }
 
-fn build_prefilter_cache_entries(
-    prefilter_ctx: &PrefilterContext,
-    reader_builder: &RowGroupReaderBuilder,
-    build_ctx: &RowGroupBuildContext<'_>,
-) -> Vec<PrefilterEntry> {
-    let row_selection = PrefilterKey::row_selection_snapshot(build_ctx.row_selection.as_ref());
-    let file_id = reader_builder.file_handle().file_id().file_id();
-    let row_group_idx = build_ctx.row_group_idx as u32;
-    let mut entries = Vec::new();
+fn build_prefilter_groups(prefilter_ctx: &PrefilterContext) -> Vec<PrefilterGroup> {
+    let mut groups = Vec::new();
 
     for (idx, filter_ctx) in prefilter_ctx.filters.iter().enumerate() {
-        entries.push(PrefilterEntry {
-            kind: PrefilterEntryKind::Simple(idx),
-            key: Some(PrefilterKey::new(
-                file_id,
-                row_group_idx,
-                row_selection.clone(),
-                prefilter_ctx.schema_version,
-                smallvec![filter_ctx.expr_str().to_string()],
-            )),
-        });
+        let Some(filter) = filter_ctx.filter().as_filter() else {
+            continue;
+        };
+        add_prefilter_entry(
+            &mut groups,
+            filter.column_name(),
+            filter_ctx.semantic_type(),
+            PrefilterEntry {
+                kind: PrefilterEntryKind::Simple(idx),
+                exprs: smallvec![filter_ctx.expr_str().to_string()],
+                cacheable: true,
+            },
+        );
     }
 
     for (idx, filter_ctx) in prefilter_ctx.physical_filters.iter().enumerate() {
-        entries.push(PrefilterEntry {
-            kind: PrefilterEntryKind::Physical(idx),
-            key: filter_ctx.is_immutable().then(|| {
+        add_prefilter_entry(
+            &mut groups,
+            filter_ctx.column_name(),
+            filter_ctx.semantic_type(),
+            PrefilterEntry {
+                kind: PrefilterEntryKind::Physical(idx),
+                exprs: smallvec![filter_ctx.expr_str().to_string()],
+                cacheable: filter_ctx.is_immutable(),
+            },
+        );
+    }
+
+    if prefilter_ctx.pk_filter.is_some() {
+        add_prefilter_entry(
+            &mut groups,
+            PRIMARY_KEY_COLUMN_NAME,
+            SemanticType::Tag,
+            PrefilterEntry {
+                kind: PrefilterEntryKind::PkGroup,
+                exprs: prefilter_ctx
+                    .pk_filter_expr_strs
+                    .clone()
+                    .unwrap_or_default(),
+                cacheable: prefilter_ctx.pk_filter_expr_strs.is_some(),
+            },
+        );
+    }
+
+    groups.sort_by_key(|group| {
+        (
+            !group.cacheable,
+            semantic_type_rank(group.semantic_type),
+            group.original_order,
+        )
+    });
+    groups
+}
+
+fn add_prefilter_entry(
+    groups: &mut Vec<PrefilterGroup>,
+    column_name: &str,
+    semantic_type: SemanticType,
+    entry: PrefilterEntry,
+) {
+    if let Some(group) = groups
+        .iter_mut()
+        .find(|group| group.column_name == column_name)
+    {
+        group.add_entry(entry);
+        return;
+    }
+
+    let original_order = groups.len();
+    groups.push(PrefilterGroup {
+        column_name: column_name.to_string(),
+        semantic_type,
+        entries: Vec::new(),
+        exprs: SmallVec::new(),
+        cacheable: true,
+        original_order,
+    });
+    groups.last_mut().unwrap().add_entry(entry);
+}
+
+fn semantic_type_rank(semantic_type: SemanticType) -> u8 {
+    match semantic_type {
+        SemanticType::Tag => 0,
+        SemanticType::Timestamp => 1,
+        SemanticType::Field => 2,
+    }
+}
+
+fn build_prefix_cache_keys(
+    groups: &[PrefilterGroup],
+    prefilter_ctx: &PrefilterContext,
+    reader_builder: &RowGroupReaderBuilder,
+    build_ctx: &RowGroupBuildContext<'_>,
+) -> Vec<Option<PrefilterKey>> {
+    let row_selection = PrefilterKey::row_selection_snapshot(build_ctx.row_selection.as_ref());
+    let file_id = reader_builder.file_handle().file_id().file_id();
+    let row_group_idx = build_ctx.row_group_idx as u32;
+    let mut cumulative_exprs = SmallVec::new();
+    let mut cacheable_prefix = true;
+
+    groups
+        .iter()
+        .map(|group| {
+            cumulative_exprs.extend(group.exprs.iter().cloned());
+            cacheable_prefix &= group.cacheable;
+            cacheable_prefix.then(|| {
                 PrefilterKey::new(
                     file_id,
                     row_group_idx,
                     row_selection.clone(),
                     prefilter_ctx.schema_version,
-                    smallvec![filter_ctx.expr_str().to_string()],
+                    cumulative_exprs.clone(),
                 )
-            }),
-        });
-    }
-
-    if prefilter_ctx.pk_filter.is_some() {
-        entries.push(PrefilterEntry {
-            kind: PrefilterEntryKind::PkGroup,
-            key: prefilter_ctx.pk_filter_expr_strs.as_ref().map(|exprs| {
-                PrefilterKey::new(
-                    file_id,
-                    row_group_idx,
-                    row_selection,
-                    prefilter_ctx.schema_version,
-                    exprs.clone(),
-                )
-            }),
-        });
-    }
-
-    entries
+            })
+        })
+        .collect()
 }
 
 fn rows_before_filter(
@@ -1749,6 +1905,107 @@ mod tests {
     }
 
     #[test]
+    fn test_prefilter_groups_by_column_and_orders_tags_first() {
+        let metadata: RegionMetadataRef = Arc::new(sst_region_metadata());
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::new(metadata.column_metadatas.iter().map(|c| c.column_id)),
+            None,
+            "test",
+            true,
+        )
+        .unwrap();
+        let filters = new_simple_filter_contexts(
+            &metadata,
+            &[
+                col("ts").gt_eq(lit(ScalarValue::TimestampMillisecond(Some(1), None))),
+                col("tag_1").eq(lit("x")),
+                col("tag_0").eq(lit("a")),
+                col("tag_0").not_eq(lit("b")),
+                col("field_0").gt(lit(1_u64)),
+            ],
+        );
+        let prefilter_ctx = PrefilterContext {
+            pk_filter: None,
+            filters,
+            physical_filters: Vec::new(),
+            schema_version: metadata.schema_version,
+            pk_filter_expr_strs: None,
+            arrow_schema: read_format.arrow_schema().clone(),
+        };
+
+        let groups = build_prefilter_groups(&prefilter_ctx);
+        assert_eq!(
+            vec!["tag_1", "tag_0", "ts", "field_0"],
+            groups
+                .iter()
+                .map(|group| group.column_name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(2, groups[1].entries.len());
+        assert!(groups.iter().all(|group| group.cacheable));
+    }
+
+    #[test]
+    fn test_progressive_prefilter_scatter_and_prefix_cache() {
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_result_cache_size(4096)
+                .build(),
+        );
+        let cache_strategy = CacheStrategy::EnableAll(cache.clone());
+        let file_id = FileId::random();
+        let first_key = PrefilterKey::new(file_id, 0, None, 1, smallvec!["tag_0 = a".to_string()]);
+        let second_key = PrefilterKey::new(
+            file_id,
+            0,
+            None,
+            1,
+            smallvec!["tag_0 = a".to_string(), "ts >= 1".to_string()],
+        );
+        let fetch_metrics = ParquetFetchMetrics::default();
+        let tracker = PrefilterMetricsTracker::new(fetch_metrics.clone());
+        tracker.start();
+        let mut progress = ProgressivePrefilterProgress {
+            original_rows: 6,
+            cumulative_mask: BooleanBuffer::new_set(6),
+            current_group: 0,
+            prefix_keys: vec![Some(first_key.clone()), Some(second_key.clone())],
+            cache_strategy,
+            metrics_tracker: Some(tracker),
+        };
+
+        progress
+            .complete_group(
+                0,
+                &BooleanBuffer::from(vec![true, false, true, false, true, false]),
+            )
+            .unwrap();
+        let first = cache.get_prefilter_result(&first_key).unwrap();
+        assert_eq!(
+            vec![true, false, true, false, true, false],
+            (0..first.len())
+                .map(|idx| first.value(idx))
+                .collect::<Vec<_>>()
+        );
+        assert!(cache.get_prefilter_result(&second_key).is_none());
+
+        progress
+            .complete_group(1, &BooleanBuffer::from(vec![false, true, true]))
+            .unwrap();
+        let second = cache.get_prefilter_result(&second_key).unwrap();
+        assert_eq!(
+            vec![false, false, true, false, true, false],
+            (0..second.len())
+                .map(|idx| second.value(idx))
+                .collect::<Vec<_>>()
+        );
+        let metrics = fetch_metrics.data.lock().unwrap();
+        assert_eq!(4, metrics.prefilter_filtered_rows);
+        assert!(!metrics.prefilter_cost.is_zero());
+    }
+
+    #[test]
     fn test_eval_simple_filter_mask_uses_flat_tag_columns_directly() {
         let metadata: RegionMetadataRef = Arc::new(sst_region_metadata());
         let filters = new_simple_filter_contexts(&metadata, &[col("tag_0").eq(lit("a"))]);
@@ -1793,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefilter_predicate_publishes_complete_masks_and_metrics() {
+    fn test_column_group_predicate_publishes_complete_conjunction_and_metrics() {
         let metadata: RegionMetadataRef = Arc::new(sst_region_metadata());
         let read_format = FlatReadFormat::new(
             metadata.clone(),
@@ -1833,35 +2090,48 @@ mod tests {
         let fetch_metrics = ParquetFetchMetrics::default();
         let tracker = PrefilterMetricsTracker::new(fetch_metrics.clone());
         tracker.start();
-        let mut predicate = PrefilterPredicate::new(
-            ProjectionMask::all(),
+        let shared = Arc::new(Mutex::new(ProgressivePrefilterShared {
             prefilter_ctx,
+            progress: ProgressivePrefilterProgress {
+                original_rows: 4,
+                cumulative_mask: BooleanBuffer::from(vec![true, false, true, false]),
+                current_group: 0,
+                prefix_keys: vec![Some(key.clone())],
+                cache_strategy,
+                metrics_tracker: Some(tracker),
+            },
+        }));
+        let mut predicate = ColumnGroupPredicate::new(
+            ProjectionMask::all(),
             vec![PrefilterEntry {
                 kind: PrefilterEntryKind::Simple(0),
-                key: Some(key.clone()),
+                exprs: smallvec!["tag_0 = a".to_string()],
+                cacheable: true,
             }],
-            Some(BooleanBuffer::from(vec![true, false, true, false])),
-            4,
-            cache_strategy,
+            0,
+            shared,
             "test".to_string(),
-            Some(tracker),
         );
 
-        let first = new_record_batch_with_custom_sequence(&["a", "x"], 0, 2, 1);
+        let first = new_record_batch_with_custom_sequence(&["a", "x"], 0, 1, 1);
         assert_eq!(
             1,
             predicate.evaluate_batch(&first).unwrap().count_set_bits()
         );
         assert!(cache.get_prefilter_result(&key).is_none());
 
-        let second = new_record_batch_with_custom_sequence(&["a", "x"], 2, 4, 1);
+        let second = new_record_batch_with_custom_sequence(&["a", "x"], 1, 2, 1);
         assert_eq!(
             1,
             predicate.evaluate_batch(&second).unwrap().count_set_bits()
         );
         let cached = cache.get_prefilter_result(&key).unwrap();
         assert_eq!(4, cached.len());
-        assert_eq!(4, cached.count_set_bits());
+        assert_eq!(2, cached.count_set_bits());
+        assert!(cached.value(0));
+        assert!(!cached.value(1));
+        assert!(cached.value(2));
+        assert!(!cached.value(3));
 
         let metrics = fetch_metrics.data.lock().unwrap();
         assert!(!metrics.prefilter_cost.is_zero());

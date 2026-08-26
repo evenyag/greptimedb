@@ -46,6 +46,7 @@ use parquet::file::metadata::{
     FileMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, ParquetMetaDataWriter,
 };
 use puffin::puffin_manager::cache::{PuffinMetadataCache, PuffinMetadataCacheRef};
+use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 use snafu::{OptionExt, ResultExt};
 use store_api::metadata::{RegionMetadata, RegionMetadataRef};
@@ -557,7 +558,9 @@ pub(crate) struct PrefilterKey {
     row_group_idx: u32,
     row_selection: Option<Arc<Vec<PrefilterRowSelector>>>,
     schema_version: u64,
-    filter_exprs: SmallVec<[String; 1]>,
+    predicate_digest: [u8; 16],
+    predicate_count: usize,
+    predicate_encoded_len: usize,
     mem_usage: usize,
 }
 
@@ -580,29 +583,39 @@ impl PrefilterKey {
         row_group_idx: u32,
         row_selection: Option<Arc<Vec<PrefilterRowSelector>>>,
         schema_version: u64,
-        filter_exprs: SmallVec<[String; 1]>,
+        mut filter_exprs: SmallVec<[String; 1]>,
     ) -> Self {
+        filter_exprs.sort_unstable();
+        filter_exprs.dedup();
+        let predicate_count = filter_exprs.len();
+        let predicate_encoded_len = filter_exprs
+            .iter()
+            .map(|expr| mem::size_of::<u64>() + expr.len())
+            .sum();
+        let mut hasher = Sha256::new();
+        hasher.update(b"greptimedb:mito2:prefilter:v1\0");
+        for expr in &filter_exprs {
+            hasher.update((expr.len() as u64).to_le_bytes());
+            hasher.update(expr.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut predicate_digest = [0; 16];
+        predicate_digest.copy_from_slice(&digest[..16]);
+
         let row_selection_bytes = row_selection
             .as_ref()
             .map(|selection| selection.len() * mem::size_of::<PrefilterRowSelector>())
             .unwrap_or(0);
-        let spilled_expr_bytes = if filter_exprs.spilled() {
-            filter_exprs.capacity() * mem::size_of::<String>()
-        } else {
-            0
-        };
-        let expr_bytes = filter_exprs.iter().map(|s| s.capacity()).sum::<usize>();
 
         Self {
             file_id,
             row_group_idx,
             row_selection,
             schema_version,
-            filter_exprs,
-            mem_usage: mem::size_of::<Self>()
-                + row_selection_bytes
-                + spilled_expr_bytes
-                + expr_bytes,
+            predicate_digest,
+            predicate_count,
+            predicate_encoded_len,
+            mem_usage: mem::size_of::<Self>() + row_selection_bytes,
         }
     }
 
@@ -2742,7 +2755,7 @@ mod tests {
         let pk_group = PrefilterKey::new(
             file_id,
             0,
-            row_selection,
+            row_selection.clone(),
             1,
             SmallVec::from_vec(vec![
                 "tag_0 IN ([a])".to_string(),
@@ -2750,6 +2763,32 @@ mod tests {
             ]),
         );
         assert_ne!(base, pk_group);
+
+        let ordered = PrefilterKey::new(
+            file_id,
+            0,
+            row_selection.clone(),
+            1,
+            SmallVec::from_vec(vec!["a".to_string(), "bc".to_string()]),
+        );
+        let reversed_with_duplicate = PrefilterKey::new(
+            file_id,
+            0,
+            row_selection.clone(),
+            1,
+            SmallVec::from_vec(vec!["bc".to_string(), "a".to_string(), "a".to_string()]),
+        );
+        assert_eq!(ordered, reversed_with_duplicate);
+        assert_ne!(
+            ordered,
+            PrefilterKey::new(
+                file_id,
+                0,
+                row_selection,
+                1,
+                SmallVec::from_vec(vec!["ab".to_string(), "c".to_string()]),
+            )
+        );
     }
 
     #[test]

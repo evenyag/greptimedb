@@ -8645,6 +8645,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "session",
+ "sha2 0.10.9",
  "smallvec",
  "snafu 0.8.6",
  "store-api",

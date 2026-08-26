@@ -83,6 +83,7 @@ scopeguard = "1.2"
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
+sha2 = "0.10.8"
 smallvec.workspace = true
 snafu.workspace = true
 store-api.workspace = true

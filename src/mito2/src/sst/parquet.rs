@@ -1947,7 +1947,10 @@ mod tests {
         .await;
         let handle = create_file_handle_from_sst_info(&info, &metadata);
 
-        let predicate = Predicate::new(vec![col("tag_0").eq(lit("a"))]);
+        let predicate = Predicate::new(vec![
+            col("tag_0").eq(lit("a")),
+            col("ts").lt(lit(ScalarValue::TimestampMillisecond(Some(3), None))),
+        ]);
         let cache = Arc::new(
             CacheManager::builder()
                 .prefilter_result_cache_size(1024 * 1024)
