@@ -668,6 +668,10 @@ auto_flush_interval = "1h"
 ## @toml2docs:none-default="Auto"
 #+ prefilter_result_cache_size = "128MB"
 
+## Maximum decoded predicate-column cache size for each active parquet row group.
+## Setting it to 0 disables decoded-column reuse while keeping prefiltering enabled.
+experimental_prefilter_column_cache_size = "16MB"
+
 ## Whether to enable the write cache, it's enabled by default when using object storage. It is recommended to enable it when using object storage for better performance.
 enable_write_cache = false
 

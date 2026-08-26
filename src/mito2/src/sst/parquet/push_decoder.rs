@@ -23,7 +23,8 @@ use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use parquet::DecodeResult;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
+use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowFilter, RowSelection};
 use parquet::arrow::push_decoder::ParquetPushDecoderBuilder;
 use snafu::{ResultExt, ensure};
 
@@ -33,7 +34,31 @@ use crate::error::{OpenDalSnafu, ReadParquetSnafu, Result, UnexpectedSnafu};
 use crate::metrics::{READ_STAGE_ELAPSED, READ_STAGE_FETCH_PAGES};
 use crate::sst::file::RegionFileId;
 use crate::sst::parquet::helper::fetch_byte_ranges;
+use crate::sst::parquet::prefilter::PrefilterMetricsTracker;
 use crate::sst::parquet::row_group::{ParquetFetchMetrics, compute_total_range_size};
+
+struct ArrowReaderMetricsGuard {
+    arrow_metrics: ArrowReaderMetrics,
+    fetch_metrics: Option<ParquetFetchMetrics>,
+}
+
+impl Drop for ArrowReaderMetricsGuard {
+    fn drop(&mut self) {
+        let Some(fetch_metrics) = &self.fetch_metrics else {
+            return;
+        };
+        let Some(records_from_cache) = self.arrow_metrics.records_read_from_cache() else {
+            return;
+        };
+        let records_from_inner = self
+            .arrow_metrics
+            .records_read_from_inner()
+            .unwrap_or_default();
+        let mut data = fetch_metrics.data.lock().unwrap();
+        data.predicate_cache_records_read_from_cache += records_from_cache;
+        data.predicate_cache_records_read_from_inner += records_from_inner;
+    }
+}
 
 /// Fetches parquet byte ranges through Greptime's cache hierarchy.
 ///
@@ -311,23 +336,51 @@ fn assemble_range(range: &Range<u64>, mut parts: Vec<PageRangePart>) -> Result<B
     Ok(output.freeze())
 }
 
+/// Read options for a parquet push-decoder stream.
+pub(crate) struct ParquetPushDecoderOptions {
+    pub(crate) row_group_idx: usize,
+    pub(crate) row_selection: Option<RowSelection>,
+    pub(crate) projection: ProjectionMask,
+    pub(crate) batch_size: usize,
+    pub(crate) row_filter: Option<RowFilter>,
+    pub(crate) max_predicate_cache_size: usize,
+    pub(crate) prefilter_metrics: Option<PrefilterMetricsTracker>,
+}
+
 /// Builds a parquet record batch stream driven directly by [ParquetPushDecoderBuilder].
-pub fn build_sst_parquet_record_batch_stream(
+pub(crate) fn build_sst_parquet_record_batch_stream(
     arrow_metadata: ArrowReaderMetadata,
-    row_group_idx: usize,
-    row_selection: Option<RowSelection>,
-    projection: ProjectionMask,
     fetcher: SstParquetRangeFetcher,
     file_path: String,
-    batch_size: usize,
+    options: ParquetPushDecoderOptions,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let ParquetPushDecoderOptions {
+        row_group_idx,
+        row_selection,
+        projection,
+        batch_size,
+        row_filter,
+        max_predicate_cache_size,
+        prefilter_metrics,
+    } = options;
+    let fetch_metrics = fetcher.fetch_metrics.clone();
+    let arrow_metrics = if fetch_metrics.is_some() {
+        ArrowReaderMetrics::enabled()
+    } else {
+        ArrowReaderMetrics::disabled()
+    };
     let mut builder = ParquetPushDecoderBuilder::new_with_metadata(arrow_metadata)
         .with_row_groups(vec![row_group_idx])
         .with_projection(projection)
-        .with_batch_size(batch_size);
+        .with_batch_size(batch_size)
+        .with_metrics(arrow_metrics.clone())
+        .with_max_predicate_cache_size(max_predicate_cache_size);
 
     if let Some(selection) = row_selection {
         builder = builder.with_row_selection(selection);
+    }
+    if let Some(row_filter) = row_filter {
+        builder = builder.with_row_filter(row_filter);
     }
 
     let mut decoder = builder
@@ -335,6 +388,13 @@ pub fn build_sst_parquet_record_batch_stream(
         .context(ReadParquetSnafu { path: &file_path })?;
 
     Ok(async_stream::try_stream! {
+        let _metrics_guard = ArrowReaderMetricsGuard {
+            arrow_metrics,
+            fetch_metrics,
+        };
+        if let Some(metrics) = &prefilter_metrics {
+            metrics.start();
+        }
         loop {
             match decoder.try_decode().context(ReadParquetSnafu { path: &file_path })? {
                 DecodeResult::NeedsData(ranges) => {

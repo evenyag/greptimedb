@@ -127,6 +127,9 @@ pub struct MitoConfig {
     pub range_result_cache_size: ReadableSize,
     /// Cache size for prefilter results. Setting it to 0 to disable the cache.
     pub prefilter_result_cache_size: ReadableSize,
+    /// Maximum decoded predicate-column cache size for each active parquet row group.
+    /// Setting it to 0 disables decoded-column reuse.
+    pub experimental_prefilter_column_cache_size: ReadableSize,
     /// Whether to enable the write cache.
     pub enable_write_cache: bool,
     /// File system path for write cache dir's root, defaults to `{data_home}`.
@@ -220,6 +223,7 @@ impl Default for MitoConfig {
             selector_result_cache_size: ReadableSize::mb(512),
             range_result_cache_size: ReadableSize::mb(512),
             prefilter_result_cache_size: ReadableSize::mb(128),
+            experimental_prefilter_column_cache_size: ReadableSize::mb(16),
             enable_write_cache: false,
             write_cache_path: String::new(),
             write_cache_size: ReadableSize::gb(5),
@@ -400,6 +404,21 @@ mod tests {
 
         let config: MitoConfig = toml::from_str("experimental_series_scan_v2 = false").unwrap();
         assert!(!config.experimental_series_scan_v2);
+    }
+
+    #[test]
+    fn test_experimental_prefilter_column_cache_size_config() {
+        assert_eq!(
+            ReadableSize::mb(16),
+            MitoConfig::default().experimental_prefilter_column_cache_size
+        );
+
+        let config: MitoConfig =
+            toml::from_str("experimental_prefilter_column_cache_size = '8MB'").unwrap();
+        assert_eq!(
+            ReadableSize::mb(8),
+            config.experimental_prefilter_column_cache_size
+        );
     }
 }
 

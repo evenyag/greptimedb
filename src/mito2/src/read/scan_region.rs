@@ -239,6 +239,8 @@ pub(crate) struct ScanRegion {
     cache_strategy: CacheStrategy,
     /// Maximum number of SST files to scan concurrently.
     max_concurrent_scan_files: usize,
+    /// Maximum decoded predicate-column cache size for each parquet row group.
+    prefilter_column_cache_size: usize,
     /// Memory pool shared by internal scan operators across all queries.
     scan_memory_pool: Arc<dyn MemoryPool>,
     /// Whether to enable the experimental two-phase metric series scan.
@@ -274,6 +276,7 @@ impl ScanRegion {
             request,
             cache_strategy,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
+            prefilter_column_cache_size: crate::sst::parquet::DEFAULT_PREFILTER_COLUMN_CACHE_SIZE,
             scan_memory_pool: Arc::new(UnboundedMemoryPool::default()),
             experimental_series_scan_v2: false,
             ignore_inverted_index: false,
@@ -301,6 +304,13 @@ impl ScanRegion {
         max_concurrent_scan_files: usize,
     ) -> Self {
         self.max_concurrent_scan_files = max_concurrent_scan_files;
+        self
+    }
+
+    /// Sets the decoded predicate-column cache size for each parquet row group.
+    #[must_use]
+    pub(crate) fn with_prefilter_column_cache_size(mut self, bytes: usize) -> Self {
+        self.prefilter_column_cache_size = bytes;
         self
     }
 
@@ -563,6 +573,7 @@ impl ScanRegion {
             .with_bloom_filter_index_appliers(bloom_filter_appliers)
             .with_fulltext_index_appliers(fulltext_index_appliers)
             .with_max_concurrent_scan_files(self.max_concurrent_scan_files)
+            .with_prefilter_column_cache_size(self.prefilter_column_cache_size)
             .with_scan_memory_pool(self.scan_memory_pool)
             .with_start_time(self.start_time)
             .with_append_mode(self.version.options.append_mode)
@@ -916,6 +927,8 @@ pub struct ScanInput {
     pub(crate) files: Vec<FileHandle>,
     /// Scan-wide hint for rows in an execution batch.
     batch_size: usize,
+    /// Maximum decoded predicate-column cache size for each parquet row group.
+    prefilter_column_cache_size: usize,
     /// Cache.
     pub(crate) cache_strategy: CacheStrategy,
     /// Ignores file not found error.
@@ -972,6 +985,7 @@ impl ScanInput {
             memtables: Vec::new(),
             files: Vec::new(),
             batch_size: crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+            prefilter_column_cache_size: crate::sst::parquet::DEFAULT_PREFILTER_COLUMN_CACHE_SIZE,
             cache_strategy: CacheStrategy::Disabled,
             ignore_file_not_found: false,
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
@@ -1036,6 +1050,13 @@ impl ScanInput {
     #[must_use]
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Sets the decoded predicate-column cache size for each parquet row group.
+    #[must_use]
+    pub(crate) fn with_prefilter_column_cache_size(mut self, bytes: usize) -> Self {
+        self.prefilter_column_cache_size = bytes;
         self
     }
 
@@ -1330,6 +1351,7 @@ impl ScanInput {
             .bloom_filter_index_appliers(self.bloom_filter_index_appliers.clone())
             .fulltext_index_appliers(self.fulltext_index_appliers.clone());
         let reader = reader.batch_size(self.batch_size);
+        let reader = reader.prefilter_column_cache_size(self.prefilter_column_cache_size);
         let reader = if !self.compaction && may_build_selective_row_selection {
             reader.deferred_optional_page_index()
         } else {

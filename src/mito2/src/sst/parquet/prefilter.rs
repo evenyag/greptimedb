@@ -20,7 +20,8 @@
 
 use std::collections::HashSet;
 use std::ops::{BitAnd, Range};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
@@ -28,11 +29,11 @@ use datafusion_expr::Expr;
 use datatypes::arrow::array::{Array, BinaryArray, BooleanArray, BooleanBufferBuilder};
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::error::ArrowError;
 use datatypes::arrow::record_batch::RecordBatch;
-use futures::StreamExt;
 use mito_codec::row_converter::{PrimaryKeyCodec, PrimaryKeyFilter, build_primary_key_codec};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::RowSelection;
+use parquet::arrow::arrow_reader::{ArrowPredicate, RowFilter, RowSelection};
 use parquet::schema::types::SchemaDescriptor;
 use smallvec::{SmallVec, smallvec};
 use snafu::{OptionExt, ResultExt};
@@ -40,7 +41,7 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use table::predicate::Predicate;
 
-use crate::cache::PrefilterKey;
+use crate::cache::{CacheStrategy, PrefilterKey};
 use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, EvalPartitionFilterSnafu, NewRecordBatchSnafu,
     RecordBatchSnafu, Result, UnexpectedSnafu,
@@ -52,6 +53,7 @@ use crate::sst::parquet::reader::{
     MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
 };
+use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
 pub(crate) fn matching_row_ranges_by_primary_key(
     input: &RecordBatch,
@@ -315,8 +317,8 @@ pub(crate) fn simple_tag_filters(
 
 /// How the parquet reader should apply each predicate.
 ///
-/// The reader runs in two phases. Predicates routed into `prefilter_builder`
-/// execute on a reduced column set first to compute a refined row selection;
+/// Predicates routed into `prefilter_builder` execute through parquet's row
+/// filter on a reduced column set before the output projection is decoded.
 /// `remaining_simple_filters` execute alongside the full projection on the
 /// normal read path. The contract for what is precise vs best-effort is
 /// documented on [`build_reader_filter_plan`].
@@ -419,9 +421,8 @@ pub(crate) fn build_reader_filter_plan(
     let mut primary_key_filters = Vec::new();
     let mut pk_filter_contexts = Vec::new();
 
-    // `SkipFields` keeps field predicates in the normal read path to avoid a
-    // second read of projected field columns, while tags/timestamp can still
-    // participate in prefiltering.
+    // `SkipFields` keeps field predicates in the normal read path, while
+    // tags/timestamp can still participate in prefiltering.
     let field_prefilter_enabled = pre_filter_mode == PreFilterMode::All;
     // When true, tag columns are encoded in the primary key column and are NOT
     // stored as separate parquet columns. Tag predicates must go through PK
@@ -680,18 +681,65 @@ impl PrefilterContextBuilder {
 const PREFILTER_COLUMN_RATIO_THRESHOLD: f64 = 0.5;
 const PREFILTER_MIN_REMAINING_COLUMNS: usize = 2;
 
-/// Result of prefiltering a row group.
-pub(crate) struct PrefilterResult {
-    /// Refined row selection after prefiltering.
-    pub(crate) refined_selection: RowSelection,
-    /// Number of rows filtered out by prefiltering.
-    pub(crate) filtered_rows: usize,
+/// Plan for applying a prefilter while reading a row group.
+pub(crate) struct PrefilterReadPlan {
+    /// Upstream row selection, refined immediately when all predicate masks are cached.
+    pub(crate) row_selection: Option<RowSelection>,
+    /// Predicate evaluated by the parquet push decoder for cache misses.
+    pub(crate) row_filter: Option<RowFilter>,
+    /// Tracks the lazy parquet prefilter phase.
+    pub(crate) metrics_tracker: Option<PrefilterMetricsTracker>,
+    /// Number of rows filtered eagerly by a complete prefilter-result cache hit.
+    pub(crate) eagerly_filtered_rows: Option<usize>,
 }
 
-/// Executes prefiltering on a row group.
-///
-/// Reads only the prefilter columns (currently the PK dictionary column),
-/// applies filters, and returns a refined [RowSelection].
+/// Tracks the wall-clock cost and filtered rows of a lazy parquet prefilter.
+#[derive(Clone)]
+pub(crate) struct PrefilterMetricsTracker {
+    state: Arc<Mutex<PrefilterMetricsState>>,
+    fetch_metrics: ParquetFetchMetrics,
+}
+
+#[derive(Default)]
+struct PrefilterMetricsState {
+    start: Option<Instant>,
+    finished: bool,
+}
+
+impl PrefilterMetricsTracker {
+    fn new(fetch_metrics: ParquetFetchMetrics) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(PrefilterMetricsState::default())),
+            fetch_metrics,
+        }
+    }
+
+    /// Starts timing immediately before the decoder begins requesting predicate data.
+    pub(crate) fn start(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.start.get_or_insert_with(Instant::now);
+    }
+
+    fn finish(&self, filtered_rows: usize) {
+        let elapsed = {
+            let mut state = self.state.lock().unwrap();
+            if state.finished {
+                return;
+            }
+            let Some(start) = state.start else {
+                return;
+            };
+            state.finished = true;
+            start.elapsed()
+        };
+
+        let mut data = self.fetch_metrics.data.lock().unwrap();
+        data.prefilter_cost += elapsed;
+        data.prefilter_filtered_rows += filtered_rows;
+    }
+}
+
+/// Computes the parquet projection needed to evaluate the prefilter.
 fn compute_projection_mask(
     column_names: &HashSet<String>,
     arrow_schema: &datatypes::arrow::datatypes::SchemaRef,
@@ -740,28 +788,29 @@ fn should_use_prefilter(
     ratio <= PREFILTER_COLUMN_RATIO_THRESHOLD
 }
 
-pub(crate) async fn execute_prefilter(
-    prefilter_ctx: &mut PrefilterContext,
+pub(crate) fn build_prefilter_read_plan(
+    prefilter_ctx: PrefilterContext,
     reader_builder: &RowGroupReaderBuilder,
     build_ctx: &RowGroupBuildContext<'_>,
-) -> Result<PrefilterResult> {
-    let entries = build_prefilter_cache_entries(prefilter_ctx, reader_builder, build_ctx);
-
-    if entries.is_empty() {
-        return execute_prefilter_by_reading_columns(prefilter_ctx, reader_builder, build_ctx)
-            .await;
+) -> Result<PrefilterReadPlan> {
+    let entries = build_prefilter_cache_entries(&prefilter_ctx, reader_builder, build_ctx);
+    let expected_rows = rows_before_filter(reader_builder, build_ctx);
+    if expected_rows == 0 {
+        for entry in entries {
+            if let Some(key) = entry.key {
+                reader_builder
+                    .cache_strategy()
+                    .put_prefilter_result(key, Arc::new(BooleanBuffer::new_set(0)));
+            }
+        }
+        return Ok(PrefilterReadPlan {
+            row_selection: Some(RowSelection::from(vec![])),
+            row_filter: None,
+            metrics_tracker: None,
+            eagerly_filtered_rows: Some(0),
+        });
     }
 
-    execute_prefilter_with_result_cache(prefilter_ctx, reader_builder, build_ctx, entries).await
-}
-
-async fn execute_prefilter_with_result_cache(
-    prefilter_ctx: &mut PrefilterContext,
-    reader_builder: &RowGroupReaderBuilder,
-    build_ctx: &RowGroupBuildContext<'_>,
-    entries: Vec<PrefilterEntry>,
-) -> Result<PrefilterResult> {
-    let non_cacheable_physical = non_cacheable_physical_filters(prefilter_ctx);
     let mut hit_mask: Option<BooleanBuffer> = None;
     let mut misses = Vec::new();
     for entry in entries {
@@ -770,7 +819,9 @@ async fn execute_prefilter_with_result_cache(
             continue;
         };
 
-        if let Some(mask) = reader_builder.cache_strategy().get_prefilter_result(key) {
+        if let Some(mask) = reader_builder.cache_strategy().get_prefilter_result(key)
+            && mask.len() == expected_rows
+        {
             hit_mask = Some(match hit_mask {
                 Some(hit_mask) => hit_mask.bitand(mask.as_ref()),
                 None => mask.as_ref().clone(),
@@ -780,61 +831,20 @@ async fn execute_prefilter_with_result_cache(
         }
     }
 
-    if misses.is_empty() && non_cacheable_physical.is_empty() {
-        let combined_mask = hit_mask.unwrap_or_else(|| BooleanBuffer::new_set(0));
-        let refined_selection =
-            refined_selection_from_mask(&combined_mask, &build_ctx.row_selection);
-        let rows_before_filter = rows_before_filter(reader_builder, build_ctx);
-        let filtered_rows = rows_before_filter.saturating_sub(refined_selection.row_count());
-        return Ok(PrefilterResult {
-            refined_selection,
-            filtered_rows,
+    if misses.is_empty() {
+        let combined_mask = hit_mask.unwrap_or_else(|| BooleanBuffer::new_set(expected_rows));
+        debug_assert_eq!(combined_mask.len(), expected_rows);
+        let row_selection = refined_selection_from_mask(&combined_mask, &build_ctx.row_selection);
+        let filtered_rows = expected_rows.saturating_sub(row_selection.row_count());
+        return Ok(PrefilterReadPlan {
+            row_selection: Some(row_selection),
+            row_filter: None,
+            metrics_tracker: None,
+            eagerly_filtered_rows: Some(filtered_rows),
         });
     }
 
-    let mut uncached_entries = misses;
-    uncached_entries.extend(
-        non_cacheable_physical
-            .iter()
-            .copied()
-            .map(|idx| PrefilterEntry::without_cache(PrefilterEntryKind::Physical(idx))),
-    );
-    let (uncached_mask, read_rows) =
-        build_prefilter_masks(prefilter_ctx, reader_builder, build_ctx, &uncached_entries).await?;
-
-    let final_mask = match (hit_mask, uncached_mask) {
-        (Some(hit_mask), Some(uncached_mask)) => hit_mask.bitand(&uncached_mask),
-        (Some(hit_mask), None) => hit_mask,
-        (None, Some(uncached_mask)) => uncached_mask,
-        (None, None) => BooleanBuffer::new_set(read_rows),
-    };
-    debug_assert_eq!(final_mask.len(), read_rows);
-    let rows_selected = final_mask.count_set_bits();
-    let filtered_rows = read_rows.saturating_sub(rows_selected);
-    let refined_selection = refined_selection_from_mask(&final_mask, &build_ctx.row_selection);
-
-    Ok(PrefilterResult {
-        refined_selection,
-        filtered_rows,
-    })
-}
-
-fn non_cacheable_physical_filters(prefilter_ctx: &PrefilterContext) -> Vec<usize> {
-    prefilter_ctx
-        .physical_filters
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, filter)| (!filter.is_immutable()).then_some(idx))
-        .collect()
-}
-
-async fn build_prefilter_masks(
-    prefilter_ctx: &mut PrefilterContext,
-    reader_builder: &RowGroupReaderBuilder,
-    build_ctx: &RowGroupBuildContext<'_>,
-    entries: &[PrefilterEntry],
-) -> Result<(Option<BooleanBuffer>, usize)> {
-    let prefilter_column_names = prefilter_column_names_for_entries(prefilter_ctx, entries);
+    let prefilter_column_names = prefilter_column_names_for_entries(&prefilter_ctx, &misses);
     let parquet_schema = reader_builder
         .parquet_metadata()
         .file_metadata()
@@ -844,61 +854,27 @@ async fn build_prefilter_masks(
         &prefilter_ctx.arrow_schema,
         parquet_schema,
     );
+    let metrics_tracker = build_ctx
+        .fetch_metrics
+        .cloned()
+        .map(PrefilterMetricsTracker::new);
+    let predicate = PrefilterPredicate::new(
+        projection,
+        prefilter_ctx,
+        misses,
+        hit_mask,
+        expected_rows,
+        reader_builder.cache_strategy().clone(),
+        reader_builder.file_path().to_string(),
+        metrics_tracker.clone(),
+    );
 
-    let mut stream = reader_builder
-        .build_with_projection(
-            build_ctx.row_group_idx,
-            build_ctx.row_selection.clone(),
-            projection,
-            build_ctx.fetch_metrics,
-        )
-        .await?;
-
-    let mut cache_builders = entries
-        .iter()
-        .map(|entry| entry.key.is_some().then(|| BooleanBufferBuilder::new(0)))
-        .collect::<Vec<_>>();
-    let mut combined_builder = (!entries.is_empty()).then(|| BooleanBufferBuilder::new(0));
-    let mut rows_before_filter = 0usize;
-
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result?;
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            continue;
-        }
-        rows_before_filter += num_rows;
-
-        let mut batch_mask = BooleanBuffer::new_set(num_rows);
-        for (idx, entry) in entries.iter().enumerate() {
-            let mask = eval_entry_mask(
-                &batch,
-                prefilter_ctx,
-                entry.kind,
-                reader_builder.file_path(),
-            )?;
-            batch_mask = batch_mask.bitand(&mask);
-            if let Some(Some(builder)) = cache_builders.get_mut(idx) {
-                builder.append_buffer(&mask);
-            }
-        }
-        if let Some(builder) = &mut combined_builder {
-            builder.append_buffer(&batch_mask);
-        }
-    }
-
-    for (entry, builder) in entries.iter().zip(cache_builders) {
-        if let (Some(key), Some(mut builder)) = (&entry.key, builder) {
-            reader_builder
-                .cache_strategy()
-                .put_prefilter_result(key.clone(), Arc::new(builder.finish()));
-        }
-    }
-
-    Ok((
-        combined_builder.map(|mut builder| builder.finish()),
-        rows_before_filter,
-    ))
+    Ok(PrefilterReadPlan {
+        row_selection: build_ctx.row_selection.clone(),
+        row_filter: Some(RowFilter::new(vec![Box::new(predicate)])),
+        metrics_tracker,
+        eagerly_filtered_rows: None,
+    })
 }
 
 fn prefilter_column_names_for_entries(
@@ -928,48 +904,6 @@ fn prefilter_column_names_for_entries(
     prefilter_column_names
 }
 
-async fn execute_prefilter_by_reading_columns(
-    prefilter_ctx: &mut PrefilterContext,
-    reader_builder: &RowGroupReaderBuilder,
-    build_ctx: &RowGroupBuildContext<'_>,
-) -> Result<PrefilterResult> {
-    let entries = all_prefilter_entries(prefilter_ctx);
-    let (mask, rows_before_filter) =
-        build_prefilter_masks(prefilter_ctx, reader_builder, build_ctx, &entries).await?;
-
-    let final_mask = mask.unwrap_or_else(|| BooleanBuffer::new_set(rows_before_filter));
-    let rows_selected = final_mask.count_set_bits();
-    let filtered_rows = rows_before_filter.saturating_sub(rows_selected);
-    let refined_selection = refined_selection_from_mask(&final_mask, &build_ctx.row_selection);
-
-    Ok(PrefilterResult {
-        refined_selection,
-        filtered_rows,
-    })
-}
-
-fn all_prefilter_entries(prefilter_ctx: &PrefilterContext) -> Vec<PrefilterEntry> {
-    let mut entries = Vec::new();
-    if prefilter_ctx.pk_filter.is_some() {
-        entries.push(PrefilterEntry::without_cache(PrefilterEntryKind::PkGroup));
-    }
-    entries.extend(
-        prefilter_ctx
-            .filters
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| PrefilterEntry::without_cache(PrefilterEntryKind::Simple(idx))),
-    );
-    entries.extend(
-        prefilter_ctx
-            .physical_filters
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| PrefilterEntry::without_cache(PrefilterEntryKind::Physical(idx))),
-    );
-    entries
-}
-
 #[derive(Clone, Copy)]
 enum PrefilterEntryKind {
     Simple(usize),
@@ -982,9 +916,107 @@ struct PrefilterEntry {
     key: Option<PrefilterKey>,
 }
 
-impl PrefilterEntry {
-    fn without_cache(kind: PrefilterEntryKind) -> Self {
-        Self { kind, key: None }
+struct PrefilterPredicate {
+    projection: ProjectionMask,
+    prefilter_ctx: PrefilterContext,
+    entries: Vec<PrefilterEntry>,
+    hit_mask: Option<BooleanBuffer>,
+    cache_builders: Vec<Option<BooleanBufferBuilder>>,
+    processed_rows: usize,
+    expected_rows: usize,
+    filtered_rows: usize,
+    cache_strategy: CacheStrategy,
+    file_path: String,
+    metrics_tracker: Option<PrefilterMetricsTracker>,
+}
+
+impl PrefilterPredicate {
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        projection: ProjectionMask,
+        prefilter_ctx: PrefilterContext,
+        entries: Vec<PrefilterEntry>,
+        hit_mask: Option<BooleanBuffer>,
+        expected_rows: usize,
+        cache_strategy: CacheStrategy,
+        file_path: String,
+        metrics_tracker: Option<PrefilterMetricsTracker>,
+    ) -> Self {
+        let cache_builders = entries
+            .iter()
+            .map(|entry| entry.key.is_some().then(|| BooleanBufferBuilder::new(0)))
+            .collect();
+        Self {
+            projection,
+            prefilter_ctx,
+            entries,
+            hit_mask,
+            cache_builders,
+            processed_rows: 0,
+            expected_rows,
+            filtered_rows: 0,
+            cache_strategy,
+            file_path,
+            metrics_tracker,
+        }
+    }
+
+    fn evaluate_batch(&mut self, batch: &RecordBatch) -> Result<BooleanBuffer> {
+        let num_rows = batch.num_rows();
+        if self.processed_rows.saturating_add(num_rows) > self.expected_rows {
+            return UnexpectedSnafu {
+                reason: format!(
+                    "Prefilter received more rows than expected for {}: processed {}, batch {}, expected {}",
+                    self.file_path, self.processed_rows, num_rows, self.expected_rows
+                ),
+            }
+            .fail();
+        }
+        let mut combined_mask = self
+            .hit_mask
+            .as_ref()
+            .map(|mask| mask.slice(self.processed_rows, num_rows))
+            .unwrap_or_else(|| BooleanBuffer::new_set(num_rows));
+
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let mask =
+                eval_entry_mask(batch, &mut self.prefilter_ctx, entry.kind, &self.file_path)?;
+            combined_mask = combined_mask.bitand(&mask);
+            if let Some(Some(builder)) = self.cache_builders.get_mut(idx) {
+                builder.append_buffer(&mask);
+            }
+        }
+
+        self.processed_rows += num_rows;
+        self.filtered_rows += num_rows.saturating_sub(combined_mask.count_set_bits());
+        if self.processed_rows == self.expected_rows {
+            self.finish();
+        }
+        Ok(combined_mask)
+    }
+
+    fn finish(&mut self) {
+        for (entry, builder) in self.entries.iter().zip(&mut self.cache_builders) {
+            if let (Some(key), Some(mut builder)) = (&entry.key, builder.take()) {
+                self.cache_strategy
+                    .put_prefilter_result(key.clone(), Arc::new(builder.finish()));
+            }
+        }
+        if let Some(tracker) = &self.metrics_tracker {
+            tracker.finish(self.filtered_rows);
+        }
+    }
+}
+
+impl ArrowPredicate for PrefilterPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> std::result::Result<BooleanArray, ArrowError> {
+        self.evaluate_batch(&batch)
+            .map(|mask| BooleanArray::new(mask, None))
+            .map_err(|error| ArrowError::ExternalError(Box::new(error)))
     }
 }
 
@@ -1012,33 +1044,32 @@ fn build_prefilter_cache_entries(
     }
 
     for (idx, filter_ctx) in prefilter_ctx.physical_filters.iter().enumerate() {
-        if !filter_ctx.is_immutable() {
-            continue;
-        }
         entries.push(PrefilterEntry {
             kind: PrefilterEntryKind::Physical(idx),
-            key: Some(PrefilterKey::new(
-                file_id,
-                row_group_idx,
-                row_selection.clone(),
-                prefilter_ctx.schema_version,
-                smallvec![filter_ctx.expr_str().to_string()],
-            )),
+            key: filter_ctx.is_immutable().then(|| {
+                PrefilterKey::new(
+                    file_id,
+                    row_group_idx,
+                    row_selection.clone(),
+                    prefilter_ctx.schema_version,
+                    smallvec![filter_ctx.expr_str().to_string()],
+                )
+            }),
         });
     }
 
-    if prefilter_ctx.pk_filter.is_some()
-        && let Some(exprs) = &prefilter_ctx.pk_filter_expr_strs
-    {
+    if prefilter_ctx.pk_filter.is_some() {
         entries.push(PrefilterEntry {
             kind: PrefilterEntryKind::PkGroup,
-            key: Some(PrefilterKey::new(
-                file_id,
-                row_group_idx,
-                row_selection,
-                prefilter_ctx.schema_version,
-                exprs.clone(),
-            )),
+            key: prefilter_ctx.pk_filter_expr_strs.as_ref().map(|exprs| {
+                PrefilterKey::new(
+                    file_id,
+                    row_group_idx,
+                    row_selection,
+                    prefilter_ctx.schema_version,
+                    exprs.clone(),
+                )
+            }),
         });
     }
 
@@ -1202,8 +1233,10 @@ mod tests {
     use datatypes::arrow::datatypes::{DataType, Field, Schema, UInt32Type};
     use mito_codec::row_converter::{PrimaryKeyFilter, build_primary_key_codec};
     use store_api::codec::PrimaryKeyEncoding;
+    use store_api::storage::FileId;
 
     use super::*;
+    use crate::cache::CacheManager;
     use crate::read::read_columns::ReadColumns;
     use crate::sst::internal_fields;
     use crate::sst::parquet::flat_format::{FlatReadFormat, primary_key_column_index};
@@ -1757,6 +1790,82 @@ mod tests {
 
         let mask = eval_physical_filter_mask(&batch, &physical_filters[0], "test").unwrap();
         assert_eq!(mask.count_set_bits(), 1);
+    }
+
+    #[test]
+    fn test_prefilter_predicate_publishes_complete_masks_and_metrics() {
+        let metadata: RegionMetadataRef = Arc::new(sst_region_metadata());
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::new(metadata.column_metadatas.iter().map(|c| c.column_id)),
+            None,
+            "test",
+            true,
+        )
+        .unwrap();
+        let codec = build_primary_key_codec(metadata.as_ref());
+        let filters = new_simple_filter_contexts(&metadata, &[col("tag_0").eq(lit("a"))]);
+        let prefilter_ctx = PrefilterContextBuilder::new(
+            &read_format,
+            &codec,
+            None,
+            None,
+            filters,
+            Vec::new(),
+            metadata.schema_version,
+        )
+        .unwrap()
+        .build();
+
+        let key = PrefilterKey::new(
+            FileId::random(),
+            0,
+            None,
+            metadata.schema_version,
+            smallvec!["tag_0 = a".to_string()],
+        );
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_result_cache_size(1024)
+                .build(),
+        );
+        let cache_strategy = CacheStrategy::EnableAll(cache.clone());
+        let fetch_metrics = ParquetFetchMetrics::default();
+        let tracker = PrefilterMetricsTracker::new(fetch_metrics.clone());
+        tracker.start();
+        let mut predicate = PrefilterPredicate::new(
+            ProjectionMask::all(),
+            prefilter_ctx,
+            vec![PrefilterEntry {
+                kind: PrefilterEntryKind::Simple(0),
+                key: Some(key.clone()),
+            }],
+            Some(BooleanBuffer::from(vec![true, false, true, false])),
+            4,
+            cache_strategy,
+            "test".to_string(),
+            Some(tracker),
+        );
+
+        let first = new_record_batch_with_custom_sequence(&["a", "x"], 0, 2, 1);
+        assert_eq!(
+            1,
+            predicate.evaluate_batch(&first).unwrap().count_set_bits()
+        );
+        assert!(cache.get_prefilter_result(&key).is_none());
+
+        let second = new_record_batch_with_custom_sequence(&["a", "x"], 2, 4, 1);
+        assert_eq!(
+            1,
+            predicate.evaluate_batch(&second).unwrap().count_set_bits()
+        );
+        let cached = cache.get_prefilter_result(&key).unwrap();
+        assert_eq!(4, cached.len());
+        assert_eq!(4, cached.count_set_bits());
+
+        let metrics = fetch_metrics.data.lock().unwrap();
+        assert!(!metrics.prefilter_cost.is_zero());
+        assert_eq!(2, metrics.prefilter_filtered_rows);
     }
 
     #[test]

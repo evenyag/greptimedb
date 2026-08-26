@@ -52,12 +52,19 @@ pub struct ParquetFetchMetricsData {
     pub prefilter_cost: std::time::Duration,
     /// Number of rows filtered out by prefiltering.
     pub prefilter_filtered_rows: usize,
+    /// Predicate column-records served from parquet's decoded-array cache.
+    pub predicate_cache_records_read_from_cache: usize,
+    /// Predicate column-records decoded because they were absent from the cache.
+    pub predicate_cache_records_read_from_inner: usize,
 }
 
 impl ParquetFetchMetricsData {
     /// Returns true if the metrics are empty (contain no meaningful data).
     fn is_empty(&self) -> bool {
-        self.total_fetch_elapsed.is_zero() && self.prefilter_cost.is_zero()
+        self.total_fetch_elapsed.is_zero()
+            && self.prefilter_cost.is_zero()
+            && self.predicate_cache_records_read_from_cache == 0
+            && self.predicate_cache_records_read_from_inner == 0
     }
 }
 
@@ -90,6 +97,8 @@ impl std::fmt::Debug for ParquetFetchMetrics {
             total_fetch_elapsed,
             prefilter_cost,
             prefilter_filtered_rows,
+            predicate_cache_records_read_from_cache,
+            predicate_cache_records_read_from_inner,
         } = *data;
 
         write!(f, "{{")?;
@@ -158,6 +167,20 @@ impl std::fmt::Debug for ParquetFetchMetrics {
                 prefilter_filtered_rows
             )?;
         }
+        if predicate_cache_records_read_from_cache > 0 {
+            write!(
+                f,
+                ", \"predicate_cache_records_read_from_cache\":{}",
+                predicate_cache_records_read_from_cache
+            )?;
+        }
+        if predicate_cache_records_read_from_inner > 0 {
+            write!(
+                f,
+                ", \"predicate_cache_records_read_from_inner\":{}",
+                predicate_cache_records_read_from_inner
+            )?;
+        }
 
         write!(f, "}}")
     }
@@ -187,6 +210,8 @@ impl ParquetFetchMetrics {
             total_fetch_elapsed,
             prefilter_cost,
             prefilter_filtered_rows,
+            predicate_cache_records_read_from_cache,
+            predicate_cache_records_read_from_inner,
         } = *other.data.lock().unwrap();
 
         let mut data = self.data.lock().unwrap();
@@ -205,6 +230,8 @@ impl ParquetFetchMetrics {
         data.total_fetch_elapsed += total_fetch_elapsed;
         data.prefilter_cost += prefilter_cost;
         data.prefilter_filtered_rows += prefilter_filtered_rows;
+        data.predicate_cache_records_read_from_cache += predicate_cache_records_read_from_cache;
+        data.predicate_cache_records_read_from_inner += predicate_cache_records_read_from_inner;
     }
 }
 

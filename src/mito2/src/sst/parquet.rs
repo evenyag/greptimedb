@@ -48,6 +48,8 @@ pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 /// default execution batch size to reduce rebatching and concatenation in the
 /// query pipeline.
 pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
+/// Default decoded predicate-column cache size for each active parquet row group.
+pub(crate) const DEFAULT_PREFILTER_COLUMN_CACHE_SIZE: usize = 16 * 1024 * 1024;
 /// Default row group size for parquet files.
 ///
 /// Keep the existing persisted/on-disk default stable. It intentionally stays
@@ -1945,9 +1947,20 @@ mod tests {
         .await;
         let handle = create_file_handle_from_sst_info(&info, &metadata);
 
-        let builder =
-            ParquetReaderBuilder::new(FILE_DIR.to_string(), PathType::Bare, handle, object_store)
-                .predicate(Some(Predicate::new(vec![col("tag_0").eq(lit("a"))])));
+        let predicate = Predicate::new(vec![col("tag_0").eq(lit("a"))]);
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_result_cache_size(1024 * 1024)
+                .build(),
+        );
+        let builder = ParquetReaderBuilder::new(
+            FILE_DIR.to_string(),
+            PathType::Bare,
+            handle.clone(),
+            object_store.clone(),
+        )
+        .predicate(Some(predicate.clone()))
+        .cache(CacheStrategy::EnableAll(cache.clone()));
 
         let mut metrics = ReaderMetrics::default();
         let (context, _) = builder
@@ -1968,6 +1981,78 @@ mod tests {
             &[new_record_batch_by_range(&["a", "d"], 0, 3)],
         )
         .await;
+
+        {
+            let metrics = reader.fetch_metrics().data.lock().unwrap();
+            assert!(!metrics.prefilter_cost.is_zero());
+            assert_eq!(3, metrics.prefilter_filtered_rows);
+            assert!(metrics.predicate_cache_records_read_from_cache > 0);
+            assert!(metrics.predicate_cache_records_read_from_inner > 0);
+        }
+
+        let builder = ParquetReaderBuilder::new(
+            FILE_DIR.to_string(),
+            PathType::Bare,
+            handle.clone(),
+            object_store.clone(),
+        )
+        .predicate(Some(predicate.clone()))
+        .cache(CacheStrategy::EnableAll(cache));
+        let mut metrics = ReaderMetrics::default();
+        let (context, _) = builder
+            .build_reader_input(&mut metrics)
+            .await
+            .unwrap()
+            .unwrap();
+        let selection = RowGroupSelection::from_row_ranges(
+            vec![(0, std::iter::once(0..6).collect())],
+            row_group_size,
+        );
+        let mut reader = ParquetReader::new(Arc::new(context), selection)
+            .await
+            .unwrap();
+        check_record_batch_reader_result(
+            &mut reader,
+            &[new_record_batch_by_range(&["a", "d"], 0, 3)],
+        )
+        .await;
+
+        {
+            let metrics = reader.fetch_metrics().data.lock().unwrap();
+            assert!(!metrics.prefilter_cost.is_zero());
+            assert_eq!(3, metrics.prefilter_filtered_rows);
+            assert_eq!(0, metrics.predicate_cache_records_read_from_cache);
+            assert_eq!(0, metrics.predicate_cache_records_read_from_inner);
+        }
+
+        let builder =
+            ParquetReaderBuilder::new(FILE_DIR.to_string(), PathType::Bare, handle, object_store)
+                .predicate(Some(predicate))
+                .prefilter_column_cache_size(0);
+        let mut metrics = ReaderMetrics::default();
+        let (context, _) = builder
+            .build_reader_input(&mut metrics)
+            .await
+            .unwrap()
+            .unwrap();
+        let selection = RowGroupSelection::from_row_ranges(
+            vec![(0, std::iter::once(0..6).collect())],
+            row_group_size,
+        );
+        let mut reader = ParquetReader::new(Arc::new(context), selection)
+            .await
+            .unwrap();
+        check_record_batch_reader_result(
+            &mut reader,
+            &[new_record_batch_by_range(&["a", "d"], 0, 3)],
+        )
+        .await;
+
+        let metrics = reader.fetch_metrics().data.lock().unwrap();
+        assert!(!metrics.prefilter_cost.is_zero());
+        assert_eq!(3, metrics.prefilter_filtered_rows);
+        assert_eq!(0, metrics.predicate_cache_records_read_from_cache);
+        assert_eq!(0, metrics.predicate_cache_records_read_from_inner);
     }
 
     #[tokio::test]

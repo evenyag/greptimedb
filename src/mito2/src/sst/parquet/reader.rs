@@ -36,7 +36,9 @@ use datatypes::prelude::DataType;
 use futures::StreamExt;
 use mito_codec::row_converter::build_primary_key_codec;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection,
+};
 use parquet::arrow::{ProjectionMask, parquet_to_arrow_schema};
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use parquet::file::properties::DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT;
@@ -76,7 +78,6 @@ use crate::sst::index::inverted_index::applier::{
 };
 #[cfg(feature = "vector_index")]
 use crate::sst::index::vector_index::applier::VectorIndexApplierRef;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::file_range::{
     FileRangeContext, FileRangeContextRef, PartitionFilterContext, PreFilterMode, RangeBase,
 };
@@ -85,15 +86,17 @@ use crate::sst::parquet::format::{INTERNAL_COLUMN_NUM, need_override_sequence};
 use crate::sst::parquet::json_align::{NestedSchemaAligner, ProjectedRecordBatchStream};
 use crate::sst::parquet::metadata::MetadataLoader;
 use crate::sst::parquet::prefilter::{
-    PrefilterContextBuilder, build_reader_filter_plan, execute_prefilter,
+    PrefilterContextBuilder, PrefilterMetricsTracker, build_prefilter_read_plan,
+    build_reader_filter_plan,
 };
 use crate::sst::parquet::push_decoder::{
-    SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
+    ParquetPushDecoderOptions, SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
 };
 use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_plan};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
+use crate::sst::parquet::{DEFAULT_PREFILTER_COLUMN_CACHE_SIZE, DEFAULT_READ_BATCH_SIZE};
 use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
 const INDEX_TYPE_FULLTEXT: &str = "fulltext";
@@ -191,6 +194,8 @@ pub struct ParquetReaderBuilder {
     defer_optional_page_index: bool,
     /// Scan-wide hint for rows in a decoded batch.
     batch_size: usize,
+    /// Maximum decoded predicate-column cache size for each row group.
+    prefilter_column_cache_size: usize,
 }
 
 impl ParquetReaderBuilder {
@@ -224,6 +229,7 @@ impl ParquetReaderBuilder {
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
             batch_size: DEFAULT_READ_BATCH_SIZE,
+            prefilter_column_cache_size: DEFAULT_PREFILTER_COLUMN_CACHE_SIZE,
         }
     }
 
@@ -231,6 +237,13 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub(crate) fn batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.clamp(1, DEFAULT_READ_BATCH_SIZE);
+        self
+    }
+
+    /// Sets the decoded predicate-column cache size for each row group.
+    #[must_use]
+    pub(crate) fn prefilter_column_cache_size(mut self, bytes: usize) -> Self {
+        self.prefilter_column_cache_size = bytes;
         self
     }
 
@@ -583,6 +596,7 @@ impl ParquetReaderBuilder {
             cache_strategy: self.cache_strategy.clone(),
             prefilter_builder: filter_plan.prefilter_builder,
             batch_size: self.batch_size,
+            prefilter_column_cache_size: self.prefilter_column_cache_size,
         };
 
         let partition_filter = self.build_partition_filter(&read_format, &prune_schema)?;
@@ -1809,6 +1823,8 @@ pub(crate) struct RowGroupReaderBuilder {
     prefilter_builder: Option<PrefilterContextBuilder>,
     /// Hint for rows in a decoded batch.
     batch_size: usize,
+    /// Maximum decoded predicate-column cache size for this row group.
+    prefilter_column_cache_size: usize,
 }
 
 /// Context passed to [RowGroupReaderBuilder::build()] carrying all information
@@ -1851,9 +1867,9 @@ impl RowGroupReaderBuilder {
 
     /// Builds a parquet record batch stream to read the row group at `row_group_idx`.
     ///
-    /// If prefiltering is applicable (based on `build_ctx`), this performs a two-phase read:
-    /// 1. Reads only the prefilter columns (e.g. PK column), applies filters to get a refined row selection
-    /// 2. Reads the full projection with the refined row selection
+    /// If prefiltering is applicable, parquet evaluates it as a row filter before
+    /// decoding the output projection. Predicate columns shared with the output
+    /// projection can be reused from parquet's bounded decoded-array cache.
     ///
     /// The prefilter pass is *best-effort pruning*, not the precise filter for the query.
     /// Predicates that cannot be lowered to prefilter columns (column not projected,
@@ -1863,17 +1879,15 @@ impl RowGroupReaderBuilder {
     /// flow through [`SimpleFilterEvaluator`] are enforced precisely in this pass. See
     /// [`build_reader_filter_plan`] for the bucketing rules and disabled mode.
     ///
-    /// When the prefilter result selects no rows, the second read still issues but
-    /// parquet-rs short-circuits before any column-chunk IO: the row-group state machine
-    /// jumps to `Finished` once it sees `num_rows_selected() == 0`, so no fast path is
-    /// added here.
+    /// A complete Mito prefilter-result cache hit is applied as a row selection,
+    /// avoiding predicate-column decoding entirely.
     pub(crate) async fn build(
         &self,
         build_ctx: RowGroupBuildContext<'_>,
     ) -> Result<ProjectedRecordBatchStream> {
         let prefilter_ctx = self.prefilter_builder.as_ref().map(|b| b.build());
 
-        let Some(mut prefilter_ctx) = prefilter_ctx else {
+        let Some(prefilter_ctx) = prefilter_ctx else {
             // No prefilter applicable, build stream with full projection.
             let stream = self
                 .build_with_projection(
@@ -1881,27 +1895,31 @@ impl RowGroupReaderBuilder {
                     build_ctx.row_selection,
                     self.projection.mask.clone(),
                     build_ctx.fetch_metrics,
+                    None,
+                    None,
                 )
                 .await?;
             return self.make_projected_stream(stream);
         };
 
         let prefilter_start = Instant::now();
-        let prefilter_result = execute_prefilter(&mut prefilter_ctx, self, &build_ctx).await?;
-        if let Some(metrics) = build_ctx.fetch_metrics {
+        let prefilter_plan = build_prefilter_read_plan(prefilter_ctx, self, &build_ctx)?;
+        if let Some(filtered_rows) = prefilter_plan.eagerly_filtered_rows
+            && let Some(metrics) = build_ctx.fetch_metrics
+        {
             let mut data = metrics.data.lock().unwrap();
             data.prefilter_cost += prefilter_start.elapsed();
-            data.prefilter_filtered_rows += prefilter_result.filtered_rows;
+            data.prefilter_filtered_rows += filtered_rows;
         }
-
-        let refined_selection = Some(prefilter_result.refined_selection);
 
         let stream = self
             .build_with_projection(
                 build_ctx.row_group_idx,
-                refined_selection,
+                prefilter_plan.row_selection,
                 self.projection.mask.clone(),
                 build_ctx.fetch_metrics,
+                prefilter_plan.row_filter,
+                prefilter_plan.metrics_tracker,
             )
             .await?;
         self.make_projected_stream(stream)
@@ -1921,6 +1939,8 @@ impl RowGroupReaderBuilder {
                 build_ctx.row_selection,
                 self.projection.mask.clone(),
                 build_ctx.fetch_metrics,
+                None,
+                None,
             )
             .await?;
         self.make_projected_stream(stream)
@@ -1950,6 +1970,8 @@ impl RowGroupReaderBuilder {
             build_ctx.row_selection,
             projection,
             build_ctx.fetch_metrics,
+            None,
+            None,
         )
         .await
     }
@@ -1977,6 +1999,8 @@ impl RowGroupReaderBuilder {
         row_selection: Option<RowSelection>,
         projection: ProjectionMask,
         fetch_metrics: Option<&ParquetFetchMetrics>,
+        row_filter: Option<RowFilter>,
+        prefilter_metrics: Option<PrefilterMetricsTracker>,
     ) -> Result<ProjectedRecordBatchStream> {
         let range_fetcher = SstParquetRangeFetcher::new(
             self.file_handle.file_id(),
@@ -1989,12 +2013,17 @@ impl RowGroupReaderBuilder {
 
         build_sst_parquet_record_batch_stream(
             self.arrow_metadata.clone(),
-            row_group_idx,
-            row_selection,
-            projection,
             range_fetcher,
             self.file_path.clone(),
-            self.batch_size,
+            ParquetPushDecoderOptions {
+                row_group_idx,
+                row_selection,
+                projection,
+                batch_size: self.batch_size,
+                row_filter,
+                max_predicate_cache_size: self.prefilter_column_cache_size,
+                prefilter_metrics,
+            },
         )
     }
 }
@@ -2382,6 +2411,11 @@ impl ParquetReader {
     pub fn parquet_metadata(&self) -> Arc<ParquetMetaData> {
         self.context.reader_builder().parquet_meta.clone()
     }
+
+    #[cfg(test)]
+    pub(crate) fn fetch_metrics(&self) -> &ParquetFetchMetrics {
+        &self.fetch_metrics
+    }
 }
 
 /// Reader to read a row group of a parquet file in flat format, returning RecordBatch.
@@ -2597,12 +2631,17 @@ mod tests {
         );
         let mut stream = build_sst_parquet_record_batch_stream(
             arrow_metadata,
-            0,
-            None,
-            projection_plan.mask,
             fetcher,
             file_path,
-            1024,
+            ParquetPushDecoderOptions {
+                row_group_idx: 0,
+                row_selection: None,
+                projection: projection_plan.mask,
+                batch_size: 1024,
+                row_filter: None,
+                max_predicate_cache_size: DEFAULT_PREFILTER_COLUMN_CACHE_SIZE,
+                prefilter_metrics: None,
+            },
         )?;
 
         let Some(batch) = stream.next().await.transpose()? else {
