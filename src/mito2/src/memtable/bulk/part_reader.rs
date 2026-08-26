@@ -49,6 +49,8 @@ pub struct EncodedBulkPartIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Whether detailed verbose metrics are enabled.
+    detailed: bool,
 }
 
 impl EncodedBulkPartIter {
@@ -60,6 +62,9 @@ impl EncodedBulkPartIter {
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> error::Result<Self> {
+        let detailed = mem_scan_metrics
+            .as_ref()
+            .is_some_and(MemScanMetrics::detailed);
         let parquet_meta = encoded_part.metadata().parquet_metadata.clone();
         let data = encoded_part.data().clone();
         let series_count = encoded_part.metadata().num_series as usize;
@@ -99,13 +104,36 @@ impl EncodedBulkPartIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            detailed,
         })
     }
 
     fn report_mem_scan_metrics(&mut self) {
         if let Some(mem_scan_metrics) = self.mem_scan_metrics.take() {
+            if self.detailed {
+                self.metrics.bulk_encoded_scan_cost = self.metrics.scan_cost;
+            }
             mem_scan_metrics.merge_inner(&self.metrics);
         }
+    }
+
+    fn next_decoded_batch(
+        reader: &mut ParquetRecordBatchReader,
+        metrics: &mut MemScanMetricsData,
+        detailed: bool,
+    ) -> Option<Result<RecordBatch, datatypes::arrow::error::ArrowError>> {
+        let start = detailed.then(Instant::now);
+        let batch = reader.next();
+        if let Some(start) = start {
+            metrics.bulk_decode_cost += start.elapsed();
+        }
+        if let Some(Ok(batch)) = &batch
+            && detailed
+        {
+            metrics.bulk_decoded_batches += 1;
+            metrics.bulk_decoded_rows += batch.num_rows();
+        }
+        batch
     }
 
     /// Fetches next non-empty record batch.
@@ -118,7 +146,8 @@ impl EncodedBulkPartIter {
             return Ok(None);
         };
 
-        for batch in current {
+        while let Some(batch) = Self::next_decoded_batch(current, &mut self.metrics, self.detailed)
+        {
             let batch = batch.context(DecodeArrowRowGroupSnafu)?;
             if let Some(batch) = apply_combined_filters(
                 &self.context,
@@ -129,6 +158,7 @@ impl EncodedBulkPartIter {
                     .as_mut()
                     .map(|f| f as &mut dyn PrimaryKeyFilter),
                 &mut self.metrics,
+                self.detailed,
             )? {
                 // Update metrics
                 self.metrics.num_batches += 1;
@@ -146,7 +176,9 @@ impl EncodedBulkPartIter {
             let next_reader = self.builder.build_row_group_reader(next_row_group, None)?;
             let current = self.current_reader.insert(next_reader);
 
-            for batch in current {
+            while let Some(batch) =
+                Self::next_decoded_batch(current, &mut self.metrics, self.detailed)
+            {
                 let batch = batch.context(DecodeArrowRowGroupSnafu)?;
                 if let Some(batch) = apply_combined_filters(
                     &self.context,
@@ -157,6 +189,7 @@ impl EncodedBulkPartIter {
                         .as_mut()
                         .map(|f| f as &mut dyn PrimaryKeyFilter),
                     &mut self.metrics,
+                    self.detailed,
                 )? {
                     // Update metrics
                     self.metrics.num_batches += 1;
@@ -228,6 +261,16 @@ pub struct BulkPartBatchIter {
     metrics: MemScanMetricsData,
     /// Optional memory scan metrics to report to.
     mem_scan_metrics: Option<MemScanMetrics>,
+    /// Source representation for this iterator.
+    source: BulkPartSource,
+    /// Whether detailed verbose metrics are enabled.
+    detailed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum BulkPartSource {
+    Raw,
+    Multi,
 }
 
 impl BulkPartBatchIter {
@@ -239,7 +282,28 @@ impl BulkPartBatchIter {
         series_count: usize,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Self {
+        Self::new_with_source(
+            batches,
+            context,
+            sequence,
+            series_count,
+            mem_scan_metrics,
+            BulkPartSource::Multi,
+        )
+    }
+
+    fn new_with_source(
+        batches: Vec<RecordBatch>,
+        context: BulkIterContextRef,
+        sequence: Option<SequenceRange>,
+        series_count: usize,
+        mem_scan_metrics: Option<MemScanMetrics>,
+        source: BulkPartSource,
+    ) -> Self {
         let pk_filter = context.build_pk_filter();
+        let detailed = mem_scan_metrics
+            .as_ref()
+            .is_some_and(MemScanMetrics::detailed);
 
         Self {
             batches: VecDeque::from(batches),
@@ -251,6 +315,8 @@ impl BulkPartBatchIter {
                 ..Default::default()
             },
             mem_scan_metrics,
+            source,
+            detailed,
         }
     }
 
@@ -262,17 +328,28 @@ impl BulkPartBatchIter {
         series_count: usize,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Self {
-        Self::new(
+        Self::new_with_source(
             vec![record_batch],
             context,
             sequence,
             series_count,
             mem_scan_metrics,
+            BulkPartSource::Raw,
         )
     }
 
     fn report_mem_scan_metrics(&mut self) {
         if let Some(mem_scan_metrics) = self.mem_scan_metrics.take() {
+            if self.detailed {
+                match self.source {
+                    BulkPartSource::Raw => {
+                        self.metrics.bulk_raw_scan_cost = self.metrics.scan_cost;
+                    }
+                    BulkPartSource::Multi => {
+                        self.metrics.bulk_multi_scan_cost = self.metrics.scan_cost;
+                    }
+                }
+            }
             mem_scan_metrics.merge_inner(&self.metrics);
         }
     }
@@ -311,6 +388,7 @@ impl BulkPartBatchIter {
                 .as_mut()
                 .map(|f| f as &mut dyn PrimaryKeyFilter),
             &mut self.metrics,
+            self.detailed,
         )?
         else {
             self.metrics.scan_cost += start.elapsed();
@@ -385,6 +463,7 @@ fn apply_combined_filters(
     skip_fields: bool,
     pk_filter: Option<&mut dyn PrimaryKeyFilter>,
     metrics: &mut MemScanMetricsData,
+    detailed: bool,
 ) -> error::Result<Option<RecordBatch>> {
     // Apply PK prefilter on raw batch before convert_batch to reduce conversion overhead.
     let record_batch = if let Some(pk_filter) = pk_filter {
@@ -408,62 +487,74 @@ fn apply_combined_filters(
     };
 
     // Converts the format to the flat format.
+    let convert_start = detailed.then(Instant::now);
     let record_batch = context.read_format().convert_batch(record_batch, None)?;
+    if let Some(convert_start) = convert_start {
+        metrics.bulk_convert_cost += convert_start.elapsed();
+    }
 
-    let num_rows = record_batch.num_rows();
-    let mut combined_filter = None;
-    let mut tag_decode_state = TagDecodeState::new();
+    let filter_start = detailed.then(Instant::now);
+    let result = (|| {
+        let num_rows = record_batch.num_rows();
+        let mut combined_filter = None;
+        let mut tag_decode_state = TagDecodeState::new();
 
-    // Apply predicate filters using the shared method.
-    if !context.base.filters.is_empty() {
-        let predicate_mask = context.base.compute_filter_mask_flat(
-            &record_batch,
-            skip_fields,
-            false,
-            &mut tag_decode_state,
-        )?;
-        // If predicate filters out the entire batch, return None early
-        let Some(mask) = predicate_mask else {
+        // Apply predicate filters using the shared method.
+        if !context.base.filters.is_empty() {
+            let predicate_mask = context.base.compute_filter_mask_flat(
+                &record_batch,
+                skip_fields,
+                false,
+                &mut tag_decode_state,
+            )?;
+            // If predicate filters out the entire batch, return None early
+            let Some(mask) = predicate_mask else {
+                return Ok(None);
+            };
+            combined_filter = Some(BooleanArray::from(mask));
+        }
+
+        // Filters rows by the given `sequence`. Only preserves rows with sequence less than or equal to `sequence`.
+        if let Some(sequence) = sequence {
+            let sequence_column =
+                record_batch.column(sequence_column_index(record_batch.num_columns()));
+            let sequence_filter = sequence
+                .filter(&sequence_column)
+                .context(ComputeArrowSnafu)?;
+            // Combine with existing filter using AND operation
+            combined_filter = match combined_filter {
+                None => Some(sequence_filter),
+                Some(existing_filter) => {
+                    let and_result =
+                        datatypes::arrow::compute::and(&existing_filter, &sequence_filter)
+                            .context(ComputeArrowSnafu)?;
+                    Some(and_result)
+                }
+            };
+        }
+
+        // Apply the combined filter if any filters were applied
+        let Some(filter_array) = combined_filter else {
+            // No filters applied, return original batch
+            return Ok(Some(record_batch));
+        };
+        let select_count = filter_array.true_count();
+        if select_count == 0 {
             return Ok(None);
-        };
-        combined_filter = Some(BooleanArray::from(mask));
-    }
+        }
+        if select_count == num_rows {
+            return Ok(Some(record_batch));
+        }
+        let filtered_batch =
+            datatypes::arrow::compute::filter_record_batch(&record_batch, &filter_array)
+                .context(ComputeArrowSnafu)?;
 
-    // Filters rows by the given `sequence`. Only preserves rows with sequence less than or equal to `sequence`.
-    if let Some(sequence) = sequence {
-        let sequence_column =
-            record_batch.column(sequence_column_index(record_batch.num_columns()));
-        let sequence_filter = sequence
-            .filter(&sequence_column)
-            .context(ComputeArrowSnafu)?;
-        // Combine with existing filter using AND operation
-        combined_filter = match combined_filter {
-            None => Some(sequence_filter),
-            Some(existing_filter) => {
-                let and_result = datatypes::arrow::compute::and(&existing_filter, &sequence_filter)
-                    .context(ComputeArrowSnafu)?;
-                Some(and_result)
-            }
-        };
+        Ok(Some(filtered_batch))
+    })();
+    if let Some(filter_start) = filter_start {
+        metrics.bulk_filter_cost += filter_start.elapsed();
     }
-
-    // Apply the combined filter if any filters were applied
-    let Some(filter_array) = combined_filter else {
-        // No filters applied, return original batch
-        return Ok(Some(record_batch));
-    };
-    let select_count = filter_array.true_count();
-    if select_count == 0 {
-        return Ok(None);
-    }
-    if select_count == num_rows {
-        return Ok(Some(record_batch));
-    }
-    let filtered_batch =
-        datatypes::arrow::compute::filter_record_batch(&record_batch, &filter_array)
-            .context(ComputeArrowSnafu)?;
-
-    Ok(Some(filtered_batch))
+    result
 }
 
 #[cfg(test)]

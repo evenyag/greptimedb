@@ -56,8 +56,9 @@ use crate::memtable::bulk::part_reader::BulkPartBatchIter;
 use crate::memtable::stats::WriteMetrics;
 use crate::memtable::{
     AllocTracker, BoxedBatchIterator, BoxedRecordBatchIterator, EncodedBulkPart, EncodedRange,
-    IterBuilder, KeyValues, MemScanMetrics, Memtable, MemtableBuilder, MemtableId, MemtableRange,
-    MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats, RangesOptions,
+    IterBuilder, KeyValues, MemScanMetrics, MemScanMetricsData, Memtable, MemtableBuilder,
+    MemtableId, MemtableRange, MemtableRangeContext, MemtableRanges, MemtableRef, MemtableStats,
+    RangesOptions,
 };
 use crate::read::flat_dedup::{FlatDedupIterator, FlatLastNonNull, FlatLastRow};
 use crate::read::flat_merge::FlatMergeIterator;
@@ -854,7 +855,25 @@ impl IterBuilder for BulkRangeIterBuilder {
         metrics: Option<MemScanMetrics>,
     ) -> Result<BoxedRecordBatchIterator> {
         let metadata = self.context.read_format().metadata();
-        if should_prune_bulk_part(&self.part.batch, &self.context, metadata) {
+        let detailed = metrics.as_ref().is_some_and(MemScanMetrics::detailed);
+        let prune_start = detailed.then(Instant::now);
+        let pruned = should_prune_bulk_part(&self.part.batch, &self.context, metadata);
+        let prune_cost = prune_start.map(|start| start.elapsed());
+
+        if let (Some(metrics), Some(prune_cost)) = (&metrics, prune_cost) {
+            let num_rows = self.part.batch.num_rows();
+            metrics.merge_inner(&MemScanMetricsData {
+                bulk_raw_ranges: 1,
+                bulk_prune_cost: prune_cost,
+                bulk_raw_parts_before_prune: 1,
+                bulk_raw_parts_pruned: usize::from(pruned),
+                bulk_raw_rows_before_prune: num_rows,
+                bulk_raw_rows_pruned: if pruned { num_rows } else { 0 },
+                ..Default::default()
+            });
+        }
+
+        if pruned {
             return Ok(Box::new(std::iter::empty()));
         }
 
@@ -1663,7 +1682,10 @@ mod tests {
             assert!(range.num_rows() > 0);
             assert!(range.is_record_batch());
 
-            let record_batch_iter = range.build_record_batch_iter(None, None).unwrap();
+            let metrics = MemScanMetrics::new(true);
+            let record_batch_iter = range
+                .build_record_batch_iter(None, Some(metrics.clone()))
+                .unwrap();
 
             let mut total_rows = 0;
             for batch_result in record_batch_iter {
@@ -1673,6 +1695,13 @@ mod tests {
                 assert_eq!(8, batch.num_columns());
             }
             assert_eq!(total_rows, range.num_rows());
+            let data = metrics.data();
+            assert_eq!(1, data.bulk_raw_ranges);
+            assert_eq!(1, data.bulk_raw_parts_before_prune);
+            assert_eq!(0, data.bulk_raw_parts_pruned);
+            assert_eq!(range.num_rows(), data.bulk_raw_rows_before_prune);
+            assert_eq!(0, data.bulk_raw_rows_pruned);
+            assert_eq!(range.num_rows(), data.num_rows);
         }
     }
 

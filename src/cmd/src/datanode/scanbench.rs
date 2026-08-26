@@ -88,6 +88,10 @@ pub struct ScanbenchCommand {
     #[clap(long)]
     table_dir: String,
 
+    /// Region option to use while opening the region, as KEY=VALUE. May be repeated.
+    #[clap(long = "region-option", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    region_options: Vec<String>,
+
     /// Scanner type: seq, unordered, series
     #[clap(long, default_value = "seq")]
     scanner: String,
@@ -140,6 +144,32 @@ struct ScanConfig {
     projection_names: Option<Vec<String>>,
     filters: Option<Vec<String>>,
     series_row_selector: Option<String>,
+}
+
+fn parse_region_options(options: &[String]) -> error::Result<HashMap<String, String>> {
+    let mut parsed = HashMap::with_capacity(options.len());
+    for option in options {
+        let (key, value) = option
+            .split_once('=')
+            .with_context(|| error::IllegalConfigSnafu {
+                msg: format!("Invalid region option '{option}', expected KEY=VALUE"),
+            })?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(error::IllegalConfigSnafu {
+                msg: format!("Invalid region option '{option}', key and value must not be empty"),
+            }
+            .build());
+        }
+        if parsed.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(error::IllegalConfigSnafu {
+                msg: format!("Duplicate region option '{key}'"),
+            }
+            .build());
+        }
+    }
+    Ok(parsed)
 }
 
 fn resolve_projection(
@@ -407,6 +437,7 @@ impl ScanbenchCommand {
 
         let region_id = parse_region_id(&self.region_id)?;
         let path_type = parse_path_type(&self.path_type)?;
+        let region_options = parse_region_options(&self.region_options)?;
         println!(
             "{} Region ID: {} (u64: {})",
             "✓".green(),
@@ -487,7 +518,7 @@ impl ScanbenchCommand {
             engine: "mito".to_string(),
             table_dir: self.table_dir.clone(),
             path_type,
-            options: HashMap::default(),
+            options: region_options,
             skip_wal_replay: !self.enable_wal,
             checkpoint: None,
             requirements: Default::default(),
@@ -825,7 +856,9 @@ mod tests {
     use store_api::metadata::{ColumnMetadata, RegionMetadataBuilder};
     use store_api::storage::RegionId;
 
-    use super::{ScanConfig, ScanbenchCommand, resolve_filters, resolve_projection};
+    use super::{
+        ScanConfig, ScanbenchCommand, parse_region_options, resolve_filters, resolve_projection,
+    };
     use crate::error;
 
     #[test]
@@ -862,6 +895,43 @@ mod tests {
         .unwrap();
 
         assert!(command.disable_time_index_prefilter);
+    }
+
+    #[test]
+    fn test_parse_region_options() {
+        let command = <ScanbenchCommand as clap::Parser>::try_parse_from([
+            "scanbench",
+            "--config",
+            "config.toml",
+            "--region-id",
+            "1024:0",
+            "--table-dir",
+            "greptime/public/1024",
+            "--region-option",
+            "memtable.type=bulk",
+            "--region-option",
+            "append_mode=true",
+        ])
+        .unwrap();
+
+        let options = parse_region_options(&command.region_options).unwrap();
+        assert_eq!(Some(&"bulk".to_string()), options.get("memtable.type"));
+        assert_eq!(Some(&"true".to_string()), options.get("append_mode"));
+    }
+
+    #[test]
+    fn test_reject_invalid_region_options() {
+        for options in [
+            vec!["missing-separator".to_string()],
+            vec!["=value".to_string()],
+            vec!["key=".to_string()],
+            vec!["key=one".to_string(), "key=two".to_string()],
+        ] {
+            assert!(
+                parse_region_options(&options).is_err(),
+                "options: {options:?}"
+            );
+        }
     }
 
     #[test]

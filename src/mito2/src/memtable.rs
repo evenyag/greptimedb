@@ -500,23 +500,45 @@ impl MemtableBuilderProvider {
 
 /// Metrics for scanning a memtable.
 #[derive(Clone, Default)]
-pub struct MemScanMetrics(Arc<Mutex<MemScanMetricsData>>);
+pub struct MemScanMetrics {
+    inner: Arc<Mutex<MemScanMetricsData>>,
+    detailed: bool,
+}
 
 impl MemScanMetrics {
+    /// Creates memtable scan metrics.
+    pub(crate) fn new(detailed: bool) -> Self {
+        Self {
+            inner: Default::default(),
+            detailed,
+        }
+    }
+
+    /// Returns whether detailed metrics are enabled.
+    pub(crate) fn detailed(&self) -> bool {
+        self.detailed
+    }
+
     /// Merges the metrics.
     pub(crate) fn merge_inner(&self, inner: &MemScanMetricsData) {
-        let mut metrics = self.0.lock().unwrap();
+        let mut metrics = self.inner.lock().unwrap();
         metrics.total_series += inner.total_series;
         metrics.num_rows += inner.num_rows;
         metrics.num_batches += inner.num_batches;
         metrics.scan_cost += inner.scan_cost;
         metrics.prefilter_cost += inner.prefilter_cost;
         metrics.prefilter_rows_filtered += inner.prefilter_rows_filtered;
+
+        if !self.detailed {
+            return;
+        }
+
+        metrics.merge_bulk(inner);
     }
 
     /// Gets the metrics data.
     pub(crate) fn data(&self) -> MemScanMetricsData {
-        self.0.lock().unwrap().clone()
+        self.inner.lock().unwrap().clone()
     }
 }
 
@@ -534,6 +556,84 @@ pub(crate) struct MemScanMetricsData {
     pub(crate) prefilter_cost: Duration,
     /// Number of rows filtered by prefilter in memtable scan.
     pub(crate) prefilter_rows_filtered: usize,
+    /// Number of raw bulk memtable ranges considered.
+    pub(crate) bulk_raw_ranges: usize,
+    /// Number of multi-batch bulk memtable ranges considered.
+    pub(crate) bulk_multi_ranges: usize,
+    /// Number of encoded bulk memtable ranges considered.
+    pub(crate) bulk_encoded_ranges: usize,
+    /// Duration to scan raw bulk memtable ranges.
+    pub(crate) bulk_raw_scan_cost: Duration,
+    /// Duration to scan multi-batch bulk memtable ranges.
+    pub(crate) bulk_multi_scan_cost: Duration,
+    /// Duration to scan encoded bulk memtable ranges.
+    pub(crate) bulk_encoded_scan_cost: Duration,
+    /// Duration to decode encoded bulk memtable batches.
+    pub(crate) bulk_decode_cost: Duration,
+    /// Duration to convert bulk memtable batches to the read format.
+    pub(crate) bulk_convert_cost: Duration,
+    /// Duration to filter converted bulk memtable batches.
+    pub(crate) bulk_filter_cost: Duration,
+    /// Number of batches decoded from encoded bulk memtable ranges.
+    pub(crate) bulk_decoded_batches: usize,
+    /// Number of rows decoded from encoded bulk memtable ranges.
+    pub(crate) bulk_decoded_rows: usize,
+    /// Duration to prune bulk memtable data while building readers.
+    pub(crate) bulk_prune_cost: Duration,
+    /// Number of raw parts considered by pruning.
+    pub(crate) bulk_raw_parts_before_prune: usize,
+    /// Number of raw parts pruned.
+    pub(crate) bulk_raw_parts_pruned: usize,
+    /// Number of rows in raw parts considered by pruning.
+    pub(crate) bulk_raw_rows_before_prune: usize,
+    /// Number of rows in pruned raw parts.
+    pub(crate) bulk_raw_rows_pruned: usize,
+    /// Number of batches in multi-parts considered by pruning.
+    pub(crate) bulk_batches_before_prune: usize,
+    /// Number of batches in multi-parts pruned.
+    pub(crate) bulk_batches_pruned: usize,
+    /// Number of rows in multi-part batches considered by pruning.
+    pub(crate) bulk_batch_rows_before_prune: usize,
+    /// Number of rows in pruned multi-part batches.
+    pub(crate) bulk_batch_rows_pruned: usize,
+    /// Number of encoded row groups considered by pruning.
+    pub(crate) bulk_row_groups_before_prune: usize,
+    /// Number of encoded row groups pruned.
+    pub(crate) bulk_row_groups_pruned: usize,
+    /// Number of rows in encoded row groups considered by pruning.
+    pub(crate) bulk_row_group_rows_before_prune: usize,
+    /// Number of rows in pruned encoded row groups.
+    pub(crate) bulk_row_group_rows_pruned: usize,
+}
+
+impl MemScanMetricsData {
+    /// Merges detailed bulk memtable metrics.
+    pub(crate) fn merge_bulk(&mut self, other: &Self) {
+        self.bulk_raw_ranges += other.bulk_raw_ranges;
+        self.bulk_multi_ranges += other.bulk_multi_ranges;
+        self.bulk_encoded_ranges += other.bulk_encoded_ranges;
+        self.bulk_raw_scan_cost += other.bulk_raw_scan_cost;
+        self.bulk_multi_scan_cost += other.bulk_multi_scan_cost;
+        self.bulk_encoded_scan_cost += other.bulk_encoded_scan_cost;
+        self.bulk_decode_cost += other.bulk_decode_cost;
+        self.bulk_convert_cost += other.bulk_convert_cost;
+        self.bulk_filter_cost += other.bulk_filter_cost;
+        self.bulk_decoded_batches += other.bulk_decoded_batches;
+        self.bulk_decoded_rows += other.bulk_decoded_rows;
+        self.bulk_prune_cost += other.bulk_prune_cost;
+        self.bulk_raw_parts_before_prune += other.bulk_raw_parts_before_prune;
+        self.bulk_raw_parts_pruned += other.bulk_raw_parts_pruned;
+        self.bulk_raw_rows_before_prune += other.bulk_raw_rows_before_prune;
+        self.bulk_raw_rows_pruned += other.bulk_raw_rows_pruned;
+        self.bulk_batches_before_prune += other.bulk_batches_before_prune;
+        self.bulk_batches_pruned += other.bulk_batches_pruned;
+        self.bulk_batch_rows_before_prune += other.bulk_batch_rows_before_prune;
+        self.bulk_batch_rows_pruned += other.bulk_batch_rows_pruned;
+        self.bulk_row_groups_before_prune += other.bulk_row_groups_before_prune;
+        self.bulk_row_groups_pruned += other.bulk_row_groups_pruned;
+        self.bulk_row_group_rows_before_prune += other.bulk_row_group_rows_before_prune;
+        self.bulk_row_group_rows_pruned += other.bulk_row_group_rows_pruned;
+    }
 }
 
 /// Encoded range in the memtable.
@@ -847,5 +947,41 @@ mod tests {
             provider.bulk_memtable_builder(options.need_dedup(), options.merge_mode(), &options);
 
         assert_eq!(&config, builder.config());
+    }
+
+    #[test]
+    fn test_detailed_mem_scan_metrics() {
+        let input = MemScanMetricsData {
+            num_rows: 7,
+            bulk_encoded_ranges: 1,
+            bulk_decode_cost: Duration::from_millis(2),
+            bulk_decoded_batches: 3,
+            bulk_decoded_rows: 11,
+            bulk_row_groups_before_prune: 4,
+            bulk_row_groups_pruned: 2,
+            bulk_row_group_rows_before_prune: 20,
+            bulk_row_group_rows_pruned: 9,
+            ..Default::default()
+        };
+
+        let detailed = MemScanMetrics::new(true);
+        detailed.merge_inner(&input);
+        let data = detailed.data();
+        assert_eq!(7, data.num_rows);
+        assert_eq!(1, data.bulk_encoded_ranges);
+        assert_eq!(Duration::from_millis(2), data.bulk_decode_cost);
+        assert_eq!(3, data.bulk_decoded_batches);
+        assert_eq!(11, data.bulk_decoded_rows);
+        assert_eq!(4, data.bulk_row_groups_before_prune);
+        assert_eq!(2, data.bulk_row_groups_pruned);
+        assert_eq!(20, data.bulk_row_group_rows_before_prune);
+        assert_eq!(9, data.bulk_row_group_rows_pruned);
+
+        let basic = MemScanMetrics::default();
+        basic.merge_inner(&input);
+        let data = basic.data();
+        assert_eq!(7, data.num_rows);
+        assert_eq!(0, data.bulk_encoded_ranges);
+        assert!(data.bulk_decode_cost.is_zero());
     }
 }

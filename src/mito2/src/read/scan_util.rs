@@ -32,7 +32,7 @@ use smallvec::SmallVec;
 use store_api::storage::RegionId;
 
 use crate::error::Result;
-use crate::memtable::MemScanMetrics;
+use crate::memtable::{MemScanMetrics, MemScanMetricsData};
 use crate::metrics::{
     IN_PROGRESS_SCAN, PRECISE_FILTER_ROWS_TOTAL, READ_BATCHES_RETURN, READ_ROW_GROUPS_TOTAL,
     READ_ROWS_IN_ROW_GROUP_TOTAL, READ_ROWS_RETURN, READ_STAGE_ELAPSED,
@@ -141,6 +141,8 @@ pub(crate) struct ScanMetricsSet {
     mem_prefilter_cost: Duration,
     /// Number of rows filtered by prefilter in memtable scan.
     mem_prefilter_rows_filtered: usize,
+    /// Detailed bulk memtable metrics, populated only for verbose explain.
+    bulk_mem_metrics: MemScanMetricsData,
 
     // SST related metrics:
     /// Duration to build file ranges.
@@ -289,6 +291,58 @@ impl PartialEq for CompareCostReverse<'_> {
     }
 }
 
+fn fmt_bulk_mem_metrics(f: &mut fmt::Formatter<'_>, metrics: &MemScanMetricsData) -> fmt::Result {
+    macro_rules! write_count {
+        ($field:ident) => {
+            if metrics.$field > 0 {
+                write!(
+                    f,
+                    concat!(", \"mem_", stringify!($field), "\":{}"),
+                    metrics.$field
+                )?;
+            }
+        };
+    }
+    macro_rules! write_duration {
+        ($field:ident) => {
+            if !metrics.$field.is_zero() {
+                write!(
+                    f,
+                    concat!(", \"mem_", stringify!($field), "\":\"{:?}\""),
+                    metrics.$field
+                )?;
+            }
+        };
+    }
+
+    write_count!(bulk_raw_ranges);
+    write_count!(bulk_multi_ranges);
+    write_count!(bulk_encoded_ranges);
+    write_duration!(bulk_raw_scan_cost);
+    write_duration!(bulk_multi_scan_cost);
+    write_duration!(bulk_encoded_scan_cost);
+    write_duration!(bulk_decode_cost);
+    write_duration!(bulk_convert_cost);
+    write_duration!(bulk_filter_cost);
+    write_count!(bulk_decoded_batches);
+    write_count!(bulk_decoded_rows);
+    write_duration!(bulk_prune_cost);
+    write_count!(bulk_raw_parts_before_prune);
+    write_count!(bulk_raw_parts_pruned);
+    write_count!(bulk_raw_rows_before_prune);
+    write_count!(bulk_raw_rows_pruned);
+    write_count!(bulk_batches_before_prune);
+    write_count!(bulk_batches_pruned);
+    write_count!(bulk_batch_rows_before_prune);
+    write_count!(bulk_batch_rows_pruned);
+    write_count!(bulk_row_groups_before_prune);
+    write_count!(bulk_row_groups_pruned);
+    write_count!(bulk_row_group_rows_before_prune);
+    write_count!(bulk_row_group_rows_pruned);
+
+    Ok(())
+}
+
 impl fmt::Debug for ScanMetricsSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ScanMetricsSet {
@@ -349,6 +403,7 @@ impl fmt::Debug for ScanMetricsSet {
             mem_series,
             mem_prefilter_cost,
             mem_prefilter_rows_filtered,
+            bulk_mem_metrics,
             inverted_index_apply_metrics,
             bloom_filter_apply_metrics,
             fulltext_index_apply_metrics,
@@ -529,6 +584,7 @@ impl fmt::Debug for ScanMetricsSet {
                 ", \"mem_prefilter_rows_filtered\":{mem_prefilter_rows_filtered}"
             )?;
         }
+        fmt_bulk_mem_metrics(f, bulk_mem_metrics)?;
 
         // Write optional verbose metrics if they are not empty
         if let Some(metrics) = inverted_index_apply_metrics
@@ -1086,6 +1142,7 @@ impl PartitionMetrics {
         metrics.mem_series += data.total_series;
         metrics.mem_prefilter_cost += data.prefilter_cost;
         metrics.mem_prefilter_rows_filtered += data.prefilter_rows_filtered;
+        metrics.bulk_mem_metrics.merge_bulk(data);
     }
 
     /// Merges [ScannerMetrics], `build_reader_cost`, `scan_cost` and `yield_cost`.
@@ -1214,7 +1271,7 @@ pub(crate) fn scan_flat_mem_ranges(
         part_metrics.inc_num_mem_ranges(ranges.len());
         for range in ranges {
             let build_reader_start = Instant::now();
-            let mem_scan_metrics = Some(MemScanMetrics::default());
+            let mem_scan_metrics = Some(MemScanMetrics::new(part_metrics.explain_verbose()));
             let mut iter = range.build_record_batch_iter(Some(time_range), mem_scan_metrics.clone())?;
             part_metrics.inc_build_reader_cost(build_reader_start.elapsed());
 
@@ -1959,6 +2016,27 @@ mod tests {
             DEFAULT_READ_BATCH_SIZE,
             compute_average_batch_size(std::iter::empty())
         );
+    }
+
+    #[test]
+    fn test_format_bulk_mem_metrics() {
+        let mut metrics = ScanMetricsSet::default();
+        metrics.bulk_mem_metrics = MemScanMetricsData {
+            bulk_encoded_ranges: 1,
+            bulk_decode_cost: Duration::from_millis(2),
+            bulk_decoded_batches: 3,
+            bulk_row_groups_before_prune: 4,
+            bulk_row_groups_pruned: 2,
+            ..Default::default()
+        };
+
+        let output = format!("{metrics:?}");
+        assert!(output.contains(r#""mem_bulk_encoded_ranges":1"#));
+        assert!(output.contains(r#""mem_bulk_decode_cost":"2ms""#));
+        assert!(output.contains(r#""mem_bulk_decoded_batches":3"#));
+        assert!(output.contains(r#""mem_bulk_row_groups_before_prune":4"#));
+        assert!(output.contains(r#""mem_bulk_row_groups_pruned":2"#));
+        assert!(!output.contains("mem_bulk_raw_ranges"));
     }
 
     /// Builds a flat-format record batch whose time index column holds `timestamps`.

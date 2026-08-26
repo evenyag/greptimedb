@@ -65,7 +65,9 @@ use crate::memtable::bulk::context::{BulkIterContext, BulkIterContextRef};
 use crate::memtable::bulk::json_align::Json2Aligner;
 use crate::memtable::bulk::part_reader::EncodedBulkPartIter;
 use crate::memtable::time_series::{ValueBuilder, Values};
-use crate::memtable::{BoxedRecordBatchIterator, MemScanMetrics, MemtableStats};
+use crate::memtable::{
+    BoxedRecordBatchIterator, MemScanMetrics, MemScanMetricsData, MemtableStats,
+};
 use crate::sst::SeriesEstimator;
 use crate::sst::index::IndexOutput;
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -1234,9 +1236,36 @@ impl EncodedBulkPart {
         // Compute skip_fields for row group pruning from the configured pre-filter mode.
         let skip_fields_for_pruning = context.pre_filter_mode().skip_fields();
 
+        let detailed = mem_scan_metrics
+            .as_ref()
+            .is_some_and(MemScanMetrics::detailed);
+        let prune_start = detailed.then(Instant::now);
+
         // use predicate to find row groups to read.
         let row_groups_to_read =
             context.row_groups_to_read(&self.metadata.parquet_metadata, skip_fields_for_pruning);
+        let prune_cost = prune_start.map(|start| start.elapsed());
+
+        if let (Some(metrics), Some(prune_cost)) = (&mem_scan_metrics, prune_cost) {
+            let row_groups = self.metadata.parquet_metadata.row_groups();
+            let rows_before_prune = row_groups
+                .iter()
+                .map(|row_group| row_group.num_rows() as usize)
+                .sum::<usize>();
+            let rows_to_read = row_groups_to_read
+                .iter()
+                .map(|index| row_groups[*index].num_rows() as usize)
+                .sum::<usize>();
+            metrics.merge_inner(&MemScanMetricsData {
+                bulk_encoded_ranges: 1,
+                bulk_prune_cost: prune_cost,
+                bulk_row_groups_before_prune: row_groups.len(),
+                bulk_row_groups_pruned: row_groups.len() - row_groups_to_read.len(),
+                bulk_row_group_rows_before_prune: rows_before_prune,
+                bulk_row_group_rows_pruned: rows_before_prune - rows_to_read,
+                ..Default::default()
+            });
+        }
 
         if row_groups_to_read.is_empty() {
             // All row groups are filtered.
@@ -1743,7 +1772,7 @@ impl MultiBulkPart {
             return Ok(None);
         }
 
-        let batches_to_read = self.prune_batches(&context);
+        let batches_to_read = self.prune_batches(&context, mem_scan_metrics.as_ref());
 
         if batches_to_read.is_empty() {
             return Ok(None);
@@ -1761,8 +1790,14 @@ impl MultiBulkPart {
 
     /// Prunes batches using the first-tag min/max statistics and the predicate.
     /// Returns all batches if no stats or no predicate is available.
-    fn prune_batches(&self, context: &BulkIterContextRef) -> Vec<RecordBatch> {
-        if let Some(stats) = &self.batch_stats
+    fn prune_batches(
+        &self,
+        context: &BulkIterContextRef,
+        mem_scan_metrics: Option<&MemScanMetrics>,
+    ) -> Vec<RecordBatch> {
+        let detailed = mem_scan_metrics.is_some_and(MemScanMetrics::detailed);
+        let prune_start = detailed.then(Instant::now);
+        let batches: Vec<RecordBatch> = if let Some(stats) = &self.batch_stats
             && let Some(predicate) = &context.predicate
         {
             let region_meta = context.read_format().metadata();
@@ -1783,7 +1818,28 @@ impl MultiBulkPart {
                 .collect()
         } else {
             self.batches.iter().cloned().collect()
+        };
+
+        let prune_cost = prune_start.map(|start| start.elapsed());
+        if let (Some(metrics), Some(prune_cost)) = (mem_scan_metrics, prune_cost) {
+            let rows_before_prune = self
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            let rows_to_read = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            metrics.merge_inner(&MemScanMetricsData {
+                bulk_multi_ranges: 1,
+                bulk_prune_cost: prune_cost,
+                bulk_batches_before_prune: self.batches.len(),
+                bulk_batches_pruned: self.batches.len() - batches.len(),
+                bulk_batch_rows_before_prune: rows_before_prune,
+                bulk_batch_rows_pruned: rows_before_prune - rows_to_read,
+                ..Default::default()
+            });
         }
+
+        batches
     }
 
     /// Converts this `MultiBulkPart` to `MemtableStats`.
@@ -2119,8 +2175,9 @@ mod tests {
             )
             .unwrap(),
         );
+        let metrics = MemScanMetrics::new(true);
         let reader = part
-            .read(context, None, None)
+            .read(context, None, Some(metrics.clone()))
             .unwrap()
             .expect("expect at least one row group");
         let mut total_rows_read = 0;
@@ -2130,6 +2187,12 @@ mod tests {
         }
         // Should only read row group 1.
         assert_eq!(expected_rows, total_rows_read);
+        let data = metrics.data();
+        assert_eq!(1, data.bulk_encoded_ranges);
+        assert!(data.bulk_row_groups_before_prune > 0);
+        assert!(data.bulk_decoded_batches > 0);
+        assert!(data.bulk_decoded_rows >= expected_rows);
+        assert_eq!(expected_rows, data.num_rows);
     }
 
     #[test]
@@ -2154,7 +2217,18 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(part.read(context, None, None).unwrap().is_none());
+        let metrics = MemScanMetrics::new(true);
+        assert!(
+            part.read(context, None, Some(metrics.clone()))
+                .unwrap()
+                .is_none()
+        );
+        let data = metrics.data();
+        assert_eq!(1, data.bulk_encoded_ranges);
+        assert_eq!(1, data.bulk_row_groups_before_prune);
+        assert_eq!(1, data.bulk_row_groups_pruned);
+        assert_eq!(310, data.bulk_row_group_rows_before_prune);
+        assert_eq!(310, data.bulk_row_group_rows_pruned);
 
         check_prune_row_group(&part, None, 310);
 
@@ -3135,12 +3209,20 @@ mod tests {
             )
             .unwrap(),
         );
+        let metrics = MemScanMetrics::new(true);
         let reader = multi
-            .read(context, None, None)
+            .read(context, None, Some(metrics.clone()))
             .unwrap()
             .expect("should have results");
         let total_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 2);
+        let data = metrics.data();
+        assert_eq!(1, data.bulk_multi_ranges);
+        assert_eq!(3, data.bulk_batches_before_prune);
+        assert_eq!(2, data.bulk_batches_pruned);
+        assert_eq!(6, data.bulk_batch_rows_before_prune);
+        assert_eq!(4, data.bulk_batch_rows_pruned);
+        assert_eq!(2, data.num_rows);
 
         // k0 = "nonexistent" => all pruned, returns None.
         let context = Arc::new(
@@ -3155,7 +3237,19 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(multi.read(context, None, None).unwrap().is_none());
+        let metrics = MemScanMetrics::new(true);
+        assert!(
+            multi
+                .read(context, None, Some(metrics.clone()))
+                .unwrap()
+                .is_none()
+        );
+        let data = metrics.data();
+        assert_eq!(1, data.bulk_multi_ranges);
+        assert_eq!(3, data.bulk_batches_before_prune);
+        assert_eq!(3, data.bulk_batches_pruned);
+        assert_eq!(6, data.bulk_batch_rows_before_prune);
+        assert_eq!(6, data.bulk_batch_rows_pruned);
 
         // No predicate => all 6 rows.
         let context = Arc::new(

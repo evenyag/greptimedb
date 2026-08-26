@@ -19,6 +19,7 @@ cargo build -p cmd --bin greptime
   --config <CONFIG_TOML> \
   --region-id <REGION_ID> \
   --table-dir <TABLE_DIR> \
+  [--region-option <KEY=VALUE>]... \
   [--scanner <seq|unordered|series>] \
   [--disable-seq-scan-split] \
   [--disable-time-index-prefilter] \
@@ -50,6 +51,7 @@ cargo build -p cmd --bin greptime
 - `--disable-seq-scan-split`: Keep SeqScan partition ranges grouped instead of splitting them by SST row group. This only applies with `--scanner seq` and defaults to disabled.
 - `--disable-time-index-prefilter`: Keep time-index predicates out of the reduced-column SST prefilter pass. Normal precise filtering and time-based file, row-group, and page pruning remain enabled. The flag is off by default.
 - `--scan-config`: JSON file to tune scan request.
+- `--region-option`: Region option applied while opening the region. Repeat the flag for multiple options. For example, `--region-option memtable.type=bulk` reconstructs WAL entries in a bulk memtable.
 - `--parallelism`: Simulated scan parallelism. Default: `1`.
 - `--iterations`: Benchmark iterations. Default: `1`.
 - `--path-type`: Region path type (`bare`, `data`, `metadata`). Default: `bare`.
@@ -58,6 +60,8 @@ cargo build -p cmd --bin greptime
 - `--pprof-file`: Output flamegraph path (Unix only).
 - `--pprof-after-warmup`: Start profiling after the first iteration, using it as a warmup. Requires `--pprof-file`. Default: disabled.
 - `--verbose` / `-v`: Enable verbose output.
+
+Verbose explain output includes per-partition SST metrics and detailed bulk-memtable metrics. Bulk metrics distinguish raw, multi-batch, and encoded ranges; decoding, conversion, and filtering costs; and statistics-based pruning of raw parts, multi-part batches, and encoded row groups. Bulk pruning cost is part of `build_reader_cost`, while bulk scan-stage costs are part of `mem_scan_cost`.
 
 ## Scan Config JSON
 
@@ -155,3 +159,20 @@ Scan with WAL replay enabled (uses `[wal]` config from TOML):
   --table-dir greptime/public/1024 \
   --enable-wal
 ```
+
+Replay a region into a bulk memtable and collect its per-partition explain metrics:
+
+```bash
+./target/debug/greptime datanode scanbench \
+  --config /path/to/config.toml \
+  --region-id 1024:0 \
+  --table-dir greptime/benchmark/1024 \
+  --region-option memtable.type=bulk \
+  --enable-wal \
+  --scanner seq \
+  --parallelism 8 \
+  --scan-config /path/to/scan-config.json \
+  --verbose
+```
+
+Run scanbench against a disposable copy of the data directory when WAL replay is enabled because opening a region may update local state.
