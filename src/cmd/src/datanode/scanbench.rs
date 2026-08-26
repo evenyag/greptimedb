@@ -96,6 +96,10 @@ pub struct ScanbenchCommand {
     #[clap(long, default_value_t = false)]
     disable_seq_scan_split: bool,
 
+    /// Keep time-index predicates out of the reduced-column prefilter pass.
+    #[clap(long, default_value_t = false)]
+    disable_time_index_prefilter: bool,
+
     /// Path to scan request JSON config file (optional)
     #[clap(long, value_name = "FILE")]
     scan_config: Option<PathBuf>,
@@ -541,7 +545,8 @@ impl ScanbenchCommand {
             .build());
         }
         let scan_options = MitoScanOptions::new(scanner_type)
-            .with_disable_seq_scan_range_split(self.disable_seq_scan_split);
+            .with_disable_seq_scan_range_split(self.disable_seq_scan_split)
+            .with_disable_time_index_prefilter(self.disable_time_index_prefilter);
 
         let series_row_selector = match scan_config.series_row_selector.as_deref() {
             Some("last_row") => Some(TimeSeriesRowSelector::LastRow),
@@ -555,12 +560,17 @@ impl ScanbenchCommand {
         };
 
         println!(
-            "{} Scanner: {}, Parallelism: {}, Iterations: {}, SeqScan range split: {}",
+            "{} Scanner: {}, Parallelism: {}, Iterations: {}, SeqScan range split: {}, Time-index prefilter: {}",
             "ℹ".blue(),
             self.scanner,
             self.parallelism,
             self.iterations,
             if self.disable_seq_scan_split {
+                "disabled"
+            } else {
+                "enabled"
+            },
+            if self.disable_time_index_prefilter {
                 "disabled"
             } else {
                 "enabled"
@@ -834,6 +844,24 @@ mod tests {
 
         assert_eq!("seq", command.scanner);
         assert!(command.disable_seq_scan_split);
+        assert!(!command.disable_time_index_prefilter);
+    }
+
+    #[test]
+    fn test_parse_disable_time_index_prefilter() {
+        let command = <ScanbenchCommand as clap::Parser>::try_parse_from([
+            "scanbench",
+            "--config",
+            "config.toml",
+            "--region-id",
+            "1024:0",
+            "--table-dir",
+            "greptime/public/1024",
+            "--disable-time-index-prefilter",
+        ])
+        .unwrap();
+
+        assert!(command.disable_time_index_prefilter);
     }
 
     #[test]

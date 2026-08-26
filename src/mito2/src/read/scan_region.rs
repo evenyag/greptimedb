@@ -105,6 +105,7 @@ pub enum MitoScannerType {
 pub struct MitoScanOptions {
     scanner_type: MitoScannerType,
     disable_seq_scan_range_split: bool,
+    disable_time_index_prefilter: bool,
 }
 
 impl MitoScanOptions {
@@ -113,6 +114,7 @@ impl MitoScanOptions {
         Self {
             scanner_type,
             disable_seq_scan_range_split: false,
+            disable_time_index_prefilter: false,
         }
     }
 
@@ -120,6 +122,13 @@ impl MitoScanOptions {
     #[must_use]
     pub fn with_disable_seq_scan_range_split(mut self, disable: bool) -> Self {
         self.disable_seq_scan_range_split = disable;
+        self
+    }
+
+    /// Sets whether the reduced-column prefilter should skip time-index predicates.
+    #[must_use]
+    pub fn with_disable_time_index_prefilter(mut self, disable: bool) -> Self {
+        self.disable_time_index_prefilter = disable;
         self
     }
 }
@@ -668,6 +677,11 @@ impl ScanRegion {
                     .then_some(self.request.memtable_max_sequence)
                     .flatten(),
             )
+            .with_disable_time_index_prefilter(
+                self.scan_options
+                    .map(|options| options.disable_time_index_prefilter)
+                    .unwrap_or(false),
+            )
             .with_query_stat_counters(self.query_stat_counters);
         #[cfg(feature = "vector_index")]
         let input = input
@@ -1043,6 +1057,8 @@ pub struct ScanInput {
     pub(crate) compaction: bool,
     /// Whether SeqScan should keep grouped ranges intact.
     pub(crate) disable_seq_scan_range_split: bool,
+    /// Whether the reduced-column prefilter should skip time-index predicates.
+    pub(crate) disable_time_index_prefilter: bool,
     /// Counters that should receive query-load metrics.
     pub(crate) query_stat_counters: Option<RegionQueryStatCounters>,
     #[cfg(feature = "enterprise")]
@@ -1084,6 +1100,7 @@ impl ScanInput {
             snapshot_sequence: None,
             compaction: false,
             disable_seq_scan_range_split: false,
+            disable_time_index_prefilter: false,
             query_stat_counters: None,
             #[cfg(feature = "enterprise")]
             extension_ranges: Vec::new(),
@@ -1296,6 +1313,13 @@ impl ScanInput {
         self
     }
 
+    /// Sets whether the reduced-column prefilter should skip time-index predicates.
+    #[must_use]
+    pub(crate) fn with_disable_time_index_prefilter(mut self, disable: bool) -> Self {
+        self.disable_time_index_prefilter = disable;
+        self
+    }
+
     /// Builds memtable ranges to scan by `index`.
     pub(crate) fn build_mem_ranges(&self, index: RowGroupIndex) -> SmallVec<[MemtableRange; 2]> {
         let memtable = &self.memtables[index.index];
@@ -1446,6 +1470,7 @@ impl ScanInput {
             .compaction(self.compaction)
             .pre_filter_mode(pre_filter_mode)
             .enable_predicate_prefilter(enable_predicate_prefilter)
+            .enable_time_index_prefilter(!self.disable_time_index_prefilter)
             .decode_primary_key_values(decode_pk_values)
             .build_reader_input(reader_metrics)
             .await;
@@ -2228,6 +2253,15 @@ mod tests {
     use crate::sst::file::FileMeta;
     use crate::test_util::memtable_util::metadata_with_primary_key;
     use crate::test_util::scheduler_util::SchedulerEnv;
+
+    #[test]
+    fn test_mito_scan_options_disable_time_index_prefilter() {
+        let options = MitoScanOptions::new(MitoScannerType::Seq);
+        assert!(!options.disable_time_index_prefilter);
+
+        let options = options.with_disable_time_index_prefilter(true);
+        assert!(options.disable_time_index_prefilter);
+    }
 
     async fn new_scan_input(metadata: RegionMetadataRef, filters: Vec<Expr>) -> ScanInput {
         let env = SchedulerEnv::new().await;

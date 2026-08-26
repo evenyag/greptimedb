@@ -185,6 +185,8 @@ pub struct ParquetReaderBuilder {
     pre_filter_mode: PreFilterMode,
     /// Whether to run the reduced-column predicate prefilter pass.
     enable_predicate_prefilter: bool,
+    /// Whether time-index predicates may run in the reduced-column prefilter pass.
+    enable_time_index_prefilter: bool,
     /// Whether to decode primary key values eagerly when reading primary key format SSTs.
     decode_primary_key_values: bool,
     page_index_policy: PageIndexPolicy,
@@ -220,6 +222,7 @@ impl ParquetReaderBuilder {
             compaction: false,
             pre_filter_mode: PreFilterMode::All,
             enable_predicate_prefilter: true,
+            enable_time_index_prefilter: true,
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
@@ -325,6 +328,13 @@ impl ParquetReaderBuilder {
     #[must_use]
     pub(crate) fn enable_predicate_prefilter(mut self, enable: bool) -> Self {
         self.enable_predicate_prefilter = enable;
+        self
+    }
+
+    /// Sets whether time-index predicates may run in the reduced-column prefilter pass.
+    #[must_use]
+    pub(crate) fn enable_time_index_prefilter(mut self, enable: bool) -> Self {
+        self.enable_time_index_prefilter = enable;
         self
     }
 
@@ -508,6 +518,7 @@ impl ParquetReaderBuilder {
             self.expected_metadata.as_deref(),
             self.pre_filter_mode,
             self.enable_predicate_prefilter,
+            self.enable_time_index_prefilter,
             &read_format,
             &codec,
         );

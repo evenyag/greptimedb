@@ -373,13 +373,16 @@ pub(crate) fn build_bulk_filter_plan(
 ///
 /// With predicate prefiltering enabled, tag and timestamp predicates that lower to
 /// [`SimpleFilterEvaluator`] are an exception — the engine enforces them precisely in
-/// the prefilter pass. When it is disabled, all simple filters remain on the normal
-/// precise-filter path instead.
+/// the prefilter pass. When predicate prefiltering is disabled, all simple filters remain
+/// on the normal precise-filter path instead. Time-index prefiltering can also be disabled
+/// independently, leaving timestamp filters on the normal path while eligible tag and field
+/// filters continue to use the prefilter.
 pub(crate) fn build_reader_filter_plan(
     predicate: Option<&Predicate>,
     expected_metadata: Option<&RegionMetadata>,
     pre_filter_mode: PreFilterMode,
     enable_predicate_prefilter: bool,
+    enable_time_index_prefilter: bool,
     read_format: &FlatReadFormat,
     codec: &Arc<dyn PrimaryKeyCodec>,
 ) -> ReaderFilterPlan {
@@ -412,7 +415,7 @@ pub(crate) fn build_reader_filter_plan(
         match semantic_type {
             SemanticType::Tag => !need_pk_prefilter,
             SemanticType::Field => field_prefilter_enabled,
-            SemanticType::Timestamp => true,
+            SemanticType::Timestamp => enable_time_index_prefilter,
         }
     };
 
@@ -1570,6 +1573,7 @@ mod tests {
             None,
             PreFilterMode::SkipFields,
             true,
+            true,
             &full_read_format,
             &codec,
         );
@@ -1598,6 +1602,7 @@ mod tests {
             None,
             PreFilterMode::All,
             true,
+            true,
             &projected_read_format,
             &metric_codec,
         );
@@ -1621,6 +1626,7 @@ mod tests {
             None,
             PreFilterMode::All,
             false,
+            true,
             &projected_read_format,
             &metric_codec,
         );
@@ -1629,6 +1635,115 @@ mod tests {
             remaining_simple_filter_columns(&disabled_plan.remaining_simple_filters),
             vec!["tag_0", "field_0", "ts"]
         );
+    }
+
+    #[test]
+    fn test_build_reader_filter_plan_can_disable_time_index_prefilter() {
+        let metadata: RegionMetadataRef = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let field_0 = metadata.column_by_name("field_0").unwrap().column_id;
+        let ts = metadata.time_index_column().column_id;
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::new([field_0, ts]),
+            None,
+            "test",
+            true,
+        )
+        .unwrap();
+        let codec = build_primary_key_codec(metadata.as_ref());
+        let ts_lower = lit(ScalarValue::TimestampMillisecond(Some(1), None));
+        let ts_upper = lit(ScalarValue::TimestampMillisecond(Some(2), None));
+
+        let enabled_plan = build_reader_filter_plan(
+            Some(&Predicate::new(vec![
+                col("tag_0").eq(lit("a")),
+                col("ts").gt_eq(ts_lower.clone()),
+            ])),
+            None,
+            PreFilterMode::All,
+            true,
+            true,
+            &read_format,
+            &codec,
+        );
+        let builder = enabled_plan.prefilter_builder.as_ref().unwrap();
+        assert!(
+            builder
+                .filters
+                .iter()
+                .any(|filter| filter.semantic_type() == SemanticType::Timestamp)
+        );
+
+        let mixed_plan = build_reader_filter_plan(
+            Some(&Predicate::new(vec![
+                col("tag_0").eq(lit("a")),
+                col("field_0").gt(lit(1_u64)),
+                col("ts").gt_eq(ts_lower.clone()),
+            ])),
+            None,
+            PreFilterMode::All,
+            true,
+            false,
+            &read_format,
+            &codec,
+        );
+        let builder = mixed_plan.prefilter_builder.as_ref().unwrap();
+        assert!(builder.build_primary_key_filter().is_some());
+        assert!(
+            builder
+                .filters
+                .iter()
+                .all(|filter| filter.semantic_type() != SemanticType::Timestamp)
+        );
+        assert_eq!(
+            remaining_simple_filter_columns(&mixed_plan.remaining_simple_filters),
+            vec!["ts"]
+        );
+
+        let time_only_plan = build_reader_filter_plan(
+            Some(&Predicate::new(vec![col("ts").gt_eq(ts_lower.clone())])),
+            None,
+            PreFilterMode::All,
+            true,
+            false,
+            &read_format,
+            &codec,
+        );
+        assert!(time_only_plan.prefilter_builder.is_none());
+        assert_eq!(
+            remaining_simple_filter_columns(&time_only_plan.remaining_simple_filters),
+            vec!["ts"]
+        );
+
+        let physical_predicate = Predicate::new(vec![
+            col("tag_0").eq(lit("a")),
+            col("ts").between(ts_lower, ts_upper),
+        ]);
+        let physical_enabled_plan = build_reader_filter_plan(
+            Some(&physical_predicate),
+            None,
+            PreFilterMode::All,
+            true,
+            true,
+            &read_format,
+            &codec,
+        );
+        let builder = physical_enabled_plan.prefilter_builder.as_ref().unwrap();
+        assert_eq!(builder.physical_filters.len(), 1);
+
+        let physical_disabled_plan = build_reader_filter_plan(
+            Some(&physical_predicate),
+            None,
+            PreFilterMode::All,
+            true,
+            false,
+            &read_format,
+            &codec,
+        );
+        let builder = physical_disabled_plan.prefilter_builder.as_ref().unwrap();
+        assert!(builder.physical_filters.is_empty());
     }
 
     #[test]
@@ -1653,6 +1768,7 @@ mod tests {
             None,
             PreFilterMode::All,
             true,
+            true,
             &read_format,
             &codec,
         );
@@ -1660,6 +1776,7 @@ mod tests {
             Some(&Predicate::new(vec![expr_b, expr_a])),
             None,
             PreFilterMode::All,
+            true,
             true,
             &read_format,
             &codec,

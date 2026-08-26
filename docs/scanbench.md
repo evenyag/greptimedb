@@ -21,6 +21,7 @@ cargo build -p cmd --bin greptime
   --table-dir <TABLE_DIR> \
   [--scanner <seq|unordered|series>] \
   [--disable-seq-scan-split] \
+  [--disable-time-index-prefilter] \
   [--scan-config <SCAN_CONFIG_JSON>] \
   [--parallelism <N>] \
   [--iterations <N>] \
@@ -47,6 +48,7 @@ cargo build -p cmd --bin greptime
   - `unordered`: unordered scan with time-windowed distribution
   - `series`: per-series scan
 - `--disable-seq-scan-split`: Keep SeqScan partition ranges grouped instead of splitting them by SST row group. This only applies with `--scanner seq` and defaults to disabled.
+- `--disable-time-index-prefilter`: Keep time-index predicates out of the reduced-column SST prefilter pass. Normal precise filtering and time-based file, row-group, and page pruning remain enabled. The flag is off by default.
 - `--scan-config`: JSON file to tune scan request.
 - `--parallelism`: Simulated scan parallelism. Default: `1`.
 - `--iterations`: Benchmark iterations. Default: `1`.
@@ -109,6 +111,17 @@ Sequential scan without row-group range splitting:
   --table-dir greptime/public/1024 \
   --scanner seq \
   --disable-seq-scan-split
+```
+
+Scan without time-index predicates in the reduced-column prefilter:
+
+```bash
+./target/debug/greptime datanode scanbench \
+  --config /path/to/config.toml \
+  --region-id 1024:0 \
+  --table-dir greptime/public/1024 \
+  --scan-config /path/to/scan-config.json \
+  --disable-time-index-prefilter
 ```
 
 Series scan with scan config and flamegraph:
