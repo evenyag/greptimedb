@@ -33,6 +33,7 @@ use crate::cache::{CacheStrategy, PageRangePart};
 use crate::error::{OpenDalSnafu, ReadParquetSnafu, Result, UnexpectedSnafu};
 use crate::metrics::{READ_STAGE_ELAPSED, READ_STAGE_FETCH_PAGES};
 use crate::sst::file::RegionFileId;
+use crate::sst::parquet::DEFAULT_PREFILTER_COLUMN_CACHE_SIZE;
 use crate::sst::parquet::helper::fetch_byte_ranges;
 use crate::sst::parquet::prefilter::PrefilterMetricsTracker;
 use crate::sst::parquet::row_group::{ParquetFetchMetrics, compute_total_range_size};
@@ -347,8 +348,34 @@ pub(crate) struct ParquetPushDecoderOptions {
     pub(crate) prefilter_metrics: Option<PrefilterMetricsTracker>,
 }
 
+/// Builds a parquet record batch stream without predicate pushdown.
+pub fn build_sst_parquet_record_batch_stream(
+    arrow_metadata: ArrowReaderMetadata,
+    row_group_idx: usize,
+    row_selection: Option<RowSelection>,
+    projection: ProjectionMask,
+    fetcher: SstParquetRangeFetcher,
+    file_path: String,
+    batch_size: usize,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    build_sst_parquet_record_batch_stream_with_options(
+        arrow_metadata,
+        fetcher,
+        file_path,
+        ParquetPushDecoderOptions {
+            row_group_idx,
+            row_selection,
+            projection,
+            batch_size,
+            row_filter: None,
+            max_predicate_cache_size: DEFAULT_PREFILTER_COLUMN_CACHE_SIZE,
+            prefilter_metrics: None,
+        },
+    )
+}
+
 /// Builds a parquet record batch stream driven directly by [ParquetPushDecoderBuilder].
-pub(crate) fn build_sst_parquet_record_batch_stream(
+pub(crate) fn build_sst_parquet_record_batch_stream_with_options(
     arrow_metadata: ArrowReaderMetadata,
     fetcher: SstParquetRangeFetcher,
     file_path: String,

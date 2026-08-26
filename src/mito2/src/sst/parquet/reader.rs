@@ -90,7 +90,8 @@ use crate::sst::parquet::prefilter::{
     build_reader_filter_plan,
 };
 use crate::sst::parquet::push_decoder::{
-    ParquetPushDecoderOptions, SstParquetRangeFetcher, build_sst_parquet_record_batch_stream,
+    ParquetPushDecoderOptions, SstParquetRangeFetcher,
+    build_sst_parquet_record_batch_stream_with_options,
 };
 use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_plan};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
@@ -2011,7 +2012,7 @@ impl RowGroupReaderBuilder {
             fetch_metrics.cloned(),
         );
 
-        build_sst_parquet_record_batch_stream(
+        build_sst_parquet_record_batch_stream_with_options(
             self.arrow_metadata.clone(),
             range_fetcher,
             self.file_path.clone(),
@@ -2629,7 +2630,7 @@ mod tests {
             0,
             None,
         );
-        let mut stream = build_sst_parquet_record_batch_stream(
+        let mut stream = build_sst_parquet_record_batch_stream_with_options(
             arrow_metadata,
             fetcher,
             file_path,
