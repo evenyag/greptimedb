@@ -1383,8 +1383,6 @@ mod split_tests {
         StreamContext {
             input,
             ranges: vec![],
-            scan_fingerprint: None,
-            scan_implied_time_range: None,
             query_start: std::time::Instant::now(),
         }
     }
@@ -1764,8 +1762,6 @@ mod tests {
         Arc::new(StreamContext {
             input,
             ranges: Vec::new(),
-            scan_fingerprint: None,
-            scan_implied_time_range: None,
             query_start: Instant::now(),
         })
     }
