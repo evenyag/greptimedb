@@ -157,7 +157,7 @@ mod tests {
     use crate::access_layer::{FilePathProvider, Metrics, RegionFilePathFactory, WriteType};
     use crate::cache::index::result_cache::PredicateKey;
     use crate::cache::test_util::assert_parquet_metadata_equal;
-    use crate::cache::{CacheManager, CacheStrategy};
+    use crate::cache::{CacheManager, CacheStrategy, PrimaryKeyCacheKey};
     use crate::config::IndexConfig;
     use crate::read::FlatSource;
     use crate::region::options::{IndexOptions, InvertedIndexOptions};
@@ -1534,7 +1534,7 @@ mod tests {
                         .expect("partition expression should be valid JSON"),
                     None => None,
                 },
-                num_series: 0,
+                num_series: info.num_series,
                 ..Default::default()
             },
             Arc::new(NoopFilePurger),
@@ -2047,10 +2047,19 @@ mod tests {
         )
         .await;
         let handle = create_file_handle_from_sst_info(&info, &metadata);
+        let file_id = handle.file_id().file_id();
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_primary_key_cache_size(1024 * 1024)
+                .prefilter_primary_key_cache_max_series(10)
+                .build(),
+        );
+        assert!(cache.prefilter_primary_key_cache_enabled_for(&handle));
 
         let builder =
             ParquetReaderBuilder::new(FILE_DIR.to_string(), PathType::Bare, handle, object_store)
-                .predicate(Some(Predicate::new(vec![col("tag_0").eq(lit("a"))])));
+                .predicate(Some(Predicate::new(vec![col("tag_0").eq(lit("a"))])))
+                .cache(CacheStrategy::EnableAll(cache.clone()));
 
         let mut metrics = ReaderMetrics::default();
         let (context, _) = builder
@@ -2071,6 +2080,15 @@ mod tests {
             &[new_record_batch_by_range(&["a", "d"], 0, 3)],
         )
         .await;
+        let cached = cache
+            .get_cached_primary_key_columns(&PrimaryKeyCacheKey {
+                file_id,
+                row_group_id: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cached.tags.num_rows(), 2);
+        assert_eq!(cached.row_ranges, vec![0..3, 3..10]);
     }
 
     #[tokio::test]
@@ -2107,10 +2125,20 @@ mod tests {
         )
         .await;
         let handle = create_file_handle_from_sst_info(&info, &metadata);
+        let file_id = handle.file_id().file_id();
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_primary_key_cache_size(1024 * 1024)
+                .prefilter_primary_key_cache_max_series(10)
+                .build(),
+        );
 
         let builder =
             ParquetReaderBuilder::new(FILE_DIR.to_string(), PathType::Bare, handle, object_store)
-                .predicate(Some(Predicate::new(vec![col("tag_0").eq(lit("a"))])));
+                .predicate(Some(Predicate::new(vec![
+                    col("tag_0").in_list(vec![lit("a")], false),
+                ])))
+                .cache(CacheStrategy::EnableAll(cache.clone()));
 
         let mut metrics = ReaderMetrics::default();
         let (context, _) = builder
@@ -2136,6 +2164,15 @@ mod tests {
             ])],
         )
         .await;
+        assert!(
+            cache
+                .get_cached_primary_key_columns(&PrimaryKeyCacheKey {
+                    file_id,
+                    row_group_id: 0,
+                })
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]

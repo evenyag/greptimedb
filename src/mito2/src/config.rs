@@ -41,6 +41,8 @@ const GLOBAL_WRITE_BUFFER_SIZE_FACTOR: u64 = 8;
 const SST_META_CACHE_SIZE_FACTOR: u64 = 8;
 /// Use `1/PREFILTER_RESULT_CACHE_SIZE_FACTOR` of OS memory size as prefilter result cache size in default mode
 const PREFILTER_RESULT_CACHE_SIZE_FACTOR: u64 = 32;
+/// Use `1/PREFILTER_PRIMARY_KEY_CACHE_SIZE_FACTOR` of OS memory size as primary key cache size in default mode.
+const PREFILTER_PRIMARY_KEY_CACHE_SIZE_FACTOR: u64 = 32;
 /// Use `1/INDEX_METADATA_CACHE_SIZE_FACTOR` of OS memory size as index metadata cache size in default mode
 const INDEX_METADATA_CACHE_SIZE_FACTOR: u64 = 32;
 /// Use `1/MEM_CACHE_SIZE_FACTOR` of OS memory size as mem cache size in default mode
@@ -127,6 +129,12 @@ pub struct MitoConfig {
     pub range_result_cache_size: ReadableSize,
     /// Cache size for prefilter results. Setting it to 0 to disable the cache.
     pub prefilter_result_cache_size: ReadableSize,
+    /// Cache size for decoded primary key tag columns used by prefiltering.
+    /// Setting it to 0 disables the cache.
+    pub experimental_prefilter_primary_key_cache_size: ReadableSize,
+    /// Maximum number of series in an SST eligible for primary key preloading.
+    /// Setting it to 0 disables primary key preloading.
+    pub experimental_prefilter_primary_key_cache_max_series: u64,
     /// Whether to enable the write cache.
     pub enable_write_cache: bool,
     /// File system path for write cache dir's root, defaults to `{data_home}`.
@@ -220,6 +228,8 @@ impl Default for MitoConfig {
             selector_result_cache_size: ReadableSize::mb(512),
             range_result_cache_size: ReadableSize::mb(512),
             prefilter_result_cache_size: ReadableSize::mb(128),
+            experimental_prefilter_primary_key_cache_size: ReadableSize::mb(256),
+            experimental_prefilter_primary_key_cache_max_series: 10_240,
             enable_write_cache: false,
             write_cache_path: String::new(),
             write_cache_size: ReadableSize::gb(5),
@@ -344,6 +354,10 @@ impl MitoConfig {
             sys_memory / PREFILTER_RESULT_CACHE_SIZE_FACTOR,
             ReadableSize::mb(128),
         );
+        let prefilter_primary_key_cache_size = cmp::min(
+            sys_memory / PREFILTER_PRIMARY_KEY_CACHE_SIZE_FACTOR,
+            ReadableSize::mb(256),
+        );
         // shouldn't be greater than 512MB in default mode.
         let mem_cache_size = cmp::min(sys_memory / MEM_CACHE_SIZE_FACTOR, ReadableSize::mb(512));
         let page_cache_size = sys_memory / PAGE_CACHE_SIZE_FACTOR;
@@ -357,6 +371,7 @@ impl MitoConfig {
         self.range_result_cache_size = mem_cache_size;
         // Use a smaller cache size because prefilter result usually should be small.
         self.prefilter_result_cache_size = prefilter_result_cache_size;
+        self.experimental_prefilter_primary_key_cache_size = prefilter_primary_key_cache_size;
 
         self.index.adjust_buffer_and_cache_size(sys_memory);
     }
@@ -396,10 +411,22 @@ mod tests {
         config.adjust_buffer_and_cache_size(ReadableSize::gb(1));
         assert_eq!(ReadableSize::mb(128), config.sst_meta_cache_size);
         assert_eq!(ReadableSize::mb(32), config.prefilter_result_cache_size);
+        assert_eq!(
+            ReadableSize::mb(32),
+            config.experimental_prefilter_primary_key_cache_size
+        );
 
         config.adjust_buffer_and_cache_size(ReadableSize::gb(64));
         assert_eq!(ReadableSize::mb(512), config.sst_meta_cache_size);
         assert_eq!(ReadableSize::mb(128), config.prefilter_result_cache_size);
+        assert_eq!(
+            ReadableSize::mb(256),
+            config.experimental_prefilter_primary_key_cache_size
+        );
+        assert_eq!(
+            10_240,
+            config.experimental_prefilter_primary_key_cache_max_series
+        );
     }
 
     #[test]

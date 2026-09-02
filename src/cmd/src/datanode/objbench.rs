@@ -498,6 +498,14 @@ async fn build_cache_manager(
             .selector_result_cache_size(config.selector_result_cache_size.as_bytes())
             .range_result_cache_size(config.range_result_cache_size.as_bytes())
             .prefilter_result_cache_size(config.prefilter_result_cache_size.as_bytes())
+            .prefilter_primary_key_cache_size(
+                config
+                    .experimental_prefilter_primary_key_cache_size
+                    .as_bytes(),
+            )
+            .prefilter_primary_key_cache_max_series(
+                config.experimental_prefilter_primary_key_cache_max_series,
+            )
             .index_metadata_size(config.index.metadata_cache_size.as_bytes())
             .index_content_size(config.index.content_cache_size.as_bytes())
             .index_content_page_size(config.index.content_cache_page_size.as_bytes())

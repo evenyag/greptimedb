@@ -24,15 +24,16 @@ use std::sync::Arc;
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
+use common_telemetry::warn;
 use datafusion_expr::Expr;
-use datatypes::arrow::array::{Array, BinaryArray, BooleanArray, BooleanBufferBuilder};
+use datatypes::arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, BooleanBufferBuilder};
 use datatypes::arrow::buffer::BooleanBuffer;
-use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::datatypes::{Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use mito_codec::row_converter::{PrimaryKeyCodec, PrimaryKeyFilter, build_primary_key_codec};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::RowSelection;
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::schema::types::SchemaDescriptor;
 use smallvec::{SmallVec, smallvec};
 use snafu::{OptionExt, ResultExt};
@@ -40,18 +41,21 @@ use store_api::metadata::{RegionMetadata, RegionMetadataRef};
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use table::predicate::Predicate;
 
-use crate::cache::PrefilterKey;
+use crate::cache::{CachedPrimaryKeyColumns, PrefilterKey, PrimaryKeyCacheKey};
 use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, EvalPartitionFilterSnafu, NewRecordBatchSnafu,
     RecordBatchSnafu, Result, UnexpectedSnafu,
 };
 use crate::sst::parquet::file_range::PreFilterMode;
-use crate::sst::parquet::flat_format::FlatReadFormat;
+use crate::sst::parquet::flat_format::{DecodedPrimaryKeys, FlatReadFormat};
 use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::reader::{
     MaybeFilter, PhysicalFilterContext, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
 };
+use crate::sst::parquet::row_group::ParquetFetchMetrics;
+use crate::sst::parquet::row_selection::row_selection_from_row_ranges;
+use crate::sst::tag_maybe_to_dictionary_field;
 
 pub(crate) fn matching_row_ranges_by_primary_key(
     input: &RecordBatch,
@@ -556,6 +560,8 @@ pub(crate) fn build_reader_filter_plan(
 pub(crate) struct PrefilterContext {
     /// Optional PK filter for legacy primary-key-format parquet.
     pk_filter: Option<Box<dyn PrimaryKeyFilter>>,
+    /// Simple tag filters represented by `pk_filter` for encoded-PK SSTs.
+    pk_filters: Option<Arc<Vec<SimpleFilterEvaluator>>>,
     /// Simple filters that can be evaluated directly from the prefilter batch.
     filters: Vec<SimpleFilterContext>,
     /// Physical filters that can be evaluated directly from the prefilter batch.
@@ -567,6 +573,10 @@ pub(crate) struct PrefilterContext {
     pk_filter_expr_strs: Option<SmallVec<[String; 1]>>,
     /// Arrow schema used to build narrowed prefilter projections.
     arrow_schema: SchemaRef,
+    /// Codec used to decode primary keys into cached tag columns.
+    codec: Arc<dyn PrimaryKeyCodec>,
+    /// Metadata describing the primary key columns in this SST.
+    metadata: RegionMetadataRef,
 }
 
 /// Pre-built state for constructing [PrefilterContext] per row group.
@@ -665,11 +675,14 @@ impl PrefilterContextBuilder {
             .map(|filter| Box::new(filter) as Box<dyn PrimaryKeyFilter>);
         PrefilterContext {
             pk_filter,
+            pk_filters: self.pk_filters.clone(),
             filters: self.filters.clone(),
             physical_filters: self.physical_filters.clone(),
             schema_version: self.schema_version,
             pk_filter_expr_strs: self.pk_filter_expr_strs.clone(),
             arrow_schema: self.arrow_schema.clone(),
+            codec: Arc::clone(&self.codec),
+            metadata: self.metadata.clone(),
         }
     }
 
@@ -752,6 +765,59 @@ pub(crate) async fn execute_prefilter(
     reader_builder: &RowGroupReaderBuilder,
     build_ctx: &RowGroupBuildContext<'_>,
 ) -> Result<PrefilterResult> {
+    if has_tag_prefilter(prefilter_ctx)
+        && reader_builder
+            .cache_strategy()
+            .prefilter_primary_key_cache_enabled_for(reader_builder.file_handle())
+    {
+        let key = PrimaryKeyCacheKey {
+            file_id: reader_builder.file_handle().file_id().file_id(),
+            row_group_id: build_ctx.row_group_idx as u32,
+        };
+        let metadata = prefilter_ctx.metadata.clone();
+        let codec = Arc::clone(&prefilter_ctx.codec);
+        let loaded = reader_builder
+            .cache_strategy()
+            .get_or_load_primary_key_columns(key, async {
+                load_primary_key_columns(
+                    reader_builder,
+                    &metadata,
+                    &codec,
+                    build_ctx.row_group_idx,
+                    build_ctx.fetch_metrics,
+                )
+                .await
+            })
+            .await;
+        match loaded {
+            Ok(Some(cached)) => {
+                return execute_prefilter_with_primary_key_columns(
+                    prefilter_ctx,
+                    reader_builder,
+                    build_ctx,
+                    &cached,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(err.as_ref();
+                    "Failed to cache primary key columns, file_id: {}, row_group_id: {}",
+                    key.file_id,
+                    key.row_group_id
+                );
+            }
+        }
+    }
+
+    execute_prefilter_inner(prefilter_ctx, reader_builder, build_ctx).await
+}
+
+async fn execute_prefilter_inner(
+    prefilter_ctx: &mut PrefilterContext,
+    reader_builder: &RowGroupReaderBuilder,
+    build_ctx: &RowGroupBuildContext<'_>,
+) -> Result<PrefilterResult> {
     let entries = build_prefilter_cache_entries(prefilter_ctx, reader_builder, build_ctx);
 
     if entries.is_empty() {
@@ -760,6 +826,271 @@ pub(crate) async fn execute_prefilter(
     }
 
     execute_prefilter_with_result_cache(prefilter_ctx, reader_builder, build_ctx, entries).await
+}
+
+fn has_tag_prefilter(prefilter_ctx: &PrefilterContext) -> bool {
+    prefilter_ctx.pk_filter.is_some()
+        || prefilter_ctx
+            .filters
+            .iter()
+            .any(|filter| filter.semantic_type() == SemanticType::Tag)
+        || prefilter_ctx
+            .physical_filters
+            .iter()
+            .any(|filter| filter.semantic_type() == SemanticType::Tag)
+}
+
+async fn execute_prefilter_with_primary_key_columns(
+    prefilter_ctx: &mut PrefilterContext,
+    reader_builder: &RowGroupReaderBuilder,
+    build_ctx: &RowGroupBuildContext<'_>,
+    cached: &CachedPrimaryKeyColumns,
+) -> Result<PrefilterResult> {
+    let mut series_mask = BooleanBuffer::new_set(cached.tags.num_rows());
+
+    if let Some(filters) = &prefilter_ctx.pk_filters {
+        for filter in filters.iter() {
+            let (idx, _) = cached
+                .tags
+                .schema()
+                .column_with_name(filter.column_name())
+                .with_context(|| UnexpectedSnafu {
+                    reason: format!(
+                        "Cached primary key column '{}' not found for file {}",
+                        filter.column_name(),
+                        reader_builder.file_path()
+                    ),
+                })?;
+            let evaluated = filter
+                .evaluate_array(cached.tags.column(idx))
+                .context(RecordBatchSnafu)?;
+            series_mask = series_mask.bitand(&evaluated);
+        }
+    }
+
+    for filter in prefilter_ctx
+        .filters
+        .iter()
+        .filter(|filter| filter.semantic_type() == SemanticType::Tag)
+    {
+        let evaluated = eval_simple_filter_mask(&cached.tags, filter, reader_builder.file_path())?;
+        series_mask = series_mask.bitand(&evaluated);
+    }
+    for filter in prefilter_ctx
+        .physical_filters
+        .iter()
+        .filter(|filter| filter.semantic_type() == SemanticType::Tag)
+    {
+        let evaluated =
+            eval_physical_filter_mask(&cached.tags, filter, reader_builder.file_path())?;
+        series_mask = series_mask.bitand(&evaluated);
+    }
+
+    let row_count = reader_builder
+        .parquet_metadata()
+        .row_group(build_ctx.row_group_idx)
+        .num_rows() as usize;
+    let matched_ranges = cached
+        .row_ranges
+        .iter()
+        .zip(series_mask.iter())
+        .filter_map(|(range, matched)| matched.then_some(range.clone()));
+    let tag_selection = row_selection_from_row_ranges(matched_ranges, row_count);
+    let refined_selection = match &build_ctx.row_selection {
+        // Both selections use row-group-local coordinates. `and_then` expects its second
+        // selection to describe only the rows selected by the first one.
+        Some(original) => complete_row_selection(original, row_count)
+            .intersection(&complete_row_selection(&tag_selection, row_count)),
+        None => tag_selection,
+    };
+    let rows_before = rows_before_filter(reader_builder, build_ctx);
+
+    prefilter_ctx
+        .filters
+        .retain(|filter| filter.semantic_type() != SemanticType::Tag);
+    prefilter_ctx
+        .physical_filters
+        .retain(|filter| filter.semantic_type() != SemanticType::Tag);
+    prefilter_ctx.pk_filter = None;
+    prefilter_ctx.pk_filters = None;
+    prefilter_ctx.pk_filter_expr_strs = None;
+
+    if prefilter_ctx.filters.is_empty() && prefilter_ctx.physical_filters.is_empty() {
+        return Ok(PrefilterResult {
+            filtered_rows: rows_before.saturating_sub(refined_selection.row_count()),
+            refined_selection,
+        });
+    }
+
+    let narrowed_ctx = RowGroupBuildContext {
+        row_group_idx: build_ctx.row_group_idx,
+        row_selection: Some(refined_selection),
+        fetch_metrics: build_ctx.fetch_metrics,
+    };
+    let mut result = execute_prefilter_inner(prefilter_ctx, reader_builder, &narrowed_ctx).await?;
+    result.filtered_rows = rows_before.saturating_sub(result.refined_selection.row_count());
+    Ok(result)
+}
+
+fn complete_row_selection(selection: &RowSelection, row_count: usize) -> RowSelection {
+    let mut selectors = selection.iter().cloned().collect::<Vec<_>>();
+    let covered_rows: usize = selectors.iter().map(|selector| selector.row_count).sum();
+    if covered_rows < row_count {
+        selectors.push(RowSelector::skip(row_count - covered_rows));
+    }
+    RowSelection::from(selectors)
+}
+
+/// Loads one row group's primary keys into a tag-only record batch and row ranges.
+pub(crate) async fn load_primary_key_columns(
+    reader_builder: &RowGroupReaderBuilder,
+    metadata: &RegionMetadataRef,
+    codec: &Arc<dyn PrimaryKeyCodec>,
+    row_group_idx: usize,
+    fetch_metrics: Option<&ParquetFetchMetrics>,
+) -> Result<CachedPrimaryKeyColumns> {
+    let mut stream = reader_builder
+        .build_primary_key(RowGroupBuildContext {
+            row_group_idx,
+            row_selection: None,
+            fetch_metrics,
+        })
+        .await?;
+    let mut primary_keys = Vec::<Vec<u8>>::new();
+    let mut row_ranges = Vec::<Range<usize>>::new();
+    let mut row_offset = 0usize;
+
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        let (pk_idx, _) = batch
+            .schema()
+            .column_with_name(PRIMARY_KEY_COLUMN_NAME)
+            .context(UnexpectedSnafu {
+                reason: "Primary key column not found while building cache",
+            })?;
+        append_primary_key_runs(
+            batch.column(pk_idx),
+            row_offset,
+            &mut primary_keys,
+            &mut row_ranges,
+        )?;
+        row_offset += batch.num_rows();
+    }
+
+    let expected_rows = reader_builder
+        .parquet_metadata()
+        .row_group(row_group_idx)
+        .num_rows() as usize;
+    if row_offset != expected_rows {
+        return UnexpectedSnafu {
+            reason: format!(
+                "Primary key cache loaded {row_offset} rows but row group {row_group_idx} contains {expected_rows} rows"
+            ),
+        }
+        .fail();
+    }
+
+    decode_primary_key_columns(metadata, codec, primary_keys, row_ranges)
+}
+
+fn decode_primary_key_columns(
+    metadata: &RegionMetadataRef,
+    codec: &Arc<dyn PrimaryKeyCodec>,
+    primary_keys: Vec<Vec<u8>>,
+    row_ranges: Vec<Range<usize>>,
+) -> Result<CachedPrimaryKeyColumns> {
+    let decoded = primary_keys
+        .iter()
+        .map(|primary_key| codec.decode(primary_key).context(DecodeSnafu))
+        .collect::<Result<Vec<_>>>()?;
+    let decoded = DecodedPrimaryKeys::from_unique(decoded);
+    let source_schema = metadata.schema.arrow_schema();
+    let mut fields = Vec::with_capacity(metadata.primary_key.len());
+    let mut columns = Vec::<ArrayRef>::with_capacity(metadata.primary_key.len());
+    for (pk_index, column_id) in metadata.primary_key.iter().copied().enumerate() {
+        let column_index = metadata
+            .column_index_by_id(column_id)
+            .context(UnexpectedSnafu {
+                reason: format!("Primary key column id {column_id} not found in metadata"),
+            })?;
+        let column = &metadata.column_metadatas[column_index];
+        fields.push(tag_maybe_to_dictionary_field(
+            &column.column_schema.data_type,
+            &source_schema.fields()[column_index],
+        ));
+        columns.push(decoded.get_tag_column(
+            column_id,
+            (codec.encoding() != store_api::codec::PrimaryKeyEncoding::Sparse).then_some(pk_index),
+            &column.column_schema.data_type,
+        )?);
+    }
+    let tags = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .context(NewRecordBatchSnafu)?;
+    Ok(CachedPrimaryKeyColumns { tags, row_ranges })
+}
+
+fn append_primary_key_runs(
+    column: &ArrayRef,
+    row_offset: usize,
+    primary_keys: &mut Vec<Vec<u8>>,
+    row_ranges: &mut Vec<Range<usize>>,
+) -> Result<()> {
+    let mut append = |value: &[u8], start: usize, end: usize| {
+        let start = row_offset + start;
+        let end = row_offset + end;
+        if primary_keys.last().is_some_and(|last| last == value)
+            && let Some(last_range) = row_ranges.last_mut()
+            && last_range.end == start
+        {
+            last_range.end = end;
+        } else {
+            primary_keys.push(value.to_vec());
+            row_ranges.push(start..end);
+        }
+    };
+
+    if let Some(array) = column.as_any().downcast_ref::<PrimaryKeyArray>() {
+        let values = array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .context(UnexpectedSnafu {
+                reason: "Primary key dictionary values are not binary",
+            })?;
+        let keys = array.keys().values();
+        let mut start = 0;
+        while start < keys.len() {
+            let key = keys[start];
+            let mut end = start + 1;
+            while end < keys.len() && keys[end] == key {
+                end += 1;
+            }
+            append(values.value(key as usize), start, end);
+            start = end;
+        }
+        return Ok(());
+    }
+    if let Some(array) = column.as_any().downcast_ref::<BinaryArray>() {
+        let mut start = 0;
+        while start < array.len() {
+            let value = array.value(start);
+            let mut end = start + 1;
+            while end < array.len() && array.value(end) == value {
+                end += 1;
+            }
+            append(value, start, end);
+            start = end;
+        }
+        return Ok(());
+    }
+
+    UnexpectedSnafu {
+        reason: format!(
+            "Primary key cache input is neither dictionary nor binary, got {:?}",
+            column.data_type()
+        ),
+    }
+    .fail()
 }
 
 async fn execute_prefilter_with_result_cache(
@@ -1204,7 +1535,8 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_expr::{col, lit};
     use datatypes::arrow::array::{
-        ArrayRef, DictionaryArray, TimestampMillisecondArray, UInt8Array, UInt32Array, UInt64Array,
+        ArrayRef, DictionaryArray, StringArray, TimestampMillisecondArray, UInt8Array, UInt32Array,
+        UInt64Array,
     };
     use datatypes::arrow::datatypes::{DataType, Field, Schema, UInt32Type};
     use mito_codec::row_converter::{PrimaryKeyFilter, build_primary_key_codec};
@@ -1215,8 +1547,8 @@ mod tests {
     use crate::sst::internal_fields;
     use crate::sst::parquet::flat_format::{FlatReadFormat, primary_key_column_index};
     use crate::test_util::sst_util::{
-        new_primary_key, new_record_batch_with_custom_sequence, sst_region_metadata,
-        sst_region_metadata_with_encoding,
+        new_primary_key, new_record_batch_with_custom_sequence, new_sparse_primary_key,
+        sst_region_metadata, sst_region_metadata_with_encoding,
     };
 
     struct CountingPrimaryKeyFilter {
@@ -1249,6 +1581,90 @@ mod tests {
         );
 
         assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_append_primary_key_runs_merges_batch_boundary() {
+        let pk_a = new_primary_key(&["a", "x"]);
+        let pk_b = new_primary_key(&["b", "y"]);
+        let dictionary: ArrayRef = Arc::new(DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![0, 0]),
+            Arc::new(BinaryArray::from_iter_values([pk_a.as_slice()])),
+        ));
+        let binary: ArrayRef = Arc::new(BinaryArray::from_iter_values([
+            pk_a.as_slice(),
+            pk_b.as_slice(),
+            pk_b.as_slice(),
+        ]));
+        let mut primary_keys = Vec::new();
+        let mut row_ranges = Vec::new();
+
+        append_primary_key_runs(&dictionary, 0, &mut primary_keys, &mut row_ranges).unwrap();
+        append_primary_key_runs(&binary, 2, &mut primary_keys, &mut row_ranges).unwrap();
+
+        assert_eq!(primary_keys, vec![pk_a, pk_b]);
+        assert_eq!(row_ranges, vec![0..3, 3..5]);
+    }
+
+    #[test]
+    fn test_decode_primary_key_columns_builds_tag_record_batch() {
+        let metadata = Arc::new(sst_region_metadata());
+        let codec = build_primary_key_codec(&metadata);
+        let cached = decode_primary_key_columns(
+            &metadata,
+            &codec,
+            vec![new_primary_key(&["a", "x"]), new_primary_key(&["b", "y"])],
+            vec![0..2, 2..5],
+        )
+        .unwrap();
+
+        assert_eq!(cached.tags.num_rows(), 2);
+        assert_eq!(cached.tags.num_columns(), 2);
+        assert_eq!(cached.row_ranges, vec![0..2, 2..5]);
+        for (column_index, expected) in [vec!["a", "b"], vec!["x", "y"]].into_iter().enumerate() {
+            let dictionary = cached
+                .tags
+                .column(column_index)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let values = dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let actual = dictionary
+                .keys()
+                .values()
+                .iter()
+                .map(|key| values.value(*key as usize))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+
+        let sparse_metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let sparse_codec = build_primary_key_codec(&sparse_metadata);
+        let cached = decode_primary_key_columns(
+            &sparse_metadata,
+            &sparse_codec,
+            vec![new_sparse_primary_key(&["a", "x"], &sparse_metadata, 42, 7)],
+            vec![0..3],
+        )
+        .unwrap();
+        assert_eq!(cached.tags.num_columns(), 4);
+        let tag_0 = cached.tags.column_by_name("tag_0").unwrap();
+        let dictionary = tag_0
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(dictionary.keys().value(0) as usize), "a");
     }
 
     fn new_test_filters(exprs: &[datafusion_expr::Expr]) -> Vec<SimpleFilterEvaluator> {

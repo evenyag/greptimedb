@@ -24,6 +24,7 @@ pub(crate) mod test_util;
 pub(crate) mod write_cache;
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, RwLock, Weak};
@@ -39,6 +40,7 @@ use datatypes::value::Value;
 use datatypes::vectors::VectorRef;
 use index::bloom_filter_index::{BloomFilterIndexCache, BloomFilterIndexCacheRef};
 use index::result_cache::IndexResultCache;
+use moka::future::Cache as AsyncCache;
 use moka::notification::RemovalCause;
 use moka::sync::Cache;
 use object_store::ObjectStore;
@@ -68,7 +70,7 @@ use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
 use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::read::read_columns::JsonTargetTypes;
-use crate::sst::file::{RegionFileId, RegionIndexId};
+use crate::sst::file::{FileHandle, RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
 use crate::sst::parquet::reader::MetadataCacheMetrics;
@@ -91,6 +93,8 @@ const SELECTOR_RESULT_TYPE: &str = "selector_result";
 const RANGE_RESULT_TYPE: &str = "range_result";
 /// Metrics type key for prefilter result cache.
 const PREFILTER_RESULT_TYPE: &str = "prefilter_result";
+/// Metrics type key for cached primary key tag columns.
+const PREFILTER_PRIMARY_KEY_TYPE: &str = "prefilter_primary_key";
 const RANGE_RESULT_CONCAT_MEMORY_LIMIT: ReadableSize = ReadableSize::mb(512);
 const RANGE_RESULT_CONCAT_MEMORY_PERMIT: ReadableSize = ReadableSize::kb(1);
 
@@ -635,6 +639,39 @@ fn prefilter_result_cache_weight(k: &PrefilterKey, v: &Arc<BooleanBuffer>) -> u3
     (k.mem_usage() + mem::size_of::<BooleanBuffer>() + v.values().len()) as u32
 }
 
+/// Key for decoded primary key tag columns of one SST row group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PrimaryKeyCacheKey {
+    pub(crate) file_id: FileId,
+    pub(crate) row_group_id: u32,
+}
+
+/// Decoded tag values and their source row ranges for one SST row group.
+#[derive(Debug)]
+pub(crate) struct CachedPrimaryKeyColumns {
+    /// One row per distinct primary key in the row group.
+    pub(crate) tags: RecordBatch,
+    /// Row range represented by the corresponding row in `tags`.
+    pub(crate) row_ranges: Vec<Range<usize>>,
+}
+
+impl CachedPrimaryKeyColumns {
+    fn estimated_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + record_batch_estimated_size(&self.tags)
+            + self.row_ranges.capacity() * mem::size_of::<Range<usize>>()
+    }
+}
+
+type PrefilterPrimaryKeyCache = AsyncCache<PrimaryKeyCacheKey, Arc<CachedPrimaryKeyColumns>>;
+
+fn prefilter_primary_key_cache_weight(
+    _key: &PrimaryKeyCacheKey,
+    value: &Arc<CachedPrimaryKeyColumns>,
+) -> u32 {
+    u32::try_from(mem::size_of::<PrimaryKeyCacheKey>() + value.estimated_size()).unwrap_or(u32::MAX)
+}
+
 /// Cache strategies that may only enable a subset of caches.
 #[derive(Clone)]
 pub enum CacheStrategy {
@@ -651,6 +688,34 @@ pub enum CacheStrategy {
 }
 
 impl CacheStrategy {
+    /// Returns whether `file` is eligible for decoded primary key caching.
+    pub(crate) fn prefilter_primary_key_cache_enabled_for(&self, file: &FileHandle) -> bool {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) => {
+                cache_manager.prefilter_primary_key_cache_enabled_for(file)
+            }
+            CacheStrategy::Compaction(_) | CacheStrategy::Disabled => false,
+        }
+    }
+
+    /// Gets or initializes decoded primary key columns for one row group.
+    pub(crate) async fn get_or_load_primary_key_columns<F>(
+        &self,
+        key: PrimaryKeyCacheKey,
+        init: F,
+    ) -> std::result::Result<Option<Arc<CachedPrimaryKeyColumns>>, Arc<crate::error::Error>>
+    where
+        F: Future<Output = Result<CachedPrimaryKeyColumns>> + Send,
+    {
+        match self {
+            CacheStrategy::EnableAll(cache_manager) => cache_manager
+                .get_or_load_primary_key_columns(key, init)
+                .await
+                .map(Some),
+            CacheStrategy::Compaction(_) | CacheStrategy::Disabled => Ok(None),
+        }
+    }
+
     /// Returns whether the SST metadata cache is enabled for this strategy.
     pub(crate) fn sst_meta_cache_enabled(&self) -> bool {
         match self {
@@ -1020,11 +1085,91 @@ pub struct CacheManager {
     index_result_cache: Option<IndexResultCache>,
     /// Cache for prefilter result.
     prefilter_result_cache: Option<PrefilterResultCache>,
+    /// Cache for decoded primary key tag columns by SST row group.
+    prefilter_primary_key_cache: Option<PrefilterPrimaryKeyCache>,
+    /// Maximum file-level series count eligible for primary key caching.
+    prefilter_primary_key_cache_max_series: u64,
 }
 
 pub type CacheManagerRef = Arc<CacheManager>;
 
 impl CacheManager {
+    /// Returns whether `file` is eligible for decoded primary key caching.
+    pub(crate) fn prefilter_primary_key_cache_enabled_for(&self, file: &FileHandle) -> bool {
+        let num_series = file.meta_ref().num_series;
+        self.prefilter_primary_key_cache.is_some()
+            && num_series > 0
+            && num_series <= self.prefilter_primary_key_cache_max_series
+    }
+
+    /// Gets or initializes decoded primary key columns for one row group.
+    pub(crate) async fn get_or_load_primary_key_columns<F>(
+        &self,
+        key: PrimaryKeyCacheKey,
+        init: F,
+    ) -> std::result::Result<Arc<CachedPrimaryKeyColumns>, Arc<crate::error::Error>>
+    where
+        F: Future<Output = Result<CachedPrimaryKeyColumns>> + Send,
+    {
+        let cache = self
+            .prefilter_primary_key_cache
+            .as_ref()
+            .expect("primary key cache must be enabled before loading");
+        if let Some(value) = cache.get(&key).await {
+            CACHE_HIT
+                .with_label_values(&[PREFILTER_PRIMARY_KEY_TYPE])
+                .inc();
+            return Ok(value);
+        }
+
+        CACHE_MISS
+            .with_label_values(&[PREFILTER_PRIMARY_KEY_TYPE])
+            .inc();
+        cache
+            .try_get_with(key, async move {
+                let value = Arc::new(init.await?);
+                CACHE_BYTES
+                    .with_label_values(&[PREFILTER_PRIMARY_KEY_TYPE])
+                    .add(prefilter_primary_key_cache_weight(&key, &value).into());
+                Ok(value)
+            })
+            .await
+    }
+
+    /// Returns whether the primary key cache has reached its configured capacity.
+    pub(crate) fn prefilter_primary_key_cache_is_full(&self) -> bool {
+        self.prefilter_primary_key_cache
+            .as_ref()
+            .is_none_or(|cache| {
+                cache
+                    .policy()
+                    .max_capacity()
+                    .is_some_and(|capacity| cache.weighted_size() >= capacity)
+            })
+    }
+
+    /// Invalidates all cached row groups for `file_id`.
+    pub(crate) async fn invalidate_primary_key_columns(&self, file_id: FileId) {
+        let Some(cache) = &self.prefilter_primary_key_cache else {
+            return;
+        };
+        let keys = cache
+            .iter()
+            .filter_map(|(key, _)| (key.file_id == file_id).then_some(*key))
+            .collect::<Vec<_>>();
+        for key in keys {
+            cache.invalidate(&key).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_cached_primary_key_columns(
+        &self,
+        key: &PrimaryKeyCacheKey,
+    ) -> Option<Arc<CachedPrimaryKeyColumns>> {
+        self.prefilter_primary_key_cache.as_ref()?.get(key).await
+    }
+
     /// Returns a builder to build the cache.
     pub fn builder() -> CacheManagerBuilder {
         CacheManagerBuilder::default()
@@ -1468,6 +1613,8 @@ pub struct CacheManagerBuilder {
     index_content_page_size: u64,
     index_result_cache_size: u64,
     prefilter_result_cache_size: u64,
+    prefilter_primary_key_cache_size: u64,
+    prefilter_primary_key_cache_max_series: u64,
     puffin_metadata_size: u64,
     write_cache: Option<WriteCacheRef>,
     selector_result_cache_size: u64,
@@ -1526,6 +1673,18 @@ impl CacheManagerBuilder {
     /// Sets cache size for prefilter result.
     pub fn prefilter_result_cache_size(mut self, bytes: u64) -> Self {
         self.prefilter_result_cache_size = bytes;
+        self
+    }
+
+    /// Sets the cache size for decoded primary key tag columns.
+    pub fn prefilter_primary_key_cache_size(mut self, bytes: u64) -> Self {
+        self.prefilter_primary_key_cache_size = bytes;
+        self
+    }
+
+    /// Sets the maximum SST series count eligible for primary key caching.
+    pub fn prefilter_primary_key_cache_max_series(mut self, max_series: u64) -> Self {
+        self.prefilter_primary_key_cache_max_series = max_series;
         self
     }
 
@@ -1619,6 +1778,26 @@ impl CacheManagerBuilder {
             .then(|| IndexResultCache::new(self.index_result_cache_size));
         let prefilter_result_cache = (self.prefilter_result_cache_size != 0)
             .then(|| new_prefilter_result_cache(self.prefilter_result_cache_size));
+        let prefilter_primary_key_cache = (self.prefilter_primary_key_cache_size != 0
+            && self.prefilter_primary_key_cache_max_series != 0)
+            .then(|| {
+                AsyncCache::builder()
+                    .max_capacity(self.prefilter_primary_key_cache_size)
+                    .weigher(prefilter_primary_key_cache_weight)
+                    .eviction_listener(|key, value, cause| {
+                        let size = prefilter_primary_key_cache_weight(&key, &value);
+                        CACHE_BYTES
+                            .with_label_values(&[PREFILTER_PRIMARY_KEY_TYPE])
+                            .sub(size.into());
+                        CACHE_EVICTION
+                            .with_label_values(&[
+                                PREFILTER_PRIMARY_KEY_TYPE,
+                                removal_cause_str(cause),
+                            ])
+                            .inc();
+                    })
+                    .build()
+            });
         let puffin_metadata_cache =
             PuffinMetadataCache::new(self.puffin_metadata_size, &CACHE_BYTES);
         let selector_result_cache = (self.selector_result_cache_size != 0).then(|| {
@@ -1671,6 +1850,8 @@ impl CacheManagerBuilder {
             )),
             index_result_cache,
             prefilter_result_cache,
+            prefilter_primary_key_cache,
+            prefilter_primary_key_cache_max_series: self.prefilter_primary_key_cache_max_series,
         }
     }
 }
@@ -2087,9 +2268,12 @@ type RangeResultCache = Cache<RangeScanCacheKey, Arc<RangeScanCacheValue>>;
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use api::v1::SemanticType;
     use api::v1::index::{BloomFilterMeta, InvertedIndexMetas};
+    use datatypes::arrow::datatypes::Schema;
+    use datatypes::arrow::record_batch::RecordBatch;
     use datatypes::schema::ColumnSchema;
     use datatypes::vectors::Int64Vector;
     use parquet::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
@@ -2107,7 +2291,85 @@ mod tests {
         RangeScanCacheKey, RangeScanCacheValue, ScanRequestFingerprintBuilder,
     };
     use crate::read::read_columns::ReadColumns;
+    use crate::sst::file::{FileHandle, FileMeta};
     use crate::sst::parquet::row_selection::RowGroupSelection;
+    use crate::test_util::new_noop_file_purger;
+
+    fn primary_key_cache_value() -> CachedPrimaryKeyColumns {
+        CachedPrimaryKeyColumns {
+            tags: RecordBatch::new_empty(Arc::new(Schema::empty())),
+            row_ranges: Vec::new(),
+        }
+    }
+
+    fn file_with_num_series(num_series: u64) -> FileHandle {
+        FileHandle::new(
+            FileMeta {
+                file_id: FileId::random(),
+                num_series,
+                ..Default::default()
+            },
+            new_noop_file_purger(),
+        )
+    }
+
+    #[test]
+    fn test_primary_key_cache_eligibility_uses_known_series_count() {
+        let cache = CacheManager::builder()
+            .prefilter_primary_key_cache_size(1024)
+            .prefilter_primary_key_cache_max_series(10)
+            .build();
+
+        assert!(!cache.prefilter_primary_key_cache_enabled_for(&file_with_num_series(0)));
+        assert!(cache.prefilter_primary_key_cache_enabled_for(&file_with_num_series(10)));
+        assert!(!cache.prefilter_primary_key_cache_enabled_for(&file_with_num_series(11)));
+    }
+
+    #[tokio::test]
+    async fn test_primary_key_cache_singleflight_and_file_invalidation() {
+        let cache = Arc::new(
+            CacheManager::builder()
+                .prefilter_primary_key_cache_size(1024 * 1024)
+                .prefilter_primary_key_cache_max_series(10)
+                .build(),
+        );
+        let key = PrimaryKeyCacheKey {
+            file_id: FileId::random(),
+            row_group_id: 3,
+        };
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let cache = cache.clone();
+            let loads = loads.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_load_primary_key_columns(key, async move {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        tokio::task::yield_now().await;
+                        Ok(primary_key_cache_value())
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let first = tasks.remove(0).await.unwrap();
+        let second = tasks.remove(0).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(1, loads.load(Ordering::Relaxed));
+
+        cache.invalidate_primary_key_columns(key.file_id).await;
+        assert!(
+            cache
+                .prefilter_primary_key_cache
+                .as_ref()
+                .unwrap()
+                .get(&key)
+                .await
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn test_disable_cache() {

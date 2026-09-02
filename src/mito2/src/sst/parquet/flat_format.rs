@@ -736,6 +736,15 @@ pub(crate) struct DecodedPrimaryKeys {
 }
 
 impl DecodedPrimaryKeys {
+    /// Creates decoded primary keys with one identity key per unique value.
+    pub(crate) fn from_unique(decoded_pk_values: Vec<CompositeValues>) -> Self {
+        let keys_array = UInt32Array::from_iter_values(0..decoded_pk_values.len() as u32);
+        Self {
+            decoded_pk_values,
+            keys_array,
+        }
+    }
+
     /// Gets a tag column array by column id and data type.
     ///
     /// For sparse encoding, uses column_id to lookup values.

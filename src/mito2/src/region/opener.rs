@@ -29,6 +29,7 @@ use futures::future::BoxFuture;
 use log_store::kafka::log_store::KafkaLogStore;
 use log_store::noop::log_store::NoopLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
+use mito_codec::row_converter::build_primary_key_codec;
 use object_store::ObjectStore;
 use object_store::manager::ObjectStoreManagerRef;
 use object_store::util::{is_object_storage, normalize_dir};
@@ -47,7 +48,9 @@ use tokio::sync::Semaphore;
 
 use crate::access_layer::AccessLayer;
 use crate::cache::file_cache::{FileCache, FileType, IndexKey};
-use crate::cache::{CacheManagerRef, SstMetaPreparation, prepare_sst_meta};
+use crate::cache::{
+    CacheManagerRef, CacheStrategy, PrimaryKeyCacheKey, SstMetaPreparation, prepare_sst_meta,
+};
 use crate::config::MitoConfig;
 use crate::engine::region_hook::RegionHookRef;
 use crate::error;
@@ -78,15 +81,19 @@ use crate::sst::index::intermediate::IntermediateManager;
 use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::sst::location::{self, region_dir_from_table_dir};
 use crate::sst::parquet::metadata::{MetadataLoader, extract_primary_key_range};
-use crate::sst::parquet::reader::MetadataCacheMetrics;
+use crate::sst::parquet::prefilter::load_primary_key_columns;
+use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderMetrics};
 use crate::time_provider::TimeProviderRef;
 use crate::wal::entry_reader::WalEntryReader;
 use crate::wal::{EntryId, Wal};
 
 const PARQUET_META_PRELOAD_CONCURRENCY: usize = 8;
+const PRIMARY_KEY_PRELOAD_CONCURRENCY: usize = 8;
 
 static PARQUET_META_PRELOAD_SEMAPHORE: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(PARQUET_META_PRELOAD_CONCURRENCY));
+static PRIMARY_KEY_PRELOAD_SEMAPHORE: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(PRIMARY_KEY_PRELOAD_CONCURRENCY));
 
 fn initial_pruned_entry_id(wal_options: &WalOptions) -> EntryId {
     match wal_options {
@@ -668,6 +675,7 @@ impl RegionOpener {
 
         maybe_load_cache(&region, config, &self.cache_manager);
         maybe_preload_parquet_meta_cache(&region, config, &self.cache_manager);
+        maybe_preload_primary_key_cache(&region, &self.cache_manager);
 
         Ok(Some(region))
     }
@@ -1334,6 +1342,124 @@ fn maybe_preload_parquet_meta_cache(
                 region_id,
                 loaded,
                 preloading_cost.as_millis()
+            );
+        }
+    });
+}
+
+/// Loads and decodes primary keys for eligible SST row groups.
+///
+/// Unlike metadata preloading, this intentionally reads from remote object stores too. The cache
+/// is derived state and all failures are best-effort: query-time reads can retry or use the normal
+/// prefilter path.
+async fn preload_primary_key_cache_for_files(
+    region_id: RegionId,
+    cache_manager: CacheManagerRef,
+    access_layer: Arc<AccessLayer>,
+    mut files: Vec<FileHandle>,
+) -> usize {
+    files.sort_by_key(|file| std::cmp::Reverse(file.meta_ref().time_range.1));
+
+    let mut loaded_row_groups = 0;
+    for file in files {
+        if cache_manager.prefilter_primary_key_cache_is_full() {
+            break;
+        }
+        if !cache_manager.prefilter_primary_key_cache_enabled_for(&file) {
+            continue;
+        }
+
+        let file_id = file.file_id().file_id();
+        let builder = access_layer
+            .read_sst(file)
+            .cache(CacheStrategy::EnableAll(cache_manager.clone()));
+        let mut metrics = ReaderMetrics::default();
+        let context = match builder.build_reader_input(&mut metrics).await {
+            Ok(Some((context, _))) => context,
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(err; "Failed to prepare SST primary key cache preload, region: {}, file: {}", region_id, file_id);
+                continue;
+            }
+        };
+        let metadata = context.read_format().metadata().clone();
+        let codec = build_primary_key_codec(&metadata);
+        let num_row_groups = context.reader_builder().parquet_metadata().num_row_groups();
+
+        for row_group_idx in 0..num_row_groups {
+            if cache_manager.prefilter_primary_key_cache_is_full() {
+                break;
+            }
+            let key = PrimaryKeyCacheKey {
+                file_id,
+                row_group_id: row_group_idx as u32,
+            };
+            match cache_manager
+                .get_or_load_primary_key_columns(key, async {
+                    load_primary_key_columns(
+                        context.reader_builder(),
+                        &metadata,
+                        &codec,
+                        row_group_idx,
+                        None,
+                    )
+                    .await
+                })
+                .await
+            {
+                Ok(_) => loaded_row_groups += 1,
+                Err(err) => warn!(err.as_ref();
+                    "Failed to preload SST primary key columns, region: {}, file: {}, row_group: {}",
+                    region_id,
+                    file_id,
+                    row_group_idx
+                ),
+            }
+        }
+    }
+
+    loaded_row_groups
+}
+
+fn maybe_preload_primary_key_cache(
+    region: &MitoRegionRef,
+    cache_manager: &Option<CacheManagerRef>,
+) {
+    let Some(cache_manager) = cache_manager else {
+        return;
+    };
+
+    let files = {
+        let version = region.version_control.current().version;
+        version
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files.values().cloned())
+            .collect::<Vec<_>>()
+    };
+    if !files
+        .iter()
+        .any(|file| cache_manager.prefilter_primary_key_cache_enabled_for(file))
+    {
+        return;
+    }
+
+    let region_id = region.region_id;
+    let access_layer = region.access_layer.clone();
+    let cache_manager = cache_manager.clone();
+    tokio::spawn(async move {
+        let _permit = PRIMARY_KEY_PRELOAD_SEMAPHORE.acquire().await.unwrap();
+        let start = Instant::now();
+        let loaded =
+            preload_primary_key_cache_for_files(region_id, cache_manager, access_layer, files)
+                .await;
+        if loaded > 0 {
+            info!(
+                "Preloaded primary key columns for region {}, loaded_row_groups: {}, elapsed_ms: {}",
+                region_id,
+                loaded,
+                start.elapsed().as_millis()
             );
         }
     });

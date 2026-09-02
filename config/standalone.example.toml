@@ -692,6 +692,14 @@ auto_flush_interval = "10m"
 ## @toml2docs:none-default="Auto"
 #+ prefilter_result_cache_size = "128MB"
 
+## Cache size for decoded primary key tag columns used by prefiltering.
+## If not set, it's default to 1/32 of OS memory with a max limitation of 256MB. Setting it to 0 disables the cache.
+## @toml2docs:none-default="Auto"
+#+ experimental_prefilter_primary_key_cache_size = "256MB"
+
+## Maximum number of series in an SST eligible for primary key preloading. Setting it to 0 disables preloading.
+experimental_prefilter_primary_key_cache_max_series = 10240
+
 ## Whether to enable the write cache, it's enabled by default when using object storage. It is recommended to enable it when using object storage for better performance.
 enable_write_cache = false
 
