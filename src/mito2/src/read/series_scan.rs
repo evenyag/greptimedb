@@ -735,6 +735,7 @@ impl SeriesDistributor {
                         partition_pruner,
                         file_scan_semaphore,
                         merge_semaphore,
+                        1,
                     )
                     .await
                 }));

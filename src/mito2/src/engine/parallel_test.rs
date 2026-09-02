@@ -116,16 +116,17 @@ async fn test_parallel_scan_with_format(flat_format: bool) {
         rows: build_rows_for_key("a", 0, 3, 0),
     };
     put_rows(&engine, region_id, rows).await;
-    // SST0
-    flush_region(&engine, region_id, None).await;
+    // SST0 with multiple row groups.
+    flush_region(&engine, region_id, Some(1)).await;
 
     let rows = Rows {
         schema: column_schemas.clone(),
         rows: build_rows_for_key("b", 0, 3, 0),
     };
     put_rows(&engine, region_id, rows).await;
-    // SST1
-    flush_region(&engine, region_id, None).await;
+    // SST1 overlaps SST0 and also has multiple row groups. Parallel scans can
+    // split both files into additional merge sources.
+    flush_region(&engine, region_id, Some(1)).await;
 
     // Delete (a, 2)
     let rows = Rows {
@@ -134,7 +135,7 @@ async fn test_parallel_scan_with_format(flat_format: bool) {
     };
     delete_rows(&engine, region_id, rows).await;
     // SST2
-    flush_region(&engine, region_id, None).await;
+    flush_region(&engine, region_id, Some(1)).await;
 
     // Delete (b, 0), (b, 1)
     let rows = Rows {

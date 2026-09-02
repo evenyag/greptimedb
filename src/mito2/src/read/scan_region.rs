@@ -1445,7 +1445,7 @@ impl ScanInput {
         semaphore: Arc<Semaphore>,
         channel_size: usize,
     ) -> Result<Vec<BoxedRecordBatchStream>> {
-        if sources.len() <= 1 {
+        if sources.is_empty() {
             return Ok(sources);
         }
 
