@@ -270,13 +270,14 @@ impl FileRange {
         if check_dynamic_filter && !self.in_dynamic_filter_range() {
             return Ok(None);
         }
+        let primary_key_fetch_metrics = fetch_metrics.map(ParquetFetchMetrics::primary_key_phase);
         let stream = self
             .context
             .reader_builder
             .build_primary_key(self.context.build_context(
                 self.row_group_idx,
                 self.row_selection.clone(),
-                fetch_metrics,
+                primary_key_fetch_metrics.as_ref(),
             ))
             .await?;
         if self.context.compat_batch().is_none() {

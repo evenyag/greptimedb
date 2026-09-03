@@ -92,11 +92,7 @@ impl SstParquetRangeFetcher {
             && lookup.cached_bytes > 0
             && let Some(metrics) = &self.fetch_metrics
         {
-            let mut metrics_data = metrics.data.lock().unwrap();
-            metrics_data.page_cache_hit += 1;
-            metrics_data.pages_to_fetch_mem += lookup.cached_range_count;
-            metrics_data.page_size_to_fetch_mem += lookup.cached_bytes;
-            metrics_data.page_size_needed += lookup.cached_bytes;
+            metrics.record_page_cache_hit(lookup.cached_range_count, lookup.cached_bytes);
         }
 
         // Fast path: all requested ranges can be assembled from cached fragments.
@@ -109,7 +105,7 @@ impl SstParquetRangeFetcher {
             if let Some(metrics) = &self.fetch_metrics
                 && let Some(start) = fetch_start
             {
-                metrics.data.lock().unwrap().total_fetch_elapsed += start.elapsed();
+                metrics.record_total_fetch_elapsed(start.elapsed());
             }
             return assemble_ranges(&ranges, lookup.cached_parts, &[]);
         }
@@ -145,12 +141,12 @@ impl SstParquetRangeFetcher {
                         .unwrap_or_default();
                     let range_size_needed: u64 =
                         missing_ranges.iter().map(|r| r.end - r.start).sum();
-                    let mut metrics_data = metrics.data.lock().unwrap();
-                    metrics_data.write_cache_fetch_elapsed += elapsed;
-                    metrics_data.write_cache_hit += 1;
-                    metrics_data.pages_to_fetch_write_cache += missing_ranges.len();
-                    metrics_data.page_size_to_fetch_write_cache += unaligned_size;
-                    metrics_data.page_size_needed += range_size_needed;
+                    metrics.record_write_cache_fetch(
+                        missing_ranges.len(),
+                        unaligned_size,
+                        range_size_needed,
+                        elapsed,
+                    );
                 }
                 data
             }
@@ -173,12 +169,12 @@ impl SstParquetRangeFetcher {
                     let elapsed = start.map(|start| start.elapsed()).unwrap_or_default();
                     let range_size_needed: u64 =
                         missing_ranges.iter().map(|r| r.end - r.start).sum();
-                    let mut metrics_data = metrics.data.lock().unwrap();
-                    metrics_data.store_fetch_elapsed += elapsed;
-                    metrics_data.cache_miss += 1;
-                    metrics_data.pages_to_fetch_store += missing_ranges.len();
-                    metrics_data.page_size_to_fetch_store += unaligned_size;
-                    metrics_data.page_size_needed += range_size_needed;
+                    metrics.record_store_fetch(
+                        missing_ranges.len(),
+                        unaligned_size,
+                        range_size_needed,
+                        elapsed,
+                    );
                 }
                 data
             }
@@ -202,7 +198,7 @@ impl SstParquetRangeFetcher {
         );
 
         if let (Some(metrics), Some(start)) = (&self.fetch_metrics, fetch_start) {
-            metrics.data.lock().unwrap().total_fetch_elapsed += start.elapsed();
+            metrics.record_total_fetch_elapsed(start.elapsed());
         }
 
         if let Some(lookup) = page_lookup {
