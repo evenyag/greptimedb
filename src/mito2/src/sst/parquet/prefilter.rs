@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 use std::ops::{BitAnd, Range};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use api::v1::SemanticType;
 use common_recordbatch::filter::SimpleFilterEvaluator;
@@ -764,6 +765,8 @@ async fn execute_prefilter_with_result_cache(
     let non_cacheable_physical = non_cacheable_physical_filters(prefilter_ctx);
     let mut hit_mask: Option<BooleanBuffer> = None;
     let mut misses = Vec::new();
+    let mut cache_hits = 0;
+    let mut cache_misses = 0;
     for entry in entries {
         let Some(key) = &entry.key else {
             misses.push(entry);
@@ -771,21 +774,30 @@ async fn execute_prefilter_with_result_cache(
         };
 
         if let Some(mask) = reader_builder.cache_strategy().get_prefilter_result(key) {
+            cache_hits += 1;
             hit_mask = Some(match hit_mask {
                 Some(hit_mask) => hit_mask.bitand(mask.as_ref()),
                 None => mask.as_ref().clone(),
             });
         } else {
+            cache_misses += 1;
             misses.push(entry);
         }
     }
+    if let Some(metrics) = build_ctx.fetch_metrics {
+        let mut data = metrics.data.lock().unwrap();
+        data.prefilter_result_cache_hits += cache_hits;
+        data.prefilter_result_cache_misses += cache_misses;
+    }
 
     if misses.is_empty() && non_cacheable_physical.is_empty() {
+        let selection_start = build_ctx.fetch_metrics.map(|_| Instant::now());
         let combined_mask = hit_mask.unwrap_or_else(|| BooleanBuffer::new_set(0));
         let refined_selection =
             refined_selection_from_mask(&combined_mask, &build_ctx.row_selection);
         let rows_before_filter = rows_before_filter(reader_builder, build_ctx);
         let filtered_rows = rows_before_filter.saturating_sub(refined_selection.row_count());
+        record_selection_elapsed(build_ctx, selection_start);
         return Ok(PrefilterResult {
             refined_selection,
             filtered_rows,
@@ -802,6 +814,7 @@ async fn execute_prefilter_with_result_cache(
     let (uncached_mask, read_rows) =
         build_prefilter_masks(prefilter_ctx, reader_builder, build_ctx, &uncached_entries).await?;
 
+    let selection_start = build_ctx.fetch_metrics.map(|_| Instant::now());
     let final_mask = match (hit_mask, uncached_mask) {
         (Some(hit_mask), Some(uncached_mask)) => hit_mask.bitand(&uncached_mask),
         (Some(hit_mask), None) => hit_mask,
@@ -812,6 +825,7 @@ async fn execute_prefilter_with_result_cache(
     let rows_selected = final_mask.count_set_bits();
     let filtered_rows = read_rows.saturating_sub(rows_selected);
     let refined_selection = refined_selection_from_mask(&final_mask, &build_ctx.row_selection);
+    record_selection_elapsed(build_ctx, selection_start);
 
     Ok(PrefilterResult {
         refined_selection,
@@ -845,14 +859,19 @@ async fn build_prefilter_masks(
         parquet_schema,
     );
 
+    let prefilter_fetch_metrics = build_ctx
+        .fetch_metrics
+        .map(|metrics| metrics.prefilter_phase());
+    let build_start = build_ctx.fetch_metrics.map(|_| Instant::now());
     let mut stream = reader_builder
         .build_with_projection(
             build_ctx.row_group_idx,
             build_ctx.row_selection.clone(),
             projection,
-            build_ctx.fetch_metrics,
+            prefilter_fetch_metrics.as_ref(),
         )
         .await?;
+    let mut column_read_elapsed = build_start.map(|start| start.elapsed()).unwrap_or_default();
 
     let mut cache_builders = entries
         .iter()
@@ -860,15 +879,27 @@ async fn build_prefilter_masks(
         .collect::<Vec<_>>();
     let mut combined_builder = (!entries.is_empty()).then(|| BooleanBufferBuilder::new(0));
     let mut rows_before_filter = 0usize;
+    let mut input_batches = 0usize;
+    let mut filter_eval_elapsed = Duration::ZERO;
 
-    while let Some(batch_result) = stream.next().await {
+    loop {
+        let read_start = build_ctx.fetch_metrics.map(|_| Instant::now());
+        let next = stream.next().await;
+        if let Some(read_start) = read_start {
+            column_read_elapsed += read_start.elapsed();
+        }
+        let Some(batch_result) = next else {
+            break;
+        };
         let batch = batch_result?;
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             continue;
         }
+        input_batches += 1;
         rows_before_filter += num_rows;
 
+        let eval_start = build_ctx.fetch_metrics.map(|_| Instant::now());
         let mut batch_mask = BooleanBuffer::new_set(num_rows);
         for (idx, entry) in entries.iter().enumerate() {
             let mask = eval_entry_mask(
@@ -885,6 +916,9 @@ async fn build_prefilter_masks(
         if let Some(builder) = &mut combined_builder {
             builder.append_buffer(&batch_mask);
         }
+        if let Some(eval_start) = eval_start {
+            filter_eval_elapsed += eval_start.elapsed();
+        }
     }
 
     for (entry, builder) in entries.iter().zip(cache_builders) {
@@ -893,6 +927,15 @@ async fn build_prefilter_masks(
                 .cache_strategy()
                 .put_prefilter_result(key.clone(), Arc::new(builder.finish()));
         }
+    }
+
+    if let Some(metrics) = build_ctx.fetch_metrics {
+        let mut data = metrics.data.lock().unwrap();
+        data.prefilter_column_read_elapsed += column_read_elapsed;
+        data.prefilter_filter_eval_elapsed += filter_eval_elapsed;
+        data.prefilter_rows_read += rows_before_filter;
+        data.prefilter_batches_read += input_batches;
+        data.prefilter_columns_read.extend(prefilter_column_names);
     }
 
     Ok((
@@ -937,15 +980,23 @@ async fn execute_prefilter_by_reading_columns(
     let (mask, rows_before_filter) =
         build_prefilter_masks(prefilter_ctx, reader_builder, build_ctx, &entries).await?;
 
+    let selection_start = build_ctx.fetch_metrics.map(|_| Instant::now());
     let final_mask = mask.unwrap_or_else(|| BooleanBuffer::new_set(rows_before_filter));
     let rows_selected = final_mask.count_set_bits();
     let filtered_rows = rows_before_filter.saturating_sub(rows_selected);
     let refined_selection = refined_selection_from_mask(&final_mask, &build_ctx.row_selection);
+    record_selection_elapsed(build_ctx, selection_start);
 
     Ok(PrefilterResult {
         refined_selection,
         filtered_rows,
     })
+}
+
+fn record_selection_elapsed(build_ctx: &RowGroupBuildContext<'_>, start: Option<Instant>) {
+    if let (Some(metrics), Some(start)) = (build_ctx.fetch_metrics, start) {
+        metrics.data.lock().unwrap().prefilter_selection_elapsed += start.elapsed();
+    }
 }
 
 fn all_prefilter_entries(prefilter_ctx: &PrefilterContext) -> Vec<PrefilterEntry> {

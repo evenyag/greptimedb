@@ -1985,6 +1985,9 @@ impl RowGroupReaderBuilder {
             let mut data = metrics.data.lock().unwrap();
             data.prefilter_cost += prefilter_start.elapsed();
             data.prefilter_filtered_rows += prefilter_result.filtered_rows;
+            let selected_rows = prefilter_result.refined_selection.row_count();
+            data.prefilter_selected_rows += selected_rows;
+            data.prefilter_candidate_rows += selected_rows + prefilter_result.filtered_rows;
         }
 
         let refined_selection = Some(prefilter_result.refined_selection);
