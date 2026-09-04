@@ -45,6 +45,7 @@ use common_runtime::JoinHandle;
 use common_stat::get_total_memory_bytes;
 use common_telemetry::{error, info, warn};
 use futures::future::try_join_all;
+use object_store::ObjectStore;
 use object_store::manager::ObjectStoreManagerRef;
 use prometheus::{Histogram, IntGauge};
 use rand::{Rng, rng};
@@ -57,6 +58,7 @@ use store_api::storage::{FileId, RegionId};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 
+use crate::access_layer::new_fs_cache_store;
 use crate::cache::write_cache::{WriteCache, WriteCacheRef};
 use crate::cache::{CacheManager, CacheManagerRef, WriteCacheUploadStoreWrapperRef};
 use crate::compaction::CompactionScheduler;
@@ -65,6 +67,7 @@ use crate::config::MitoConfig;
 use crate::error::{self, CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::gc::{GcLimiter, GcLimiterRef};
+use crate::local_index::{LocalIndexReconcileFinished, reconcile_range_indexes};
 use crate::memtable::MemtableBuilderProvider;
 use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::opener::PartitionExprFetcherRef;
@@ -190,6 +193,11 @@ impl WorkerGroup {
             .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
+        let local_index_store = if config.experimental_local_index_root.trim().is_empty() {
+            None
+        } else {
+            Some(new_fs_cache_store(&config.experimental_local_index_root).await?)
+        };
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -242,6 +250,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
+                    local_index_store: local_index_store.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -399,6 +408,11 @@ impl WorkerGroup {
         });
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
+        let local_index_store = if config.experimental_local_index_root.trim().is_empty() {
+            None
+        } else {
+            Some(new_fs_cache_store(&config.experimental_local_index_root).await?)
+        };
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
         let flush_semaphore = Arc::new(Semaphore::new(config.max_background_flushes));
@@ -452,6 +466,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
+                    local_index_store: local_index_store.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -546,6 +561,7 @@ struct WorkerStarter<S> {
     write_buffer_manager: WriteBufferManagerRef,
     compact_job_pool: SchedulerRef,
     index_build_job_pool: SchedulerRef,
+    local_index_store: Option<ObjectStore>,
     flush_job_pool: SchedulerRef,
     purge_scheduler: SchedulerRef,
     listener: WorkerListener,
@@ -595,9 +611,12 @@ impl<S: LogStore> WorkerStarter<S> {
             purge_scheduler: self.purge_scheduler.clone(),
             write_buffer_manager: self.write_buffer_manager,
             index_build_scheduler: IndexBuildScheduler::new(
-                self.index_build_job_pool,
+                self.index_build_job_pool.clone(),
                 self.config.max_background_index_builds,
             ),
+            local_index_job_pool: self.index_build_job_pool,
+            local_index_store: self.local_index_store,
+            local_index_states: HashMap::new(),
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -870,6 +889,12 @@ struct RegionWorkerLoop<S> {
     write_buffer_manager: WriteBufferManagerRef,
     /// Scheduler for index build task.
     index_build_scheduler: IndexBuildScheduler,
+    /// Shared pool used by disposable local-index reconciliation.
+    local_index_job_pool: SchedulerRef,
+    /// Local filesystem store for disposable indexes.
+    local_index_store: Option<ObjectStore>,
+    /// Per-region reconciliation scheduling state.
+    local_index_states: HashMap<RegionId, LocalIndexState>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
@@ -910,6 +935,13 @@ struct RegionWorkerLoop<S> {
     flush_semaphore: Arc<Semaphore>,
     /// Plugins for flush hooks.
     plugins: Plugins,
+}
+
+#[derive(Debug, Default)]
+struct LocalIndexState {
+    next_check_millis: i64,
+    in_flight: bool,
+    generation: u64,
 }
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -1222,6 +1254,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
     /// Handle periodical tasks such as region auto flush.
     fn handle_periodical_tasks(&mut self) {
+        self.schedule_local_index_reconciliation();
         let interval = CHECK_REGION_INTERVAL.as_millis() as i64;
         if self
             .time_provider
@@ -1241,6 +1274,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     /// Handles region background request
     async fn handle_background_notify(&mut self, region_id: RegionId, notify: BackgroundNotify) {
         match notify {
+            BackgroundNotify::LocalIndexReconcileFinished(finished) => {
+                self.handle_local_index_finished(region_id, finished)
+            }
             BackgroundNotify::CompactionPickFinished(req) => {
                 self.handle_compaction_pick_finished(region_id, req).await
             }
@@ -1280,6 +1316,64 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             BackgroundNotify::CopyRegionFromFinished(req) => {
                 self.handle_copy_region_from_finished(req)
             }
+        }
+    }
+
+    fn schedule_local_index_reconciliation(&mut self) {
+        let Some(store) = self.local_index_store.clone() else {
+            return;
+        };
+        let now = self.time_provider.current_time_millis();
+        let interval = self
+            .config
+            .experimental_local_index_reconcile_interval
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+
+        for region in self.regions.list_regions() {
+            let state = self.local_index_states.entry(region.region_id).or_default();
+            if state.in_flight || now < state.next_check_millis {
+                continue;
+            }
+            state.in_flight = true;
+            state.generation = state.generation.wrapping_add(1);
+            let generation = state.generation;
+            state.next_check_millis = now.saturating_add(interval);
+
+            let version = region.version_control.current().version;
+            let regions = self.regions.clone();
+            let sender = self.sender.clone();
+            let region_id = region.region_id;
+            let store = store.clone();
+            let job = async move {
+                if let Err(error) = reconcile_range_indexes(store, regions, region, version).await {
+                    warn!(error; "Failed to reconcile local indexes for region {region_id}");
+                }
+                let _ = sender
+                    .send(WorkerRequestWithTime::new(WorkerRequest::Background {
+                        region_id,
+                        notify: BackgroundNotify::LocalIndexReconcileFinished(
+                            LocalIndexReconcileFinished { generation },
+                        ),
+                    }))
+                    .await;
+            };
+            if let Err(error) = self.local_index_job_pool.schedule(Box::pin(job)) {
+                warn!(error; "Failed to schedule local indexes for region {region_id}");
+                state.in_flight = false;
+            }
+        }
+    }
+
+    fn handle_local_index_finished(
+        &mut self,
+        region_id: RegionId,
+        finished: LocalIndexReconcileFinished,
+    ) {
+        if let Some(state) = self.local_index_states.get_mut(&region_id)
+            && state.generation == finished.generation
+        {
+            state.in_flight = false;
         }
     }
 

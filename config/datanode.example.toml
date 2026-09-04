@@ -474,6 +474,20 @@ experimental_manifest_keep_removed_file_ttl = "1h"
 ## Whether to compress manifest and checkpoint file by gzip (default false).
 compress_manifest = false
 
+## Max number of running background index jobs (default: 1/8 of cpu cores).
+## @toml2docs:none-default="Auto"
+#+ max_background_index_builds = 1
+
+## Root below `data_home` for disposable machine-local range and series indexes.
+## An empty value disables local background indexes.
+experimental_local_index_root = ""
+
+## Interval between local index reconciliation passes.
+experimental_local_index_reconcile_interval = "5m"
+
+## Event-time bucket width for local series indexes.
+experimental_local_series_index_bucket_width = "5d"
+
 ## Max number of running background flush jobs (default: 1/2 of cpu cores).
 ## @toml2docs:none-default="Auto"
 #+ max_background_flushes = 4

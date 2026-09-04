@@ -35,6 +35,7 @@ pub mod error;
 pub mod extension;
 pub mod flush;
 pub mod gc;
+mod local_index;
 pub mod manifest;
 pub mod memtable;
 mod metrics;

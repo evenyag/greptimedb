@@ -2406,6 +2406,8 @@ pub struct ParquetReader {
     reader: Option<FlatPruneReader>,
     /// Metrics for tracking row group fetch operations.
     fetch_metrics: ParquetFetchMetrics,
+    /// Physical row group currently being decoded.
+    current_row_group_idx: Option<usize>,
 }
 
 impl ParquetReader {
@@ -2417,12 +2419,25 @@ impl ParquetReader {
         )
     )]
     pub async fn next_record_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.next_record_batch_with_row_group()
+            .await
+            .map(|batch| batch.map(|(_, batch)| batch))
+    }
+
+    /// Returns the next batch together with its physical Parquet row-group id.
+    pub(crate) async fn next_record_batch_with_row_group(
+        &mut self,
+    ) -> Result<Option<(usize, RecordBatch)>> {
         loop {
             if let Some(reader) = &mut self.reader {
                 if let Some(batch) = reader.next_batch().await? {
-                    return Ok(Some(batch));
+                    return Ok(Some((
+                        self.current_row_group_idx.unwrap_or_default(),
+                        batch,
+                    )));
                 }
                 self.reader = None;
+                self.current_row_group_idx = None;
                 continue;
             }
 
@@ -2445,6 +2460,7 @@ impl ParquetReader {
                 FlatRowGroupReader::new(self.context.clone(), parquet_reader),
                 skip_fields,
             ));
+            self.current_row_group_idx = Some(row_group_idx);
         }
     }
     /// Creates a new reader.
@@ -2460,30 +2476,35 @@ impl ParquetReader {
         mut selection: RowGroupSelection,
     ) -> Result<Self> {
         let fetch_metrics = ParquetFetchMetrics::default();
-        let reader = if let Some((row_group_idx, row_selection)) = selection.pop_first() {
-            let skip_fields = context.pre_filter_mode().skip_fields();
-            let parquet_reader = context
-                .reader_builder()
-                .build(context.build_context(
-                    row_group_idx,
-                    Some(row_selection),
-                    Some(&fetch_metrics),
-                ))
-                .await?;
-            Some(FlatPruneReader::new_with_row_group_reader(
-                context.clone(),
-                FlatRowGroupReader::new(context.clone(), parquet_reader),
-                skip_fields,
-            ))
-        } else {
-            None
-        };
+        let (reader, current_row_group_idx) =
+            if let Some((row_group_idx, row_selection)) = selection.pop_first() {
+                let skip_fields = context.pre_filter_mode().skip_fields();
+                let parquet_reader = context
+                    .reader_builder()
+                    .build(context.build_context(
+                        row_group_idx,
+                        Some(row_selection),
+                        Some(&fetch_metrics),
+                    ))
+                    .await?;
+                (
+                    Some(FlatPruneReader::new_with_row_group_reader(
+                        context.clone(),
+                        FlatRowGroupReader::new(context.clone(), parquet_reader),
+                        skip_fields,
+                    )),
+                    Some(row_group_idx),
+                )
+            } else {
+                (None, None)
+            };
 
         Ok(ParquetReader {
             context,
             selection,
             reader,
             fetch_metrics,
+            current_row_group_idx,
         })
     }
 

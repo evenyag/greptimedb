@@ -89,6 +89,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         self.compaction_scheduler.on_region_closed(region_id);
         // clean index build status.
         self.index_build_scheduler.on_region_closed(region_id).await;
+        self.local_index_states.remove(&region_id);
         self.region_count.dec();
 
         // Notify the region hook that the region has been closed. The region is
