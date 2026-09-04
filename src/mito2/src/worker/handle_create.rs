@@ -94,6 +94,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Insert the MitoRegion into the RegionMap.
         self.regions.insert_region(region);
+        self.local_index_notify.notify_one();
 
         Ok(0)
     }

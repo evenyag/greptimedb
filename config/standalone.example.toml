@@ -646,7 +646,8 @@ experimental_local_index_root = ""
 ## Interval between local index reconciliation passes.
 experimental_local_index_reconcile_interval = "5m"
 
-## Event-time bucket width for local series indexes.
+## Requested minimum event-time bucket width for local series indexes. The effective width is
+## rounded up to an exact multiple of each region's compaction time window.
 experimental_local_series_index_bucket_width = "5d"
 
 ## Max number of running background flush jobs (default: 1/2 of cpu cores).

@@ -130,16 +130,6 @@ impl SeriesIndexWriter {
         object_store: ObjectStore,
         path: &str,
         options: SeriesIndexWriterOptions,
-    ) -> Result<Self> {
-        Self::try_new_with_key_value_metadata(metadata, object_store, path, options, None).await
-    }
-
-    /// Creates a writer with optional Parquet key-value metadata.
-    pub async fn try_new_with_key_value_metadata(
-        metadata: RegionMetadataRef,
-        object_store: ObjectStore,
-        path: &str,
-        options: SeriesIndexWriterOptions,
         key_value_metadata: Option<Vec<KeyValue>>,
     ) -> Result<Self> {
         let open_start = Instant::now();
@@ -151,7 +141,7 @@ impl SeriesIndexWriter {
         );
         let schema = series_index_schema(&metadata)?;
         let tag_columns = tag_columns(&metadata);
-        let writer = ParquetIndexWriter::try_new_with_key_value_metadata(
+        let writer = ParquetIndexWriter::try_new(
             "series index",
             object_store,
             path,
@@ -776,6 +766,7 @@ mod tests {
                 store.clone(),
                 &path,
                 SeriesIndexWriterOptions::default(),
+                None,
             )
             .await
             .err()
@@ -827,6 +818,7 @@ mod tests {
             store.clone(),
             "series.parquet",
             SeriesIndexWriterOptions { row_group_size: 2 },
+            None,
         )
         .await
         .unwrap();
@@ -934,6 +926,7 @@ mod tests {
             store.clone(),
             "groups.parquet",
             SeriesIndexWriterOptions { row_group_size: 2 },
+            None,
         )
         .await
         .unwrap();
@@ -954,6 +947,7 @@ mod tests {
             store.clone(),
             "empty.parquet",
             SeriesIndexWriterOptions::default(),
+            None,
         )
         .await
         .unwrap()
@@ -980,6 +974,7 @@ mod tests {
             store.clone(),
             "abort.parquet",
             SeriesIndexWriterOptions { row_group_size: 1 },
+            None,
         )
         .await
         .unwrap();
@@ -1008,6 +1003,7 @@ mod tests {
             store.clone(),
             "dictionary-abort.parquet",
             SeriesIndexWriterOptions { row_group_size: 1 },
+            None,
         )
         .await
         .unwrap();
@@ -1063,6 +1059,7 @@ mod tests {
             store.clone(),
             "nullable.parquet",
             SeriesIndexWriterOptions::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1085,6 +1082,7 @@ mod tests {
                 store,
                 "invalid.parquet",
                 SeriesIndexWriterOptions { row_group_size: 0 },
+                None,
             )
             .await
             .is_err()

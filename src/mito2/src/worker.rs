@@ -56,7 +56,7 @@ use store_api::region_engine::{
 };
 use store_api::storage::{FileId, RegionId};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
 
 use crate::access_layer::new_fs_cache_store;
 use crate::cache::write_cache::{WriteCache, WriteCacheRef};
@@ -67,9 +67,7 @@ use crate::config::MitoConfig;
 use crate::error::{self, CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::gc::{GcLimiter, GcLimiterRef};
-use crate::local_index::{
-    LocalIndexReconcileFinished, reconcile_range_indexes, reconcile_series_indexes,
-};
+use crate::local_index::{local_index_channel, run_local_index_task};
 use crate::memtable::MemtableBuilderProvider;
 use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::opener::PartitionExprFetcherRef;
@@ -592,6 +590,21 @@ impl<S: LogStore> WorkerStarter<S> {
         let (sender, receiver) = mpsc::channel(self.config.worker_channel_size);
 
         let running = Arc::new(AtomicBool::new(true));
+        let local_index_notify = Arc::new(Notify::new());
+        let local_index_handle = self.local_index_store.clone().map(|store| {
+            let (purger, purge_receiver) = local_index_channel(store.clone());
+            common_runtime::spawn_global(run_local_index_task(
+                self.id,
+                store,
+                regions.clone(),
+                running.clone(),
+                local_index_notify.clone(),
+                self.config.experimental_local_index_reconcile_interval,
+                self.config.experimental_local_series_index_bucket_width,
+                purge_receiver,
+                purger,
+            ))
+        });
         let now = self.time_provider.current_time_millis();
         let id_string = self.id.to_string();
         let mut worker_thread = RegionWorkerLoop {
@@ -616,9 +629,7 @@ impl<S: LogStore> WorkerStarter<S> {
                 self.index_build_job_pool.clone(),
                 self.config.max_background_index_builds,
             ),
-            local_index_job_pool: self.index_build_job_pool,
-            local_index_store: self.local_index_store,
-            local_index_states: HashMap::new(),
+            local_index_notify: local_index_notify.clone(),
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -660,6 +671,8 @@ impl<S: LogStore> WorkerStarter<S> {
             catchup_regions,
             sender,
             handle: Mutex::new(Some(handle)),
+            local_index_handle: Mutex::new(local_index_handle),
+            local_index_notify,
             running,
         })
     }
@@ -679,6 +692,10 @@ pub(crate) struct RegionWorker {
     sender: Sender<WorkerRequestWithTime>,
     /// Handle to the worker thread.
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// Handle to the sequential local-index task.
+    local_index_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Wakes the local-index task on region insertion and shutdown.
+    local_index_notify: Arc<Notify>,
     /// Whether to run the worker thread.
     running: Arc<AtomicBool>,
 }
@@ -695,6 +712,7 @@ impl RegionWorker {
             );
             // Manually set the running flag to false to avoid printing more warning logs.
             self.set_running(false);
+            self.local_index_notify.notify_waiters();
             return WorkerStoppedSnafu { id: self.id }.fail();
         }
 
@@ -720,6 +738,9 @@ impl RegionWorker {
             }
 
             handle.await.context(JoinSnafu)?;
+            if let Some(handle) = self.local_index_handle.lock().await.take() {
+                handle.await.context(JoinSnafu)?;
+            }
         }
 
         Ok(())
@@ -772,6 +793,7 @@ impl Drop for RegionWorker {
     fn drop(&mut self) {
         if self.is_running() {
             self.set_running(false);
+            self.local_index_notify.notify_waiters();
             // Once we drop the sender, the worker thread will receive a disconnected error.
         }
     }
@@ -891,12 +913,8 @@ struct RegionWorkerLoop<S> {
     write_buffer_manager: WriteBufferManagerRef,
     /// Scheduler for index build task.
     index_build_scheduler: IndexBuildScheduler,
-    /// Shared pool used by disposable local-index reconciliation.
-    local_index_job_pool: SchedulerRef,
-    /// Local filesystem store for disposable indexes.
-    local_index_store: Option<ObjectStore>,
-    /// Per-region reconciliation scheduling state.
-    local_index_states: HashMap<RegionId, LocalIndexState>,
+    /// Wakes the worker-owned local-index task after a region is inserted.
+    local_index_notify: Arc<Notify>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
@@ -937,13 +955,6 @@ struct RegionWorkerLoop<S> {
     flush_semaphore: Arc<Semaphore>,
     /// Plugins for flush hooks.
     plugins: Plugins,
-}
-
-#[derive(Debug, Default)]
-struct LocalIndexState {
-    next_check_millis: i64,
-    in_flight: bool,
-    generation: u64,
 }
 
 impl<S: LogStore> RegionWorkerLoop<S> {
@@ -1256,7 +1267,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
     /// Handle periodical tasks such as region auto flush.
     fn handle_periodical_tasks(&mut self) {
-        self.schedule_local_index_reconciliation();
         let interval = CHECK_REGION_INTERVAL.as_millis() as i64;
         if self
             .time_provider
@@ -1276,13 +1286,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     /// Handles region background request
     async fn handle_background_notify(&mut self, region_id: RegionId, notify: BackgroundNotify) {
         match notify {
-            BackgroundNotify::LocalIndexReconcile => {
-                self.local_index_states.remove(&region_id);
-                self.schedule_local_index_reconciliation();
-            }
-            BackgroundNotify::LocalIndexReconcileFinished(finished) => {
-                self.handle_local_index_finished(region_id, finished)
-            }
             BackgroundNotify::CompactionPickFinished(req) => {
                 self.handle_compaction_pick_finished(region_id, req).await
             }
@@ -1322,79 +1325,6 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             BackgroundNotify::CopyRegionFromFinished(req) => {
                 self.handle_copy_region_from_finished(req)
             }
-        }
-    }
-
-    fn schedule_local_index_reconciliation(&mut self) {
-        let Some(store) = self.local_index_store.clone() else {
-            return;
-        };
-        let now = self.time_provider.current_time_millis();
-        let interval = self
-            .config
-            .experimental_local_index_reconcile_interval
-            .as_millis()
-            .min(i64::MAX as u128) as i64;
-
-        for region in self.regions.list_regions() {
-            let state = self.local_index_states.entry(region.region_id).or_default();
-            if state.in_flight || now < state.next_check_millis {
-                continue;
-            }
-            state.in_flight = true;
-            state.generation = state.generation.wrapping_add(1);
-            let generation = state.generation;
-            state.next_check_millis = now.saturating_add(interval);
-
-            let version = region.version_control.current().version;
-            let regions = self.regions.clone();
-            let sender = self.sender.clone();
-            let region_id = region.region_id;
-            let store = store.clone();
-            let bucket_width = self.config.experimental_local_series_index_bucket_width;
-            let job = async move {
-                let result = reconcile_range_indexes(
-                    store.clone(),
-                    regions.clone(),
-                    region.clone(),
-                    version.clone(),
-                )
-                .await;
-                let result = match result {
-                    Ok(()) => {
-                        reconcile_series_indexes(store, regions, region, version, bucket_width, now)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = result {
-                    warn!(error; "Failed to reconcile local indexes for region {region_id}");
-                }
-                let _ = sender
-                    .send(WorkerRequestWithTime::new(WorkerRequest::Background {
-                        region_id,
-                        notify: BackgroundNotify::LocalIndexReconcileFinished(
-                            LocalIndexReconcileFinished { generation },
-                        ),
-                    }))
-                    .await;
-            };
-            if let Err(error) = self.local_index_job_pool.schedule(Box::pin(job)) {
-                warn!(error; "Failed to schedule local indexes for region {region_id}");
-                state.in_flight = false;
-            }
-        }
-    }
-
-    fn handle_local_index_finished(
-        &mut self,
-        region_id: RegionId,
-        finished: LocalIndexReconcileFinished,
-    ) {
-        if let Some(state) = self.local_index_states.get_mut(&region_id)
-            && state.generation == finished.generation
-        {
-            state.in_flight = false;
         }
     }
 

@@ -319,25 +319,24 @@ lazy_static! {
 // Index metrics.
 lazy_static! {
     // Index metrics.
-    /// Number of successfully built local series-index files.
-    pub static ref LOCAL_SERIES_INDEX_BUILD_TOTAL: IntCounter = register_int_counter!(
-        "greptime_mito_local_series_index_build_total",
-        "successfully built local series-index files",
+    /// Outcomes of local-index reconciliation passes.
+    pub static ref LOCAL_INDEX_RECONCILE_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_local_index_reconcile_total",
+        "local-index reconciliation passes",
+        &["result"],
     ).unwrap();
-    /// Number of local series-index files loaded and validated.
-    pub static ref LOCAL_SERIES_INDEX_LOAD_TOTAL: IntCounter = register_int_counter!(
-        "greptime_mito_local_series_index_load_total",
-        "local series-index files loaded and validated",
+    /// Elapsed time of local-index reconciliation phases.
+    pub static ref LOCAL_INDEX_RECONCILE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_mito_local_index_reconcile_elapsed",
+        "local-index reconciliation elapsed time",
+        &["phase"],
+        exponential_buckets(0.01, 10.0, 7).unwrap(),
     ).unwrap();
-    /// Number of local series-index files reconstructed from coverage metadata.
-    pub static ref LOCAL_SERIES_INDEX_REBUILD_TOTAL: IntCounter = register_int_counter!(
-        "greptime_mito_local_series_index_rebuild_total",
-        "local series-index files reconstructed",
-    ).unwrap();
-    /// Number of local series-index files removed after complete bucket expiry.
-    pub static ref LOCAL_SERIES_INDEX_EXPIRE_TOTAL: IntCounter = register_int_counter!(
-        "greptime_mito_local_series_index_expire_total",
-        "local series-index files removed after bucket expiry",
+    /// Local-index file operations.
+    pub static ref LOCAL_INDEX_FILE_OPERATION_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_local_index_file_operation_total",
+        "local-index file operations",
+        &["index_type", "operation", "result"],
     ).unwrap();
     /// Number of stale index publications rejected at each publication stage.
     pub static ref INDEX_PUBLICATION_STALE_TOTAL: IntCounterVec =

@@ -93,7 +93,8 @@ pub struct MitoConfig {
     /// Interval between local-index reconciliation passes.
     #[serde(with = "humantime_serde")]
     pub experimental_local_index_reconcile_interval: Duration,
-    /// Event-time bucket width used by local series indexes.
+    /// Requested minimum bucket width for local series indexes. It is rounded up to an exact
+    /// multiple of each region's compaction time window.
     #[serde(with = "humantime_serde")]
     pub experimental_local_series_index_bucket_width: Duration,
     /// Max number of running background flush jobs (default: 1/2 of cpu cores).

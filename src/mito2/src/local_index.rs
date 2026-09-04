@@ -14,105 +14,266 @@
 
 //! Disposable machine-local indexes maintained from visible SSTs.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Debug, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
-use common_telemetry::warn;
+use common_telemetry::{debug, info, warn};
 use common_time::timestamp::TimeUnit;
 use common_time::{TimeToLive, Timestamp};
-use datafusion_common::ScalarValue;
-use datafusion_expr::{col, lit};
 use futures::TryStreamExt;
 use object_store::{ErrorKind, ObjectStore};
 use parquet::file::metadata::KeyValue;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 use store_api::storage::{FileId, RegionId};
-use table::predicate::Predicate;
+use tokio::sync::{Notify, mpsc};
 
-use crate::error::{OpenDalSnafu, Result, UnexpectedSnafu};
+use crate::error::{OpenDalSnafu, Result, SerdeJsonSnafu, UnexpectedSnafu};
 use crate::metrics::{
-    LOCAL_SERIES_INDEX_BUILD_TOTAL, LOCAL_SERIES_INDEX_EXPIRE_TOTAL, LOCAL_SERIES_INDEX_LOAD_TOTAL,
-    LOCAL_SERIES_INDEX_REBUILD_TOTAL,
+    LOCAL_INDEX_FILE_OPERATION_TOTAL, LOCAL_INDEX_RECONCILE_ELAPSED, LOCAL_INDEX_RECONCILE_TOTAL,
 };
 use crate::read::BoxedRecordBatchStream;
-use crate::read::flat_dedup::{FlatDedupReader, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
+use crate::read::prune::FlatPruneReader;
 use crate::read::read_columns::ReadColumns;
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::version::VersionRef;
 use crate::region::{MitoRegionRef, RegionMapRef};
-use crate::series_index::{SeriesIndexSearcher, SeriesIndexWriter, SeriesIndexWriterOptions};
-use crate::sst::file::FileHandle;
-use crate::sst::range_index::{
-    SstRangeIndexSearcher, SstRangeIndexWriter, SstRangeIndexWriterOptions,
-};
+use crate::series_index::{SeriesIndexWriter, SeriesIndexWriterOptions};
+use crate::sst::file::{FileHandle, RegionFileId};
+use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics};
+use crate::sst::parquet::row_group::ParquetFetchMetrics;
+use crate::sst::range_index::{SstRangeIndexWriter, SstRangeIndexWriterOptions};
 
 pub(crate) const RANGE_DIR: &str = "range";
 pub(crate) const SERIES_DIR: &str = "series";
-pub(crate) const SERIES_CATALOG: &str = "series-index.json";
-const SERIES_FORMAT_VERSION: u32 = 1;
-const SERIES_SCHEMA_VERSION: u32 = 1;
-const META_PREFIX: &str = "greptime.local_series_index.";
+const RANGE_CATALOG: &str = "range-index.json";
+const SERIES_CATALOG: &str = "series-index.json";
+const SERIES_METADATA_KEY: &str = "greptime.local_series_index";
 
-/// Complete catalog of disposable series indexes for one region.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SeriesIndexCatalog {
-    #[serde(default = "catalog_version")]
-    pub(crate) version: u32,
-    #[serde(default)]
-    pub(crate) indexes: Vec<SeriesIndexEntry>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LocalIndexType {
+    Range,
+    Series,
 }
 
-fn catalog_version() -> u32 {
-    1
-}
-
-impl Default for SeriesIndexCatalog {
-    fn default() -> Self {
-        Self {
-            version: catalog_version(),
-            indexes: Vec::new(),
+impl LocalIndexType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Range => "range",
+            Self::Series => "series",
         }
     }
 }
 
-/// Coverage of one local series-index file.
+#[derive(Debug)]
+pub(crate) struct PurgeRequest {
+    index_type: LocalIndexType,
+    file_id: RegionFileId,
+}
+
+#[derive(Clone)]
+pub(crate) struct LocalIndexFilePurger {
+    store: ObjectStore,
+    sender: mpsc::UnboundedSender<PurgeRequest>,
+}
+
+impl Debug for LocalIndexFilePurger {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalIndexFilePurger")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalIndexFilePurger {
+    fn purge(&self, request: PurgeRequest) {
+        if let Err(error) = self.sender.send(request) {
+            let store = self.store.clone();
+            common_runtime::spawn_global(async move {
+                let _ = purge_file(&store, error.0).await;
+            });
+        }
+    }
+}
+
+/// A reference-counted local-index file with deferred deletion semantics.
+#[derive(Clone)]
+pub(crate) struct LocalIndexFileHandle {
+    inner: Arc<LocalIndexFileHandleInner>,
+}
+
+impl Debug for LocalIndexFileHandle {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalIndexFileHandle")
+            .field("file_id", &self.inner.file_id)
+            .field("index_type", &self.inner.index_type)
+            .field("deleted", &self.inner.deleted.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl LocalIndexFileHandle {
+    fn new(
+        file_id: RegionFileId,
+        index_type: LocalIndexType,
+        purger: LocalIndexFilePurger,
+    ) -> Self {
+        Self {
+            inner: Arc::new(LocalIndexFileHandleInner {
+                file_id,
+                index_type,
+                deleted: AtomicBool::new(false),
+                purger,
+            }),
+        }
+    }
+
+    fn identity(&self) -> (LocalIndexType, RegionFileId) {
+        (self.inner.index_type, self.inner.file_id)
+    }
+
+    pub(crate) fn mark_deleted(&self) {
+        self.inner.deleted.store(true, Ordering::Release);
+    }
+}
+
+struct LocalIndexFileHandleInner {
+    file_id: RegionFileId,
+    index_type: LocalIndexType,
+    deleted: AtomicBool,
+    purger: LocalIndexFilePurger,
+}
+
+impl Drop for LocalIndexFileHandleInner {
+    fn drop(&mut self) {
+        if self.deleted.load(Ordering::Acquire) {
+            self.purger.purge(PurgeRequest {
+                index_type: self.index_type,
+                file_id: self.file_id,
+            });
+        }
+    }
+}
+
+/// Immutable local-index snapshot for one region.
+#[derive(Debug, Default)]
+pub(crate) struct LocalIndexVersion {
+    pub(crate) range_indexes: HashMap<FileId, LocalIndexFileHandle>,
+    pub(crate) series_indexes: HashMap<FileId, LocalIndexFileHandle>,
+}
+
+impl LocalIndexVersion {
+    fn mark_all_deleted(&self) {
+        self.range_indexes
+            .values()
+            .chain(self.series_indexes.values())
+            .for_each(LocalIndexFileHandle::mark_deleted);
+    }
+}
+
+/// Copy-on-write local-index snapshots owned by a region.
+#[derive(Debug, Default)]
+pub(crate) struct LocalIndexVersionControl {
+    current: RwLock<Arc<LocalIndexVersion>>,
+}
+
+impl LocalIndexVersionControl {
+    pub(crate) fn current(&self) -> Arc<LocalIndexVersion> {
+        self.current.read().unwrap().clone()
+    }
+
+    fn publish(&self, next: Arc<LocalIndexVersion>) -> Arc<LocalIndexVersion> {
+        std::mem::replace(&mut *self.current.write().unwrap(), next)
+    }
+
+    pub(crate) fn mark_dropped(&self) {
+        self.publish(Arc::new(LocalIndexVersion::default()))
+            .mark_all_deleted();
+    }
+}
+
+/// Self-describing coverage stored in a series-index Parquet footer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SeriesIndexEntry {
-    pub(crate) index_uuid: FileId,
+struct SeriesIndexEntry {
+    index_uuid: FileId,
     /// Inclusive bucket start in Unix milliseconds.
-    pub(crate) bucket_start_ms: i64,
+    bucket_start_ms: i64,
     /// Exclusive bucket end in Unix milliseconds.
-    pub(crate) bucket_end_ms: i64,
-    /// Inclusive source-file sequence interval.
-    pub(crate) min_file_sequence: u64,
-    /// Inclusive source-file sequence interval.
-    pub(crate) max_file_sequence: u64,
-    pub(crate) format_version: u32,
-    pub(crate) schema_version: u32,
+    bucket_end_ms: i64,
+    source_file_ids: Vec<FileId>,
+    min_file_sequence: u64,
+    max_file_sequence: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SeriesIndexCatalog {
+    indexes: Vec<SeriesIndexEntry>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RangeIndexCatalog {
+    indexes: Vec<FileId>,
 }
 
 #[derive(Debug, Clone)]
-struct SeriesBuildPlan {
-    entry: SeriesIndexEntry,
+struct SeriesBucket {
+    start_ms: i64,
+    end_ms: i64,
     files: Vec<FileHandle>,
+    has_unknown_sequence: bool,
 }
 
-/// Result sent back to the owning region worker.
-#[derive(Debug)]
-pub(crate) struct LocalIndexReconcileFinished {
-    pub(crate) generation: u64,
+#[derive(Debug, Default)]
+pub(crate) struct ReconcileStats {
+    source_files: usize,
+    loaded_range: usize,
+    loaded_series: usize,
+    built_range: usize,
+    built_series: usize,
+    removed_range: usize,
+    removed_series: usize,
+    repaired_catalogs: usize,
+    computed_buckets: usize,
+    skipped_buckets: usize,
+}
+
+impl ReconcileStats {
+    fn changed(&self) -> bool {
+        self.built_range
+            + self.built_series
+            + self.removed_range
+            + self.removed_series
+            + self.repaired_catalogs
+            > 0
+    }
 }
 
 pub(crate) fn range_index_path(region_id: RegionId, file_id: FileId) -> String {
     format!("{}/{RANGE_DIR}/{file_id}.parquet", region_id.as_u64())
 }
 
-fn range_index_dir(region_id: RegionId) -> String {
-    format!("{}/{RANGE_DIR}/", region_id.as_u64())
+fn range_catalog_path(region_id: RegionId) -> String {
+    format!("{}/{RANGE_CATALOG}", region_id.as_u64())
+}
+
+fn series_index_path(region_id: RegionId, index_uuid: FileId) -> String {
+    format!("{}/{SERIES_DIR}/{index_uuid}.parquet", region_id.as_u64())
+}
+
+fn series_catalog_path(region_id: RegionId) -> String {
+    format!("{}/{SERIES_CATALOG}", region_id.as_u64())
+}
+
+fn local_index_path(index_type: LocalIndexType, file_id: RegionFileId) -> String {
+    match index_type {
+        LocalIndexType::Range => range_index_path(file_id.region_id(), file_id.file_id()),
+        LocalIndexType::Series => series_index_path(file_id.region_id(), file_id.file_id()),
+    }
 }
 
 fn is_current_region_version(
@@ -126,315 +287,329 @@ fn is_current_region_version(
     })
 }
 
-/// Reconciles all range indexes for one immutable region version.
-pub(crate) async fn reconcile_range_indexes(
-    store: ObjectStore,
-    regions: RegionMapRef,
-    region: MitoRegionRef,
-    version: VersionRef,
-) -> Result<()> {
-    if !is_sparse_metric_metadata(&version.metadata) {
-        return Ok(());
-    }
-
-    let files = version
-        .ssts
-        .levels()
-        .iter()
-        .flat_map(|level| level.files())
-        .cloned()
-        .collect::<Vec<_>>();
-    let visible = files
-        .iter()
-        .map(|file| file.file_id().file_id())
-        .collect::<HashSet<_>>();
-
-    for file in files {
-        let file_id = file.file_id().file_id();
-        let target = range_index_path(region.region_id, file_id);
-        if SstRangeIndexSearcher::open(store.clone(), &target)
-            .await
-            .is_ok()
-        {
-            continue;
-        }
-
-        let temporary = format!("{}.building-{}", target, FileId::random());
-        let mut writer = SstRangeIndexWriter::try_new(
-            version.metadata.clone(),
-            store.clone(),
-            &temporary,
-            SstRangeIndexWriterOptions::default(),
-        )
-        .await?;
-        let mut reader = match region
-            .access_layer
-            .read_sst(file)
-            .projection(Some(ReadColumns::new([])))
-            .build()
-            .await?
-        {
-            Some(reader) => reader,
-            None => {
-                writer.abort().await?;
-                continue;
-            }
-        };
-
-        while let Some((row_group_id, batch)) = reader.next_record_batch_with_row_group().await? {
-            if let Err(error) = writer.write(row_group_id as u32, &batch).await {
-                let _ = writer.abort().await;
-                return Err(error);
-            }
-        }
-        writer.finish().await?;
-
-        if !is_current_region_version(&regions, &region, &version) {
-            let _ = store.delete(&temporary).await;
-            return Ok(());
-        }
-        store
-            .rename(&temporary, &target)
-            .await
-            .context(OpenDalSnafu)?;
-        SstRangeIndexSearcher::open(store.clone(), &target).await?;
-    }
-
-    if !is_current_region_version(&regions, &region, &version) {
-        return Ok(());
-    }
-    let dir = range_index_dir(region.region_id);
-    let entries = match store.list(&dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context(OpenDalSnafu),
-    };
-    for entry in entries {
-        if entry.metadata().is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let Some(name) = path.rsplit('/').next() else {
-            continue;
-        };
-        let Some(stem) = name.strip_suffix(".parquet") else {
-            continue;
-        };
-        let Ok(file_id) = FileId::parse_str(stem) else {
-            continue;
-        };
-        if !visible.contains(&file_id)
-            && let Err(error) = store.delete(path).await
-        {
-            warn!(error; "Failed to remove stale local range index {path}");
-        }
-    }
-
-    Ok(())
-}
-
-fn series_catalog_path(region_id: RegionId) -> String {
-    format!("{}/{SERIES_CATALOG}", region_id.as_u64())
-}
-
-fn series_index_path(region_id: RegionId, index_uuid: FileId) -> String {
-    format!("{}/{SERIES_DIR}/{index_uuid}.parquet", region_id.as_u64())
-}
-
 fn timestamp_millis(timestamp: Timestamp) -> Option<i64> {
     timestamp
         .convert_to(TimeUnit::Millisecond)
         .map(|timestamp| timestamp.value())
 }
 
-fn plan_series_indexes(
-    files: &[FileHandle],
-    existing: &[SeriesIndexEntry],
-    bucket_width: Duration,
-    now_ms: i64,
-) -> Vec<SeriesBuildPlan> {
-    let width_ms = i64::try_from(bucket_width.as_millis())
+fn rounded_bucket_width(requested: Duration, compaction_window: Duration) -> Option<i64> {
+    let window_ms = i64::try_from(compaction_window.as_millis()).ok()?.max(1);
+    let requested_ms = i64::try_from(requested.as_millis())
         .unwrap_or(i64::MAX)
         .max(1);
-    let active_start = now_ms.div_euclid(width_ms) * width_ms;
-    let mut buckets = BTreeMap::<i64, Vec<FileHandle>>::new();
-
-    for file in files {
-        if file.meta_ref().sequence.is_none() {
-            continue;
-        }
-        let Some(start_ms) = timestamp_millis(file.time_range().0) else {
-            continue;
-        };
-        let Some(end_ms) = timestamp_millis(file.time_range().1) else {
-            continue;
-        };
-        let first = start_ms.div_euclid(width_ms) * width_ms;
-        let last = end_ms.div_euclid(width_ms) * width_ms;
-        let mut bucket = first;
-        loop {
-            buckets.entry(bucket).or_default().push(file.clone());
-            if bucket >= last {
-                break;
-            }
-            let Some(next) = bucket.checked_add(width_ms) else {
-                break;
-            };
-            bucket = next;
-        }
-    }
-
-    let mut plans = Vec::new();
-    for (bucket_start_ms, files) in buckets {
-        let mut groups = BTreeMap::<u64, Vec<FileHandle>>::new();
-        for file in files {
-            let Some(sequence) = file.meta_ref().sequence else {
-                continue;
-            };
-            groups.entry(sequence.get()).or_default().push(file);
-        }
-
-        let mut eligible = Vec::new();
-        for (sequence, group) in groups {
-            // The current/future bucket only consumes the contiguous L1 prefix.
-            if bucket_start_ms >= active_start && group.iter().any(|file| file.level() == 0) {
-                break;
-            }
-            eligible.push((sequence, group));
-        }
-
-        let covered = existing
-            .iter()
-            .filter(|entry| entry.bucket_start_ms == bucket_start_ms)
-            .map(|entry| (entry.min_file_sequence, entry.max_file_sequence))
-            .collect::<Vec<_>>();
-        let mut run = Vec::new();
-        for (sequence, group) in eligible {
-            if covered
-                .iter()
-                .any(|(min, max)| sequence >= *min && sequence <= *max)
-            {
-                append_series_plan(&mut plans, bucket_start_ms, width_ms, &mut run);
-            } else {
-                run.push((sequence, group));
-            }
-        }
-        append_series_plan(&mut plans, bucket_start_ms, width_ms, &mut run);
-    }
-    plans
+    let multiples = requested_ms.saturating_add(window_ms - 1) / window_ms;
+    Some(multiples.saturating_mul(window_ms))
 }
 
-fn append_series_plan(
-    plans: &mut Vec<SeriesBuildPlan>,
-    bucket_start_ms: i64,
-    width_ms: i64,
-    run: &mut Vec<(u64, Vec<FileHandle>)>,
-) {
-    let file_count = run.iter().map(|(_, files)| files.len()).sum::<usize>();
-    if file_count < 2 {
-        run.clear();
-        return;
+fn plan_series_buckets(files: &[FileHandle], width_ms: i64) -> Vec<SeriesBucket> {
+    let mut spans = files
+        .iter()
+        .filter_map(|file| {
+            let start = timestamp_millis(file.time_range().0)?;
+            let end = timestamp_millis(file.time_range().1)?;
+            Some(SeriesBucket {
+                start_ms: start.div_euclid(width_ms).saturating_mul(width_ms),
+                end_ms: end
+                    .div_euclid(width_ms)
+                    .saturating_add(1)
+                    .saturating_mul(width_ms),
+                files: vec![file.clone()],
+                has_unknown_sequence: file.meta_ref().sequence.is_none(),
+            })
+        })
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_ms, span.end_ms));
+    let mut buckets: Vec<SeriesBucket> = Vec::new();
+    for mut span in spans {
+        if let Some(last) = buckets.last_mut()
+            && span.start_ms < last.end_ms
+        {
+            last.end_ms = last.end_ms.max(span.end_ms);
+            last.files.append(&mut span.files);
+            last.has_unknown_sequence |= span.has_unknown_sequence;
+        } else {
+            buckets.push(span);
+        }
     }
-    let Some(min_file_sequence) = run.first().map(|group| group.0) else {
-        return;
-    };
-    let Some(max_file_sequence) = run.last().map(|group| group.0) else {
-        return;
-    };
-    let files = run.drain(..).flat_map(|(_, files)| files).collect();
-    plans.push(SeriesBuildPlan {
-        entry: SeriesIndexEntry {
-            index_uuid: FileId::random(),
-            bucket_start_ms,
-            bucket_end_ms: bucket_start_ms.saturating_add(width_ms),
-            min_file_sequence,
-            max_file_sequence,
-            format_version: SERIES_FORMAT_VERSION,
-            schema_version: SERIES_SCHEMA_VERSION,
-        },
-        files,
-    });
+    buckets
 }
 
-fn timestamp_literal(timestamp_ms: i64, unit: TimeUnit) -> Option<ScalarValue> {
-    let timestamp = Timestamp::new_millisecond(timestamp_ms).convert_to(unit)?;
-    Some(match unit {
-        TimeUnit::Second => ScalarValue::TimestampSecond(Some(timestamp.value()), None),
-        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(timestamp.value()), None),
-        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(timestamp.value()), None),
-        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(timestamp.value()), None),
+fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
+    if bucket.has_unknown_sequence || bucket.files.len() < 2 {
+        return None;
+    }
+    let mut source_file_ids = bucket
+        .files
+        .iter()
+        .map(|file| file.file_id().file_id())
+        .collect::<Vec<_>>();
+    source_file_ids.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut sequences = bucket
+        .files
+        .iter()
+        .filter_map(|file| file.meta_ref().sequence.map(|sequence| sequence.get()));
+    let first = sequences.next()?;
+    let (mut min_file_sequence, mut max_file_sequence) = (first, first);
+    for sequence in sequences {
+        min_file_sequence = min_file_sequence.min(sequence);
+        max_file_sequence = max_file_sequence.max(sequence);
+    }
+    Some(SeriesIndexEntry {
+        index_uuid: FileId::random(),
+        bucket_start_ms: bucket.start_ms,
+        bucket_end_ms: bucket.end_ms,
+        source_file_ids,
+        min_file_sequence,
+        max_file_sequence,
     })
 }
 
-fn series_metadata(entry: &SeriesIndexEntry) -> Vec<KeyValue> {
-    [
-        ("index_uuid", entry.index_uuid.to_string()),
-        ("bucket_start_ms", entry.bucket_start_ms.to_string()),
-        ("bucket_end_ms", entry.bucket_end_ms.to_string()),
-        ("min_file_sequence", entry.min_file_sequence.to_string()),
-        ("max_file_sequence", entry.max_file_sequence.to_string()),
-        ("format_version", entry.format_version.to_string()),
-        ("schema_version", entry.schema_version.to_string()),
-    ]
-    .into_iter()
-    .map(|(key, value)| KeyValue::new(format!("{META_PREFIX}{key}"), Some(value)))
-    .collect()
+fn same_series_coverage(left: &SeriesIndexEntry, right: &SeriesIndexEntry) -> bool {
+    left.bucket_start_ms == right.bucket_start_ms
+        && left.bucket_end_ms == right.bucket_end_ms
+        && left.source_file_ids == right.source_file_ids
+        && left.min_file_sequence == right.min_file_sequence
+        && left.max_file_sequence == right.max_file_sequence
+}
+
+fn series_metadata(entry: &SeriesIndexEntry) -> Result<Vec<KeyValue>> {
+    Ok(vec![KeyValue::new(
+        SERIES_METADATA_KEY.to_string(),
+        Some(serde_json::to_string(entry).context(SerdeJsonSnafu)?),
+    )])
+}
+
+async fn load_catalog<T>(store: &ObjectStore, path: &str) -> Result<(T, bool)>
+where
+    T: Default + DeserializeOwned,
+{
+    let bytes = match store.read(path).await {
+        Ok(bytes) => bytes.to_bytes(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((T::default(), true)),
+        Err(error) => return Err(error).context(OpenDalSnafu),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(catalog) => Ok((catalog, false)),
+        Err(error) => {
+            warn!(error; "Invalid local-index catalog, path: {path}, phase: load, retry: true");
+            Ok((T::default(), true))
+        }
+    }
+}
+
+async fn store_catalog<T>(store: &ObjectStore, path: &str, catalog: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec_pretty(catalog).context(SerdeJsonSnafu)?;
+    store
+        .write(path, bytes)
+        .await
+        .map(|_| ())
+        .context(OpenDalSnafu)
+}
+
+fn load_range_indexes(
+    catalog: RangeIndexCatalog,
+    region_id: RegionId,
+    visible: &HashSet<FileId>,
+    purger: &LocalIndexFilePurger,
+    known: &HashMap<(LocalIndexType, RegionFileId), LocalIndexFileHandle>,
+    stats: &mut ReconcileStats,
+) -> (
+    HashMap<FileId, LocalIndexFileHandle>,
+    Vec<LocalIndexFileHandle>,
+) {
+    let mut indexes = HashMap::new();
+    let mut retired = Vec::new();
+    for file_id in catalog.indexes {
+        let region_file_id = RegionFileId::new(region_id, file_id);
+        let identity = (LocalIndexType::Range, region_file_id);
+        let handle = known.get(&identity).cloned().unwrap_or_else(|| {
+            LocalIndexFileHandle::new(region_file_id, LocalIndexType::Range, purger.clone())
+        });
+        if !visible.contains(&file_id) {
+            stats.removed_range += 1;
+            retired.push(handle);
+            continue;
+        }
+        stats.loaded_range += 1;
+        file_operation(LocalIndexType::Range, "load", "success");
+        indexes.insert(file_id, handle);
+    }
+    (indexes, retired)
+}
+
+fn load_series_indexes(
+    catalog: SeriesIndexCatalog,
+    region_id: RegionId,
+    purger: &LocalIndexFilePurger,
+    known: &HashMap<(LocalIndexType, RegionFileId), LocalIndexFileHandle>,
+    stats: &mut ReconcileStats,
+) -> Vec<(SeriesIndexEntry, LocalIndexFileHandle)> {
+    let mut indexes = Vec::new();
+    for entry in catalog.indexes {
+        let region_file_id = RegionFileId::new(region_id, entry.index_uuid);
+        let identity = (LocalIndexType::Series, region_file_id);
+        let handle = known.get(&identity).cloned().unwrap_or_else(|| {
+            LocalIndexFileHandle::new(region_file_id, LocalIndexType::Series, purger.clone())
+        });
+        stats.loaded_series += 1;
+        file_operation(LocalIndexType::Series, "load", "success");
+        indexes.push((entry, handle));
+    }
+    indexes
+}
+
+async fn reader_input(
+    region: &MitoRegionRef,
+    file: FileHandle,
+) -> Result<
+    Option<(
+        Arc<crate::sst::parquet::file_range::FileRangeContext>,
+        crate::sst::parquet::row_selection::RowGroupSelection,
+    )>,
+> {
+    Ok(region
+        .access_layer
+        .read_sst(file)
+        .projection(Some(ReadColumns::new([])))
+        .build_reader_input(&mut ReaderMetrics::default())
+        .await?
+        .map(|(context, selection)| (Arc::new(context), selection)))
+}
+
+async fn build_range_index(
+    store: &ObjectStore,
+    region: &MitoRegionRef,
+    version: &VersionRef,
+    file: FileHandle,
+    purger: &LocalIndexFilePurger,
+) -> Result<Option<LocalIndexFileHandle>> {
+    let file_id = file.file_id().file_id();
+    let path = range_index_path(region.region_id, file_id);
+    let mut writer = SstRangeIndexWriter::try_new(
+        version.metadata.clone(),
+        store.clone(),
+        &path,
+        SstRangeIndexWriterOptions::default(),
+    )
+    .await?;
+    let Some((context, mut selection)) = reader_input(region, file).await? else {
+        writer.abort().await?;
+        return Ok(None);
+    };
+    let fetch_metrics = ParquetFetchMetrics::default();
+    while let Some((row_group_id, row_selection)) = selection.pop_first() {
+        let parquet_reader = context
+            .reader_builder()
+            .build(context.build_context(row_group_id, Some(row_selection), Some(&fetch_metrics)))
+            .await?;
+        let mut reader = FlatPruneReader::new_with_row_group_reader(
+            context.clone(),
+            FlatRowGroupReader::new(context.clone(), parquet_reader),
+            context.pre_filter_mode().skip_fields(),
+        );
+        while let Some(batch) = reader.next_batch().await? {
+            writer.write(row_group_id as u32, &batch).await?;
+        }
+    }
+    writer.finish().await?;
+    file_operation(LocalIndexType::Range, "build", "success");
+    Ok(Some(LocalIndexFileHandle::new(
+        RegionFileId::new(region.region_id, file_id),
+        LocalIndexType::Range,
+        purger.clone(),
+    )))
 }
 
 async fn build_series_index(
     store: &ObjectStore,
-    regions: &RegionMapRef,
     region: &MitoRegionRef,
     version: &VersionRef,
-    plan: &SeriesBuildPlan,
-) -> Result<bool> {
-    let metadata = region.metadata();
-    let time_index = metadata.time_index_column();
-    let unit = time_index
-        .column_schema
-        .data_type
-        .as_timestamp()
-        .map(|timestamp| timestamp.unit())
-        .unwrap_or(TimeUnit::Millisecond);
-    let start = timestamp_literal(plan.entry.bucket_start_ms, unit).context(UnexpectedSnafu {
-        reason: "local series-index bucket start does not fit the time-index unit",
-    })?;
-    let end = timestamp_literal(plan.entry.bucket_end_ms, unit).context(UnexpectedSnafu {
-        reason: "local series-index bucket end does not fit the time-index unit",
-    })?;
-    let predicate = Predicate::new(vec![
-        col(&time_index.column_schema.name).gt_eq(lit(start)),
-        col(&time_index.column_schema.name).lt(lit(end)),
-    ]);
+    bucket: &SeriesBucket,
+    entry: &SeriesIndexEntry,
+    missing_range_ids: &HashSet<FileId>,
+    purger: &LocalIndexFilePurger,
+) -> Result<(LocalIndexFileHandle, HashMap<FileId, LocalIndexFileHandle>)> {
+    struct UnpublishedRangeIndexes(Arc<Mutex<HashMap<FileId, LocalIndexFileHandle>>>);
 
+    impl Drop for UnpublishedRangeIndexes {
+        fn drop(&mut self) {
+            for handle in self.0.lock().unwrap().values() {
+                handle.mark_deleted();
+            }
+        }
+    }
+
+    let completed_ranges = Arc::new(Mutex::new(HashMap::new()));
+    let unpublished_ranges = UnpublishedRangeIndexes(completed_ranges.clone());
     let mut sources = Vec::<BoxedRecordBatchStream>::new();
     let mut schema = None;
-    for file in &plan.files {
-        let Some(mut reader) = region
-            .access_layer
-            .read_sst(file.clone())
-            .projection(Some(ReadColumns::new([])))
-            .predicate(Some(predicate.clone()))
-            .build()
-            .await?
-        else {
+    let mut expected_ranges = 0;
+    for file in &bucket.files {
+        let file_id = file.file_id().file_id();
+        let Some((context, mut selection)) = reader_input(region, file.clone()).await? else {
             continue;
         };
-        let Some(first) = reader.next_record_batch().await? else {
-            continue;
+        schema.get_or_insert(context.read_format().output_arrow_schema()?);
+        let range_writer = if missing_range_ids.contains(&file_id) {
+            expected_ranges += 1;
+            let path = range_index_path(region.region_id, file_id);
+            Some(
+                SstRangeIndexWriter::try_new(
+                    version.metadata.clone(),
+                    store.clone(),
+                    &path,
+                    SstRangeIndexWriterOptions::default(),
+                )
+                .await?,
+            )
+        } else {
+            None
         };
-        schema.get_or_insert_with(|| first.schema());
+        let completed_ranges = completed_ranges.clone();
+        let range_purger = purger.clone();
+        let region_id = region.region_id;
         sources.push(Box::pin(try_stream! {
-            yield first;
-            while let Some(batch) = reader.next_record_batch().await? {
-                yield batch;
+            let fetch_metrics = ParquetFetchMetrics::default();
+            let mut range_writer = range_writer;
+            while let Some((row_group_id, row_selection)) = selection.pop_first() {
+                let parquet_reader = context.reader_builder().build(context.build_context(
+                    row_group_id,
+                    Some(row_selection),
+                    Some(&fetch_metrics),
+                )).await?;
+                let mut reader = FlatPruneReader::new_with_row_group_reader(
+                    context.clone(),
+                    FlatRowGroupReader::new(context.clone(), parquet_reader),
+                    context.pre_filter_mode().skip_fields(),
+                );
+                while let Some(batch) = reader.next_batch().await? {
+                    if let Some(writer) = &mut range_writer {
+                        writer.write(row_group_id as u32, &batch).await?;
+                    }
+                    yield batch;
+                }
+            }
+            if let Some(writer) = range_writer {
+                writer.finish().await?;
+                file_operation(LocalIndexType::Range, "build", "success");
+                completed_ranges.lock().unwrap().insert(
+                    file_id,
+                    LocalIndexFileHandle::new(
+                        RegionFileId::new(region_id, file_id),
+                        LocalIndexType::Range,
+                        range_purger,
+                    ),
+                );
             }
         }));
     }
-    let Some(schema) = schema else {
-        return Ok(false);
-    };
-
+    let schema = schema.context(UnexpectedSnafu {
+        reason: "local series-index bucket has no readable SST",
+    })?;
     let merged: BoxedRecordBatchStream = if sources.len() == 1 {
         sources.pop().context(UnexpectedSnafu {
             reason: "local series-index source disappeared",
@@ -446,215 +621,68 @@ async fn build_series_index(
                 .into_stream(),
         )
     };
-    let mut visible: BoxedRecordBatchStream = if version.options.append_mode {
-        merged
-    } else {
-        Box::pin(FlatDedupReader::new(merged, FlatLastRow::new(true), None).into_stream())
-    };
-
-    let target = series_index_path(region.region_id, plan.entry.index_uuid);
-    let temporary = format!("{}.building-{}", target, FileId::random());
-    let mut writer = SeriesIndexWriter::try_new_with_key_value_metadata(
-        metadata.clone(),
+    // TODO: Deduplicate update-mode rows before local series indexes are used by queries.
+    let mut visible = merged;
+    let path = series_index_path(region.region_id, entry.index_uuid);
+    let mut writer = SeriesIndexWriter::try_new(
+        region.metadata(),
         store.clone(),
-        &temporary,
+        &path,
         SeriesIndexWriterOptions::default(),
-        Some(series_metadata(&plan.entry)),
+        Some(series_metadata(entry)?),
     )
     .await?;
     while let Some(batch) = visible.try_next().await? {
-        if let Err(error) = writer.write(&batch).await {
-            let _ = writer.abort().await;
-            return Err(error);
-        }
+        writer.write(&batch).await?;
     }
     writer.finish().await?;
-    if !is_current_region_version(regions, region, version) {
-        let _ = store.delete(&temporary).await;
-        return Ok(false);
+    file_operation(LocalIndexType::Series, "build", "success");
+    let range_indexes = std::mem::take(&mut *completed_ranges.lock().unwrap());
+    if range_indexes.len() != expected_ranges {
+        return UnexpectedSnafu {
+            reason: "not all combined range-index builds completed",
+        }
+        .fail();
     }
-    store
-        .rename(&temporary, &target)
-        .await
-        .context(OpenDalSnafu)?;
-    let searcher = SeriesIndexSearcher::try_new(metadata, store.clone(), None, None)?;
-    let mut result = searcher.search(&target).await?;
-    let _ = result.try_next().await?;
-    Ok(true)
-}
-
-async fn load_series_catalog(store: &ObjectStore, region_id: RegionId) -> SeriesIndexCatalog {
-    let path = series_catalog_path(region_id);
-    let bytes = match store.read(&path).await {
-        Ok(bytes) => bytes.to_bytes(),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Default::default(),
-        Err(error) => {
-            warn!(error; "Failed to read local series-index catalog {path}; rebuilding coverage");
-            return Default::default();
-        }
-    };
-    match serde_json::from_slice(&bytes) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            warn!(error; "Invalid local series-index catalog {path}; rebuilding coverage");
-            Default::default()
-        }
-    }
-}
-
-async fn store_series_catalog(
-    store: &ObjectStore,
-    region_id: RegionId,
-    catalog: &SeriesIndexCatalog,
-) -> Result<()> {
-    let path = series_catalog_path(region_id);
-    let temporary = format!("{}.building-{}", path, FileId::random());
-    let bytes = serde_json::to_vec_pretty(catalog).context(crate::error::SerdeJsonSnafu)?;
-    store.write(&temporary, bytes).await.context(OpenDalSnafu)?;
-    store.rename(&temporary, &path).await.context(OpenDalSnafu)
-}
-
-async fn validate_series_index(
-    store: &ObjectStore,
-    metadata: store_api::metadata::RegionMetadataRef,
-    path: &str,
-) -> bool {
-    let result: Result<()> = async {
-        let searcher = SeriesIndexSearcher::try_new(metadata, store.clone(), None, None)?;
-        let mut stream = searcher.search(path).await?;
-        let _ = stream.try_next().await?;
-        Ok(())
-    }
-    .await;
-    result.is_ok()
-}
-
-fn files_for_recorded_coverage(files: &[FileHandle], entry: &SeriesIndexEntry) -> Vec<FileHandle> {
-    files
-        .iter()
-        .filter(|file| {
-            let Some(sequence) = file.meta_ref().sequence.map(|sequence| sequence.get()) else {
-                return false;
-            };
-            let Some(start_ms) = timestamp_millis(file.time_range().0) else {
-                return false;
-            };
-            let Some(end_ms) = timestamp_millis(file.time_range().1) else {
-                return false;
-            };
-            sequence >= entry.min_file_sequence
-                && sequence <= entry.max_file_sequence
-                && start_ms < entry.bucket_end_ms
-                && end_ms >= entry.bucket_start_ms
-        })
-        .cloned()
-        .collect()
-}
-
-async fn clean_task_temporary_files(store: &ObjectStore, region_id: RegionId) {
-    for dir in [
-        format!("{}/", region_id.as_u64()),
-        format!("{}/{SERIES_DIR}/", region_id.as_u64()),
-    ] {
-        let Ok(entries) = store.list(&dir).await else {
-            continue;
-        };
-        for entry in entries {
-            if !entry.metadata().is_dir()
-                && entry.path().contains(".building-")
-                && let Err(error) = store.delete(entry.path()).await
-            {
-                warn!(error; "Failed to clean local-index temporary file {}", entry.path());
-            }
-        }
-    }
-}
-
-async fn recover_series_catalog(
-    store: &ObjectStore,
-    regions: &RegionMapRef,
-    region: &MitoRegionRef,
-    version: &VersionRef,
-    files: &[FileHandle],
-    catalog: &mut SeriesIndexCatalog,
-    now_ms: i64,
-) -> Result<bool> {
-    let mut changed = false;
-    let mut retained = Vec::with_capacity(catalog.indexes.len());
-    for entry in catalog.indexes.drain(..) {
-        let expired = complete_bucket_expired(&entry, version.options.ttl, now_ms);
-        let path = series_index_path(region.region_id, entry.index_uuid);
-        if expired {
-            if let Err(error) = store.delete(&path).await
-                && error.kind() != ErrorKind::NotFound
-            {
-                warn!(error; "Failed to remove expired local series index {path}");
-                retained.push(entry);
-                continue;
-            }
-            LOCAL_SERIES_INDEX_EXPIRE_TOTAL.inc();
-            changed = true;
-            continue;
-        }
-
-        if validate_series_index(store, version.metadata.clone(), &path).await {
-            LOCAL_SERIES_INDEX_LOAD_TOTAL.inc();
-            retained.push(entry);
-            continue;
-        }
-
-        let source_files = files_for_recorded_coverage(files, &entry);
-        if source_files.is_empty() {
-            // Keep the authoritative coverage record and retry after SST state advances.
-            retained.push(entry);
-            continue;
-        }
-        let plan = SeriesBuildPlan {
-            entry: entry.clone(),
-            files: source_files,
-        };
-        if build_series_index(store, regions, region, version, &plan).await? {
-            LOCAL_SERIES_INDEX_REBUILD_TOTAL.inc();
-            retained.push(entry);
-            changed = true;
-        } else {
-            return Ok(changed);
-        }
-    }
-    catalog.indexes = retained;
-    Ok(changed)
+    drop(unpublished_ranges);
+    Ok((
+        LocalIndexFileHandle::new(
+            RegionFileId::new(region.region_id, entry.index_uuid),
+            LocalIndexType::Series,
+            purger.clone(),
+        ),
+        range_indexes,
+    ))
 }
 
 fn complete_bucket_expired(entry: &SeriesIndexEntry, ttl: Option<TimeToLive>, now_ms: i64) -> bool {
-    let Some(ttl) = ttl else {
-        return false;
-    };
-    match ttl.is_expired(
+    let Some(ttl) = ttl else { return false };
+    ttl.is_expired(
         &Timestamp::new_millisecond(entry.bucket_end_ms),
         &Timestamp::new_millisecond(now_ms),
-    ) {
-        Ok(expired) => expired,
-        Err(error) => {
-            warn!(error; "Failed to evaluate local series-index TTL");
-            false
-        }
-    }
+    )
+    .unwrap_or(false)
 }
 
-/// Adds missing series coverage after range-index reconciliation.
-pub(crate) async fn reconcile_series_indexes(
+/// Reconciles and atomically publishes all local indexes for one region snapshot.
+pub(crate) async fn reconcile_local_indexes(
+    worker_id: u32,
     store: ObjectStore,
     regions: RegionMapRef,
     region: MitoRegionRef,
-    version: VersionRef,
-    bucket_width: Duration,
+    requested_bucket_width: Duration,
     now_ms: i64,
-) -> Result<()> {
+    purger: LocalIndexFilePurger,
+) -> Result<ReconcileStats> {
+    let total_start = Instant::now();
+    let version = region.version_control.current().version;
+    let mut stats = ReconcileStats::default();
     if !is_sparse_metric_metadata(&version.metadata) {
-        return Ok(());
+        LOCAL_INDEX_RECONCILE_TOTAL
+            .with_label_values(&["noop"])
+            .inc();
+        return Ok(stats);
     }
-    clean_task_temporary_files(&store, region.region_id).await;
-    let mut catalog = load_series_catalog(&store, region.region_id).await;
     let files = version
         .ssts
         .levels()
@@ -662,54 +690,342 @@ pub(crate) async fn reconcile_series_indexes(
         .flat_map(|level| level.files())
         .cloned()
         .collect::<Vec<_>>();
-    recover_series_catalog(
-        &store,
-        &regions,
-        &region,
-        &version,
-        &files,
-        &mut catalog,
-        now_ms,
-    )
-    .await?;
-    let plans = plan_series_indexes(&files, &catalog.indexes, bucket_width, now_ms);
-    for plan in plans {
-        if !build_series_index(&store, &regions, &region, &version, &plan).await? {
-            return Ok(());
+    stats.source_files = files.len();
+    let visible = files
+        .iter()
+        .map(|file| file.file_id().file_id())
+        .collect::<HashSet<_>>();
+    let current = region.local_index_version();
+    let known = current
+        .range_indexes
+        .values()
+        .chain(current.series_indexes.values())
+        .map(|handle| (handle.identity(), handle.clone()))
+        .collect::<HashMap<_, _>>();
+    let load_start = Instant::now();
+    let (range_catalog, repair_range_catalog) =
+        load_catalog::<RangeIndexCatalog>(&store, &range_catalog_path(region.region_id)).await?;
+    let (series_catalog, repair_series_catalog) =
+        load_catalog::<SeriesIndexCatalog>(&store, &series_catalog_path(region.region_id)).await?;
+    stats.repaired_catalogs =
+        usize::from(repair_range_catalog) + usize::from(repair_series_catalog);
+    let (mut range_indexes, mut retired_handles) = load_range_indexes(
+        range_catalog,
+        region.region_id,
+        &visible,
+        &purger,
+        &known,
+        &mut stats,
+    );
+    let mut loaded_series = load_series_indexes(
+        series_catalog,
+        region.region_id,
+        &purger,
+        &known,
+        &mut stats,
+    );
+    LOCAL_INDEX_RECONCILE_ELAPSED
+        .with_label_values(&["load"])
+        .observe(load_start.elapsed().as_secs_f64());
+    let buckets = match version.compaction_time_window {
+        Some(window) => rounded_bucket_width(requested_bucket_width, window)
+            .map(|width| plan_series_buckets(&files, width))
+            .unwrap_or_default(),
+        None => {
+            debug!(
+                "Deferring local series indexes without compaction window, worker: {worker_id}, region: {}",
+                region.region_id
+            );
+            Vec::new()
         }
-        LOCAL_SERIES_INDEX_BUILD_TOTAL.inc();
-        catalog.indexes.push(plan.entry);
-    }
-    catalog.indexes.sort_by_key(|entry| {
-        (
-            entry.bucket_start_ms,
-            entry.min_file_sequence,
-            entry.max_file_sequence,
+    };
+    stats.computed_buckets = buckets.len();
+    let build_start = Instant::now();
+    let mut series_indexes = HashMap::new();
+    let mut series_entries = Vec::new();
+    let mut newly_built = Vec::new();
+    for bucket in buckets {
+        let Some(mut expected) = series_entry(&bucket) else {
+            stats.skipped_buckets += 1;
+            if bucket.has_unknown_sequence {
+                debug!(
+                    "Deferring local series-index bucket with unknown sequence, worker: {worker_id}, region: {}, bucket_start_ms: {}, bucket_end_ms: {}",
+                    region.region_id, bucket.start_ms, bucket.end_ms
+                );
+            }
+            continue;
+        };
+        if complete_bucket_expired(&expected, version.options.ttl, now_ms) {
+            stats.skipped_buckets += 1;
+            continue;
+        }
+        if let Some(position) = loaded_series
+            .iter()
+            .position(|(entry, _)| same_series_coverage(entry, &expected))
+        {
+            let (entry, handle) = loaded_series.swap_remove(position);
+            if !complete_bucket_expired(&entry, version.options.ttl, now_ms) {
+                series_entries.push(entry.clone());
+                series_indexes.insert(entry.index_uuid, handle);
+                continue;
+            }
+            retired_handles.push(handle);
+            stats.removed_series += 1;
+        }
+        let missing_range_ids = bucket
+            .files
+            .iter()
+            .map(|file| file.file_id().file_id())
+            .filter(|file_id| !range_indexes.contains_key(file_id))
+            .collect::<HashSet<_>>();
+        expected.index_uuid = FileId::random();
+        let (series_handle, built_ranges) = build_series_index(
+            &store,
+            &region,
+            &version,
+            &bucket,
+            &expected,
+            &missing_range_ids,
+            &purger,
         )
-    });
-    if is_current_region_version(&regions, &region, &version) {
-        store_series_catalog(&store, region.region_id, &catalog).await?;
+        .await?;
+        stats.built_series += 1;
+        stats.built_range += built_ranges.len();
+        newly_built.extend(built_ranges.values().cloned());
+        range_indexes.extend(built_ranges);
+        series_entries.push(expected.clone());
+        newly_built.push(series_handle.clone());
+        series_indexes.insert(expected.index_uuid, series_handle);
     }
-    Ok(())
+    for file in files {
+        let file_id = file.file_id().file_id();
+        if range_indexes.contains_key(&file_id) {
+            continue;
+        }
+        if let Some(handle) = build_range_index(&store, &region, &version, file, &purger).await? {
+            stats.built_range += 1;
+            newly_built.push(handle.clone());
+            range_indexes.insert(file_id, handle);
+        }
+    }
+    LOCAL_INDEX_RECONCILE_ELAPSED
+        .with_label_values(&["build"])
+        .observe(build_start.elapsed().as_secs_f64());
+    stats.removed_series += loaded_series.len();
+    retired_handles.extend(loaded_series.into_iter().map(|(_, handle)| handle));
+    let next = Arc::new(LocalIndexVersion {
+        range_indexes,
+        series_indexes,
+    });
+    if !is_current_region_version(&regions, &region, &version) {
+        for handle in newly_built {
+            handle.mark_deleted();
+        }
+        LOCAL_INDEX_RECONCILE_TOTAL
+            .with_label_values(&["stale"])
+            .inc();
+        debug!(
+            "Skipped stale local-index publication, worker: {worker_id}, region: {}",
+            region.region_id
+        );
+        return Ok(stats);
+    }
+    if stats.changed() {
+        let mut range_entries = next.range_indexes.keys().copied().collect::<Vec<_>>();
+        range_entries.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        series_entries.sort_unstable_by_key(|entry| {
+            (
+                entry.bucket_start_ms,
+                entry.bucket_end_ms,
+                entry.min_file_sequence,
+                entry.max_file_sequence,
+            )
+        });
+        store_catalog(
+            &store,
+            &range_catalog_path(region.region_id),
+            &RangeIndexCatalog {
+                indexes: range_entries,
+            },
+        )
+        .await?;
+        store_catalog(
+            &store,
+            &series_catalog_path(region.region_id),
+            &SeriesIndexCatalog {
+                indexes: series_entries,
+            },
+        )
+        .await?;
+    }
+    if !is_current_region_version(&regions, &region, &version) {
+        LOCAL_INDEX_RECONCILE_TOTAL
+            .with_label_values(&["stale"])
+            .inc();
+        debug!(
+            "Skipped stale local-index publication after catalog update, worker: {worker_id}, region: {}",
+            region.region_id
+        );
+        return Ok(stats);
+    }
+    let previous = region.local_index_version_control.publish(next.clone());
+    let current_identities = next
+        .range_indexes
+        .values()
+        .chain(next.series_indexes.values())
+        .map(LocalIndexFileHandle::identity)
+        .collect::<HashSet<_>>();
+    for handle in previous
+        .range_indexes
+        .values()
+        .chain(previous.series_indexes.values())
+    {
+        if !current_identities.contains(&handle.identity()) {
+            handle.mark_deleted();
+        }
+    }
+    for handle in retired_handles {
+        handle.mark_deleted();
+    }
+    let result = if stats.changed() { "changed" } else { "noop" };
+    LOCAL_INDEX_RECONCILE_TOTAL
+        .with_label_values(&[result])
+        .inc();
+    LOCAL_INDEX_RECONCILE_ELAPSED
+        .with_label_values(&["total"])
+        .observe(total_start.elapsed().as_secs_f64());
+    if stats.changed() {
+        info!(
+            "Reconciled local-index snapshot, worker: {worker_id}, region: {}, elapsed: {:?}, stats: {:?}",
+            region.region_id,
+            total_start.elapsed(),
+            stats
+        );
+    } else {
+        debug!(
+            "Local-index reconciliation made no changes, worker: {worker_id}, region: {}",
+            region.region_id
+        );
+    }
+    Ok(stats)
+}
+
+fn file_operation(index_type: LocalIndexType, operation: &str, result: &str) {
+    LOCAL_INDEX_FILE_OPERATION_TOTAL
+        .with_label_values(&[index_type.as_str(), operation, result])
+        .inc();
+}
+
+async fn purge_file(store: &ObjectStore, request: PurgeRequest) -> bool {
+    let path = local_index_path(request.index_type, request.file_id);
+    match store.delete(&path).await {
+        Ok(()) => {
+            file_operation(request.index_type, "delete", "success");
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            file_operation(request.index_type, "delete", "success");
+            true
+        }
+        Err(error) => {
+            file_operation(request.index_type, "delete", "failure");
+            warn!(error; "Failed to delete local index, index_type: {}, path: {}, phase: deletion, retry: true", request.index_type.as_str(), path);
+            false
+        }
+    }
+}
+
+/// Runs one sequential reconciliation task for a region worker.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_local_index_task(
+    worker_id: u32,
+    store: ObjectStore,
+    regions: RegionMapRef,
+    running: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    interval: Duration,
+    bucket_width: Duration,
+    mut purge_receiver: mpsc::UnboundedReceiver<PurgeRequest>,
+    purger: LocalIndexFilePurger,
+) {
+    info!("Start local-index reconciliation task, worker: {worker_id}");
+    let mut retry_purges = Vec::new();
+    while running.load(Ordering::Relaxed) {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = notify.notified() => {}
+            Some(request) = purge_receiver.recv() => {
+                if !purge_file(&store, PurgeRequest {
+                    index_type: request.index_type,
+                    file_id: request.file_id,
+                }).await {
+                    retry_purges.push(request);
+                }
+                continue;
+            }
+        }
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        for request in std::mem::take(&mut retry_purges) {
+            if !purge_file(
+                &store,
+                PurgeRequest {
+                    index_type: request.index_type,
+                    file_id: request.file_id,
+                },
+            )
+            .await
+            {
+                retry_purges.push(request);
+            }
+        }
+        for region in regions.list_regions() {
+            if let Err(error) = reconcile_local_indexes(
+                worker_id,
+                store.clone(),
+                regions.clone(),
+                region.clone(),
+                bucket_width,
+                common_time::util::current_time_millis(),
+                purger.clone(),
+            )
+            .await
+            {
+                LOCAL_INDEX_RECONCILE_TOTAL
+                    .with_label_values(&["failure"])
+                    .inc();
+                warn!(error; "Failed to reconcile local indexes, worker: {worker_id}, region: {}, phase: reconcile, retry: true", region.region_id);
+            }
+        }
+    }
+    while let Ok(request) = purge_receiver.try_recv() {
+        retry_purges.push(request);
+    }
+    for request in retry_purges {
+        let _ = purge_file(&store, request).await;
+    }
+    info!("Stop local-index reconciliation task, worker: {worker_id}");
+}
+
+pub(crate) fn local_index_channel(
+    store: ObjectStore,
+) -> (LocalIndexFilePurger, mpsc::UnboundedReceiver<PurgeRequest>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (LocalIndexFilePurger { store, sender }, receiver)
 }
 
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
 
+    use bytes::Bytes;
+    use object_store::ObjectStore;
+    use object_store::services::Memory;
+
     use super::*;
     use crate::sst::file::FileMeta;
     use crate::test_util::new_noop_file_purger;
-
-    #[test]
-    fn test_range_index_layout() {
-        let region_id = RegionId::new(42, 7);
-        let file_id = FileId::random();
-        assert_eq!(
-            format!("{}/range/{file_id}.parquet", region_id.as_u64()),
-            range_index_path(region_id, file_id)
-        );
-    }
 
     fn file(sequence: Option<u64>, level: u8, start_ms: i64, end_ms: i64) -> FileHandle {
         FileHandle::new(
@@ -727,104 +1043,99 @@ mod tests {
         )
     }
 
-    fn entry(min: u64, max: u64) -> SeriesIndexEntry {
-        SeriesIndexEntry {
-            index_uuid: FileId::random(),
-            bucket_start_ms: 0,
-            bucket_end_ms: 100,
-            min_file_sequence: min,
-            max_file_sequence: max,
-            format_version: 1,
-            schema_version: 1,
-        }
-    }
-
     #[test]
-    fn test_plan_closed_bucket_includes_all_levels_and_skips_unknown_sequence() {
-        let files = vec![
-            file(Some(1), 0, 1, 2),
-            file(None, 0, 1, 2),
-            file(Some(2), 1, 1, 2),
-        ];
-        let plans = plan_series_indexes(&files, &[], Duration::from_millis(100), 200);
-        assert_eq!(1, plans.len());
-        assert_eq!(2, plans[0].files.len());
-        assert_eq!(1, plans[0].entry.min_file_sequence);
-        assert_eq!(2, plans[0].entry.max_file_sequence);
-    }
-
-    #[test]
-    fn test_plan_active_bucket_stops_before_indivisible_l0_group() {
-        let files = vec![
-            file(Some(1), 1, 1, 2),
-            file(Some(1), 1, 1, 2),
-            file(Some(2), 1, 1, 2),
-            file(Some(3), 0, 1, 2),
-            file(Some(3), 1, 1, 2),
-            file(Some(4), 1, 1, 2),
-        ];
-        let plans = plan_series_indexes(&files, &[], Duration::from_millis(100), 50);
-        assert_eq!(1, plans.len());
-        assert_eq!(3, plans[0].files.len());
-        assert_eq!(1, plans[0].entry.min_file_sequence);
-        assert_eq!(2, plans[0].entry.max_file_sequence);
-    }
-
-    #[test]
-    fn test_plan_keeps_non_overlapping_indexes_in_one_bucket() {
-        let files = (1..=5)
-            .map(|sequence| file(Some(sequence), 1, 1, 2))
-            .collect::<Vec<_>>();
-        let plans = plan_series_indexes(&files, &[entry(3, 3)], Duration::from_millis(100), 200);
-        assert_eq!(2, plans.len());
+    fn test_bucket_width_is_rounded_to_compaction_window() {
         assert_eq!(
-            (1, 2),
-            (
-                plans[0].entry.min_file_sequence,
-                plans[0].entry.max_file_sequence
-            )
+            Some(300),
+            rounded_bucket_width(Duration::from_millis(201), Duration::from_millis(100))
         );
         assert_eq!(
-            (4, 5),
+            Some(100),
+            rounded_bucket_width(Duration::ZERO, Duration::from_millis(100))
+        );
+    }
+
+    #[test]
+    fn test_bucket_planning_merges_cross_boundary_spans_transitively() {
+        let files = vec![
+            file(Some(1), 1, 10, 20),
+            file(Some(2), 0, 90, 110),
+            file(Some(3), 1, 190, 210),
+        ];
+        let buckets = plan_series_buckets(&files, 100);
+        assert_eq!(1, buckets.len());
+        assert_eq!(
+            (0, 300, 3),
             (
-                plans[1].entry.min_file_sequence,
-                plans[1].entry.max_file_sequence
+                buckets[0].start_ms,
+                buckets[0].end_ms,
+                buckets[0].files.len()
             )
         );
     }
 
     #[test]
-    fn test_recorded_coverage_survives_source_replacement() {
-        let coverage = entry(1, 5);
-        let compacted = file(Some(5), 1, 1, 2);
-        let newer = file(Some(6), 1, 1, 2);
-        let selected = files_for_recorded_coverage(&[compacted.clone(), newer], &coverage);
-        assert_eq!(1, selected.len());
-        assert_eq!(compacted.file_id(), selected[0].file_id());
+    fn test_bucket_planning_keeps_exact_boundary_in_next_bucket() {
+        let buckets = plan_series_buckets(&[file(Some(1), 1, 0, 100)], 100);
+        assert_eq!((0, 200), (buckets[0].start_ms, buckets[0].end_ms));
     }
 
     #[test]
-    fn test_complete_bucket_ttl_and_no_ttl() {
-        let coverage = entry(1, 2);
-        assert!(!complete_bucket_expired(&coverage, None, 10_000));
-        let ttl = Some(TimeToLive::Duration(Duration::from_millis(100)));
-        assert!(!complete_bucket_expired(&coverage, ttl, 200));
-        assert!(complete_bucket_expired(&coverage, ttl, 201));
+    fn test_bucket_planning_includes_levels_and_defers_unknown_sequences() {
+        let buckets = plan_series_buckets(
+            &[
+                file(Some(1), 0, 1, 2),
+                file(None, 1, 3, 4),
+                file(Some(2), 2, 5, 6),
+            ],
+            100,
+        );
+        assert_eq!(1, buckets.len());
+        assert!(buckets[0].has_unknown_sequence);
+        assert!(series_entry(&buckets[0]).is_none());
     }
 
     #[test]
-    fn test_catalog_round_trip_preserves_coverage() {
-        let catalog = SeriesIndexCatalog {
-            version: 1,
-            indexes: vec![entry(2, 7)],
+    fn test_changed_bucket_layout_does_not_match_existing_coverage() {
+        let bucket = SeriesBucket {
+            start_ms: 0,
+            end_ms: 200,
+            files: vec![file(Some(1), 1, 1, 101), file(Some(2), 1, 2, 3)],
+            has_unknown_sequence: false,
         };
-        let encoded = serde_json::to_vec(&catalog).unwrap();
-        let decoded: SeriesIndexCatalog = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(catalog, decoded);
-        let metadata = series_metadata(&catalog.indexes[0]);
-        assert!(metadata.iter().any(|value| {
-            value.key == format!("{META_PREFIX}min_file_sequence")
-                && value.value.as_deref() == Some("2")
+        let current = series_entry(&bucket).unwrap();
+        let mut old = current.clone();
+        old.bucket_end_ms = 100;
+        assert!(!same_series_coverage(&old, &current));
+    }
+
+    #[tokio::test]
+    async fn test_old_snapshot_defers_removed_file_deletion() {
+        let store = ObjectStore::new(Memory::default()).unwrap().finish();
+        let region_file_id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let path = local_index_path(LocalIndexType::Range, region_file_id);
+        store
+            .write(&path, Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+        let (purger, mut receiver) = local_index_channel(store.clone());
+        let handle = LocalIndexFileHandle::new(region_file_id, LocalIndexType::Range, purger);
+        let control = LocalIndexVersionControl::default();
+        control.publish(Arc::new(LocalIndexVersion {
+            range_indexes: HashMap::from([(FileId::random(), handle)]),
+            series_indexes: HashMap::new(),
         }));
+        let held = control.current();
+        let removed = control.publish(Arc::new(LocalIndexVersion::default()));
+        removed.mark_all_deleted();
+        drop(removed);
+        assert!(store.stat(&path).await.is_ok());
+
+        drop(held);
+        assert!(purge_file(&store, receiver.recv().await.unwrap()).await);
+        assert_eq!(
+            ErrorKind::NotFound,
+            store.stat(&path).await.unwrap_err().kind()
+        );
     }
 }

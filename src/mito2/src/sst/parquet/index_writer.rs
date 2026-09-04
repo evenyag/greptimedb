@@ -95,25 +95,6 @@ impl ParquetIndexWriter {
         path: &str,
         schema: &SchemaRef,
         row_group_size: usize,
-    ) -> Result<Self> {
-        Self::try_new_with_key_value_metadata(
-            name,
-            object_store,
-            path,
-            schema,
-            row_group_size,
-            None,
-        )
-        .await
-    }
-
-    /// Opens an index file with optional Parquet key-value metadata.
-    pub(crate) async fn try_new_with_key_value_metadata(
-        name: &'static str,
-        object_store: ObjectStore,
-        path: &str,
-        schema: &SchemaRef,
-        row_group_size: usize,
         key_value_metadata: Option<Vec<KeyValue>>,
     ) -> Result<Self> {
         let file_name = path.rsplit('/').next().unwrap_or(path).to_string();

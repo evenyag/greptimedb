@@ -417,6 +417,7 @@ impl RegionOpener {
         Ok(Arc::new(MitoRegion {
             region_id,
             version_control,
+            local_index_version_control: Default::default(),
             access_layer: access_layer.clone(),
             // Region is writable after it is created.
             manifest_ctx: Arc::new(ManifestContext::new(
@@ -647,6 +648,7 @@ impl RegionOpener {
         let region = MitoRegion {
             region_id: self.region_id,
             version_control: version_control.clone(),
+            local_index_version_control: Default::default(),
             access_layer: access_layer.clone(),
             // Region is always opened in read only mode.
             manifest_ctx: Arc::new(ManifestContext::new(

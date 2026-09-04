@@ -53,7 +53,6 @@ use crate::error::{
     MissingPartitionExprSnafu, Result, UnexpectedSnafu,
 };
 use crate::flush::FlushReason;
-use crate::local_index::LocalIndexReconcileFinished;
 use crate::manifest::action::{RegionEdit, TruncateKind};
 use crate::memtable::MemtableId;
 use crate::memtable::bulk::part::BulkPart;
@@ -897,10 +896,6 @@ pub(crate) struct SenderDdlRequest {
 /// Notification from a background job.
 #[derive(Debug)]
 pub(crate) enum BackgroundNotify {
-    /// Reconcile local indexes immediately after a region becomes visible.
-    LocalIndexReconcile,
-    /// A disposable local-index reconciliation pass has finished.
-    LocalIndexReconcileFinished(LocalIndexReconcileFinished),
     /// Compaction planning has finished.
     CompactionPickFinished(CompactionPickFinished),
     /// Flush has finished.

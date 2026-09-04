@@ -128,6 +128,7 @@ where
 
         // Marks region version as dropped
         region.version_control.mark_dropped();
+        region.local_index_version_control.mark_dropped();
         info!(
             "Region {} is dropped logically, but some files are not deleted yet",
             region_id
@@ -205,7 +206,6 @@ where
         self.index_build_scheduler
             .on_region_dropped(region_id)
             .await;
-        self.local_index_states.remove(&region_id);
     }
 }
 
