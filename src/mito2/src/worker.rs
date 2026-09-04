@@ -67,7 +67,9 @@ use crate::config::MitoConfig;
 use crate::error::{self, CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::gc::{GcLimiter, GcLimiterRef};
-use crate::local_index::{LocalIndexReconcileFinished, reconcile_range_indexes};
+use crate::local_index::{
+    LocalIndexReconcileFinished, reconcile_range_indexes, reconcile_series_indexes,
+};
 use crate::memtable::MemtableBuilderProvider;
 use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::opener::PartitionExprFetcherRef;
@@ -1345,8 +1347,23 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let sender = self.sender.clone();
             let region_id = region.region_id;
             let store = store.clone();
+            let bucket_width = self.config.experimental_local_series_index_bucket_width;
             let job = async move {
-                if let Err(error) = reconcile_range_indexes(store, regions, region, version).await {
+                let result = reconcile_range_indexes(
+                    store.clone(),
+                    regions.clone(),
+                    region.clone(),
+                    version.clone(),
+                )
+                .await;
+                let result = match result {
+                    Ok(()) => {
+                        reconcile_series_indexes(store, regions, region, version, bucket_width, now)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
                     warn!(error; "Failed to reconcile local indexes for region {region_id}");
                 }
                 let _ = sender

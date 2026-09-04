@@ -27,6 +27,7 @@ use datatypes::timestamp::timestamp_array_to_primitive;
 use datatypes::value::Value;
 use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec, build_primary_key_codec};
 use object_store::ObjectStore;
+use parquet::file::metadata::KeyValue;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
@@ -130,6 +131,17 @@ impl SeriesIndexWriter {
         path: &str,
         options: SeriesIndexWriterOptions,
     ) -> Result<Self> {
+        Self::try_new_with_key_value_metadata(metadata, object_store, path, options, None).await
+    }
+
+    /// Creates a writer with optional Parquet key-value metadata.
+    pub async fn try_new_with_key_value_metadata(
+        metadata: RegionMetadataRef,
+        object_store: ObjectStore,
+        path: &str,
+        options: SeriesIndexWriterOptions,
+        key_value_metadata: Option<Vec<KeyValue>>,
+    ) -> Result<Self> {
         let open_start = Instant::now();
         ensure!(
             options.row_group_size > 0,
@@ -139,12 +151,13 @@ impl SeriesIndexWriter {
         );
         let schema = series_index_schema(&metadata)?;
         let tag_columns = tag_columns(&metadata);
-        let writer = ParquetIndexWriter::try_new(
+        let writer = ParquetIndexWriter::try_new_with_key_value_metadata(
             "series index",
             object_store,
             path,
             &schema,
             options.row_group_size,
+            key_value_metadata,
         )
         .await?;
         let codec = build_primary_key_codec(&metadata);
