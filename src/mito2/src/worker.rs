@@ -56,7 +56,7 @@ use store_api::region_engine::{
 };
 use store_api::storage::{FileId, RegionId};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 
 use crate::access_layer::new_fs_cache_store;
 use crate::cache::write_cache::{WriteCache, WriteCacheRef};
@@ -67,7 +67,7 @@ use crate::config::MitoConfig;
 use crate::error::{self, CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::gc::{GcLimiter, GcLimiterRef};
-use crate::local_index::{local_index_channel, run_local_index_task};
+use crate::local_index::{LocalIndexTaskState, local_index_channel, run_local_index_task};
 use crate::memtable::MemtableBuilderProvider;
 use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::opener::PartitionExprFetcherRef;
@@ -590,21 +590,27 @@ impl<S: LogStore> WorkerStarter<S> {
         let (sender, receiver) = mpsc::channel(self.config.worker_channel_size);
 
         let running = Arc::new(AtomicBool::new(true));
-        let local_index_notify = Arc::new(Notify::new());
-        let local_index_handle = self.local_index_store.clone().map(|store| {
-            let (purger, purge_receiver) = local_index_channel(store.clone());
-            common_runtime::spawn_global(run_local_index_task(
-                self.id,
-                store,
-                regions.clone(),
-                running.clone(),
-                local_index_notify.clone(),
-                self.config.experimental_local_index_reconcile_interval,
-                self.config.experimental_local_series_index_bucket_width,
-                purge_receiver,
-                purger,
-            ))
-        });
+        let local_index_task_state = self
+            .local_index_store
+            .as_ref()
+            .map(|_| Arc::new(LocalIndexTaskState::new()));
+        let local_index_handle = self
+            .local_index_store
+            .clone()
+            .zip(local_index_task_state.clone())
+            .map(|(store, state)| {
+                let (purger, purge_receiver) = local_index_channel(store.clone());
+                common_runtime::spawn_global(run_local_index_task(
+                    self.id,
+                    store,
+                    regions.clone(),
+                    state,
+                    self.config.experimental_local_index_reconcile_interval,
+                    self.config.experimental_local_series_index_bucket_width,
+                    purge_receiver,
+                    purger,
+                ))
+            });
         let now = self.time_provider.current_time_millis();
         let id_string = self.id.to_string();
         let mut worker_thread = RegionWorkerLoop {
@@ -629,7 +635,7 @@ impl<S: LogStore> WorkerStarter<S> {
                 self.index_build_job_pool.clone(),
                 self.config.max_background_index_builds,
             ),
-            local_index_notify: local_index_notify.clone(),
+            local_index_task_state: local_index_task_state.clone(),
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -672,7 +678,7 @@ impl<S: LogStore> WorkerStarter<S> {
             sender,
             handle: Mutex::new(Some(handle)),
             local_index_handle: Mutex::new(local_index_handle),
-            local_index_notify,
+            local_index_task_state,
             running,
         })
     }
@@ -694,8 +700,8 @@ pub(crate) struct RegionWorker {
     handle: Mutex<Option<JoinHandle<()>>>,
     /// Handle to the sequential local-index task.
     local_index_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Wakes the local-index task on region insertion and shutdown.
-    local_index_notify: Arc<Notify>,
+    /// Controls the worker-owned local-index task.
+    local_index_task_state: Option<Arc<LocalIndexTaskState>>,
     /// Whether to run the worker thread.
     running: Arc<AtomicBool>,
 }
@@ -712,7 +718,9 @@ impl RegionWorker {
             );
             // Manually set the running flag to false to avoid printing more warning logs.
             self.set_running(false);
-            self.local_index_notify.notify_waiters();
+            if let Some(state) = &self.local_index_task_state {
+                state.stop();
+            }
             return WorkerStoppedSnafu { id: self.id }.fail();
         }
 
@@ -724,10 +732,15 @@ impl RegionWorker {
     /// This method waits until the worker thread exists.
     async fn stop(&self) -> Result<()> {
         let handle = self.handle.lock().await.take();
+        self.set_running(false);
+        if let Some(state) = &self.local_index_task_state {
+            state.stop();
+        }
+
+        let mut worker_result = Ok(());
         if let Some(handle) = handle {
             info!("Stop region worker {}", self.id);
 
-            self.set_running(false);
             if self
                 .sender
                 .send(WorkerRequestWithTime::new(WorkerRequest::Stop))
@@ -737,11 +750,15 @@ impl RegionWorker {
                 warn!("Worker {} is already exited before stop", self.id);
             }
 
-            handle.await.context(JoinSnafu)?;
-            if let Some(handle) = self.local_index_handle.lock().await.take() {
-                handle.await.context(JoinSnafu)?;
-            }
+            worker_result = handle.await.context(JoinSnafu);
         }
+        let local_index_result = if let Some(handle) = self.local_index_handle.lock().await.take() {
+            handle.await.context(JoinSnafu)
+        } else {
+            Ok(())
+        };
+        worker_result?;
+        local_index_result?;
 
         Ok(())
     }
@@ -791,9 +808,11 @@ impl RegionWorker {
 
 impl Drop for RegionWorker {
     fn drop(&mut self) {
+        if let Some(state) = &self.local_index_task_state {
+            state.stop();
+        }
         if self.is_running() {
             self.set_running(false);
-            self.local_index_notify.notify_waiters();
             // Once we drop the sender, the worker thread will receive a disconnected error.
         }
     }
@@ -913,8 +932,8 @@ struct RegionWorkerLoop<S> {
     write_buffer_manager: WriteBufferManagerRef,
     /// Scheduler for index build task.
     index_build_scheduler: IndexBuildScheduler,
-    /// Wakes the worker-owned local-index task after a region is inserted.
-    local_index_notify: Arc<Notify>,
+    /// Controls the worker-owned local-index task.
+    local_index_task_state: Option<Arc<LocalIndexTaskState>>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
@@ -1601,10 +1620,15 @@ mod tests {
         let group = env
             .create_worker_group(MitoConfig {
                 num_workers: 4,
+                experimental_local_index_root: "local-index".to_string(),
+                experimental_local_index_reconcile_interval: Duration::from_secs(3600),
                 ..Default::default()
             })
             .await;
 
-        group.stop().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), group.stop())
+            .await
+            .expect("local-index tasks should stop without waiting for their interval")
+            .unwrap();
     }
 }

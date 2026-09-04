@@ -225,7 +225,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let opening_regions = self.opening_regions.clone();
         let region_count = self.region_count.clone();
         let worker_id = self.id;
-        let local_index_notify = self.local_index_notify.clone();
+        let local_index_task_state = self.local_index_task_state.clone();
         opening_regions.insert_sender(region_id, sender);
         common_runtime::spawn_global(async move {
             match opener.open(&config, &wal).await {
@@ -248,7 +248,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                     // Insert the Region into the RegionMap.
                     regions.insert_region(region);
-                    local_index_notify.notify_one();
+                    if let Some(state) = &local_index_task_state {
+                        state.wake();
+                    }
 
                     let senders = opening_regions.remove_sender(region_id);
                     for sender in senders {

@@ -56,6 +56,40 @@ const RANGE_CATALOG: &str = "range-index.json";
 const SERIES_CATALOG: &str = "series-index.json";
 const SERIES_METADATA_KEY: &str = "greptime.local_series_index";
 
+/// Shared lifecycle state for a worker's local-index task.
+#[derive(Debug)]
+pub(crate) struct LocalIndexTaskState {
+    running: AtomicBool,
+    notify: Notify,
+}
+
+impl LocalIndexTaskState {
+    pub(crate) fn new() -> Self {
+        Self {
+            running: AtomicBool::new(true),
+            notify: Notify::new(),
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn wake(&self) {
+        self.notify.notify_one();
+    }
+
+    pub(crate) fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        // notify_one() retains a permit if the task has not started waiting yet.
+        self.notify.notify_one();
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LocalIndexType {
     Range,
@@ -941,8 +975,7 @@ pub(crate) async fn run_local_index_task(
     worker_id: u32,
     store: ObjectStore,
     regions: RegionMapRef,
-    running: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    state: Arc<LocalIndexTaskState>,
     interval: Duration,
     bucket_width: Duration,
     mut purge_receiver: mpsc::UnboundedReceiver<PurgeRequest>,
@@ -950,10 +983,10 @@ pub(crate) async fn run_local_index_task(
 ) {
     info!("Start local-index reconciliation task, worker: {worker_id}");
     let mut retry_purges = Vec::new();
-    while running.load(Ordering::Relaxed) {
+    while state.is_running() {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = notify.notified() => {}
+            _ = state.notified() => {}
             Some(request) = purge_receiver.recv() => {
                 if !purge_file(&store, PurgeRequest {
                     index_type: request.index_type,
@@ -964,7 +997,7 @@ pub(crate) async fn run_local_index_task(
                 continue;
             }
         }
-        if !running.load(Ordering::Relaxed) {
+        if !state.is_running() {
             break;
         }
         for request in std::mem::take(&mut retry_purges) {
