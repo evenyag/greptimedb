@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use async_stream::try_stream;
 use common_telemetry::warn;
-use common_time::Timestamp;
 use common_time::timestamp::TimeUnit;
+use common_time::{TimeToLive, Timestamp};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{col, lit};
 use futures::TryStreamExt;
@@ -33,6 +33,10 @@ use store_api::storage::{FileId, RegionId};
 use table::predicate::Predicate;
 
 use crate::error::{OpenDalSnafu, Result, UnexpectedSnafu};
+use crate::metrics::{
+    LOCAL_SERIES_INDEX_BUILD_TOTAL, LOCAL_SERIES_INDEX_EXPIRE_TOTAL, LOCAL_SERIES_INDEX_LOAD_TOTAL,
+    LOCAL_SERIES_INDEX_REBUILD_TOTAL,
+};
 use crate::read::BoxedRecordBatchStream;
 use crate::read::flat_dedup::{FlatDedupReader, FlatLastRow};
 use crate::read::flat_merge::FlatMergeReader;
@@ -104,11 +108,11 @@ pub(crate) struct LocalIndexReconcileFinished {
 }
 
 pub(crate) fn range_index_path(region_id: RegionId, file_id: FileId) -> String {
-    format!("{region_id}/{RANGE_DIR}/{file_id}.parquet")
+    format!("{}/{RANGE_DIR}/{file_id}.parquet", region_id.as_u64())
 }
 
 fn range_index_dir(region_id: RegionId) -> String {
-    format!("{region_id}/{RANGE_DIR}/")
+    format!("{}/{RANGE_DIR}/", region_id.as_u64())
 }
 
 fn is_current_region_version(
@@ -230,11 +234,11 @@ pub(crate) async fn reconcile_range_indexes(
 }
 
 fn series_catalog_path(region_id: RegionId) -> String {
-    format!("{region_id}/{SERIES_CATALOG}")
+    format!("{}/{SERIES_CATALOG}", region_id.as_u64())
 }
 
 fn series_index_path(region_id: RegionId, index_uuid: FileId) -> String {
-    format!("{region_id}/{SERIES_DIR}/{index_uuid}.parquet")
+    format!("{}/{SERIES_DIR}/{index_uuid}.parquet", region_id.as_u64())
 }
 
 fn timestamp_millis(timestamp: Timestamp) -> Option<i64> {
@@ -479,17 +483,23 @@ async fn build_series_index(
     Ok(true)
 }
 
-async fn load_series_catalog(
-    store: &ObjectStore,
-    region_id: RegionId,
-) -> Result<SeriesIndexCatalog> {
+async fn load_series_catalog(store: &ObjectStore, region_id: RegionId) -> SeriesIndexCatalog {
     let path = series_catalog_path(region_id);
     let bytes = match store.read(&path).await {
         Ok(bytes) => bytes.to_bytes(),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Default::default()),
-        Err(error) => return Err(error).context(OpenDalSnafu),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Default::default(),
+        Err(error) => {
+            warn!(error; "Failed to read local series-index catalog {path}; rebuilding coverage");
+            return Default::default();
+        }
     };
-    serde_json::from_slice(&bytes).context(crate::error::SerdeJsonSnafu)
+    match serde_json::from_slice(&bytes) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            warn!(error; "Invalid local series-index catalog {path}; rebuilding coverage");
+            Default::default()
+        }
+    }
 }
 
 async fn store_series_catalog(
@@ -504,6 +514,133 @@ async fn store_series_catalog(
     store.rename(&temporary, &path).await.context(OpenDalSnafu)
 }
 
+async fn validate_series_index(
+    store: &ObjectStore,
+    metadata: store_api::metadata::RegionMetadataRef,
+    path: &str,
+) -> bool {
+    let result: Result<()> = async {
+        let searcher = SeriesIndexSearcher::try_new(metadata, store.clone(), None, None)?;
+        let mut stream = searcher.search(path).await?;
+        let _ = stream.try_next().await?;
+        Ok(())
+    }
+    .await;
+    result.is_ok()
+}
+
+fn files_for_recorded_coverage(files: &[FileHandle], entry: &SeriesIndexEntry) -> Vec<FileHandle> {
+    files
+        .iter()
+        .filter(|file| {
+            let Some(sequence) = file.meta_ref().sequence.map(|sequence| sequence.get()) else {
+                return false;
+            };
+            let Some(start_ms) = timestamp_millis(file.time_range().0) else {
+                return false;
+            };
+            let Some(end_ms) = timestamp_millis(file.time_range().1) else {
+                return false;
+            };
+            sequence >= entry.min_file_sequence
+                && sequence <= entry.max_file_sequence
+                && start_ms < entry.bucket_end_ms
+                && end_ms >= entry.bucket_start_ms
+        })
+        .cloned()
+        .collect()
+}
+
+async fn clean_task_temporary_files(store: &ObjectStore, region_id: RegionId) {
+    for dir in [
+        format!("{}/", region_id.as_u64()),
+        format!("{}/{SERIES_DIR}/", region_id.as_u64()),
+    ] {
+        let Ok(entries) = store.list(&dir).await else {
+            continue;
+        };
+        for entry in entries {
+            if !entry.metadata().is_dir()
+                && entry.path().contains(".building-")
+                && let Err(error) = store.delete(entry.path()).await
+            {
+                warn!(error; "Failed to clean local-index temporary file {}", entry.path());
+            }
+        }
+    }
+}
+
+async fn recover_series_catalog(
+    store: &ObjectStore,
+    regions: &RegionMapRef,
+    region: &MitoRegionRef,
+    version: &VersionRef,
+    files: &[FileHandle],
+    catalog: &mut SeriesIndexCatalog,
+    now_ms: i64,
+) -> Result<bool> {
+    let mut changed = false;
+    let mut retained = Vec::with_capacity(catalog.indexes.len());
+    for entry in catalog.indexes.drain(..) {
+        let expired = complete_bucket_expired(&entry, version.options.ttl, now_ms);
+        let path = series_index_path(region.region_id, entry.index_uuid);
+        if expired {
+            if let Err(error) = store.delete(&path).await
+                && error.kind() != ErrorKind::NotFound
+            {
+                warn!(error; "Failed to remove expired local series index {path}");
+                retained.push(entry);
+                continue;
+            }
+            LOCAL_SERIES_INDEX_EXPIRE_TOTAL.inc();
+            changed = true;
+            continue;
+        }
+
+        if validate_series_index(store, version.metadata.clone(), &path).await {
+            LOCAL_SERIES_INDEX_LOAD_TOTAL.inc();
+            retained.push(entry);
+            continue;
+        }
+
+        let source_files = files_for_recorded_coverage(files, &entry);
+        if source_files.is_empty() {
+            // Keep the authoritative coverage record and retry after SST state advances.
+            retained.push(entry);
+            continue;
+        }
+        let plan = SeriesBuildPlan {
+            entry: entry.clone(),
+            files: source_files,
+        };
+        if build_series_index(store, regions, region, version, &plan).await? {
+            LOCAL_SERIES_INDEX_REBUILD_TOTAL.inc();
+            retained.push(entry);
+            changed = true;
+        } else {
+            return Ok(changed);
+        }
+    }
+    catalog.indexes = retained;
+    Ok(changed)
+}
+
+fn complete_bucket_expired(entry: &SeriesIndexEntry, ttl: Option<TimeToLive>, now_ms: i64) -> bool {
+    let Some(ttl) = ttl else {
+        return false;
+    };
+    match ttl.is_expired(
+        &Timestamp::new_millisecond(entry.bucket_end_ms),
+        &Timestamp::new_millisecond(now_ms),
+    ) {
+        Ok(expired) => expired,
+        Err(error) => {
+            warn!(error; "Failed to evaluate local series-index TTL");
+            false
+        }
+    }
+}
+
 /// Adds missing series coverage after range-index reconciliation.
 pub(crate) async fn reconcile_series_indexes(
     store: ObjectStore,
@@ -516,7 +653,8 @@ pub(crate) async fn reconcile_series_indexes(
     if !is_sparse_metric_metadata(&version.metadata) {
         return Ok(());
     }
-    let mut catalog = load_series_catalog(&store, region.region_id).await?;
+    clean_task_temporary_files(&store, region.region_id).await;
+    let mut catalog = load_series_catalog(&store, region.region_id).await;
     let files = version
         .ssts
         .levels()
@@ -524,11 +662,22 @@ pub(crate) async fn reconcile_series_indexes(
         .flat_map(|level| level.files())
         .cloned()
         .collect::<Vec<_>>();
+    recover_series_catalog(
+        &store,
+        &regions,
+        &region,
+        &version,
+        &files,
+        &mut catalog,
+        now_ms,
+    )
+    .await?;
     let plans = plan_series_indexes(&files, &catalog.indexes, bucket_width, now_ms);
     for plan in plans {
         if !build_series_index(&store, &regions, &region, &version, &plan).await? {
             return Ok(());
         }
+        LOCAL_SERIES_INDEX_BUILD_TOTAL.inc();
         catalog.indexes.push(plan.entry);
     }
     catalog.indexes.sort_by_key(|entry| {
@@ -557,7 +706,7 @@ mod tests {
         let region_id = RegionId::new(42, 7);
         let file_id = FileId::random();
         assert_eq!(
-            format!("42_0000000007/range/{file_id}.parquet"),
+            format!("{}/range/{file_id}.parquet", region_id.as_u64()),
             range_index_path(region_id, file_id)
         );
     }
@@ -642,5 +791,40 @@ mod tests {
                 plans[1].entry.max_file_sequence
             )
         );
+    }
+
+    #[test]
+    fn test_recorded_coverage_survives_source_replacement() {
+        let coverage = entry(1, 5);
+        let compacted = file(Some(5), 1, 1, 2);
+        let newer = file(Some(6), 1, 1, 2);
+        let selected = files_for_recorded_coverage(&[compacted.clone(), newer], &coverage);
+        assert_eq!(1, selected.len());
+        assert_eq!(compacted.file_id(), selected[0].file_id());
+    }
+
+    #[test]
+    fn test_complete_bucket_ttl_and_no_ttl() {
+        let coverage = entry(1, 2);
+        assert!(!complete_bucket_expired(&coverage, None, 10_000));
+        let ttl = Some(TimeToLive::Duration(Duration::from_millis(100)));
+        assert!(!complete_bucket_expired(&coverage, ttl, 200));
+        assert!(complete_bucket_expired(&coverage, ttl, 201));
+    }
+
+    #[test]
+    fn test_catalog_round_trip_preserves_coverage() {
+        let catalog = SeriesIndexCatalog {
+            version: 1,
+            indexes: vec![entry(2, 7)],
+        };
+        let encoded = serde_json::to_vec(&catalog).unwrap();
+        let decoded: SeriesIndexCatalog = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(catalog, decoded);
+        let metadata = series_metadata(&catalog.indexes[0]);
+        assert!(metadata.iter().any(|value| {
+            value.key == format!("{META_PREFIX}min_file_sequence")
+                && value.value.as_deref() == Some("2")
+        }));
     }
 }

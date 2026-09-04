@@ -205,6 +205,7 @@ where
         self.index_build_scheduler
             .on_region_dropped(region_id)
             .await;
+        self.local_index_states.remove(&region_id);
     }
 }
 

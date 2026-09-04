@@ -1276,6 +1276,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     /// Handles region background request
     async fn handle_background_notify(&mut self, region_id: RegionId, notify: BackgroundNotify) {
         match notify {
+            BackgroundNotify::LocalIndexReconcile => {
+                self.local_index_states.remove(&region_id);
+                self.schedule_local_index_reconciliation();
+            }
             BackgroundNotify::LocalIndexReconcileFinished(finished) => {
                 self.handle_local_index_finished(region_id, finished)
             }

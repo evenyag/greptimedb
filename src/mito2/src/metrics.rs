@@ -319,6 +319,26 @@ lazy_static! {
 // Index metrics.
 lazy_static! {
     // Index metrics.
+    /// Number of successfully built local series-index files.
+    pub static ref LOCAL_SERIES_INDEX_BUILD_TOTAL: IntCounter = register_int_counter!(
+        "greptime_mito_local_series_index_build_total",
+        "successfully built local series-index files",
+    ).unwrap();
+    /// Number of local series-index files loaded and validated.
+    pub static ref LOCAL_SERIES_INDEX_LOAD_TOTAL: IntCounter = register_int_counter!(
+        "greptime_mito_local_series_index_load_total",
+        "local series-index files loaded and validated",
+    ).unwrap();
+    /// Number of local series-index files reconstructed from coverage metadata.
+    pub static ref LOCAL_SERIES_INDEX_REBUILD_TOTAL: IntCounter = register_int_counter!(
+        "greptime_mito_local_series_index_rebuild_total",
+        "local series-index files reconstructed",
+    ).unwrap();
+    /// Number of local series-index files removed after complete bucket expiry.
+    pub static ref LOCAL_SERIES_INDEX_EXPIRE_TOTAL: IntCounter = register_int_counter!(
+        "greptime_mito_local_series_index_expire_total",
+        "local series-index files removed after bucket expiry",
+    ).unwrap();
     /// Number of stale index publications rejected at each publication stage.
     pub static ref INDEX_PUBLICATION_STALE_TOTAL: IntCounterVec =
         register_int_counter_vec!(

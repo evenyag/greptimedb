@@ -897,6 +897,8 @@ pub(crate) struct SenderDdlRequest {
 /// Notification from a background job.
 #[derive(Debug)]
 pub(crate) enum BackgroundNotify {
+    /// Reconcile local indexes immediately after a region becomes visible.
+    LocalIndexReconcile,
     /// A disposable local-index reconciliation pass has finished.
     LocalIndexReconcileFinished(LocalIndexReconcileFinished),
     /// Compaction planning has finished.

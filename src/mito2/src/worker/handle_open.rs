@@ -35,7 +35,7 @@ use crate::region::opener::{
     RegionOpener, get_object_store, provider_from_wal_options, sanitize_open_request_options,
 };
 use crate::region::options::RegionOptions;
-use crate::request::OptionOutputTx;
+use crate::request::{BackgroundNotify, OptionOutputTx, WorkerRequest, WorkerRequestWithTime};
 use crate::sst::location::region_dir_from_table_dir;
 use crate::wal::entry_distributor::WalEntryReceiver;
 use crate::worker::handle_drop::{
@@ -225,6 +225,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let opening_regions = self.opening_regions.clone();
         let region_count = self.region_count.clone();
         let worker_id = self.id;
+        let worker_sender = self.sender.clone();
         opening_regions.insert_sender(region_id, sender);
         common_runtime::spawn_global(async move {
             match opener.open(&config, &wal).await {
@@ -247,6 +248,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                     // Insert the Region into the RegionMap.
                     regions.insert_region(region);
+                    let _ = worker_sender
+                        .send(WorkerRequestWithTime::new(WorkerRequest::Background {
+                            region_id,
+                            notify: BackgroundNotify::LocalIndexReconcile,
+                        }))
+                        .await;
 
                     let senders = opening_regions.remove_sender(region_id);
                     for sender in senders {
