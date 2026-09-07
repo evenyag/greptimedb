@@ -19,8 +19,9 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use store_api::storage::FileId;
+use store_api::storage::{FileId, RegionId};
 
+use super::catalog::SeriesIndexEntry;
 use super::purger::{IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
 
@@ -40,18 +41,23 @@ impl Debug for SeriesIndexFileHandle {
 }
 
 impl SeriesIndexFileHandle {
-    pub(crate) fn new(file_id: RegionFileId, purger: IndexFilePurger) -> Self {
+    pub(crate) fn new(
+        region_id: RegionId,
+        entry: SeriesIndexEntry,
+        purger: IndexFilePurger,
+    ) -> Self {
         Self {
             inner: Arc::new(SeriesIndexFileHandleInner {
-                file_id,
+                file_id: RegionFileId::new(region_id, entry.index_uuid),
+                entry,
                 deleted: AtomicBool::new(false),
                 purger,
             }),
         }
     }
 
-    pub(crate) fn identity(&self) -> RegionFileId {
-        self.inner.file_id
+    pub(crate) fn entry(&self) -> &SeriesIndexEntry {
+        &self.inner.entry
     }
 
     pub(crate) fn mark_deleted(&self) {
@@ -61,6 +67,7 @@ impl SeriesIndexFileHandle {
 
 struct SeriesIndexFileHandleInner {
     file_id: RegionFileId,
+    entry: SeriesIndexEntry,
     deleted: AtomicBool,
     purger: IndexFilePurger,
 }
@@ -108,37 +115,5 @@ impl SeriesIndexVersionControl {
     pub(crate) fn mark_dropped(&self) {
         self.publish(Arc::new(SeriesIndexVersion::default()))
             .mark_all_deleted();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use object_store::ObjectStore;
-    use object_store::services::Memory;
-    use store_api::storage::RegionId;
-
-    use super::super::catalog::series_index_path;
-    use super::super::purger::{purge_file, series_index_channel};
-    use super::*;
-
-    #[tokio::test]
-    async fn test_snapshot_pins_retired_series_index() {
-        let store = ObjectStore::new(Memory::default()).unwrap().finish();
-        let id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
-        let path = series_index_path(id.region_id(), id.file_id());
-        store.write(&path, "index").await.unwrap();
-        let (purger, mut receiver) = series_index_channel(store.clone());
-        let control = SeriesIndexVersionControl::default();
-        control.publish(Arc::new(SeriesIndexVersion {
-            series_indexes: HashMap::from([(id.file_id(), SeriesIndexFileHandle::new(id, purger))]),
-            ..Default::default()
-        }));
-        let held = control.current();
-        control.mark_dropped();
-        assert!(receiver.try_recv().is_err());
-        assert!(store.exists(&path).await.unwrap());
-        drop(held);
-        assert!(purge_file(&store, receiver.try_recv().unwrap()).await);
-        assert!(!store.exists(&path).await.unwrap());
     }
 }

@@ -28,12 +28,11 @@ use tokio::sync::{Notify, mpsc};
 use super::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
 use super::builder::{build_range_index, build_series_index};
 use super::catalog::{
-    RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, load_catalog, load_range_indexes,
-    load_series_indexes, range_catalog_path, same_series_coverage, series_catalog_path,
-    store_catalog,
+    RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, range_catalog_path,
+    same_series_coverage, series_catalog_path, store_catalog,
 };
 use super::purger::{IndexFilePurger, PurgeRequest, purge_file};
-use super::version::{SeriesIndexFileHandle, SeriesIndexVersion};
+use super::version::SeriesIndexVersion;
 use crate::error::Result;
 use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTAL};
 use crate::read::series_candidate::is_sparse_metric_metadata;
@@ -77,25 +76,17 @@ impl SeriesIndexTaskState {
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileStats {
     pub(crate) source_files: usize,
-    pub(crate) loaded_range: usize,
-    pub(crate) loaded_series: usize,
     pub(crate) built_range: usize,
     pub(crate) built_series: usize,
     pub(crate) removed_range: usize,
     pub(crate) removed_series: usize,
-    pub(crate) repaired_catalogs: usize,
     pub(crate) computed_buckets: usize,
     pub(crate) skipped_buckets: usize,
 }
 
 impl ReconcileStats {
     fn changed(&self) -> bool {
-        self.built_range
-            + self.built_series
-            + self.removed_range
-            + self.removed_series
-            + self.repaired_catalogs
-            > 0
+        self.built_range + self.built_series + self.removed_range + self.removed_series > 0
     }
 }
 
@@ -148,37 +139,9 @@ pub(crate) async fn reconcile_series_indexes(
         .map(|file| file.file_id().file_id())
         .collect::<HashSet<_>>();
     let current = region.series_index_version();
-    let known = current
-        .series_indexes
-        .values()
-        .map(|handle| (handle.identity(), handle.clone()))
-        .collect::<HashMap<_, _>>();
-    let load_start = Instant::now();
-    let (range_catalog, repair_range_catalog) =
-        load_catalog::<RangeIndexCatalog>(&store, &range_catalog_path(region.region_id)).await?;
-    let (series_catalog, repair_series_catalog) =
-        load_catalog::<SeriesIndexCatalog>(&store, &series_catalog_path(region.region_id)).await?;
-    stats.repaired_catalogs =
-        usize::from(repair_range_catalog) + usize::from(repair_series_catalog);
-    let mut range_indexes = load_range_indexes(
-        &store,
-        region.region_id,
-        range_catalog,
-        &visible,
-        &mut stats,
-    )
-    .await?;
-    let mut retired_handles = Vec::new();
-    let mut loaded_series = load_series_indexes(
-        series_catalog,
-        region.region_id,
-        &purger,
-        &known,
-        &mut stats,
-    );
-    SERIES_INDEX_RECONCILE_ELAPSED
-        .with_label_values(&["load"])
-        .observe(load_start.elapsed().as_secs_f64());
+    let mut range_indexes = current.range_indexes.clone();
+    range_indexes.retain(|file_id| visible.contains(file_id));
+    stats.removed_range = current.range_indexes.len() - range_indexes.len();
     let buckets = match version.compaction_time_window {
         Some(window) => rounded_bucket_width(requested_bucket_width, window)
             .map(|width| plan_series_buckets(&files, width))
@@ -194,7 +157,6 @@ pub(crate) async fn reconcile_series_indexes(
     stats.computed_buckets = buckets.len();
     let build_start = Instant::now();
     let mut series_indexes = HashMap::new();
-    let mut series_entries = Vec::new();
     let mut newly_built = Vec::new();
     for bucket in buckets {
         let Some(mut expected) = series_entry(&bucket) else {
@@ -211,18 +173,13 @@ pub(crate) async fn reconcile_series_indexes(
             stats.skipped_buckets += 1;
             continue;
         }
-        if let Some(position) = loaded_series
-            .iter()
-            .position(|(entry, _)| same_series_coverage(entry, &expected))
+        if let Some(handle) = current
+            .series_indexes
+            .values()
+            .find(|handle| same_series_coverage(handle.entry(), &expected))
         {
-            let (entry, handle) = loaded_series.swap_remove(position);
-            if !complete_bucket_expired(&entry, version.options.ttl, now_ms) {
-                series_entries.push(entry.clone());
-                series_indexes.insert(entry.index_uuid, handle);
-                continue;
-            }
-            retired_handles.push(handle);
-            stats.removed_series += 1;
+            series_indexes.insert(handle.entry().index_uuid, handle.clone());
+            continue;
         }
         let missing_range_ids = bucket
             .files
@@ -244,7 +201,6 @@ pub(crate) async fn reconcile_series_indexes(
         stats.built_series += 1;
         stats.built_range += built_ranges.len();
         range_indexes.extend(built_ranges);
-        series_entries.push(expected.clone());
         newly_built.push(series_handle.clone());
         series_indexes.insert(expected.index_uuid, series_handle);
     }
@@ -261,8 +217,11 @@ pub(crate) async fn reconcile_series_indexes(
     SERIES_INDEX_RECONCILE_ELAPSED
         .with_label_values(&["build"])
         .observe(build_start.elapsed().as_secs_f64());
-    stats.removed_series += loaded_series.len();
-    retired_handles.extend(loaded_series.into_iter().map(|(_, handle)| handle));
+    stats.removed_series = current
+        .series_indexes
+        .keys()
+        .filter(|id| !series_indexes.contains_key(id))
+        .count();
     let next = Arc::new(SeriesIndexVersion {
         range_indexes,
         series_indexes,
@@ -283,6 +242,11 @@ pub(crate) async fn reconcile_series_indexes(
     if stats.changed() {
         let mut range_entries = next.range_indexes.iter().copied().collect::<Vec<_>>();
         range_entries.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        let mut series_entries = next
+            .series_indexes
+            .values()
+            .map(|handle| handle.entry().clone())
+            .collect::<Vec<_>>();
         series_entries.sort_unstable_by_key(|entry| {
             (
                 entry.bucket_start,
@@ -319,18 +283,10 @@ pub(crate) async fn reconcile_series_indexes(
         return Ok(stats);
     }
     let previous = region.series_index_version_control.publish(next.clone());
-    let current_identities = next
-        .series_indexes
-        .values()
-        .map(SeriesIndexFileHandle::identity)
-        .collect::<HashSet<_>>();
-    for handle in previous.series_indexes.values() {
-        if !current_identities.contains(&handle.identity()) {
+    for (id, handle) in &previous.series_indexes {
+        if !next.series_indexes.contains_key(id) {
             handle.mark_deleted();
         }
-    }
-    for handle in retired_handles {
-        handle.mark_deleted();
     }
     let result = if stats.changed() { "changed" } else { "noop" };
     SERIES_INDEX_RECONCILE_TOTAL

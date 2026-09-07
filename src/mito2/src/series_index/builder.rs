@@ -35,7 +35,7 @@ use crate::read::prune::FlatPruneReader;
 use crate::read::read_columns::ReadColumns;
 use crate::region::MitoRegionRef;
 use crate::region::version::VersionRef;
-use crate::sst::file::{FileHandle, RegionFileId};
+use crate::sst::file::FileHandle;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::range_index::{SstRangeIndexWriter, SstRangeIndexWriterOptions};
@@ -198,10 +198,7 @@ pub(crate) async fn build_series_index(
         .fail();
     }
     Ok((
-        SeriesIndexFileHandle::new(
-            RegionFileId::new(region.region_id, entry.index_uuid),
-            purger.clone(),
-        ),
+        SeriesIndexFileHandle::new(region.region_id, entry.clone(), purger.clone()),
         range_indexes,
     ))
 }

@@ -61,6 +61,7 @@ use crate::memtable::bulk::part::BulkPart;
 use crate::memtable::time_partition::{TimePartitions, TimePartitionsRef};
 use crate::memtable::{MemtableBuilderProvider, ensure_json2_not_use_time_series_memtable};
 use crate::metrics::{CACHE_FILL_DOWNLOADED_FILES, CACHE_FILL_PENDING_FILES};
+use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::options::RegionOptions;
 use crate::region::version::{VersionBuilder, VersionControl, VersionControlRef};
 use crate::region::{
@@ -70,6 +71,7 @@ use crate::region::{
 use crate::region_write_ctx::RegionWriteCtx;
 use crate::request::OptionOutputTx;
 use crate::schedule::scheduler::SchedulerRef;
+use crate::series_index::{IndexFilePurger, load_version_control};
 use crate::sst::FormatType;
 use crate::sst::file::{FileHandle, RegionFileId, RegionIndexId};
 use crate::sst::file_purger::{FilePurgerRef, create_file_purger};
@@ -165,6 +167,7 @@ pub(crate) struct RegionOpener {
     partition_expr_fetcher: PartitionExprFetcherRef,
     hook: Option<RegionHookRef>,
     series_index_store: Option<ObjectStore>,
+    series_index_purger: Option<IndexFilePurger>,
 }
 
 impl RegionOpener {
@@ -205,12 +208,19 @@ impl RegionOpener {
             partition_expr_fetcher,
             hook: None,
             series_index_store: None,
+            series_index_purger: None,
         }
     }
 
     /// Sets the store for companion range indexes.
     pub(crate) fn series_index_store(mut self, store: Option<ObjectStore>) -> Self {
         self.series_index_store = store;
+        self
+    }
+
+    /// Sets the purger shared with the worker's series-index maintenance task.
+    pub(crate) fn series_index_purger(mut self, purger: Option<IndexFilePurger>) -> Self {
+        self.series_index_purger = purger;
         self
     }
 
@@ -659,10 +669,20 @@ impl RegionOpener {
 
         let now = self.time_provider.current_time_millis();
 
+        let series_index_version_control =
+            match (&self.series_index_store, &self.series_index_purger) {
+                (Some(store), Some(purger))
+                    if is_sparse_metric_metadata(&version_control.current().version.metadata) =>
+                {
+                    load_version_control(store, self.region_id, purger).await
+                }
+                _ => Default::default(),
+            };
+
         let region = MitoRegion {
             region_id: self.region_id,
             version_control: version_control.clone(),
-            series_index_version_control: Default::default(),
+            series_index_version_control,
             access_layer: access_layer.clone(),
             // Region is always opened in read only mode.
             manifest_ctx: Arc::new(ManifestContext::new(

@@ -14,8 +14,6 @@
 
 //! Index catalog persistence, coverage metadata, and file paths.
 
-use std::collections::{HashMap, HashSet};
-
 use common_telemetry::warn;
 use common_time::Timestamp;
 use object_store::{ErrorKind, ObjectStore};
@@ -25,11 +23,9 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use store_api::storage::{FileId, RegionId};
 
-use super::maintenance::ReconcileStats;
-use super::purger::{IndexFilePurger, IndexFileType, file_operation};
-use super::version::SeriesIndexFileHandle;
+use super::purger::IndexFilePurger;
+use super::version::{SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl};
 use crate::error::{OpenDalSnafu, Result, SerdeJsonSnafu};
-use crate::sst::file::RegionFileId;
 pub(crate) use crate::sst::range_index::range_index_path;
 const SERIES_DIR: &str = "series";
 const RANGE_CATALOG: &str = "range-index.json";
@@ -86,20 +82,23 @@ pub(crate) fn series_metadata(entry: &SeriesIndexEntry) -> Result<Vec<KeyValue>>
     )])
 }
 
-pub(crate) async fn load_catalog<T>(store: &ObjectStore, path: &str) -> Result<(T, bool)>
+pub(crate) async fn load_catalog<T>(store: &ObjectStore, path: &str) -> T
 where
     T: Default + DeserializeOwned,
 {
     let bytes = match store.read(path).await {
         Ok(bytes) => bytes.to_bytes(),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((T::default(), true)),
-        Err(error) => return Err(error).context(OpenDalSnafu),
+        Err(error) if error.kind() == ErrorKind::NotFound => return T::default(),
+        Err(error) => {
+            warn!(error; "Failed to load series-index catalog, path: {path}");
+            return T::default();
+        }
     };
     match serde_json::from_slice(&bytes) {
-        Ok(catalog) => Ok((catalog, false)),
+        Ok(catalog) => catalog,
         Err(error) => {
-            warn!(error; "Invalid series-index catalog, path: {path}, phase: load, retry: true");
-            Ok((T::default(), true))
+            warn!(error; "Invalid series-index catalog, path: {path}, phase: load");
+            T::default()
         }
     }
 }
@@ -116,49 +115,29 @@ where
         .context(OpenDalSnafu)
 }
 
-/// Catalog entries can outlive range files deleted on final SST handle release.
-pub(crate) async fn load_range_indexes(
+/// Restores the in-memory snapshot once when opening a region.
+pub(crate) async fn load_version_control(
     store: &ObjectStore,
     region_id: RegionId,
-    catalog: RangeIndexCatalog,
-    visible: &HashSet<FileId>,
-    stats: &mut ReconcileStats,
-) -> Result<HashSet<FileId>> {
-    let mut indexes = HashSet::new();
-    for file_id in catalog.indexes {
-        if visible.contains(&file_id)
-            && store
-                .exists(&range_index_path(region_id, file_id))
-                .await
-                .context(OpenDalSnafu)?
-        {
-            stats.loaded_range += 1;
-            file_operation(IndexFileType::Range, "load", "success");
-            indexes.insert(file_id);
-        } else {
-            stats.removed_range += 1;
-        }
-    }
-    Ok(indexes)
-}
-
-pub(crate) fn load_series_indexes(
-    catalog: SeriesIndexCatalog,
-    region_id: RegionId,
     purger: &IndexFilePurger,
-    known: &HashMap<RegionFileId, SeriesIndexFileHandle>,
-    stats: &mut ReconcileStats,
-) -> Vec<(SeriesIndexEntry, SeriesIndexFileHandle)> {
-    let mut indexes = Vec::new();
-    for entry in catalog.indexes {
-        let region_file_id = RegionFileId::new(region_id, entry.index_uuid);
-        let handle = known
-            .get(&region_file_id)
-            .cloned()
-            .unwrap_or_else(|| SeriesIndexFileHandle::new(region_file_id, purger.clone()));
-        stats.loaded_series += 1;
-        file_operation(IndexFileType::Series, "load", "success");
-        indexes.push((entry, handle));
-    }
-    indexes
+) -> SeriesIndexVersionControl {
+    let range = load_catalog::<RangeIndexCatalog>(store, &range_catalog_path(region_id)).await;
+    let series = load_catalog::<SeriesIndexCatalog>(store, &series_catalog_path(region_id)).await;
+    // TODO: Handle catalog entries whose index files are missing from storage.
+    let version = SeriesIndexVersion {
+        range_indexes: range.indexes.into_iter().collect(),
+        series_indexes: series
+            .indexes
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.index_uuid,
+                    SeriesIndexFileHandle::new(region_id, entry, purger.clone()),
+                )
+            })
+            .collect(),
+    };
+    let control = SeriesIndexVersionControl::default();
+    control.publish(std::sync::Arc::new(version));
+    control
 }

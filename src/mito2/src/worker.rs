@@ -79,7 +79,9 @@ use crate::request::{
     SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
-use crate::series_index::{SeriesIndexTaskState, run_series_index_task, series_index_channel};
+use crate::series_index::{
+    IndexFilePurger, SeriesIndexTaskState, run_series_index_task, series_index_channel,
+};
 use crate::sst::file::RegionFileId;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::IndexBuildScheduler;
@@ -594,12 +596,14 @@ impl<S: LogStore> WorkerStarter<S> {
             .series_index_store
             .as_ref()
             .map(|_| Arc::new(SeriesIndexTaskState::new()));
+        let mut series_index_purger = None;
         let series_index_handle = self
             .series_index_store
             .clone()
             .zip(series_index_task_state.clone())
             .map(|(store, state)| {
                 let (purger, purge_receiver) = series_index_channel(store.clone());
+                series_index_purger = Some(purger.clone());
                 common_runtime::spawn_global(run_series_index_task(
                     self.id,
                     store,
@@ -637,6 +641,7 @@ impl<S: LogStore> WorkerStarter<S> {
             ),
             series_index_task_state: series_index_task_state.clone(),
             series_index_store: self.series_index_store,
+            series_index_purger,
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -938,6 +943,7 @@ struct RegionWorkerLoop<S> {
     series_index_task_state: Option<Arc<SeriesIndexTaskState>>,
     /// Store for companion range indexes deleted by the region SST purger.
     series_index_store: Option<ObjectStore>,
+    series_index_purger: Option<IndexFilePurger>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
