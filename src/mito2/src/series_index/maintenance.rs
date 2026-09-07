@@ -76,16 +76,16 @@ impl SeriesIndexTaskState {
 
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileStats {
-    pub(super) source_files: usize,
-    pub(super) loaded_range: usize,
-    pub(super) loaded_series: usize,
-    pub(super) built_range: usize,
-    pub(super) built_series: usize,
-    pub(super) removed_range: usize,
-    pub(super) removed_series: usize,
-    pub(super) repaired_catalogs: usize,
-    pub(super) computed_buckets: usize,
-    pub(super) skipped_buckets: usize,
+    pub(crate) source_files: usize,
+    pub(crate) loaded_range: usize,
+    pub(crate) loaded_series: usize,
+    pub(crate) built_range: usize,
+    pub(crate) built_series: usize,
+    pub(crate) removed_range: usize,
+    pub(crate) removed_series: usize,
+    pub(crate) repaired_catalogs: usize,
+    pub(crate) computed_buckets: usize,
+    pub(crate) skipped_buckets: usize,
 }
 
 impl ReconcileStats {
@@ -160,7 +160,14 @@ pub(crate) async fn reconcile_series_indexes(
         load_catalog::<SeriesIndexCatalog>(&store, &series_catalog_path(region.region_id)).await?;
     stats.repaired_catalogs =
         usize::from(repair_range_catalog) + usize::from(repair_series_catalog);
-    let mut range_indexes = load_range_indexes(range_catalog, &visible, &mut stats);
+    let mut range_indexes = load_range_indexes(
+        &store,
+        region.region_id,
+        range_catalog,
+        &visible,
+        &mut stats,
+    )
+    .await?;
     let mut retired_handles = Vec::new();
     let mut loaded_series = load_series_indexes(
         series_catalog,
@@ -367,10 +374,7 @@ pub(crate) async fn run_series_index_task(
             _ = tokio::time::sleep(interval) => {}
             _ = state.notified() => {}
             Some(request) = purge_receiver.recv() => {
-                if !purge_file(&store, PurgeRequest {
-                    index_type: request.index_type,
-                    file_id: request.file_id,
-                }).await {
+                if !purge_file(&store, request).await {
                     retry_purges.push(request);
                 }
                 continue;
@@ -380,15 +384,7 @@ pub(crate) async fn run_series_index_task(
             break;
         }
         for request in std::mem::take(&mut retry_purges) {
-            if !purge_file(
-                &store,
-                PurgeRequest {
-                    index_type: request.index_type,
-                    file_id: request.file_id,
-                },
-            )
-            .await
-            {
+            if !purge_file(&store, request).await {
                 retry_purges.push(request);
             }
         }

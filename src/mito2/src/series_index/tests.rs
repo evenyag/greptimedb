@@ -186,6 +186,26 @@ async fn test_reconcile_reuses_coverage_rejects_stale_publication_and_expires_se
             .contains_key(&first_id)
     );
 
+    // A range file removed on close must be rebuilt even when its catalog entry survives.
+    let range_path = range_index_path(
+        region.region_id,
+        *first.range_indexes.iter().next().unwrap(),
+    );
+    store.delete(&range_path).await.unwrap();
+    let stats = reconcile_series_indexes(
+        0,
+        store.clone(),
+        regions.clone(),
+        region.clone(),
+        Duration::from_secs(100),
+        0,
+        purger.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((1, 0), (stats.built_range, stats.built_series));
+    assert!(store.exists(&range_path).await.unwrap());
+
     // A stale region map forces rejection after building different bucket coverage.
     let before_stale = region.series_index_version();
     reconcile_series_indexes(

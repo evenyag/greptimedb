@@ -29,9 +29,7 @@ mod writer;
 
 use futures::stream::BoxStream;
 pub(crate) use maintenance::{SeriesIndexTaskState, run_series_index_task};
-#[cfg(test)]
-pub(crate) use purger::purge_file as purge_index_file_for_test;
-pub(crate) use purger::{IndexFilePurger, series_index_channel};
+pub(crate) use purger::series_index_channel;
 pub use searcher::SeriesIndexSearcher;
 use store_api::metric_engine_consts::{
     DATA_SCHEMA_TABLE_ID_COLUMN_NAME as TABLE_ID_COLUMN,

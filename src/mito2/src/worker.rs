@@ -79,9 +79,7 @@ use crate::request::{
     SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
-use crate::series_index::{
-    IndexFilePurger, SeriesIndexTaskState, run_series_index_task, series_index_channel,
-};
+use crate::series_index::{SeriesIndexTaskState, run_series_index_task, series_index_channel};
 use crate::sst::file::RegionFileId;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::IndexBuildScheduler;
@@ -596,14 +594,12 @@ impl<S: LogStore> WorkerStarter<S> {
             .series_index_store
             .as_ref()
             .map(|_| Arc::new(SeriesIndexTaskState::new()));
-        let mut series_index_purger = None;
         let series_index_handle = self
             .series_index_store
             .clone()
             .zip(series_index_task_state.clone())
             .map(|(store, state)| {
                 let (purger, purge_receiver) = series_index_channel(store.clone());
-                series_index_purger = Some(purger.clone());
                 common_runtime::spawn_global(run_series_index_task(
                     self.id,
                     store,
@@ -636,11 +632,11 @@ impl<S: LogStore> WorkerStarter<S> {
             purge_scheduler: self.purge_scheduler.clone(),
             write_buffer_manager: self.write_buffer_manager,
             index_build_scheduler: IndexBuildScheduler::new(
-                self.index_build_job_pool.clone(),
+                self.index_build_job_pool,
                 self.config.max_background_index_builds,
             ),
             series_index_task_state: series_index_task_state.clone(),
-            series_index_purger,
+            series_index_store: self.series_index_store,
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -940,8 +936,8 @@ struct RegionWorkerLoop<S> {
     index_build_scheduler: IndexBuildScheduler,
     /// Controls the worker-owned series-index task.
     series_index_task_state: Option<Arc<SeriesIndexTaskState>>,
-    /// Couples range-index deletion to the region SST purger.
-    series_index_purger: Option<IndexFilePurger>,
+    /// Store for companion range indexes deleted by the region SST purger.
+    series_index_store: Option<ObjectStore>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.

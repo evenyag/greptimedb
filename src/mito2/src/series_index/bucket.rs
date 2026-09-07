@@ -23,14 +23,14 @@ use super::catalog::SeriesIndexEntry;
 use crate::sst::file::FileHandle;
 
 #[derive(Debug, Clone)]
-pub(super) struct SeriesBucket {
-    pub(super) start: Timestamp,
-    pub(super) end: Timestamp,
-    pub(super) files: Vec<FileHandle>,
-    pub(super) has_unknown_sequence: bool,
+pub(crate) struct SeriesBucket {
+    pub(crate) start: Timestamp,
+    pub(crate) end: Timestamp,
+    pub(crate) files: Vec<FileHandle>,
+    pub(crate) has_unknown_sequence: bool,
 }
 
-pub(super) fn rounded_bucket_width(
+pub(crate) fn rounded_bucket_width(
     requested: Duration,
     compaction_window: Duration,
 ) -> Option<i64> {
@@ -42,7 +42,7 @@ pub(super) fn rounded_bucket_width(
     multiples.checked_mul(window_secs)
 }
 
-pub(super) fn plan_series_buckets(files: &[FileHandle], width_secs: i64) -> Vec<SeriesBucket> {
+pub(crate) fn plan_series_buckets(files: &[FileHandle], width_secs: i64) -> Vec<SeriesBucket> {
     let mut spans = files
         .iter()
         .map(|file| {
@@ -78,7 +78,7 @@ pub(super) fn plan_series_buckets(files: &[FileHandle], width_secs: i64) -> Vec<
     buckets
 }
 
-pub(super) fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
+pub(crate) fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
     if bucket.has_unknown_sequence || bucket.files.len() < 2 {
         return None;
     }

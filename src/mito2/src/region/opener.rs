@@ -70,7 +70,6 @@ use crate::region::{
 use crate::region_write_ctx::RegionWriteCtx;
 use crate::request::OptionOutputTx;
 use crate::schedule::scheduler::SchedulerRef;
-use crate::series_index::IndexFilePurger;
 use crate::sst::FormatType;
 use crate::sst::file::{FileHandle, RegionFileId, RegionIndexId};
 use crate::sst::file_purger::{FilePurgerRef, create_file_purger};
@@ -80,6 +79,7 @@ use crate::sst::index::puffin_manager::PuffinManagerFactory;
 use crate::sst::location::{self, region_dir_from_table_dir};
 use crate::sst::parquet::metadata::{MetadataLoader, extract_primary_key_range};
 use crate::sst::parquet::reader::MetadataCacheMetrics;
+use crate::sst::range_index::RangeIndexDeleter;
 use crate::time_provider::TimeProviderRef;
 use crate::wal::entry_reader::WalEntryReader;
 use crate::wal::{EntryId, Wal};
@@ -143,18 +143,6 @@ pub trait PartitionExprFetcher {
 
 pub type PartitionExprFetcherRef = Arc<dyn PartitionExprFetcher + Send + Sync>;
 
-/// Adds range-index cleanup when series-index maintenance is enabled.
-fn wrap_series_index_purger(
-    purger: Option<&IndexFilePurger>,
-    region_id: RegionId,
-    file_purger: FilePurgerRef,
-) -> FilePurgerRef {
-    match purger {
-        Some(purger) => purger.wrap_sst_purger(region_id, file_purger),
-        None => file_purger,
-    }
-}
-
 /// Builder to create a new [MitoRegion] or open an existing one.
 pub(crate) struct RegionOpener {
     region_id: RegionId,
@@ -176,7 +164,7 @@ pub(crate) struct RegionOpener {
     file_ref_manager: FileReferenceManagerRef,
     partition_expr_fetcher: PartitionExprFetcherRef,
     hook: Option<RegionHookRef>,
-    series_index_purger: Option<IndexFilePurger>,
+    series_index_store: Option<ObjectStore>,
 }
 
 impl RegionOpener {
@@ -216,13 +204,13 @@ impl RegionOpener {
             file_ref_manager,
             partition_expr_fetcher,
             hook: None,
-            series_index_purger: None,
+            series_index_store: None,
         }
     }
 
-    /// Sets the purger for companion range indexes.
-    pub(crate) fn series_index_purger(mut self, purger: Option<IndexFilePurger>) -> Self {
-        self.series_index_purger = purger;
+    /// Sets the store for companion range indexes.
+    pub(crate) fn series_index_store(mut self, store: Option<ObjectStore>) -> Self {
+        self.series_index_store = store;
         self
     }
 
@@ -446,17 +434,15 @@ impl RegionOpener {
                 RegionRoleState::Leader(RegionLeaderState::Writable),
                 self.hook.clone(),
             )),
-            file_purger: wrap_series_index_purger(
-                self.series_index_purger.as_ref(),
-                region_id,
-                create_file_purger(
-                    config.gc.enable,
-                    self.path_type,
-                    self.purge_scheduler,
-                    access_layer,
-                    self.cache_manager,
-                    self.file_ref_manager.clone(),
-                ),
+            file_purger: create_file_purger(
+                config.gc.enable,
+                self.path_type,
+                self.purge_scheduler,
+                access_layer,
+                self.cache_manager,
+                self.file_ref_manager.clone(),
+                self.series_index_store
+                    .map(|store| RangeIndexDeleter::new(store, region_id)),
             ),
             provider,
             last_flush_millis: AtomicI64::new(now),
@@ -565,17 +551,16 @@ impl RegionOpener {
             self.puffin_manager_factory.clone(),
             self.intermediate_manager.clone(),
         ));
-        let file_purger = wrap_series_index_purger(
-            self.series_index_purger.as_ref(),
-            region_id,
-            create_file_purger(
-                config.gc.enable,
-                self.path_type,
-                self.purge_scheduler.clone(),
-                access_layer.clone(),
-                self.cache_manager.clone(),
-                self.file_ref_manager.clone(),
-            ),
+        let file_purger = create_file_purger(
+            config.gc.enable,
+            self.path_type,
+            self.purge_scheduler.clone(),
+            access_layer.clone(),
+            self.cache_manager.clone(),
+            self.file_ref_manager.clone(),
+            self.series_index_store
+                .clone()
+                .map(|store| RangeIndexDeleter::new(store, region_id)),
         );
         // We should sanitize the region options before creating a new memtable.
         let memtable_builder = self

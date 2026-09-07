@@ -40,7 +40,7 @@ use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::range_index::{SstRangeIndexWriter, SstRangeIndexWriterOptions};
 
-pub(super) async fn reader_input(
+async fn reader_input(
     region: &MitoRegionRef,
     file: FileHandle,
 ) -> Result<
@@ -58,7 +58,7 @@ pub(super) async fn reader_input(
         .map(|(context, selection)| (Arc::new(context), selection)))
 }
 
-pub(super) async fn build_range_index(
+pub(crate) async fn build_range_index(
     store: &ObjectStore,
     region: &MitoRegionRef,
     version: &VersionRef,
@@ -97,7 +97,7 @@ pub(super) async fn build_range_index(
     Ok(Some(file_id))
 }
 
-pub(super) async fn build_series_index(
+pub(crate) async fn build_series_index(
     store: &ObjectStore,
     region: &MitoRegionRef,
     version: &VersionRef,

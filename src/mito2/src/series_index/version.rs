@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 
 use store_api::storage::FileId;
 
-use super::purger::{IndexFilePurger, IndexFileType, PurgeRequest};
+use super::purger::{IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
 
 /// A reference-counted series-index file with deferred deletion semantics.
@@ -40,7 +40,7 @@ impl Debug for SeriesIndexFileHandle {
 }
 
 impl SeriesIndexFileHandle {
-    pub(super) fn new(file_id: RegionFileId, purger: IndexFilePurger) -> Self {
+    pub(crate) fn new(file_id: RegionFileId, purger: IndexFilePurger) -> Self {
         Self {
             inner: Arc::new(SeriesIndexFileHandleInner {
                 file_id,
@@ -50,7 +50,7 @@ impl SeriesIndexFileHandle {
         }
     }
 
-    pub(super) fn identity(&self) -> RegionFileId {
+    pub(crate) fn identity(&self) -> RegionFileId {
         self.inner.file_id
     }
 
@@ -69,7 +69,6 @@ impl Drop for SeriesIndexFileHandleInner {
     fn drop(&mut self) {
         if self.deleted.load(Ordering::Acquire) {
             self.purger.purge(PurgeRequest {
-                index_type: IndexFileType::Series,
                 file_id: self.file_id,
             });
         }
@@ -102,7 +101,7 @@ impl SeriesIndexVersionControl {
         self.current.read().unwrap().clone()
     }
 
-    pub(super) fn publish(&self, next: Arc<SeriesIndexVersion>) -> Arc<SeriesIndexVersion> {
+    pub(crate) fn publish(&self, next: Arc<SeriesIndexVersion>) -> Arc<SeriesIndexVersion> {
         std::mem::replace(&mut *self.current.write().unwrap(), next)
     }
 
