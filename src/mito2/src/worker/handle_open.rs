@@ -196,6 +196,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         )
         .skip_wal_replay(request.skip_wal_replay)
         .cache(Some(self.cache_manager.clone()))
+        .series_index_purger(self.series_index_purger.clone())
         .hook(self.plugins.get())
         .wal_entry_reader(wal_entry_receiver.map(|receiver| Box::new(receiver) as _))
         .replay_checkpoint(request.checkpoint.map(|checkpoint| checkpoint.entry_id))
@@ -225,7 +226,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         let opening_regions = self.opening_regions.clone();
         let region_count = self.region_count.clone();
         let worker_id = self.id;
-        let local_index_task_state = self.local_index_task_state.clone();
+        let series_index_task_state = self.series_index_task_state.clone();
         opening_regions.insert_sender(region_id, sender);
         common_runtime::spawn_global(async move {
             match opener.open(&config, &wal).await {
@@ -248,7 +249,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
                     // Insert the Region into the RegionMap.
                     regions.insert_region(region);
-                    if let Some(state) = &local_index_task_state {
+                    if let Some(state) = &series_index_task_state {
                         state.wake();
                     }
 

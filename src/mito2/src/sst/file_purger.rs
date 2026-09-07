@@ -225,8 +225,11 @@ mod tests {
     use crate::sst::index::puffin_manager::PuffinManagerFactory;
     use crate::sst::location;
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn test_file_purge() {
+    async fn test_file_purge(#[case] gc_enabled: bool) {
         common_telemetry::init_default_ut_logging();
 
         let dir = create_temp_dir("file-purge");
@@ -257,7 +260,23 @@ mod tests {
 
         let scheduler = Arc::new(LocalScheduler::new(3));
 
-        let file_purger = Arc::new(LocalFilePurger::new(scheduler.clone(), layer, None));
+        let file_purger = create_file_purger(
+            gc_enabled,
+            PathType::Bare,
+            scheduler.clone(),
+            layer,
+            None,
+            Arc::new(crate::sst::file_ref::FileReferenceManager::new(None)),
+        );
+        let index_store = ObjectStore::new(object_store::services::Memory::default())
+            .unwrap()
+            .finish();
+        let (index_purger, mut receiver) =
+            crate::series_index::series_index_channel(index_store.clone());
+        let owner = RegionId::new(9, 1);
+        let index_path = format!("{}/range/{}.parquet", owner.as_u64(), sst_file_id.file_id());
+        index_store.write(&index_path, "range index").await.unwrap();
+        let file_purger = index_purger.wrap_sst_purger(owner, file_purger);
 
         {
             let handle = FileHandle::new(
@@ -281,13 +300,27 @@ mod tests {
                 },
                 file_purger,
             );
-            // mark file as deleted and drop the handle, we expect the file is deleted.
+            // Normal close must keep the range index, including for imported SSTs.
+            let meta = handle.meta_ref().clone();
+            let purger = handle.file_purger();
+            drop(handle);
+            assert!(receiver.try_recv().is_err());
+            assert!(index_store.exists(&index_path).await.unwrap());
+            let handle = FileHandle::new(meta, purger);
+            let reader = handle.clone();
             handle.mark_deleted();
+            drop(handle);
+            assert!(receiver.try_recv().is_err());
+            drop(reader);
         }
 
         scheduler.stop(true).await.unwrap();
 
-        assert!(!object_store.exists(&path).await.unwrap());
+        assert_eq!(gc_enabled, object_store.exists(&path).await.unwrap());
+        // The worker consumes this same queue in production, including retry handling.
+        let request = receiver.try_recv().unwrap();
+        assert!(crate::series_index::purge_index_file_for_test(&index_store, request).await);
+        assert!(!index_store.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]

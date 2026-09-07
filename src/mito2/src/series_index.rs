@@ -12,17 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Series index writer and searcher.
+//! Series index construction, search, and maintenance.
+//!
+//! Under development. Index files are currently stored on the local filesystem.
 
+mod bucket;
+mod builder;
+mod catalog;
+mod maintenance;
+mod purger;
 mod searcher;
+#[cfg(test)]
+mod tests;
+mod version;
 mod writer;
 
 use futures::stream::BoxStream;
+pub(crate) use maintenance::{SeriesIndexTaskState, run_series_index_task};
+#[cfg(test)]
+pub(crate) use purger::purge_file as purge_index_file_for_test;
+pub(crate) use purger::{IndexFilePurger, series_index_channel};
 pub use searcher::SeriesIndexSearcher;
 use store_api::metric_engine_consts::{
     DATA_SCHEMA_TABLE_ID_COLUMN_NAME as TABLE_ID_COLUMN,
     DATA_SCHEMA_TSID_COLUMN_NAME as TSID_COLUMN,
 };
+pub(crate) use version::{SeriesIndexVersion, SeriesIndexVersionControl};
 pub use writer::{
     SeriesIndexWriter, SeriesIndexWriterMetrics, SeriesIndexWriterOptions, series_index_schema,
 };

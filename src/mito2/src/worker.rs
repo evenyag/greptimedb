@@ -67,7 +67,6 @@ use crate::config::MitoConfig;
 use crate::error::{self, CreateDirSnafu, JoinSnafu, Result, WorkerStoppedSnafu};
 use crate::flush::{FlushScheduler, WriteBufferManagerImpl, WriteBufferManagerRef};
 use crate::gc::{GcLimiter, GcLimiterRef};
-use crate::local_index::{LocalIndexTaskState, local_index_channel, run_local_index_task};
 use crate::memtable::MemtableBuilderProvider;
 use crate::metrics::{REGION_COUNT, REQUEST_WAIT_TIME, WRITE_STALLING};
 use crate::region::opener::PartitionExprFetcherRef;
@@ -80,6 +79,9 @@ use crate::request::{
     SenderDdlRequest, SenderWriteRequest, WorkerRequest, WorkerRequestWithTime,
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
+use crate::series_index::{
+    IndexFilePurger, SeriesIndexTaskState, run_series_index_task, series_index_channel,
+};
 use crate::sst::file::RegionFileId;
 use crate::sst::file_ref::FileReferenceManagerRef;
 use crate::sst::index::IndexBuildScheduler;
@@ -193,10 +195,10 @@ impl WorkerGroup {
             .with_buffer_size(Some(config.index.write_buffer_size.as_bytes() as _));
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
-        let local_index_store = if config.experimental_local_index_root.trim().is_empty() {
+        let series_index_store = if config.experimental_series_index_root.trim().is_empty() {
             None
         } else {
-            Some(new_fs_cache_store(&config.experimental_local_index_root).await?)
+            Some(new_fs_cache_store(&config.experimental_series_index_root).await?)
         };
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
@@ -250,7 +252,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
-                    local_index_store: local_index_store.clone(),
+                    series_index_store: series_index_store.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -408,10 +410,10 @@ impl WorkerGroup {
         });
         let index_build_job_pool =
             Arc::new(LocalScheduler::new(config.max_background_index_builds));
-        let local_index_store = if config.experimental_local_index_root.trim().is_empty() {
+        let series_index_store = if config.experimental_series_index_root.trim().is_empty() {
             None
         } else {
-            Some(new_fs_cache_store(&config.experimental_local_index_root).await?)
+            Some(new_fs_cache_store(&config.experimental_series_index_root).await?)
         };
         let flush_job_pool = Arc::new(LocalScheduler::new(config.max_background_flushes));
         let compact_job_pool = Arc::new(LocalScheduler::new(config.max_background_compactions));
@@ -466,7 +468,7 @@ impl WorkerGroup {
                     object_store_manager: object_store_manager.clone(),
                     write_buffer_manager: write_buffer_manager.clone(),
                     index_build_job_pool: index_build_job_pool.clone(),
-                    local_index_store: local_index_store.clone(),
+                    series_index_store: series_index_store.clone(),
                     flush_job_pool: flush_job_pool.clone(),
                     compact_job_pool: compact_job_pool.clone(),
                     purge_scheduler: purge_scheduler.clone(),
@@ -561,7 +563,7 @@ struct WorkerStarter<S> {
     write_buffer_manager: WriteBufferManagerRef,
     compact_job_pool: SchedulerRef,
     index_build_job_pool: SchedulerRef,
-    local_index_store: Option<ObjectStore>,
+    series_index_store: Option<ObjectStore>,
     flush_job_pool: SchedulerRef,
     purge_scheduler: SchedulerRef,
     listener: WorkerListener,
@@ -590,23 +592,25 @@ impl<S: LogStore> WorkerStarter<S> {
         let (sender, receiver) = mpsc::channel(self.config.worker_channel_size);
 
         let running = Arc::new(AtomicBool::new(true));
-        let local_index_task_state = self
-            .local_index_store
+        let series_index_task_state = self
+            .series_index_store
             .as_ref()
-            .map(|_| Arc::new(LocalIndexTaskState::new()));
-        let local_index_handle = self
-            .local_index_store
+            .map(|_| Arc::new(SeriesIndexTaskState::new()));
+        let mut series_index_purger = None;
+        let series_index_handle = self
+            .series_index_store
             .clone()
-            .zip(local_index_task_state.clone())
+            .zip(series_index_task_state.clone())
             .map(|(store, state)| {
-                let (purger, purge_receiver) = local_index_channel(store.clone());
-                common_runtime::spawn_global(run_local_index_task(
+                let (purger, purge_receiver) = series_index_channel(store.clone());
+                series_index_purger = Some(purger.clone());
+                common_runtime::spawn_global(run_series_index_task(
                     self.id,
                     store,
                     regions.clone(),
                     state,
-                    self.config.experimental_local_index_reconcile_interval,
-                    self.config.experimental_local_series_index_bucket_width,
+                    self.config.experimental_series_index_reconcile_interval,
+                    self.config.experimental_series_index_bucket_width,
                     purge_receiver,
                     purger,
                 ))
@@ -635,7 +639,8 @@ impl<S: LogStore> WorkerStarter<S> {
                 self.index_build_job_pool.clone(),
                 self.config.max_background_index_builds,
             ),
-            local_index_task_state: local_index_task_state.clone(),
+            series_index_task_state: series_index_task_state.clone(),
+            series_index_purger,
             flush_scheduler: FlushScheduler::new(self.flush_job_pool),
             compaction_scheduler: CompactionScheduler::new(
                 self.compact_job_pool,
@@ -677,8 +682,8 @@ impl<S: LogStore> WorkerStarter<S> {
             catchup_regions,
             sender,
             handle: Mutex::new(Some(handle)),
-            local_index_handle: Mutex::new(local_index_handle),
-            local_index_task_state,
+            series_index_handle: Mutex::new(series_index_handle),
+            series_index_task_state,
             running,
         })
     }
@@ -698,10 +703,10 @@ pub(crate) struct RegionWorker {
     sender: Sender<WorkerRequestWithTime>,
     /// Handle to the worker thread.
     handle: Mutex<Option<JoinHandle<()>>>,
-    /// Handle to the sequential local-index task.
-    local_index_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Controls the worker-owned local-index task.
-    local_index_task_state: Option<Arc<LocalIndexTaskState>>,
+    /// Handle to the sequential series-index task.
+    series_index_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Controls the worker-owned series-index task.
+    series_index_task_state: Option<Arc<SeriesIndexTaskState>>,
     /// Whether to run the worker thread.
     running: Arc<AtomicBool>,
 }
@@ -718,7 +723,7 @@ impl RegionWorker {
             );
             // Manually set the running flag to false to avoid printing more warning logs.
             self.set_running(false);
-            if let Some(state) = &self.local_index_task_state {
+            if let Some(state) = &self.series_index_task_state {
                 state.stop();
             }
             return WorkerStoppedSnafu { id: self.id }.fail();
@@ -733,7 +738,7 @@ impl RegionWorker {
     async fn stop(&self) -> Result<()> {
         let handle = self.handle.lock().await.take();
         self.set_running(false);
-        if let Some(state) = &self.local_index_task_state {
+        if let Some(state) = &self.series_index_task_state {
             state.stop();
         }
 
@@ -752,13 +757,14 @@ impl RegionWorker {
 
             worker_result = handle.await.context(JoinSnafu);
         }
-        let local_index_result = if let Some(handle) = self.local_index_handle.lock().await.take() {
+        let series_index_result = if let Some(handle) = self.series_index_handle.lock().await.take()
+        {
             handle.await.context(JoinSnafu)
         } else {
             Ok(())
         };
         worker_result?;
-        local_index_result?;
+        series_index_result?;
 
         Ok(())
     }
@@ -808,7 +814,7 @@ impl RegionWorker {
 
 impl Drop for RegionWorker {
     fn drop(&mut self) {
-        if let Some(state) = &self.local_index_task_state {
+        if let Some(state) = &self.series_index_task_state {
             state.stop();
         }
         if self.is_running() {
@@ -932,8 +938,10 @@ struct RegionWorkerLoop<S> {
     write_buffer_manager: WriteBufferManagerRef,
     /// Scheduler for index build task.
     index_build_scheduler: IndexBuildScheduler,
-    /// Controls the worker-owned local-index task.
-    local_index_task_state: Option<Arc<LocalIndexTaskState>>,
+    /// Controls the worker-owned series-index task.
+    series_index_task_state: Option<Arc<SeriesIndexTaskState>>,
+    /// Couples range-index deletion to the region SST purger.
+    series_index_purger: Option<IndexFilePurger>,
     /// Schedules background flush requests.
     flush_scheduler: FlushScheduler,
     /// Scheduler for compaction tasks.
@@ -1620,15 +1628,15 @@ mod tests {
         let group = env
             .create_worker_group(MitoConfig {
                 num_workers: 4,
-                experimental_local_index_root: "local-index".to_string(),
-                experimental_local_index_reconcile_interval: Duration::from_secs(3600),
+                experimental_series_index_root: "series-index".to_string(),
+                experimental_series_index_reconcile_interval: Duration::from_secs(3600),
                 ..Default::default()
             })
             .await;
 
         tokio::time::timeout(Duration::from_secs(5), group.stop())
             .await
-            .expect("local-index tasks should stop without waiting for their interval")
+            .expect("series-index tasks should stop without waiting for their interval")
             .unwrap();
     }
 }

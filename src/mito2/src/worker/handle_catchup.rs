@@ -125,6 +125,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             self.partition_expr_fetcher.clone(),
         )
         .cache(Some(self.cache_manager.clone()))
+        .series_index_purger(self.series_index_purger.clone())
         .hook(self.plugins.get())
         .options(region.version().options.clone())?
         .skip_wal_replay(true)
@@ -132,7 +133,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         .await?;
         debug_assert!(!reopened_region.is_writable());
         self.regions.insert_region(reopened_region.clone());
-        if let Some(state) = &self.local_index_task_state {
+        if let Some(state) = &self.series_index_task_state {
             state.wake();
         }
 

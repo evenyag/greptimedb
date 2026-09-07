@@ -88,15 +88,16 @@ pub struct MitoConfig {
     // Background job configs:
     /// Max number of running background index build jobs (default: 1/8 of cpu cores).
     pub max_background_index_builds: usize,
-    /// Root directory for disposable local indexes. Empty disables the feature.
-    pub experimental_local_index_root: String,
-    /// Interval between local-index reconciliation passes.
+    /// Under development; do not enable. Root directory for series indexes, currently stored
+    /// on the local filesystem. Empty disables the feature.
+    pub experimental_series_index_root: String,
+    /// Under development; do not enable. Interval between series-index reconciliation passes.
     #[serde(with = "humantime_serde")]
-    pub experimental_local_index_reconcile_interval: Duration,
-    /// Requested minimum bucket width for local series indexes. It is rounded up to an exact
-    /// multiple of each region's compaction time window.
+    pub experimental_series_index_reconcile_interval: Duration,
+    /// Under development; do not enable. Requested minimum bucket width for series indexes.
+    /// It is rounded up to an exact multiple of each region's compaction time window.
     #[serde(with = "humantime_serde")]
-    pub experimental_local_series_index_bucket_width: Duration,
+    pub experimental_series_index_bucket_width: Duration,
     /// Max number of running background flush jobs (default: 1/2 of cpu cores).
     pub max_background_flushes: usize,
     /// Max number of running background compaction jobs (default: 1/4 of cpu cores).
@@ -214,9 +215,9 @@ impl Default for MitoConfig {
             experimental_manifest_keep_removed_file_ttl: Duration::from_secs(60 * 60),
             compress_manifest: false,
             max_background_index_builds: divide_num_cpus(8),
-            experimental_local_index_root: String::new(),
-            experimental_local_index_reconcile_interval: Duration::from_secs(5 * 60),
-            experimental_local_series_index_bucket_width: Duration::from_secs(5 * 24 * 60 * 60),
+            experimental_series_index_root: String::new(),
+            experimental_series_index_reconcile_interval: Duration::from_secs(5 * 60),
+            experimental_series_index_bucket_width: Duration::from_secs(5 * 24 * 60 * 60),
             max_background_flushes: divide_num_cpus(2),
             max_background_compactions: divide_num_cpus(4),
             max_background_purges: get_total_cpu_cores(),
@@ -303,11 +304,11 @@ impl MitoConfig {
             self.max_background_purges = cpu_cores;
         }
 
-        if !self.experimental_local_index_root.trim().is_empty()
-            && Path::new(&self.experimental_local_index_root).is_relative()
+        if !self.experimental_series_index_root.trim().is_empty()
+            && Path::new(&self.experimental_series_index_root).is_relative()
         {
-            self.experimental_local_index_root = Path::new(data_home)
-                .join(&self.experimental_local_index_root)
+            self.experimental_series_index_root = Path::new(data_home)
+                .join(&self.experimental_series_index_root)
                 .display()
                 .to_string();
         }

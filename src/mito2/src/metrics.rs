@@ -319,23 +319,23 @@ lazy_static! {
 // Index metrics.
 lazy_static! {
     // Index metrics.
-    /// Outcomes of local-index reconciliation passes.
-    pub static ref LOCAL_INDEX_RECONCILE_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "greptime_mito_local_index_reconcile_total",
-        "local-index reconciliation passes",
+    /// Outcomes of series-index reconciliation passes.
+    pub static ref SERIES_INDEX_RECONCILE_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_series_index_reconcile_total",
+        "series-index reconciliation passes",
         &["result"],
     ).unwrap();
-    /// Elapsed time of local-index reconciliation phases.
-    pub static ref LOCAL_INDEX_RECONCILE_ELAPSED: HistogramVec = register_histogram_vec!(
-        "greptime_mito_local_index_reconcile_elapsed",
-        "local-index reconciliation elapsed time",
+    /// Elapsed time of series-index reconciliation phases.
+    pub static ref SERIES_INDEX_RECONCILE_ELAPSED: HistogramVec = register_histogram_vec!(
+        "greptime_mito_series_index_reconcile_elapsed",
+        "series-index reconciliation elapsed time",
         &["phase"],
         exponential_buckets(0.01, 10.0, 7).unwrap(),
     ).unwrap();
-    /// Local-index file operations.
-    pub static ref LOCAL_INDEX_FILE_OPERATION_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "greptime_mito_local_index_file_operation_total",
-        "local-index file operations",
+    /// Series and range index file operations.
+    pub static ref SERIES_INDEX_FILE_OPERATION_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_series_index_file_operation_total",
+        "series-index file operations",
         &["index_type", "operation", "result"],
     ).unwrap();
     /// Number of stale index publications rejected at each publication stage.

@@ -52,13 +52,13 @@ use crate::error::{
     FlushableRegionStateSnafu, InvalidPartitionExprSnafu, RegionNotFoundSnafu, RegionStateSnafu,
     RegionTruncatedSnafu, Result, UnexpectedSnafu, UpdateManifestSnafu,
 };
-use crate::local_index::{LocalIndexVersion, LocalIndexVersionControl};
 use crate::manifest::action::{
     RegionChange, RegionManifest, RegionMetaAction, RegionMetaActionList,
 };
 use crate::manifest::manager::RegionManifestManager;
 use crate::region::version::{VersionControlRef, VersionRef};
 use crate::request::{OnFailure, OptionOutputTx};
+use crate::series_index::{SeriesIndexVersion, SeriesIndexVersionControl};
 use crate::sst::file::FileMeta;
 use crate::sst::file_purger::FilePurgerRef;
 use crate::sst::location::{index_file_path, sst_file_path};
@@ -151,8 +151,8 @@ pub struct MitoRegion {
     ///
     /// We MUST update the version control inside the write lock of the region manifest manager.
     pub(crate) version_control: VersionControlRef,
-    /// Snapshot controller for disposable machine-local indexes.
-    pub(crate) local_index_version_control: LocalIndexVersionControl,
+    /// Snapshot controller for range and series indexes.
+    pub(crate) series_index_version_control: SeriesIndexVersionControl,
     /// SSTs accessor for this region.
     pub(crate) access_layer: AccessLayerRef,
     /// Context to maintain manifest for this region.
@@ -241,9 +241,9 @@ impl StagingPartitionInfo {
 }
 
 impl MitoRegion {
-    /// Returns the current immutable local-index snapshot.
-    pub(crate) fn local_index_version(&self) -> Arc<LocalIndexVersion> {
-        self.local_index_version_control.current()
+    /// Returns the current immutable series-index snapshot.
+    pub(crate) fn series_index_version(&self) -> Arc<SeriesIndexVersion> {
+        self.series_index_version_control.current()
     }
 
     fn remove_region_metrics(&self) {
@@ -2048,7 +2048,7 @@ mod tests {
         MitoRegion {
             region_id: metadata.region_id,
             version_control,
-            local_index_version_control: Default::default(),
+            series_index_version_control: Default::default(),
             access_layer: env.access_layer.clone(),
             manifest_ctx,
             file_purger: crate::test_util::new_noop_file_purger(),
@@ -2552,7 +2552,7 @@ mod tests {
         let region = MitoRegion {
             region_id: metadata.region_id,
             version_control,
-            local_index_version_control: Default::default(),
+            series_index_version_control: Default::default(),
             access_layer,
             manifest_ctx: manifest_ctx.clone(),
             file_purger: crate::test_util::new_noop_file_purger(),

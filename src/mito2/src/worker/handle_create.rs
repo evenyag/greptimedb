@@ -71,6 +71,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         .metadata_builder(builder)
         .parse_options(request.options)?
         .cache(Some(self.cache_manager.clone()))
+        .series_index_purger(self.series_index_purger.clone())
         .hook(self.plugins.get());
 
         opener.ensure_region_requirements(requirements)?;
@@ -94,7 +95,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
         // Insert the MitoRegion into the RegionMap.
         self.regions.insert_region(region);
-        if let Some(state) = &self.local_index_task_state {
+        if let Some(state) = &self.series_index_task_state {
             state.wake();
         }
 
