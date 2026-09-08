@@ -28,6 +28,8 @@ use crate::series_index::purger::IndexFilePurger;
 use crate::series_index::version::{
     SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl,
 };
+pub(crate) use crate::sst::range_index::range_index_path;
+
 const SERIES_DIR: &str = "series";
 const RANGE_CATALOG: &str = "range-index.json";
 const SERIES_CATALOG: &str = "series-index.json";
@@ -135,9 +137,9 @@ pub(crate) async fn load_version_control(
         .await
         .unwrap_or_default();
     // TODO: Handle catalog entries whose index files are missing from storage.
-    let version = SeriesIndexVersion {
-        range_indexes: range.indexes.into_iter().collect(),
-        series_indexes: series
+    let version = SeriesIndexVersion::new(
+        range.indexes.into_iter().collect(),
+        series
             .indexes
             .into_iter()
             .map(|entry| {
@@ -147,7 +149,7 @@ pub(crate) async fn load_version_control(
                 )
             })
             .collect(),
-    };
+    );
     let control = SeriesIndexVersionControl::default();
     control.publish(std::sync::Arc::new(version));
     control
