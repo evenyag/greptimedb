@@ -14,25 +14,23 @@
 
 //! Worker-owned series-index reconciliation and publication.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common_telemetry::{debug, info};
-use common_time::{TimeToLive, Timestamp};
 use object_store::ObjectStore;
-use store_api::storage::{FileId, RegionId};
+use store_api::storage::RegionId;
 
 use crate::error::Result;
 use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTAL};
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::MitoRegionRef;
 use crate::region::version::VersionRef;
-use crate::series_index::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
+use crate::series_index::bucket::{plan_series_buckets, plan_series_indexes, rounded_bucket_width};
 use crate::series_index::builder::{build_range_index, build_series_index};
 use crate::series_index::catalog::{
-    RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, range_catalog_path,
-    same_series_coverage, series_catalog_path, store_catalog,
+    RangeIndexCatalog, SeriesIndexCatalog, range_catalog_path, series_catalog_path, store_catalog,
 };
 use crate::series_index::purger::IndexFilePurger;
 use crate::series_index::version::SeriesIndexVersion;
@@ -52,12 +50,6 @@ impl ReconcileStats {
     fn changed(&self) -> bool {
         self.built_range + self.built_series + self.removed_range + self.removed_series > 0
     }
-}
-
-fn complete_bucket_expired(entry: &SeriesIndexEntry, ttl: Option<TimeToLive>, now_ms: i64) -> bool {
-    let Some(ttl) = ttl else { return false };
-    ttl.is_expired(&entry.bucket_end, &Timestamp::new_millisecond(now_ms))
-        .unwrap_or(false)
 }
 
 /// Reconciles indexes for one region snapshot, persists catalogs, then atomically publishes it.
@@ -159,40 +151,25 @@ async fn build_index_version(
             Vec::new()
         }
     };
-    stats.computed_buckets = buckets.len();
-    let mut series_indexes = HashMap::new();
-    for bucket in buckets {
-        // Aggregate only multi-file buckets with known sequences that have not fully expired.
-        let Some(mut expected) = series_entry(&bucket) else {
-            stats.skipped_buckets += 1;
-            if bucket.has_unknown_sequence {
-                debug!(
-                    "Deferring series-index bucket with unknown sequence, worker: {worker_id}, region: {}, bucket_start: {:?}, bucket_end: {:?}",
-                    region.region_id, bucket.start, bucket.end
-                );
-            }
-            continue;
-        };
-        if complete_bucket_expired(&expected, version.options.ttl, now_ms) {
-            stats.skipped_buckets += 1;
-            continue;
-        }
-        // Identical source coverage can reuse the existing series file.
-        if let Some(handle) = current
-            .series_indexes
-            .values()
-            .find(|handle| same_series_coverage(handle.entry(), &expected))
-        {
-            series_indexes.insert(handle.entry().index_uuid, handle.clone());
-            continue;
-        }
+    let plan = plan_series_indexes(
+        buckets,
+        current.index_buckets.clone(),
+        version.options.ttl,
+        now_ms,
+    );
+    stats.computed_buckets = plan.computed_buckets;
+    stats.skipped_buckets = plan.skipped_buckets;
+    let mut series_indexes = current.series_indexes.clone();
+    for id in &plan.expired_index_ids {
+        series_indexes.remove(id);
+    }
+    for (bucket, expected) in plan.builds {
         let missing_range_ids = bucket
             .files
             .iter()
             .map(|file| file.file_id().file_id())
             .filter(|file_id| !range_indexes.contains(file_id))
             .collect::<HashSet<_>>();
-        expected.index_uuid = FileId::random();
         let (series_handle, built_ranges) = build_series_index(
             store,
             region,
@@ -227,6 +204,7 @@ async fn build_index_version(
     let next = SeriesIndexVersion {
         range_indexes,
         series_indexes,
+        index_buckets: plan.index_buckets,
     };
     Ok((next, stats))
 }

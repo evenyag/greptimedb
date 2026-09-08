@@ -14,13 +14,16 @@
 
 //! Immutable index snapshots and aggregate series-file handles.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use common_time::Timestamp;
+use smallvec::smallvec;
 use store_api::storage::{FileId, RegionId};
 
+use crate::series_index::bucket::IndexBucket;
 use crate::series_index::catalog::SeriesIndexEntry;
 use crate::series_index::purger::{IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
@@ -87,9 +90,32 @@ impl Drop for SeriesIndexFileHandleInner {
 pub(crate) struct SeriesIndexVersion {
     pub(crate) range_indexes: HashSet<FileId>,
     pub(crate) series_indexes: HashMap<FileId, SeriesIndexFileHandle>,
+    pub(crate) index_buckets: BTreeMap<Timestamp, IndexBucket>,
 }
 
 impl SeriesIndexVersion {
+    /// Restores bucket lookup from immutable index coverage stored in the catalog.
+    pub(crate) fn new(
+        range_indexes: HashSet<FileId>,
+        series_indexes: HashMap<FileId, SeriesIndexFileHandle>,
+    ) -> Self {
+        let mut index_buckets = BTreeMap::new();
+        for handle in series_indexes.values() {
+            let entry = handle.entry();
+            IndexBucket {
+                end: entry.bucket_end,
+                index_ids: smallvec![entry.index_uuid],
+                max_file_sequence: entry.max_file_sequence,
+            }
+            .insert_into(entry.bucket_start, &mut index_buckets);
+        }
+        Self {
+            range_indexes,
+            series_indexes,
+            index_buckets,
+        }
+    }
+
     fn mark_all_deleted(&self) {
         self.series_indexes
             .values()

@@ -14,20 +14,133 @@
 
 //! Event-time bucket planning and source coverage.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use common_time::Timestamp;
+use common_time::{TimeToLive, Timestamp};
+use smallvec::{SmallVec, smallvec};
 use store_api::storage::FileId;
 
 use crate::series_index::catalog::SeriesIndexEntry;
 use crate::sst::file::FileHandle;
 
+const SERIES_INDEX_TRIGGER_FILES: usize = 4;
+
+/// Index files sharing a non-overlapping, half-open time bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexBucket {
+    pub(crate) end: Timestamp,
+    pub(crate) index_ids: SmallVec<[FileId; 2]>,
+    pub(crate) max_file_sequence: u64,
+}
+
+impl IndexBucket {
+    pub(crate) fn new(end: Timestamp) -> Self {
+        Self {
+            end,
+            index_ids: SmallVec::new(),
+            max_file_sequence: 0,
+        }
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.end = self.end.max(other.end);
+        self.index_ids.append(&mut other.index_ids);
+        self.max_file_sequence = self.max_file_sequence.max(other.max_file_sequence);
+    }
+
+    /// Inserts a bucket, consuming overlapping entries and expanding their interval.
+    pub(crate) fn insert_into(
+        mut self,
+        mut start: Timestamp,
+        buckets: &mut BTreeMap<Timestamp, Self>,
+    ) {
+        if let Some((&previous_start, previous)) = buckets.range(..start).next_back()
+            && previous.end > start
+        {
+            start = previous_start;
+        }
+        // Expanding the end may expose more overlaps, so look up the next entry again.
+        while let Some((&next_start, _)) = buckets.range(start..self.end).next() {
+            if let Some(other) = buckets.remove(&next_start) {
+                self.merge(other);
+            }
+        }
+        buckets.insert(start, self);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesBucket {
     pub(crate) start: Timestamp,
     pub(crate) end: Timestamp,
-    pub(crate) files: Vec<FileHandle>,
+    pub(crate) files: SmallVec<[FileHandle; 2]>,
     pub(crate) has_unknown_sequence: bool,
+}
+
+/// Next bucket coverage and the work required to publish it, computed without I/O.
+pub(crate) struct SeriesIndexPlan {
+    pub(crate) index_buckets: BTreeMap<Timestamp, IndexBucket>,
+    pub(crate) builds: Vec<(SeriesBucket, SeriesIndexEntry)>,
+    pub(crate) expired_index_ids: Vec<FileId>,
+    pub(crate) computed_buckets: usize,
+    pub(crate) skipped_buckets: usize,
+}
+
+/// Plans complete sequence suffixes after merging time coverage. The returned bucket
+/// map is publishable only after every planned build and the catalog writes succeed.
+pub(crate) fn plan_series_indexes(
+    buckets: Vec<SeriesBucket>,
+    mut index_buckets: BTreeMap<Timestamp, IndexBucket>,
+    ttl: Option<TimeToLive>,
+    now_ms: i64,
+) -> SeriesIndexPlan {
+    let buckets = reconcile_series_buckets(buckets, &mut index_buckets);
+    let computed_buckets = buckets.len();
+    let expired = |end| {
+        ttl.is_some_and(|ttl| {
+            ttl.is_expired(&end, &Timestamp::new_millisecond(now_ms))
+                .unwrap_or(false)
+        })
+    };
+    let mut expired_index_ids = Vec::new();
+    index_buckets.retain(|_, bucket| {
+        if expired(bucket.end) {
+            expired_index_ids.extend_from_slice(&bucket.index_ids);
+            false
+        } else {
+            true
+        }
+    });
+    let mut builds = Vec::new();
+    for mut bucket in buckets {
+        if expired(bucket.end) {
+            continue;
+        }
+        let index_bucket = index_buckets
+            .entry(bucket.start)
+            .or_insert_with(|| IndexBucket::new(bucket.end));
+        // Select all SSTs above the watermark, including every file sharing a sequence.
+        // File IDs may change under compaction without advancing indexed coverage.
+        bucket.files.retain(|file| {
+            file.meta_ref()
+                .sequence
+                .is_some_and(|sequence| sequence.get() > index_bucket.max_file_sequence)
+        });
+        if let Some(entry) = series_entry(&bucket) {
+            index_bucket.index_ids.push(entry.index_uuid);
+            index_bucket.max_file_sequence = entry.max_file_sequence;
+            builds.push((bucket, entry));
+        }
+    }
+    index_buckets.retain(|_, bucket| !bucket.index_ids.is_empty());
+    SeriesIndexPlan {
+        index_buckets,
+        skipped_buckets: computed_buckets - builds.len(),
+        builds,
+        expired_index_ids,
+        computed_buckets,
+    }
 }
 
 pub(crate) fn rounded_bucket_width(
@@ -57,12 +170,34 @@ pub(crate) fn plan_series_buckets(files: &[FileHandle], width_secs: i64) -> Vec<
                         .saturating_add(1)
                         .saturating_mul(width_secs),
                 ),
-                files: vec![file.clone()],
+                files: smallvec![file.clone()],
                 has_unknown_sequence: file.meta_ref().sequence.is_none(),
             }
         })
         .collect::<Vec<_>>();
-    spans.sort_by_key(|span| (span.start, span.end));
+    spans.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+    group_series_buckets(spans)
+}
+
+/// Expands SST buckets through existing index coverage before grouping build inputs.
+fn reconcile_series_buckets(
+    mut buckets: Vec<SeriesBucket>,
+    index_buckets: &mut BTreeMap<Timestamp, IndexBucket>,
+) -> Vec<SeriesBucket> {
+    for bucket in &buckets {
+        IndexBucket::new(bucket.end).insert_into(bucket.start, index_buckets);
+    }
+    for bucket in &mut buckets {
+        if let Some((&start, index_bucket)) = index_buckets.range(..=bucket.start).next_back() {
+            bucket.start = start;
+            bucket.end = index_bucket.end;
+        }
+    }
+    // Expanding sorted, disjoint spans preserves their order, but may join several of them.
+    group_series_buckets(buckets)
+}
+
+fn group_series_buckets(spans: Vec<SeriesBucket>) -> Vec<SeriesBucket> {
     let mut buckets: Vec<SeriesBucket> = Vec::new();
     for mut span in spans {
         if let Some(last) = buckets.last_mut()
@@ -78,8 +213,8 @@ pub(crate) fn plan_series_buckets(files: &[FileHandle], width_secs: i64) -> Vec<
     buckets
 }
 
-pub(crate) fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
-    if bucket.has_unknown_sequence || bucket.files.len() < 2 {
+fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
+    if bucket.has_unknown_sequence || bucket.files.len() < SERIES_INDEX_TRIGGER_FILES {
         return None;
     }
     let mut source_file_ids = bucket
@@ -110,6 +245,7 @@ pub(crate) fn series_entry(bucket: &SeriesBucket) -> Option<SeriesIndexEntry> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::num::NonZeroU64;
 
     use common_time::timestamp::TimeUnit;
@@ -172,8 +308,7 @@ mod tests {
             ],
             spans
         );
-        let entry = series_entry(&buckets[0]).unwrap();
-        assert_eq!((1, 3), (entry.min_file_sequence, entry.max_file_sequence));
+        assert!(series_entry(&buckets[0]).is_none());
         assert!(series_entry(&buckets[1]).is_none());
         let mut files = files.to_vec();
         files.push(file(
@@ -206,6 +341,149 @@ mod tests {
         assert_eq!(
             (Timestamp::new_second(-1), Timestamp::new_second(1)),
             (buckets[0].start, buckets[0].end)
+        );
+    }
+
+    #[test]
+    fn test_reconcile_bridge_expands_through_index_and_sst_buckets() {
+        let ts = Timestamp::new_second;
+        let mut indexes = BTreeMap::new();
+        let ids = [FileId::random(), FileId::random(), FileId::random()];
+        for (start, end, max_sequence, id) in [
+            (0, 20, 10, ids[0]),
+            (30, 60, 30, ids[1]),
+            (70, 100, 20, ids[2]),
+        ] {
+            IndexBucket {
+                end: ts(end),
+                index_ids: smallvec![id],
+                max_file_sequence: max_sequence,
+            }
+            .insert_into(ts(start), &mut indexes);
+        }
+        let files = [
+            file(Some(15), 1, ts(10), ts(30)),
+            file(Some(31), 0, ts(50), ts(70)),
+            file(Some(32), 0, ts(90), ts(95)),
+            file(Some(32), 1, ts(90), ts(95)),
+            file(Some(33), 0, ts(90), ts(95)),
+            file(Some(34), 0, ts(100), ts(105)),
+        ];
+        let planned = plan_series_buckets(&files, 10);
+        assert_eq!(4, planned.len());
+        let plan = plan_series_indexes(planned, indexes, None, 0);
+        assert_eq!((2, 1), (plan.computed_buckets, plan.skipped_buckets));
+        let [(bucket, entry)] = plan.builds.as_slice() else {
+            panic!("expected one incremental build");
+        };
+        assert_eq!((ts(0), ts(100)), (bucket.start, bucket.end));
+        // Ignore the gap at sequence 15, include both files at 32, and exclude the
+        // adjacent time bucket even though its sequence exceeds the merged watermark.
+        let expected = files[1..5]
+            .iter()
+            .map(|file| file.file_id().file_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            expected,
+            bucket
+                .files
+                .iter()
+                .map(|file| file.file_id().file_id())
+                .collect()
+        );
+        assert_eq!(expected, entry.source_file_ids.iter().copied().collect());
+        assert_eq!((31, 33), (entry.min_file_sequence, entry.max_file_sequence));
+        assert!(plan.expired_index_ids.is_empty());
+        assert_eq!(1, plan.index_buckets.len());
+        let merged = &plan.index_buckets[&ts(0)];
+        assert_eq!(ts(100), merged.end);
+        assert_eq!(33, merged.max_file_sequence);
+        assert_eq!(
+            [ids[0], ids[1], ids[2], entry.index_uuid].as_slice(),
+            merged.index_ids.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_plan_reuses_replaced_sources_and_builds_complete_sequence_suffix() {
+        let ts = Timestamp::new_second;
+        let make_file = |sequence| file(Some(sequence), 0, ts(1), ts(2));
+        let original = (1..=4).map(make_file).collect::<Vec<_>>();
+        let initial =
+            plan_series_indexes(plan_series_buckets(&original, 10), BTreeMap::new(), None, 0);
+        let first_id = initial.builds[0].1.index_uuid;
+
+        // New file IDs with already indexed sequences do not invalidate the index.
+        let mut files = (1..=4).map(make_file).collect::<Vec<_>>();
+        let replaced = plan_series_indexes(
+            plan_series_buckets(&files, 10),
+            initial.index_buckets.clone(),
+            None,
+            0,
+        );
+        assert!(replaced.builds.is_empty());
+        assert!(replaced.expired_index_ids.is_empty());
+        assert_eq!(initial.index_buckets, replaced.index_buckets);
+
+        files.extend((5..=7).map(make_file));
+        let deferred = plan_series_indexes(
+            plan_series_buckets(&files, 10),
+            replaced.index_buckets,
+            None,
+            0,
+        );
+        assert!(deferred.builds.is_empty());
+        assert_eq!(initial.index_buckets, deferred.index_buckets);
+
+        files.push(make_file(8));
+        let ready = plan_series_indexes(
+            plan_series_buckets(&files, 10),
+            deferred.index_buckets,
+            None,
+            0,
+        );
+        let [(bucket, entry)] = ready.builds.as_slice() else {
+            panic!("the fourth new SST must trigger one build");
+        };
+        let expected = files[4..]
+            .iter()
+            .map(|file| file.file_id().file_id())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            expected,
+            bucket
+                .files
+                .iter()
+                .map(|file| file.file_id().file_id())
+                .collect()
+        );
+        assert_eq!(expected, entry.source_file_ids.iter().copied().collect());
+        assert_eq!((5, 8), (entry.min_file_sequence, entry.max_file_sequence));
+        assert_eq!(
+            [first_id, entry.index_uuid].as_slice(),
+            ready.index_buckets[&ts(0)].index_ids.as_slice()
+        );
+        let repeated = plan_series_indexes(
+            plan_series_buckets(&files, 10),
+            ready.index_buckets.clone(),
+            None,
+            0,
+        );
+        assert!(repeated.builds.is_empty());
+        assert_eq!(ready.index_buckets, repeated.index_buckets);
+
+        // Retiring the whole bucket must retire both historical and incremental indexes.
+        let expired = plan_series_indexes(
+            Vec::new(),
+            ready.index_buckets,
+            Some(TimeToLive::Duration(Duration::from_secs(10))),
+            21_000,
+        );
+        assert!(expired.builds.is_empty());
+        assert!(expired.index_buckets.is_empty());
+        assert_eq!(
+            [first_id, entry.index_uuid].as_slice(),
+            expired.expired_index_ids.as_slice()
         );
     }
 }

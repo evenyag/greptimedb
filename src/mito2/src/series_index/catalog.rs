@@ -70,14 +70,6 @@ pub(crate) fn series_catalog_path(region_id: RegionId) -> String {
     format!("{}/{SERIES_CATALOG}", region_id.as_u64())
 }
 
-pub(crate) fn same_series_coverage(left: &SeriesIndexEntry, right: &SeriesIndexEntry) -> bool {
-    left.bucket_start == right.bucket_start
-        && left.bucket_end == right.bucket_end
-        && left.source_file_ids == right.source_file_ids
-        && left.min_file_sequence == right.min_file_sequence
-        && left.max_file_sequence == right.max_file_sequence
-}
-
 pub(crate) fn series_metadata(entry: &SeriesIndexEntry) -> Result<Vec<KeyValue>> {
     Ok(vec![KeyValue::new(
         SERIES_METADATA_KEY.to_string(),
@@ -145,9 +137,9 @@ pub(crate) async fn load_version_control(
         .await
         .unwrap_or_default();
     // TODO: Handle catalog entries whose index files are missing from storage.
-    let version = SeriesIndexVersion {
-        range_indexes: range.indexes.into_iter().collect(),
-        series_indexes: series
+    let version = SeriesIndexVersion::new(
+        range.indexes.into_iter().collect(),
+        series
             .indexes
             .into_iter()
             .map(|entry| {
@@ -157,7 +149,7 @@ pub(crate) async fn load_version_control(
                 )
             })
             .collect(),
-    };
+    );
     let control = SeriesIndexVersionControl::default();
     control.publish(std::sync::Arc::new(version));
     control

@@ -85,7 +85,7 @@ async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
-    for ts in [1000, 2000] {
+    for ts in [1000, 2000, 3000, 4000] {
         engine
             .handle_request(
                 region_id,
@@ -133,7 +133,7 @@ async fn test_reconcile_restores_and_reuses_indexes() {
     )
     .await
     .unwrap();
-    assert_eq!((2, 1), (stats.built_range, stats.built_series));
+    assert_eq!((4, 1), (stats.built_range, stats.built_series));
     let first = region.series_index_version();
     let first_id = *first.series_indexes.keys().next().unwrap();
 
@@ -175,6 +175,7 @@ async fn test_reconcile_restores_and_reuses_indexes() {
     .unwrap();
     let restored = reopened.series_index_version();
     assert_eq!(first.range_indexes, restored.range_indexes);
+    assert_eq!(first.index_buckets, restored.index_buckets);
     assert_eq!(
         first.series_indexes[&first_id].entry(),
         restored.series_indexes[&first_id].entry()
@@ -345,7 +346,7 @@ async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
     let stats = reconcile_series_indexes(0, store, region, Duration::from_secs(100), 0, purger)
         .await
         .unwrap();
-    assert_eq!((2, 1), (stats.built_range, stats.built_series));
+    assert_eq!((4, 1), (stats.built_range, stats.built_series));
     engine.stop().await.unwrap();
 }
 
@@ -390,9 +391,9 @@ async fn test_reconcile_publishes_after_region_version_changes(#[case] during_ca
     .unwrap();
 
     assert!(!Arc::ptr_eq(&initial_version, &region.version()));
-    assert_eq!((2, 1), (stats.built_range, stats.built_series));
+    assert_eq!((4, 1), (stats.built_range, stats.built_series));
     let published = region.series_index_version();
-    assert_eq!(2, published.range_indexes.len());
+    assert_eq!(4, published.range_indexes.len());
     assert_eq!(1, published.series_indexes.len());
     let restored = load_version_control(&store, region.region_id, &purger).await;
     assert_eq!(published.range_indexes, restored.current().range_indexes);
