@@ -137,7 +137,6 @@ impl SeriesIndexTask {
             if let Err(error) = reconcile_series_indexes(
                 self.worker_id,
                 self.store.clone(),
-                self.regions.clone(),
                 region.clone(),
                 self.bucket_width,
                 common_time::util::current_time_millis(),

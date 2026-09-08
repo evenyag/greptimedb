@@ -21,13 +21,13 @@ use std::time::{Duration, Instant};
 use common_telemetry::{debug, info};
 use common_time::{TimeToLive, Timestamp};
 use object_store::ObjectStore;
-use store_api::storage::FileId;
+use store_api::storage::{FileId, RegionId};
 
 use crate::error::Result;
 use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTAL};
 use crate::read::series_candidate::is_sparse_metric_metadata;
+use crate::region::MitoRegionRef;
 use crate::region::version::VersionRef;
-use crate::region::{MitoRegionRef, RegionMapRef};
 use crate::series_index::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
 use crate::series_index::builder::{build_range_index, build_series_index};
 use crate::series_index::catalog::{
@@ -54,42 +54,83 @@ impl ReconcileStats {
     }
 }
 
-fn is_current_region_version(
-    regions: &RegionMapRef,
-    region: &MitoRegionRef,
-    version: &VersionRef,
-) -> bool {
-    regions.get_region(region.region_id).is_some_and(|current| {
-        Arc::ptr_eq(&current, region)
-            && Arc::ptr_eq(&current.version_control.current().version, version)
-    })
-}
-
 fn complete_bucket_expired(entry: &SeriesIndexEntry, ttl: Option<TimeToLive>, now_ms: i64) -> bool {
     let Some(ttl) = ttl else { return false };
     ttl.is_expired(&entry.bucket_end, &Timestamp::new_millisecond(now_ms))
         .unwrap_or(false)
 }
 
-/// Reconciles and atomically publishes all series indexes for one region snapshot.
+/// Reconciles indexes for one region snapshot, persists catalogs, then atomically publishes it.
 pub(crate) async fn reconcile_series_indexes(
     worker_id: u32,
     store: ObjectStore,
-    regions: RegionMapRef,
     region: MitoRegionRef,
     requested_bucket_width: Duration,
     now_ms: i64,
     purger: IndexFilePurger,
 ) -> Result<ReconcileStats> {
     let total_start = Instant::now();
+    // Use this snapshot throughout reconciliation, even if the region version advances.
     let version = region.version_control.current().version;
-    let mut stats = ReconcileStats::default();
     if !is_sparse_metric_metadata(&version.metadata) {
         SERIES_INDEX_RECONCILE_TOTAL
             .with_label_values(&["noop"])
             .inc();
-        return Ok(stats);
+        return Ok(ReconcileStats::default());
     }
+    let build_start = Instant::now();
+    let (next, stats) = build_index_version(
+        worker_id,
+        &store,
+        &region,
+        &version,
+        requested_bucket_width,
+        now_ms,
+        &purger,
+    )
+    .await?;
+    SERIES_INDEX_RECONCILE_ELAPSED
+        .with_label_values(&["build"])
+        .observe(build_start.elapsed().as_secs_f64());
+    // Persist both catalogs before making the new snapshot visible to readers.
+    if stats.changed() {
+        persist_index_catalogs(&store, region.region_id, &next).await?;
+    }
+    publish_index_version(&region, Arc::new(next));
+    let result = if stats.changed() { "changed" } else { "noop" };
+    SERIES_INDEX_RECONCILE_TOTAL
+        .with_label_values(&[result])
+        .inc();
+    SERIES_INDEX_RECONCILE_ELAPSED
+        .with_label_values(&["total"])
+        .observe(total_start.elapsed().as_secs_f64());
+    if stats.changed() {
+        info!(
+            "Reconciled series-index snapshot, worker: {worker_id}, region: {}, elapsed: {:?}, stats: {:?}",
+            region.region_id,
+            total_start.elapsed(),
+            stats
+        );
+    } else {
+        debug!(
+            "Series-index reconciliation made no changes, worker: {worker_id}, region: {}",
+            region.region_id
+        );
+    }
+    Ok(stats)
+}
+
+/// Builds the next snapshot, retaining reusable indexes and removing obsolete coverage.
+async fn build_index_version(
+    worker_id: u32,
+    store: &ObjectStore,
+    region: &MitoRegionRef,
+    version: &VersionRef,
+    requested_bucket_width: Duration,
+    now_ms: i64,
+    purger: &IndexFilePurger,
+) -> Result<(SeriesIndexVersion, ReconcileStats)> {
+    let mut stats = ReconcileStats::default();
     let files = version
         .ssts
         .levels()
@@ -119,10 +160,9 @@ pub(crate) async fn reconcile_series_indexes(
         }
     };
     stats.computed_buckets = buckets.len();
-    let build_start = Instant::now();
     let mut series_indexes = HashMap::new();
-    let mut newly_built = Vec::new();
     for bucket in buckets {
+        // Aggregate only multi-file buckets with known sequences that have not fully expired.
         let Some(mut expected) = series_entry(&bucket) else {
             stats.skipped_buckets += 1;
             if bucket.has_unknown_sequence {
@@ -137,6 +177,7 @@ pub(crate) async fn reconcile_series_indexes(
             stats.skipped_buckets += 1;
             continue;
         }
+        // Identical source coverage can reuse the existing series file.
         if let Some(handle) = current
             .series_indexes
             .values()
@@ -153,124 +194,90 @@ pub(crate) async fn reconcile_series_indexes(
             .collect::<HashSet<_>>();
         expected.index_uuid = FileId::random();
         let (series_handle, built_ranges) = build_series_index(
-            &store,
-            &region,
-            &version,
+            store,
+            region,
+            version,
             &bucket,
             &expected,
             &missing_range_ids,
-            &purger,
+            purger,
         )
         .await?;
         stats.built_series += 1;
         stats.built_range += built_ranges.len();
         range_indexes.extend(built_ranges);
-        newly_built.push(series_handle.clone());
         series_indexes.insert(expected.index_uuid, series_handle);
     }
+    // Cover SSTs not indexed while building aggregates, including skipped buckets.
     for file in files {
         let file_id = file.file_id().file_id();
         if range_indexes.contains(&file_id) {
             continue;
         }
-        if let Some(file_id) = build_range_index(&store, &region, &version, file).await? {
+        if let Some(file_id) = build_range_index(store, region, version, file).await? {
             stats.built_range += 1;
             range_indexes.insert(file_id);
         }
     }
-    SERIES_INDEX_RECONCILE_ELAPSED
-        .with_label_values(&["build"])
-        .observe(build_start.elapsed().as_secs_f64());
     stats.removed_series = current
         .series_indexes
         .keys()
         .filter(|id| !series_indexes.contains_key(id))
         .count();
-    let next = Arc::new(SeriesIndexVersion {
+    let next = SeriesIndexVersion {
         range_indexes,
         series_indexes,
+    };
+    Ok((next, stats))
+}
+
+/// Writes catalogs in a stable order; the two writes are not atomic together.
+async fn persist_index_catalogs(
+    store: &ObjectStore,
+    region_id: RegionId,
+    next: &SeriesIndexVersion,
+) -> Result<()> {
+    let mut range_entries = next.range_indexes.iter().copied().collect::<Vec<_>>();
+    range_entries.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut series_entries = next
+        .series_indexes
+        .values()
+        .map(|handle| handle.entry().clone())
+        .collect::<Vec<_>>();
+    series_entries.sort_unstable_by_key(|entry| {
+        (
+            entry.bucket_start,
+            entry.bucket_end,
+            entry.min_file_sequence,
+            entry.max_file_sequence,
+        )
     });
-    if !is_current_region_version(&regions, &region, &version) {
-        for handle in newly_built {
-            handle.mark_deleted();
-        }
-        SERIES_INDEX_RECONCILE_TOTAL
-            .with_label_values(&["stale"])
-            .inc();
-        debug!(
-            "Skipped stale series-index publication, worker: {worker_id}, region: {}",
-            region.region_id
-        );
-        return Ok(stats);
-    }
-    if stats.changed() {
-        let mut range_entries = next.range_indexes.iter().copied().collect::<Vec<_>>();
-        range_entries.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        let mut series_entries = next
-            .series_indexes
-            .values()
-            .map(|handle| handle.entry().clone())
-            .collect::<Vec<_>>();
-        series_entries.sort_unstable_by_key(|entry| {
-            (
-                entry.bucket_start,
-                entry.bucket_end,
-                entry.min_file_sequence,
-                entry.max_file_sequence,
-            )
-        });
-        store_catalog(
-            &store,
-            &range_catalog_path(region.region_id),
-            &RangeIndexCatalog {
-                indexes: range_entries,
-            },
-        )
-        .await?;
-        store_catalog(
-            &store,
-            &series_catalog_path(region.region_id),
-            &SeriesIndexCatalog {
-                indexes: series_entries,
-            },
-        )
-        .await?;
-    }
-    if !is_current_region_version(&regions, &region, &version) {
-        SERIES_INDEX_RECONCILE_TOTAL
-            .with_label_values(&["stale"])
-            .inc();
-        debug!(
-            "Skipped stale series-index publication after catalog update, worker: {worker_id}, region: {}",
-            region.region_id
-        );
-        return Ok(stats);
-    }
+    store_catalog(
+        store,
+        &range_catalog_path(region_id),
+        &RangeIndexCatalog {
+            indexes: range_entries,
+        },
+    )
+    .await?;
+    store_catalog(
+        store,
+        &series_catalog_path(region_id),
+        &SeriesIndexCatalog {
+            indexes: series_entries,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Publishes the snapshot and retires series files absent from the new version.
+fn publish_index_version(region: &MitoRegionRef, next: Arc<SeriesIndexVersion>) {
     let previous = region.series_index_version_control.publish(next.clone());
     for (id, handle) in &previous.series_indexes {
         if !next.series_indexes.contains_key(id) {
+            // Purge only after readers release their retained handles.
             handle.mark_deleted();
         }
     }
-    let result = if stats.changed() { "changed" } else { "noop" };
-    SERIES_INDEX_RECONCILE_TOTAL
-        .with_label_values(&[result])
-        .inc();
-    SERIES_INDEX_RECONCILE_ELAPSED
-        .with_label_values(&["total"])
-        .observe(total_start.elapsed().as_secs_f64());
-    if stats.changed() {
-        info!(
-            "Reconciled series-index snapshot, worker: {worker_id}, region: {}, elapsed: {:?}, stats: {:?}",
-            region.region_id,
-            total_start.elapsed(),
-            stats
-        );
-    } else {
-        debug!(
-            "Series-index reconciliation made no changes, worker: {worker_id}, region: {}",
-            region.region_id
-        );
-    }
-    Ok(stats)
 }

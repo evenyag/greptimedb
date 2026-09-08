@@ -40,7 +40,7 @@ use crate::config::MitoConfig;
 use crate::engine::MitoEngine;
 use crate::memtable::MemtableBuilderProvider;
 use crate::region::opener::RegionOpener;
-use crate::region::{MitoRegionRef, RegionMap, RegionMapRef};
+use crate::region::{MitoRegionRef, RegionMap};
 use crate::schedule::scheduler::LocalScheduler;
 use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 use crate::test_util::{
@@ -50,7 +50,7 @@ use crate::time_provider::StdTimeProvider;
 use crate::wal::Wal;
 
 /// Builds real sparse SSTs; background maintenance is disabled so tests control publication.
-async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef, RegionMapRef) {
+async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
     let engine = env.create_engine(MitoConfig::default()).await;
     let metadata = Arc::new(sst_region_metadata_with_encoding(
         PrimaryKeyEncoding::Sparse,
@@ -114,21 +114,18 @@ async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef, Region
         flush_region(&engine, region_id, None).await;
     }
     let region = engine.get_region(region_id).unwrap();
-    let regions = Arc::new(RegionMap::default());
-    regions.insert_region(region.clone());
-    (engine, region, regions)
+    (engine, region)
 }
 
 #[tokio::test]
 async fn test_reconcile_restores_and_reuses_indexes() {
     let mut env = TestEnv::with_prefix("series-reconcile").await;
-    let (engine, region, regions) = prepare_region(&mut env).await;
+    let (engine, region) = prepare_region(&mut env).await;
     let store = ObjectStore::new(Memory::default()).unwrap().finish();
     let (purger, _receiver) = series_index_channel(store.clone());
     let stats = reconcile_series_indexes(
         0,
         store.clone(),
-        regions.clone(),
         region.clone(),
         Duration::from_secs(100),
         0,
@@ -182,7 +179,6 @@ async fn test_reconcile_restores_and_reuses_indexes() {
         first.series_indexes[&first_id].entry(),
         restored.series_indexes[&first_id].entry()
     );
-    regions.insert_region(reopened.clone());
 
     // Catalog changes are not reloaded, and missing index files are not repaired.
     for path in [
@@ -194,7 +190,6 @@ async fn test_reconcile_restores_and_reuses_indexes() {
     let stats = reconcile_series_indexes(
         0,
         store.clone(),
-        regions,
         reopened.clone(),
         Duration::from_secs(100),
         0,
@@ -309,7 +304,7 @@ impl mock::Write for FailingSeriesWriter {
 #[tokio::test]
 async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
     let mut env = TestEnv::with_prefix("series-build-failure").await;
-    let (engine, region, regions) = prepare_region(&mut env).await;
+    let (engine, region) = prepare_region(&mut env).await;
     let store = ObjectStore::new(Memory::default()).unwrap().finish();
     let layer = MockLayerBuilder::default()
         .writer_factory(Arc::new(|path, _, inner| {
@@ -326,7 +321,6 @@ async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
         reconcile_series_indexes(
             0,
             failing_store,
-            regions.clone(),
             region.clone(),
             Duration::from_secs(100),
             0,
@@ -348,18 +342,66 @@ async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
         assert!(store.exists(&path).await.unwrap());
     }
     // A retry can rebuild and publish the complete snapshot.
+    let stats = reconcile_series_indexes(0, store, region, Duration::from_secs(100), 0, purger)
+        .await
+        .unwrap();
+    assert_eq!((2, 1), (stats.built_range, stats.built_series));
+    engine.stop().await.unwrap();
+}
+
+#[rstest::rstest]
+#[case::during_build(false)]
+#[case::during_catalog_write(true)]
+#[tokio::test]
+async fn test_reconcile_publishes_after_region_version_changes(#[case] during_catalog_write: bool) {
+    let mut env = TestEnv::with_prefix("series-version-change").await;
+    let (engine, region) = prepare_region(&mut env).await;
+    let initial_version = region.version();
+    let store = ObjectStore::new(Memory::default()).unwrap().finish();
+    let target_region = region.clone();
+    let catalog_path = range_catalog_path(region.region_id);
+    let layer = MockLayerBuilder::default()
+        .writer_factory(Arc::new(move |path, _, inner| {
+            let should_advance = if during_catalog_write {
+                path == catalog_path
+            } else {
+                path.contains("/series/")
+            };
+            if should_advance {
+                // Replace the version while reconciliation is writing its captured snapshot.
+                target_region
+                    .version_control
+                    .alter_options(target_region.version().options.clone());
+            }
+            inner
+        }))
+        .build()
+        .unwrap();
+    let (purger, mut receiver) = series_index_channel(store.clone());
     let stats = reconcile_series_indexes(
         0,
-        store,
-        regions,
-        region,
+        store.clone().layer(layer),
+        region.clone(),
         Duration::from_secs(100),
         0,
-        purger,
+        purger.clone(),
     )
     .await
     .unwrap();
+
+    assert!(!Arc::ptr_eq(&initial_version, &region.version()));
     assert_eq!((2, 1), (stats.built_range, stats.built_series));
+    let published = region.series_index_version();
+    assert_eq!(2, published.range_indexes.len());
+    assert_eq!(1, published.series_indexes.len());
+    let restored = load_version_control(&store, region.region_id, &purger).await;
+    assert_eq!(published.range_indexes, restored.current().range_indexes);
+    let handle = published.series_indexes.values().next().unwrap();
+    assert_eq!(
+        handle.entry(),
+        restored.current().series_indexes[&handle.entry().index_uuid].entry()
+    );
+    assert!(receiver.try_recv().is_err());
     engine.stop().await.unwrap();
 }
 
@@ -369,7 +411,7 @@ async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
 #[tokio::test]
 async fn test_maintenance_wakeup_and_timer(#[case] immediate: bool) {
     let mut env = TestEnv::with_prefix("series-task").await;
-    let (engine, region, regions) = prepare_region(&mut env).await;
+    let (engine, region) = prepare_region(&mut env).await;
     let store = ObjectStore::new(Memory::default()).unwrap().finish();
     let (purger, receiver) = series_index_channel(store.clone());
     let state = Arc::new(super::task::SeriesIndexTaskState::new());
@@ -377,6 +419,8 @@ async fn test_maintenance_wakeup_and_timer(#[case] immediate: bool) {
     if immediate {
         state.wake();
     }
+    let regions = Arc::new(RegionMap::default());
+    regions.insert_region(region.clone());
     let task = super::task::spawn_series_index_tasks(
         0,
         store,
