@@ -23,10 +23,13 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use store_api::storage::{FileId, RegionId};
 
-use super::purger::IndexFilePurger;
-use super::version::{SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl};
 use crate::error::{OpenDalSnafu, Result, SerdeJsonSnafu};
+use crate::series_index::purger::IndexFilePurger;
+use crate::series_index::version::{
+    SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl,
+};
 pub(crate) use crate::sst::range_index::range_index_path;
+
 const SERIES_DIR: &str = "series";
 const RANGE_CATALOG: &str = "range-index.json";
 const SERIES_CATALOG: &str = "series-index.json";
@@ -82,23 +85,23 @@ pub(crate) fn series_metadata(entry: &SeriesIndexEntry) -> Result<Vec<KeyValue>>
     )])
 }
 
-pub(crate) async fn load_catalog<T>(store: &ObjectStore, path: &str) -> T
+pub(crate) async fn load_catalog<T>(store: &ObjectStore, path: &str) -> Option<T>
 where
-    T: Default + DeserializeOwned,
+    T: DeserializeOwned,
 {
     let bytes = match store.read(path).await {
         Ok(bytes) => bytes.to_bytes(),
-        Err(error) if error.kind() == ErrorKind::NotFound => return T::default(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
         Err(error) => {
             warn!(error; "Failed to load series-index catalog, path: {path}");
-            return T::default();
+            return None;
         }
     };
     match serde_json::from_slice(&bytes) {
-        Ok(catalog) => catalog,
+        Ok(catalog) => Some(catalog),
         Err(error) => {
             warn!(error; "Invalid series-index catalog, path: {path}, phase: load");
-            T::default()
+            None
         }
     }
 }
@@ -115,14 +118,32 @@ where
         .context(OpenDalSnafu)
 }
 
+/// Best-effort removal of both catalogs when dropping a region.
+pub(crate) async fn delete_catalogs(store: &ObjectStore, region_id: RegionId) {
+    for path in [
+        series_catalog_path(region_id),
+        range_catalog_path(region_id),
+    ] {
+        if let Err(error) = store.delete(&path).await
+            && error.kind() != ErrorKind::NotFound
+        {
+            warn!(error; "Failed to delete index catalog, path: {path}");
+        }
+    }
+}
+
 /// Restores the in-memory snapshot once when opening a region.
 pub(crate) async fn load_version_control(
     store: &ObjectStore,
     region_id: RegionId,
     purger: &IndexFilePurger,
 ) -> SeriesIndexVersionControl {
-    let range = load_catalog::<RangeIndexCatalog>(store, &range_catalog_path(region_id)).await;
-    let series = load_catalog::<SeriesIndexCatalog>(store, &series_catalog_path(region_id)).await;
+    let range = load_catalog::<RangeIndexCatalog>(store, &range_catalog_path(region_id))
+        .await
+        .unwrap_or_default();
+    let series = load_catalog::<SeriesIndexCatalog>(store, &series_catalog_path(region_id))
+        .await
+        .unwrap_or_default();
     // TODO: Handle catalog entries whose index files are missing from storage.
     let version = SeriesIndexVersion {
         range_indexes: range.indexes.into_iter().collect(),

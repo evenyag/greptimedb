@@ -80,7 +80,7 @@ use crate::request::{
 };
 use crate::schedule::scheduler::{LocalScheduler, SchedulerRef};
 use crate::series_index::{
-    IndexFilePurger, SeriesIndexTaskState, run_series_index_task, series_index_channel,
+    IndexFilePurger, SeriesIndexTaskState, series_index_channel, spawn_series_index_tasks,
 };
 use crate::sst::file::RegionFileId;
 use crate::sst::file_ref::FileReferenceManagerRef;
@@ -604,16 +604,16 @@ impl<S: LogStore> WorkerStarter<S> {
             .map(|(store, state)| {
                 let (purger, purge_receiver) = series_index_channel(store.clone());
                 series_index_purger = Some(purger.clone());
-                common_runtime::spawn_global(run_series_index_task(
+                spawn_series_index_tasks(
                     self.id,
                     store,
                     regions.clone(),
                     state,
-                    self.config.experimental_series_index_reconcile_interval,
                     self.config.experimental_series_index_bucket_width,
-                    purge_receiver,
                     purger,
-                ))
+                    purge_receiver,
+                    self.config.experimental_series_index_maintenance_interval,
+                )
             });
         let now = self.time_provider.current_time_millis();
         let id_string = self.id.to_string();
@@ -1631,7 +1631,7 @@ mod tests {
             .create_worker_group(MitoConfig {
                 num_workers: 4,
                 experimental_series_index_root: "series-index".to_string(),
-                experimental_series_index_reconcile_interval: Duration::from_secs(3600),
+                experimental_series_index_maintenance_interval: Duration::from_secs(3600),
                 ..Default::default()
             })
             .await;

@@ -27,12 +27,12 @@ use store_api::codec::PrimaryKeyEncoding;
 use store_api::metric_engine_consts::PRIMARY_KEY_ENCODING;
 use store_api::region_engine::RegionEngine;
 use store_api::region_request::{RegionPutRequest, RegionRequest};
-use store_api::storage::RegionId;
 use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
+use store_api::storage::{FileId, RegionId};
 
 use super::catalog::{
-    load_version_control, range_catalog_path, range_index_path, series_catalog_path,
-    series_index_path,
+    delete_catalogs, load_catalog, load_version_control, range_catalog_path, range_index_path,
+    series_catalog_path, series_index_path,
 };
 use super::maintenance::reconcile_series_indexes;
 use super::purger::series_index_channel;
@@ -235,6 +235,11 @@ async fn test_load_catalog_defaults_on_missing_invalid_or_unreadable_catalog() {
     let store = ObjectStore::new(Memory::default()).unwrap().finish();
     let region_id = RegionId::new(1, 1);
     let (purger, _receiver) = series_index_channel(store.clone());
+    assert!(
+        load_catalog::<super::catalog::SeriesIndexCatalog>(&store, &series_catalog_path(region_id))
+            .await
+            .is_none()
+    );
     let control = load_version_control(&store, region_id, &purger).await;
     assert!(control.current().range_indexes.is_empty());
     assert!(control.current().series_indexes.is_empty());
@@ -260,7 +265,18 @@ async fn test_load_catalog_defaults_on_missing_invalid_or_unreadable_catalog() {
         .reader_factory(Arc::new(|_, _, _| Box::new(FailingCatalogReader)))
         .build()
         .unwrap();
-    let control = load_version_control(&store.layer(layer), region_id, &purger).await;
+    assert!(
+        load_catalog::<super::catalog::SeriesIndexCatalog>(&store, &series_catalog_path(region_id))
+            .await
+            .is_none()
+    );
+    let store = store.layer(layer);
+    assert!(
+        load_catalog::<super::catalog::RangeIndexCatalog>(&store, &range_catalog_path(region_id))
+            .await
+            .is_none()
+    );
+    let control = load_version_control(&store, region_id, &purger).await;
     assert!(control.current().range_indexes.is_empty());
     assert!(control.current().series_indexes.is_empty());
 }
@@ -345,4 +361,113 @@ async fn test_failed_series_build_keeps_completed_sst_range_indexes() {
     .unwrap();
     assert_eq!((2, 1), (stats.built_range, stats.built_series));
     engine.stop().await.unwrap();
+}
+
+#[rstest::rstest]
+#[case(true)]
+#[case(false)]
+#[tokio::test]
+async fn test_maintenance_wakeup_and_timer(#[case] immediate: bool) {
+    let mut env = TestEnv::with_prefix("series-task").await;
+    let (engine, region, regions) = prepare_region(&mut env).await;
+    let store = ObjectStore::new(Memory::default()).unwrap().finish();
+    let (purger, receiver) = series_index_channel(store.clone());
+    let state = Arc::new(super::task::SeriesIndexTaskState::new());
+    // A notification issued before the task starts must also trigger maintenance.
+    if immediate {
+        state.wake();
+    }
+    let task = super::task::spawn_series_index_tasks(
+        0,
+        store,
+        regions,
+        state.clone(),
+        Duration::from_secs(100),
+        purger,
+        receiver,
+        if immediate {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_millis(20)
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        while region.series_index_version().series_indexes.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    state.stop();
+    task.await.unwrap();
+    engine.stop().await.unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
+async fn test_drop_catalogs_and_retained_snapshot_after_task_stop() {
+    use common_time::Timestamp;
+
+    use super::catalog::{SeriesIndexCatalog, SeriesIndexEntry, store_catalog};
+
+    let store = ObjectStore::new(Memory::default()).unwrap().finish();
+    let region_id = RegionId::new(1, 1);
+    let entry = SeriesIndexEntry {
+        index_uuid: FileId::random(),
+        bucket_start: Timestamp::new_second(0),
+        bucket_end: Timestamp::new_second(100),
+        source_file_ids: vec![FileId::random()],
+        min_file_sequence: 1,
+        max_file_sequence: 2,
+    };
+    let path = series_index_path(region_id, entry.index_uuid);
+    store.write(&path, "index").await.unwrap();
+    store_catalog(
+        &store,
+        &series_catalog_path(region_id),
+        &SeriesIndexCatalog {
+            indexes: vec![entry.clone()],
+        },
+    )
+    .await
+    .unwrap();
+    store_catalog(
+        &store,
+        &range_catalog_path(region_id),
+        &super::catalog::RangeIndexCatalog::default(),
+    )
+    .await
+    .unwrap();
+    let (purger, receiver) = series_index_channel(store.clone());
+    let control = load_version_control(&store, region_id, &purger).await;
+    let snapshot = control.current();
+    assert_eq!(&entry, snapshot.series_indexes[&entry.index_uuid].entry());
+    let state = Arc::new(super::task::SeriesIndexTaskState::new());
+    state.stop();
+    super::task::spawn_series_index_tasks(
+        0,
+        store.clone(),
+        Arc::new(RegionMap::default()),
+        state,
+        Duration::from_secs(100),
+        purger,
+        receiver,
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+    delete_catalogs(&store, region_id).await;
+    // Removing already absent catalogs is harmless.
+    delete_catalogs(&store, region_id).await;
+    assert!(!store.exists(&range_catalog_path(region_id)).await.unwrap());
+    assert!(!store.exists(&series_catalog_path(region_id)).await.unwrap());
+    control.mark_dropped();
+    assert!(store.exists(&path).await.unwrap());
+    drop(snapshot);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.exists(&path).await.unwrap() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

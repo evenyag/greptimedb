@@ -16,14 +16,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common_telemetry::{debug, info, warn};
+use common_telemetry::{debug, info};
 use common_time::{TimeToLive, Timestamp};
 use object_store::ObjectStore;
 use store_api::storage::FileId;
-use tokio::sync::{Notify, mpsc};
 
 use super::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
 use super::builder::{build_range_index, build_series_index};
@@ -31,47 +29,13 @@ use super::catalog::{
     RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, range_catalog_path,
     same_series_coverage, series_catalog_path, store_catalog,
 };
-use super::purger::{IndexFilePurger, PurgeRequest, purge_file};
+use super::purger::IndexFilePurger;
 use super::version::SeriesIndexVersion;
 use crate::error::Result;
 use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTAL};
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::version::VersionRef;
 use crate::region::{MitoRegionRef, RegionMapRef};
-
-/// Shared lifecycle state for a worker's series-index task.
-#[derive(Debug)]
-pub(crate) struct SeriesIndexTaskState {
-    running: AtomicBool,
-    notify: Notify,
-}
-
-impl SeriesIndexTaskState {
-    pub(crate) fn new() -> Self {
-        Self {
-            running: AtomicBool::new(true),
-            notify: Notify::new(),
-        }
-    }
-
-    pub(crate) fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn wake(&self) {
-        self.notify.notify_one();
-    }
-
-    pub(crate) fn stop(&self) {
-        self.running.store(false, Ordering::Release);
-        // notify_one() retains a permit if the task has not started waiting yet.
-        self.notify.notify_one();
-    }
-
-    pub(crate) async fn notified(&self) {
-        self.notify.notified().await;
-    }
-}
 
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileStats {
@@ -309,65 +273,4 @@ pub(crate) async fn reconcile_series_indexes(
         );
     }
     Ok(stats)
-}
-
-/// Runs one sequential reconciliation task for a region worker.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_series_index_task(
-    worker_id: u32,
-    store: ObjectStore,
-    regions: RegionMapRef,
-    state: Arc<SeriesIndexTaskState>,
-    interval: Duration,
-    bucket_width: Duration,
-    mut purge_receiver: mpsc::UnboundedReceiver<PurgeRequest>,
-    purger: IndexFilePurger,
-) {
-    info!("Start series-index reconciliation task, worker: {worker_id}");
-    let mut retry_purges = Vec::new();
-    while state.is_running() {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = state.notified() => {}
-            Some(request) = purge_receiver.recv() => {
-                if !purge_file(&store, request).await {
-                    retry_purges.push(request);
-                }
-                continue;
-            }
-        }
-        if !state.is_running() {
-            break;
-        }
-        for request in std::mem::take(&mut retry_purges) {
-            if !purge_file(&store, request).await {
-                retry_purges.push(request);
-            }
-        }
-        for region in regions.list_regions() {
-            if let Err(error) = reconcile_series_indexes(
-                worker_id,
-                store.clone(),
-                regions.clone(),
-                region.clone(),
-                bucket_width,
-                common_time::util::current_time_millis(),
-                purger.clone(),
-            )
-            .await
-            {
-                SERIES_INDEX_RECONCILE_TOTAL
-                    .with_label_values(&["failure"])
-                    .inc();
-                warn!(error; "Failed to reconcile series indexes, worker: {worker_id}, region: {}, phase: reconcile, retry: true", region.region_id);
-            }
-        }
-    }
-    while let Ok(request) = purge_receiver.try_recv() {
-        retry_purges.push(request);
-    }
-    for request in retry_purges {
-        let _ = purge_file(&store, request).await;
-    }
-    info!("Stop series-index reconciliation task, worker: {worker_id}");
 }

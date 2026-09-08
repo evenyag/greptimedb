@@ -474,24 +474,6 @@ experimental_manifest_keep_removed_file_ttl = "1h"
 ## Whether to compress manifest and checkpoint file by gzip (default false).
 compress_manifest = false
 
-## Max number of running background index jobs (default: 1/8 of cpu cores).
-## @toml2docs:none-default="Auto"
-#+ max_background_index_builds = 1
-
-## Root below `data_home` for range and series indexes, currently stored locally.
-## An empty value disables background series-index maintenance.
-## Under development; do not enable this feature.
-experimental_series_index_root = ""
-
-## Interval between series index reconciliation passes.
-## Under development; do not enable this feature.
-experimental_series_index_reconcile_interval = "5m"
-
-## Requested minimum event-time bucket width for series indexes. The effective width is
-## rounded up to an exact multiple of each region's compaction time window.
-## Under development; do not enable this feature.
-experimental_series_index_bucket_width = "5d"
-
 ## Max number of running background flush jobs (default: 1/2 of cpu cores).
 ## @toml2docs:none-default="Auto"
 #+ max_background_flushes = 4

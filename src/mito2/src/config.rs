@@ -32,6 +32,7 @@ use crate::gc::GcConfig;
 use crate::sst::DEFAULT_WRITE_BUFFER_SIZE;
 
 const MULTIPART_UPLOAD_MINIMUM_SIZE: ReadableSize = ReadableSize::mb(5);
+const DEFAULT_SERIES_INDEX_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Default maximum number of SST files to scan concurrently.
 pub(crate) const DEFAULT_MAX_CONCURRENT_SCAN_FILES: usize = 384;
 
@@ -91,9 +92,9 @@ pub struct MitoConfig {
     /// Under development; do not enable. Root directory for series indexes, currently stored
     /// on the local filesystem. Empty disables the feature.
     pub experimental_series_index_root: String,
-    /// Under development; do not enable. Interval between series-index reconciliation passes.
+    /// Interval between series-index maintenance runs (default 5 min). Zero uses the default.
     #[serde(with = "humantime_serde")]
-    pub experimental_series_index_reconcile_interval: Duration,
+    pub experimental_series_index_maintenance_interval: Duration,
     /// Under development; do not enable. Requested minimum bucket width for series indexes.
     /// It is rounded up to an exact multiple of each region's compaction time window.
     #[serde(with = "humantime_serde")]
@@ -216,7 +217,8 @@ impl Default for MitoConfig {
             compress_manifest: false,
             max_background_index_builds: divide_num_cpus(8),
             experimental_series_index_root: String::new(),
-            experimental_series_index_reconcile_interval: Duration::from_secs(5 * 60),
+            experimental_series_index_maintenance_interval:
+                DEFAULT_SERIES_INDEX_MAINTENANCE_INTERVAL,
             experimental_series_index_bucket_width: Duration::from_secs(5 * 24 * 60 * 60),
             max_background_flushes: divide_num_cpus(2),
             max_background_compactions: divide_num_cpus(4),
@@ -302,6 +304,15 @@ impl MitoConfig {
             let cpu_cores = get_total_cpu_cores();
             warn!("Sanitize max background purges 0 to {}", cpu_cores);
             self.max_background_purges = cpu_cores;
+        }
+
+        if self
+            .experimental_series_index_maintenance_interval
+            .is_zero()
+        {
+            warn!("Sanitize series-index maintenance interval 0 to 5 minutes");
+            self.experimental_series_index_maintenance_interval =
+                DEFAULT_SERIES_INDEX_MAINTENANCE_INTERVAL;
         }
 
         if !self.experimental_series_index_root.trim().is_empty()
@@ -422,6 +433,36 @@ mod tests {
         config.adjust_buffer_and_cache_size(ReadableSize::gb(64));
         assert_eq!(ReadableSize::mb(512), config.sst_meta_cache_size);
         assert_eq!(ReadableSize::mb(128), config.prefilter_result_cache_size);
+    }
+
+    #[test]
+    fn test_series_index_config() {
+        assert!(
+            MitoConfig::default()
+                .experimental_series_index_root
+                .is_empty()
+        );
+        let mut config: MitoConfig = toml::from_str(
+            "experimental_series_index_root = 'indexes'
+             experimental_series_index_maintenance_interval = '30s'",
+        )
+        .unwrap();
+        config.sanitize("/data").unwrap();
+        assert_eq!(config.experimental_series_index_root, "/data/indexes");
+        assert_eq!(
+            config.experimental_series_index_maintenance_interval,
+            Duration::from_secs(30)
+        );
+        let restored: MitoConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config, restored);
+
+        let mut config: MitoConfig =
+            toml::from_str("experimental_series_index_maintenance_interval = '0s'").unwrap();
+        config.sanitize("/data").unwrap();
+        assert_eq!(
+            config.experimental_series_index_maintenance_interval,
+            MitoConfig::default().experimental_series_index_maintenance_interval
+        );
     }
 
     #[test]
