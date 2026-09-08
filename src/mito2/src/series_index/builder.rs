@@ -23,11 +23,6 @@ use object_store::ObjectStore;
 use snafu::OptionExt;
 use store_api::storage::FileId;
 
-use super::bucket::SeriesBucket;
-use super::catalog::{SeriesIndexEntry, range_index_path, series_index_path, series_metadata};
-use super::purger::{IndexFilePurger, IndexFileType, file_operation};
-use super::version::SeriesIndexFileHandle;
-use super::{SeriesIndexWriter, SeriesIndexWriterOptions};
 use crate::error::{Result, UnexpectedSnafu};
 use crate::read::BoxedRecordBatchStream;
 use crate::read::flat_merge::FlatMergeReader;
@@ -35,6 +30,13 @@ use crate::read::prune::FlatPruneReader;
 use crate::read::read_columns::ReadColumns;
 use crate::region::MitoRegionRef;
 use crate::region::version::VersionRef;
+use crate::series_index::bucket::SeriesBucket;
+use crate::series_index::catalog::{
+    SeriesIndexEntry, range_index_path, series_index_path, series_metadata,
+};
+use crate::series_index::purger::{IndexFilePurger, IndexFileType, file_operation};
+use crate::series_index::version::SeriesIndexFileHandle;
+use crate::series_index::{SeriesIndexWriter, SeriesIndexWriterOptions};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::reader::{FlatRowGroupReader, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;

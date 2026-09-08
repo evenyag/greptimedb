@@ -23,19 +23,19 @@ use common_time::{TimeToLive, Timestamp};
 use object_store::ObjectStore;
 use store_api::storage::FileId;
 
-use super::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
-use super::builder::{build_range_index, build_series_index};
-use super::catalog::{
-    RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, range_catalog_path,
-    same_series_coverage, series_catalog_path, store_catalog,
-};
-use super::purger::IndexFilePurger;
-use super::version::SeriesIndexVersion;
 use crate::error::Result;
 use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTAL};
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::version::VersionRef;
 use crate::region::{MitoRegionRef, RegionMapRef};
+use crate::series_index::bucket::{plan_series_buckets, rounded_bucket_width, series_entry};
+use crate::series_index::builder::{build_range_index, build_series_index};
+use crate::series_index::catalog::{
+    RangeIndexCatalog, SeriesIndexCatalog, SeriesIndexEntry, range_catalog_path,
+    same_series_coverage, series_catalog_path, store_catalog,
+};
+use crate::series_index::purger::IndexFilePurger;
+use crate::series_index::version::SeriesIndexVersion;
 
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileStats {

@@ -19,7 +19,7 @@ use std::time::Duration;
 use common_time::Timestamp;
 use store_api::storage::FileId;
 
-use super::catalog::SeriesIndexEntry;
+use crate::series_index::catalog::SeriesIndexEntry;
 use crate::sst::file::FileHandle;
 
 #[derive(Debug, Clone)]
