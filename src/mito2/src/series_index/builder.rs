@@ -190,8 +190,6 @@ pub(crate) async fn build_series_index(
     while let Some(batch) = visible.try_next().await? {
         writer.write(&batch).await?;
     }
-    writer.finish().await?;
-    file_operation(IndexFileType::Series, "build", "success");
     let range_indexes = std::mem::take(&mut *completed_ranges.lock().unwrap());
     if range_indexes.len() != expected_ranges {
         return UnexpectedSnafu {
@@ -199,6 +197,8 @@ pub(crate) async fn build_series_index(
         }
         .fail();
     }
+    writer.finish().await?;
+    file_operation(IndexFileType::Series, "build", "success");
     Ok((
         SeriesIndexFileHandle::new(region.region_id, entry.clone(), purger.clone()),
         range_indexes,

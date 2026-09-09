@@ -33,7 +33,25 @@ use crate::series_index::catalog::{
     RangeIndexCatalog, SeriesIndexCatalog, range_catalog_path, series_catalog_path, store_catalog,
 };
 use crate::series_index::purger::IndexFilePurger;
-use crate::series_index::version::SeriesIndexVersion;
+use crate::series_index::version::{SeriesIndexFileHandle, SeriesIndexVersion};
+
+/// Retires newly completed series files unless their snapshot is published.
+#[derive(Default)]
+struct UnpublishedSeriesFiles(Vec<SeriesIndexFileHandle>);
+
+impl UnpublishedSeriesFiles {
+    fn disarm(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for UnpublishedSeriesFiles {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.mark_deleted();
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ReconcileStats {
@@ -71,6 +89,7 @@ pub(crate) async fn reconcile_series_indexes(
         return Ok(ReconcileStats::default());
     }
     let build_start = Instant::now();
+    let mut unpublished = UnpublishedSeriesFiles::default();
     let (next, stats) = build_index_version(
         worker_id,
         &store,
@@ -79,6 +98,7 @@ pub(crate) async fn reconcile_series_indexes(
         requested_bucket_width,
         now_ms,
         &purger,
+        &mut unpublished,
     )
     .await?;
     SERIES_INDEX_RECONCILE_ELAPSED
@@ -89,6 +109,7 @@ pub(crate) async fn reconcile_series_indexes(
         persist_index_catalogs(&store, region.region_id, &next).await?;
     }
     publish_index_version(&region, Arc::new(next));
+    unpublished.disarm();
     let result = if stats.changed() { "changed" } else { "noop" };
     SERIES_INDEX_RECONCILE_TOTAL
         .with_label_values(&[result])
@@ -113,6 +134,7 @@ pub(crate) async fn reconcile_series_indexes(
 }
 
 /// Builds the next snapshot, retaining reusable indexes and removing obsolete coverage.
+#[allow(clippy::too_many_arguments)]
 async fn build_index_version(
     worker_id: u32,
     store: &ObjectStore,
@@ -121,6 +143,7 @@ async fn build_index_version(
     requested_bucket_width: Duration,
     now_ms: i64,
     purger: &IndexFilePurger,
+    unpublished: &mut UnpublishedSeriesFiles,
 ) -> Result<(SeriesIndexVersion, ReconcileStats)> {
     let mut stats = ReconcileStats::default();
     let files = version
@@ -180,6 +203,7 @@ async fn build_index_version(
             purger,
         )
         .await?;
+        unpublished.0.push(series_handle.clone());
         stats.built_series += 1;
         stats.built_range += built_ranges.len();
         range_indexes.extend(built_ranges);

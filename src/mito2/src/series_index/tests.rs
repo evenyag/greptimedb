@@ -50,7 +50,14 @@ use crate::time_provider::StdTimeProvider;
 use crate::wal::Wal;
 
 /// Builds real sparse SSTs; background maintenance is disabled so tests control publication.
-async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
+pub(super) async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
+    prepare_region_with_timestamps(env, &[1000, 2000, 3000, 4000]).await
+}
+
+async fn prepare_region_with_timestamps(
+    env: &mut TestEnv,
+    timestamps: &[i64],
+) -> (MitoEngine, MitoRegionRef) {
     let engine = env.create_engine(MitoConfig::default()).await;
     let metadata = Arc::new(sst_region_metadata_with_encoding(
         PrimaryKeyEncoding::Sparse,
@@ -75,6 +82,11 @@ async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
         "compaction.twcs.time_window".to_string(),
         "100s".to_string(),
     );
+    // Keep the source SSTs stable while tests reconcile multiple buckets.
+    request.options.insert(
+        "compaction.twcs.trigger_file_num".to_string(),
+        "100".to_string(),
+    );
     let full_schema = rows_schema(&request);
     let mut pk_column = full_schema[0].clone();
     pk_column.column_name = PRIMARY_KEY_COLUMN_NAME.to_string();
@@ -85,7 +97,7 @@ async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
-    for ts in [1000, 2000, 3000, 4000] {
+    for &ts in timestamps {
         engine
             .handle_request(
                 region_id,
@@ -412,6 +424,167 @@ async fn test_reconcile_publishes_after_region_version_changes(#[case] during_ca
         handle.entry(),
         restored.current().series_indexes[&handle.entry().index_uuid].entry()
     );
+    assert!(receiver.try_recv().is_err());
+    engine.stop().await.unwrap();
+}
+
+#[rstest::rstest]
+#[case::later_bucket("series")]
+#[case::standalone_range("range")]
+#[case::range_catalog("range-index.json")]
+#[case::series_catalog("series-index.json")]
+#[tokio::test]
+async fn test_failed_reconcile_retires_only_unpublished_series(#[case] failure: &'static str) {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    use super::bucket::{plan_series_buckets, plan_series_indexes};
+    use super::builder::build_series_index;
+    use super::purger::run_index_purge_task;
+    use super::version::SeriesIndexVersion;
+
+    let mut env = TestEnv::with_prefix("series-unpublished-cleanup").await;
+    let mut timestamps = vec![
+        -99000, -98000, -97000, -96000, 1000, 2000, 3000, 4000, 101000,
+    ];
+    if failure != "range" {
+        timestamps.extend([102000, 103000, 104000]);
+    }
+    let (engine, region) = prepare_region_with_timestamps(&mut env, &timestamps).await;
+    let store = ObjectStore::new(Memory::default()).unwrap();
+    let (purger, mut receiver) = series_index_channel(store.clone());
+
+    // Publish the first bucket so failed attempts must preserve a reused handle.
+    let version = region.version();
+    let files = version
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .cloned()
+        .collect::<Vec<_>>();
+    let plan = plan_series_indexes(
+        plan_series_buckets(&files, 100),
+        Default::default(),
+        None,
+        0,
+    );
+    let (bucket, entry) = &plan.builds[0];
+    let missing = bucket
+        .files
+        .iter()
+        .map(|file| file.file_id().file_id())
+        .collect();
+    let (handle, ranges) =
+        build_series_index(&store, &region, &version, bucket, entry, &missing, &purger)
+            .await
+            .unwrap();
+    let reused_path = series_index_path(region.region_id, entry.index_uuid);
+    region
+        .series_index_version_control
+        .publish(Arc::new(SeriesIndexVersion::new(
+            ranges,
+            HashMap::from([(entry.index_uuid, handle)]),
+        )));
+    let previous = region.series_index_version();
+    let standalone_path = files
+        .iter()
+        .find(|file| file.time_range().0 == common_time::Timestamp::new_millisecond(101000))
+        .map(|file| range_index_path(region.region_id, file.file_id().file_id()))
+        .unwrap();
+
+    // Each failed retry creates fresh UUIDs; every completed output must be retired.
+    for _ in 0..2 {
+        let attempted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = attempted.clone();
+        let standalone_path = standalone_path.clone();
+        let layer = MockLayerBuilder::default()
+            .writer_factory(Arc::new(move |path, _, inner| {
+                let mut paths = recorded.lock().unwrap();
+                if path.contains("/series/") {
+                    paths.push(path.to_string());
+                }
+                let fail = match failure {
+                    "series" => path.contains("/series/") && paths.len() == 2,
+                    "range" => path == standalone_path,
+                    catalog => path.ends_with(catalog),
+                };
+                Box::new(FailingSeriesWriter { inner, fail })
+            }))
+            .build()
+            .unwrap();
+        assert!(
+            reconcile_series_indexes(
+                0,
+                store.clone().layer(layer),
+                region.clone(),
+                Duration::from_secs(100),
+                0,
+                purger.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&previous, &region.series_index_version()));
+
+        let completed = attempted
+            .lock()
+            .unwrap()
+            .iter()
+            .take(if failure.ends_with(".json") { 2 } else { 1 })
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            if failure.ends_with(".json") { 2 } else { 1 },
+            completed.len()
+        );
+        let mut retired = HashSet::new();
+        // Drain through the real purge task using a finite channel.
+        let (drain_purger, drain_receiver) = series_index_channel(store.clone());
+        while let Ok(request) = receiver.try_recv() {
+            let path = series_index_path(request.file_id.region_id(), request.file_id.file_id());
+            assert!(store.exists(&path).await.unwrap());
+            assert!(retired.insert(path));
+            drain_purger.purge(request);
+        }
+        assert_eq!(completed, retired);
+        drop(drain_purger);
+        run_index_purge_task(0, store.clone(), drain_receiver).await;
+        let attempted_paths = attempted.lock().unwrap().clone();
+        for path in attempted_paths {
+            assert!(!store.exists(&path).await.unwrap());
+        }
+        assert!(store.exists(&reused_path).await.unwrap());
+    }
+
+    let stats = reconcile_series_indexes(
+        0,
+        store.clone(),
+        region.clone(),
+        Duration::from_secs(100),
+        0,
+        purger,
+    )
+    .await
+    .unwrap();
+    assert_eq!(if failure == "range" { 1 } else { 2 }, stats.built_series);
+    let published = region.series_index_version();
+    for handle in published.series_indexes.values() {
+        assert!(
+            store
+                .exists(&series_index_path(
+                    region.region_id,
+                    handle.entry().index_uuid
+                ))
+                .await
+                .unwrap()
+        );
+    }
+    // Release all snapshots without retiring them: neither reused nor published files
+    // should have been marked deleted by the cleanup guard.
+    region.series_index_version_control.publish(Arc::default());
+    drop(published);
+    drop(previous);
     assert!(receiver.try_recv().is_err());
     engine.stop().await.unwrap();
 }

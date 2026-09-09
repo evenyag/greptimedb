@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::metrics::SERIES_INDEX_RECONCILE_TOTAL;
-use crate::region::RegionMapRef;
+use crate::region::{RegionLeaderState, RegionMapRef, RegionRoleState};
 use crate::series_index::maintenance::reconcile_series_indexes;
 use crate::series_index::purger::{IndexFilePurger, PurgeRequest, run_index_purge_task};
 
@@ -134,6 +134,14 @@ impl SeriesIndexTask {
             if !self.state.is_running() {
                 break;
             }
+            // Best effort: the region can still change state during reconciliation.
+            // Local indexes can be built on followers as well as writable leaders.
+            if !matches!(
+                region.state(),
+                RegionRoleState::Follower | RegionRoleState::Leader(RegionLeaderState::Writable)
+            ) {
+                continue;
+            }
             if let Err(error) = reconcile_series_indexes(
                 self.worker_id,
                 self.store.clone(),
@@ -150,5 +158,65 @@ impl SeriesIndexTask {
                 warn!(error; "Failed to reconcile series indexes, worker: {}, region: {}", self.worker_id, region.region_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::services::Memory;
+    use store_api::region_engine::RegionEngine;
+
+    use super::*;
+    use crate::region::RegionMap;
+    use crate::series_index::catalog::{range_catalog_path, series_catalog_path};
+    use crate::series_index::purger::series_index_channel;
+    use crate::series_index::tests::prepare_region;
+    use crate::test_util::TestEnv;
+
+    #[rstest::rstest]
+    #[case::follower(RegionRoleState::Follower, true)]
+    #[case::writable(RegionRoleState::Leader(RegionLeaderState::Writable), true)]
+    #[case::staging(RegionRoleState::Leader(RegionLeaderState::Staging), false)]
+    #[case::entering_staging(RegionRoleState::Leader(RegionLeaderState::EnteringStaging), false)]
+    #[case::altering(RegionRoleState::Leader(RegionLeaderState::Altering), false)]
+    #[case::dropping(RegionRoleState::Leader(RegionLeaderState::Dropping), false)]
+    #[case::truncating(RegionRoleState::Leader(RegionLeaderState::Truncating), false)]
+    #[case::editing(RegionRoleState::Leader(RegionLeaderState::Editing), false)]
+    #[case::downgrading(RegionRoleState::Leader(RegionLeaderState::Downgrading), false)]
+    #[tokio::test]
+    async fn test_maintenance_region_states(#[case] role: RegionRoleState, #[case] builds: bool) {
+        let mut env = TestEnv::with_prefix("series-maintenance-state").await;
+        let (engine, region) = prepare_region(&mut env).await;
+        // Install the desired state without triggering the corresponding DDL.
+        region.switch_state_to_staging(RegionLeaderState::Writable);
+        region
+            .manifest_ctx
+            .exit_staging(region.region_id, role)
+            .unwrap();
+        let store = ObjectStore::new(Memory::default()).unwrap();
+        let (purger, _receiver) = series_index_channel(store.clone());
+        let regions = Arc::new(RegionMap::default());
+        regions.insert_region(region.clone());
+        let mut task = SeriesIndexTask {
+            store: store.clone(),
+            regions,
+            bucket_width: Duration::from_secs(100),
+            purger,
+            worker_id: 0,
+            state: Arc::new(SeriesIndexTaskState::new()),
+            interval: Duration::from_secs(3600),
+        };
+        task.maintain().await;
+        assert_eq!(
+            builds,
+            !region.series_index_version().series_indexes.is_empty()
+        );
+        for path in [
+            range_catalog_path(region.region_id),
+            series_catalog_path(region.region_id),
+        ] {
+            assert_eq!(builds, store.exists(&path).await.unwrap());
+        }
+        engine.stop().await.unwrap();
     }
 }
