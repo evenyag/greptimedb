@@ -29,6 +29,7 @@ use crate::metrics::SERIES_INDEX_RECONCILE_TOTAL;
 use crate::region::{RegionLeaderState, RegionMapRef, RegionRoleState};
 use crate::series_index::maintenance::reconcile_series_indexes;
 use crate::series_index::purger::{IndexFilePurger, PurgeRequest, run_index_purge_task};
+use crate::time_provider::TimeProviderRef;
 
 /// Shared lifecycle state for a worker's series-index task.
 #[derive(Debug)]
@@ -75,6 +76,7 @@ pub(crate) fn spawn_series_index_tasks(
     purger: IndexFilePurger,
     purge_receiver: UnboundedReceiver<PurgeRequest>,
     interval: Duration,
+    time_provider: TimeProviderRef,
 ) -> JoinHandle<()> {
     // Snapshots may retain senders after the worker stops; purge until all senders drop.
     common_runtime::spawn_global(run_index_purge_task(
@@ -91,6 +93,7 @@ pub(crate) fn spawn_series_index_tasks(
             purger,
             state,
             interval,
+            time_provider,
         }
         .run()
         .await;
@@ -106,6 +109,7 @@ struct SeriesIndexTask {
     worker_id: u32,
     state: Arc<SeriesIndexTaskState>,
     interval: Duration,
+    time_provider: TimeProviderRef,
 }
 
 impl SeriesIndexTask {
@@ -113,9 +117,10 @@ impl SeriesIndexTask {
     async fn run(mut self) {
         let worker_id = self.worker_id;
         info!("Start series-index background task, worker: {worker_id}");
-        let interval = self.interval;
+        let interval = self.time_provider.wait_duration(self.interval);
         let mut timer = tokio::time::interval_at(Instant::now() + interval, interval);
-        timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Schedule future ticks from a late tick rather than the original cadence.
+        timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         while self.state.is_running() {
             tokio::select! {
                 _ = self.state.notified() => {}
@@ -147,7 +152,7 @@ impl SeriesIndexTask {
                 self.store.clone(),
                 region.clone(),
                 self.bucket_width,
-                common_time::util::current_time_millis(),
+                self.time_provider.current_time_millis(),
                 self.purger.clone(),
             )
             .await
@@ -205,6 +210,7 @@ mod tests {
             worker_id: 0,
             state: Arc::new(SeriesIndexTaskState::new()),
             interval: Duration::from_secs(3600),
+            time_provider: Arc::new(crate::time_provider::StdTimeProvider),
         };
         task.maintain().await;
         assert_eq!(

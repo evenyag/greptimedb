@@ -88,6 +88,8 @@ impl Drop for SeriesIndexFileHandleInner {
 /// Immutable series-index snapshot for one region.
 #[derive(Debug, Default)]
 pub(crate) struct SeriesIndexVersion {
+    /// Range indexes for visible SSTs; reconciliation removes IDs absent from its SST snapshot.
+    /// Physical deletion is independently handled by the SST file purger.
     pub(crate) range_indexes: HashSet<FileId>,
     pub(crate) series_indexes: HashMap<FileId, SeriesIndexFileHandle>,
     pub(crate) index_buckets: BTreeMap<Timestamp, IndexBucket>,
@@ -103,11 +105,12 @@ impl SeriesIndexVersion {
         for handle in series_indexes.values() {
             let entry = handle.entry();
             IndexBucket {
+                start: entry.bucket_start,
                 end: entry.bucket_end,
                 index_ids: smallvec![entry.index_uuid],
                 max_file_sequence: entry.max_file_sequence,
             }
-            .insert_into(entry.bucket_start, &mut index_buckets);
+            .insert_into(&mut index_buckets);
         }
         Self {
             range_indexes,

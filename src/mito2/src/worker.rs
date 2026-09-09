@@ -613,6 +613,7 @@ impl<S: LogStore> WorkerStarter<S> {
                     purger,
                     purge_receiver,
                     self.config.experimental_series_index_maintenance_interval,
+                    self.time_provider.clone(),
                 )
             });
         let now = self.time_provider.current_time_millis();

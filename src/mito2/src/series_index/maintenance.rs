@@ -27,7 +27,9 @@ use crate::metrics::{SERIES_INDEX_RECONCILE_ELAPSED, SERIES_INDEX_RECONCILE_TOTA
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::MitoRegionRef;
 use crate::region::version::VersionRef;
-use crate::series_index::bucket::{plan_series_buckets, plan_series_indexes, rounded_bucket_width};
+use crate::series_index::bucket::{
+    group_files_into_series_buckets, plan_series_indexes, rounded_bucket_width,
+};
 use crate::series_index::builder::{build_range_index, build_series_index};
 use crate::series_index::catalog::{
     RangeIndexCatalog, SeriesIndexCatalog, range_catalog_path, series_catalog_path, store_catalog,
@@ -105,10 +107,10 @@ pub(crate) async fn reconcile_series_indexes(
         .with_label_values(&["build"])
         .observe(build_start.elapsed().as_secs_f64());
     // Persist both catalogs before making the new snapshot visible to readers.
-    if stats.changed() {
+    if let Some(next) = next {
         persist_index_catalogs(&store, region.region_id, &next).await?;
+        publish_index_version(&region, Arc::new(next));
     }
-    publish_index_version(&region, Arc::new(next));
     unpublished.disarm();
     let result = if stats.changed() { "changed" } else { "noop" };
     SERIES_INDEX_RECONCILE_TOTAL
@@ -133,7 +135,8 @@ pub(crate) async fn reconcile_series_indexes(
     Ok(stats)
 }
 
-/// Builds the next snapshot, retaining reusable indexes and removing obsolete coverage.
+/// Builds a changed snapshot, retaining reusable indexes and removing obsolete coverage.
+/// Returns `None` when no range or series indexes were added or removed.
 #[allow(clippy::too_many_arguments)]
 async fn build_index_version(
     worker_id: u32,
@@ -144,7 +147,7 @@ async fn build_index_version(
     now_ms: i64,
     purger: &IndexFilePurger,
     unpublished: &mut UnpublishedSeriesFiles,
-) -> Result<(SeriesIndexVersion, ReconcileStats)> {
+) -> Result<(Option<SeriesIndexVersion>, ReconcileStats)> {
     let mut stats = ReconcileStats::default();
     let files = version
         .ssts
@@ -159,12 +162,13 @@ async fn build_index_version(
         .map(|file| file.file_id().file_id())
         .collect::<HashSet<_>>();
     let current = region.series_index_version();
-    let mut range_indexes = current.range_indexes.clone();
-    range_indexes.retain(|file_id| visible.contains(file_id));
-    stats.removed_range = current.range_indexes.len() - range_indexes.len();
+    // The SST purger deletes companion range files after final handle release. Prune
+    // metadata here using the captured SST snapshot, independently of physical deletion;
+    // a later region-version change is picked up by the next reconciliation.
+    stats.removed_range = current.range_indexes.difference(&visible).count();
     let buckets = match version.compaction_time_window {
         Some(window) => rounded_bucket_width(requested_bucket_width, window)
-            .map(|width| plan_series_buckets(&files, width))
+            .map(|width| group_files_into_series_buckets(&files, width))
             .unwrap_or_default(),
         None => {
             debug!(
@@ -182,6 +186,15 @@ async fn build_index_version(
     );
     stats.computed_buckets = plan.computed_buckets;
     stats.skipped_buckets = plan.skipped_buckets;
+    if plan.builds.is_empty()
+        && plan.expired_index_ids.is_empty()
+        && stats.removed_range == 0
+        && current.range_indexes.len() == visible.len()
+    {
+        return Ok((None, stats));
+    }
+    let mut range_indexes = current.range_indexes.clone();
+    range_indexes.retain(|file_id| visible.contains(file_id));
     let mut series_indexes = current.series_indexes.clone();
     for id in &plan.expired_index_ids {
         series_indexes.remove(id);
@@ -225,12 +238,17 @@ async fn build_index_version(
         .keys()
         .filter(|id| !series_indexes.contains_key(id))
         .count();
+    // Bucket reconciliation is speculative until indexes change. Recompute its coverage
+    // next time rather than replacing the published snapshot on a no-op pass.
+    if !stats.changed() {
+        return Ok((None, stats));
+    }
     let next = SeriesIndexVersion {
         range_indexes,
         series_indexes,
         index_buckets: plan.index_buckets,
     };
-    Ok((next, stats))
+    Ok((Some(next), stats))
 }
 
 /// Writes catalogs in a stable order; the two writes are not atomic together.
