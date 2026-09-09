@@ -34,6 +34,10 @@ const SERIES_CATALOG: &str = "series-index.json";
 const SERIES_METADATA_KEY: &str = "greptime.series_index";
 
 /// Self-describing coverage stored in a series-index Parquet footer.
+///
+/// A published entry must include every series from every SST in the region
+/// contained by its bucket and inclusive file-sequence interval. Query planning
+/// relies on this complete-coverage contract, not on `source_file_ids`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SeriesIndexEntry {
     pub(crate) index_uuid: FileId,
@@ -44,6 +48,23 @@ pub(crate) struct SeriesIndexEntry {
     pub(crate) source_file_ids: Vec<FileId>,
     pub(crate) min_file_sequence: u64,
     pub(crate) max_file_sequence: u64,
+}
+
+impl SeriesIndexEntry {
+    /// Whether this index completely covers an SST in the query's sequence domain.
+    pub(crate) fn covers_file(
+        &self,
+        file: &crate::sst::file::FileMeta,
+        region_id: RegionId,
+    ) -> bool {
+        file.region_id == region_id
+            && file.time_range.0 <= file.time_range.1
+            && self.bucket_start <= file.time_range.0
+            && file.time_range.1 < self.bucket_end
+            && file.sequence.is_some_and(|sequence| {
+                self.min_file_sequence <= sequence.get() && sequence.get() <= self.max_file_sequence
+            })
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -190,6 +211,44 @@ mod tests {
                 mock::ErrorKind::Unexpected,
                 "injected catalog read failure",
             ))
+        }
+    }
+
+    #[test]
+    fn coverage_uses_exclusive_time_end_and_inclusive_file_sequences() {
+        let region_id = RegionId::new(1, 1);
+        let entry = SeriesIndexEntry {
+            index_uuid: FileId::random(),
+            bucket_start: Timestamp::new_second(1),
+            bucket_end: Timestamp::new_second(2),
+            source_file_ids: Vec::new(),
+            min_file_sequence: 2,
+            max_file_sequence: 4,
+        };
+        for (start, end, sequence, own_region, covered) in [
+            (1000, 1999, 2, true, true),
+            (1000, 1999, 4, true, true),
+            (999, 1999, 3, true, false),
+            (1000, 2000, 3, true, false),
+            (1000, 1999, 1, true, false),
+            (1000, 1999, 5, true, false),
+            (1000, 1999, 0, true, false),
+            (1000, 1999, 3, false, false),
+        ] {
+            let file = crate::sst::file::FileMeta {
+                region_id: if own_region {
+                    region_id
+                } else {
+                    RegionId::new(2, 1)
+                },
+                time_range: (
+                    Timestamp::new_millisecond(start),
+                    Timestamp::new_millisecond(end),
+                ),
+                sequence: std::num::NonZeroU64::new(sequence),
+                ..Default::default()
+            };
+            assert_eq!(covered, entry.covers_file(&file, region_id), "{file:?}");
         }
     }
 
