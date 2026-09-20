@@ -701,6 +701,11 @@ compress_manifest = false
 ## Interval between series-index maintenance runs. Zero uses the default of 5 min.
 #+ experimental_series_index_maintenance_interval = "5m"
 
+## Build buckets with fewer than four SSTs after their coverage stays unchanged
+## for this duration. Checked on the maintenance interval; observation restarts
+## when the region is reopened. Zero disables the wait.
+#+ experimental_series_index_idle_timeout = "10m"
+
 ## Requested minimum series-index bucket width (default: 5 days), rounded up to
 ## an exact multiple of each region's compaction time window.
 #+ experimental_series_index_bucket_width = "5days"

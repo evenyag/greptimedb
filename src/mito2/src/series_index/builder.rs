@@ -214,6 +214,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use datatypes::data_type::ConcreteDataType;
     use object_store::layers::mock::{self, MockLayerBuilder, oio};
@@ -221,7 +222,9 @@ mod tests {
     use store_api::region_engine::RegionEngine;
 
     use super::*;
-    use crate::series_index::bucket::{group_files_into_series_buckets, plan_series_indexes};
+    use crate::series_index::bucket::{
+        SeriesIndexBuildState, group_files_into_series_buckets, plan_series_indexes,
+    };
     use crate::series_index::catalog::{
         SeriesIndexCatalog, load_version_control, series_catalog_path, store_catalog,
     };
@@ -242,6 +245,8 @@ mod tests {
             BTreeMap::new(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, plan.builds.len());
         plan.builds.pop().unwrap()
@@ -338,6 +343,8 @@ mod tests {
                 recovered.index_buckets.clone(),
                 None,
                 0,
+                &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+                Instant::now(),
             );
             assert!(repeated.builds.is_empty());
             assert_eq!(recovered.index_buckets, repeated.index_buckets);

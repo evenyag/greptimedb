@@ -28,7 +28,8 @@ use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::version::VersionRef;
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionRoleState};
 use crate::series_index::bucket::{
-    group_files_into_series_buckets, plan_series_indexes, rounded_bucket_width,
+    SeriesIndexBuildState, group_files_into_series_buckets, plan_series_indexes,
+    rounded_bucket_width,
 };
 use crate::series_index::builder::{build_range_index, build_series_index};
 use crate::series_index::catalog::{
@@ -74,6 +75,7 @@ impl ReconcileStats {
 }
 
 /// Reconciles indexes for one region snapshot, persists catalogs, then atomically publishes it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_series_indexes(
     worker_id: u32,
     store: ObjectStore,
@@ -82,11 +84,14 @@ pub(crate) async fn reconcile_series_indexes(
     now_ms: i64,
     purger: IndexFilePurger,
     enable_range_index: bool,
+    build_state: &mut SeriesIndexBuildState,
+    now: Instant,
 ) -> Result<ReconcileStats> {
     let total_start = Instant::now();
     // Use this snapshot throughout reconciliation, even if the region version advances.
     let version = region.version_control.current().version;
     if !is_sparse_metric_metadata(&version.metadata) {
+        build_state.clear();
         SERIES_INDEX_RECONCILE_TOTAL
             .with_label_values(&["noop"])
             .inc();
@@ -104,6 +109,8 @@ pub(crate) async fn reconcile_series_indexes(
         &purger,
         &mut unpublished,
         enable_range_index,
+        build_state,
+        now,
     )
     .await?;
     SERIES_INDEX_RECONCILE_ELAPSED
@@ -113,6 +120,7 @@ pub(crate) async fn reconcile_series_indexes(
     let publish_result: Result<()> = async {
         if let Some(next) = next {
             persist_index_catalogs(&store, region.region_id, &next, &stats).await?;
+            build_state.published(&next.index_buckets);
             publish_index_version(&region, Arc::new(next));
             unpublished.disarm();
         }
@@ -125,6 +133,7 @@ pub(crate) async fn reconcile_series_indexes(
     if region.state() == RegionRoleState::Leader(RegionLeaderState::Dropping) {
         delete_catalogs(&store, region.region_id).await;
         region.series_index_version_control.mark_dropped();
+        build_state.clear();
         stats = ReconcileStats::default();
     }
     publish_result?;
@@ -164,6 +173,8 @@ async fn build_index_version(
     purger: &IndexFilePurger,
     unpublished: &mut UnpublishedSeriesFiles,
     enable_range_index: bool,
+    build_state: &mut SeriesIndexBuildState,
+    now: Instant,
 ) -> Result<(Option<SeriesIndexVersion>, ReconcileStats)> {
     let mut stats = ReconcileStats::default();
     let files = version
@@ -204,6 +215,8 @@ async fn build_index_version(
         current.index_buckets.clone(),
         version.options.ttl,
         now_ms,
+        build_state,
+        now,
     );
     stats.computed_buckets = plan.computed_buckets;
     stats.skipped_buckets = plan.skipped_buckets;

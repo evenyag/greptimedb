@@ -623,6 +623,7 @@ impl<S: LogStore> WorkerStarter<S> {
                     self.config.experimental_series_index_maintenance_interval,
                     self.time_provider.clone(),
                     self.config.experimental_enable_range_index,
+                    self.config.experimental_series_index_idle_timeout,
                 )
             });
         let now = self.time_provider.current_time_millis();

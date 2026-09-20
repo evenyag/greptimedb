@@ -2512,6 +2512,7 @@ compress_manifest = false
 experimental_enable_series_index = false
 experimental_enable_range_index = false
 experimental_series_index_maintenance_interval = "5m"
+experimental_series_index_idle_timeout = "10m"
 experimental_series_index_bucket_width = "5days"
 experimental_compaction_memory_limit = "unlimited"
 experimental_compaction_on_exhausted = "wait"

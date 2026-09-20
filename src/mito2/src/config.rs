@@ -98,6 +98,11 @@ pub struct MitoConfig {
     /// Interval between series-index maintenance runs (default 5 min). Zero uses the default.
     #[serde(with = "humantime_serde")]
     pub experimental_series_index_maintenance_interval: Duration,
+    /// Build buckets with fewer than four SSTs after their coverage stays unchanged
+    /// for this duration (default 10 min). Zero disables the wait. Checked during
+    /// maintenance; observation starts over when a region is reopened.
+    #[serde(with = "humantime_serde")]
+    pub experimental_series_index_idle_timeout: Duration,
     /// Under development; do not enable. Requested minimum bucket width for series indexes.
     /// It is rounded up to an exact multiple of each region's compaction time window.
     #[serde(with = "humantime_serde")]
@@ -224,6 +229,7 @@ impl Default for MitoConfig {
             experimental_series_index_maintenance_interval:
                 DEFAULT_SERIES_INDEX_MAINTENANCE_INTERVAL,
             experimental_series_index_bucket_width: Duration::from_secs(5 * 24 * 60 * 60),
+            experimental_series_index_idle_timeout: Duration::from_secs(10 * 60),
             max_background_flushes: divide_num_cpus(2),
             max_background_compactions: divide_num_cpus(4),
             max_background_purges: get_total_cpu_cores(),
@@ -442,11 +448,13 @@ mod tests {
             "experimental_enable_series_index = true
              experimental_enable_range_index = false
              experimental_series_index_maintenance_interval = '30s'
+             experimental_series_index_idle_timeout = '0s'
              experimental_series_index_bucket_width = '2days'",
         )
         .unwrap();
         config.sanitize("/data").unwrap();
         assert!(config.experimental_enable_series_index);
+        assert!(config.experimental_series_index_idle_timeout.is_zero());
         assert!(!config.experimental_enable_range_index);
         assert_eq!(
             config.experimental_series_index_maintenance_interval,

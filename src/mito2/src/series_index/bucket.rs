@@ -15,8 +15,9 @@
 //! Event-time bucket planning and source coverage.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use common_telemetry::info;
 use common_time::{TimeToLive, Timestamp};
 use smallvec::{SmallVec, smallvec};
 use store_api::storage::FileId;
@@ -25,6 +26,44 @@ use crate::series_index::catalog::{SeriesIndexEntry, WindowSequence};
 use crate::sst::file::FileHandle;
 
 const SERIES_INDEX_TRIGGER_FILES: usize = 4;
+
+/// Observed coverage awaiting an idle-triggered build. Never persisted or shared with readers.
+struct PendingSeriesBucket {
+    end: Timestamp,
+    compaction_window_secs: i64,
+    window_sequences: BTreeMap<i64, WindowSequence>,
+    unchanged_since: Instant,
+}
+
+/// Per-region build observations owned by the background maintenance task.
+pub(crate) struct SeriesIndexBuildState {
+    idle_timeout: Duration,
+    pending: BTreeMap<Timestamp, PendingSeriesBucket>,
+}
+
+impl SeriesIndexBuildState {
+    pub(crate) fn new(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Clear completed observations only after catalog publication succeeds.
+    pub(crate) fn published(&mut self, indexes: &BTreeMap<Timestamp, IndexBucket>) {
+        self.pending.retain(|start, pending| {
+            !indexes.get(start).is_some_and(|indexed| {
+                indexed.end == pending.end
+                    && indexed.compaction_window_secs == pending.compaction_window_secs
+                    && indexed.window_sequences == pending.window_sequences
+            })
+        });
+    }
+}
 
 /// Index files sharing a non-overlapping, half-open time bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +166,8 @@ pub(crate) fn plan_series_indexes(
     mut index_buckets: BTreeMap<Timestamp, IndexBucket>,
     ttl: Option<TimeToLive>,
     now_ms: i64,
+    build_state: &mut SeriesIndexBuildState,
+    now: Instant,
 ) -> SeriesIndexPlan {
     // Reconciliation changes geometry, not established coverage. In particular,
     // a deferred bridge must not change the indexed snapshot.
@@ -149,11 +190,14 @@ pub(crate) fn plan_series_indexes(
     });
     let mut builds = Vec::new();
     let mut superseded_index_ids = Vec::new();
+    // Only observations still requiring builds survive this pass. Retain eligible
+    // observations until publication succeeds so failed builds can retry immediately.
+    let mut previous = std::mem::take(&mut build_state.pending);
     for bucket in buckets {
         if expired(bucket.end) {
             continue;
         }
-        if bucket.has_unknown_sequence {
+        if bucket.has_unknown_sequence || bucket.files.is_empty() {
             continue;
         }
         if index_buckets.get(&bucket.start).is_some_and(|indexed| {
@@ -163,7 +207,47 @@ pub(crate) fn plan_series_indexes(
         }) {
             continue;
         }
+        let trigger = if bucket.files.len() >= SERIES_INDEX_TRIGGER_FILES {
+            "file_count"
+        } else {
+            let pending = previous.remove(&bucket.start).filter(|pending| {
+                pending.end == bucket.end
+                    && pending.compaction_window_secs == bucket.compaction_window_secs
+                    && pending.window_sequences == bucket.window_sequences
+            });
+            let pending = pending.unwrap_or_else(|| {
+                if !build_state.idle_timeout.is_zero() {
+                    info!(
+                        "Waiting for idle series-index bucket, region: {:?}, start: {:?}, end: {:?}, files: {}, idle_timeout: {:?}",
+                        bucket.files.first().map(|file| file.meta_ref().region_id),
+                        bucket.start,
+                        bucket.end,
+                        bucket.files.len(),
+                        build_state.idle_timeout,
+                    );
+                }
+                PendingSeriesBucket {
+                    end: bucket.end,
+                    compaction_window_secs: bucket.compaction_window_secs,
+                    window_sequences: bucket.window_sequences.clone(),
+                    unchanged_since: now,
+                }
+            });
+            let idle = now.saturating_duration_since(pending.unchanged_since);
+            build_state.pending.insert(bucket.start, pending);
+            if idle < build_state.idle_timeout {
+                continue;
+            }
+            "idle_timeout"
+        };
         if let Some(entry) = bucket.to_series_entry() {
+            info!(
+                "Planning series-index build, region: {:?}, start: {:?}, end: {:?}, files: {}, trigger: {trigger}",
+                bucket.files.first().map(|file| file.meta_ref().region_id),
+                bucket.start,
+                bucket.end,
+                bucket.files.len(),
+            );
             index_buckets.retain(|_, indexed| {
                 if indexed.start < bucket.end && bucket.start < indexed.end {
                     superseded_index_ids.extend_from_slice(&indexed.index_ids);
@@ -317,9 +401,9 @@ fn merge_window_sequences(
 
 impl SeriesBucket {
     /// Creates entry metadata with a fresh UUID and sorted source file IDs.
-    /// Returns `None` for unknown sequences or too few files.
+    /// Returns `None` for unknown sequences or an empty bucket.
     fn to_series_entry(&self) -> Option<SeriesIndexEntry> {
-        if self.has_unknown_sequence || self.files.len() < SERIES_INDEX_TRIGGER_FILES {
+        if self.has_unknown_sequence || self.files.is_empty() {
             return None;
         }
         let mut source_file_ids = self
@@ -429,8 +513,8 @@ mod tests {
         );
         assert_eq!(3, buckets[0].max_file_sequence);
         assert_eq!(4, buckets[1].max_file_sequence);
-        assert!(buckets[0].to_series_entry().is_none());
-        assert!(buckets[1].to_series_entry().is_none());
+        assert!(buckets[0].to_series_entry().is_some());
+        assert!(buckets[1].to_series_entry().is_some());
         let mut files = files.to_vec();
         files.push(file(
             None,
@@ -499,7 +583,14 @@ mod tests {
         ];
         let planned = group_files_into_series_buckets(&files, 10, 10);
         assert_eq!(4, planned.len());
-        let plan = plan_series_indexes(planned, indexes, None, 0);
+        let plan = plan_series_indexes(
+            planned,
+            indexes,
+            None,
+            0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
+        );
         assert_eq!((2, 1), (plan.computed_buckets, plan.skipped_buckets));
         let [(bucket, entry)] = plan.builds.as_slice() else {
             panic!("expected one replacement build");
@@ -540,6 +631,8 @@ mod tests {
             BTreeMap::new(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         let first_id = initial.builds[0].1.index_uuid;
 
@@ -550,6 +643,8 @@ mod tests {
             initial.index_buckets.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(replaced.builds.is_empty());
         assert!(replaced.expired_index_ids.is_empty());
@@ -561,6 +656,8 @@ mod tests {
             replaced.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         let [(bucket, entry)] = ready.builds.as_slice() else {
             panic!("a changed window must rebuild the whole bucket");
@@ -589,6 +686,8 @@ mod tests {
             ready.index_buckets.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(repeated.builds.is_empty());
         assert_eq!(ready.index_buckets, repeated.index_buckets);
@@ -599,6 +698,8 @@ mod tests {
             ready.index_buckets,
             Some(TimeToLive::Duration(Duration::from_secs(10))),
             21_000,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(expired.builds.is_empty());
         assert!(expired.index_buckets.is_empty());
@@ -623,6 +724,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_idle_builds_follow_coverage_changes_not_compaction_file_ids() {
+        let ts = Timestamp::new_second;
+        let mut state = SeriesIndexBuildState::new(Duration::from_secs(600));
+        let start = Instant::now();
+        let mut files = vec![
+            file(Some(1), 0, ts(0), ts(9)),
+            file(Some(1), 0, ts(100), ts(109)),
+        ];
+        let plan = |state: &mut SeriesIndexBuildState, files: &[FileHandle], indexes, seconds| {
+            plan_series_indexes(
+                group_files_into_series_buckets(files, 100, 10),
+                indexes,
+                None,
+                0,
+                state,
+                start + Duration::from_secs(seconds),
+            )
+        };
+        assert!(
+            plan(&mut state, &files, BTreeMap::new(), 0)
+                .builds
+                .is_empty()
+        );
+        // New coverage resets only the affected bucket's timer.
+        files[0] = file(Some(2), 0, ts(0), ts(9));
+        assert!(
+            plan(&mut state, &files, BTreeMap::new(), 300)
+                .builds
+                .is_empty()
+        );
+        // Compaction replaces an SST without changing its coverage summary.
+        files[0] = file(Some(2), 1, ts(0), ts(9));
+        let ready = plan(&mut state, &files, BTreeMap::new(), 600);
+        assert_eq!(1, ready.builds.len());
+        assert_eq!(ts(100), ready.builds[0].0.start);
+        state.published(&ready.index_buckets);
+        let waiting = plan(&mut state, &files, ready.index_buckets, 899);
+        assert!(waiting.builds.is_empty());
+        let ready = plan(&mut state, &files, waiting.index_buckets, 900);
+        assert_eq!(1, ready.builds.len());
+        assert_eq!(ts(0), ready.builds[0].0.start);
+        assert_eq!(
+            vec![files[0].file_id().file_id()],
+            ready.builds[0].1.source_file_ids
+        );
+        state.published(&ready.index_buckets);
+        assert!(state.pending.is_empty());
+        assert!(
+            plan(&mut state, &files, ready.index_buckets, 1500)
+                .builds
+                .is_empty()
+        );
+    }
+
     #[rstest::rstest]
     #[case(32)]
     #[case(33)]
@@ -638,6 +794,8 @@ mod tests {
             BTreeMap::new(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, initial.builds.len());
         assert_eq!(
@@ -649,6 +807,8 @@ mod tests {
             initial.index_buckets.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(repeated.builds.is_empty());
         assert_eq!(initial.index_buckets, repeated.index_buckets);
@@ -668,6 +828,8 @@ mod tests {
             repeated.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, replaced.builds.len());
         assert_eq!(1, replaced.superseded_index_ids.len());
@@ -676,6 +838,8 @@ mod tests {
             replaced.index_buckets.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(repeated.builds.is_empty());
         assert_eq!(replaced.index_buckets, repeated.index_buckets);
@@ -697,6 +861,8 @@ mod tests {
             BTreeMap::new(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, initial.builds.len());
         // The maximum end survives even when the highest sequence is in a shorter SST.
@@ -711,6 +877,8 @@ mod tests {
             initial.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         let [(bucket, entry)] = plan.builds.as_slice() else {
             panic!("new data must rebuild the bucket");
@@ -728,6 +896,8 @@ mod tests {
             plan.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(repeated.builds.is_empty());
     }
@@ -755,6 +925,8 @@ mod tests {
             indexes.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(deferred.builds.is_empty());
         assert!(deferred.superseded_index_ids.is_empty());
@@ -765,6 +937,8 @@ mod tests {
             deferred.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, plan.builds.len());
         assert_eq!(4, plan.builds[0].0.files.len());
@@ -780,6 +954,8 @@ mod tests {
             indexes.clone(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(unknown.builds.is_empty());
         assert_eq!(indexes, unknown.index_buckets);
@@ -806,6 +982,8 @@ mod tests {
             BTreeMap::new(),
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         if add_window {
             files = original;
@@ -818,6 +996,8 @@ mod tests {
             initial.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert_eq!(1, plan.builds.len());
         assert_eq!(1, plan.superseded_index_ids.len());
@@ -826,6 +1006,8 @@ mod tests {
             plan.index_buckets,
             None,
             0,
+            &mut SeriesIndexBuildState::new(Duration::from_secs(600)),
+            Instant::now(),
         );
         assert!(repeated.builds.is_empty());
     }
