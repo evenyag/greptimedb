@@ -14,8 +14,6 @@
 
 //! Structs for partition ranges.
 
-use std::collections::HashSet;
-
 use common_time::Timestamp;
 use smallvec::{SmallVec, smallvec};
 use store_api::region_engine::PartitionRange;
@@ -411,20 +409,12 @@ impl FileRangeBuilder {
     /// This does not read index data pages or consume any range references.
     pub(crate) async fn estimate_row_group_count(
         &self,
-        requested: &HashSet<i64>,
         predicate: Option<&Predicate>,
     ) -> crate::error::Result<usize> {
         let Some(context) = &self.context else {
             return Ok(0);
         };
-        let all = requested.iter().any(|index| *index < 0);
-        let mut row_groups = self
-            .selection
-            .iter()
-            .filter_map(|(index, _)| {
-                (all || requested.contains(&(*index as i64))).then_some(*index)
-            })
-            .collect::<Vec<_>>();
+        let mut row_groups: Vec<_> = self.selection.iter().map(|(index, _)| *index).collect();
         if !row_groups.is_empty()
             && let Some(searcher) = context.range_index_searcher().await?
         {

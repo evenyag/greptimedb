@@ -4084,31 +4084,68 @@ async fn test_two_phase_sparse_metric_exact_sequence_cache_isolation() {
         filters: vec![col("tag_0").gt_eq(lit(ScalarValue::Utf8(Some("a".to_string()))))],
         ..Default::default()
     };
-    let scan = |request| async {
+    let engine_ref = &engine;
+    let scan = |request, target| async move {
+        let engine = engine_ref;
         let scanner = engine.scanner(region_id, request).await.unwrap();
-        let Scanner::Series(scanner) = scanner else {
+        let Scanner::Series(mut scanner) = scanner else {
             panic!("sparse metric scan must use SeriesScan");
         };
         assert_eq!("two_phase", scanner.mode());
-        assert_eq!(1, scanner.properties().num_partitions());
-        let batches = RecordBatches::try_collect(scanner.build_stream().await.unwrap())
-            .await
+        let ranges = scanner
+            .properties()
+            .partitions
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut partitions = vec![Vec::new(); target];
+        partitions[0] = ranges;
+        scanner
+            .prepare(
+                PrepareRequest::default()
+                    .with_ranges(partitions)
+                    .with_target_partitions(target),
+            )
             .unwrap();
+        let metrics = ExecutionPlanMetricsSet::default();
+        let streams = (0..target)
+            .map(|partition| {
+                scanner
+                    .scan_partition(
+                        &store_api::region_engine::QueryScanContext::default(),
+                        &metrics,
+                        partition,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let stream = common_recordbatch::util::ChainedRecordBatchStream::new(streams).unwrap();
+        let batches = RecordBatches::try_collect(Box::pin(stream)).await.unwrap();
+        assert_eq!(
+            1,
+            metrics
+                .clone_inner()
+                .sum_by_name("series_active_partitions")
+                .unwrap()
+                .as_usize()
+        );
         (
             canonical_sparse_rows(&batches),
             format!("{}", VerboseDisplay(scanner)),
         )
     };
 
-    let (cold, _) = scan(restrictive.clone()).await;
+    let (cold, _) = scan(restrictive.clone(), 1).await;
     // Cache insertion is performed by the range stream's async concat task.
     // Wait for the SeriesReader's data-stage entry, rather than treating a
     // candidate-stage cache hit as evidence that the reader replayed its data.
+    // A different target must still choose one active partition from cached counts.
     let warm = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let (rows, verbose) = scan(restrictive.clone()).await;
-            // The single output partition is 0; the candidate distributor uses
-            // synthetic partition 1. Only a partition-0 hit proves data replay.
+            let (rows, verbose) = scan(restrictive.clone(), 3).await;
+            // The active output partition is 0. Its data cache key is unchanged
+            // even though the target grew from one partition to three.
             let data_metrics = verbose
                 .split("\"partition\":0, \"metrics\":")
                 .nth(1)
@@ -4137,10 +4174,13 @@ async fn test_two_phase_sparse_metric_exact_sequence_cache_isolation() {
 
     // (0, 5] selects the same three flushed files as (0, 4] but its output
     // includes a's sequence-5 row, so it must not reuse the restrictive rows.
-    let (different_upper, _) = scan(ScanRequest {
-        memtable_max_sequence: Some(5),
-        ..restrictive.clone()
-    })
+    let (different_upper, _) = scan(
+        ScanRequest {
+            memtable_max_sequence: Some(5),
+            ..restrictive.clone()
+        },
+        1,
+    )
     .await;
     assert_eq!(
         vec![
@@ -4154,11 +4194,14 @@ async fn test_two_phase_sparse_metric_exact_sequence_cache_isolation() {
         "different upper bound reused restrictive rows"
     );
 
-    let (unbounded, _) = scan(ScanRequest {
-        distribution: Some(TimeSeriesDistribution::PerSeries),
-        filters: restrictive.filters.clone(),
-        ..Default::default()
-    })
+    let (unbounded, _) = scan(
+        ScanRequest {
+            distribution: Some(TimeSeriesDistribution::PerSeries),
+            filters: restrictive.filters.clone(),
+            ..Default::default()
+        },
+        1,
+    )
     .await;
     assert_eq!(
         vec![

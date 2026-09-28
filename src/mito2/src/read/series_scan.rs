@@ -15,6 +15,7 @@
 //! Per-series scan implementation.
 
 use std::fmt;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +48,7 @@ use crate::error::{
 };
 use crate::read::ScannerMetrics;
 use crate::read::pruner::{PartitionPruner, Pruner, PrunerOptions};
+use crate::read::range_cache::CandidateRowGroupStats;
 use crate::read::scan_region::{ScanInput, StreamContext};
 use crate::read::scan_util::{
     PartitionMetrics, PartitionMetricsList, SeriesDistributorMetrics, compute_average_batch_size,
@@ -56,6 +58,7 @@ use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::{SeriesCandidateScanner, is_sparse_metric_metadata};
 use crate::read::series_reader::{AssignedSeriesBatch, SeriesBatchCollector, SeriesReader};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
+use crate::series_index::MetricSeriesIdStream;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
 
@@ -880,8 +883,100 @@ impl SeriesCandidateDistributor {
             part_metrics.clone(),
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
-        let row_group_counts = candidate_scanner.prepare_row_group_counts().await?;
-        let estimated_mean = mean_surviving_row_groups(&row_group_counts);
+        let (candidates, stats) = candidate_scanner.build_stream().await?;
+        let estimate = async {
+            let Some(mut stats) = stats else {
+                return Ok(None);
+            };
+            stats.merge(candidate_scanner.estimate_indexed_row_groups().await?);
+            Ok(Some(stats))
+        };
+        let result = self
+            .distribute_candidates(
+                candidates,
+                estimate,
+                &partition_pruner,
+                CANDIDATE_SERIES_ASSIGNMENT_THRESHOLD,
+            )
+            .await;
+        part_metrics.on_finish();
+        result
+    }
+
+    /// Chooses parallelism at the first send. Index pruning is polled alongside
+    /// candidates, but is no longer needed once the assignment becomes chunked.
+    async fn distribute_candidates(
+        &mut self,
+        mut candidates: MetricSeriesIdStream,
+        estimate: impl Future<Output = Result<Option<CandidateRowGroupStats>>>,
+        partition_pruner: &Arc<PartitionPruner>,
+        threshold: usize,
+    ) -> Result<()> {
+        let mut estimate = Some(Box::pin(estimate));
+        let mut estimated_stats = Ok(None);
+        let mut collector = SeriesBatchCollector::default();
+        let mut chunked = false;
+        loop {
+            if !self.should_fetch_candidates() {
+                return Ok(());
+            }
+            let batch = tokio::select! {
+                () = self.receivers_closed() => return Ok(()),
+                result = async {
+                    match estimate.as_mut() {
+                        Some(future) => future.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    estimated_stats = result;
+                    estimate = None;
+                    continue;
+                }
+                batch = candidates.try_next() => batch?,
+            };
+            let Some(batch) = batch else {
+                break;
+            };
+            collector.push(batch);
+            if collector.len() > threshold {
+                if !chunked {
+                    chunked = true;
+                    // Drop pending work and any error from estimation. Data
+                    // readers still perform their normal pruning and checks.
+                    estimate = None;
+                    estimated_stats = Ok(None);
+                    self.set_active_partitions(None);
+                }
+                let assignments = collector
+                    .finish(self.partitions.len(), false)
+                    .context(InvalidSenderSnafu)?;
+                self.send_assignments(assignments, partition_pruner);
+                collector = SeriesBatchCollector::default();
+            }
+        }
+
+        if collector.len() > 0 && self.should_fetch_candidates() {
+            let active_partitions = if chunked {
+                self.partitions.len()
+            } else {
+                let stats = match estimate {
+                    Some(future) => tokio::select! {
+                        () = self.receivers_closed() => return Ok(()),
+                        stats = future => stats?,
+                    },
+                    None => estimated_stats?,
+                };
+                self.set_active_partitions(stats.and_then(|stats| stats.mean()))
+            };
+            let assignments = collector
+                .finish(active_partitions, !chunked)
+                .context(InvalidSenderSnafu)?;
+            self.send_assignments(assignments, partition_pruner);
+        }
+        Ok(())
+    }
+
+    fn set_active_partitions(&mut self, estimated_mean: Option<usize>) -> usize {
         let active_partitions = estimated_mean
             .unwrap_or(self.partitions.len())
             .min(self.partitions.len());
@@ -894,37 +989,7 @@ impl SeriesCandidateDistributor {
         for sender in &mut self.senders[active_partitions..] {
             *sender = None;
         }
-        if !self.should_fetch_candidates() {
-            part_metrics.on_finish();
-            return Ok(());
-        }
-        let mut candidates = candidate_scanner.build_stream().await?;
-        let mut collector =
-            SeriesBatchCollector::new(active_partitions).context(InvalidSenderSnafu)?;
-        let mut chunked = false;
-        while let Some(batch) = candidates.try_next().await? {
-            if !self.should_fetch_candidates() {
-                part_metrics.on_finish();
-                return Ok(());
-            }
-            collector.push(batch);
-            if collector.len() >= CANDIDATE_SERIES_ASSIGNMENT_THRESHOLD {
-                chunked = true;
-                self.send_assignments(collector.finish(false), &partition_pruner);
-                if !self.should_fetch_candidates() {
-                    part_metrics.on_finish();
-                    return Ok(());
-                }
-                collector =
-                    SeriesBatchCollector::new(active_partitions).context(InvalidSenderSnafu)?;
-            }
-        }
-
-        if collector.len() > 0 {
-            self.send_assignments(collector.finish(!chunked), &partition_pruner);
-        }
-        part_metrics.on_finish();
-        Ok(())
+        active_partitions
     }
 
     fn send_assignments(
@@ -952,6 +1017,11 @@ impl SeriesCandidateDistributor {
         }
     }
 
+    async fn receivers_closed(&self) {
+        futures::future::join_all(self.senders.iter().flatten().map(|sender| sender.closed()))
+            .await;
+    }
+
     fn should_fetch_candidates(&self) -> bool {
         self.active_receivers.load(Ordering::Relaxed) > 0
             && self
@@ -968,17 +1038,6 @@ impl SeriesCandidateDistributor {
             let _ = sender.send(result);
         }
     }
-}
-
-/// Rounded-up mean across surviving SSTs; empty SSTs do not limit memtable work.
-fn mean_surviving_row_groups(counts: &[usize]) -> Option<usize> {
-    let mut total = 0u128;
-    let mut files = 0u128;
-    for count in counts.iter().copied().filter(|count| *count > 0) {
-        total += count as u128;
-        files += 1;
-    }
-    (files > 0).then(|| total.div_ceil(files) as usize)
 }
 
 /// Batches of the same series.
@@ -1273,20 +1332,10 @@ mod tests {
     use crate::test_util::scheduler_util::SchedulerEnv;
     use crate::test_util::sst_util::sst_region_metadata_with_encoding;
 
-    #[test]
-    fn surviving_row_group_mean() {
-        assert_eq!(None, mean_surviving_row_groups(&[]));
-        assert_eq!(None, mean_surviving_row_groups(&[0, 0]));
-        assert_eq!(Some(1), mean_surviving_row_groups(&[0, 1, 1]));
-        assert_eq!(Some(3), mean_surviving_row_groups(&[1, 4]));
-        assert_eq!(
-            Some(usize::MAX),
-            mean_surviving_row_groups(&[usize::MAX, usize::MAX])
-        );
-    }
-
     #[tokio::test]
-    async fn candidate_distributor_ignores_closed_inactive_partitions() {
+    async fn candidate_distribution_defers_assignment_and_cancels_unused_estimation() {
+        use crate::series_index::MetricSeriesId;
+
         let env = SchedulerEnv::new().await;
         let metadata = Arc::new(sst_region_metadata_with_encoding(
             store_api::codec::PrimaryKeyEncoding::Sparse,
@@ -1297,26 +1346,135 @@ mod tests {
         )
         .build();
         let scanner = SeriesScan::new(input, true);
-        let (mut senders, mut receivers, active_receivers) = new_candidate_channel_list(3);
-        senders[1] = None;
-        senders[2] = None;
-        let distributor = SeriesCandidateDistributor {
-            stream_ctx: scanner.stream_ctx.clone(),
-            range_semaphore: Arc::new(Semaphore::new(3)),
-            partitions: scanner.properties.partitions.clone(),
-            pruner: scanner.pruner.clone(),
-            senders,
-            active_receivers: active_receivers.clone(),
-            metrics_set: ExecutionPlanMetricsSet::default(),
-            metrics_list: Arc::new(PartitionMetricsList::default()),
-            explain_verbose: false,
-        };
-        assert!(distributor.should_fetch_candidates());
-        drop(receivers[0].take());
-        assert_eq!(2, active_receivers.load(Ordering::Relaxed));
-        assert!(!distributor.should_fetch_candidates());
-        assert!(receivers[1].as_mut().unwrap().recv().await.is_none());
-        assert!(receivers[2].as_mut().unwrap().recv().await.is_none());
+        let pruner = Arc::new(PartitionPruner::new(scanner.pruner.clone(), &[]));
+        for (count, cancel, fail) in [
+            (2, false, false),
+            (3, false, false),
+            (5, false, false),
+            (2, true, false),
+            (2, false, true),
+            (0, false, false),
+        ] {
+            let (senders, mut receivers, active_receivers) = new_candidate_channel_list(3);
+            let mut distributor = SeriesCandidateDistributor {
+                stream_ctx: scanner.stream_ctx.clone(),
+                range_semaphore: Arc::new(Semaphore::new(3)),
+                partitions: vec![Vec::new(); 3],
+                pruner: scanner.pruner.clone(),
+                senders,
+                active_receivers,
+                metrics_set: ExecutionPlanMetricsSet::default(),
+                metrics_list: Arc::new(PartitionMetricsList::default()),
+                explain_verbose: false,
+            };
+            let expected: Vec<_> = (0..count)
+                .map(|i| MetricSeriesId {
+                    table_id: i as u32,
+                    tsid: if i % 2 == 0 { 0 } else { u64::MAX },
+                })
+                .collect();
+            let input = expected.clone();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            let candidates = Box::pin(try_stream! {
+                let first = input.len().min(4);
+                if first > 0 {
+                    yield input[..first].to_vec();
+                }
+                if input.len() > first {
+                    resume_rx.await.unwrap();
+                    yield input[first..].to_vec();
+                }
+            });
+            let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();
+            let mut distribution = Box::pin(distributor.distribute_candidates(
+                candidates,
+                async { stats_rx.await.unwrap() },
+                &pruner,
+                3,
+            ));
+            let mut received = Vec::new();
+            if count > 3 {
+                assert!(futures::poll!(&mut distribution).is_pending());
+                assert!(stats_tx.is_closed(), "chunking must drop pending pruning");
+                // The first assignments arrive before the candidate stream ends.
+                for (partition, receiver) in receivers.iter_mut().enumerate() {
+                    while let Ok(input) = receiver.as_mut().unwrap().receiver.try_recv() {
+                        received.push((partition, input.unwrap().assigned_series));
+                    }
+                }
+                assert_eq!(
+                    4,
+                    received
+                        .iter()
+                        .map(|(_, batch)| batch.series().len())
+                        .sum::<usize>()
+                );
+                resume_tx.send(()).unwrap();
+            } else if count > 0 {
+                assert!(futures::poll!(&mut distribution).is_pending());
+                assert!(
+                    receivers.iter_mut().all(|receiver| receiver
+                        .as_mut()
+                        .unwrap()
+                        .receiver
+                        .try_recv()
+                        .is_err())
+                );
+                if cancel {
+                    receivers.clear();
+                } else {
+                    let result = if fail {
+                        crate::error::UnexpectedSnafu {
+                            reason: "injected pruning failure",
+                        }
+                        .fail()
+                    } else {
+                        let mut stats = CandidateRowGroupStats::default();
+                        stats.add_file(1);
+                        Ok(Some(stats))
+                    };
+                    stats_tx.send(result).unwrap();
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), distribution)
+                .await
+                .unwrap();
+            assert_eq!(fail, result.is_err());
+            if cancel || fail {
+                continue;
+            }
+            if count > 0 && count <= 3 {
+                assert!(receivers[1].as_mut().unwrap().recv().await.is_none());
+                assert!(receivers[2].as_mut().unwrap().recv().await.is_none());
+                while let Ok(input) = receivers[0].as_mut().unwrap().receiver.try_recv() {
+                    received.push((0, input.unwrap().assigned_series));
+                }
+                // Inactive receivers must not keep the distributor alive.
+                drop(receivers[0].take());
+                assert!(!distributor.should_fetch_candidates());
+            }
+            drop(distributor);
+            for (partition, receiver) in receivers.iter_mut().enumerate() {
+                if let Some(receiver) = receiver {
+                    while let Some(input) = receiver.recv().await {
+                        received.push((partition, input.unwrap().assigned_series));
+                    }
+                }
+            }
+            let mut actual = Vec::new();
+            for (partition, batch) in received {
+                assert_eq!(count <= 3, batch.enable_range_cache());
+                for series in batch.series() {
+                    assert_eq!(
+                        if count <= 3 || series.tsid == 0 { 0 } else { 2 },
+                        partition
+                    );
+                    actual.push(*series);
+                }
+            }
+            actual.sort_unstable();
+            assert_eq!(expected, actual);
+        }
     }
 
     #[tokio::test]

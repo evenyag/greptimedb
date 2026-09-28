@@ -322,6 +322,7 @@ impl SeqScan {
                 stream_ctx.input.cache_strategy.clone(),
                 key,
                 part_metrics.clone(),
+                None,
             ),
             None => stream,
         };

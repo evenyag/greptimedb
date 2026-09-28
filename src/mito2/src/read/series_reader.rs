@@ -111,46 +111,43 @@ impl AssignedSeriesBatch {
     }
 }
 
-/// Collects candidate batches and assigns every TSID by its integer range.
+/// Buffers candidates until the distributor chooses the data-reader parallelism.
+#[derive(Default)]
 pub(crate) struct SeriesBatchCollector {
-    assignments: Vec<Vec<MetricSeriesId>>,
-    num_series: usize,
+    series: Vec<MetricSeriesId>,
 }
 
 impl SeriesBatchCollector {
-    pub(crate) fn new(partitions: usize) -> Option<Self> {
-        (partitions > 0).then(|| Self {
-            assignments: (0..partitions).map(|_| Vec::new()).collect(),
-            num_series: 0,
-        })
-    }
-
     pub(crate) fn push(&mut self, batch: Vec<MetricSeriesId>) {
-        self.num_series += batch.len();
-        let partitions = self.assignments.len();
-        for series in batch {
-            let partition = SeriesRange::partition_for(series.tsid, partitions);
-            self.assignments[partition].push(series);
-        }
+        self.series.extend(batch);
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.num_series
+        self.series.len()
     }
 
-    pub(crate) fn finish(self, enable_range_cache: bool) -> Vec<AssignedSeriesBatch> {
-        let partitions = self.assignments.len();
-        self.assignments
-            .into_iter()
-            .enumerate()
-            .map(|(partition, series)| {
-                AssignedSeriesBatch::new(
-                    SeriesRange::new(partition, partitions).unwrap(),
-                    series,
+    pub(crate) fn finish(
+        self,
+        partitions: usize,
+        enable_range_cache: bool,
+    ) -> Option<Vec<AssignedSeriesBatch>> {
+        if partitions == 0 {
+            return None;
+        }
+        let mut assignments: Vec<_> = (0..partitions)
+            .map(|partition| {
+                Some(AssignedSeriesBatch::new(
+                    SeriesRange::new(partition, partitions)?,
+                    Vec::new(),
                     enable_range_cache,
-                )
+                ))
             })
-            .collect()
+            .collect::<Option<_>>()?;
+        for series in self.series {
+            let partition = SeriesRange::partition_for(series.tsid, partitions);
+            assignments[partition].series.push(series);
+        }
+        Some(assignments)
     }
 }
 
@@ -486,6 +483,7 @@ async fn build_series_partition_range(
             stream_ctx.input.cache_strategy.clone(),
             key,
             part_metrics,
+            None,
         ),
         None => stream,
     };
@@ -596,9 +594,12 @@ mod tests {
         partition: usize,
         series: Vec<MetricSeriesId>,
     ) -> AssignedSeriesBatch {
-        let mut collector = SeriesBatchCollector::new(partitions).unwrap();
+        let mut collector = SeriesBatchCollector::default();
         collector.push(series);
-        collector.finish(true).remove(partition)
+        collector
+            .finish(partitions, true)
+            .unwrap()
+            .remove(partition)
     }
 
     #[test]
@@ -611,15 +612,15 @@ mod tests {
             series(1, u64::MAX),
             series(3, 0),
         ];
-        let mut first = SeriesBatchCollector::new(4).unwrap();
+        let mut first = SeriesBatchCollector::default();
         first.push(input.clone());
-        let first = first.finish(true);
+        let first = first.finish(4, true).unwrap();
 
-        let mut second = SeriesBatchCollector::new(4).unwrap();
+        let mut second = SeriesBatchCollector::default();
         for chunk in input.chunks(2) {
             second.push(chunk.to_vec());
         }
-        let second = second.finish(true);
+        let second = second.finish(4, true).unwrap();
 
         assert_eq!(
             first
@@ -644,12 +645,12 @@ mod tests {
 
     #[test]
     fn collector_tracks_size_and_cache_policy() {
-        let mut collector = SeriesBatchCollector::new(2).unwrap();
+        let mut collector = SeriesBatchCollector::default();
         collector.push(vec![series(1, 1), series(1, u64::MAX)]);
         collector.push(vec![series(2, 2)]);
         assert_eq!(3, collector.len());
 
-        let assignments = collector.finish(false);
+        let assignments = collector.finish(2, false).unwrap();
         assert_eq!(
             3,
             assignments

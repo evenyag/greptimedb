@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use common_telemetry::debug;
-use futures::{StreamExt, TryStreamExt};
 use smallvec::SmallVec;
 use snafu::ResultExt;
 use store_api::region_engine::PartitionRange;
@@ -94,47 +93,26 @@ impl PartitionPruner {
         self
     }
 
-    /// Prepares all selected SSTs and estimates their surviving row-group counts.
-    /// Builders and range-index footers are retained for the candidate and data
-    /// phases. Unlike `build_file_ranges`, this does not consume range references.
-    pub(crate) async fn prepare_row_group_counts(
+    /// Estimates one index-covered SST without consuming its range references.
+    pub(crate) async fn estimate_indexed_row_groups(
         &self,
-        partition_ranges: &[PartitionRange],
+        file_index: usize,
         partition_metrics: &PartitionMetrics,
-    ) -> Result<Vec<usize>> {
+    ) -> Result<usize> {
+        let mut reader_metrics = ReaderMetrics::default();
+        let builder = self
+            .pruner
+            .get_file_builder(
+                file_index,
+                self.pre_filter_mode(file_index),
+                partition_metrics,
+                &mut reader_metrics,
+            )
+            .await?;
+        partition_metrics.merge_reader_metrics(&reader_metrics, None);
         let ctx = &self.pruner.inner.stream_ctx;
-        let mut requested: HashMap<usize, HashSet<i64>> = HashMap::new();
-        for range in partition_ranges {
-            for index in &ctx.ranges[range.identifier].row_group_indices {
-                if let Some(file_index) = self.file_index(*index) {
-                    requested
-                        .entry(file_index)
-                        .or_default()
-                        .insert(index.row_group_index);
-                }
-            }
-        }
-        futures::stream::iter(requested)
-            .map(|(file_index, row_groups)| async move {
-                let mut reader_metrics = ReaderMetrics::default();
-                let builder = self
-                    .pruner
-                    .get_file_builder(
-                        file_index,
-                        self.pre_filter_mode(file_index),
-                        partition_metrics,
-                        &mut reader_metrics,
-                    )
-                    .await?;
-                partition_metrics.merge_reader_metrics(&reader_metrics, None);
-                let predicate = ctx.input.predicate_for_file(&ctx.input.files[file_index]);
-                builder
-                    .estimate_row_group_count(&row_groups, predicate.as_ref())
-                    .await
-            })
-            .buffer_unordered(self.pruner.inner.num_workers.max(1))
-            .try_collect()
-            .await
+        let predicate = ctx.input.predicate_for_file(&ctx.input.files[file_index]);
+        builder.estimate_row_group_count(predicate.as_ref()).await
     }
 
     /// Gets or creates the FileRangeBuilder for a file.
@@ -971,30 +949,6 @@ mod tests {
             false,
             &metrics_set,
         )
-    }
-
-    #[tokio::test]
-    async fn preparation_reuses_builders_without_consuming_references() {
-        let (_env, pruner) = make_test_pruner_with_retained_builders(1, true).await;
-        let ranges = vec![file_partition_range(0), file_partition_range(0)];
-        pruner.add_partition_ranges(&ranges);
-        {
-            let mut entry = pruner.inner.file_entries[0].lock().unwrap();
-            let mut metrics = ReaderMetrics::default();
-            cache_builder_if_needed(
-                &mut entry,
-                &Arc::new(FileRangeBuilder::default()),
-                &mut metrics,
-            );
-        }
-        let partition_pruner = PartitionPruner::new(pruner.clone(), &ranges);
-        let counts = partition_pruner
-            .prepare_row_group_counts(&ranges, &make_partition_metrics())
-            .await
-            .unwrap();
-        assert_eq!(counts, vec![0]);
-        assert_eq!(2, pruner.test_remaining_ranges(0));
-        assert!(pruner.test_has_builder(0));
     }
 
     #[test]

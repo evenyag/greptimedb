@@ -48,7 +48,8 @@ use crate::read::BoxedRecordBatchStream;
 use crate::read::pruner::{PartitionPruner, Pruner};
 use crate::read::range::RowGroupIndex;
 use crate::read::range_cache::{
-    build_candidate_range_cache_key, cache_flat_range_stream, cached_flat_range_stream,
+    CandidateRowGroupStats, build_candidate_range_cache_key, cache_flat_range_stream,
+    cached_flat_range_stream,
 };
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::{PartitionMetrics, new_filter_metrics, scan_flat_mem_ranges};
@@ -138,7 +139,9 @@ impl SeriesCandidateScanner {
     }
 
     /// Builds a globally sorted stream of candidate metric-series IDs.
-    pub(crate) async fn build_stream(&self) -> Result<MetricSeriesIdStream> {
+    pub(crate) async fn build_stream(
+        &self,
+    ) -> Result<(MetricSeriesIdStream, Option<CandidateRowGroupStats>)> {
         let all_ranges = self
             .partitions
             .iter()
@@ -176,8 +179,14 @@ impl SeriesCandidateScanner {
         }
 
         let mut range_streams = Vec::with_capacity(tasks.len());
+        let mut stats = Some(CandidateRowGroupStats::default());
         for task in tasks {
-            range_streams.push(task.await.context(JoinSnafu)??);
+            let (stream, range_stats) = task.await.context(JoinSnafu)??;
+            range_streams.push(stream);
+            stats = stats.zip(range_stats).map(|(mut total, range)| {
+                total.merge(range);
+                total
+            });
         }
 
         if let Some(context) = &self.stream_ctx.input.series_index {
@@ -206,7 +215,8 @@ impl SeriesCandidateScanner {
             self.partitions.len(),
             "SeriesCandidateScanner::final_merge",
         )?;
-        decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())
+        let stream = decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())?;
+        Ok((stream, stats))
     }
 
     /// Returns the partition pruner shared with the data phase.
@@ -214,17 +224,25 @@ impl SeriesCandidateScanner {
         self.partition_pruner.clone()
     }
 
-    /// Prepares every data SST, including sources replaced by candidate indexes
-    /// or cached candidate streams, before fixing the series assignments.
-    pub(crate) async fn prepare_row_group_counts(&self) -> Result<Vec<usize>> {
-        let ranges = self
-            .partitions
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        self.partition_pruner
-            .prepare_row_group_counts(&ranges, &self.part_metrics)
+    /// Prepares only SSTs whose candidates come from a series index. The caller
+    /// polls this alongside candidate collection and can drop it when chunking.
+    pub(crate) async fn estimate_indexed_row_groups(&self) -> Result<CandidateRowGroupStats> {
+        // Use a separate bound: taking candidate-read permits here could block
+        // collection behind pruning before it can reach the chunking threshold.
+        futures::stream::iter(self.coverage.covered_files.iter().copied())
+            .map(|file_index| async move {
+                self.partition_pruner
+                    .estimate_indexed_row_groups(file_index, &self.part_metrics)
+                    .await
+            })
+            .buffer_unordered(self.partitions.len().max(1))
+            .try_fold(
+                CandidateRowGroupStats::default(),
+                |mut stats, count| async move {
+                    stats.add_file(count);
+                    Ok(stats)
+                },
+            )
             .await
     }
 }
@@ -372,7 +390,7 @@ impl SeriesCandidateRangeBuilder {
         &self,
         part_range: PartitionRange,
         merge_partition: usize,
-    ) -> Result<BoxedRecordBatchStream> {
+    ) -> Result<(BoxedRecordBatchStream, Option<CandidateRowGroupStats>)> {
         let range_meta = &self.stream_ctx.ranges[part_range.identifier];
         // A cache entry describes the complete original range. Never cache a
         // partial range whose missing candidates are supplied by a global index.
@@ -388,14 +406,18 @@ impl SeriesCandidateRangeBuilder {
         if let Some(key) = cache_key.as_ref() {
             if let Some(value) = self.stream_ctx.input.cache_strategy.get_range_result(key) {
                 self.part_metrics.inc_range_cache_hit();
-                return Ok(cached_flat_range_stream(value));
+                let stats = value.candidate_stats;
+                return Ok((cached_flat_range_stream(value), stats));
             }
             self.part_metrics.inc_range_cache_miss();
         }
 
+        let mut stats = CandidateRowGroupStats::default();
         let mut sources = Vec::with_capacity(range_meta.row_group_indices.len());
         for index in &range_meta.row_group_indices {
-            let source = self.build_source(*index, range_meta.time_range).await?;
+            let source = self
+                .build_source(*index, range_meta.time_range, &mut stats)
+                .await?;
             if let Some(source) = source {
                 sources.push(source);
             }
@@ -414,21 +436,24 @@ impl SeriesCandidateRangeBuilder {
             "SeriesCandidateScanner::range_merge",
         )?;
 
-        Ok(match cache_key {
+        let stream = match cache_key {
             Some(key) => cache_flat_range_stream(
                 stream,
                 self.stream_ctx.input.cache_strategy.clone(),
                 key,
                 self.part_metrics.clone(),
+                Some(stats),
             ),
             None => stream,
-        })
+        };
+        Ok((stream, Some(stats)))
     }
 
     async fn build_source(
         &self,
         index: RowGroupIndex,
         time_range: crate::sst::file::FileTimeRange,
+        stats: &mut CandidateRowGroupStats,
     ) -> Result<Option<BoxedRecordBatchStream>> {
         let metadata = self.stream_ctx.input.region_metadata().clone();
         if self.stream_ctx.is_mem_range_index(index) {
@@ -448,9 +473,8 @@ impl SeriesCandidateRangeBuilder {
 
         if self.stream_ctx.is_file_range_index(index) {
             if self.coverage.covers_source(&self.stream_ctx, index) {
-                // Leave the range reference for the data phase so its first
-                // read can cache the builder. Retaining builders only prevents
-                // eviction; it does not allow caching at zero references.
+                // Index-covered SSTs are prepared separately alongside candidate
+                // collection. Preserve references so their builders can be cached.
                 return Ok(None);
             }
             let file = self.stream_ctx.input.file_from_index(index);
@@ -469,6 +493,7 @@ impl SeriesCandidateRangeBuilder {
                 .partition_pruner
                 .build_file_ranges(index, &self.part_metrics, &mut reader_metrics)
                 .await?;
+            stats.add_file(ranges.len());
             self.part_metrics.inc_num_file_ranges(ranges.len());
             self.part_metrics
                 .merge_reader_metrics(&reader_metrics, None);
@@ -931,6 +956,7 @@ mod tests {
             .build_stream()
             .await
             .unwrap()
+            .0
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -940,8 +966,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             groups.into_iter().flatten().collect::<Vec<_>>()
         );
-        // Covered SSTs have no builder yet. Keep their references so the data
-        // phase can cache each builder on its first read and reuse it later.
+        // Candidate discovery leaves covered SST references available for the
+        // separate pruning future and subsequent data reads.
         for file_index in 0..2 {
             assert_eq!(1, pruner.test_remaining_ranges(file_index));
         }
@@ -979,6 +1005,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_candidates_restore_counts_without_preparing_ssts() {
+        let (_env, mut scanner, _pruner) = indexed_scanner().await;
+        let context = scanner.stream_ctx.input.series_index.clone().unwrap();
+        let index = scanner.coverage.indexes[0].clone();
+        let keys: Vec<_> = scanner
+            .partitions
+            .iter()
+            .flatten()
+            .map(|range| build_candidate_range_cache_key(&scanner.stream_ctx, range).unwrap())
+            .collect();
+        let mut expected = Vec::new();
+        for (position, key) in keys.iter().enumerate() {
+            let stream = index_primary_key_stream(
+                scanner.stream_ctx.clone(),
+                context.clone(),
+                index.clone(),
+                scanner.range_semaphore.clone(),
+            );
+            let mut stats = CandidateRowGroupStats::default();
+            stats.add_file(2 + position * 2);
+            let cached = cache_flat_range_stream(
+                stream,
+                scanner.stream_ctx.input.cache_strategy.clone(),
+                key.clone(),
+                scanner.part_metrics.clone(),
+                Some(stats),
+            );
+            expected =
+                decode_metric_series(cached, scanner.stream_ctx.input.region_metadata().clone())
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while keys.iter().any(|key| {
+                scanner
+                    .stream_ctx
+                    .input
+                    .cache_strategy
+                    .get_range_result(key)
+                    .is_none()
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Replay without the series index. The SST objects do not exist, so
+        // preparing any builder instead of using cached counts would fail.
+        scanner.coverage = Arc::new(SeriesIndexCoverage::default());
+        scanner.candidate_pruner = scanner.partition_pruner.clone();
+        let (stream, stats) = scanner.build_stream().await.unwrap();
+        assert_eq!(Some(3), stats.unwrap().mean());
+        let actual = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(
+            expected.into_iter().flatten().collect::<Vec<_>>(),
+            actual.into_iter().flatten().collect::<Vec<_>>()
+        );
+
+        // A candidate entry without statistics must remain readable, but cannot
+        // supply a complete estimate for the scan.
+        scanner.stream_ctx.input.cache_strategy.put_range_result(
+            keys[0].clone(),
+            Arc::new(crate::read::range_cache::RangeScanCacheValue::new(
+                Vec::new(),
+                0,
+            )),
+        );
+        let (_, stats) = scanner.build_stream().await.unwrap();
+        assert!(stats.is_none());
+    }
+
+    #[tokio::test]
     async fn index_read_failure_after_output_is_propagated() {
         let (_env, scanner, _pruner) = indexed_scanner().await;
         let context = scanner.stream_ctx.input.series_index.clone().unwrap();
@@ -1003,6 +1104,7 @@ mod tests {
                 .build_stream()
                 .await
                 .unwrap()
+                .0
                 .try_collect::<Vec<_>>()
                 .await
                 .is_err()

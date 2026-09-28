@@ -259,6 +259,8 @@ impl CachedBatchSlice {
 
 pub(crate) struct RangeScanCacheValue {
     cached_batches: Vec<CachedBatchSlice>,
+    /// Present only for candidate streams with complete SST pruning statistics.
+    pub(crate) candidate_stats: Option<CandidateRowGroupStats>,
     /// Precomputed size of all compacted batches.
     estimated_batches_size: usize,
 }
@@ -270,6 +272,7 @@ impl RangeScanCacheValue {
     ) -> Self {
         Self {
             cached_batches,
+            candidate_stats: None,
             estimated_batches_size,
         }
     }
@@ -283,6 +286,31 @@ impl RangeScanCacheValue {
                 .map(CachedBatchSlice::metadata_size)
                 .sum::<usize>()
             + self.estimated_batches_size
+    }
+}
+
+/// Additive statistics for candidate ranges, whose SST sources do not overlap.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CandidateRowGroupStats {
+    num_row_groups: u128,
+    num_files: u128,
+}
+
+impl CandidateRowGroupStats {
+    pub(crate) fn add_file(&mut self, num_row_groups: usize) {
+        if num_row_groups > 0 {
+            self.num_row_groups += num_row_groups as u128;
+            self.num_files += 1;
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.num_row_groups += other.num_row_groups;
+        self.num_files += other.num_files;
+    }
+
+    pub(crate) fn mean(&self) -> Option<usize> {
+        (self.num_files > 0).then(|| self.num_row_groups.div_ceil(self.num_files) as usize)
     }
 }
 
@@ -613,6 +641,7 @@ enum CacheConcatCommand {
         key: RangeScanCacheKey,
         cache_strategy: CacheStrategy,
         part_metrics: PartitionMetrics,
+        candidate_stats: Option<CandidateRowGroupStats>,
         result_tx: Option<oneshot::Sender<Result<Arc<RangeScanCacheValue>>>>,
     },
 }
@@ -699,6 +728,7 @@ async fn run_cache_concat_task(
                 key,
                 cache_strategy,
                 part_metrics,
+                candidate_stats,
                 result_tx,
             } => {
                 let compact_result = state
@@ -706,7 +736,8 @@ async fn run_cache_concat_task(
                     .await
                     .map(|()| state.finish());
                 let result = match compact_result {
-                    Ok(v) => {
+                    Ok(mut v) => {
+                        v.candidate_stats = candidate_stats;
                         let value = Arc::new(v);
                         part_metrics
                             .inc_range_cache_size(key.estimated_size() + value.estimated_size());
@@ -807,6 +838,7 @@ impl CacheBatchBuffer {
         key: RangeScanCacheKey,
         cache_strategy: CacheStrategy,
         part_metrics: PartitionMetrics,
+        candidate_stats: Option<CandidateRowGroupStats>,
         result_tx: Option<oneshot::Sender<Result<Arc<RangeScanCacheValue>>>>,
     ) {
         let Some(sender) = self.sender.take() else {
@@ -819,6 +851,7 @@ impl CacheBatchBuffer {
                 key,
                 cache_strategy,
                 part_metrics,
+                candidate_stats,
                 result_tx,
             })
             .is_ok()
@@ -841,12 +874,13 @@ impl Drop for CacheBatchBuffer {
     }
 }
 
-/// Wraps a stream to cache its output for future range cache hits.
+/// Wraps a stream to cache its output and optional candidate pruning statistics.
 pub(crate) fn cache_flat_range_stream(
     mut stream: BoxedRecordBatchStream,
     cache_strategy: CacheStrategy,
     key: RangeScanCacheKey,
     part_metrics: PartitionMetrics,
+    candidate_stats: Option<CandidateRowGroupStats>,
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
         let mut buffer = CacheBatchBuffer::new(&cache_strategy);
@@ -855,7 +889,7 @@ pub(crate) fn cache_flat_range_stream(
             yield batch;
         }
 
-        buffer.finish(key, cache_strategy, part_metrics, None);
+        buffer.finish(key, cache_strategy, part_metrics, candidate_stats, None);
     })
 }
 
@@ -906,7 +940,7 @@ pub fn bench_cache_flat_range_stream(
     let part_metrics =
         PartitionMetrics::new(region_id, 0, "bench", Instant::now(), false, &metrics_set);
 
-    cache_flat_range_stream(stream, cache_strategy, key, part_metrics)
+    cache_flat_range_stream(stream, cache_strategy, key, part_metrics, None)
 }
 
 #[cfg(test)]
@@ -988,7 +1022,7 @@ mod tests {
     ) -> Result<Arc<RangeScanCacheValue>> {
         let (tx, rx) = oneshot::channel();
         common_telemetry::info!("finish start");
-        buffer.finish(key, cache_strategy, part_metrics, Some(tx));
+        buffer.finish(key, cache_strategy, part_metrics, None, Some(tx));
         common_telemetry::info!("finish end");
         rx.await.context(crate::error::RecvSnafu)?
     }
