@@ -13,106 +13,95 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_expr::utils::expr_to_columns;
-use datafusion_expr::{col, lit};
 use datatypes::arrow::array::{Array, Int64Array, UInt32Array, UInt64Array};
 use datatypes::arrow::datatypes::{DataType, SchemaRef};
+use datatypes::arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
-use snafu::{OptionExt, ensure};
+use snafu::{OptionExt, ResultExt, ensure};
 use table::predicate::Predicate;
 
-use crate::error::{InvalidRecordBatchSnafu, Result, UnexpectedSnafu};
+use crate::error::{
+    InvalidRecordBatchSnafu, ReserveRangeIndexMemorySnafu, Result, UnexpectedSnafu,
+};
 use crate::series_index::MetricSeriesId;
-use crate::sst::parquet::format::column_values_by_type;
 use crate::sst::parquet::index_reader::ParquetIndexReader;
 use crate::sst::range_index::{
     END_COLUMN, ROW_GROUP_ID_COLUMN, START_COLUMN, TABLE_ID_COLUMN, TSID_COLUMN,
 };
 
-/// Searches per-SST range-index files for the rows of candidate metric series.
+/// Query-scoped range-index batches shared by all series assignments for an SST.
 pub struct SstRangeIndexSearcher {
-    reader: ParquetIndexReader,
+    /// Zero-copy slices grouped by source SST row group.
+    batches: BTreeMap<u32, Vec<RecordBatch>>,
+    _reservation: MemoryReservation,
 }
 
 impl SstRangeIndexSearcher {
-    /// Opens the range-index file at `path` and loads its Parquet metadata.
-    pub async fn open(object_store: ObjectStore, path: &str) -> Result<Self> {
+    /// Loads index batches pruned by the scan-wide predicate. Assignment-specific
+    /// series filters must only be applied by `search`, so every partition can reuse this data.
+    pub async fn open(
+        object_store: ObjectStore,
+        path: &str,
+        predicate: Option<&Predicate>,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
         let reader = ParquetIndexReader::open(object_store, path).await?;
         validate_index_schema(reader.schema())?;
-        Ok(Self { reader })
+        let mut stream = reader.read(
+            &index_predicate(predicate),
+            &[
+                ROW_GROUP_ID_COLUMN,
+                TABLE_ID_COLUMN,
+                TSID_COLUMN,
+                START_COLUMN,
+                END_COLUMN,
+            ],
+        )?;
+        let reservation = MemoryConsumer::new("SstRangeIndexSearcher").register(memory_pool);
+        let mut batches: BTreeMap<u32, Vec<RecordBatch>> = BTreeMap::new();
+        let mut last_group = None;
+        while let Some(batch) = stream.try_next().await? {
+            // Charge the buffers once before retaining slices that share them.
+            reservation
+                .try_grow(batch.get_array_memory_size())
+                .context(ReserveRangeIndexMemorySnafu)?;
+            let groups = typed_column::<UInt32Array>(&batch, ROW_GROUP_ID_COLUMN, "UInt32")?;
+            let mut start = 0;
+            while start < batch.num_rows() {
+                let group = groups.value(start);
+                ensure!(
+                    last_group.is_none_or(|last| last <= group),
+                    InvalidRecordBatchSnafu {
+                        reason: "range index source row groups are not sorted",
+                    }
+                );
+                last_group = Some(group);
+                let mut end = start + 1;
+                while end < batch.num_rows() && groups.value(end) == group {
+                    end += 1;
+                }
+                batches
+                    .entry(group)
+                    .or_default()
+                    .push(batch.slice(start, end - start));
+                start = end;
+            }
+        }
+        Ok(Self {
+            batches,
+            _reservation: reservation,
+        })
     }
 
-    /// Retains source SST row groups that may match the range-index footer.
-    /// Index row-group boundaries are independent of source SST boundaries, so
-    /// their source-ID intervals are unioned rather than counted directly.
-    pub(crate) fn retain_source_row_groups(
-        &self,
-        predicate: Option<&Predicate>,
-        source_row_groups: &mut Vec<usize>,
-    ) {
-        // Keep whole expressions: dropping an unsupported branch of an OR
-        // would make the estimate incorrectly exclude matching source groups.
-        let exprs = predicate
-            .into_iter()
-            .flat_map(|predicate| predicate.exprs())
-            .filter(|expr| {
-                let mut columns = HashSet::new();
-                expr_to_columns(expr, &mut columns).is_ok()
-                    && columns
-                        .iter()
-                        .all(|column| column.name == TABLE_ID_COLUMN || column.name == TSID_COLUMN)
-            })
-            .cloned()
-            .collect();
-        let index_groups = self.reader.row_groups_to_read(&Predicate::new(exprs));
-        if index_groups.is_empty() {
-            source_row_groups.clear();
-            return;
-        }
-        let Ok(column) = self.reader.schema().index_of(ROW_GROUP_ID_COLUMN) else {
-            return;
-        };
-        let metadata = self.reader.row_group_metadata();
-        let Some(mins) = column_values_by_type(metadata, &DataType::UInt32, column, true) else {
-            return;
-        };
-        let Some(maxs) = column_values_by_type(metadata, &DataType::UInt32, column, false) else {
-            return;
-        };
-        let (Some(mins), Some(maxs)) = (
-            mins.as_any().downcast_ref::<UInt32Array>(),
-            maxs.as_any().downcast_ref::<UInt32Array>(),
-        ) else {
-            return;
-        };
-        let mut intervals = Vec::with_capacity(index_groups.len());
-        for index in index_groups {
-            if mins.is_null(index) || maxs.is_null(index) || mins.value(index) > maxs.value(index) {
-                return;
-            }
-            intervals.push((mins.value(index) as usize, maxs.value(index) as usize));
-        }
-        // Sort and merge overlapping intervals to avoid counting a source group
-        // twice when its series span multiple index row groups.
-        intervals.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
-        for (start, end) in intervals {
-            if let Some(last) = merged.last_mut()
-                && start <= last.1
-            {
-                last.1 = last.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        }
-        source_row_groups.retain(|group| {
-            let position = merged.partition_point(|(start, _)| start <= group);
-            position > 0 && *group <= merged[position - 1].1
-        });
+    pub(crate) fn contains_row_group(&self, row_group: usize) -> bool {
+        u32::try_from(row_group).is_ok_and(|group| self.batches.contains_key(&group))
     }
 
     /// Returns the row ranges for `series` in one source SST row group.
@@ -123,7 +112,7 @@ impl SstRangeIndexSearcher {
     /// sorted, non-overlapping, and coalesced when adjacent. The number of
     /// returned ranges may be less than the number of input series if some
     /// series don't exist in the row group.
-    pub async fn search(
+    pub fn search(
         &self,
         row_group_id: u32,
         series: &[MetricSeriesId],
@@ -133,22 +122,12 @@ impl SstRangeIndexSearcher {
         }
 
         validate_sorted_series(series)?;
-        let predicate = search_predicate(row_group_id, series)?;
-        let mut batches = self.reader.read(
-            &predicate,
-            &[
-                ROW_GROUP_ID_COLUMN,
-                TABLE_ID_COLUMN,
-                TSID_COLUMN,
-                START_COLUMN,
-                END_COLUMN,
-            ],
-        )?;
         let mut merge = RangeMergeState::new(row_group_id, series);
-
-        while let Some(batch) = batches.try_next().await? {
-            if merge.append_batch(&batch)? {
-                break;
+        if let Some(batches) = self.batches.get(&row_group_id) {
+            for batch in batches {
+                if merge.append_batch(batch)? {
+                    break;
+                }
             }
         }
 
@@ -169,25 +148,22 @@ fn validate_sorted_series(series: &[MetricSeriesId]) -> Result<()> {
     Ok(())
 }
 
-fn search_predicate(row_group_id: u32, series: &[MetricSeriesId]) -> Result<Predicate> {
-    let min_table_id = series
-        .first()
-        .context(UnexpectedSnafu {
-            reason: "cannot build a range-index predicate for an empty series set",
-        })?
-        .table_id;
-    let max_table_id = series
-        .last()
-        .context(UnexpectedSnafu {
-            reason: "cannot build a range-index predicate for an empty series set",
-        })?
-        .table_id;
-
-    Ok(Predicate::new(vec![
-        col(ROW_GROUP_ID_COLUMN).eq(lit(row_group_id)),
-        col(TABLE_ID_COLUMN).gt_eq(lit(min_table_id)),
-        col(TABLE_ID_COLUMN).lt_eq(lit(max_table_id)),
-    ]))
+/// Keep whole expressions: dropping an unsupported branch of an OR could
+/// exclude matching series. Only identity columns have the same meaning here.
+fn index_predicate(predicate: Option<&Predicate>) -> Predicate {
+    let exprs = predicate
+        .into_iter()
+        .flat_map(|predicate| predicate.exprs())
+        .filter(|expr| {
+            let mut columns = HashSet::new();
+            expr_to_columns(expr, &mut columns).is_ok()
+                && columns
+                    .iter()
+                    .all(|column| column.name == TABLE_ID_COLUMN || column.name == TSID_COLUMN)
+        })
+        .cloned()
+        .collect();
+    Predicate::new(exprs)
 }
 
 fn validate_index_schema(schema: &SchemaRef) -> Result<()> {
@@ -380,6 +356,8 @@ fn typed_column<'a, T: 'static>(
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use datafusion_expr::{col, lit};
     use datatypes::arrow::array::{ArrayRef, BinaryArray};
     use datatypes::arrow::datatypes::{Field, Schema};
     use datatypes::arrow::record_batch::RecordBatch;
@@ -453,130 +431,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_filters_exact_series_pairs_and_coalesces_ranges() {
+    async fn cached_batches_support_independent_series_selections() {
         let store = object_store();
         let path = "range-search.parquet";
         write_index(&store, path).await;
-        let searcher = SstRangeIndexSearcher::open(store, path).await.unwrap();
-
-        let ranges = searcher
-            .search(0, &[series(1, 10), series(2, 20)])
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let searcher = SstRangeIndexSearcher::open(store.clone(), path, None, &pool)
             .await
             .unwrap();
+        assert!(pool.reserved() > 0);
+        // Every assignment and source group must reuse the decoded batches.
+        store.delete(path).await.unwrap();
+
+        let ranges = searcher.search(0, &[series(1, 10), series(2, 20)]).unwrap();
         assert_eq!(ranges, vec![0..2, 4..6]);
 
-        let ranges = searcher
-            .search(0, &[series(1, 10), series(1, 20)])
-            .await
-            .unwrap();
+        let ranges = searcher.search(0, &[series(1, 10), series(1, 20)]).unwrap();
         assert_eq!(ranges, vec![0..3]);
 
-        let ranges = searcher
-            .search(0, &[series(1, 15), series(2, 20)])
-            .await
-            .unwrap();
+        let ranges = searcher.search(0, &[series(1, 15), series(2, 20)]).unwrap();
         assert_eq!(ranges, vec![4..6]);
 
-        let ranges = searcher
-            .search(0, &[series(1, 10), series(2, 30)])
-            .await
-            .unwrap();
+        let ranges = searcher.search(0, &[series(1, 10), series(2, 30)]).unwrap();
         assert_eq!(ranges, vec![0..2]);
 
-        let ranges = searcher
-            .search(1, &[series(2, 20), series(2, 20)])
-            .await
-            .unwrap();
+        let ranges = searcher.search(1, &[series(2, 20), series(2, 20)]).unwrap();
         assert_eq!(ranges, vec![0..2]);
 
-        assert!(
-            searcher
-                .search(1, &[series(1, 10)])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(searcher.search(1, &[series(1, 10)]).unwrap().is_empty());
 
-        assert!(searcher.search(0, &[]).await.unwrap().is_empty());
+        assert!(searcher.search(0, &[]).unwrap().is_empty());
 
         let error = searcher
             .search(0, &[series(2, 20), series(1, 10)])
-            .await
             .unwrap_err();
         assert!(error.to_string().contains("not sorted"), "{error}");
+        drop(searcher);
+        assert_eq!(pool.reserved(), 0);
     }
 
     #[tokio::test]
-    async fn opening_a_missing_index_fails() {
-        assert!(
-            SstRangeIndexSearcher::open(object_store(), "does-not-exist.parquet")
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn footer_estimate_counts_source_groups_without_reading_pages() {
+    async fn loading_prunes_by_scan_predicate() {
         let store = object_store();
-        let path = "range-footer.parquet";
+        let path = "range-pruning.parquet";
         write_index(&store, path).await;
-        let searcher = SstRangeIndexSearcher::open(store.clone(), path)
-            .await
-            .unwrap();
-        // Only the already-opened footer is needed by the estimate.
-        store.delete(path).await.unwrap();
-
-        let mut groups = vec![0, 1];
-        searcher.retain_source_row_groups(None, &mut groups);
-        assert_eq!(groups, vec![0, 1]);
-
-        let mut groups = vec![0, 1];
-        searcher.retain_source_row_groups(
-            Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
-            &mut groups,
-        );
-        assert_eq!(groups, vec![0]);
-
-        let mut groups = vec![1];
-        searcher.retain_source_row_groups(
-            Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
-            &mut groups,
-        );
-        assert!(groups.is_empty());
-
-        let mut groups = vec![0, 1];
-        searcher.retain_source_row_groups(
-            Some(&Predicate::new(vec![col(TSID_COLUMN).gt(lit(100u64))])),
-            &mut groups,
-        );
-        assert!(groups.is_empty());
-
-        let mut groups = vec![0, 1];
-        searcher.retain_source_row_groups(
-            Some(&Predicate::new(vec![
-                col(TABLE_ID_COLUMN)
-                    .eq(lit(1u32))
-                    .or(col("unknown_tag").eq(lit("matches"))),
-            ])),
-            &mut groups,
-        );
-        assert_eq!(groups, vec![0, 1]);
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        for (predicate, expected_groups) in [
+            (
+                Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))]),
+                vec![0],
+            ),
+            (
+                Predicate::new(vec![col(TSID_COLUMN).gt(lit(100u64))]),
+                vec![],
+            ),
+            // An unsupported branch of an OR must not be dropped independently.
+            (
+                Predicate::new(vec![
+                    col(TABLE_ID_COLUMN)
+                        .eq(lit(1u32))
+                        .or(col("unknown_tag").eq(lit("matches"))),
+                ]),
+                vec![0, 1],
+            ),
+        ] {
+            let searcher =
+                SstRangeIndexSearcher::open(store.clone(), path, Some(&predicate), &pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                searcher.batches.keys().copied().collect::<Vec<_>>(),
+                expected_groups
+            );
+        }
     }
 
     #[tokio::test]
-    async fn footer_estimate_handles_overlapping_intervals_and_missing_statistics() {
+    async fn loaded_groups_do_not_depend_on_footer_intervals() {
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
         for statistics in [EnabledStatistics::Chunk, EnabledStatistics::None] {
+            // Group 0 spans index batches; groups 0 and 2 share one index batch.
+            // Group 1 must not be counted merely because it lies between them.
             let batch = RecordBatch::try_new(
                 range_index_schema(),
                 vec![
-                    Arc::new(UInt32Array::from(vec![0, 0, 0, 1, 2])) as ArrayRef,
-                    Arc::new(UInt32Array::from(vec![1, 1, 2, 2, 1])),
+                    Arc::new(UInt32Array::from(vec![0, 0, 0, 2, 2])) as ArrayRef,
+                    Arc::new(UInt32Array::from(vec![1, 1, 2, 2, 3])),
                     Arc::new(UInt64Array::from(vec![10, 20, 10, 10, 10])),
-                    Arc::new(Int64Array::from(vec![0, 1, 2, 0, 0])),
-                    Arc::new(Int64Array::from(vec![1, 2, 3, 1, 1])),
+                    Arc::new(Int64Array::from(vec![0, 1, 2, 0, 1])),
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 1, 2])),
                 ],
             )
             .unwrap();
@@ -590,40 +535,44 @@ mod tests {
             writer.write(&batch).unwrap();
             writer.close().unwrap();
             let store = object_store();
-            store.write("footer.parquet", bytes).await.unwrap();
-            let searcher = SstRangeIndexSearcher::open(store.clone(), "footer.parquet")
+            let path = "range-groups.parquet";
+            store.write(path, bytes).await.unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let searcher = SstRangeIndexSearcher::open(store.clone(), path, None, &pool)
                 .await
                 .unwrap();
-            store.delete("footer.parquet").await.unwrap();
-
-            let mut groups = vec![0, 1, 2];
-            searcher.retain_source_row_groups(None, &mut groups);
-            assert_eq!(groups, vec![0, 1, 2]);
-            let mut groups = vec![0, 1, 2];
-            searcher.retain_source_row_groups(
-                Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
-                &mut groups,
+            assert_eq!(
+                searcher.batches.keys().copied().collect::<Vec<_>>(),
+                vec![0, 2]
             );
             assert_eq!(
-                groups,
-                if statistics == EnabledStatistics::None {
-                    vec![0, 1, 2]
-                } else {
-                    vec![0, 2]
-                }
+                searcher.search(0, &[series(1, 20), series(2, 10)]).unwrap(),
+                vec![1..3]
             );
+            assert_eq!(
+                searcher.search(2, &[series(2, 10), series(3, 10)]).unwrap(),
+                vec![0..2]
+            );
+
+            // Allow some batches but reject the complete index. Partial loading
+            // must release its reservation so a subsequent attempt can succeed.
+            let limited_pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(pool.reserved() - 1));
+            assert!(
+                SstRangeIndexSearcher::open(store.clone(), path, None, &limited_pool)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(limited_pool.reserved(), 0);
+            let predicate = Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))]);
+            if statistics == EnabledStatistics::Chunk {
+                let retry =
+                    SstRangeIndexSearcher::open(store, path, Some(&predicate), &limited_pool)
+                        .await
+                        .unwrap();
+                assert_eq!(retry.search(0, &[series(1, 10)]).unwrap(), vec![0..1]);
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn pruning_uses_the_source_row_group_and_table_id_range() {
-        let store = object_store();
-        let path = "range-pruning.parquet";
-        write_index(&store, path).await;
-        let reader = ParquetIndexReader::open(store, path).await.unwrap();
-        let predicate = search_predicate(0, &[series(1, 999), series(2, 999)]).unwrap();
-
-        assert_eq!(reader.row_groups_to_read(&predicate), vec![0, 1]);
     }
 
     #[test]

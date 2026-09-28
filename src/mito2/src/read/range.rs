@@ -14,7 +14,10 @@
 
 //! Structs for partition ranges.
 
+use std::sync::Arc;
+
 use common_time::Timestamp;
+use datafusion::execution::memory_pool::MemoryPool;
 use smallvec::{SmallVec, smallvec};
 use store_api::region_engine::PartitionRange;
 use store_api::storage::TimeSeriesDistribution;
@@ -405,22 +408,26 @@ impl FileRangeBuilder {
         }
     }
 
-    /// Estimates selected source row groups, refining with range-index footer statistics.
-    /// This does not read index data pages or consume any range references.
+    /// Loads shared range-index batches and counts source groups selected by both
+    /// the SST pruner and range index, without consuming range references.
     pub(crate) async fn estimate_row_group_count(
         &self,
         predicate: Option<&Predicate>,
+        memory_pool: &Arc<dyn MemoryPool>,
     ) -> crate::error::Result<usize> {
         let Some(context) = &self.context else {
             return Ok(0);
         };
-        let mut row_groups: Vec<_> = self.selection.iter().map(|(index, _)| *index).collect();
-        if !row_groups.is_empty()
-            && let Some(searcher) = context.range_index_searcher().await?
+        if !self.selection.is_empty()
+            && let Some(searcher) = context.range_index_searcher(predicate, memory_pool).await?
         {
-            searcher.retain_source_row_groups(predicate, &mut row_groups);
+            return Ok(self
+                .selection
+                .iter()
+                .filter(|(index, _)| searcher.contains_row_group(**index))
+                .count());
         }
-        Ok(row_groups.len())
+        Ok(self.selection.iter().count())
     }
 
     /// Builds file ranges to read.

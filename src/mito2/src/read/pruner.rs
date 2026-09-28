@@ -112,7 +112,9 @@ impl PartitionPruner {
         partition_metrics.merge_reader_metrics(&reader_metrics, None);
         let ctx = &self.pruner.inner.stream_ctx;
         let predicate = ctx.input.predicate_for_file(&ctx.input.files[file_index]);
-        builder.estimate_row_group_count(predicate.as_ref()).await
+        builder
+            .estimate_row_group_count(predicate.as_ref(), &ctx.input.scan_memory_pool)
+            .await
     }
 
     /// Gets or creates the FileRangeBuilder for a file.

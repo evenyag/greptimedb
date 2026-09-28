@@ -23,7 +23,6 @@ use futures::TryStreamExt;
 use mito_codec::row_converter::{PrimaryKeyFilter, SparsePrimaryKeyCodec};
 use snafu::ResultExt;
 use store_api::region_engine::PartitionRange;
-use store_api::storage::SequenceRange;
 use tokio::sync::Semaphore;
 
 #[cfg(feature = "enterprise")]
@@ -445,8 +444,7 @@ async fn build_series_partition_range(
                 ranges,
                 filter.clone(),
                 codec.clone(),
-                stream_ctx.input.sequence_range,
-                stream_ctx.input.region_metadata().region_id,
+                stream_ctx.clone(),
             );
             sources.push(Box::pin(stream) as BoxedRecordBatchStream);
             continue;
@@ -495,10 +493,11 @@ fn scan_series_file_ranges(
     ranges: smallvec::SmallVec<[crate::sst::parquet::file_range::FileRange; 2]>,
     filter: MetricSeriesFilter,
     codec: SparsePrimaryKeyCodec,
-    sequence_range: Option<SequenceRange>,
-    region_id: store_api::storage::RegionId,
+    stream_ctx: Arc<StreamContext>,
 ) -> impl futures::Stream<Item = Result<datatypes::arrow::record_batch::RecordBatch>> {
     try_stream! {
+        let sequence_range = stream_ctx.input.sequence_range;
+        let region_id = stream_ctx.input.region_metadata().region_id;
         let fetch_metrics = part_metrics
             .explain_verbose()
             .then(|| Arc::new(ParquetFetchMetrics::default()));
@@ -510,12 +509,15 @@ fn scan_series_file_ranges(
 
         for range in ranges {
             let build_start = Instant::now();
-            let searcher = range.range_index_searcher().await?;
+            let predicate = stream_ctx.input.predicate_for_file(range.file_handle());
+            let searcher = range.range_index_searcher(
+                predicate.as_ref(), &stream_ctx.input.scan_memory_pool,
+            ).await?;
             let reader = if let Some(searcher) = searcher {
                 let row_group_id = u32::try_from(range.row_group_index()).map_err(|_| UnexpectedSnafu {
                     reason: format!("row group index exceeds u32: {}", range.row_group_index()),
                 }.build())?;
-                let selected = searcher.search(row_group_id, &filter.sorted_series).await?;
+                let selected = searcher.search(row_group_id, &filter.sorted_series)?;
                 range.reader_by_row_ranges(selected, fetch_metrics.as_deref()).await?
             } else {
                 range.reader_by_primary_key(primary_key_filter.as_mut(), fetch_metrics.as_deref()).await?
