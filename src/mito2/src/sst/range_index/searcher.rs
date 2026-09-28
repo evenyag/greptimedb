@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ops::Range;
 
+use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{col, lit};
-use datatypes::arrow::array::{Int64Array, UInt32Array, UInt64Array};
+use datatypes::arrow::array::{Array, Int64Array, UInt32Array, UInt64Array};
 use datatypes::arrow::datatypes::{DataType, SchemaRef};
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -25,6 +27,7 @@ use table::predicate::Predicate;
 
 use crate::error::{InvalidRecordBatchSnafu, Result, UnexpectedSnafu};
 use crate::series_index::MetricSeriesId;
+use crate::sst::parquet::format::column_values_by_type;
 use crate::sst::parquet::index_reader::ParquetIndexReader;
 use crate::sst::range_index::{
     END_COLUMN, ROW_GROUP_ID_COLUMN, START_COLUMN, TABLE_ID_COLUMN, TSID_COLUMN,
@@ -41,6 +44,75 @@ impl SstRangeIndexSearcher {
         let reader = ParquetIndexReader::open(object_store, path).await?;
         validate_index_schema(reader.schema())?;
         Ok(Self { reader })
+    }
+
+    /// Retains source SST row groups that may match the range-index footer.
+    /// Index row-group boundaries are independent of source SST boundaries, so
+    /// their source-ID intervals are unioned rather than counted directly.
+    pub(crate) fn retain_source_row_groups(
+        &self,
+        predicate: Option<&Predicate>,
+        source_row_groups: &mut Vec<usize>,
+    ) {
+        // Keep whole expressions: dropping an unsupported branch of an OR
+        // would make the estimate incorrectly exclude matching source groups.
+        let exprs = predicate
+            .into_iter()
+            .flat_map(|predicate| predicate.exprs())
+            .filter(|expr| {
+                let mut columns = HashSet::new();
+                expr_to_columns(expr, &mut columns).is_ok()
+                    && columns
+                        .iter()
+                        .all(|column| column.name == TABLE_ID_COLUMN || column.name == TSID_COLUMN)
+            })
+            .cloned()
+            .collect();
+        let index_groups = self.reader.row_groups_to_read(&Predicate::new(exprs));
+        if index_groups.is_empty() {
+            source_row_groups.clear();
+            return;
+        }
+        let Ok(column) = self.reader.schema().index_of(ROW_GROUP_ID_COLUMN) else {
+            return;
+        };
+        let metadata = self.reader.row_group_metadata();
+        let Some(mins) = column_values_by_type(metadata, &DataType::UInt32, column, true) else {
+            return;
+        };
+        let Some(maxs) = column_values_by_type(metadata, &DataType::UInt32, column, false) else {
+            return;
+        };
+        let (Some(mins), Some(maxs)) = (
+            mins.as_any().downcast_ref::<UInt32Array>(),
+            maxs.as_any().downcast_ref::<UInt32Array>(),
+        ) else {
+            return;
+        };
+        let mut intervals = Vec::with_capacity(index_groups.len());
+        for index in index_groups {
+            if mins.is_null(index) || maxs.is_null(index) || mins.value(index) > maxs.value(index) {
+                return;
+            }
+            intervals.push((mins.value(index) as usize, maxs.value(index) as usize));
+        }
+        // Sort and merge overlapping intervals to avoid counting a source group
+        // twice when its series span multiple index row groups.
+        intervals.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+        for (start, end) in intervals {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        source_row_groups.retain(|group| {
+            let position = merged.partition_point(|(start, _)| start <= group);
+            position > 0 && *group <= merged[position - 1].1
+        });
     }
 
     /// Returns the row ranges for `series` in one source SST row group.
@@ -441,6 +513,106 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn footer_estimate_counts_source_groups_without_reading_pages() {
+        let store = object_store();
+        let path = "range-footer.parquet";
+        write_index(&store, path).await;
+        let searcher = SstRangeIndexSearcher::open(store.clone(), path)
+            .await
+            .unwrap();
+        // Only the already-opened footer is needed by the estimate.
+        store.delete(path).await.unwrap();
+
+        let mut groups = vec![0, 1];
+        searcher.retain_source_row_groups(None, &mut groups);
+        assert_eq!(groups, vec![0, 1]);
+
+        let mut groups = vec![0, 1];
+        searcher.retain_source_row_groups(
+            Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
+            &mut groups,
+        );
+        assert_eq!(groups, vec![0]);
+
+        let mut groups = vec![1];
+        searcher.retain_source_row_groups(
+            Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
+            &mut groups,
+        );
+        assert!(groups.is_empty());
+
+        let mut groups = vec![0, 1];
+        searcher.retain_source_row_groups(
+            Some(&Predicate::new(vec![col(TSID_COLUMN).gt(lit(100u64))])),
+            &mut groups,
+        );
+        assert!(groups.is_empty());
+
+        let mut groups = vec![0, 1];
+        searcher.retain_source_row_groups(
+            Some(&Predicate::new(vec![
+                col(TABLE_ID_COLUMN)
+                    .eq(lit(1u32))
+                    .or(col("unknown_tag").eq(lit("matches"))),
+            ])),
+            &mut groups,
+        );
+        assert_eq!(groups, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn footer_estimate_handles_overlapping_intervals_and_missing_statistics() {
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::{EnabledStatistics, WriterProperties};
+
+        for statistics in [EnabledStatistics::Chunk, EnabledStatistics::None] {
+            let batch = RecordBatch::try_new(
+                range_index_schema(),
+                vec![
+                    Arc::new(UInt32Array::from(vec![0, 0, 0, 1, 2])) as ArrayRef,
+                    Arc::new(UInt32Array::from(vec![1, 1, 2, 2, 1])),
+                    Arc::new(UInt64Array::from(vec![10, 20, 10, 10, 10])),
+                    Arc::new(Int64Array::from(vec![0, 1, 2, 0, 0])),
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 1, 1])),
+                ],
+            )
+            .unwrap();
+            let properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(2))
+                .set_statistics_enabled(statistics)
+                .build();
+            let mut bytes = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let store = object_store();
+            store.write("footer.parquet", bytes).await.unwrap();
+            let searcher = SstRangeIndexSearcher::open(store.clone(), "footer.parquet")
+                .await
+                .unwrap();
+            store.delete("footer.parquet").await.unwrap();
+
+            let mut groups = vec![0, 1, 2];
+            searcher.retain_source_row_groups(None, &mut groups);
+            assert_eq!(groups, vec![0, 1, 2]);
+            let mut groups = vec![0, 1, 2];
+            searcher.retain_source_row_groups(
+                Some(&Predicate::new(vec![col(TABLE_ID_COLUMN).eq(lit(1u32))])),
+                &mut groups,
+            );
+            assert_eq!(
+                groups,
+                if statistics == EnabledStatistics::None {
+                    vec![0, 1, 2]
+                } else {
+                    vec![0, 2]
+                }
+            );
+        }
     }
 
     #[tokio::test]

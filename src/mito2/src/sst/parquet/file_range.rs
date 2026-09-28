@@ -486,7 +486,7 @@ impl FileRangeContext {
     }
 
     /// Opens the range index once, retaining the SST handle throughout its use.
-    async fn range_index_searcher(&self) -> Result<Option<&SstRangeIndexSearcher>> {
+    pub(crate) async fn range_index_searcher(&self) -> Result<Option<&SstRangeIndexSearcher>> {
         let Some(store) = &self.range_index_store else {
             return Ok(None);
         };

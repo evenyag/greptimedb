@@ -213,6 +213,20 @@ impl SeriesCandidateScanner {
     pub(crate) fn partition_pruner(&self) -> Arc<PartitionPruner> {
         self.partition_pruner.clone()
     }
+
+    /// Prepares every data SST, including sources replaced by candidate indexes
+    /// or cached candidate streams, before fixing the series assignments.
+    pub(crate) async fn prepare_row_group_counts(&self) -> Result<Vec<usize>> {
+        let ranges = self
+            .partitions
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        self.partition_pruner
+            .prepare_row_group_counts(&ranges, &self.part_metrics)
+            .await
+    }
 }
 
 /// A scanner-wide replacement plan, independent of partition-range boundaries.

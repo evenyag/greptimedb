@@ -25,7 +25,7 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
 use common_telemetry::warn;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::array::BinaryArray;
 use datatypes::arrow::record_batch::RecordBatch;
@@ -880,9 +880,27 @@ impl SeriesCandidateDistributor {
             part_metrics.clone(),
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
+        let row_group_counts = candidate_scanner.prepare_row_group_counts().await?;
+        let estimated_mean = mean_surviving_row_groups(&row_group_counts);
+        let active_partitions = estimated_mean
+            .unwrap_or(self.partitions.len())
+            .min(self.partitions.len());
+        MetricBuilder::new(&self.metrics_set)
+            .gauge("series_estimated_row_groups_per_sst", self.partitions.len())
+            .set(estimated_mean.unwrap_or(0));
+        MetricBuilder::new(&self.metrics_set)
+            .gauge("series_active_partitions", self.partitions.len())
+            .set(active_partitions);
+        for sender in &mut self.senders[active_partitions..] {
+            *sender = None;
+        }
+        if !self.should_fetch_candidates() {
+            part_metrics.on_finish();
+            return Ok(());
+        }
         let mut candidates = candidate_scanner.build_stream().await?;
         let mut collector =
-            SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
+            SeriesBatchCollector::new(active_partitions).context(InvalidSenderSnafu)?;
         let mut chunked = false;
         while let Some(batch) = candidates.try_next().await? {
             if !self.should_fetch_candidates() {
@@ -898,7 +916,7 @@ impl SeriesCandidateDistributor {
                     return Ok(());
                 }
                 collector =
-                    SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
+                    SeriesBatchCollector::new(active_partitions).context(InvalidSenderSnafu)?;
             }
         }
 
@@ -936,6 +954,11 @@ impl SeriesCandidateDistributor {
 
     fn should_fetch_candidates(&self) -> bool {
         self.active_receivers.load(Ordering::Relaxed) > 0
+            && self
+                .senders
+                .iter()
+                .flatten()
+                .any(|sender| !sender.is_closed())
     }
 
     fn send_error(&mut self, error: Error) {
@@ -945,6 +968,17 @@ impl SeriesCandidateDistributor {
             let _ = sender.send(result);
         }
     }
+}
+
+/// Rounded-up mean across surviving SSTs; empty SSTs do not limit memtable work.
+fn mean_surviving_row_groups(counts: &[usize]) -> Option<usize> {
+    let mut total = 0u128;
+    let mut files = 0u128;
+    for count in counts.iter().copied().filter(|count| *count > 0) {
+        total += count as u128;
+        files += 1;
+    }
+    (files > 0).then(|| total.div_ceil(files) as usize)
 }
 
 /// Batches of the same series.
@@ -1238,6 +1272,52 @@ mod tests {
     use crate::read::scan_region::PredicateGroup;
     use crate::test_util::scheduler_util::SchedulerEnv;
     use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+    #[test]
+    fn surviving_row_group_mean() {
+        assert_eq!(None, mean_surviving_row_groups(&[]));
+        assert_eq!(None, mean_surviving_row_groups(&[0, 0]));
+        assert_eq!(Some(1), mean_surviving_row_groups(&[0, 1, 1]));
+        assert_eq!(Some(3), mean_surviving_row_groups(&[1, 4]));
+        assert_eq!(
+            Some(usize::MAX),
+            mean_surviving_row_groups(&[usize::MAX, usize::MAX])
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_distributor_ignores_closed_inactive_partitions() {
+        let env = SchedulerEnv::new().await;
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            store_api::codec::PrimaryKeyEncoding::Sparse,
+        ));
+        let input = ScanInput::builder(
+            env.access_layer.clone(),
+            FlatProjectionMapper::new(&metadata, [0]).unwrap(),
+        )
+        .build();
+        let scanner = SeriesScan::new(input, true);
+        let (mut senders, mut receivers, active_receivers) = new_candidate_channel_list(3);
+        senders[1] = None;
+        senders[2] = None;
+        let distributor = SeriesCandidateDistributor {
+            stream_ctx: scanner.stream_ctx.clone(),
+            range_semaphore: Arc::new(Semaphore::new(3)),
+            partitions: scanner.properties.partitions.clone(),
+            pruner: scanner.pruner.clone(),
+            senders,
+            active_receivers: active_receivers.clone(),
+            metrics_set: ExecutionPlanMetricsSet::default(),
+            metrics_list: Arc::new(PartitionMetricsList::default()),
+            explain_verbose: false,
+        };
+        assert!(distributor.should_fetch_candidates());
+        drop(receivers[0].take());
+        assert_eq!(2, active_receivers.load(Ordering::Relaxed));
+        assert!(!distributor.should_fetch_candidates());
+        assert!(receivers[1].as_mut().unwrap().recv().await.is_none());
+        assert!(receivers[2].as_mut().unwrap().recv().await.is_none());
+    }
 
     #[tokio::test]
     async fn two_phase_eligibility_allows_exact_sequence_range() {

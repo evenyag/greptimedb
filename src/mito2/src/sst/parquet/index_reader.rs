@@ -71,6 +71,11 @@ impl ParquetIndexReader {
         self.arrow_metadata.schema()
     }
 
+    /// Returns footer statistics without reading index data pages.
+    pub(crate) fn row_group_metadata(&self) -> &[RowGroupMetaData] {
+        self.arrow_metadata.metadata().row_groups()
+    }
+
     /// Returns row groups that may match `predicate`.
     pub(crate) fn row_groups_to_read(&self, predicate: &Predicate) -> Vec<usize> {
         let stats = IndexRowGroupPruningStats {

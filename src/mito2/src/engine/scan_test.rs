@@ -1492,6 +1492,21 @@ async fn check_two_phase_series_scan(
         .map_or(0, |value| value.as_usize());
     assert_eq!(usize::from(use_index), index_files);
 
+    for metric in [
+        "series_estimated_row_groups_per_sst",
+        "series_active_partitions",
+    ] {
+        assert_eq!(
+            1,
+            metrics_set
+                .clone_inner()
+                .sum_by_name(metric)
+                .unwrap()
+                .as_usize()
+        );
+    }
+    assert!(partition_batches[1..].iter().all(Vec::is_empty));
+
     let mut series_to_partition = BTreeMap::new();
     let mut actual_rows = Vec::new();
     for (partition, batches) in partition_batches.into_iter().enumerate() {
@@ -1532,8 +1547,8 @@ async fn check_two_phase_series_scan(
     assert_eq!(4, series_to_partition.len());
     assert_eq!(Some(&0), series_to_partition.get("a"));
     assert_eq!(Some(&0), series_to_partition.get("c"));
-    assert_eq!(Some(&2), series_to_partition.get("b"));
-    assert_eq!(Some(&2), series_to_partition.get("d"));
+    assert_eq!(Some(&0), series_to_partition.get("b"));
+    assert_eq!(Some(&0), series_to_partition.get("d"));
 
     scanner.reset_state();
     assert_eq!("two_phase", scanner.mode());
