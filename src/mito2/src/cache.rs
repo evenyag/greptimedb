@@ -24,6 +24,7 @@ pub(crate) mod test_util;
 pub(crate) mod write_cache;
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, RwLock, Weak};
@@ -61,7 +62,7 @@ use crate::cache::index::inverted_index::{InvertedIndexCache, InvertedIndexCache
 use crate::cache::write_cache::WriteCacheRef;
 use crate::error::{
     CompressObjectSnafu, DecompressObjectSnafu, InvalidMetadataSnafu, InvalidParquetSnafu,
-    JoinSnafu, ReadParquetSnafu, Result, UnexpectedSnafu, WriteParquetSnafu,
+    JoinSnafu, LoadSstMetadataSnafu, ReadParquetSnafu, Result, UnexpectedSnafu, WriteParquetSnafu,
 };
 use crate::memtable::record_batch_estimated_size;
 use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
@@ -676,6 +677,46 @@ pub enum CacheStrategy {
 }
 
 impl CacheStrategy {
+    /// Fast path for a reader's decoded-metadata hit, with read-path metrics.
+    /// Misses are accounted for by the coordinated loader's cache-tier lookup.
+    pub(crate) fn get_cached_sst_meta_data(
+        &self,
+        file_id: RegionFileId,
+        metrics: &mut MetadataCacheMetrics,
+        policy: PageIndexPolicy,
+    ) -> Option<Arc<CachedSstMeta>> {
+        let manager = match self {
+            Self::EnableAll(manager) | Self::Compaction(manager) => manager,
+            Self::Disabled => return None,
+        };
+        let key = SstMetaKey(file_id.region_id(), file_id.file_id());
+        let metadata = manager
+            .get_decoded_sst_meta(&key)
+            .filter(|metadata| metadata.satisfies_page_index_policy(policy))?;
+        CACHE_HIT.with_label_values(&[SST_META_TYPE]).inc();
+        CACHE_HIT.with_label_values(&[SST_META_DECODED_TYPE]).inc();
+        metrics.mem_cache_hit += 1;
+        Some(metadata)
+    }
+
+    /// Shares an in-flight SST metadata load without changing cache retention.
+    /// The initializer must recheck the synchronous caches before doing I/O.
+    pub(crate) async fn load_sst_meta_with(
+        &self,
+        file_id: RegionFileId,
+        policy: PageIndexPolicy,
+        init: impl Future<Output = Result<(Arc<CachedSstMeta>, bool)>>,
+    ) -> Result<(Arc<CachedSstMeta>, bool)> {
+        match self {
+            Self::EnableAll(manager) | Self::Compaction(manager) => manager
+                .sst_meta_loader
+                .load(file_id, policy, init)
+                .await
+                .context(LoadSstMetadataSnafu),
+            Self::Disabled => init.await,
+        }
+    }
+
     /// Returns the runtime for CPU-bound SST metadata work for this request.
     pub(crate) fn sst_meta_runtime(&self) -> Runtime {
         match self {
@@ -1019,6 +1060,8 @@ impl CacheStrategy {
 /// All caches are disabled by default.
 #[derive(Default)]
 pub struct CacheManager {
+    /// Coordinates metadata decoding and I/O across readers, without retaining results.
+    sst_meta_loader: SstMetaLoadCoordinator,
     /// Cache for compact, authoritative SST metadata.
     sst_meta_cache: Option<SstMetaCache>,
     /// Cache for decoded SST metadata, used only as an acceleration tier.
@@ -1667,6 +1710,7 @@ impl CacheManagerBuilder {
                 .build()
         });
         CacheManager {
+            sst_meta_loader: SstMetaLoadCoordinator::default(),
             sst_meta_cache,
             sst_decoded_meta_cache,
             vector_cache,
@@ -1730,6 +1774,40 @@ fn update_hit_miss<T>(value: Option<T>, cache_type: &str) -> Option<T> {
 /// Cache key (region id, file id) for SST meta.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SstMetaKey(RegionId, FileId);
+
+/// Shares results only while an SST metadata load is in flight. Retention and
+/// byte accounting remain owned by the synchronous compact and decoded caches.
+struct SstMetaLoadCoordinator {
+    in_flight: moka::future::Cache<(RegionFileId, u8), (Arc<CachedSstMeta>, bool)>,
+}
+
+impl Default for SstMetaLoadCoordinator {
+    fn default() -> Self {
+        Self {
+            // Moka's initializer registry is independent of the retained-value
+            // map. Zero capacity keeps only concurrent waiters, not cache entries.
+            in_flight: moka::future::Cache::new(0),
+        }
+    }
+}
+
+impl SstMetaLoadCoordinator {
+    async fn load(
+        &self,
+        file_id: RegionFileId,
+        policy: PageIndexPolicy,
+        init: impl Future<Output = Result<(Arc<CachedSstMeta>, bool)>>,
+    ) -> std::result::Result<(Arc<CachedSstMeta>, bool), Arc<crate::error::Error>> {
+        let policy_key = match policy {
+            PageIndexPolicy::Skip => 0,
+            PageIndexPolicy::Optional => 1,
+            PageIndexPolicy::Required => 2,
+        };
+        self.in_flight
+            .try_get_with((file_id, policy_key), init)
+            .await
+    }
+}
 
 impl SstMetaKey {
     /// Returns memory used by the key (estimated).
@@ -2121,6 +2199,132 @@ mod tests {
     };
     use crate::read::read_columns::ReadColumns;
     use crate::sst::parquet::row_selection::RowGroupSelection;
+
+    fn load_test_metadata() -> Arc<CachedSstMeta> {
+        let (metadata, _) = sst_parquet_meta();
+        Arc::new(CachedSstMeta::try_new("test.parquet", Arc::unwrap_or_clone(metadata)).unwrap())
+    }
+
+    #[tokio::test]
+    async fn metadata_loads_share_results_without_retaining_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let loader = SstMetaLoadCoordinator::default();
+        let file_id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let metadata = load_test_metadata();
+        let loads = AtomicUsize::new(0);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(loader.load(file_id, PageIndexPolicy::Skip, async {
+            loads.fetch_add(1, Ordering::Relaxed);
+            wait.await.unwrap();
+            Ok((metadata.clone(), true))
+        }));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut second = Box::pin(loader.load(file_id, PageIndexPolicy::Skip, async {
+            loads.fetch_add(1, Ordering::Relaxed);
+            Ok((metadata.clone(), false))
+        }));
+        assert!(futures::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        let (first, second) = futures::join!(first, second);
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first.1 && second.1);
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert_eq!(1, loads.load(Ordering::Relaxed));
+
+        loader
+            .load(file_id, PageIndexPolicy::Skip, async {
+                loads.fetch_add(1, Ordering::Relaxed);
+                Ok((metadata, false))
+            })
+            .await
+            .unwrap();
+        assert_eq!(2, loads.load(Ordering::Relaxed));
+        assert_eq!(0, loader.in_flight.entry_count());
+    }
+
+    #[tokio::test]
+    async fn metadata_load_keys_do_not_block_each_other() {
+        let loader = SstMetaLoadCoordinator::default();
+        let file_id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let mut blocked =
+            Box::pin(loader.load(file_id, PageIndexPolicy::Skip, std::future::pending()));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        for (file, policy) in [
+            (file_id, PageIndexPolicy::Optional),
+            (file_id, PageIndexPolicy::Required),
+            (
+                RegionFileId::new(RegionId::new(2, 1), file_id.file_id()),
+                PageIndexPolicy::Skip,
+            ),
+            (
+                RegionFileId::new(file_id.region_id(), FileId::random()),
+                PageIndexPolicy::Skip,
+            ),
+        ] {
+            let mut independent =
+                Box::pin(loader.load(file, policy, async { Ok((load_test_metadata(), true)) }));
+            assert!(futures::poll!(&mut independent).is_ready());
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_load_error_is_shared_and_retryable() {
+        use common_error::ext::ErrorExt;
+
+        let loader = SstMetaLoadCoordinator::default();
+        let file_id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(loader.load(file_id, PageIndexPolicy::Skip, async {
+            wait.await.unwrap();
+            UnexpectedSnafu {
+                reason: "injected metadata failure",
+            }
+            .fail()
+        }));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut second = Box::pin(loader.load(file_id, PageIndexPolicy::Skip, async {
+            panic!("waiter must share the failed initialization");
+        }));
+        assert!(futures::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        let (first, second) = futures::join!(first, second);
+        let (first, second) = (first.unwrap_err(), second.unwrap_err());
+        assert!(Arc::ptr_eq(&first, &second));
+        let wrapped = Err::<(), _>(first.clone())
+            .context(LoadSstMetadataSnafu)
+            .unwrap_err();
+        assert_eq!(first.status_code(), wrapped.status_code());
+        assert_eq!(first.retry_hint(), wrapped.retry_hint());
+        assert!(
+            loader
+                .load(file_id, PageIndexPolicy::Skip, async {
+                    Ok((load_test_metadata(), true))
+                })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_load_waiter_recovers_from_cancelled_leader() {
+        let loader = SstMetaLoadCoordinator::default();
+        let file_id = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let mut first =
+            Box::pin(loader.load(file_id, PageIndexPolicy::Skip, std::future::pending()));
+        assert!(futures::poll!(&mut first).is_pending());
+        let mut second = Box::pin(loader.load(file_id, PageIndexPolicy::Skip, async {
+            Ok((load_test_metadata(), true))
+        }));
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(first);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), second)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn test_disable_cache() {

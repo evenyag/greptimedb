@@ -804,13 +804,44 @@ impl ParquetReaderBuilder {
             .start_timer();
 
         let file_id = self.file_handle.file_id();
+        // Keep memory-only lookup synchronous for range construction and hot reads.
+        if let Some(metadata) =
+            self.cache_strategy
+                .get_cached_sst_meta_data(file_id, cache_metrics, page_index_policy)
+        {
+            cache_metrics.metadata_load_cost += start.elapsed();
+            return Ok((metadata, false));
+        }
+
+        let result = self
+            .cache_strategy
+            .load_sst_meta_with(
+                file_id,
+                page_index_policy,
+                self.load_parquet_metadata(file_path, file_size, cache_metrics, page_index_policy),
+            )
+            .await;
+        // Only the winning initializer mutates read/byte counters. Every caller
+        // records its own wait time, including callers sharing a failed load.
+        cache_metrics.metadata_load_cost += start.elapsed();
+        result
+    }
+
+    /// Rechecks all cache tiers before loading. Executed by one coordinated caller.
+    async fn load_parquet_metadata(
+        &self,
+        file_path: &str,
+        file_size: u64,
+        cache_metrics: &mut MetadataCacheMetrics,
+        page_index_policy: PageIndexPolicy,
+    ) -> Result<(Arc<CachedSstMeta>, bool)> {
+        let file_id = self.file_handle.file_id();
         // Tries to get from cache with metrics tracking.
         if let Some(metadata) = self
             .cache_strategy
             .get_sst_meta_data(file_id, cache_metrics, page_index_policy)
             .await
         {
-            cache_metrics.metadata_load_cost += start.elapsed();
             return Ok((metadata, false));
         }
 
@@ -853,7 +884,6 @@ impl ParquetReaderBuilder {
             )?)
         };
 
-        cache_metrics.metadata_load_cost += start.elapsed();
         Ok((decoded, true))
     }
 
@@ -2460,6 +2490,109 @@ mod tests {
     use crate::sst::parquet::read_columns::{ParquetReadColumn, ParquetReadColumns};
     use crate::sst::parquet::row_group::ParquetFetchMetrics;
     use crate::test_util::sst_util::{sst_file_handle, sst_region_metadata};
+
+    #[tokio::test]
+    async fn concurrent_metadata_readers_share_cold_and_compact_loads() {
+        use parquet::file::metadata::KeyValue;
+
+        let store = ObjectStore::new(Memory::default()).unwrap();
+        let handle = sst_file_handle(0, 1);
+        let path = handle.file_path("metadata-sharing", PathType::Bare);
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                crate::sst::parquet::PARQUET_METADATA_KEY.to_string(),
+                sst_region_metadata().to_json().unwrap(),
+            )]))
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = bytes.len() as u64;
+        store.write(&path, bytes).await.unwrap();
+        let cache = Arc::new(
+            CacheManager::builder()
+                .sst_meta_cache_size(1024 * 1024)
+                .build(),
+        );
+        let builder = ParquetReaderBuilder::new(
+            "metadata-sharing".to_string(),
+            PathType::Bare,
+            handle.clone(),
+            store.clone(),
+        )
+        .cache(CacheStrategy::EnableAll(cache.clone()));
+        let results = futures::future::join_all((0..16).map(|_| async {
+            let mut metrics = MetadataCacheMetrics::default();
+            let (metadata, _) = builder
+                .read_parquet_metadata(&path, size, &mut metrics, PageIndexPolicy::Skip)
+                .await
+                .unwrap();
+            (metadata, metrics)
+        }))
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|(metadata, _)| Arc::ptr_eq(metadata, &results[0].0))
+        );
+        assert_eq!(
+            1,
+            results
+                .iter()
+                .map(|(_, metrics)| metrics.num_reads)
+                .sum::<usize>()
+        );
+        assert!(
+            results
+                .iter()
+                .all(|(_, metrics)| !metrics.metadata_load_cost.is_zero())
+        );
+
+        // Reinsert only the compact tier and remove the object: every reader
+        // must decode or join a decode instead of going back to storage.
+        let mut metrics = MetadataCacheMetrics::default();
+        let raw = MetadataLoader::new(store.clone(), &path, size)
+            .load(&mut metrics)
+            .await
+            .unwrap();
+        let prepared = prepare_sst_meta(
+            &path,
+            raw,
+            None,
+            PageIndexPolicy::Skip,
+            &common_runtime::global_runtime(),
+        )
+        .await
+        .unwrap();
+        let SstMetaPreparation::Prepared(prepared) = prepared else {
+            panic!("metadata should be cacheable")
+        };
+        cache.remove_parquet_meta_data(handle.file_id());
+        cache.put_prepared_sst_meta(handle.file_id(), prepared, false);
+        store.delete(&path).await.unwrap();
+        let results = futures::future::join_all((0..16).map(|_| async {
+            let mut metrics = MetadataCacheMetrics::default();
+            let (metadata, miss) = builder
+                .read_parquet_metadata(&path, size, &mut metrics, PageIndexPolicy::Skip)
+                .await
+                .unwrap();
+            assert!(!miss);
+            assert_eq!(0, metrics.num_reads);
+            metadata
+        }))
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|metadata| Arc::ptr_eq(metadata, &results[0]))
+        );
+    }
 
     async fn prefilter_test_builder(
         object_store: ObjectStore,

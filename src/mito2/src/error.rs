@@ -1352,6 +1352,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Failed to load SST metadata"))]
+    LoadSstMetadata {
+        source: Arc<Error>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to cast column"))]
     CastColumn {
         #[snafu(source)]
@@ -1616,7 +1623,7 @@ impl ErrorExt for Error {
 
             TooManyFilesToRead { .. } | TooManyGcJobs { .. } => StatusCode::RateLimited,
 
-            PruneFile { source, .. } => source.status_code(),
+            PruneFile { source, .. } | LoadSstMetadata { source, .. } => source.status_code(),
 
             FlushableRegionState { .. } => StatusCode::RegionNotReady,
         }
@@ -1661,7 +1668,8 @@ impl ErrorExt for Error {
             | CompactRegion { source, .. }
             | EditRegion { source, .. }
             | ScanSeries { source, .. }
-            | PruneFile { source, .. } => source.retry_hint(),
+            | PruneFile { source, .. }
+            | LoadSstMetadata { source, .. } => source.retry_hint(),
 
             DataTypeMismatch { source, .. }
             | ConvertVector { source, .. }
