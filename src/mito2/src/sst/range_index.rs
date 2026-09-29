@@ -15,7 +15,7 @@
 //! Per-SST series row-range index.
 
 mod deleter;
-mod searcher;
+pub(crate) mod searcher;
 mod writer;
 
 pub use searcher::SstRangeIndexSearcher;

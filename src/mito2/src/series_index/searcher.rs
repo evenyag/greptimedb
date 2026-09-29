@@ -13,22 +13,26 @@
 // limitations under the License.
 
 use async_stream::try_stream;
+use bytes::Bytes;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use common_time::range::TimestampRange;
 use common_time::timestamp::TimeUnit;
 use datafusion_expr::{Expr, col, lit};
-use datatypes::arrow::array::{ArrayRef, UInt32Array, UInt64Array};
+use datatypes::arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::datatypes::{DataType, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
-use datatypes::value::timestamp_to_scalar_value;
+use datatypes::prelude::DataType as _;
+use datatypes::value::{ValueRef, timestamp_to_scalar_value};
 use futures::TryStreamExt;
+use mito_codec::row_converter::SparsePrimaryKeyCodec;
 use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::metadata::RegionMetadataRef;
 use table::predicate::Predicate;
 
 use crate::error::{InvalidRecordBatchSnafu, RecordBatchSnafu, Result, UnexpectedSnafu};
+use crate::read::series_reader::{SeriesCandidateBatch, SeriesCandidateStream};
 use crate::series_index::{
     MAX_TS_COLUMN, METRIC_SERIES_ID_BATCH_SIZE, MIN_TS_COLUMN, MetricSeriesId,
     MetricSeriesIdStream, ROW_COUNT_COLUMN, SeriesIndexFileHandle, TABLE_ID_COLUMN, TSID_COLUMN,
@@ -94,6 +98,81 @@ impl SeriesIndexSearcher {
             pruning_predicate,
             filters,
         })
+    }
+
+    /// Returns complete keys when the index contains every expected tag. Older
+    /// schemas remain conservative candidates and recover keys from the SST.
+    pub(crate) fn search_with_primary_keys(
+        &self,
+        metadata: RegionMetadataRef,
+    ) -> Result<SeriesCandidateStream> {
+        let Some(reader) = self.reader.as_ref() else {
+            return Ok(Box::pin(futures::stream::empty()));
+        };
+        let complete = metadata.primary_key_columns().all(|column| {
+            reader
+                .schema()
+                .field_with_name(&column.column_schema.name)
+                .is_ok_and(|field| {
+                    field.data_type() == &column.column_schema.data_type.as_arrow_type()
+                })
+        });
+        let mut projection = vec![TABLE_ID_COLUMN, TSID_COLUMN];
+        projection.extend(self.filters.iter().map(SimpleFilterEvaluator::column_name));
+        if complete {
+            projection.extend(
+                metadata
+                    .primary_key_columns()
+                    .map(|column| column.column_schema.name.as_str()),
+            );
+        }
+        let mut batches = reader.read(&self.pruning_predicate, &projection)?;
+        let filters = self.filters.clone();
+        let file_handle = self.file_handle.clone();
+        Ok(Box::pin(try_stream! {
+            let codec = SparsePrimaryKeyCodec::new(&metadata);
+            let mut output = SeriesCandidateBatch::default();
+            while let Some(batch) = batches.try_next().await? {
+                let mut mask = BooleanBuffer::new_set(batch.num_rows());
+                for filter in &filters {
+                    let evaluated = filter.evaluate_array(column(&batch, filter.column_name())?).context(RecordBatchSnafu)?;
+                    mask = &mask & &evaluated;
+                }
+                let table_ids = column(&batch, TABLE_ID_COLUMN)?.as_any().downcast_ref::<UInt32Array>()
+                    .context(InvalidRecordBatchSnafu { reason: "series index table IDs are not UInt32" })?;
+                let tsids = column(&batch, TSID_COLUMN)?.as_any().downcast_ref::<UInt64Array>()
+                    .context(InvalidRecordBatchSnafu { reason: "series index TSIDs are not UInt64" })?;
+                for (row, matched) in mask.iter().enumerate() {
+                    if !matched { continue; }
+                    let id = MetricSeriesId { table_id: table_ids.value(row), tsid: tsids.value(row) };
+                    let key = if complete {
+                        let mut values = Vec::with_capacity(metadata.primary_key.len());
+                        for col in metadata.primary_key_columns() {
+                            let value = match col.column_schema.name.as_str() {
+                                TABLE_ID_COLUMN => ValueRef::UInt32(id.table_id),
+                                TSID_COLUMN => ValueRef::UInt64(id.tsid),
+                                name => {
+                                    let array = column(&batch, name)?;
+                                    if array.is_null(row) { ValueRef::Null } else {
+                                        ValueRef::String(datatypes::arrow_array::string_array_value_at_index(array, row)
+                                            .context(InvalidRecordBatchSnafu { reason: "series index tag is not a string" })?)
+                                    }
+                                }
+                            };
+                            values.push((col.column_id, value));
+                        }
+                        let mut key = Vec::new();
+                        codec.encode_to_vec(values.into_iter(), &mut key).context(crate::error::EncodeSnafu)?;
+                        Some(Bytes::from(key))
+                    } else { None };
+                    output.series.push(id);
+                    output.primary_keys.push(key);
+                    if output.series.len() == METRIC_SERIES_ID_BATCH_SIZE { yield std::mem::take(&mut output); }
+                }
+            }
+            if !output.series.is_empty() { yield output; }
+            drop(file_handle);
+        }))
     }
 
     /// Searches the index file and returns sorted batches of matching
@@ -417,6 +496,51 @@ mod tests {
         (file_handle, receiver)
     }
 
+    #[tokio::test]
+    async fn search_retains_complete_primary_keys() {
+        let metadata = Arc::new(sst_region_metadata_with_encoding(
+            PrimaryKeyEncoding::Sparse,
+        ));
+        let store = ObjectStore::new(Memory::default()).unwrap();
+        let (handle, _receiver) = write_index(
+            metadata.clone(),
+            store.clone(),
+            &[(1, 10, "a", "x", 0), (2, 10, "b", "y", 1)],
+            1,
+        )
+        .await;
+        let searcher = SeriesIndexSearcher::try_new(metadata.clone(), store, handle, None, None)
+            .await
+            .unwrap();
+        let batches = searcher
+            .search_with_primary_keys(metadata.clone())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let keys: Vec<_> = batches
+            .into_iter()
+            .flat_map(|batch| batch.primary_keys)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Some(Bytes::from(new_sparse_primary_key(
+                    &["a", "x"],
+                    &metadata,
+                    1,
+                    10
+                ))),
+                Some(Bytes::from(new_sparse_primary_key(
+                    &["b", "y"],
+                    &metadata,
+                    2,
+                    10
+                ))),
+            ]
+        );
+    }
+
     async fn collect_ids(stream: MetricSeriesIdStream) -> Vec<MetricSeriesId> {
         stream
             .try_collect::<Vec<_>>()
@@ -552,7 +676,7 @@ mod tests {
         let predicate =
             Predicate::new(vec![col("tag_0").eq(lit("a")), col("tag_2").eq(lit("new"))]);
         let searcher = SeriesIndexSearcher::try_new(
-            current_metadata,
+            current_metadata.clone(),
             object_store,
             index,
             Some(&predicate),
@@ -560,6 +684,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let candidates = searcher
+            .search_with_primary_keys(current_metadata)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .iter()
+                .flat_map(|batch| &batch.primary_keys)
+                .all(Option::is_none)
+        );
         let ids = collect_ids(searcher.search().unwrap()).await;
         assert_eq!(
             ids,

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use api::v1::{OpType, SemanticType};
 use common_telemetry::error;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
 use datatypes::arrow::array::{Array as _, ArrayRef, BooleanArray};
@@ -41,22 +41,24 @@ use store_api::storage::{ColumnId, TimeSeriesRowSelector};
 use table::predicate::Predicate;
 use tokio::sync::OnceCell;
 
-use crate::cache::CacheStrategy;
+use crate::cache::{CacheStrategy, RangeResultKey, RangeResultValue};
 use crate::error::{
     ComputeArrowSnafu, DecodeStatsSnafu, EvalPartitionFilterSnafu, InvalidRecordBatchSnafu,
-    NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu, UnexpectedSnafu,
+    NewRecordBatchSnafu, RecordBatchSnafu, ReserveSeriesScanMemorySnafu, Result,
+    StatsNotPresentSnafu, UnexpectedSnafu,
 };
 use crate::read::compat::FlatCompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::read::prune::FlatPruneReader;
+use crate::read::series_mapping::{SeriesPrimaryKeyCursor, SeriesRowGroup, SeriesRowGroupBuilder};
+use crate::series_index::MetricSeriesId;
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
     DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys, primary_key_column_index,
     time_index_column_index,
 };
 use crate::sst::parquet::json_align::ProjectedRecordBatchStream;
-use crate::sst::parquet::prefilter::primary_key_filter_mask;
 use crate::sst::parquet::reader::{
     FlatRowGroupReader, MaybeFilter, RowGroupBuildContext, RowGroupReaderBuilder,
     SimpleFilterContext,
@@ -271,87 +273,206 @@ impl FileRange {
         Ok(Some(flat_prune_reader))
     }
 
-    /// Creates a reader that returns only the encoded primary-key column.
-    ///
-    /// The returned primary keys are compatible with the expected region metadata.
-    pub(crate) async fn primary_key_reader(
+    /// Returns complete source-schema runs. Reading the whole PK column once
+    /// makes the cache independent of predicates and pruning selections.
+    pub(crate) async fn series_rows(
         &self,
+        memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<Option<ProjectedRecordBatchStream>> {
-        self.primary_key_reader_inner(fetch_metrics, true).await
+    ) -> Result<Arc<SeriesRowGroup>> {
+        let cell = self
+            .context
+            .series_rows
+            .get(self.row_group_idx)
+            .context(UnexpectedSnafu {
+                reason: "series row group is out of bounds",
+            })?;
+        let (mapping, _) = cell
+            .get_or_try_init(|| async {
+                let builder = &self.context.reader_builder;
+                let cache = builder.cache_strategy();
+                let key =
+                    RangeResultKey::SeriesRows(builder.file_handle().file_id(), self.row_group_idx);
+                let reservation = MemoryConsumer::new("SeriesRowGroup").register(memory_pool);
+                if let Some(RangeResultValue::SeriesRows(mapping)) = cache.get_series_mapping(&key)
+                {
+                    reservation
+                        .try_grow(mapping.estimated_size())
+                        .context(ReserveSeriesScanMemorySnafu)?;
+                    return Ok((mapping, reservation));
+                }
+                let mut stream = builder
+                    .build_primary_key(self.context.build_context(
+                        self.row_group_idx,
+                        None,
+                        fetch_metrics,
+                    ))
+                    .await?;
+                let mut mapping = SeriesRowGroupBuilder::default();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    mapping.append(batch.column(0), Some(&reservation))?;
+                }
+                let mapping = Arc::new(mapping.finish());
+                let expected_rows = builder
+                    .parquet_metadata()
+                    .row_group(self.row_group_idx)
+                    .num_rows() as usize;
+                ensure!(
+                    mapping.runs.last().map_or(0, |run| run.rows.end) == expected_rows,
+                    UnexpectedSnafu {
+                        reason: "primary-key mapping does not cover the complete row group",
+                    }
+                );
+                reservation
+                    .try_resize(mapping.estimated_size())
+                    .context(ReserveSeriesScanMemorySnafu)?;
+                cache.put_series_mapping(key, RangeResultValue::SeriesRows(mapping.clone()));
+                Ok::<_, crate::error::Error>((mapping, reservation))
+            })
+            .await?;
+        Ok(mapping.clone())
     }
 
-    async fn primary_key_reader_inner(
+    /// Candidate keys and data selection use the same retained source mapping.
+    pub(crate) async fn series_candidate_keys(
         &self,
+        memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-        check_dynamic_filter: bool,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
-        if check_dynamic_filter && !self.in_dynamic_filter_range() {
+        if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
-        let stream = self
-            .context
-            .reader_builder
-            .build_primary_key(self.context.build_context(
-                self.row_group_idx,
-                self.row_selection.clone(),
-                fetch_metrics,
-            ))
-            .await?;
-        if self.context.compat_batch().is_none() {
-            return Ok(Some(stream));
+        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
+        let runs = mapping
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(key, run)| (key, run.rows.clone()))
+            .collect();
+        let cursor = SeriesPrimaryKeyCursor::new(
+            mapping.primary_keys.clone(),
+            runs,
+            self.row_selection.as_ref(),
+        );
+        let mut primary_keys = cursor.unique_keys();
+        if let Some(compat) = self.context.compat_batch() {
+            primary_keys = compat.compat_primary_key(&primary_keys)?;
         }
-
-        let context = self.context.clone();
-        let stream = stream
-            .map(move |batch| {
-                let batch = batch?;
-                let compat = context.compat_batch().context(UnexpectedSnafu {
-                    reason: "Primary-key compatibility helper is missing",
-                })?;
-                let primary_key = compat.compat_primary_key(batch.column(0))?;
-                RecordBatch::try_new(batch.schema(), vec![primary_key]).context(NewRecordBatchSnafu)
-            })
-            .boxed();
-        Ok(Some(stream))
+        let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
+            datatypes::arrow::datatypes::Field::new(
+                store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME,
+                primary_keys.data_type().clone(),
+                false,
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![primary_keys]).context(NewRecordBatchSnafu)?;
+        Ok(Some(Box::pin(futures::stream::once(async { Ok(batch) }))))
     }
 
-    /// Builds a full-projection reader selected only by the provided encoded-PK
-    /// filter and this range's existing row selection.
-    ///
-    /// This deliberately bypasses generic predicate prefiltering. The series
-    /// pruner selected the row group independently, and simple predicates retained
-    /// by the disabled prefilter plan are applied precisely before merge.
-    pub(crate) async fn reader_by_primary_key(
+    /// Selects series from retained runs and reads data without the PK column.
+    pub(crate) async fn reader_by_series(
         &self,
-        primary_key_filter: &mut dyn mito_codec::row_converter::PrimaryKeyFilter,
+        series: &[MetricSeriesId],
+        memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<FlatRowGroupReader>> {
-        let Some(mut primary_keys) = self.primary_key_reader_inner(fetch_metrics, false).await?
-        else {
-            return Ok(None);
-        };
+        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
+        let cursor = SeriesPrimaryKeyCursor::new(
+            mapping.primary_keys.clone(),
+            mapping.select(series),
+            self.row_selection.as_ref(),
+        );
+        self.reader_with_series_keys(cursor, fetch_metrics).await
+    }
 
-        let mut masks = Vec::new();
-        while let Some(batch) = primary_keys.next().await {
-            let batch = batch?;
-            masks.push(BooleanArray::from(primary_key_filter_mask(
-                &batch,
-                primary_key_filter,
-            )?));
+    /// Resolves range-index identities against sorted candidate keys. Only use
+    /// these keys when their schema matches this SST; otherwise load source keys.
+    pub(crate) async fn reader_by_indexed_series(
+        &self,
+        runs: Vec<crate::read::series_mapping::SeriesRowRange>,
+        series: &[MetricSeriesId],
+        primary_keys: &[Option<bytes::Bytes>],
+        expected_metadata: &RegionMetadataRef,
+        memory_pool: &Arc<dyn MemoryPool>,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<Option<FlatRowGroupReader>> {
+        if runs.is_empty() {
+            return Ok(None);
         }
-        let Some(selected) = refine_primary_key_selection(&masks, &self.row_selection) else {
-            return Ok(None);
-        };
+        let num_rows = self
+            .context
+            .reader_builder
+            .parquet_metadata()
+            .row_group(self.row_group_idx)
+            .num_rows() as usize;
+        ensure!(
+            runs.iter().all(|run| run.rows.end <= num_rows),
+            InvalidRecordBatchSnafu {
+                reason: "range-index row range exceeds the source row group",
+            }
+        );
+        let same_schema = self.region_metadata().primary_key == expected_metadata.primary_key
+            && self
+                .region_metadata()
+                .primary_key_columns()
+                .zip(expected_metadata.primary_key_columns())
+                .all(|(a, b)| a.column_schema == b.column_schema);
+        if !same_schema {
+            return self
+                .reader_by_series(series, memory_pool, fetch_metrics)
+                .await;
+        }
+        let mut keys = datatypes::arrow::array::BinaryBuilder::new();
+        let mut selected = Vec::with_capacity(runs.len());
+        let mut cursor = 0;
+        for run in runs {
+            while cursor < series.len() && series[cursor] < run.series {
+                cursor += 1;
+            }
+            let key = if series.get(cursor) == Some(&run.series) {
+                primary_keys.get(cursor).and_then(Option::as_ref)
+            } else {
+                None
+            };
+            let Some(key) = key else {
+                return self
+                    .reader_by_series(series, memory_pool, fetch_metrics)
+                    .await;
+            };
+            keys.append_value(key);
+            selected.push((selected.len(), run.rows));
+        }
+        let cursor =
+            SeriesPrimaryKeyCursor::new(keys.finish(), selected, self.row_selection.as_ref());
+        self.reader_with_series_keys(cursor, fetch_metrics).await
+    }
 
+    async fn reader_with_series_keys(
+        &self,
+        cursor: SeriesPrimaryKeyCursor,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<Option<FlatRowGroupReader>> {
+        if cursor.is_finished() {
+            return Ok(None);
+        }
+        let num_rows = self
+            .context
+            .reader_builder
+            .parquet_metadata()
+            .row_group(self.row_group_idx)
+            .num_rows() as usize;
+        let ranges = cursor.row_ranges().collect();
+        let selected = refine_row_range_selection(ranges, num_rows, &None)?;
         let stream = self
             .context
             .reader_builder
-            .build_without_prefilter(self.context.build_context(
-                self.row_group_idx,
-                Some(selected),
-                fetch_metrics,
-            ))
+            .build_with_series_keys(
+                self.context
+                    .build_context(self.row_group_idx, selected, fetch_metrics),
+                cursor,
+            )
             .await?;
         Ok(Some(FlatRowGroupReader::new(self.context.clone(), stream)))
     }
@@ -359,35 +480,6 @@ impl FileRange {
     /// Returns the source SST row-group index.
     pub(crate) fn row_group_index(&self) -> usize {
         self.row_group_idx
-    }
-
-    /// Builds a reader from absolute row-group offsets supplied by a range index.
-    /// Existing pruning is intersected before reading, without predicate prefiltering.
-    pub(crate) async fn reader_by_row_ranges(
-        &self,
-        ranges: Vec<Range<usize>>,
-        fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<Option<FlatRowGroupReader>> {
-        let num_rows = self
-            .context
-            .reader_builder
-            .parquet_metadata()
-            .row_group(self.row_group_idx)
-            .num_rows() as usize;
-        let Some(selected) = refine_row_range_selection(ranges, num_rows, &self.row_selection)?
-        else {
-            return Ok(None);
-        };
-        let stream = self
-            .context
-            .reader_builder
-            .build_without_prefilter(self.context.build_context(
-                self.row_group_idx,
-                Some(selected),
-                fetch_metrics,
-            ))
-            .await?;
-        Ok(Some(FlatRowGroupReader::new(self.context.clone(), stream)))
     }
 
     /// Returns the helper to compat batches.
@@ -448,27 +540,15 @@ fn refine_row_range_selection(
     Ok((selected.row_count() > 0).then_some(selected))
 }
 
-fn refine_primary_key_selection(
-    masks: &[BooleanArray],
-    original: &Option<RowSelection>,
-) -> Option<RowSelection> {
-    if masks.is_empty() {
-        return None;
-    }
-    let selected = RowSelection::from_filters(masks);
-    let selected = match original {
-        Some(original) => original.and_then(&selected),
-        None => selected,
-    };
-    (selected.row_count() > 0).then_some(selected)
-}
-
 /// Context shared by ranges of the same parquet SST.
 pub struct FileRangeContext {
     /// Store for a range index registered in the scan's index snapshot.
     range_index_store: Option<ObjectStore>,
     /// Lazily opened range index shared by all ranges of this file.
     range_index_searcher: OnceCell<SstRangeIndexSearcher>,
+    /// Complete source mappings shared by candidate and data reads, even when
+    /// shared-cache admission is disabled or the entry is evicted.
+    series_rows: Vec<OnceCell<(Arc<SeriesRowGroup>, MemoryReservation)>>,
     /// Row group reader builder for the file.
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.
@@ -484,9 +564,13 @@ impl FileRangeContext {
         base: RangeBase,
         range_index_store: Option<ObjectStore>,
     ) -> Self {
+        let series_rows = (0..reader_builder.parquet_metadata().num_row_groups())
+            .map(|_| OnceCell::new())
+            .collect();
         Self {
             reader_builder,
             base,
+            series_rows,
             range_index_store,
             range_index_searcher: OnceCell::new(),
         }
@@ -495,7 +579,7 @@ impl FileRangeContext {
     /// Loads scan-wide range-index batches once, retaining the SST handle throughout their use.
     pub(crate) async fn range_index_searcher(
         &self,
-        predicate: Option<&Predicate>,
+        _predicate: Option<&Predicate>,
         memory_pool: &Arc<dyn MemoryPool>,
     ) -> Result<Option<&SstRangeIndexSearcher>> {
         let Some(store) = &self.range_index_store else {
@@ -505,7 +589,14 @@ impl FileRangeContext {
             .get_or_try_init(|| async {
                 let file = self.reader_builder.file_handle();
                 let path = range_index_path(file.region_id(), file.file_id().file_id());
-                SstRangeIndexSearcher::open(store.clone(), &path, predicate, memory_pool).await
+                SstRangeIndexSearcher::open_cached(
+                    store.clone(),
+                    &path,
+                    file.file_id(),
+                    self.reader_builder.cache_strategy(),
+                    memory_pool,
+                )
+                .await
             })
             .await
             .map(Some)
@@ -1322,26 +1413,5 @@ mod tests {
         ] {
             assert!(refine_row_range_selection(ranges, 10, &None).is_err());
         }
-    }
-
-    #[test]
-    fn test_refine_primary_key_selection_intersects_original_selection() {
-        let original = Some(RowSelection::from(vec![
-            RowSelector::skip(2),
-            RowSelector::select(3),
-            RowSelector::skip(1),
-            RowSelector::select(2),
-        ]));
-        let mask = BooleanArray::from(vec![true, false, true, false, true]);
-        let actual = refine_primary_key_selection(&[mask], &original).unwrap();
-        let expected = RowSelection::from(vec![
-            RowSelector::skip(2),
-            RowSelector::select(1),
-            RowSelector::skip(1),
-            RowSelector::select(1),
-            RowSelector::skip(2),
-            RowSelector::select(1),
-        ]);
-        assert_eq!(actual, expected);
     }
 }

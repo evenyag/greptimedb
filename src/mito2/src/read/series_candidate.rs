@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_stream::try_stream;
+use bytes::Bytes;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::expressions::Column;
@@ -27,7 +28,7 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
-use datatypes::arrow::array::{Array, BinaryArray, BinaryBuilder};
+use datatypes::arrow::array::{Array, BinaryArray, BinaryBuilder, BooleanArray};
 use datatypes::arrow::compute::SortOptions;
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
@@ -53,9 +54,10 @@ use crate::read::range_cache::{
 };
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::{PartitionMetrics, new_filter_metrics, scan_flat_mem_ranges};
+use crate::read::series_reader::{SeriesCandidateBatch, SeriesCandidateStream};
 use crate::series_index::{
-    METRIC_SERIES_ID_BATCH_SIZE, MetricSeriesId, MetricSeriesIdStream, SeriesIndexFileHandle,
-    SeriesIndexReadContext, SeriesIndexSearcher,
+    METRIC_SERIES_ID_BATCH_SIZE, MetricSeriesId, SeriesIndexFileHandle, SeriesIndexReadContext,
+    SeriesIndexSearcher,
 };
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::format::PrimaryKeyArray;
@@ -141,7 +143,7 @@ impl SeriesCandidateScanner {
     /// Builds a globally sorted stream of candidate metric-series IDs.
     pub(crate) async fn build_stream(
         &self,
-    ) -> Result<(MetricSeriesIdStream, Option<CandidateRowGroupStats>)> {
+    ) -> Result<(SeriesCandidateStream, Option<CandidateRowGroupStats>)> {
         let all_ranges = self
             .partitions
             .iter()
@@ -215,7 +217,11 @@ impl SeriesCandidateScanner {
             self.partitions.len(),
             "SeriesCandidateScanner::final_merge",
         )?;
-        let stream = decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())?;
+        let stream = decode_metric_series(
+            merged,
+            self.stream_ctx.input.region_metadata().clone(),
+            self.memory_pool.clone(),
+        )?;
         Ok((stream, stats))
     }
 
@@ -350,7 +356,7 @@ fn index_primary_key_stream(
                 index,
                 stream_ctx.input.predicate_group().predicate(),
                 stream_ctx.input.time_range,
-            ).await?.search()?
+            ).await?.search_with_primary_keys(metadata.clone())?
         };
         loop {
             let batch = {
@@ -361,15 +367,21 @@ fn index_primary_key_stream(
             };
             let Some(batch) = batch else { break };
             let mut builder = BinaryBuilder::new();
+            let mut complete = Vec::with_capacity(batch.series.len());
             let mut key = Vec::new();
-            for series in batch {
-                key.clear();
-                codec.encode_internal(series.table_id, series.tsid, &mut key)
-                    .context(crate::error::EncodeSnafu)?;
-                builder.append_value(&key);
+            for (series, full_key) in batch.series.into_iter().zip(batch.primary_keys) {
+                if let Some(full_key) = full_key {
+                    builder.append_value(&full_key);
+                    complete.push(true);
+                } else {
+                    key.clear();
+                    codec.encode_internal(series.table_id, series.tsid, &mut key)
+                        .context(crate::error::EncodeSnafu)?;
+                    builder.append_value(&key);
+                    complete.push(false);
+                }
             }
-            yield RecordBatch::try_new(primary_key_schema(), vec![Arc::new(builder.finish())])
-                .context(NewRecordBatchSnafu)?;
+            yield primary_key_batch(builder.finish(), Some(BooleanArray::from(complete)))?;
         }
     })
 }
@@ -508,6 +520,7 @@ impl SeriesCandidateRangeBuilder {
                 )
             });
             let part_metrics = self.part_metrics.clone();
+            let memory_pool = self.memory_pool.clone();
             let raw = Box::pin(try_stream! {
                 let fetch_metrics = part_metrics
                     .explain_verbose()
@@ -519,7 +532,7 @@ impl SeriesCandidateRangeBuilder {
                 for range in ranges {
                     let build_start = Instant::now();
                     let Some(mut reader) = range
-                        .primary_key_reader(fetch_metrics.as_deref())
+                        .series_candidate_keys(&memory_pool, fetch_metrics.as_deref())
                         .await?
                     else {
                         continue;
@@ -579,11 +592,19 @@ pub(crate) fn validate_metric_metadata(stream_ctx: &StreamContext) -> Result<()>
 }
 
 fn primary_key_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        PRIMARY_KEY_COLUMN_NAME,
-        DataType::Binary,
-        false,
-    )]))
+    Arc::new(Schema::new(vec![
+        Field::new(PRIMARY_KEY_COLUMN_NAME, DataType::Binary, false),
+        Field::new("__series_key_complete", DataType::Boolean, false),
+    ]))
+}
+
+fn primary_key_batch(keys: BinaryArray, complete: Option<BooleanArray>) -> Result<RecordBatch> {
+    let complete = complete.unwrap_or_else(|| BooleanArray::from(vec![true; keys.len()]));
+    RecordBatch::try_new(
+        primary_key_schema(),
+        vec![Arc::new(keys), Arc::new(complete)],
+    )
+    .context(NewRecordBatchSnafu)
 }
 
 /// Filters a source by encoded-primary-key predicates and emits one binary row per local key.
@@ -668,8 +689,7 @@ fn normalize_candidate_batch(
     if array.is_empty() {
         return Ok(None);
     }
-    let batch = RecordBatch::try_new(primary_key_schema(), vec![Arc::new(array)])
-        .context(NewRecordBatchSnafu)?;
+    let batch = primary_key_batch(array, None)?;
     Ok(Some(batch))
 }
 
@@ -740,38 +760,47 @@ fn merge_primary_key_streams(
 fn decode_metric_series(
     mut input: BoxedRecordBatchStream,
     metadata: store_api::metadata::RegionMetadataRef,
-) -> Result<MetricSeriesIdStream> {
+    memory_pool: Arc<dyn MemoryPool>,
+) -> Result<SeriesCandidateStream> {
     let codec = SparsePrimaryKeyCodec::new(&metadata);
     Ok(Box::pin(try_stream! {
-        let mut last_series = None;
-        let mut output = Vec::with_capacity(METRIC_SERIES_ID_BATCH_SIZE);
+        let mut pending: Option<(MetricSeriesId, Option<Bytes>, bool)> = None;
+        let mut output = SeriesCandidateBatch::default();
         while let Some(batch) = input.try_next().await? {
-            let array = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .context(UnexpectedSnafu {
-                    reason: "merged candidate primary key is not binary",
-                })?;
-            for primary_key in array.iter().flatten() {
-                let (table_id, tsid) = codec
-                    .decode_ids(primary_key)
-                    .context(crate::error::DecodeSnafu)?;
+            let array = batch.column(0).as_any().downcast_ref::<BinaryArray>()
+                .context(UnexpectedSnafu { reason: "merged candidate primary key is not binary" })?;
+            let complete = batch.column(1).as_any().downcast_ref::<BooleanArray>()
+                .context(UnexpectedSnafu { reason: "candidate key completeness is not boolean" })?;
+            for row in 0..array.len() {
+                let (table_id, tsid) = codec.decode_ids(array.value(row)).context(crate::error::DecodeSnafu)?;
                 let series = MetricSeriesId { table_id, tsid };
-                if last_series == Some(series) {
+                let key = complete.value(row).then(|| Bytes::copy_from_slice(array.value(row)));
+                if let Some((last, last_key, conflict)) = pending.as_mut() && *last == series {
+                    if !*conflict && let Some(key) = key {
+                        if last_key.as_ref().is_some_and(|last| *last != key) {
+                            *last_key = None;
+                            *conflict = true;
+                        } else { *last_key = Some(key); }
+                    }
                     continue;
                 }
-                last_series = Some(series);
-                output.push(series);
-                if output.len() == METRIC_SERIES_ID_BATCH_SIZE {
-                    yield std::mem::replace(
-                        &mut output,
-                        Vec::with_capacity(METRIC_SERIES_ID_BATCH_SIZE),
-                    );
+                if let Some((series, key, _)) = pending.take() {
+                    output.series.push(series);
+                    output.primary_keys.push(key);
+                    if output.series.len() == METRIC_SERIES_ID_BATCH_SIZE {
+                        output.reserve(&memory_pool)?;
+                        yield std::mem::take(&mut output);
+                    }
                 }
+                pending = Some((series, key, false));
             }
         }
-        if !output.is_empty() {
+        if let Some((series, key, _)) = pending {
+            output.series.push(series);
+            output.primary_keys.push(key);
+        }
+        if !output.series.is_empty() {
+            output.reserve(&memory_pool)?;
             yield output;
         }
     }))
@@ -964,7 +993,10 @@ mod tests {
             (0..1001)
                 .map(|tsid| MetricSeriesId { table_id: 1, tsid })
                 .collect::<Vec<_>>(),
-            groups.into_iter().flatten().collect::<Vec<_>>()
+            groups
+                .into_iter()
+                .flat_map(|batch| batch.series)
+                .collect::<Vec<_>>()
         );
         // Candidate discovery leaves covered SST references available for the
         // separate pruning future and subsequent data reads.
@@ -1032,12 +1064,15 @@ mod tests {
                 scanner.part_metrics.clone(),
                 Some(stats),
             );
-            expected =
-                decode_metric_series(cached, scanner.stream_ctx.input.region_metadata().clone())
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
+            expected = decode_metric_series(
+                cached,
+                scanner.stream_ctx.input.region_metadata().clone(),
+                scanner.memory_pool.clone(),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         }
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while keys.iter().any(|key| {
@@ -1062,8 +1097,14 @@ mod tests {
         assert_eq!(Some(3), stats.unwrap().mean());
         let actual = stream.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(
-            expected.into_iter().flatten().collect::<Vec<_>>(),
-            actual.into_iter().flatten().collect::<Vec<_>>()
+            expected
+                .into_iter()
+                .flat_map(|batch| batch.series)
+                .collect::<Vec<_>>(),
+            actual
+                .into_iter()
+                .flat_map(|batch| batch.series)
+                .collect::<Vec<_>>()
         );
 
         // A candidate entry without statistics must remain readable, but cannot
@@ -1154,13 +1195,7 @@ mod tests {
     }
 
     fn binary_batch(values: &[&[u8]]) -> RecordBatch {
-        RecordBatch::try_new(
-            primary_key_schema(),
-            vec![Arc::new(BinaryArray::from_iter_values(
-                values.iter().copied(),
-            ))],
-        )
-        .unwrap()
+        primary_key_batch(BinaryArray::from_iter_values(values.iter().copied()), None).unwrap()
     }
 
     fn dictionary_batch(values: &[&[u8]], keys: &[u32]) -> RecordBatch {
@@ -1255,22 +1290,29 @@ mod tests {
         let pool = Arc::new(UnboundedMemoryPool::default());
         let merged =
             merge_primary_key_streams(vec![source], pool, &metrics, 0, "candidate-test").unwrap();
-        let groups = decode_metric_series(merged, metadata)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let groups =
+            decode_metric_series(merged, metadata, Arc::new(UnboundedMemoryPool::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
 
-        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [500, 1]);
         assert_eq!(
-            groups[0][0],
+            groups
+                .iter()
+                .map(|batch| batch.series.len())
+                .collect::<Vec<_>>(),
+            [500, 1]
+        );
+        assert_eq!(
+            groups[0].series[0],
             MetricSeriesId {
                 table_id: 1,
                 tsid: 0
             }
         );
         assert_eq!(
-            groups[1][0],
+            groups[1].series[0],
             MetricSeriesId {
                 table_id: 1,
                 tsid: 500
@@ -1310,14 +1352,18 @@ mod tests {
             "candidate-merge-test",
         )
         .unwrap();
-        let groups = decode_metric_series(merged, metadata)
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let groups =
+            decode_metric_series(merged, metadata, Arc::new(UnboundedMemoryPool::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
 
         assert_eq!(
-            groups,
+            groups
+                .into_iter()
+                .map(|batch| batch.series)
+                .collect::<Vec<_>>(),
             vec![vec![
                 MetricSeriesId {
                     table_id: 1,

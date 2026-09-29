@@ -27,10 +27,13 @@ use object_store::ObjectStore;
 use snafu::{OptionExt, ResultExt, ensure};
 use table::predicate::Predicate;
 
+use crate::cache::{CacheStrategy, RangeResultKey, RangeResultValue};
 use crate::error::{
     InvalidRecordBatchSnafu, ReserveRangeIndexMemorySnafu, Result, UnexpectedSnafu,
 };
+use crate::read::series_mapping::SeriesRowRange;
 use crate::series_index::MetricSeriesId;
+use crate::sst::file::RegionFileId;
 use crate::sst::parquet::index_reader::ParquetIndexReader;
 use crate::sst::range_index::{
     END_COLUMN, ROW_GROUP_ID_COLUMN, START_COLUMN, TABLE_ID_COLUMN, TSID_COLUMN,
@@ -39,8 +42,20 @@ use crate::sst::range_index::{
 /// Query-scoped range-index batches shared by all series assignments for an SST.
 pub struct SstRangeIndexSearcher {
     /// Zero-copy slices grouped by source SST row group.
-    batches: BTreeMap<u32, Vec<RecordBatch>>,
+    data: Arc<SstRangeIndexData>,
     _reservation: MemoryReservation,
+}
+
+/// Immutable index buffers, independent of query memory reservations and predicates.
+pub(crate) struct SstRangeIndexData {
+    batches: BTreeMap<u32, Vec<RecordBatch>>,
+    size: usize,
+}
+
+impl SstRangeIndexData {
+    pub(crate) fn estimated_size(&self) -> usize {
+        self.size
+    }
 }
 
 impl SstRangeIndexSearcher {
@@ -94,14 +109,47 @@ impl SstRangeIndexSearcher {
                 start = end;
             }
         }
+        let size = reservation.size()
+            + std::mem::size_of::<SstRangeIndexData>()
+            + batches
+                .values()
+                .map(|batches| batches.capacity() * std::mem::size_of::<RecordBatch>())
+                .sum::<usize>();
+        reservation
+            .try_resize(size)
+            .context(ReserveRangeIndexMemorySnafu)?;
         Ok(Self {
-            batches,
+            data: Arc::new(SstRangeIndexData { batches, size }),
             _reservation: reservation,
         })
     }
 
+    /// Cache complete index contents, then apply assignment filters during search.
+    pub(crate) async fn open_cached(
+        object_store: ObjectStore,
+        path: &str,
+        file_id: RegionFileId,
+        cache: &CacheStrategy,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
+        let key = RangeResultKey::RangeIndex(file_id);
+        if let Some(RangeResultValue::RangeIndex(data)) = cache.get_series_mapping(&key) {
+            let reservation = MemoryConsumer::new("SstRangeIndexSearcher").register(memory_pool);
+            reservation
+                .try_grow(data.estimated_size())
+                .context(ReserveRangeIndexMemorySnafu)?;
+            return Ok(Self {
+                data,
+                _reservation: reservation,
+            });
+        }
+        let searcher = Self::open(object_store, path, None, memory_pool).await?;
+        cache.put_series_mapping(key, RangeResultValue::RangeIndex(searcher.data.clone()));
+        Ok(searcher)
+    }
+
     pub(crate) fn contains_row_group(&self, row_group: usize) -> bool {
-        u32::try_from(row_group).is_ok_and(|group| self.batches.contains_key(&group))
+        u32::try_from(row_group).is_ok_and(|group| self.data.batches.contains_key(&group))
     }
 
     /// Returns the row ranges for `series` in one source SST row group.
@@ -117,20 +165,38 @@ impl SstRangeIndexSearcher {
         row_group_id: u32,
         series: &[MetricSeriesId],
     ) -> Result<Vec<Range<usize>>> {
+        let runs = self.search_series(row_group_id, series)?;
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(runs.len());
+        for run in runs {
+            if let Some(last) = ranges.last_mut()
+                && last.end == run.rows.start
+            {
+                last.end = run.rows.end;
+            } else {
+                ranges.push(run.rows);
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Like `search`, but preserves identities at adjacent series boundaries.
+    pub(crate) fn search_series(
+        &self,
+        row_group_id: u32,
+        series: &[MetricSeriesId],
+    ) -> Result<Vec<SeriesRowRange>> {
         if series.is_empty() {
             return Ok(Vec::new());
         }
-
         validate_sorted_series(series)?;
         let mut merge = RangeMergeState::new(row_group_id, series);
-        if let Some(batches) = self.batches.get(&row_group_id) {
+        if let Some(batches) = self.data.batches.get(&row_group_id) {
             for batch in batches {
                 if merge.append_batch(batch)? {
                     break;
                 }
             }
         }
-
         Ok(merge.finish())
     }
 }
@@ -203,7 +269,7 @@ struct RangeMergeState<'a> {
     /// Last range-index key read, used to validate ordering across batches.
     last_index_key: Option<(u32, MetricSeriesId)>,
     /// Matching row ranges, sorted and coalesced when adjacent.
-    ranges: Vec<Range<usize>>,
+    ranges: Vec<SeriesRowRange>,
 }
 
 impl<'a> RangeMergeState<'a> {
@@ -269,7 +335,7 @@ impl<'a> RangeMergeState<'a> {
                 }
                 Ordering::Greater => continue,
                 Ordering::Equal => {
-                    self.append_range(starts.value(row), ends.value(row), row)?;
+                    self.append_range(index_series, starts.value(row), ends.value(row), row)?;
                     self.advance_series();
                     if self.series_index == self.series.len() {
                         return Ok(true);
@@ -287,7 +353,13 @@ impl<'a> RangeMergeState<'a> {
         }
     }
 
-    fn append_range(&mut self, start: i64, end: i64, row: usize) -> Result<()> {
+    fn append_range(
+        &mut self,
+        series: MetricSeriesId,
+        start: i64,
+        end: i64,
+        row: usize,
+    ) -> Result<()> {
         let start = usize::try_from(start).map_err(|_| {
             InvalidRecordBatchSnafu {
                 reason: format!("range index contains negative start offset at row {row}"),
@@ -309,24 +381,23 @@ impl<'a> RangeMergeState<'a> {
 
         if let Some(last) = self.ranges.last_mut() {
             ensure!(
-                start >= last.end,
+                start >= last.rows.end,
                 InvalidRecordBatchSnafu {
                     reason: format!(
                         "range index contains overlapping or unsorted range {start}..{end} after {}..{}",
-                        last.start, last.end
+                        last.rows.start, last.rows.end
                     ),
                 }
             );
-            if start == last.end {
-                last.end = end;
-                return Ok(());
-            }
         }
-        self.ranges.push(start..end);
+        self.ranges.push(SeriesRowRange {
+            series,
+            rows: start..end,
+        });
         Ok(())
     }
 
-    fn finish(self) -> Vec<Range<usize>> {
+    fn finish(self) -> Vec<SeriesRowRange> {
         self.ranges
     }
 }
@@ -471,6 +542,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_cache_retains_identities_and_releases_query_reservations() {
+        let store = object_store();
+        let path = "shared-range-index.parquet";
+        write_index(&store, path).await;
+        let cache = CacheStrategy::EnableAll(Arc::new(
+            crate::cache::CacheManager::builder()
+                .range_result_cache_size(1024 * 1024)
+                .build(),
+        ));
+        let file = RegionFileId::new(
+            store_api::storage::RegionId::new(1, 1),
+            store_api::storage::FileId::random(),
+        );
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let first = SstRangeIndexSearcher::open_cached(store.clone(), path, file, &cache, &pool)
+            .await
+            .unwrap();
+        let runs = first
+            .search_series(0, &[series(1, 10), series(1, 20)])
+            .unwrap();
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.series, run.rows.clone()))
+                .collect::<Vec<_>>(),
+            vec![(series(1, 10), 0..2), (series(1, 20), 2..3)]
+        );
+        drop(first);
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "shared cache must not retain a query pool"
+        );
+        store.delete(path).await.unwrap();
+        let next = SstRangeIndexSearcher::open_cached(store.clone(), path, file, &cache, &pool)
+            .await
+            .unwrap();
+        assert_eq!(next.search(0, &[series(2, 20)]).unwrap(), vec![4..6]);
+        let small: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+        assert!(
+            SstRangeIndexSearcher::open_cached(store.clone(), path, file, &cache, &small)
+                .await
+                .is_err()
+        );
+        assert_eq!(small.reserved(), 0);
+        assert!(
+            SstRangeIndexSearcher::open_cached(store, path, file, &CacheStrategy::Disabled, &pool)
+                .await
+                .is_err()
+        );
+        drop(next);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
     async fn loading_prunes_by_scan_predicate() {
         let store = object_store();
         let path = "range-pruning.parquet";
@@ -500,7 +625,7 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(
-                searcher.batches.keys().copied().collect::<Vec<_>>(),
+                searcher.data.batches.keys().copied().collect::<Vec<_>>(),
                 expected_groups
             );
         }
@@ -542,7 +667,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                searcher.batches.keys().copied().collect::<Vec<_>>(),
+                searcher.data.batches.keys().copied().collect::<Vec<_>>(),
                 vec![0, 2]
             );
             assert_eq!(
@@ -633,6 +758,13 @@ mod tests {
         let mut merge = RangeMergeState::new(0, &selected);
         assert!(!merge.append_batch(&make_batch(10, 0, 1)).unwrap());
         assert!(merge.append_batch(&make_batch(20, 1, 2)).unwrap());
-        assert_eq!(merge.finish(), vec![0..2]);
+        assert_eq!(
+            merge
+                .finish()
+                .into_iter()
+                .map(|run| run.rows)
+                .collect::<Vec<_>>(),
+            vec![0..1, 1..2]
+        );
     }
 }

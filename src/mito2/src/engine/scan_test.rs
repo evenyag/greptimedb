@@ -1625,8 +1625,8 @@ async fn check_two_phase_series_scan(
     );
 
     if use_range_index {
-        // Enabled queries must read the cataloged index; disabled queries must
-        // succeed even when that file is unavailable.
+        // A new query reuses the complete cached range-index mapping even
+        // after the index object disappears. Disabled index reads also succeed.
         let region = engine.find_region(region_id).unwrap();
         let version = region.series_index_version_control.current();
         let file_id = *version.range_indexes.keys().next().unwrap();
@@ -1649,42 +1649,36 @@ async fn check_two_phase_series_scan(
             )
             .await
             .unwrap();
-        if enable_range_index {
-            if let Ok(stream) = scanner.scan().await {
-                assert!(stream.try_collect::<Vec<_>>().await.is_err());
-            }
-        } else {
-            let batches = scanner
-                .scan()
-                .await
+        let batches = scanner
+            .scan()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let tags = batch.column_by_name("tag_0").unwrap();
+            let fields = batch
+                .column_by_name("field_0")
                 .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let mut rows = Vec::new();
-            for batch in batches {
-                let tags = batch.column_by_name("tag_0").unwrap();
-                let fields = batch
-                    .column_by_name("field_0")
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                let timestamps = batch
-                    .column_by_name("ts")
-                    .unwrap()
-                    .as_primitive::<TimestampMillisecondType>();
-                for row in 0..batch.num_rows() {
-                    rows.push((
-                        datatypes::arrow_array::string_array_value_at_index(tags, row)
-                            .unwrap()
-                            .to_string(),
-                        fields.value(row),
-                        timestamps.value(row),
-                    ));
-                }
+                .as_primitive::<UInt64Type>();
+            let timestamps = batch
+                .column_by_name("ts")
+                .unwrap()
+                .as_primitive::<TimestampMillisecondType>();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    datatypes::arrow_array::string_array_value_at_index(tags, row)
+                        .unwrap()
+                        .to_string(),
+                    fields.value(row),
+                    timestamps.value(row),
+                ));
             }
-            rows.sort();
-            assert_eq!(actual_rows, rows);
         }
+        rows.sort();
+        assert_eq!(actual_rows, rows);
     }
 }
 

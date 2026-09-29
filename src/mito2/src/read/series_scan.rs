@@ -56,9 +56,10 @@ use crate::read::scan_util::{
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::{SeriesCandidateScanner, is_sparse_metric_metadata};
-use crate::read::series_reader::{AssignedSeriesBatch, SeriesBatchCollector, SeriesReader};
+use crate::read::series_reader::{
+    AssignedSeriesBatch, SeriesBatchCollector, SeriesCandidateStream, SeriesReader,
+};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
-use crate::series_index::MetricSeriesIdStream;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
 
@@ -907,7 +908,7 @@ impl SeriesCandidateDistributor {
     /// candidates, but is no longer needed once the assignment becomes chunked.
     async fn distribute_candidates(
         &mut self,
-        mut candidates: MetricSeriesIdStream,
+        mut candidates: SeriesCandidateStream,
         estimate: impl Future<Output = Result<Option<CandidateRowGroupStats>>>,
         partition_pruner: &Arc<PartitionPruner>,
         threshold: usize,
@@ -937,7 +938,7 @@ impl SeriesCandidateDistributor {
             let Some(batch) = batch else {
                 break;
             };
-            collector.push(batch);
+            collector.push_candidates(batch);
             if collector.len() > threshold {
                 if !chunked {
                     chunked = true;
@@ -1378,11 +1379,11 @@ mod tests {
             let candidates = Box::pin(try_stream! {
                 let first = input.len().min(4);
                 if first > 0 {
-                    yield input[..first].to_vec();
+                    yield input[..first].to_vec().into();
                 }
                 if input.len() > first {
                     resume_rx.await.unwrap();
-                    yield input[first..].to_vec();
+                    yield input[first..].to_vec().into();
                 }
             });
             let (stats_tx, stats_rx) = tokio::sync::oneshot::channel();

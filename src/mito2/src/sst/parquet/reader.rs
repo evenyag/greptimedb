@@ -54,8 +54,8 @@ use table::predicate::Predicate;
 use crate::cache::index::result_cache::PredicateKey;
 use crate::cache::{CacheStrategy, CachedSstMeta, SstMetaPreparation, prepare_sst_meta};
 use crate::error::{
-    ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result, SerializePartitionExprSnafu,
-    UnexpectedSnafu,
+    NewRecordBatchSnafu, ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result,
+    SerializePartitionExprSnafu, UnexpectedSnafu,
 };
 use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
@@ -1899,22 +1899,57 @@ impl RowGroupReaderBuilder {
         self.make_projected_stream(stream)
     }
 
-    /// Builds the normal projection without running the generic predicate prefilter.
-    ///
-    /// The series reader uses this after computing its own primary-key-only row
-    /// selection.
-    pub(crate) async fn build_without_prefilter(
+    /// Reads data columns and restores the PK before the normal schema adapters.
+    pub(crate) async fn build_with_series_keys(
         &self,
         build_ctx: RowGroupBuildContext<'_>,
+        mut cursor: crate::read::series_mapping::SeriesPrimaryKeyCursor,
     ) -> Result<ProjectedRecordBatchStream> {
-        let stream = self
+        let parquet_schema = self.parquet_meta.file_metadata().schema_descr();
+        let projection = ProjectionMask::leaves(
+            parquet_schema,
+            parquet_schema
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(index, column)| {
+                    self.projection.mask.leaf_included(*index)
+                        && !(column.path().parts().len() == 1
+                            && column.name() == PRIMARY_KEY_COLUMN_NAME)
+                })
+                .map(|(index, _)| index),
+        );
+        let pk_field = self
+            .arrow_metadata
+            .schema()
+            .field_with_name(PRIMARY_KEY_COLUMN_NAME)
+            .context(NewRecordBatchSnafu)?
+            .clone();
+        let mut input = self
             .build_with_projection(
                 build_ctx.row_group_idx,
                 build_ctx.row_selection,
-                self.projection.mask.clone(),
+                projection,
                 build_ctx.fetch_metrics,
             )
             .await?;
+        let stream = Box::pin(async_stream::try_stream! {
+            while let Some(batch) = input.next().await {
+                let batch = batch?;
+                let pk = cursor.next_array(batch.num_rows(), pk_field.data_type())?;
+                let position = primary_key_column_index(batch.num_columns() + 1);
+                let mut columns = batch.columns().to_vec();
+                columns.insert(position, pk);
+                let schema = batch.schema();
+                let mut fields = schema.fields().to_vec();
+                fields.insert(position, Arc::new(pk_field.clone()));
+                let schema = Arc::new(ArrowSchema::new_with_metadata(fields, schema.metadata().clone()));
+                yield RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)?;
+            }
+            if !cursor.is_finished() {
+                Err(UnexpectedSnafu { reason: "data reader returned fewer rows than the series mapping" }.build())?;
+            }
+        });
         self.make_projected_stream(stream)
     }
 
@@ -1931,7 +1966,9 @@ impl RowGroupReaderBuilder {
         let primary_key_index = parquet_schema
             .columns()
             .iter()
-            .position(|column| column.name() == PRIMARY_KEY_COLUMN_NAME)
+            .position(|column| {
+                column.path().parts().len() == 1 && column.name() == PRIMARY_KEY_COLUMN_NAME
+            })
             .context(UnexpectedSnafu {
                 reason: "SST does not contain __primary_key",
             })?;
@@ -2719,6 +2756,94 @@ mod tests {
             },
             metadata,
         )
+    }
+
+    #[tokio::test]
+    async fn series_data_reconstructs_keys_without_reading_primary_key_column() {
+        use crate::read::series_mapping::{SeriesPrimaryKeyCursor, SeriesRowGroupBuilder};
+        let store = ObjectStore::new(Memory::default()).unwrap();
+        let (mut builder, _) = prefilter_test_builder(
+            store.clone(),
+            Predicate::new(vec![col("field_0").gt_eq(lit(0_u64))]),
+            CacheStrategy::Disabled,
+        )
+        .await;
+        builder.batch_size = 1;
+        let mut keys = builder
+            .build_primary_key(RowGroupBuildContext {
+                row_group_idx: 0,
+                row_selection: None,
+                fetch_metrics: None,
+            })
+            .await
+            .unwrap();
+        let mut mapping = SeriesRowGroupBuilder::default();
+        while let Some(batch) = keys.next().await {
+            mapping.append(batch.unwrap().column(0), None).unwrap();
+        }
+        let mapping = mapping.finish();
+        assert_eq!(mapping.runs.len(), 1);
+        // The cached metadata still describes the original file. Corrupt only
+        // the PK chunk: projecting it again would now fail Parquet decoding.
+        let pk = primary_key_column_index(
+            builder
+                .parquet_meta
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+        );
+        let (offset, length) = builder.parquet_meta.row_group(0).column(pk).byte_range();
+        let mut bytes = store.read(&builder.file_path).await.unwrap().to_vec();
+        bytes[offset as usize..(offset + length) as usize].fill(0);
+        store.write(&builder.file_path, bytes).await.unwrap();
+        let mut invalid = builder
+            .build_primary_key(RowGroupBuildContext {
+                row_group_idx: 0,
+                row_selection: None,
+                fetch_metrics: None,
+            })
+            .await
+            .unwrap();
+        assert!(invalid.next().await.unwrap().is_err());
+        let selection = RowSelection::from(vec![RowSelector::skip(1), RowSelector::select(2)]);
+        let cursor = SeriesPrimaryKeyCursor::new(
+            mapping.primary_keys.clone(),
+            vec![(0, 0..3)],
+            Some(&selection),
+        );
+        let mut data = builder
+            .build_with_series_keys(
+                RowGroupBuildContext {
+                    row_group_idx: 0,
+                    row_selection: Some(selection),
+                    fetch_metrics: None,
+                },
+                cursor,
+            )
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        while let Some(batch) = data.next().await {
+            let batch = batch.unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            values.push(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0),
+            );
+            let mut reconstructed = SeriesRowGroupBuilder::default();
+            reconstructed
+                .append(
+                    batch.column(primary_key_column_index(batch.num_columns())),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(reconstructed.finish().primary_keys, mapping.primary_keys);
+        }
+        assert_eq!(values, vec![1, 2]);
     }
 
     #[tokio::test(flavor = "current_thread")]
