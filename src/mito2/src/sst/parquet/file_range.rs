@@ -24,7 +24,7 @@ use common_telemetry::error;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
-use datatypes::arrow::array::{Array as _, ArrayRef, BooleanArray};
+use datatypes::arrow::array::{Array as _, ArrayBuilder as _, ArrayRef, BooleanArray};
 use datatypes::arrow::buffer::BooleanBuffer;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::Schema;
@@ -51,7 +51,7 @@ use crate::read::compat::FlatCompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::read::prune::FlatPruneReader;
-use crate::read::series_mapping::{SeriesRowGroup, SeriesRowGroupBuilder};
+use crate::read::series_mapping::{SeriesBatchCursor, SeriesRowGroup, SeriesRowGroupBuilder};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
     DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys, primary_key_column_index,
@@ -355,6 +355,66 @@ impl FileRange {
         let batch =
             RecordBatch::try_new(schema, vec![primary_keys]).context(NewRecordBatchSnafu)?;
         Ok(Some(Box::pin(futures::stream::once(async { Ok(batch) }))))
+    }
+
+    /// Reads selected series using retained keys and decoded source-schema tags.
+    pub(crate) async fn reader_by_series(
+        &self,
+        series: &[crate::series_index::MetricSeriesId],
+        memory_pool: &Arc<dyn MemoryPool>,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<Option<FlatRowGroupReader>> {
+        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
+        let selected = mapping.select(Some(series), self.row_selection.as_ref());
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let mut keys = datatypes::arrow::array::BinaryBuilder::new();
+        let mut runs = Vec::with_capacity(selected.len());
+        let mut last = None;
+        let mut index = 0;
+        for (key, rows) in selected {
+            if last != Some(key) {
+                index = keys.len();
+                keys.append_value(mapping.primary_keys.value(key));
+                last = Some(key);
+            }
+            runs.push((index, rows));
+        }
+        let keys = keys.finish();
+        let tags = self.context.read_format().decode_series_tags(&keys)?;
+        let cursor = SeriesBatchCursor::try_new(keys, tags, runs, memory_pool)?;
+        self.reader_with_series(cursor, fetch_metrics)
+            .await
+            .map(Some)
+    }
+
+    /// The data phase is independent of where the supplied keys and tags came from.
+    async fn reader_with_series(
+        &self,
+        cursor: SeriesBatchCursor,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<FlatRowGroupReader> {
+        let num_rows = self
+            .context
+            .reader_builder
+            .parquet_metadata()
+            .row_group(self.row_group_idx)
+            .num_rows() as usize;
+        let selection = refine_row_range_selection(cursor.row_ranges().collect(), num_rows, &None)?;
+        let stream = self
+            .context
+            .reader_builder
+            .build_with_series(
+                self.context
+                    .build_context(self.row_group_idx, selection, fetch_metrics),
+                cursor,
+            )
+            .await?;
+        Ok(FlatRowGroupReader::new_materialized(
+            self.context.clone(),
+            stream,
+        ))
     }
 
     async fn primary_key_reader_inner(

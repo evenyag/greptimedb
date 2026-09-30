@@ -1580,6 +1580,51 @@ async fn check_two_phase_series_scan(
     replay_rows.sort();
     assert_eq!(actual_rows, replay_rows);
 
+    // Compare the series reader with the ordinary scanner, including projections
+    // whose tags are only needed by filters and an empty output projection.
+    for projection in [vec![], vec![4, 5], vec![3, 2], vec![0, 1, 2, 3, 4, 5]] {
+        let mut results = Vec::new();
+        for distribution in [None, Some(TimeSeriesDistribution::PerSeries)] {
+            let scan = engine
+                .scanner(
+                    region_id,
+                    ScanRequest {
+                        projection: Some(projection.clone()),
+                        filters: vec![col("tag_1").eq(lit("x"))],
+                        distribution,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let batches = scan
+                .scan()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            for batch in batches {
+                for row in 0..batch.num_rows() {
+                    rows.push(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                datatypes::arrow::util::display::array_value_to_string(column, row)
+                                    .unwrap()
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            rows.sort();
+            results.push(rows);
+        }
+        assert_eq!(results[0], results[1], "projection: {projection:?}");
+    }
+
     // Exercise precise field/time filtering and candidate tag filtering on both paths.
     let filtered = engine
         .scanner(

@@ -54,8 +54,8 @@ use table::predicate::Predicate;
 use crate::cache::index::result_cache::PredicateKey;
 use crate::cache::{CacheStrategy, CachedSstMeta, SstMetaPreparation, prepare_sst_meta};
 use crate::error::{
-    ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result, SerializePartitionExprSnafu,
-    UnexpectedSnafu,
+    NewRecordBatchSnafu, ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result,
+    SerializePartitionExprSnafu, UnexpectedSnafu,
 };
 use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
@@ -1888,6 +1888,81 @@ impl RowGroupReaderBuilder {
         self.make_projected_stream(stream)
     }
 
+    /// Reads data columns and expands supplied keys/tags before row-level filtering.
+    pub(crate) async fn build_with_series(
+        &self,
+        build_ctx: RowGroupBuildContext<'_>,
+        mut cursor: crate::read::series_mapping::SeriesBatchCursor,
+    ) -> Result<ProjectedRecordBatchStream> {
+        let tag_schema = cursor.tag_schema();
+        let supplied =
+            |name: &str| name == PRIMARY_KEY_COLUMN_NAME || tag_schema.index_of(name).is_ok();
+        let parquet_schema = self.parquet_meta.file_metadata().schema_descr();
+        let projection = ProjectionMask::leaves(
+            parquet_schema,
+            parquet_schema
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(index, column)| {
+                    self.projection.mask.leaf_included(*index)
+                        && !supplied(&column.path().parts()[0])
+                })
+                .map(|(index, _)| index),
+        );
+        let pk_field = Arc::new(
+            self.output_schema
+                .field_with_name(PRIMARY_KEY_COLUMN_NAME)
+                .context(NewRecordBatchSnafu)?
+                .clone(),
+        );
+        let mut fields = tag_schema.fields().to_vec();
+        let mut presence = vec![true; fields.len()];
+        for (field, present) in self
+            .output_schema
+            .fields()
+            .iter()
+            .zip(&self.projection.projected_root_presence)
+        {
+            if tag_schema.index_of(field.name()).is_ok() {
+                continue;
+            }
+            fields.push(field.clone());
+            presence.push(*present);
+        }
+        let output_schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            self.output_schema.metadata().clone(),
+        ));
+        let mut input = self
+            .build_with_projection(
+                build_ctx.row_group_idx,
+                build_ctx.row_selection,
+                projection,
+                build_ctx.fetch_metrics,
+            )
+            .await?;
+        let stream: ProjectedRecordBatchStream = Box::pin(async_stream::try_stream! {
+            while let Some(batch) = input.next().await {
+                yield cursor.materialize(batch?, pk_field.clone())?;
+            }
+            if !cursor.is_finished() {
+                Err(UnexpectedSnafu { reason: "data reader returned fewer rows than the series mapping" }.build())?;
+            }
+        });
+        if !self.has_nested_projection && self.json2_rewrite_targets.is_empty() {
+            return Ok(stream);
+        }
+        let mode = if self.json2_rewrite_targets.is_empty() {
+            AlignMode::AlignToSchema
+        } else {
+            AlignMode::Rewrite {
+                columns: self.json2_rewrite_targets.clone(),
+            }
+        };
+        Ok(JsonSchemaAligner::new(stream, presence, output_schema, mode)?.boxed())
+    }
+
     /// Builds a stream that reads only the encoded primary-key column.
     ///
     /// It preserves the normal reader's binary-or-dictionary decision. This path deliberately
@@ -2382,6 +2457,8 @@ pub(crate) struct FlatRowGroupReader {
     stream: ProjectedRecordBatchStream,
     /// Cached sequence array to override sequences.
     override_sequence: Option<ArrayRef>,
+    /// The stream already supplies decoded tags and dictionary keys.
+    materialized: bool,
 }
 
 impl FlatRowGroupReader {
@@ -2396,7 +2473,18 @@ impl FlatRowGroupReader {
             context,
             stream,
             override_sequence,
+            materialized: false,
         }
+    }
+
+    /// Creates a reader over batches with supplied keys and decoded tags.
+    pub(crate) fn new_materialized(
+        context: FileRangeContextRef,
+        stream: ProjectedRecordBatchStream,
+    ) -> Self {
+        let mut reader = Self::new(context, stream);
+        reader.materialized = true;
+        reader
     }
 
     /// Returns the next RecordBatch.
@@ -2405,10 +2493,12 @@ impl FlatRowGroupReader {
             Some(batch_result) => {
                 let record_batch = batch_result?;
 
-                let record_batch = self
-                    .context
-                    .read_format()
-                    .convert_batch(record_batch, self.override_sequence.as_ref())?;
+                let format = self.context.read_format();
+                let record_batch = if self.materialized {
+                    format.finish_batch(record_batch, self.override_sequence.as_ref())?
+                } else {
+                    format.convert_batch(record_batch, self.override_sequence.as_ref())?
+                };
                 Ok(Some(record_batch))
             }
             None => Ok(None),
@@ -2623,6 +2713,81 @@ mod tests {
             None,
         );
         crate::sst::parquet::file_range::FileRange::new(Arc::new(context), 0, selection)
+    }
+
+    #[tokio::test]
+    async fn series_data_reuses_keys_and_tags_without_reading_the_key_chunk() {
+        use crate::series_index::MetricSeriesId;
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let store = ObjectStore::new(Memory::default()).unwrap();
+        let (mut builder, metadata) = prefilter_test_builder(
+            store.clone(),
+            Predicate::new(vec![col("field_0").gt_eq(lit(0_u64))]),
+            CacheStrategy::Disabled,
+        )
+        .await;
+        builder.batch_size = 1;
+        let pk = primary_key_column_index(
+            builder
+                .parquet_meta
+                .file_metadata()
+                .schema_descr()
+                .num_columns(),
+        );
+        let (offset, length) = builder.parquet_meta.row_group(0).column(pk).byte_range();
+        let path = builder.file_path.clone();
+        let range = series_test_range(
+            builder,
+            metadata,
+            Some(RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(2),
+            ])),
+        );
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mapping = range.series_rows(&pool, None).await.unwrap();
+        let mut baseline = range
+            .reader_by_row_ranges(std::iter::once(0..3).collect(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut expected = Vec::new();
+        while let Some(batch) = baseline.next_batch().await.unwrap() {
+            expected.push(batch);
+        }
+        assert_eq!(expected.len(), 2);
+        drop(baseline);
+        // A second key read now fails. The data phase must use candidate discovery's mapping.
+        let mut bytes = store.read(&path).await.unwrap().to_vec();
+        bytes[offset as usize..(offset + length) as usize].fill(0);
+        store.write(&path, bytes).await.unwrap();
+        let mut control = range
+            .reader_by_row_ranges(std::iter::once(0..3).collect(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(control.next_batch().await.is_err());
+        let mut reader = range
+            .reader_by_series(
+                &[MetricSeriesId {
+                    table_id: 1,
+                    tsid: 100,
+                }],
+                &pool,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut actual = Vec::new();
+        while let Some(batch) = reader.next_batch().await.unwrap() {
+            actual.push(batch);
+        }
+        assert_eq!(actual, expected);
+        assert!(Arc::ptr_eq(
+            &mapping,
+            &range.series_rows(&pool, None).await.unwrap()
+        ));
     }
 
     #[tokio::test]

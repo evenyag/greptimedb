@@ -37,7 +37,7 @@ use datatypes::arrow::array::{
     Array, ArrayRef, BinaryArray, DictionaryArray, UInt32Array, UInt64Array,
 };
 use datatypes::arrow::compute::kernels::take::take;
-use datatypes::arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef};
+use datatypes::arrow::datatypes::{DataType as ArrowDataType, Schema, SchemaRef, UInt32Type};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::prelude::{ConcreteDataType, DataType};
 use datatypes::value::ValueRef;
@@ -385,6 +385,60 @@ impl FlatReadFormat {
         matches!(&self.parquet_adapter, ParquetAdapter::Flat(_))
     }
 
+    /// Materializes required source-schema tags once per supplied unique key.
+    pub(crate) fn decode_series_tags(&self, keys: &BinaryArray) -> Result<RecordBatch> {
+        let metadata = self.metadata();
+        let codec = build_primary_key_codec(metadata);
+        let columns = metadata
+            .primary_key_columns()
+            .filter(|column| self.projected_index_by_id(column.column_id).is_some())
+            .collect::<Vec<_>>();
+        let mut fields = Vec::with_capacity(columns.len());
+        for column in &columns {
+            let field = &metadata.schema.arrow_schema().fields()[metadata
+                .column_index_by_id(column.column_id)
+                .context(InvalidRecordBatchSnafu {
+                    reason: "series tag missing from metadata",
+                })?];
+            let field = tag_maybe_to_dictionary_field(&column.column_schema.data_type, field);
+            fields.push(Arc::new(with_field_id((*field).clone(), column.column_id)));
+        }
+        let indices = (0..keys.len())
+            .map(|i| {
+                u32::try_from(i).map_err(|_| {
+                    InvalidRecordBatchSnafu {
+                        reason: "too many series keys to decode",
+                    }
+                    .build()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys: ArrayRef = Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(
+                UInt32Array::from(indices),
+                Arc::new(keys.clone()),
+            )
+            .context(NewRecordBatchSnafu)?,
+        );
+        let arrays = if columns.is_empty() {
+            Vec::new()
+        } else {
+            let mut decoded = decode_primary_key_array(codec.as_ref(), &keys)?;
+            let columns = columns
+                .iter()
+                .map(|column| (column.column_id, column.column_schema.data_type.clone()))
+                .collect::<Vec<_>>();
+            decoded.get_sparse_tag_columns(&columns)?
+        };
+        RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &datatypes::arrow::record_batch::RecordBatchOptions::new()
+                .with_row_count(Some(keys.len())),
+        )
+        .context(NewRecordBatchSnafu)
+    }
+
     /// Creates a sequence array to override.
     pub(crate) fn new_override_sequence_array(&self, length: usize) -> Option<ArrayRef> {
         self.override_sequence
@@ -407,11 +461,20 @@ impl FlatReadFormat {
         };
 
         // First, apply flat format conversion.
-        let mut batch = match &self.parquet_adapter {
+        let batch = match &self.parquet_adapter {
             ParquetAdapter::Flat(_) => record_batch,
             ParquetAdapter::PrimaryKeyToFlat(p) => p.convert_batch(record_batch)?,
         };
 
+        self.finish_batch(batch, override_sequence_array)
+    }
+
+    /// Normalizes field schemas and sequence numbers after tags are materialized.
+    pub(crate) fn finish_batch(
+        &self,
+        mut batch: RecordBatch,
+        override_sequence_array: Option<&ArrayRef>,
+    ) -> Result<RecordBatch> {
         // Normalize nested field names and metadata to the SST's region metadata
         // before schema compatibility and merging with memtables. This removes
         // Parquet-added field IDs; equals_datatype also permits nested name differences.
@@ -715,8 +778,15 @@ pub fn decode_primary_keys(
     batch: &RecordBatch,
 ) -> Result<DecodedPrimaryKeys> {
     let primary_key_index = primary_key_column_index(batch.num_columns());
-    let pk_dict_array = batch
-        .column(primary_key_index)
+    decode_primary_key_array(codec, batch.column(primary_key_index))
+}
+
+/// Decodes the distinct values of an encoded key dictionary.
+pub(crate) fn decode_primary_key_array(
+    codec: &dyn PrimaryKeyCodec,
+    primary_keys: &ArrayRef,
+) -> Result<DecodedPrimaryKeys> {
+    let pk_dict_array = primary_keys
         .as_any()
         .downcast_ref::<PrimaryKeyArray>()
         .with_context(|| InvalidRecordBatchSnafu {

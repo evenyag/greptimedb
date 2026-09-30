@@ -18,14 +18,21 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use datafusion::execution::memory_pool::MemoryReservation;
-use datatypes::arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, DictionaryArray};
-use datatypes::arrow::datatypes::UInt32Type;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datatypes::arrow::array::{
+    Array, ArrayBuilder, ArrayRef, BinaryArray, BinaryBuilder, DictionaryArray, UInt32Array,
+};
+use datatypes::arrow::compute::take;
+use datatypes::arrow::datatypes::{FieldRef, Schema, UInt32Type};
+use datatypes::arrow::record_batch::RecordBatch;
 use mito_codec::row_converter::SparsePrimaryKeyCodec;
 use parquet::arrow::arrow_reader::RowSelection;
 use snafu::{OptionExt, ResultExt, ensure};
 
-use crate::error::{DecodeSnafu, ReserveSeriesScanMemorySnafu, Result, UnexpectedSnafu};
+use crate::error::{
+    ComputeArrowSnafu, DecodeSnafu, NewRecordBatchSnafu, ReserveSeriesScanMemorySnafu, Result,
+    UnexpectedSnafu,
+};
 use crate::series_index::MetricSeriesId;
 
 /// One contiguous series run in absolute row-group coordinates.
@@ -192,6 +199,132 @@ impl SeriesRowGroupBuilder {
     }
 }
 
+/// Expands supplied series keys and decoded tags over selected absolute runs.
+/// Both SST-key discovery and series-index discovery can supply this input.
+/// Reconstruction happens before any row-level filtering.
+pub(crate) struct SeriesBatchCursor {
+    keys: BinaryArray,
+    tags: RecordBatch,
+    runs: Vec<(usize, Range<usize>)>,
+    position: usize,
+    consumed: usize,
+    _reservation: MemoryReservation,
+}
+
+impl SeriesBatchCursor {
+    pub(crate) fn try_new(
+        keys: BinaryArray,
+        tags: RecordBatch,
+        runs: Vec<(usize, Range<usize>)>,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
+        ensure!(
+            keys.len() == tags.num_rows()
+                && runs
+                    .iter()
+                    .all(|(key, rows)| *key < keys.len() && !rows.is_empty()),
+            UnexpectedSnafu {
+                reason: "invalid series keys, tags or row runs"
+            }
+        );
+        let reservation = MemoryConsumer::new("SeriesBatchCursor").register(pool);
+        reservation
+            .try_grow(
+                keys.get_array_memory_size()
+                    + tags.get_array_memory_size()
+                    + runs.capacity() * mem::size_of::<(usize, Range<usize>)>(),
+            )
+            .context(ReserveSeriesScanMemorySnafu)?;
+        Ok(Self {
+            keys,
+            tags,
+            runs,
+            position: 0,
+            consumed: 0,
+            _reservation: reservation,
+        })
+    }
+
+    pub(crate) fn tag_schema(&self) -> datatypes::arrow::datatypes::SchemaRef {
+        self.tags.schema()
+    }
+
+    pub(crate) fn row_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.runs.iter().map(|(_, rows)| rows.clone())
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.position == self.runs.len()
+    }
+
+    /// Adds keys and tags to a data-only batch, using one cursor for all columns.
+    pub(crate) fn materialize(
+        &mut self,
+        batch: RecordBatch,
+        pk_field: FieldRef,
+    ) -> Result<RecordBatch> {
+        let mut tag_indices = Vec::with_capacity(batch.num_rows());
+        let mut key_indices = Vec::with_capacity(batch.num_rows());
+        let mut keys = BinaryBuilder::new();
+        let mut last_key = None;
+        let mut value_index = 0;
+        while key_indices.len() < batch.num_rows() {
+            let (key, rows) = self.runs.get(self.position).context(UnexpectedSnafu {
+                reason: "data reader returned more rows than the series mapping",
+            })?;
+            let count = (rows.len() - self.consumed).min(batch.num_rows() - key_indices.len());
+            if last_key != Some(*key) {
+                value_index = u32::try_from(keys.len()).map_err(|_| {
+                    UnexpectedSnafu {
+                        reason: "too many series keys in an output batch",
+                    }
+                    .build()
+                })?;
+                keys.append_value(self.keys.value(*key));
+                last_key = Some(*key);
+            }
+            let tag_index = u32::try_from(*key).map_err(|_| {
+                UnexpectedSnafu {
+                    reason: "too many series tags in an input batch",
+                }
+                .build()
+            })?;
+            key_indices.extend(std::iter::repeat_n(value_index, count));
+            tag_indices.extend(std::iter::repeat_n(tag_index, count));
+            self.consumed += count;
+            if self.consumed == rows.len() {
+                self.position += 1;
+                self.consumed = 0;
+            }
+        }
+        let tags = UInt32Array::from(tag_indices);
+        let mut columns = self
+            .tags
+            .columns()
+            .iter()
+            .map(|column| take(column, &tags, None).context(ComputeArrowSnafu))
+            .collect::<Result<Vec<_>>>()?;
+        columns.extend_from_slice(batch.columns());
+        let pk: ArrayRef = Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(
+                UInt32Array::from(key_indices),
+                Arc::new(keys.finish()),
+            )
+            .context(NewRecordBatchSnafu)?,
+        );
+        let pk_position = columns.len() - 2;
+        columns.insert(pk_position, pk);
+        let mut fields = self.tags.schema().fields().to_vec();
+        fields.extend(batch.schema().fields().iter().cloned());
+        fields.insert(pk_position, pk_field);
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        ));
+        RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use datatypes::arrow::array::UInt32Array;
@@ -272,6 +405,84 @@ mod tests {
         assert_eq!(candidates.as_ref(), binary(&[&a, &b]).as_ref());
         let empty = RowSelection::from(vec![RowSelector::skip(8)]);
         assert_eq!(mapping.candidate_keys(Some(&empty)).len(), 0);
+    }
+
+    #[test]
+    fn materializes_keys_and_nullable_tags_across_run_and_batch_boundaries() {
+        use datafusion::execution::memory_pool::UnboundedMemoryPool;
+        use datatypes::arrow::array::{StringArray, UInt8Array, UInt64Array};
+        use datatypes::arrow::datatypes::{DataType, Field};
+        let a = key(1, 7);
+        let b = key(2, 7);
+        let keys = BinaryArray::from_iter_values([a.as_slice(), b.as_slice()]);
+        let tags = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        )
+        .unwrap();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut cursor =
+            SeriesBatchCursor::try_new(keys, tags, vec![(0, 1..3), (0, 4..5), (1, 5..7)], &pool)
+                .unwrap();
+        let pk_field = Arc::new(Field::new(
+            "__primary_key",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
+            false,
+        ));
+        let input = |rows| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("ts", DataType::UInt64, false),
+                    Field::new("__sequence", DataType::UInt64, false),
+                    Field::new("__op_type", DataType::UInt8, false),
+                ])),
+                vec![
+                    Arc::new(UInt64Array::from_value(0, rows)),
+                    Arc::new(UInt64Array::from_value(1, rows)),
+                    Arc::new(UInt8Array::from_value(1, rows)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut actual_keys = Vec::new();
+        let mut actual_tags = Vec::new();
+        for rows in [2, 2, 1] {
+            let batch = cursor.materialize(input(rows), pk_field.clone()).unwrap();
+            let keys = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                .unwrap();
+            let values = keys
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            for row in 0..rows {
+                actual_keys.push(values.value(keys.keys().value(row) as usize).to_vec());
+                let tag = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                actual_tags.push((!tag.is_null(row)).then(|| tag.value(row).to_owned()));
+            }
+        }
+        assert!(cursor.is_finished());
+        assert_eq!(actual_keys, vec![a.clone(), a.clone(), a, b.clone(), b]);
+        assert_eq!(
+            actual_tags,
+            vec![
+                Some("a".into()),
+                Some("a".into()),
+                Some("a".into()),
+                None,
+                None
+            ]
+        );
+        assert!(cursor.materialize(input(1), pk_field).is_err());
+        drop(cursor);
+        assert_eq!(pool.reserved(), 0);
     }
 
     #[test]

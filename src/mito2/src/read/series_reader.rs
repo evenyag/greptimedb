@@ -87,6 +87,7 @@ pub(crate) struct AssignedSeriesBatch {
     range: SeriesRange,
     series: Vec<MetricSeriesId>,
     enable_range_cache: bool,
+    reuse_primary_keys: bool,
 }
 
 impl AssignedSeriesBatch {
@@ -95,7 +96,13 @@ impl AssignedSeriesBatch {
             range,
             series,
             enable_range_cache,
+            reuse_primary_keys: false,
         }
+    }
+
+    pub(crate) fn with_primary_key_reuse(mut self, enabled: bool) -> Self {
+        self.reuse_primary_keys = enabled;
+        self
     }
 
     pub(crate) fn range(&self) -> SeriesRange {
@@ -161,6 +168,7 @@ struct MetricSeriesFilter {
     series: Arc<HashSet<MetricSeriesId>>,
     sorted_series: Arc<Vec<MetricSeriesId>>,
     enable_range_cache: bool,
+    reuse_primary_keys: bool,
 }
 
 impl MetricSeriesFilter {
@@ -174,6 +182,7 @@ impl MetricSeriesFilter {
             series: Arc::new(series),
             sorted_series: Arc::new(sorted_series),
             enable_range_cache: assigned.enable_range_cache(),
+            reuse_primary_keys: assigned.reuse_primary_keys,
         }
     }
 
@@ -514,8 +523,9 @@ fn scan_series_file_ranges(
 
         for range in ranges {
             let build_start = Instant::now();
-            let searcher = range.range_index_searcher(&memory_pool).await?;
-            let reader = if let Some(searcher) = searcher {
+            let reader = if filter.reuse_primary_keys {
+                range.reader_by_series(&filter.sorted_series, &memory_pool, fetch_metrics.as_deref()).await?
+            } else if let Some(searcher) = range.range_index_searcher(&memory_pool).await? {
                 let row_group_id = u32::try_from(range.row_group_index()).map_err(|_| UnexpectedSnafu {
                     reason: format!("row group index exceeds u32: {}", range.row_group_index()),
                 }.build())?;

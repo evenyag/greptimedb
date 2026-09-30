@@ -209,6 +209,11 @@ impl SeriesCandidateScanner {
         decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())
     }
 
+    /// Whether candidate discovery selected any series index files.
+    pub(crate) fn uses_series_index(&self) -> bool {
+        !self.coverage.indexes.is_empty()
+    }
+
     /// Returns the partition pruner shared with the data phase.
     pub(crate) fn partition_pruner(&self) -> Arc<PartitionPruner> {
         self.partition_pruner.clone()

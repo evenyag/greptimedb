@@ -880,6 +880,7 @@ impl SeriesCandidateDistributor {
             part_metrics.clone(),
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
+        let reuse_primary_keys = !candidate_scanner.uses_series_index();
         let mut candidates = candidate_scanner.build_stream().await?;
         let mut collector =
             SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
@@ -892,7 +893,11 @@ impl SeriesCandidateDistributor {
             collector.push(batch);
             if collector.len() >= CANDIDATE_SERIES_ASSIGNMENT_THRESHOLD {
                 chunked = true;
-                self.send_assignments(collector.finish(false), &partition_pruner);
+                self.send_assignments(
+                    collector.finish(false),
+                    &partition_pruner,
+                    reuse_primary_keys,
+                );
                 if !self.should_fetch_candidates() {
                     part_metrics.on_finish();
                     return Ok(());
@@ -903,7 +908,11 @@ impl SeriesCandidateDistributor {
         }
 
         if collector.len() > 0 {
-            self.send_assignments(collector.finish(!chunked), &partition_pruner);
+            self.send_assignments(
+                collector.finish(!chunked),
+                &partition_pruner,
+                reuse_primary_keys,
+            );
         }
         part_metrics.on_finish();
         Ok(())
@@ -913,6 +922,7 @@ impl SeriesCandidateDistributor {
         &mut self,
         assignments: Vec<AssignedSeriesBatch>,
         partition_pruner: &Arc<PartitionPruner>,
+        reuse_primary_keys: bool,
     ) {
         for (partition, assigned_series) in assignments.into_iter().enumerate() {
             if assigned_series.series().is_empty() {
@@ -923,7 +933,7 @@ impl SeriesCandidateDistributor {
             };
             let sent = sender
                 .send(Ok(SeriesReaderInput {
-                    assigned_series,
+                    assigned_series: assigned_series.with_primary_key_reuse(reuse_primary_keys),
                     partition_pruner: partition_pruner.clone(),
                     range_semaphore: self.range_semaphore.clone(),
                 }))
