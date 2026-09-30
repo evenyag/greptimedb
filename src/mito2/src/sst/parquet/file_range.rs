@@ -313,7 +313,7 @@ impl FileRange {
                 let mut mapping = SeriesRowMappingBuilder::default();
                 while let Some(batch) = stream.next().await {
                     let batch = batch?;
-                    mapping.append(batch.column(0), Some(&reservation))?;
+                    mapping.append(batch.column(0))?;
                 }
                 let mapping = Arc::new(mapping.finish());
                 let expected_rows = builder
@@ -327,7 +327,7 @@ impl FileRange {
                     }
                 );
                 reservation
-                    .try_resize(mapping.estimated_size())
+                    .try_grow(mapping.estimated_size())
                     .context(ReserveSeriesScanMemorySnafu)?;
                 cache.put_series_mapping(key, RangeResultValue::SeriesRows(mapping.clone()));
                 Ok::<_, crate::error::Error>((mapping, reservation))
@@ -397,7 +397,7 @@ impl FileRange {
             let mut interval = 0;
             while let Some(batch) = input.next().await {
                 let batch = batch?;
-                mapping.append(batch.column(0), Some(&reservation))?;
+                mapping.append(batch.column(0))?;
                 let end = offset + batch.num_rows();
                 while interval < intervals.len() && intervals[interval].end <= offset {
                     interval += 1;
@@ -418,8 +418,6 @@ impl FileRange {
                     for row in start - offset..stop - offset {
                         let key = values.value(indices.map_or(row, |indices| indices.value(row) as usize));
                         if last != key {
-                            candidate_reservation.try_grow(3 * key.len() + 8)
-                                .context(ReserveSeriesScanMemorySnafu)?;
                             candidates.append_value(key);
                             last.clear();
                             last.extend_from_slice(key);
@@ -435,7 +433,7 @@ impl FileRange {
             if offset != expected {
                 Err(UnexpectedSnafu { reason: "primary-key mapping does not cover the complete row group" }.build())?;
             }
-            reservation.try_resize(mapping.estimated_size()).context(ReserveSeriesScanMemorySnafu)?;
+            reservation.try_grow(mapping.estimated_size()).context(ReserveSeriesScanMemorySnafu)?;
             range.context.reader_builder.cache_strategy()
                 .put_series_mapping(cache_key, RangeResultValue::SeriesRows(mapping.clone()));
             // Another candidate stream can finish the same immutable mapping first.
@@ -445,6 +443,9 @@ impl FileRange {
             if let Some(compat) = range.context.compat_batch() {
                 keys = compat.compat_primary_key(&keys)?;
             }
+            // Account for retained buffers once, without tracking builder allocations.
+            candidate_reservation.try_grow(keys.get_array_memory_size())
+                .context(ReserveSeriesScanMemorySnafu)?;
             let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
                 datatypes::arrow::datatypes::Field::new(
                     store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME, keys.data_type().clone(), false,

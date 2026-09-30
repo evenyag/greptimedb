@@ -2945,7 +2945,7 @@ mod tests {
             .unwrap();
         let keys: ArrayRef = Arc::new(BinaryArray::from_iter_values([encoded.as_slice()]));
         let mut builder = SeriesRowMappingBuilder::default();
-        builder.append(&keys, None).unwrap();
+        builder.append(&keys).unwrap();
         let mapping = Arc::new(builder.finish());
         let file = RegionFileId::new(RegionId::new(1, 1), FileId::random());
         let key = RangeResultKey::SeriesRows(file, 0);

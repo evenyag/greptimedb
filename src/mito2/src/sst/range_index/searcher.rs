@@ -126,15 +126,8 @@ impl SstRangeIndexSearcher {
                 start = end;
             }
         }
-        let size = reservation.size()
-            + std::mem::size_of::<SstRangeIndexData>()
-            + batches
-                .values()
-                .map(|batches| batches.capacity() * std::mem::size_of::<RecordBatch>())
-                .sum::<usize>();
-        reservation
-            .try_resize(size)
-            .context(ReserveRangeIndexMemorySnafu)?;
+        // Buffer sizes are sufficient for coarse query and cache accounting.
+        let size = reservation.size();
         Ok(Self {
             data: Arc::new(SstRangeIndexData { batches, size }),
             _reservation: reservation,

@@ -163,11 +163,7 @@ pub(crate) struct SeriesRowMappingBuilder {
 }
 
 impl SeriesRowMappingBuilder {
-    pub(crate) fn append(
-        &mut self,
-        array: &ArrayRef,
-        reservation: Option<&MemoryReservation>,
-    ) -> Result<()> {
+    pub(crate) fn append(&mut self, array: &ArrayRef) -> Result<()> {
         let (values, indices) =
             if let Some(dict) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
                 (dict.values(), Some(dict.keys()))
@@ -197,12 +193,6 @@ impl SeriesRowMappingBuilder {
                         reason: "series primary keys are not sorted",
                     }
                 );
-                if let Some(reservation) = reservation {
-                    // Allow for geometric run-buffer growth. Encoded keys are not retained.
-                    reservation
-                        .try_grow(2 * mem::size_of::<SeriesRowRange>())
-                        .context(ReserveSeriesScanMemorySnafu)?;
-                }
                 let (table_id, tsid) = codec.decode_ids(key).context(DecodeSnafu)?;
                 self.runs.push(SeriesRowRange {
                     series: MetricSeriesId { table_id, tsid },
@@ -254,11 +244,7 @@ impl SeriesBatchCursor {
         );
         let reservation = MemoryConsumer::new("SeriesBatchCursor").register(pool);
         reservation
-            .try_grow(
-                keys.get_array_memory_size()
-                    + tags.get_array_memory_size()
-                    + runs.capacity() * mem::size_of::<(usize, Range<usize>)>(),
-            )
+            .try_grow(keys.get_array_memory_size() + tags.get_array_memory_size())
             .context(ReserveSeriesScanMemorySnafu)?;
         Ok(Self {
             keys,
@@ -411,7 +397,7 @@ mod tests {
         long.extend(std::iter::repeat_n(1, 64 * 1024));
         let build = |key: &[u8]| {
             let mut builder = SeriesRowMappingBuilder::default();
-            builder.append(&binary(&[key, key]), None).unwrap();
+            builder.append(&binary(&[key, key])).unwrap();
             builder.finish()
         };
         let small = build(&short);
@@ -433,7 +419,7 @@ mod tests {
         let b = key(2, 7);
         let c = key(2, 9);
         let mut builder = SeriesRowMappingBuilder::default();
-        builder.append(&binary(&[&a, &a]), None).unwrap();
+        builder.append(&binary(&[&a, &a])).unwrap();
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<UInt32Type>::try_new(
                 UInt32Array::from(vec![1, 0, 0, 2]),
@@ -441,7 +427,7 @@ mod tests {
             )
             .unwrap(),
         );
-        builder.append(&dictionary, None).unwrap();
+        builder.append(&dictionary).unwrap();
         let mapping = builder.finish();
         assert_eq!(
             vec![0..3, 3..5, 5..6],
@@ -470,7 +456,7 @@ mod tests {
         let b = key(2, 7);
         let mut builder = SeriesRowMappingBuilder::default();
         builder
-            .append(&binary(&[&a, &a, &a, &a, &a, &b, &b, &b]), None)
+            .append(&binary(&[&a, &a, &a, &a, &a, &b, &b, &b]))
             .unwrap();
         let mapping = builder.finish();
         let selection = RowSelection::from(vec![
@@ -567,30 +553,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mapping_when_memory_budget_is_exhausted() {
-        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool};
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
-        let reservation = MemoryConsumer::new("test").register(&pool);
-        assert!(
-            SeriesRowMappingBuilder::default()
-                .append(&binary(&[&key(1, 1)]), Some(&reservation))
-                .is_err()
-        );
-        assert_eq!(pool.reserved(), 0);
-    }
-
-    #[test]
     fn rejects_unsorted_or_null_source_keys() {
         let a = key(1, 7);
         let b = key(2, 7);
         let mut builder = SeriesRowMappingBuilder::default();
-        builder.append(&binary(&[&b]), None).unwrap();
-        assert!(builder.append(&binary(&[&a]), None).is_err());
+        builder.append(&binary(&[&b])).unwrap();
+        assert!(builder.append(&binary(&[&a])).is_err());
         let null: ArrayRef = Arc::new(BinaryArray::from(vec![None::<&[u8]>]));
-        assert!(
-            SeriesRowMappingBuilder::default()
-                .append(&null, None)
-                .is_err()
-        );
+        assert!(SeriesRowMappingBuilder::default().append(&null).is_err());
     }
 }
