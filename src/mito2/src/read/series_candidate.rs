@@ -469,6 +469,7 @@ impl SeriesCandidateRangeBuilder {
                 )
             });
             let part_metrics = self.part_metrics.clone();
+            let memory_pool = self.memory_pool.clone();
             let raw = Box::pin(try_stream! {
                 let fetch_metrics = part_metrics
                     .explain_verbose()
@@ -480,7 +481,7 @@ impl SeriesCandidateRangeBuilder {
                 for range in ranges {
                     let build_start = Instant::now();
                     let Some(mut reader) = range
-                        .primary_key_reader(fetch_metrics.as_deref())
+                        .series_candidate_keys(&memory_pool, fetch_metrics.as_deref())
                         .await?
                     else {
                         continue;

@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use api::v1::{OpType, SemanticType};
 use common_telemetry::error;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
 use datatypes::arrow::array::{Array as _, ArrayRef, BooleanArray};
@@ -40,15 +41,17 @@ use store_api::storage::{ColumnId, TimeSeriesRowSelector};
 use table::predicate::Predicate;
 use tokio::sync::OnceCell;
 
-use crate::cache::CacheStrategy;
+use crate::cache::{CacheStrategy, RangeResultKey, RangeResultValue};
 use crate::error::{
     ComputeArrowSnafu, DecodeStatsSnafu, EvalPartitionFilterSnafu, InvalidRecordBatchSnafu,
-    NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu, UnexpectedSnafu,
+    NewRecordBatchSnafu, RecordBatchSnafu, ReserveSeriesScanMemorySnafu, Result,
+    StatsNotPresentSnafu, UnexpectedSnafu,
 };
 use crate::read::compat::FlatCompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::read::prune::FlatPruneReader;
+use crate::read::series_mapping::{SeriesRowGroup, SeriesRowGroupBuilder};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
     DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys, primary_key_column_index,
@@ -264,14 +267,91 @@ impl FileRange {
         Ok(Some(flat_prune_reader))
     }
 
-    /// Creates a reader that returns only the encoded primary-key column.
-    ///
-    /// The returned primary keys are compatible with the expected region metadata.
-    pub(crate) async fn primary_key_reader(
+    /// Returns complete source-schema runs. Reading the whole PK column once
+    /// makes the cache independent of predicates and pruning selections.
+    pub(crate) async fn series_rows(
         &self,
+        memory_pool: &Arc<dyn MemoryPool>,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+    ) -> Result<Arc<SeriesRowGroup>> {
+        let cell = self
+            .context
+            .series_rows
+            .get(self.row_group_idx)
+            .context(UnexpectedSnafu {
+                reason: "series row group is out of bounds",
+            })?;
+        let (mapping, _) = cell
+            .get_or_try_init(|| async {
+                let builder = &self.context.reader_builder;
+                let cache = builder.cache_strategy();
+                let key =
+                    RangeResultKey::SeriesRows(builder.file_handle().file_id(), self.row_group_idx);
+                let reservation = MemoryConsumer::new("SeriesRowGroup").register(memory_pool);
+                if let Some(RangeResultValue::SeriesRows(mapping)) = cache.get_series_mapping(&key)
+                {
+                    reservation
+                        .try_grow(mapping.estimated_size())
+                        .context(ReserveSeriesScanMemorySnafu)?;
+                    return Ok((mapping, reservation));
+                }
+                let mut stream = builder
+                    .build_primary_key(self.context.build_context(
+                        self.row_group_idx,
+                        None,
+                        fetch_metrics,
+                    ))
+                    .await?;
+                let mut mapping = SeriesRowGroupBuilder::default();
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    mapping.append(batch.column(0), Some(&reservation))?;
+                }
+                let mapping = Arc::new(mapping.finish());
+                let expected_rows = builder
+                    .parquet_metadata()
+                    .row_group(self.row_group_idx)
+                    .num_rows() as usize;
+                ensure!(
+                    mapping.runs.last().map_or(0, |run| run.rows.end) == expected_rows,
+                    UnexpectedSnafu {
+                        reason: "primary-key mapping does not cover the complete row group",
+                    }
+                );
+                reservation
+                    .try_resize(mapping.estimated_size())
+                    .context(ReserveSeriesScanMemorySnafu)?;
+                cache.put_series_mapping(key, RangeResultValue::SeriesRows(mapping.clone()));
+                Ok::<_, crate::error::Error>((mapping, reservation))
+            })
+            .await?;
+        Ok(mapping.clone())
+    }
+
+    /// Candidate keys and data selection use the same retained source mapping.
+    pub(crate) async fn series_candidate_keys(
+        &self,
+        memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
-        self.primary_key_reader_inner(fetch_metrics, true).await
+        if !self.in_dynamic_filter_range() {
+            return Ok(None);
+        }
+        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
+        let mut primary_keys = mapping.candidate_keys(self.row_selection.as_ref());
+        if let Some(compat) = self.context.compat_batch() {
+            primary_keys = compat.compat_primary_key(&primary_keys)?;
+        }
+        let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
+            datatypes::arrow::datatypes::Field::new(
+                store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME,
+                primary_keys.data_type().clone(),
+                false,
+            ),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![primary_keys]).context(NewRecordBatchSnafu)?;
+        Ok(Some(Box::pin(futures::stream::once(async { Ok(batch) }))))
     }
 
     async fn primary_key_reader_inner(
@@ -462,6 +542,8 @@ pub struct FileRangeContext {
     range_index_store: Option<ObjectStore>,
     /// Lazily opened range index shared by all ranges of this file.
     range_index_searcher: OnceCell<SstRangeIndexSearcher>,
+    /// Complete source mappings shared by candidate and data reads.
+    series_rows: Vec<OnceCell<(Arc<SeriesRowGroup>, MemoryReservation)>>,
     /// Row group reader builder for the file.
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.
@@ -477,7 +559,11 @@ impl FileRangeContext {
         base: RangeBase,
         range_index_store: Option<ObjectStore>,
     ) -> Self {
+        let series_rows = (0..reader_builder.parquet_metadata().num_row_groups())
+            .map(|_| OnceCell::new())
+            .collect();
         Self {
+            series_rows,
             reader_builder,
             base,
             range_index_store,

@@ -68,6 +68,7 @@ use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
 use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::read::read_columns::JsonTargetTypes;
+use crate::read::series_mapping::SeriesRowGroup;
 use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
@@ -920,6 +921,20 @@ impl CacheStrategy {
         }
     }
 
+    /// Gets immutable source mappings from the shared range-result budget.
+    pub(crate) fn get_series_mapping(&self, key: &RangeResultKey) -> Option<RangeResultValue> {
+        match self {
+            Self::EnableAll(cache) => cache.get_series_mapping(key),
+            Self::Compaction(_) | Self::Disabled => None,
+        }
+    }
+
+    pub(crate) fn put_series_mapping(&self, key: RangeResultKey, value: RangeResultValue) {
+        if let Self::EnableAll(cache) = self {
+            cache.put_series_mapping(key, value);
+        }
+    }
+
     /// Returns true if the range result cache is enabled.
     pub(crate) fn has_range_result_cache(&self) -> bool {
         match self {
@@ -1396,7 +1411,16 @@ impl CacheManager {
     ) -> Option<Arc<RangeScanCacheValue>> {
         self.range_result_cache
             .as_ref()
-            .and_then(|cache| update_hit_miss(cache.get(key), RANGE_RESULT_TYPE))
+            .and_then(|cache| {
+                update_hit_miss(
+                    cache.get(&RangeResultKey::Scan(key.clone())),
+                    RANGE_RESULT_TYPE,
+                )
+            })
+            .and_then(|value| match value {
+                RangeResultValue::Scan(value) => Some(value),
+                _ => None,
+            })
     }
 
     /// Puts range scan result into cache.
@@ -1405,11 +1429,26 @@ impl CacheManager {
         key: RangeScanCacheKey,
         result: Arc<RangeScanCacheValue>,
     ) {
+        self.put_series_mapping(RangeResultKey::Scan(key), RangeResultValue::Scan(result));
+    }
+
+    fn get_series_mapping(&self, key: &RangeResultKey) -> Option<RangeResultValue> {
+        self.range_result_cache
+            .as_ref()
+            .and_then(|cache| update_hit_miss(cache.get(key), RANGE_RESULT_TYPE))
+    }
+
+    fn put_series_mapping(&self, key: RangeResultKey, value: RangeResultValue) {
         if let Some(cache) = &self.range_result_cache {
+            let size = key.estimated_size().saturating_add(value.estimated_size());
+            if size as u64 > self.range_result_cache_size || size > u32::MAX as usize {
+                return;
+            }
+            let weight = range_result_cache_weight(&key, &value);
             CACHE_BYTES
                 .with_label_values(&[RANGE_RESULT_TYPE])
-                .add(range_result_cache_weight(&key, &result).into());
-            cache.insert(key, result);
+                .add(weight.into());
+            cache.insert(key, value);
         }
     }
 
@@ -1711,8 +1750,8 @@ fn selector_result_cache_weight(k: &SelectorResultKey, v: &Arc<SelectorResultVal
     (mem::size_of_val(k) + v.estimated_size()) as u32
 }
 
-fn range_result_cache_weight(k: &RangeScanCacheKey, v: &Arc<RangeScanCacheValue>) -> u32 {
-    (k.estimated_size() + v.estimated_size()) as u32
+fn range_result_cache_weight(k: &RangeResultKey, v: &RangeResultValue) -> u32 {
+    u32::try_from(k.estimated_size().saturating_add(v.estimated_size())).unwrap_or(u32::MAX)
 }
 
 /// Updates cache hit/miss metrics.
@@ -2092,8 +2131,39 @@ type SstDecodedMetaCache = Cache<SstMetaKey, Arc<CachedSstMeta>>;
 type VectorCache = Cache<(ConcreteDataType, Value), VectorRef>;
 /// Maps (file id, row group id, time series row selector) to [SelectorResultValue].
 type SelectorResultCache = Cache<SelectorResultKey, Arc<SelectorResultValue>>;
-/// Maps partition-range scan key to cached flat batches.
-type RangeResultCache = Cache<RangeScanCacheKey, Arc<RangeScanCacheValue>>;
+/// Immutable source mappings share capacity and eviction with range results.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RangeResultKey {
+    Scan(RangeScanCacheKey),
+    SeriesRows(RegionFileId, usize),
+}
+
+impl RangeResultKey {
+    fn estimated_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + match self {
+                Self::Scan(key) => key.estimated_size(),
+                _ => 0,
+            }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum RangeResultValue {
+    Scan(Arc<RangeScanCacheValue>),
+    SeriesRows(Arc<SeriesRowGroup>),
+}
+
+impl RangeResultValue {
+    fn estimated_size(&self) -> usize {
+        match self {
+            Self::Scan(value) => value.estimated_size(),
+            Self::SeriesRows(value) => value.estimated_size(),
+        }
+    }
+}
+
+type RangeResultCache = Cache<RangeResultKey, RangeResultValue>;
 
 #[cfg(test)]
 mod tests {
@@ -2858,6 +2928,69 @@ mod tests {
         assert!(disabled.get_range_result(&key).is_none());
         disabled.put_range_result(key.clone(), value);
         assert!(cache.get_range_result(&key).is_some());
+    }
+
+    #[test]
+    fn series_mapping_cache_respects_source_identity_budget_and_pinned_readers() {
+        use datatypes::arrow::array::{ArrayRef, BinaryArray};
+
+        use crate::read::series_mapping::SeriesRowGroupBuilder;
+        let mut encoded = Vec::new();
+        mito_codec::row_converter::SparsePrimaryKeyCodec::schemaless()
+            .encode_internal(1, 7, &mut encoded)
+            .unwrap();
+        let keys: ArrayRef = Arc::new(BinaryArray::from_iter_values([encoded.as_slice()]));
+        let mut builder = SeriesRowGroupBuilder::default();
+        builder.append(&keys, None).unwrap();
+        let mapping = Arc::new(builder.finish());
+        let file = RegionFileId::new(RegionId::new(1, 1), FileId::random());
+        let key = RangeResultKey::SeriesRows(file, 0);
+        let value = RangeResultValue::SeriesRows(mapping.clone());
+        let capacity = u64::from(range_result_cache_weight(&key, &value));
+        let cache = Arc::new(
+            CacheManager::builder()
+                .range_result_cache_size(capacity)
+                .build(),
+        );
+        let strategy = CacheStrategy::EnableAll(cache.clone());
+        strategy.put_series_mapping(key.clone(), value.clone());
+        let Some(RangeResultValue::SeriesRows(pinned)) = strategy.get_series_mapping(&key) else {
+            panic!("mapping was not admitted");
+        };
+        assert!(Arc::ptr_eq(&pinned, &mapping));
+        assert!(
+            strategy
+                .get_series_mapping(&RangeResultKey::SeriesRows(file, 1))
+                .is_none()
+        );
+        assert!(
+            strategy
+                .get_series_mapping(&RangeResultKey::SeriesRows(
+                    RegionFileId::new(RegionId::new(2, 1), file.file_id()),
+                    0
+                ))
+                .is_none()
+        );
+        assert!(
+            CacheStrategy::Compaction(cache.clone())
+                .get_series_mapping(&key)
+                .is_none()
+        );
+        cache.range_result_cache.as_ref().unwrap().invalidate_all();
+        cache
+            .range_result_cache
+            .as_ref()
+            .unwrap()
+            .run_pending_tasks();
+        assert!(strategy.get_series_mapping(&key).is_none());
+        assert_eq!(pinned.primary_keys.value(0), encoded.as_slice());
+        let small = CacheStrategy::EnableAll(Arc::new(
+            CacheManager::builder()
+                .range_result_cache_size(capacity - 1)
+                .build(),
+        ));
+        small.put_series_mapping(key.clone(), value);
+        assert!(small.get_series_mapping(&key).is_none());
     }
 
     #[test]

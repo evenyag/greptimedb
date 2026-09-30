@@ -509,6 +509,14 @@ pub enum Error {
         error: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Failed to reserve memory for series-scan metadata"))]
+    ReserveSeriesScanMemory {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to merge candidate series"))]
     MergeCandidateSeries {
         #[snafu(implicit)]
@@ -1486,6 +1494,8 @@ impl ErrorExt for Error {
             | InvalidSourceAndTargetRegion { .. } => StatusCode::InvalidArguments,
 
             IncrementalQueryStale { .. } | SnapshotFenceStale { .. } => StatusCode::RequestOutdated,
+
+            ReserveSeriesScanMemory { .. } => StatusCode::RuntimeResourcesExhausted,
 
             SequenceRangeUnsupported { .. } => StatusCode::Unsupported,
 

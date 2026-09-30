@@ -2588,6 +2588,81 @@ mod tests {
         )
     }
 
+    fn series_test_range(
+        builder: RowGroupReaderBuilder,
+        metadata: Arc<RegionMetadata>,
+        selection: Option<RowSelection>,
+    ) -> crate::sst::parquet::file_range::FileRange {
+        let read_format = FlatReadFormat::new(
+            metadata.clone(),
+            ReadColumns::new(
+                metadata
+                    .column_metadatas
+                    .iter()
+                    .map(|column| column.column_id),
+            ),
+            None,
+            &builder.file_path,
+            false,
+        )
+        .unwrap();
+        let context = FileRangeContext::new(
+            builder,
+            RangeBase {
+                filters: Vec::new(),
+                dyn_filters: Vec::new(),
+                read_format,
+                expected_metadata: None,
+                prune_schema: metadata.schema.clone(),
+                codec: build_primary_key_codec(&metadata),
+                compat_batch: None,
+                compaction_projection_mapper: None,
+                pre_filter_mode: PreFilterMode::All,
+                partition_filter: None,
+            },
+            None,
+        );
+        crate::sst::parquet::file_range::FileRange::new(Arc::new(context), 0, selection)
+    }
+
+    #[tokio::test]
+    async fn series_mapping_is_shared_and_retries_failed_reservations() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let (builder, metadata) = prefilter_test_builder(
+            ObjectStore::new(Memory::default()).unwrap(),
+            Predicate::new(vec![col("field_0").gt_eq(lit(0_u64))]),
+            CacheStrategy::Disabled,
+        )
+        .await;
+        let range = series_test_range(
+            builder,
+            metadata,
+            Some(RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(1),
+                RowSelector::skip(1),
+            ])),
+        );
+        let small: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+        assert!(range.series_rows(&small, None).await.is_err());
+        assert_eq!(small.reserved(), 0);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let (first, second) = tokio::join!(
+            range.series_rows(&pool, None),
+            range.series_rows(&pool, None)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        // Pruning must not restrict the cached mapping.
+        assert_eq!(first.runs[0].rows, 0..3);
+        assert_eq!(pool.reserved(), first.estimated_size());
+        drop(first);
+        drop(second);
+        drop(range);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_execute_prefilter_proven_filters_preserve_selection_without_fetching() {
         let object_store = ObjectStore::new(Memory::default()).unwrap();
