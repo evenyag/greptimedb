@@ -509,6 +509,14 @@ pub enum Error {
         error: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Failed to reserve memory for range-index batches"))]
+    ReserveRangeIndexMemory {
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(source)]
+        error: datafusion::error::DataFusionError,
+    },
+
     #[snafu(display("Failed to reserve memory for series-scan metadata"))]
     ReserveSeriesScanMemory {
         #[snafu(implicit)]
@@ -1495,7 +1503,9 @@ impl ErrorExt for Error {
 
             IncrementalQueryStale { .. } | SnapshotFenceStale { .. } => StatusCode::RequestOutdated,
 
-            ReserveSeriesScanMemory { .. } => StatusCode::RuntimeResourcesExhausted,
+            ReserveSeriesScanMemory { .. } | ReserveRangeIndexMemory { .. } => {
+                StatusCode::RuntimeResourcesExhausted
+            }
 
             SequenceRangeUnsupported { .. } => StatusCode::Unsupported,
 

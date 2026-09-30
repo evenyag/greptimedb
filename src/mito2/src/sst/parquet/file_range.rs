@@ -108,8 +108,11 @@ pub struct FileRange {
 
 impl FileRange {
     /// Returns the shared range-index searcher, opening it on first use.
-    pub(crate) async fn range_index_searcher(&self) -> Result<Option<&SstRangeIndexSearcher>> {
-        self.context.range_index_searcher().await
+    pub(crate) async fn range_index_searcher(
+        &self,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Option<&SstRangeIndexSearcher>> {
+        self.context.range_index_searcher(memory_pool).await
     }
 
     /// Returns the region metadata stored in this SST.
@@ -572,7 +575,10 @@ impl FileRangeContext {
     }
 
     /// Opens the range index once, retaining the SST handle throughout its use.
-    async fn range_index_searcher(&self) -> Result<Option<&SstRangeIndexSearcher>> {
+    async fn range_index_searcher(
+        &self,
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Option<&SstRangeIndexSearcher>> {
         let Some(store) = &self.range_index_store else {
             return Ok(None);
         };
@@ -580,7 +586,14 @@ impl FileRangeContext {
             .get_or_try_init(|| async {
                 let file = self.reader_builder.file_handle();
                 let path = range_index_path(file.region_id(), file.file_id().file_id());
-                SstRangeIndexSearcher::open(store.clone(), &path).await
+                SstRangeIndexSearcher::open_cached(
+                    store.clone(),
+                    &path,
+                    file.file_id(),
+                    self.reader_builder.cache_strategy(),
+                    memory_pool,
+                )
+                .await
             })
             .await
             .map(Some)

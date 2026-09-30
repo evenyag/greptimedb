@@ -450,6 +450,7 @@ async fn build_series_partition_range(
                 codec.clone(),
                 stream_ctx.input.sequence_range,
                 stream_ctx.input.region_metadata().region_id,
+                stream_ctx.input.scan_memory_pool.clone(),
             );
             sources.push(Box::pin(stream) as BoxedRecordBatchStream);
             continue;
@@ -499,6 +500,7 @@ fn scan_series_file_ranges(
     codec: SparsePrimaryKeyCodec,
     sequence_range: Option<SequenceRange>,
     region_id: store_api::storage::RegionId,
+    memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
 ) -> impl futures::Stream<Item = Result<datatypes::arrow::record_batch::RecordBatch>> {
     try_stream! {
         let fetch_metrics = part_metrics
@@ -512,7 +514,7 @@ fn scan_series_file_ranges(
 
         for range in ranges {
             let build_start = Instant::now();
-            let searcher = range.range_index_searcher().await?;
+            let searcher = range.range_index_searcher(&memory_pool).await?;
             let reader = if let Some(searcher) = searcher {
                 let row_group_id = u32::try_from(range.row_group_index()).map_err(|_| UnexpectedSnafu {
                     reason: format!("row group index exceeds u32: {}", range.row_group_index()),

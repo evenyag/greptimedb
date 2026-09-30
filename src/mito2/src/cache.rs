@@ -73,6 +73,7 @@ use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
 use crate::sst::parquet::reader::MetadataCacheMetrics;
+use crate::sst::range_index::searcher::SstRangeIndexData;
 
 /// Metrics type key for sst meta.
 const SST_META_TYPE: &str = "sst_meta";
@@ -2136,6 +2137,7 @@ type SelectorResultCache = Cache<SelectorResultKey, Arc<SelectorResultValue>>;
 pub(crate) enum RangeResultKey {
     Scan(RangeScanCacheKey),
     SeriesRows(RegionFileId, usize),
+    RangeIndex(RegionFileId),
 }
 
 impl RangeResultKey {
@@ -2152,6 +2154,7 @@ impl RangeResultKey {
 pub(crate) enum RangeResultValue {
     Scan(Arc<RangeScanCacheValue>),
     SeriesRows(Arc<SeriesRowGroup>),
+    RangeIndex(Arc<SstRangeIndexData>),
 }
 
 impl RangeResultValue {
@@ -2159,6 +2162,7 @@ impl RangeResultValue {
         match self {
             Self::Scan(value) => value.estimated_size(),
             Self::SeriesRows(value) => value.estimated_size(),
+            Self::RangeIndex(value) => value.estimated_size(),
         }
     }
 }
