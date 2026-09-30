@@ -24,8 +24,11 @@ use common_telemetry::error;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::expressions::DynamicFilterPhysicalExpr;
-use datatypes::arrow::array::{Array as _, ArrayBuilder as _, ArrayRef, BooleanArray};
+use datatypes::arrow::array::{
+    Array as _, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, DictionaryArray,
+};
 use datatypes::arrow::buffer::BooleanBuffer;
+use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::schema::Schema;
 use futures::StreamExt;
@@ -51,7 +54,9 @@ use crate::read::compat::FlatCompatBatch;
 use crate::read::flat_projection::CompactionProjectionMapper;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;
 use crate::read::prune::FlatPruneReader;
-use crate::read::series_mapping::{SeriesBatchCursor, SeriesRowGroup, SeriesRowGroupBuilder};
+use crate::read::series_mapping::{
+    SeriesBatchCursor, SeriesPrimaryKeys, SeriesRowMapping, SeriesRowMappingBuilder,
+};
 use crate::sst::file::FileHandle;
 use crate::sst::parquet::flat_format::{
     DecodedPrimaryKeys, FlatReadFormat, decode_primary_keys, primary_key_column_index,
@@ -276,7 +281,7 @@ impl FileRange {
         &self,
         memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-    ) -> Result<Arc<SeriesRowGroup>> {
+    ) -> Result<Arc<SeriesRowMapping>> {
         let cell = self
             .context
             .series_rows
@@ -290,7 +295,7 @@ impl FileRange {
                 let cache = builder.cache_strategy();
                 let key =
                     RangeResultKey::SeriesRows(builder.file_handle().file_id(), self.row_group_idx);
-                let reservation = MemoryConsumer::new("SeriesRowGroup").register(memory_pool);
+                let reservation = MemoryConsumer::new("SeriesRowMapping").register(memory_pool);
                 if let Some(RangeResultValue::SeriesRows(mapping)) = cache.get_series_mapping(&key)
                 {
                     reservation
@@ -305,7 +310,7 @@ impl FileRange {
                         fetch_metrics,
                     ))
                     .await?;
-                let mut mapping = SeriesRowGroupBuilder::default();
+                let mut mapping = SeriesRowMappingBuilder::default();
                 while let Some(batch) = stream.next().await {
                     let batch = batch?;
                     mapping.append(batch.column(0), Some(&reservation))?;
@@ -331,7 +336,7 @@ impl FileRange {
         Ok(mapping.clone())
     }
 
-    /// Candidate keys and data selection use the same retained source mapping.
+    /// Streams full candidate keys while caching only the complete series-to-row mapping.
     pub(crate) async fn series_candidate_keys(
         &self,
         memory_pool: &Arc<dyn MemoryPool>,
@@ -340,48 +345,154 @@ impl FileRange {
         if !self.in_dynamic_filter_range() {
             return Ok(None);
         }
-        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
-        let mut primary_keys = mapping.candidate_keys(self.row_selection.as_ref());
-        if let Some(compat) = self.context.compat_batch() {
-            primary_keys = compat.compat_primary_key(&primary_keys)?;
+        if self.range_index_searcher(memory_pool).await?.is_some() {
+            // The range index supplies the mapping; read only the candidate key payload.
+            return self.primary_key_reader_inner(fetch_metrics, false).await;
         }
-        let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
-            datatypes::arrow::datatypes::Field::new(
-                store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME,
-                primary_keys.data_type().clone(),
-                false,
-            ),
-        ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![primary_keys]).context(NewRecordBatchSnafu)?;
-        Ok(Some(Box::pin(futures::stream::once(async { Ok(batch) }))))
+        let builder = &self.context.reader_builder;
+        let cache_key =
+            RangeResultKey::SeriesRows(builder.file_handle().file_id(), self.row_group_idx);
+        if self.context.series_rows[self.row_group_idx].initialized()
+            || builder
+                .cache_strategy()
+                .get_series_mapping(&cache_key)
+                .is_some()
+        {
+            // A warm mapping has no tag payload: candidate discovery still reads keys.
+            self.series_rows(memory_pool, fetch_metrics).await?;
+            return self.primary_key_reader_inner(fetch_metrics, false).await;
+        }
+        let mut input = builder
+            .build_primary_key(
+                self.context
+                    .build_context(self.row_group_idx, None, fetch_metrics),
+            )
+            .await?;
+        let range = self.clone();
+        let reservation = MemoryConsumer::new("SeriesRowMapping").register(memory_pool);
+        let candidate_reservation =
+            MemoryConsumer::new("SeriesCandidateKeys").register(memory_pool);
+        let mut intervals = Vec::new();
+        if let Some(selection) = &self.row_selection {
+            let mut offset = 0;
+            for selector in selection.iter() {
+                if !selector.skip {
+                    intervals.push(offset..offset + selector.row_count);
+                }
+                offset += selector.row_count;
+            }
+        } else {
+            intervals.push(
+                0..builder
+                    .parquet_metadata()
+                    .row_group(self.row_group_idx)
+                    .num_rows() as usize,
+            );
+        }
+        Ok(Some(Box::pin(async_stream::try_stream! {
+            let mut mapping = SeriesRowMappingBuilder::default();
+            let mut candidates = BinaryBuilder::new();
+            let mut last = Vec::new();
+            let mut offset = 0;
+            let mut interval = 0;
+            while let Some(batch) = input.next().await {
+                let batch = batch?;
+                mapping.append(batch.column(0), Some(&reservation))?;
+                let end = offset + batch.num_rows();
+                while interval < intervals.len() && intervals[interval].end <= offset {
+                    interval += 1;
+                }
+                let mut i = interval;
+                while i < intervals.len() && intervals[i].start < end {
+                    let start = intervals[i].start.max(offset);
+                    let stop = intervals[i].end.min(end);
+                    let array = batch.column(0);
+                    let (values, indices) = if let Some(dictionary) = array.as_any()
+                        .downcast_ref::<DictionaryArray<UInt32Type>>() {
+                        (dictionary.values(), Some(dictionary.keys()))
+                    } else {
+                        (array, None)
+                    };
+                    let values = values.as_any().downcast_ref::<BinaryArray>()
+                        .context(UnexpectedSnafu { reason: "candidate keys must be binary" })?;
+                    for row in start - offset..stop - offset {
+                        let key = values.value(indices.map_or(row, |indices| indices.value(row) as usize));
+                        if last != key {
+                            candidate_reservation.try_grow(3 * key.len() + 8)
+                                .context(ReserveSeriesScanMemorySnafu)?;
+                            candidates.append_value(key);
+                            last.clear();
+                            last.extend_from_slice(key);
+                        }
+                    }
+                    i += 1;
+                }
+                offset = end;
+            }
+            let mapping = Arc::new(mapping.finish());
+            let expected = range.context.reader_builder.parquet_metadata()
+                .row_group(range.row_group_idx).num_rows() as usize;
+            if offset != expected {
+                Err(UnexpectedSnafu { reason: "primary-key mapping does not cover the complete row group" }.build())?;
+            }
+            reservation.try_resize(mapping.estimated_size()).context(ReserveSeriesScanMemorySnafu)?;
+            range.context.reader_builder.cache_strategy()
+                .put_series_mapping(cache_key, RangeResultValue::SeriesRows(mapping.clone()));
+            // Another candidate stream can finish the same immutable mapping first.
+            let _ = range.context.series_rows[range.row_group_idx].set((mapping, reservation));
+            // Publish the complete mapping before any assignment can reach the data phase.
+            let mut keys: ArrayRef = Arc::new(candidates.finish());
+            if let Some(compat) = range.context.compat_batch() {
+                keys = compat.compat_primary_key(&keys)?;
+            }
+            let schema = Arc::new(datatypes::arrow::datatypes::Schema::new(vec![
+                datatypes::arrow::datatypes::Field::new(
+                    store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME, keys.data_type().clone(), false,
+                ),
+            ]));
+            yield RecordBatch::try_new(schema, vec![keys]).context(NewRecordBatchSnafu)?;
+            drop(candidate_reservation);
+        })))
     }
 
-    /// Reads selected series using retained keys and decoded source-schema tags.
+    /// Reads selected series using query-local keys and decoded source-schema tags.
     pub(crate) async fn reader_by_series(
         &self,
         series: &[crate::series_index::MetricSeriesId],
+        primary_keys: &SeriesPrimaryKeys,
         memory_pool: &Arc<dyn MemoryPool>,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<FlatRowGroupReader>> {
-        let mapping = self.series_rows(memory_pool, fetch_metrics).await?;
+        let mapping = if let Some(searcher) = self.range_index_searcher(memory_pool).await? {
+            let row_group = u32::try_from(self.row_group_idx).map_err(|_| {
+                UnexpectedSnafu {
+                    reason: "row group index exceeds u32",
+                }
+                .build()
+            })?;
+            Arc::new(SeriesRowMapping {
+                runs: searcher.search_series(row_group, series)?,
+            })
+        } else {
+            self.series_rows(memory_pool, fetch_metrics).await?
+        };
         let selected = mapping.select(Some(series), self.row_selection.as_ref());
         if selected.is_empty() {
             return Ok(None);
         }
-        let mut keys = datatypes::arrow::array::BinaryBuilder::new();
+        let mut selected_series = Vec::new();
         let mut runs = Vec::with_capacity(selected.len());
         let mut last = None;
         let mut index = 0;
         for (key, rows) in selected {
             if last != Some(key) {
-                index = keys.len();
-                keys.append_value(mapping.primary_keys.value(key));
+                index = selected_series.len();
+                selected_series.push(mapping.runs[key].series);
                 last = Some(key);
             }
             runs.push((index, rows));
         }
-        let keys = keys.finish();
+        let keys = primary_keys.select(selected_series)?;
         let tags = self.context.read_format().decode_series_tags(&keys)?;
         let cursor = SeriesBatchCursor::try_new(keys, tags, runs, memory_pool)?;
         self.reader_with_series(cursor, fetch_metrics)
@@ -606,7 +717,7 @@ pub struct FileRangeContext {
     /// Lazily opened range index shared by all ranges of this file.
     range_index_searcher: OnceCell<SstRangeIndexSearcher>,
     /// Complete source mappings shared by candidate and data reads.
-    series_rows: Vec<OnceCell<(Arc<SeriesRowGroup>, MemoryReservation)>>,
+    series_rows: Vec<OnceCell<(Arc<SeriesRowMapping>, MemoryReservation)>>,
     /// Row group reader builder for the file.
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.

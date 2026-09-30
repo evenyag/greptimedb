@@ -68,7 +68,7 @@ use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
 use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::read::read_columns::JsonTargetTypes;
-use crate::read::series_mapping::SeriesRowGroup;
+use crate::read::series_mapping::SeriesRowMapping;
 use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
@@ -2153,7 +2153,7 @@ impl RangeResultKey {
 #[derive(Clone)]
 pub(crate) enum RangeResultValue {
     Scan(Arc<RangeScanCacheValue>),
-    SeriesRows(Arc<SeriesRowGroup>),
+    SeriesRows(Arc<SeriesRowMapping>),
     RangeIndex(Arc<SstRangeIndexData>),
 }
 
@@ -2938,13 +2938,13 @@ mod tests {
     fn series_mapping_cache_respects_source_identity_budget_and_pinned_readers() {
         use datatypes::arrow::array::{ArrayRef, BinaryArray};
 
-        use crate::read::series_mapping::SeriesRowGroupBuilder;
+        use crate::read::series_mapping::SeriesRowMappingBuilder;
         let mut encoded = Vec::new();
         mito_codec::row_converter::SparsePrimaryKeyCodec::schemaless()
             .encode_internal(1, 7, &mut encoded)
             .unwrap();
         let keys: ArrayRef = Arc::new(BinaryArray::from_iter_values([encoded.as_slice()]));
-        let mut builder = SeriesRowGroupBuilder::default();
+        let mut builder = SeriesRowMappingBuilder::default();
         builder.append(&keys, None).unwrap();
         let mapping = Arc::new(builder.finish());
         let file = RegionFileId::new(RegionId::new(1, 1), FileId::random());
@@ -2987,7 +2987,7 @@ mod tests {
             .unwrap()
             .run_pending_tasks();
         assert!(strategy.get_series_mapping(&key).is_none());
-        assert_eq!(pinned.primary_keys.value(0), encoded.as_slice());
+        assert_eq!(pinned.runs[0].rows, 0..1);
         let small = CacheStrategy::EnableAll(Arc::new(
             CacheManager::builder()
                 .range_result_cache_size(capacity - 1)

@@ -14,9 +14,10 @@
 
 //! Source-schema primary keys and absolute row-group runs for two-phase scans.
 
+use std::collections::HashMap;
 use std::mem;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datatypes::arrow::array::{
@@ -35,6 +36,52 @@ use crate::error::{
 };
 use crate::series_index::MetricSeriesId;
 
+/// Query-local full keys retained after candidate merging, once per selected series.
+/// SST and range-index mapping caches never own this payload.
+#[derive(Debug)]
+pub(crate) struct SeriesPrimaryKeys {
+    inner: Mutex<(HashMap<MetricSeriesId, Vec<u8>>, MemoryReservation)>,
+}
+
+impl SeriesPrimaryKeys {
+    pub(crate) fn new(pool: &Arc<dyn MemoryPool>) -> Self {
+        Self {
+            inner: Mutex::new((
+                HashMap::new(),
+                MemoryConsumer::new("SeriesPrimaryKeys").register(pool),
+            )),
+        }
+    }
+
+    pub(crate) fn insert(&self, series: MetricSeriesId, key: &[u8]) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let (keys, reservation) = &mut *inner;
+        if let std::collections::hash_map::Entry::Vacant(entry) = keys.entry(series) {
+            reservation
+                .try_grow(key.len() + 2 * mem::size_of::<(MetricSeriesId, Vec<u8>)>())
+                .context(ReserveSeriesScanMemorySnafu)?;
+            entry.insert(key.to_vec());
+        }
+        Ok(())
+    }
+
+    /// Copies only the keys needed by the current row-group reader.
+    pub(crate) fn select(
+        &self,
+        series: impl IntoIterator<Item = MetricSeriesId>,
+    ) -> Result<BinaryArray> {
+        let inner = self.inner.lock().unwrap();
+        let mut builder = BinaryBuilder::new();
+        for series in series {
+            let key = inner.0.get(&series).context(UnexpectedSnafu {
+                reason: "selected series has no retained candidate primary key",
+            })?;
+            builder.append_value(key);
+        }
+        Ok(builder.finish())
+    }
+}
+
 /// One contiguous series run in absolute row-group coordinates.
 #[derive(Debug, Clone)]
 pub(crate) struct SeriesRowRange {
@@ -42,18 +89,15 @@ pub(crate) struct SeriesRowRange {
     pub(crate) rows: Range<usize>,
 }
 
-/// Complete, unfiltered primary-key mapping for an immutable SST row group.
-/// Each run has one key in `primary_keys`, in the same order.
-pub(crate) struct SeriesRowGroup {
-    pub(crate) primary_keys: BinaryArray,
+/// Complete, unfiltered series-to-row mapping for an immutable SST row group.
+/// Cached mappings never retain encoded primary keys or decoded tags.
+pub(crate) struct SeriesRowMapping {
     pub(crate) runs: Vec<SeriesRowRange>,
 }
 
-impl SeriesRowGroup {
+impl SeriesRowMapping {
     pub(crate) fn estimated_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.primary_keys.get_array_memory_size()
-            + self.runs.capacity() * mem::size_of::<SeriesRowRange>()
+        mem::size_of::<Self>() + self.runs.capacity() * mem::size_of::<SeriesRowRange>()
     }
 
     /// Selects source runs for an optional sorted series assignment and intersects
@@ -108,31 +152,17 @@ impl SeriesRowGroup {
             runs
         }
     }
-
-    /// Returns one full source key per selected run, without expanding data rows.
-    pub(crate) fn candidate_keys(&self, selection: Option<&RowSelection>) -> ArrayRef {
-        let mut keys = BinaryBuilder::new();
-        let mut last = None;
-        for (key, _) in self.select(None, selection) {
-            if last != Some(key) {
-                keys.append_value(self.primary_keys.value(key));
-                last = Some(key);
-            }
-        }
-        Arc::new(keys.finish())
-    }
 }
 
 /// Builds run-length metadata without retaining a primary key per data row.
 #[derive(Default)]
-pub(crate) struct SeriesRowGroupBuilder {
-    keys: BinaryBuilder,
+pub(crate) struct SeriesRowMappingBuilder {
     last_key: Vec<u8>,
     runs: Vec<SeriesRowRange>,
     rows: usize,
 }
 
-impl SeriesRowGroupBuilder {
+impl SeriesRowMappingBuilder {
     pub(crate) fn append(
         &mut self,
         array: &ArrayRef,
@@ -168,14 +198,12 @@ impl SeriesRowGroupBuilder {
                     }
                 );
                 if let Some(reservation) = reservation {
-                    // Allow for geometric buffer growth plus the last-key scratch
-                    // buffer. Charge per run, not per repeated data row.
+                    // Allow for geometric run-buffer growth. Encoded keys are not retained.
                     reservation
-                        .try_grow(3 * key.len() + 2 * mem::size_of::<SeriesRowRange>() + 16)
+                        .try_grow(2 * mem::size_of::<SeriesRowRange>())
                         .context(ReserveSeriesScanMemorySnafu)?;
                 }
                 let (table_id, tsid) = codec.decode_ids(key).context(DecodeSnafu)?;
-                self.keys.append_value(key);
                 self.runs.push(SeriesRowRange {
                     series: MetricSeriesId { table_id, tsid },
                     rows: self.rows..self.rows,
@@ -191,11 +219,8 @@ impl SeriesRowGroupBuilder {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> SeriesRowGroup {
-        SeriesRowGroup {
-            primary_keys: self.keys.finish(),
-            runs: self.runs,
-        }
+    pub(crate) fn finish(self) -> SeriesRowMapping {
+        SeriesRowMapping { runs: self.runs }
     }
 }
 
@@ -345,11 +370,69 @@ mod tests {
     }
 
     #[test]
+    fn query_keys_are_deduplicated_and_released_with_the_query() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let keys = SeriesPrimaryKeys::new(&pool);
+        let series = MetricSeriesId {
+            table_id: 1,
+            tsid: 7,
+        };
+        let encoded = key(1, 7);
+        keys.insert(series, &encoded).unwrap();
+        let reserved = pool.reserved();
+        for _ in 0..10 {
+            keys.insert(series, &encoded).unwrap();
+        }
+        assert_eq!(pool.reserved(), reserved);
+        assert_eq!(keys.select([series]).unwrap().value(0), encoded);
+        assert!(
+            keys.select([MetricSeriesId {
+                table_id: 2,
+                tsid: 7
+            }])
+            .is_err()
+        );
+        drop(keys);
+        assert_eq!(pool.reserved(), 0);
+        let small: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+        assert!(
+            SeriesPrimaryKeys::new(&small)
+                .insert(series, &encoded)
+                .is_err()
+        );
+        assert_eq!(small.reserved(), 0);
+    }
+
+    #[test]
+    fn cached_mapping_size_is_independent_of_full_key_size() {
+        let short = key(1, 7);
+        let mut long = short.clone();
+        long.extend(std::iter::repeat_n(1, 64 * 1024));
+        let build = |key: &[u8]| {
+            let mut builder = SeriesRowMappingBuilder::default();
+            builder.append(&binary(&[key, key]), None).unwrap();
+            builder.finish()
+        };
+        let small = build(&short);
+        let large = build(&long);
+        assert_eq!(small.estimated_size(), large.estimated_size());
+        assert_eq!(
+            large.runs[0].series,
+            MetricSeriesId {
+                table_id: 1,
+                tsid: 7
+            }
+        );
+        assert_eq!(large.runs[0].rows, 0..2);
+    }
+
+    #[test]
     fn runs_span_binary_and_dictionary_batches() {
         let a = key(1, 7);
         let b = key(2, 7);
         let c = key(2, 9);
-        let mut builder = SeriesRowGroupBuilder::default();
+        let mut builder = SeriesRowMappingBuilder::default();
         builder.append(&binary(&[&a, &a]), None).unwrap();
         let dictionary: ArrayRef = Arc::new(
             DictionaryArray::<UInt32Type>::try_new(
@@ -368,7 +451,7 @@ mod tests {
                 .map(|run| run.rows.clone())
                 .collect::<Vec<_>>()
         );
-        assert_eq!(mapping.primary_keys.len(), 3);
+        assert_eq!(mapping.runs.len(), 3);
         assert_eq!(
             vec![(1, 3..5)],
             mapping.select(
@@ -382,10 +465,10 @@ mod tests {
     }
 
     #[test]
-    fn selects_absolute_runs_and_deduplicates_candidate_keys() {
+    fn selects_absolute_runs() {
         let a = key(1, 7);
         let b = key(2, 7);
-        let mut builder = SeriesRowGroupBuilder::default();
+        let mut builder = SeriesRowMappingBuilder::default();
         builder
             .append(&binary(&[&a, &a, &a, &a, &a, &b, &b, &b]), None)
             .unwrap();
@@ -401,10 +484,8 @@ mod tests {
             mapping.select(None, Some(&selection)),
             vec![(0, 1..3), (0, 4..5), (1, 5..7)]
         );
-        let candidates = mapping.candidate_keys(Some(&selection));
-        assert_eq!(candidates.as_ref(), binary(&[&a, &b]).as_ref());
         let empty = RowSelection::from(vec![RowSelector::skip(8)]);
-        assert_eq!(mapping.candidate_keys(Some(&empty)).len(), 0);
+        assert!(mapping.select(None, Some(&empty)).is_empty());
     }
 
     #[test]
@@ -491,7 +572,7 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
         let reservation = MemoryConsumer::new("test").register(&pool);
         assert!(
-            SeriesRowGroupBuilder::default()
+            SeriesRowMappingBuilder::default()
                 .append(&binary(&[&key(1, 1)]), Some(&reservation))
                 .is_err()
         );
@@ -502,12 +583,12 @@ mod tests {
     fn rejects_unsorted_or_null_source_keys() {
         let a = key(1, 7);
         let b = key(2, 7);
-        let mut builder = SeriesRowGroupBuilder::default();
+        let mut builder = SeriesRowMappingBuilder::default();
         builder.append(&binary(&[&b]), None).unwrap();
         assert!(builder.append(&binary(&[&a]), None).is_err());
         let null: ArrayRef = Arc::new(BinaryArray::from(vec![None::<&[u8]>]));
         assert!(
-            SeriesRowGroupBuilder::default()
+            SeriesRowMappingBuilder::default()
                 .append(&null, None)
                 .is_err()
         );

@@ -880,7 +880,7 @@ impl SeriesCandidateDistributor {
             part_metrics.clone(),
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
-        let reuse_primary_keys = !candidate_scanner.uses_series_index();
+        let primary_keys = candidate_scanner.primary_keys();
         let mut candidates = candidate_scanner.build_stream().await?;
         let mut collector =
             SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
@@ -896,7 +896,7 @@ impl SeriesCandidateDistributor {
                 self.send_assignments(
                     collector.finish(false),
                     &partition_pruner,
-                    reuse_primary_keys,
+                    primary_keys.clone(),
                 );
                 if !self.should_fetch_candidates() {
                     part_metrics.on_finish();
@@ -911,7 +911,7 @@ impl SeriesCandidateDistributor {
             self.send_assignments(
                 collector.finish(!chunked),
                 &partition_pruner,
-                reuse_primary_keys,
+                primary_keys.clone(),
             );
         }
         part_metrics.on_finish();
@@ -922,7 +922,7 @@ impl SeriesCandidateDistributor {
         &mut self,
         assignments: Vec<AssignedSeriesBatch>,
         partition_pruner: &Arc<PartitionPruner>,
-        reuse_primary_keys: bool,
+        primary_keys: Option<Arc<crate::read::series_mapping::SeriesPrimaryKeys>>,
     ) {
         for (partition, assigned_series) in assignments.into_iter().enumerate() {
             if assigned_series.series().is_empty() {
@@ -933,7 +933,7 @@ impl SeriesCandidateDistributor {
             };
             let sent = sender
                 .send(Ok(SeriesReaderInput {
-                    assigned_series: assigned_series.with_primary_key_reuse(reuse_primary_keys),
+                    assigned_series: assigned_series.with_primary_keys(primary_keys.clone()),
                     partition_pruner: partition_pruner.clone(),
                     range_semaphore: self.range_semaphore.clone(),
                 }))

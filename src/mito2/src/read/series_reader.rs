@@ -42,6 +42,7 @@ use crate::read::scan_util::{
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::validate_metric_metadata;
+use crate::read::series_mapping::SeriesPrimaryKeys;
 use crate::series_index::MetricSeriesId;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -87,7 +88,7 @@ pub(crate) struct AssignedSeriesBatch {
     range: SeriesRange,
     series: Vec<MetricSeriesId>,
     enable_range_cache: bool,
-    reuse_primary_keys: bool,
+    primary_keys: Option<Arc<SeriesPrimaryKeys>>,
 }
 
 impl AssignedSeriesBatch {
@@ -96,12 +97,12 @@ impl AssignedSeriesBatch {
             range,
             series,
             enable_range_cache,
-            reuse_primary_keys: false,
+            primary_keys: None,
         }
     }
 
-    pub(crate) fn with_primary_key_reuse(mut self, enabled: bool) -> Self {
-        self.reuse_primary_keys = enabled;
+    pub(crate) fn with_primary_keys(mut self, keys: Option<Arc<SeriesPrimaryKeys>>) -> Self {
+        self.primary_keys = keys;
         self
     }
 
@@ -168,7 +169,7 @@ struct MetricSeriesFilter {
     series: Arc<HashSet<MetricSeriesId>>,
     sorted_series: Arc<Vec<MetricSeriesId>>,
     enable_range_cache: bool,
-    reuse_primary_keys: bool,
+    primary_keys: Option<Arc<SeriesPrimaryKeys>>,
 }
 
 impl MetricSeriesFilter {
@@ -182,7 +183,7 @@ impl MetricSeriesFilter {
             series: Arc::new(series),
             sorted_series: Arc::new(sorted_series),
             enable_range_cache: assigned.enable_range_cache(),
-            reuse_primary_keys: assigned.reuse_primary_keys,
+            primary_keys: assigned.primary_keys.clone(),
         }
     }
 
@@ -523,8 +524,8 @@ fn scan_series_file_ranges(
 
         for range in ranges {
             let build_start = Instant::now();
-            let reader = if filter.reuse_primary_keys {
-                range.reader_by_series(&filter.sorted_series, &memory_pool, fetch_metrics.as_deref()).await?
+            let reader = if let Some(keys) = &filter.primary_keys {
+                range.reader_by_series(&filter.sorted_series, keys, &memory_pool, fetch_metrics.as_deref()).await?
             } else if let Some(searcher) = range.range_index_searcher(&memory_pool).await? {
                 let row_group_id = u32::try_from(range.row_group_index()).map_err(|_| UnexpectedSnafu {
                     reason: format!("row group index exceeds u32: {}", range.row_group_index()),
@@ -577,7 +578,11 @@ fn scan_series_file_ranges(
                     record_batch
                 };
                 if let Some(compat) = range.compat_batch() {
-                    yield compat.compat(record_batch)?;
+                    yield if filter.primary_keys.is_some() {
+                        compat.compat_with_primary_key(record_batch)?
+                    } else {
+                        compat.compat(record_batch)?
+                    };
                 } else {
                     yield record_batch;
                 }

@@ -2719,6 +2719,7 @@ mod tests {
     async fn series_data_reuses_keys_and_tags_without_reading_the_key_chunk() {
         use crate::series_index::MetricSeriesId;
         use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        use datatypes::arrow::array::{BinaryArray, DictionaryArray};
         let store = ObjectStore::new(Memory::default()).unwrap();
         let (mut builder, metadata) = prefilter_test_builder(
             store.clone(),
@@ -2745,7 +2746,33 @@ mod tests {
             ])),
         );
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let mapping = range.series_rows(&pool, None).await.unwrap();
+        let keys = crate::read::series_mapping::SeriesPrimaryKeys::new(&pool);
+        let series = MetricSeriesId {
+            table_id: 1,
+            tsid: 100,
+        };
+        // Candidate discovery builds the ID/range mapping but passes full keys onward.
+        let mut candidates = range
+            .series_candidate_keys(&pool, None)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let batch = candidates.next().await.unwrap().unwrap();
+            let array = batch.column(0);
+            if let Some(dictionary) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                let values = dictionary
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                keys.insert(series, values.value(dictionary.keys().value(0) as usize))
+                    .unwrap();
+            } else {
+                let values = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+                keys.insert(series, values.value(0)).unwrap();
+            }
+        }
         let mut baseline = range
             .reader_by_row_ranges(std::iter::once(0..3).collect(), None)
             .await
@@ -2761,6 +2788,8 @@ mod tests {
         let mut bytes = store.read(&path).await.unwrap().to_vec();
         bytes[offset as usize..(offset + length) as usize].fill(0);
         store.write(&path, bytes).await.unwrap();
+        // The mapping is ready even before the candidate stream is polled to completion.
+        let mapping = range.series_rows(&pool, None).await.unwrap();
         let mut control = range
             .reader_by_row_ranges(std::iter::once(0..3).collect(), None)
             .await
@@ -2773,6 +2802,7 @@ mod tests {
                     table_id: 1,
                     tsid: 100,
                 }],
+                &keys,
                 &pool,
                 None,
             )

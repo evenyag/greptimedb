@@ -258,6 +258,15 @@ impl FlatCompatBatch {
 
     /// Make columns of the `batch` compatible.
     pub(crate) fn compat(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        self.compat_inner(batch, false)
+    }
+
+    /// Converts source columns while preserving a key already normalized by candidate discovery.
+    pub(crate) fn compat_with_primary_key(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        self.compat_inner(batch, true)
+    }
+
+    fn compat_inner(&self, batch: RecordBatch, supplied_primary_key: bool) -> Result<RecordBatch> {
         let len = batch.num_rows();
         let columns = self
             .index_or_defaults
@@ -290,7 +299,9 @@ impl FlatCompatBatch {
 
         let mut columns = columns;
         let primary_key_index = primary_key_column_index(columns.len());
-        columns[primary_key_index] = self.compat_primary_key(&columns[primary_key_index])?;
+        if !supplied_primary_key {
+            columns[primary_key_index] = self.compat_primary_key(&columns[primary_key_index])?;
+        }
 
         RecordBatch::try_new(self.arrow_schema.clone(), columns).context(NewRecordBatchSnafu)
     }
@@ -1034,7 +1045,17 @@ mod tests {
             to_flat_sst_arrow_schema(&actual_metadata, &FlatSchemaOptions::default());
         let input_batch = RecordBatch::try_new(input_schema, input_columns).unwrap();
 
-        let result = compat_batch.compat(input_batch).unwrap();
+        let result = compat_batch.compat(input_batch.clone()).unwrap();
+        let mut supplied = input_batch.columns().to_vec();
+        let pk_index = primary_key_column_index(supplied.len());
+        supplied[pk_index] = result
+            .column(primary_key_column_index(result.num_columns()))
+            .clone();
+        let supplied = RecordBatch::try_new(input_batch.schema(), supplied).unwrap();
+        assert_eq!(
+            compat_batch.compat_with_primary_key(supplied).unwrap(),
+            result
+        );
 
         let sparse_k1 = encode_sparse_key(&[(1, Some("tag1")), (3, None)]);
         let mut null_tag_builder = StringDictionaryBuilder::<UInt32Type>::new();

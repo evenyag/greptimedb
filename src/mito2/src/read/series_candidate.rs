@@ -52,6 +52,7 @@ use crate::read::range_cache::{
 };
 use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::{PartitionMetrics, new_filter_metrics, scan_flat_mem_ranges};
+use crate::read::series_mapping::SeriesPrimaryKeys;
 use crate::series_index::{
     METRIC_SERIES_ID_BATCH_SIZE, MetricSeriesId, MetricSeriesIdStream, SeriesIndexFileHandle,
     SeriesIndexReadContext, SeriesIndexSearcher,
@@ -75,6 +76,7 @@ pub(crate) struct SeriesCandidateScanner {
     memory_pool: Arc<dyn MemoryPool>,
     metrics_set: ExecutionPlanMetricsSet,
     part_metrics: PartitionMetrics,
+    primary_keys: Option<Arc<SeriesPrimaryKeys>>,
 }
 
 impl SeriesCandidateScanner {
@@ -124,7 +126,12 @@ impl SeriesCandidateScanner {
                 PartitionPruner::new(pruner, &all_ranges).excluding_files(&coverage.covered_files),
             )
         };
+        let primary_keys = coverage
+            .indexes
+            .is_empty()
+            .then(|| Arc::new(SeriesPrimaryKeys::new(&memory_pool)));
         Ok(Self {
+            primary_keys,
             stream_ctx,
             partitions,
             partition_pruner,
@@ -206,12 +213,16 @@ impl SeriesCandidateScanner {
             self.partitions.len(),
             "SeriesCandidateScanner::final_merge",
         )?;
-        decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())
+        decode_metric_series(
+            merged,
+            self.stream_ctx.input.region_metadata().clone(),
+            self.primary_keys.clone(),
+        )
     }
 
-    /// Whether candidate discovery selected any series index files.
-    pub(crate) fn uses_series_index(&self) -> bool {
-        !self.coverage.indexes.is_empty()
+    /// Full candidate keys shared only by the current query.
+    pub(crate) fn primary_keys(&self) -> Option<Arc<SeriesPrimaryKeys>> {
+        self.primary_keys.clone()
     }
 
     /// Returns the partition pruner shared with the data phase.
@@ -707,6 +718,7 @@ fn merge_primary_key_streams(
 fn decode_metric_series(
     mut input: BoxedRecordBatchStream,
     metadata: store_api::metadata::RegionMetadataRef,
+    primary_keys: Option<Arc<SeriesPrimaryKeys>>,
 ) -> Result<MetricSeriesIdStream> {
     let codec = SparsePrimaryKeyCodec::new(&metadata);
     Ok(Box::pin(try_stream! {
@@ -729,6 +741,9 @@ fn decode_metric_series(
                     continue;
                 }
                 last_series = Some(series);
+                if let Some(keys) = &primary_keys {
+                    keys.insert(series, primary_key)?;
+                }
                 output.push(series);
                 if output.len() == METRIC_SERIES_ID_BATCH_SIZE {
                     yield std::mem::replace(
@@ -1145,7 +1160,7 @@ mod tests {
         let pool = Arc::new(UnboundedMemoryPool::default());
         let merged =
             merge_primary_key_streams(vec![source], pool, &metrics, 0, "candidate-test").unwrap();
-        let groups = decode_metric_series(merged, metadata)
+        let groups = decode_metric_series(merged, metadata, None)
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -1200,12 +1215,28 @@ mod tests {
             "candidate-merge-test",
         )
         .unwrap();
-        let groups = decode_metric_series(merged, metadata)
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let retained = Arc::new(SeriesPrimaryKeys::new(&pool));
+        let groups = decode_metric_series(merged, metadata, Some(retained.clone()))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
+        let keys = retained
+            .select((1..=3).map(|tsid| MetricSeriesId { table_id: 1, tsid }))
+            .unwrap();
+        assert_eq!(
+            keys.iter().flatten().collect::<Vec<_>>(),
+            vec![
+                keys_1[0].as_slice(),
+                keys_2[1].as_slice(),
+                keys_1[1].as_slice()
+            ]
+        );
+        assert!(pool.reserved() > 0);
+        drop(retained);
+        assert_eq!(pool.reserved(), 0);
         assert_eq!(
             groups,
             vec![vec![
