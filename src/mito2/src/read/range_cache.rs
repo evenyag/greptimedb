@@ -607,9 +607,13 @@ pub(crate) fn cached_flat_range_stream(value: Arc<RangeScanCacheValue>) -> Boxed
 }
 
 enum CacheConcatCommand {
-    Compact(Vec<RecordBatch>),
+    Compact(
+        Vec<RecordBatch>,
+        crate::read::memory_diagnostics::MemoryUsage,
+    ),
     Finish {
         pending: Vec<RecordBatch>,
+        pending_usage: crate::read::memory_diagnostics::MemoryUsage,
         key: RangeScanCacheKey,
         cache_strategy: CacheStrategy,
         part_metrics: PartitionMetrics,
@@ -621,6 +625,7 @@ enum CacheConcatCommand {
 struct CacheConcatState {
     cached_batches: Vec<CachedBatchSlice>,
     estimated_size: usize,
+    diagnostics: Option<crate::read::memory_diagnostics::MemoryUsage>,
 }
 
 impl CacheConcatState {
@@ -642,6 +647,11 @@ impl CacheConcatState {
         let compacted = compact_record_batches(batches)?;
         self.estimated_size += compacted.batch.get_array_memory_size();
         self.cached_batches.push(compacted);
+        self.diagnostics
+            .get_or_insert_with(|| {
+                crate::read::memory_diagnostics::MemoryUsage::new("cache", "concat_state")
+            })
+            .set("concat_retained", self.estimated_size);
         Ok(())
     }
 
@@ -683,7 +693,7 @@ async fn run_cache_concat_task(
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            CacheConcatCommand::Compact(batches) => {
+            CacheConcatCommand::Compact(batches, _usage) => {
                 if let Err(err) = state.compact(batches, &limiter).await {
                     warn!(err; "Failed to compact range cache batches");
                     return;
@@ -696,6 +706,7 @@ async fn run_cache_concat_task(
             }
             CacheConcatCommand::Finish {
                 pending,
+                pending_usage: _usage,
                 key,
                 cache_strategy,
                 part_metrics,
@@ -735,6 +746,7 @@ struct CacheBatchBuffer {
     buffered_batches: Vec<RecordBatch>,
     buffered_rows: usize,
     buffered_size: usize,
+    diagnostics: crate::read::memory_diagnostics::MemoryUsage,
     sender: Option<mpsc::UnboundedSender<CacheConcatCommand>>,
     /// Handle of the background concat task. Cleared once the task owns a finish
     /// command, so only unfinished scans cancel it.
@@ -748,11 +760,12 @@ impl CacheBatchBuffer {
             .map(|limiter| {
                 let skip_threshold_bytes = cache_strategy.range_result_cache_size().unwrap_or(0);
                 let (tx, rx) = mpsc::unbounded_channel();
-                let task = common_runtime::spawn_query(run_cache_concat_task(
-                    rx,
-                    limiter.clone(),
-                    skip_threshold_bytes,
-                ));
+                let partition = crate::read::memory_diagnostics::current_partition();
+                let task =
+                    common_runtime::spawn_query(crate::read::memory_diagnostics::partition_future(
+                        run_cache_concat_task(rx, limiter.clone(), skip_threshold_bytes),
+                        partition,
+                    ));
                 (tx, task)
             })
             .unzip();
@@ -761,6 +774,10 @@ impl CacheBatchBuffer {
             buffered_batches: Vec::new(),
             buffered_rows: 0,
             buffered_size: 0,
+            diagnostics: crate::read::memory_diagnostics::MemoryUsage::new(
+                "cache",
+                "pending_batches",
+            ),
             sender,
             concat_task,
         }
@@ -774,6 +791,7 @@ impl CacheBatchBuffer {
         self.buffered_rows += batch.num_rows();
         self.buffered_size += batch.get_array_memory_size();
         self.buffered_batches.push(batch);
+        self.diagnostics.set("pending_batches", self.buffered_size);
 
         if self.buffered_batches.len() > 1
             && (self.buffered_rows > read_batch_size()
@@ -793,11 +811,21 @@ impl CacheBatchBuffer {
         let batches = mem::take(&mut self.buffered_batches);
         self.buffered_rows = 0;
         self.buffered_size = 0;
+        self.diagnostics.set("pending_batches", 0);
 
         let Some(sender) = &self.sender else {
             return;
         };
-        if sender.send(CacheConcatCommand::Compact(batches)).is_err() {
+        let mut usage =
+            crate::read::memory_diagnostics::MemoryUsage::new("cache", "queued_batches");
+        usage.set(
+            "queued_batches",
+            batches.iter().map(RecordBatch::get_array_memory_size).sum(),
+        );
+        if sender
+            .send(CacheConcatCommand::Compact(batches, usage))
+            .is_err()
+        {
             self.sender = None;
         }
     }
@@ -813,9 +841,14 @@ impl CacheBatchBuffer {
             return;
         };
 
+        let mut usage =
+            crate::read::memory_diagnostics::MemoryUsage::new("cache", "queued_batches");
+        usage.set("queued_batches", self.buffered_size);
+        self.diagnostics.set("pending_batches", 0);
         if sender
             .send(CacheConcatCommand::Finish {
                 pending: mem::take(&mut self.buffered_batches),
+                pending_usage: usage,
                 key,
                 cache_strategy,
                 part_metrics,
@@ -1031,6 +1064,7 @@ mod tests {
             input,
             ranges: vec![range_meta],
             query_start: Instant::now(),
+            diagnostics: None,
         };
 
         (stream_ctx, partition_range)

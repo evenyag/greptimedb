@@ -34,13 +34,18 @@ use crate::error::{
     ComputeArrowSnafu, DecodeSnafu, NewRecordBatchSnafu, ReserveSeriesScanMemorySnafu, Result,
     UnexpectedSnafu,
 };
+use crate::read::memory_diagnostics::{self, MemoryUsage};
 use crate::series_index::MetricSeriesId;
 
 /// Query-local full keys retained after candidate merging, once per selected series.
 /// SST and range-index mapping caches never own this payload.
 #[derive(Debug)]
 pub(crate) struct SeriesPrimaryKeys {
-    inner: Mutex<(HashMap<MetricSeriesId, Vec<u8>>, MemoryReservation)>,
+    inner: Mutex<(
+        HashMap<MetricSeriesId, Vec<u8>>,
+        MemoryReservation,
+        MemoryUsage,
+    )>,
 }
 
 impl SeriesPrimaryKeys {
@@ -49,18 +54,20 @@ impl SeriesPrimaryKeys {
             inner: Mutex::new((
                 HashMap::new(),
                 MemoryConsumer::new("SeriesPrimaryKeys").register(pool),
+                MemoryUsage::new("candidate", "primary_keys"),
             )),
         }
     }
 
     pub(crate) fn insert(&self, series: MetricSeriesId, key: &[u8]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let (keys, reservation) = &mut *inner;
+        let (keys, reservation, diagnostics) = &mut *inner;
         if let std::collections::hash_map::Entry::Vacant(entry) = keys.entry(series) {
             reservation
                 .try_grow(key.len() + 2 * mem::size_of::<(MetricSeriesId, Vec<u8>)>())
                 .context(ReserveSeriesScanMemorySnafu)?;
             entry.insert(key.to_vec());
+            diagnostics.set("primary_key_map", reservation.size());
         }
         Ok(())
     }
@@ -93,9 +100,22 @@ pub(crate) struct SeriesRowRange {
 /// Cached mappings never retain encoded primary keys or decoded tags.
 pub(crate) struct SeriesRowMapping {
     pub(crate) runs: Vec<SeriesRowRange>,
+    _diagnostics: MemoryUsage,
 }
 
 impl SeriesRowMapping {
+    pub(crate) fn new(runs: Vec<SeriesRowRange>) -> Self {
+        let mut diagnostics = MemoryUsage::new("mapping", "row_mapping");
+        diagnostics.set(
+            "row_runs",
+            runs.capacity() * mem::size_of::<SeriesRowRange>(),
+        );
+        Self {
+            runs,
+            _diagnostics: diagnostics,
+        }
+    }
+
     pub(crate) fn estimated_size(&self) -> usize {
         mem::size_of::<Self>() + self.runs.capacity() * mem::size_of::<SeriesRowRange>()
     }
@@ -210,7 +230,7 @@ impl SeriesRowMappingBuilder {
     }
 
     pub(crate) fn finish(self) -> SeriesRowMapping {
-        SeriesRowMapping { runs: self.runs }
+        SeriesRowMapping::new(self.runs)
     }
 }
 
@@ -224,6 +244,7 @@ pub(crate) struct SeriesBatchCursor {
     position: usize,
     consumed: usize,
     _reservation: MemoryReservation,
+    _diagnostics: MemoryUsage,
 }
 
 impl SeriesBatchCursor {
@@ -246,7 +267,15 @@ impl SeriesBatchCursor {
         reservation
             .try_grow(keys.get_array_memory_size() + tags.get_array_memory_size())
             .context(ReserveSeriesScanMemorySnafu)?;
+        let mut diagnostics = MemoryUsage::new("cursor", "cursor");
+        diagnostics.batch(&tags, tags.num_columns());
+        diagnostics.set("pk_values", keys.get_array_memory_size());
+        diagnostics.set(
+            "row_runs",
+            runs.capacity() * mem::size_of::<(usize, Range<usize>)>(),
+        );
         Ok(Self {
+            _diagnostics: diagnostics,
             keys,
             tags,
             runs,
@@ -332,7 +361,13 @@ impl SeriesBatchCursor {
             fields,
             batch.schema().metadata().clone(),
         ));
-        RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)
+        let result = RecordBatch::try_new(schema, columns).context(NewRecordBatchSnafu)?;
+        for (component, bytes) in
+            memory_diagnostics::batch_components(&result, self.tags.num_columns())
+        {
+            memory_diagnostics::produced("materialized", component, bytes);
+        }
+        Ok(result)
     }
 }
 

@@ -225,11 +225,12 @@ impl SeqScan {
         } else {
             let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
             let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
-            let reader = FlatMergeReader::new(
+            let reader = FlatMergeReader::new_with_tag_count(
                 schema,
                 sources,
                 stream_ctx.input.batch_size(),
                 metrics_reporter,
+                mapper.field_column_start(),
             )
             .await?;
             Box::pin(reader.into_stream())

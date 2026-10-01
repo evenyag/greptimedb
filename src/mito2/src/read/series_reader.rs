@@ -89,11 +89,19 @@ pub(crate) struct AssignedSeriesBatch {
     series: Vec<MetricSeriesId>,
     enable_range_cache: bool,
     primary_keys: Option<Arc<SeriesPrimaryKeys>>,
+    _diagnostics: crate::read::memory_diagnostics::MemoryUsage,
 }
 
 impl AssignedSeriesBatch {
     fn new(range: SeriesRange, series: Vec<MetricSeriesId>, enable_range_cache: bool) -> Self {
+        let mut diagnostics =
+            crate::read::memory_diagnostics::MemoryUsage::new("candidate", "assignment");
+        diagnostics.set(
+            "assignments",
+            series.capacity() * std::mem::size_of::<MetricSeriesId>(),
+        );
         Self {
+            _diagnostics: diagnostics,
             range,
             series,
             enable_range_cache,
@@ -123,6 +131,7 @@ impl AssignedSeriesBatch {
 pub(crate) struct SeriesBatchCollector {
     assignments: Vec<Vec<MetricSeriesId>>,
     num_series: usize,
+    diagnostics: crate::read::memory_diagnostics::MemoryUsage,
 }
 
 impl SeriesBatchCollector {
@@ -130,6 +139,10 @@ impl SeriesBatchCollector {
         (partitions > 0).then(|| Self {
             assignments: (0..partitions).map(|_| Vec::new()).collect(),
             num_series: 0,
+            diagnostics: crate::read::memory_diagnostics::MemoryUsage::new(
+                "candidate",
+                "collector",
+            ),
         })
     }
 
@@ -140,6 +153,13 @@ impl SeriesBatchCollector {
             let partition = SeriesRange::partition_for(series.tsid, partitions);
             self.assignments[partition].push(series);
         }
+        self.diagnostics.set(
+            "collector",
+            self.assignments
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<MetricSeriesId>())
+                .sum(),
+        );
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -152,11 +172,13 @@ impl SeriesBatchCollector {
             .into_iter()
             .enumerate()
             .map(|(partition, series)| {
-                AssignedSeriesBatch::new(
-                    SeriesRange::new(partition, partitions).unwrap(),
-                    series,
-                    enable_range_cache,
-                )
+                crate::read::memory_diagnostics::partition_sync(Some(partition), || {
+                    AssignedSeriesBatch::new(
+                        SeriesRange::new(partition, partitions).unwrap(),
+                        series,
+                        enable_range_cache,
+                    )
+                })
             })
             .collect()
     }
@@ -168,6 +190,7 @@ struct MetricSeriesFilter {
     range: SeriesRange,
     series: Arc<HashSet<MetricSeriesId>>,
     sorted_series: Arc<Vec<MetricSeriesId>>,
+    _diagnostics: Arc<crate::read::memory_diagnostics::MemoryUsage>,
     enable_range_cache: bool,
     primary_keys: Option<Arc<SeriesPrimaryKeys>>,
 }
@@ -177,11 +200,18 @@ impl MetricSeriesFilter {
         let mut sorted_series = assigned.series().to_vec();
         sorted_series.sort_unstable();
         sorted_series.dedup();
-        let series = sorted_series.iter().copied().collect();
+        let series: HashSet<_> = sorted_series.iter().copied().collect();
+        let mut diagnostics =
+            crate::read::memory_diagnostics::MemoryUsage::new("data", "series_filter");
+        diagnostics.set(
+            "series_filter",
+            (sorted_series.capacity() + series.capacity()) * std::mem::size_of::<MetricSeriesId>(),
+        );
         Self {
             range: assigned.range(),
             series: Arc::new(series),
             sorted_series: Arc::new(sorted_series),
+            _diagnostics: Arc::new(diagnostics),
             enable_range_cache: assigned.enable_range_cache(),
             primary_keys: assigned.primary_keys.clone(),
         }
@@ -332,23 +362,40 @@ impl SeriesReader {
             let partition_pruner = self.partition_pruner.clone();
             let range_semaphore = self.range_semaphore.clone();
             let part_metrics = self.part_metrics.clone();
-            tasks.push(common_runtime::spawn_query(async move {
-                let _permit = range_semaphore.acquire().await.map_err(|error| {
-                    UnexpectedSnafu {
-                        reason: format!("failed to acquire series range permit: {error}"),
-                    }
-                    .build()
-                })?;
-                build_series_partition_range(
-                    stream_ctx,
-                    part_range,
-                    filter,
-                    codec,
-                    partition_pruner,
-                    part_metrics,
-                )
-                .await
-            }));
+            let diagnostics = self.stream_ctx.diagnostics.clone();
+            let partition = crate::read::memory_diagnostics::current_partition();
+            tasks.push(common_runtime::spawn_query(
+                crate::read::memory_diagnostics::partition_future(
+                    async move {
+                        let _permit = range_semaphore.acquire().await.map_err(|error| {
+                            UnexpectedSnafu {
+                                reason: format!("failed to acquire series range permit: {error}"),
+                            }
+                            .build()
+                        })?;
+                        let _building = crate::read::memory_diagnostics::MemoryUsage::new(
+                            "data",
+                            "range_building",
+                        );
+                        let result = build_series_partition_range(
+                            stream_ctx,
+                            part_range,
+                            filter,
+                            codec,
+                            partition_pruner,
+                            part_metrics,
+                        )
+                        .await;
+                        if result.is_ok()
+                            && let Some(diagnostics) = diagnostics
+                        {
+                            diagnostics.range_ready();
+                        }
+                        result
+                    },
+                    partition,
+                ),
+            ));
         }
 
         let mut range_streams = Vec::with_capacity(tasks.len());
@@ -362,7 +409,10 @@ impl SeriesReader {
         // Every range task above has finished, so all build permits are released
         // and the final merge can reuse the same semaphore.
         let estimated_batch_size = compute_average_batch_size(estimated_batch_sizes);
-        SeqScan::build_flat_reader_from_sources(
+        if let Some(diagnostics) = &self.stream_ctx.diagnostics {
+            diagnostics.event("final_merge_start", None);
+        }
+        let result = SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             range_streams,
             Some(self.range_semaphore.clone()),
@@ -370,7 +420,13 @@ impl SeriesReader {
             true,
             compute_parallel_channel_size(estimated_batch_size),
         )
-        .await
+        .await;
+        if result.is_ok()
+            && let Some(diagnostics) = &self.stream_ctx.diagnostics
+        {
+            diagnostics.event("final_merge_ready", None);
+        }
+        result
     }
 }
 

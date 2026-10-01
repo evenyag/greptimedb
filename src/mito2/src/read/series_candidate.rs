@@ -149,8 +149,10 @@ impl SeriesCandidateScanner {
         let all_ranges = self
             .partitions
             .iter()
-            .flatten()
-            .copied()
+            .enumerate()
+            .flat_map(|(partition, ranges)| {
+                ranges.iter().copied().map(move |range| (partition, range))
+            })
             .collect::<Vec<_>>();
         let range_builder = SeriesCandidateRangeBuilder {
             stream_ctx: self.stream_ctx.clone(),
@@ -162,24 +164,37 @@ impl SeriesCandidateScanner {
             part_metrics: self.part_metrics.clone(),
         };
         let mut tasks = Vec::with_capacity(all_ranges.len());
-        for (range_idx, part_range) in all_ranges.into_iter().enumerate() {
+        for (range_idx, (partition, part_range)) in all_ranges.into_iter().enumerate() {
             let range_builder = range_builder.clone();
-            tasks.push(common_runtime::spawn_query(async move {
-                let _permit = range_builder
-                    .range_semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|error| {
-                        UnexpectedSnafu {
-                            reason: format!("failed to acquire candidate range permit: {error}"),
-                        }
-                        .build()
-                    })?;
-                range_builder
-                    .build_range_stream(part_range, range_idx)
-                    .await
-            }));
+            tasks.push(common_runtime::spawn_query(
+                crate::read::memory_diagnostics::partition_future(
+                    async move {
+                        let _permit = range_builder
+                            .range_semaphore
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|error| {
+                                UnexpectedSnafu {
+                                    reason: format!(
+                                        "failed to acquire candidate range permit: {error}"
+                                    ),
+                                }
+                                .build()
+                            })?;
+                        let stream = range_builder
+                            .build_range_stream(part_range, range_idx)
+                            .await?;
+                        Ok::<_, crate::error::Error>(
+                            crate::read::memory_diagnostics::partition_stream(
+                                stream,
+                                Some(partition),
+                            ),
+                        )
+                    },
+                    Some(partition),
+                ),
+            ));
         }
 
         let mut range_streams = Vec::with_capacity(tasks.len());
@@ -683,7 +698,8 @@ fn merge_primary_key_streams(
     let df_sources = sources
         .into_iter()
         .map(|source| {
-            let stream = source.map_err(|error| DataFusionError::External(Box::new(error)));
+            let stream = crate::read::memory_diagnostics::observe_stream(source, "candidate_merge")
+                .map_err(|error| DataFusionError::External(Box::new(error)));
             Box::pin(RecordBatchStreamAdapter::new(schema.clone(), stream)) as _
         })
         .collect();

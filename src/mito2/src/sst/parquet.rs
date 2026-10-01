@@ -2936,11 +2936,6 @@ mod tests {
         assert_eq!(metrics.filter_metrics.rg_fulltext_filtered, 2);
         assert_eq!(metrics.filter_metrics.rows_fulltext_filtered, 100);
     }
-}
-
-#[cfg(test)]
-mod read_batch_size_tests {
-    use super::*;
 
     #[test]
     fn test_parse_read_batch_size() {

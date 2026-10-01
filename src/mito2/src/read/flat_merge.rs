@@ -301,6 +301,9 @@ pub struct BatchBuilder {
     /// The accumulated stream indexes from which to pull rows
     /// Consists of a tuple of `(batch_idx, row_idx)`
     indices: Vec<(usize, usize)>,
+    diagnostics: Vec<crate::read::memory_diagnostics::MemoryUsage>,
+    tag_count: usize,
+    indices_usage: crate::read::memory_diagnostics::MemoryUsage,
 }
 
 impl BatchBuilder {
@@ -313,18 +316,31 @@ impl BatchBuilder {
         let primary_key_column_idx = (schema.fields.len() >= 3)
             .then(|| primary_key_column_index(schema.fields.len()))
             .filter(|&column_idx| schema.field(column_idx).name() == PRIMARY_KEY_COLUMN_NAME);
+        let mut indices_usage =
+            crate::read::memory_diagnostics::MemoryUsage::new("merge", "builder");
+        indices_usage.set(
+            "row_indices",
+            batch_size * std::mem::size_of::<(usize, usize)>(),
+        );
         Self {
             schema,
             primary_key_column_idx,
             batches: Vec::with_capacity(stream_count * 2),
             cursors: vec![BatchCursor::default(); stream_count],
             indices: Vec::with_capacity(batch_size),
+            diagnostics: Vec::with_capacity(stream_count * 2),
+            tag_count: 0,
+            indices_usage,
         }
     }
 
     /// Append a new batch in `stream_idx`
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) {
         let batch_idx = self.batches.len();
+        let mut diagnostics =
+            crate::read::memory_diagnostics::MemoryUsage::new("merge", "retained_batch");
+        diagnostics.batch(&batch, self.tag_count);
+        self.diagnostics.push(diagnostics);
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
             batch_idx,
@@ -338,6 +354,10 @@ impl BatchBuilder {
         let row_idx = cursor.row_idx;
         cursor.row_idx += 1;
         self.indices.push((cursor.batch_idx, row_idx));
+        self.indices_usage.set(
+            "row_indices",
+            self.indices.capacity() * std::mem::size_of::<(usize, usize)>(),
+        );
     }
 
     /// Returns the number of in-progress rows in this [`BatchBuilder`]
@@ -419,6 +439,13 @@ impl BatchBuilder {
     }
 
     fn retain_batches(&mut self) {
+        let mut index = 0;
+        self.diagnostics.retain(|_| {
+            let stream_idx = self.batches[index].0;
+            let retain = self.cursors[stream_idx].batch_idx == index;
+            index += 1;
+            retain
+        });
         let mut batch_idx = 0;
         let mut retained = 0;
         self.batches.retain(|(stream_idx, _)| {
@@ -944,9 +971,21 @@ impl FlatMergeReader {
         batch_size: usize,
         metrics_reporter: Option<Arc<dyn MergeMetricsReport>>,
     ) -> Result<Self> {
+        Self::new_with_tag_count(schema, iters, batch_size, metrics_reporter, 0).await
+    }
+
+    pub(crate) async fn new_with_tag_count(
+        schema: SchemaRef,
+        iters: Vec<BoxedRecordBatchStream>,
+        batch_size: usize,
+        metrics_reporter: Option<Arc<dyn MergeMetricsReport>>,
+        tag_count: usize,
+    ) -> Result<Self> {
+        let _building = crate::read::memory_diagnostics::MemoryUsage::new("merge", "initializing");
         let start = Instant::now();
         let metrics = MergeMetrics::default();
         let mut in_progress = BatchBuilder::new(schema, iters.len(), batch_size);
+        in_progress.tag_count = tag_count;
         let mut nodes = Vec::with_capacity(iters.len());
         // Initialize nodes and the buffer.
         for (node_index, iter) in iters.into_iter().enumerate() {

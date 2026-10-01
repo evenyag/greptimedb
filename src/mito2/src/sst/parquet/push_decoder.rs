@@ -335,15 +335,28 @@ pub fn build_sst_parquet_record_batch_stream(
         .context(ReadParquetSnafu { path: &file_path })?;
 
     Ok(async_stream::try_stream! {
+        let mut reader_usage = crate::read::memory_diagnostics::MemoryUsage::new("parquet", "reader");
         loop {
-            match decoder.try_decode().context(ReadParquetSnafu { path: &file_path })? {
+            let decoded = decoder.try_decode().context(ReadParquetSnafu { path: &file_path })?;
+            reader_usage.set("buffered_input", decoder.buffered_bytes() as usize);
+            match decoded {
                 DecodeResult::NeedsData(ranges) => {
+                    let mut fetching = crate::read::memory_diagnostics::MemoryUsage::new("parquet", "fetching");
+                    fetching.set("requested_input", ranges.iter().map(|r| (r.end-r.start) as usize).sum());
                     let data = fetcher.fetch_bytes_with_cache(ranges.clone()).await?;
+                    let bytes = data.iter().map(bytes::Bytes::len).sum();
+                    fetching.set("fetched_input", bytes);
+                    crate::read::memory_diagnostics::produced("parquet", "fetched_input", bytes);
                     decoder
                         .push_ranges(ranges, data)
                         .context(ReadParquetSnafu { path: &file_path })?;
+                    reader_usage.set("buffered_input", decoder.buffered_bytes() as usize);
                 }
-                DecodeResult::Data(batch) => yield batch,
+                DecodeResult::Data(batch) => {
+                    let mut output = crate::read::memory_diagnostics::MemoryUsage::new("decoded", "suspended_output");
+                    output.batch(&batch, 0);
+                    yield batch;
+                },
                 DecodeResult::Finished => break,
             }
         }

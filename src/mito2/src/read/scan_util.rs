@@ -1352,6 +1352,7 @@ mod split_tests {
             input,
             ranges: vec![],
             query_start: std::time::Instant::now(),
+            diagnostics: None,
         }
     }
 
@@ -1793,6 +1794,7 @@ mod tests {
             input,
             ranges: Vec::new(),
             query_start: Instant::now(),
+            diagnostics: None,
         })
     }
 

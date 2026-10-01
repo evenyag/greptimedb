@@ -471,9 +471,9 @@ impl FileRange {
                 }
                 .build()
             })?;
-            Arc::new(SeriesRowMapping {
-                runs: searcher.search_series(row_group, series)?,
-            })
+            Arc::new(SeriesRowMapping::new(
+                searcher.search_series(row_group, series)?,
+            ))
         } else {
             self.series_rows(memory_pool, fetch_metrics).await?
         };

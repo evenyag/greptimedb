@@ -152,7 +152,12 @@ impl SeriesScan {
         if let Some(counters) = input.query_stat_counters.clone() {
             properties.set_query_stat_counters(counters);
         }
-        let stream_ctx = Arc::new(StreamContext::seq_scan_ctx(input));
+        let mut context = StreamContext::seq_scan_ctx(input);
+        context.diagnostics = crate::read::memory_diagnostics::ScanDiagnostics::new(
+            context.input.region_metadata().region_id,
+            context.input.scan_memory_pool.clone(),
+        );
+        let stream_ctx = Arc::new(context);
         properties.partitions = vec![stream_ctx.partition_ranges()];
 
         // Create the shared pruner with number of workers equal to CPU cores.
@@ -348,7 +353,9 @@ impl SeriesScan {
                     input.range_semaphore,
                     part_metrics.clone(),
                 )?;
+                if let Some(diagnostics) = &stream_ctx.diagnostics { diagnostics.event("data_build_start", Some(partition)); }
                 let mut reader_stream = reader.build_stream().await?;
+                if let Some(diagnostics) = &stream_ctx.diagnostics { diagnostics.event("data_build_ready", Some(partition)); }
                 metrics.scan_cost += build_start.elapsed();
                 fetch_start = Instant::now();
                 while let Some(record_batch) = reader_stream.try_next().await? {
@@ -357,6 +364,7 @@ impl SeriesScan {
                     metrics.num_rows += record_batch.num_rows();
 
                     let yield_start = Instant::now();
+                    if let Some(diagnostics) = &stream_ctx.diagnostics { diagnostics.first_output(partition); }
                     yield ScanBatch::RecordBatch(record_batch);
                     metrics.yield_cost += yield_start.elapsed();
                     fetch_start = Instant::now();
@@ -367,7 +375,10 @@ impl SeriesScan {
             part_metrics.merge_metrics(&metrics);
             part_metrics.on_finish();
         };
-        Ok(Box::pin(stream))
+        Ok(crate::read::memory_diagnostics::partition_stream(
+            stream,
+            Some(partition),
+        ))
     }
 
     fn maybe_start_legacy_distributor(
@@ -881,7 +892,13 @@ impl SeriesCandidateDistributor {
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
         let primary_keys = candidate_scanner.primary_keys();
+        if let Some(diagnostics) = &self.stream_ctx.diagnostics {
+            diagnostics.event("candidate_build_start", None);
+        }
         let mut candidates = candidate_scanner.build_stream().await?;
+        if let Some(diagnostics) = &self.stream_ctx.diagnostics {
+            diagnostics.event("candidate_build_ready", None);
+        }
         let mut collector =
             SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
         let mut chunked = false;
@@ -907,6 +924,9 @@ impl SeriesCandidateDistributor {
             }
         }
 
+        if let Some(diagnostics) = &self.stream_ctx.diagnostics {
+            diagnostics.event("candidate_discovery_complete", None);
+        }
         if collector.len() > 0 {
             self.send_assignments(
                 collector.finish(!chunked),

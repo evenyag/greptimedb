@@ -1942,9 +1942,13 @@ impl RowGroupReaderBuilder {
                 build_ctx.fetch_metrics,
             )
             .await?;
+        let tag_count = tag_schema.fields().len();
         let stream: ProjectedRecordBatchStream = Box::pin(async_stream::try_stream! {
             while let Some(batch) = input.next().await {
-                yield cursor.materialize(batch?, pk_field.clone())?;
+                let batch = cursor.materialize(batch?, pk_field.clone())?;
+                let mut usage = crate::read::memory_diagnostics::MemoryUsage::new("materialized", "suspended_output");
+                usage.batch(&batch, tag_count);
+                yield batch;
             }
             if !cursor.is_finished() {
                 Err(UnexpectedSnafu { reason: "data reader returned fewer rows than the series mapping" }.build())?;

@@ -1627,7 +1627,8 @@ impl ScanInput {
             .map(|source| {
                 let (sender, receiver) = mpsc::channel(channel_size);
                 self.spawn_flat_scan_task(source, semaphore.clone(), sender);
-                let stream = Box::pin(ReceiverStream::new(receiver));
+                let stream =
+                    ReceiverStream::new(receiver).map(|item| item.map(|(batch, _usage)| batch));
                 Box::pin(stream) as _
             })
             .collect();
@@ -1643,7 +1644,7 @@ impl ScanInput {
         &self,
         mut input: BoxedRecordBatchStream,
         semaphore: Arc<Semaphore>,
-        sender: mpsc::Sender<Result<RecordBatch>>,
+        sender: mpsc::Sender<Result<(RecordBatch, crate::read::memory_diagnostics::MemoryUsage)>>,
     ) {
         let region_id = self.region_metadata().region_id;
         let span = tracing::info_span!(
@@ -1651,8 +1652,10 @@ impl ScanInput {
             region_id = %region_id,
             stream_kind = "flat"
         );
+        let partition = crate::read::memory_diagnostics::current_partition();
+        let tag_count = self.mapper.field_column_start();
         common_runtime::spawn_query(
-            async move {
+            crate::read::memory_diagnostics::partition_future(async move {
                 loop {
                     // We release the permit before sending result to avoid the task waiting on
                     // the channel with the permit held.
@@ -1665,7 +1668,9 @@ impl ScanInput {
                         Some(Ok(batch)) => {
                             // The receiver is gone when the query is cancelled or finishes early,
                             // so stop reading the source.
-                            if let Err(e) = sender.send(Ok(batch)).await {
+                            let mut usage = crate::read::memory_diagnostics::MemoryUsage::new("queue", "batch");
+                            usage.batch(&batch, tag_count);
+                            if let Err(e) = sender.send(Ok((batch, usage))).await {
                                 debug!(
                                     "Stop parallel scan task, receiver dropped, region_id: {}, error: {}",
                                     region_id, e
@@ -1680,7 +1685,7 @@ impl ScanInput {
                         None => break,
                     }
                 }
-            }
+            }, partition)
             .instrument(span),
         );
     }
@@ -1956,6 +1961,7 @@ pub struct StreamContext {
     // Metrics:
     /// The start time of the query.
     pub(crate) query_start: Instant,
+    pub(crate) diagnostics: Option<Arc<crate::read::memory_diagnostics::ScanDiagnostics>>,
 }
 
 impl StreamContext {
@@ -1968,6 +1974,7 @@ impl StreamContext {
             input,
             ranges,
             query_start,
+            diagnostics: None,
         }
     }
 
@@ -1980,6 +1987,7 @@ impl StreamContext {
             input,
             ranges,
             query_start,
+            diagnostics: None,
         }
     }
 
