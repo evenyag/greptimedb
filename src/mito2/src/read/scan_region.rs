@@ -1020,7 +1020,7 @@ impl ScanInput {
                 memtables: Vec::new(),
                 files: Vec::new(),
                 primary_key_mapper: OnceLock::new(),
-                batch_size: crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                batch_size: crate::sst::parquet::read_batch_size(),
                 cache_strategy: CacheStrategy::Disabled,
                 ignore_file_not_found: false,
                 max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
@@ -2527,10 +2527,7 @@ mod tests {
         let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
         let env = SchedulerEnv::new().await;
         let input = ScanInput::builder(env.access_layer.clone(), mapper).build();
-        assert_eq!(
-            crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
-            input.batch_size()
-        );
+        assert_eq!(crate::sst::parquet::read_batch_size(), input.batch_size());
 
         let mapper = FlatProjectionMapper::new(&metadata, [0, 2, 3]).unwrap();
         let input = ScanInput::builder(env.access_layer.clone(), mapper)

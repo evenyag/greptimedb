@@ -26,10 +26,10 @@ use table::predicate::Predicate;
 
 use crate::error::Result;
 use crate::read::read_columns::ReadColumns;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::file_range::{PreFilterMode, RangeBase};
 use crate::sst::parquet::flat_format::FlatReadFormat;
 use crate::sst::parquet::prefilter::{CachedPrimaryKeyFilter, build_bulk_filter_plan};
+use crate::sst::parquet::read_batch_size;
 use crate::sst::parquet::stats::RowGroupPruningStats;
 
 pub(crate) type BulkIterContextRef = Arc<BulkIterContext>;
@@ -112,7 +112,7 @@ impl BulkIterContext {
             },
             predicate,
             pk_filters: filter_plan.pk_filters,
-            batch_size: batch_size.clamp(1, DEFAULT_READ_BATCH_SIZE),
+            batch_size: batch_size.clamp(1, read_batch_size()),
         })
     }
 

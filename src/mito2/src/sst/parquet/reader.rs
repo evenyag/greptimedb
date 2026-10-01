@@ -92,7 +92,7 @@ use crate::sst::parquet::read_columns::{ProjectionMaskPlan, build_projection_pla
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 use crate::sst::parquet::row_selection::RowGroupSelection;
 use crate::sst::parquet::stats::RowGroupPruningStats;
-use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, Json2RewriteTargets, Json2TargetLayout};
+use crate::sst::parquet::{Json2RewriteTargets, Json2TargetLayout, read_batch_size};
 use crate::sst::{override_pk_field_to_binary, tag_maybe_to_dictionary_field};
 
 const INDEX_TYPE_FULLTEXT: &str = "fulltext";
@@ -257,7 +257,7 @@ impl ParquetReaderBuilder {
             decode_primary_key_values: false,
             page_index_policy: Default::default(),
             defer_optional_page_index: false,
-            batch_size: DEFAULT_READ_BATCH_SIZE,
+            batch_size: read_batch_size(),
         }
     }
 
@@ -271,7 +271,7 @@ impl ParquetReaderBuilder {
     /// Sets the scan-wide hint for rows in a decoded batch.
     #[must_use]
     pub(crate) fn batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size.clamp(1, DEFAULT_READ_BATCH_SIZE);
+        self.batch_size = batch_size.clamp(1, read_batch_size());
         self
     }
 
@@ -2464,10 +2464,10 @@ pub(crate) struct FlatRowGroupReader {
 impl FlatRowGroupReader {
     /// Creates a new flat reader from file range.
     pub(crate) fn new(context: FileRangeContextRef, stream: ProjectedRecordBatchStream) -> Self {
-        // The batch length from the reader should be less than or equal to DEFAULT_READ_BATCH_SIZE.
+        // The batch length from the reader should be less than or equal to read_batch_size.
         let override_sequence = context
             .read_format()
-            .new_override_sequence_array(DEFAULT_READ_BATCH_SIZE);
+            .new_override_sequence_array(read_batch_size());
 
         Self {
             context,
@@ -2672,7 +2672,7 @@ mod tests {
                 has_nested_projection: false,
                 cache_strategy,
                 prefilter_builder: filter_plan.prefilter_builder,
-                batch_size: DEFAULT_READ_BATCH_SIZE,
+                batch_size: read_batch_size(),
             },
             metadata,
         )

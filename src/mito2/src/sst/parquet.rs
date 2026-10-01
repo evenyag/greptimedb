@@ -15,7 +15,7 @@
 //! SST in parquet format.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use api::v1::SemanticType;
 use common_base::readable_size::ReadableSize;
@@ -51,12 +51,32 @@ pub mod writer;
 /// Key of metadata in parquet SST.
 pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 
-/// Default batch size to read parquet files.
-///
-/// This is a runtime-only scan granularity, so we align it with DataFusion's
-/// default execution batch size to reduce rebatching and concatenation in the
-/// query pipeline.
-pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
+/// Default runtime read granularity for memory debugging.
+const DEFAULT_READ_BATCH_SIZE: usize = 1024;
+const MAX_READ_BATCH_SIZE: usize = 8192;
+const READ_BATCH_SIZE_ENV: &str = "GREPTIME_MITO_READ_BATCH_SIZE";
+
+static READ_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let value = std::env::var(READ_BATCH_SIZE_ENV).ok();
+    let size = parse_read_batch_size(value.as_deref());
+    if value.is_some() && value.as_deref().and_then(|v| v.parse::<usize>().ok()) != Some(size) {
+        common_telemetry::warn!("Invalid {READ_BATCH_SIZE_ENV}={value:?}, using {size}");
+    }
+    common_telemetry::info!("Mito read batch size: {size}, override with {READ_BATCH_SIZE_ENV}");
+    size
+});
+
+/// Runtime SST read size, overridden once per process by `GREPTIME_MITO_READ_BATCH_SIZE`.
+pub(crate) fn read_batch_size() -> usize {
+    *READ_BATCH_SIZE
+}
+
+fn parse_read_batch_size(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse().ok())
+        .filter(|size| (1..=MAX_READ_BATCH_SIZE).contains(size))
+        .unwrap_or(DEFAULT_READ_BATCH_SIZE)
+}
 
 /// JSON2 physical layouts requested by a compaction read.
 pub(crate) type Json2RewriteTargets = Arc<BTreeMap<ColumnId, Json2TargetLayout>>;
@@ -73,7 +93,7 @@ pub(crate) struct Json2TargetLayout {
 /// Default row group size for parquet files.
 ///
 /// Keep the existing persisted/on-disk default stable. It intentionally stays
-/// decoupled from [`DEFAULT_READ_BATCH_SIZE`] so we can tune runtime scan
+/// decoupled from [`read_batch_size`] so we can tune runtime scan
 /// batching without changing the row group layout of newly written SSTs.
 pub const DEFAULT_ROW_GROUP_SIZE: usize = 100 * 1024;
 
@@ -2915,5 +2935,20 @@ mod tests {
         assert_eq!(metrics.filter_metrics.rg_minmax_filtered, 0);
         assert_eq!(metrics.filter_metrics.rg_fulltext_filtered, 2);
         assert_eq!(metrics.filter_metrics.rows_fulltext_filtered, 100);
+    }
+}
+
+#[cfg(test)]
+mod read_batch_size_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_read_batch_size() {
+        for value in [None, Some(""), Some("0"), Some("8193"), Some("bad")] {
+            assert_eq!(1024, parse_read_batch_size(value));
+        }
+        for size in [1, 1024, 8192] {
+            assert_eq!(size, parse_read_batch_size(Some(&size.to_string())));
+        }
     }
 }

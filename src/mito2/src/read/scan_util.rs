@@ -52,7 +52,7 @@ use crate::sst::parquet::file_range::{FileRange, PreFilterMode};
 use crate::sst::parquet::flat_format::{sequence_column_index, time_index_column_index};
 use crate::sst::parquet::reader::{MetadataCacheMetrics, ReaderFilterMetrics, ReaderMetrics};
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
-use crate::sst::parquet::{DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE};
+use crate::sst::parquet::{DEFAULT_ROW_GROUP_SIZE, read_batch_size};
 
 /// Per-file scan metrics.
 #[derive(Default, Clone)]
@@ -1281,18 +1281,18 @@ pub(crate) fn should_split_flat_batches_for_merge(
 
     // Estimate rows per batch after splitting.
     let estimated_batch_size = if total_series > 0 && total_rows > 0 {
-        ((total_rows / total_series) as usize).clamp(1, DEFAULT_READ_BATCH_SIZE)
+        ((total_rows / total_series) as usize).clamp(1, read_batch_size())
     } else {
         // No valid estimate available, use a conservative fallback.
-        DEFAULT_READ_BATCH_SIZE / 4
+        (read_batch_size() / 4).max(1)
     };
     Some(estimated_batch_size)
 }
 
 /// Computes the channel size for parallel scan based on the estimated rows per batch.
-/// The channel should buffer approximately `2 * DEFAULT_READ_BATCH_SIZE` rows.
+/// The channel should buffer approximately `2 * read_batch_size` rows.
 pub(crate) fn compute_parallel_channel_size(estimated_rows_per_batch: usize) -> usize {
-    let size = 2 * DEFAULT_READ_BATCH_SIZE / estimated_rows_per_batch.max(1);
+    let size = 2 * read_batch_size() / estimated_rows_per_batch.max(1);
     size.clamp(2, 64)
 }
 
@@ -1308,10 +1308,10 @@ pub(crate) fn compute_average_batch_size(
     }
 
     if count == 0 {
-        return DEFAULT_READ_BATCH_SIZE;
+        return read_batch_size();
     }
 
-    (total / count).clamp(1, DEFAULT_READ_BATCH_SIZE)
+    (total / count).clamp(1, read_batch_size())
 }
 
 fn can_split_series(num_rows: u64, num_series: u64) -> bool {
@@ -1937,7 +1937,7 @@ mod tests {
         }]);
 
         assert_eq!(
-            Some(DEFAULT_READ_BATCH_SIZE),
+            Some(read_batch_size()),
             should_split_flat_batches_for_merge(&stream_ctx, &range_meta)
         );
     }
@@ -1950,19 +1950,13 @@ mod tests {
 
     #[test]
     fn test_compute_parallel_channel_size_returns_expected_mid_range_size() {
-        assert_eq!(
-            4,
-            compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE / 2)
-        );
+        assert_eq!(4, compute_parallel_channel_size(read_batch_size() / 2));
     }
 
     #[test]
     fn test_compute_parallel_channel_size_clamps_to_min_for_large_batches() {
-        assert_eq!(2, compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE));
-        assert_eq!(
-            2,
-            compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE * 2)
-        );
+        assert_eq!(2, compute_parallel_channel_size(read_batch_size()));
+        assert_eq!(2, compute_parallel_channel_size(read_batch_size() * 2));
     }
 
     #[test]
@@ -1973,8 +1967,8 @@ mod tests {
     #[test]
     fn test_compute_average_batch_size_clamps_values() {
         assert_eq!(
-            DEFAULT_READ_BATCH_SIZE,
-            compute_average_batch_size([DEFAULT_READ_BATCH_SIZE, DEFAULT_READ_BATCH_SIZE * 2])
+            read_batch_size(),
+            compute_average_batch_size([read_batch_size(), read_batch_size() * 2])
         );
         assert_eq!(1, compute_average_batch_size([0, 1]));
     }
@@ -1982,7 +1976,7 @@ mod tests {
     #[test]
     fn test_compute_average_batch_size_falls_back_when_empty() {
         assert_eq!(
-            DEFAULT_READ_BATCH_SIZE,
+            read_batch_size(),
             compute_average_batch_size(std::iter::empty())
         );
     }

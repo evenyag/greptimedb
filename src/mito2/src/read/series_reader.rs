@@ -44,9 +44,9 @@ use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::validate_metric_metadata;
 use crate::read::series_mapping::SeriesPrimaryKeys;
 use crate::series_index::MetricSeriesId;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::prefilter::prefilter_flat_batch_by_primary_key;
+use crate::sst::parquet::read_batch_size;
 use crate::sst::parquet::reader::ReaderMetrics;
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
@@ -390,7 +390,7 @@ async fn build_series_partition_range(
     if let Some(key) = cache_key.as_ref() {
         if let Some(value) = stream_ctx.input.cache_strategy.get_range_result(key) {
             part_metrics.inc_range_cache_hit();
-            return Ok((cached_flat_range_stream(value), DEFAULT_READ_BATCH_SIZE));
+            return Ok((cached_flat_range_stream(value), read_batch_size()));
         }
         part_metrics.inc_range_cache_miss();
     }
@@ -481,7 +481,7 @@ async fn build_series_partition_range(
             .map(|stream| Box::pin(SplitRecordBatchStream::new(stream)) as BoxedRecordBatchStream)
             .collect();
     }
-    let estimated_batch_size = split_batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
+    let estimated_batch_size = split_batch_size.unwrap_or(read_batch_size());
     let stream = SeqScan::build_flat_reader_from_sources(
         &stream_ctx,
         sources,

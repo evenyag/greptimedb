@@ -2083,7 +2083,7 @@ mod tests {
                         Some(projection.as_slice()),
                         None,
                         false,
-                        crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                        crate::sst::parquet::read_batch_size(),
                     )
                     .unwrap(),
                 ),
@@ -2144,7 +2144,7 @@ mod tests {
                 None,
                 predicate,
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );
@@ -2179,7 +2179,7 @@ mod tests {
                     datafusion_expr::lit(ScalarValue::TimestampMillisecond(Some(300), None)),
                 )])),
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );
@@ -3204,7 +3204,7 @@ mod tests {
                     datafusion_expr::col("k0").eq(datafusion_expr::lit("m")),
                 ])),
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );
@@ -3224,7 +3224,7 @@ mod tests {
                     datafusion_expr::col("k0").eq(datafusion_expr::lit("nonexistent")),
                 ])),
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );
@@ -3237,7 +3237,7 @@ mod tests {
                 None,
                 None,
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );

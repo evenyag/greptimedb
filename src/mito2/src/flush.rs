@@ -66,7 +66,7 @@ use crate::schedule::scheduler::{Job, SchedulerRef};
 use crate::sst::file::{FileMeta, RegionFileId, UncommittedSsts};
 use crate::sst::parquet::metadata::extract_primary_key_range;
 use crate::sst::parquet::{
-    DEFAULT_READ_BATCH_SIZE, DEFAULT_ROW_GROUP_SIZE, SstInfo, WriteOptions, flat_format,
+    DEFAULT_ROW_GROUP_SIZE, SstInfo, WriteOptions, flat_format, read_batch_size,
 };
 use crate::sst::{FlatSchemaOptions, FormatType, to_flat_sst_arrow_schema};
 use crate::worker::WorkerListener;
@@ -1155,7 +1155,7 @@ pub fn merge_and_dedup(
         merge_mode,
         field_column_start,
         input_iters,
-        DEFAULT_READ_BATCH_SIZE,
+        read_batch_size(),
     )
 }
 

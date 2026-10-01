@@ -57,11 +57,11 @@ use crate::series_index::{
     METRIC_SERIES_ID_BATCH_SIZE, MetricSeriesId, MetricSeriesIdStream, SeriesIndexFileHandle,
     SeriesIndexReadContext, SeriesIndexSearcher,
 };
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::format::PrimaryKeyArray;
 use crate::sst::parquet::prefilter::{
     CachedPrimaryKeyFilter, build_primary_key_filter, prefilter_flat_batch_by_primary_key,
 };
+use crate::sst::parquet::read_batch_size;
 use crate::sst::parquet::reader::ReaderMetrics;
 use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
@@ -703,7 +703,7 @@ fn merge_primary_key_streams(
         .with_schema(schema)
         .with_expressions(&ordering)
         .with_metrics(BaselineMetrics::new(metrics_set, partition))
-        .with_batch_size(DEFAULT_READ_BATCH_SIZE)
+        .with_batch_size(read_batch_size())
         .with_reservation(reservation)
         .build()
         .context(MergeCandidateSeriesSnafu)?;

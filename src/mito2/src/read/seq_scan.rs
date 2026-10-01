@@ -52,7 +52,7 @@ use crate::read::scan_util::{
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::read::{BoxedRecordBatchStream, ScannerMetrics, scan_util};
 use crate::region::options::MergeMode;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::read_batch_size;
 
 /// Scans a region and returns rows in a sorted sequence.
 ///
@@ -189,7 +189,7 @@ impl SeqScan {
             None,
             None,
             false,
-            compute_parallel_channel_size(DEFAULT_READ_BATCH_SIZE),
+            compute_parallel_channel_size(read_batch_size()),
         )
         .await
     }
@@ -288,7 +288,7 @@ impl SeqScan {
         if let Some(key) = cache_key.as_ref() {
             if let Some(value) = stream_ctx.input.cache_strategy.get_range_result(key) {
                 part_metrics.inc_range_cache_hit();
-                return Ok((cached_flat_range_stream(value), DEFAULT_READ_BATCH_SIZE));
+                return Ok((cached_flat_range_stream(value), read_batch_size()));
             }
             part_metrics.inc_range_cache_miss();
         }
@@ -304,7 +304,7 @@ impl SeqScan {
             file_scan_semaphore,
         )
         .await?;
-        let estimated_rows_per_batch = split_batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
+        let estimated_rows_per_batch = split_batch_size.unwrap_or(read_batch_size());
         let channel_size = compute_parallel_channel_size(estimated_rows_per_batch);
         let stream = Self::build_flat_reader_from_sources(
             stream_ctx,

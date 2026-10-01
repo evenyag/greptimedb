@@ -14,7 +14,7 @@
 
 //! Utilities for choosing an execution batch size from source statistics.
 
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::read_batch_size;
 
 /// Approximate decoded bytes to produce in one batch.
 pub(crate) const TARGET_BATCH_BYTES: usize = 64 * 1024 * 1024;
@@ -22,7 +22,7 @@ pub(crate) const TARGET_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Estimates a batch size from `(num_rows, estimated_bytes)` pairs.
 ///
 /// Uses the widest source with valid statistics and targets approximately 64 MiB of decoded data.
-/// The result is clamped to `1..=DEFAULT_READ_BATCH_SIZE`. Returns the default read batch size if
+/// The result is clamped to `1..=read_batch_size`. Returns the default read batch size if
 /// no source contains usable statistics.
 pub fn estimate_batch_size(sources: impl IntoIterator<Item = (u64, u64)>) -> usize {
     let max_row_width = sources
@@ -31,10 +31,10 @@ pub fn estimate_batch_size(sources: impl IntoIterator<Item = (u64, u64)>) -> usi
         .max();
 
     let Some(row_width) = max_row_width else {
-        return DEFAULT_READ_BATCH_SIZE;
+        return read_batch_size();
     };
 
-    (TARGET_BATCH_BYTES as u64 / row_width).clamp(1, DEFAULT_READ_BATCH_SIZE as u64) as usize
+    (TARGET_BATCH_BYTES as u64 / row_width).clamp(1, read_batch_size() as u64) as usize
 }
 
 /// Returns the ceiling of the estimated bytes per row.
@@ -52,16 +52,13 @@ mod tests {
 
     #[test]
     fn test_estimate_batch_size_without_stats() {
-        assert_eq!(DEFAULT_READ_BATCH_SIZE, estimate_batch_size([]));
-        assert_eq!(
-            DEFAULT_READ_BATCH_SIZE,
-            estimate_batch_size([(0, 100), (100, 0)])
-        );
+        assert_eq!(read_batch_size(), estimate_batch_size([]));
+        assert_eq!(read_batch_size(), estimate_batch_size([(0, 100), (100, 0)]));
     }
 
     #[test]
     fn test_estimate_batch_size_for_narrow_and_wide_rows() {
-        assert_eq!(DEFAULT_READ_BATCH_SIZE, estimate_batch_size([(100, 100)]));
+        assert_eq!(read_batch_size(), estimate_batch_size([(100, 100)]));
         assert_eq!(256, estimate_batch_size([(1, 256 * 1024)]));
         assert_eq!(1, estimate_batch_size([(1, TARGET_BATCH_BYTES as u64 + 1)]));
     }
@@ -77,7 +74,7 @@ mod tests {
     #[test]
     fn test_estimate_batch_size_saturates() {
         assert_eq!(
-            DEFAULT_READ_BATCH_SIZE,
+            read_batch_size(),
             estimate_batch_size([(u64::MAX, u64::MAX)])
         );
         assert_eq!(1, estimate_batch_size([(1, u64::MAX)]));

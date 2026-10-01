@@ -30,9 +30,9 @@ use crate::cache::{
 use crate::error::{ComputeArrowSnafu, Result};
 use crate::read::read_columns::JsonTargetTypes;
 use crate::read::{BoxedRecordBatchStream, timestamp_array_to_i64_slice};
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::{primary_key_column_index, time_index_column_index};
 use crate::sst::parquet::format::{PrimaryKeyArray, primary_key_offsets};
+use crate::sst::parquet::read_batch_size;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
 use crate::sst::parquet::reader::FlatRowGroupReader;
 
@@ -142,9 +142,9 @@ impl BatchBuffer {
         }
     }
 
-    /// Returns true if total buffered rows reaches `DEFAULT_READ_BATCH_SIZE`.
+    /// Returns true if total buffered rows reaches `read_batch_size`.
     fn is_full(&self) -> bool {
-        self.num_rows >= DEFAULT_READ_BATCH_SIZE
+        self.num_rows >= read_batch_size()
     }
 
     /// Extends the buffer from a slice of batches.

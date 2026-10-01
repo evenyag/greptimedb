@@ -584,7 +584,7 @@ mod tests {
                 None, // No projection
                 None, // No predicate
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );
@@ -619,7 +619,7 @@ mod tests {
                 Some(&[0, 2]),
                 Some(Predicate::new(vec![col("key1").eq(lit("key2"))])),
                 false,
-                crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                crate::sst::parquet::read_batch_size(),
             )
             .unwrap(),
         );

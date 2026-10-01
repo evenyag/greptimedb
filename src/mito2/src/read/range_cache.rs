@@ -43,7 +43,7 @@ use crate::read::scan_region::StreamContext;
 use crate::read::scan_util::PartitionMetrics;
 use crate::read::series_reader::SeriesRange;
 use crate::region::options::MergeMode;
-use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
+use crate::sst::parquet::read_batch_size;
 
 const RANGE_CACHE_COMPACT_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 
@@ -776,7 +776,7 @@ impl CacheBatchBuffer {
         self.buffered_batches.push(batch);
 
         if self.buffered_batches.len() > 1
-            && (self.buffered_rows > DEFAULT_READ_BATCH_SIZE
+            && (self.buffered_rows > read_batch_size()
                 || self.buffered_size > RANGE_CACHE_COMPACT_THRESHOLD_BYTES)
         {
             self.notify_compact();
@@ -1599,7 +1599,7 @@ mod tests {
             .acquire(limiter.available_permits() * limiter.permit_bytes())
             .await
             .unwrap();
-        let batch = make_batch(&vec![1; DEFAULT_READ_BATCH_SIZE / 2 + 1]);
+        let batch = make_batch(&vec![1; read_batch_size() / 2 + 1]);
         let weak = Arc::downgrade(batch.column(0));
         let mut buffer = CacheBatchBuffer::new(&strategy);
         buffer.push(batch.clone()).unwrap();
@@ -1652,7 +1652,7 @@ mod tests {
     #[tokio::test]
     async fn cache_batch_buffer_compacts_when_rows_exceed_default_batch_size() {
         let strategy = test_cache_strategy();
-        let batch = make_batch(&vec![1; DEFAULT_READ_BATCH_SIZE / 2 + 1]);
+        let batch = make_batch(&vec![1; read_batch_size() / 2 + 1]);
         let (key, part_metrics) = test_cache_context(&strategy);
 
         let mut buffer = CacheBatchBuffer::new(&strategy);
@@ -1668,16 +1668,13 @@ mod tests {
         assert_eq!(value.cached_batches.len(), 1);
         assert_eq!(
             value.cached_batches[0].slice_lengths,
-            vec![
-                DEFAULT_READ_BATCH_SIZE / 2 + 1,
-                DEFAULT_READ_BATCH_SIZE / 2 + 1
-            ]
+            vec![read_batch_size() / 2 + 1, read_batch_size() / 2 + 1]
         );
     }
 
     #[tokio::test]
     async fn cache_batch_buffer_compacts_when_buffered_size_exceeds_threshold() {
-        let large_batch = make_large_binary_batch(DEFAULT_READ_BATCH_SIZE, 4096);
+        let large_batch = make_large_binary_batch(read_batch_size(), 4096);
         let strategy = CacheStrategy::EnableAll(Arc::new(
             CacheManager::builder()
                 .range_result_cache_size((large_batch.get_array_memory_size() * 3) as u64)
@@ -1708,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_batch_buffer_skips_cache_when_compacted_size_exceeds_limit() {
-        let large_batch = make_large_binary_batch(DEFAULT_READ_BATCH_SIZE / 2 + 1, 4096);
+        let large_batch = make_large_binary_batch(read_batch_size() / 2 + 1, 4096);
         // Budget only fits two large batches.
         let budget = (large_batch.get_array_memory_size() as u64) * 2 + 1;
         let strategy = CacheStrategy::EnableAll(Arc::new(
