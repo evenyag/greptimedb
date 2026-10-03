@@ -25,8 +25,17 @@ an implementation stage.
 - [x] Verify the existing seven-day query bench and loaded dataset; record
   setup evidence and the [fresh-thread handoff](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-setup-handoff.md)
   (2026-10-03; setup only, no new measurements).
-- [ ] Stage 1: Baseline measurements, exact comparison, and preparation/readiness
-  harness; pass the baseline and polling-independence gate.
+- [x] Stage 1: Baseline tooling, exact comparison, and preparation/readiness
+  harness implemented at `1cca645d66`; normal-profile local validation at
+  `bf692aa28b` passed 1,702 tests, Clippy, and formatting. Polling-independence
+  and one-partition exact comparison passed. Current baseline accepted by the
+  user on 2026-10-03: main eight-partition timeout is an expected outcome,
+  while research V6 reproduced 51,635,200 rows at one/eight partitions.
+  Main eight-partition exactness and cross-partition comparison remain
+  unvalidated; acceptance does not claim these checks passed. See the
+  [Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md)
+  and external evidence under
+  `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261003-stage1/`.
 - [ ] Stage 2: Mapping preflight, compact identity/schema, and deferred tags;
   pass reference-output and zero data-phase primary-key-read gates.
 - [ ] Stage 3: Resident/IPC result store, both batch layouts, shared metadata,
@@ -78,11 +87,13 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Read the external [setup report and handoff](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-setup-handoff.md)
-and remote workflow before starting Stage 1. Setup verification is complete;
-no PoC implementation, build, test, or measurement has run. The external report
-records the pinned existing benchmark, loaded dataset, request windows, dirty
-remote research source that must be preserved, and ordered continuation steps.
+Stage 1's current baseline is accepted; Stage 2 is next. Read the external
+[Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md),
+[setup handoff](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-setup-handoff.md),
+and remote workflow before continuing. The report records measured source and
+binary identity, normal-profile local validation, expected main eight-partition
+timeouts, and the remaining exactness coverage. Remote research edits were
+preserved and verified; recovery details remain in the external evidence.
 Reuse the existing seven-day query bench and loaded eight-day dataset; do not
 regenerate or reload. Verify actual request windows because the historical
 plan collection used one-hour ANALYZE SQL despite seven-day dispatch parameters.
@@ -110,6 +121,15 @@ sequential polling and consumers that are never polled.
 Gate: reproduce one/eight partitions and Q03's 51,635,200 rows. Keep the older
 54,579,200-row discrepancy unresolved rather than adopting it as the baseline.
 Readiness must not depend on every output partition being polled.
+
+Acceptance recorded on 2026-10-03: the user accepted the current results after
+confirming that high memory and eight-partition timeouts are expected baseline
+behavior. Main one-partition exact comparison and readiness tests passed;
+research V6 reproduced the required row count at one/eight partitions. Main
+eight-partition reproduction and exact cross-partition comparison were not
+validated. Preserve that gap in later comparisons rather than retuning this
+baseline to force a pass. Stage 2's reference-output and zero-key-page gates
+remain required.
 
 # Stage 2: Compact identity reads and deferred tag assembly
 
