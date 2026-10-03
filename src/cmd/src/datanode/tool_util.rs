@@ -242,6 +242,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_research_storage_preserves_temp_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let temp = directory.path().join("tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let retained = temp.join("retained");
+        std::fs::write(&retained, b"keep").unwrap();
+        let config = StorageConfig {
+            data_home: directory.path().display().to_string(),
+            ..Default::default()
+        };
+        build_research_object_store(&config).unwrap();
+        assert_eq!(std::fs::read(retained).unwrap(), b"keep");
+    }
+
+    #[test]
     fn test_parse_region_and_path_type() {
         assert_eq!(parse_region_id("1024:7").unwrap(), RegionId::new(1024, 7));
         assert_eq!(

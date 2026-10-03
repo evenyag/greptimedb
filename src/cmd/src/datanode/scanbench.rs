@@ -81,6 +81,7 @@ struct PartitionScanStats {
     rows: u64,
     batches: u64,
     array_mem_size: u64,
+    max_batch_array_mem_size: u64,
     estimated_size: u64,
     first_batch_elapsed: Option<Duration>,
     elapsed: Duration,
@@ -281,6 +282,7 @@ struct ScanRunResult {
     scan_elapsed_ns: u64,
     elapsed_ns: u64,
     array_mem_size_bytes: u64,
+    max_output_batch_array_mem_size_bytes: u64,
     estimated_size_bytes: u64,
     partitions: Vec<PartitionResult>,
     scanner_explain: String,
@@ -294,6 +296,7 @@ struct PartitionResult {
     rows: u64,
     batches: u64,
     array_mem_size_bytes: u64,
+    max_output_batch_array_mem_size_bytes: u64,
     estimated_size_bytes: u64,
     first_batch_elapsed_ns: Option<u64>,
     elapsed_ns: u64,
@@ -1125,6 +1128,7 @@ impl ScanbenchCommand {
                     let mut rows = 0u64;
                     let mut batches = 0u64;
                     let mut array_mem_size = 0u64;
+                    let mut max_batch_array_mem_size = 0u64;
                     let mut estimated_size = 0u64;
                     let mut first_batch_elapsed = None;
                     while let Some(batch_result) = stream.next().await {
@@ -1158,7 +1162,10 @@ impl ScanbenchCommand {
                                         })?,
                                     );
                                 }
-                                array_mem_size += df_batch.get_array_memory_size() as u64;
+                                let batch_array_mem_size = df_batch.get_array_memory_size() as u64;
+                                array_mem_size += batch_array_mem_size;
+                                max_batch_array_mem_size =
+                                    max_batch_array_mem_size.max(batch_array_mem_size);
                                 estimated_size +=
                                     mito2::memtable::record_batch_estimated_size(df_batch) as u64;
                             }
@@ -1185,6 +1192,7 @@ impl ScanbenchCommand {
                         rows,
                         batches,
                         array_mem_size,
+                        max_batch_array_mem_size,
                         estimated_size,
                         first_batch_elapsed,
                         elapsed: partition_start.elapsed(),
@@ -1300,6 +1308,11 @@ impl ScanbenchCommand {
 
             if self.result_file.is_some() {
                 let source_config = &scan_config_set.configs[query_index];
+                let effective_scanner = format!("{}", VerboseScannerDisplay(scanner.as_ref()));
+                let effective_mode = effective_scanner
+                    .split("\"mode\":\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next());
                 run_results.push(ScanRunResult {
                     iteration: iteration + 1,
                     query_index: query_index + 1,
@@ -1316,6 +1329,7 @@ impl ScanbenchCommand {
                     scan_elapsed_ns: duration_ns(scan_elapsed),
                     elapsed_ns: duration_ns(elapsed),
                     array_mem_size_bytes: total_array_mem_size,
+                    max_output_batch_array_mem_size_bytes: partition_stats.iter().map(|stats| stats.max_batch_array_mem_size).max().unwrap_or_default(),
                     estimated_size_bytes: total_estimated_size,
                     partitions: partition_stats
                         .iter()
@@ -1324,15 +1338,17 @@ impl ScanbenchCommand {
                             rows: stats.rows,
                             batches: stats.batches,
                             array_mem_size_bytes: stats.array_mem_size,
+                            max_output_batch_array_mem_size_bytes: stats.max_batch_array_mem_size,
                             estimated_size_bytes: stats.estimated_size,
                             first_batch_elapsed_ns: stats.first_batch_elapsed.map(duration_ns),
                             elapsed_ns: duration_ns(stats.elapsed),
                         })
                         .collect(),
                     effective_settings: serde_json::json!({
-                        "mode": format!("{}", VerboseScannerDisplay(scanner.as_ref())).split("\"mode\":\"").nth(1).and_then(|s| s.split('"').next()),
-                        "source_policy": if self.scanner == "series" && engine.mito_config().experimental_series_scan_v2 { "selected_series_per_partition" } else { "native" },
+                        "mode": effective_mode,
+                        "source_policy": if effective_mode == Some("two_phase") { "selected_series_per_partition" } else { "native" },
                         "query_memory_budget_bytes": null,
+                        "baseline_shared_scan_memory_limit": format!("{:?}", engine.mito_config().scan_memory_limit),
                         "spill_threshold_bytes": null,
                         "ipc_layout": "not_applicable",
                         "batch_rows": mito2::sst::parquet::DEFAULT_READ_BATCH_SIZE,
@@ -1731,12 +1747,14 @@ mod tests {
                 scan_elapsed_ns: 80,
                 elapsed_ns: 90,
                 array_mem_size_bytes: 1024,
+                max_output_batch_array_mem_size_bytes: 1024,
                 estimated_size_bytes: 512,
                 partitions: vec![PartitionResult {
                     partition: 0,
                     rows: 100,
                     batches: 2,
                     array_mem_size_bytes: 1024,
+                    max_output_batch_array_mem_size_bytes: 1024,
                     estimated_size_bytes: 512,
                     first_batch_elapsed_ns: Some(20),
                     elapsed_ns: 80,

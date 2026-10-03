@@ -1762,6 +1762,28 @@ pub(crate) fn split_record_batch(record_batch: RecordBatch, batches: &mut VecDeq
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn series_reader_guard_tracks_lifetime() {
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = PartitionMetrics::new(
+            RegionId::new(1, 0),
+            0,
+            "SeriesScan",
+            Instant::now(),
+            true,
+            &metrics_set,
+        );
+        let first = metrics.series_reader_guard();
+        let second = metrics.series_reader_guard();
+        assert_eq!(metrics.0.live_series_readers.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.0.peak_series_readers.value(), 2);
+        drop(first);
+        assert_eq!(metrics.0.live_series_readers.load(Ordering::Relaxed), 1);
+        drop(second);
+        assert_eq!(metrics.0.live_series_readers.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.0.series_readers_opened.value(), 2);
+    }
+
     use std::sync::Arc;
     use std::time::Instant;
 
