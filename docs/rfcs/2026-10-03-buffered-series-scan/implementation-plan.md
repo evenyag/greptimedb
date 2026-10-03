@@ -1,274 +1,299 @@
 # Buffered SeriesScan implementation and experiment plan
 
-Status: Initial draft for review, 2026-10-03.
+Status: Draft revised after first review, 2026-10-03.
 
-Read the [design](design.md) for execution semantics, storage interfaces, and
-correctness boundaries. This plan separates reusable result-store work from
-scanner integration and from optional optimizations.
+Read the [design](design.md) for execution semantics and interfaces. Preparation
+runs outside scan partition streams; those streams perform final merge and tag
+assembly after notification. The core merge key is (table_id, tsid). Range
+results can spill to Arrow IPC files before replay; final replay never spills.
 
 # Working conventions
 
-- Preserve current v2 and existing uncommitted research changes. Record source
-  and binary identity for every measured implementation.
-- Keep experimental choices selectable in development tools so each can be
-  measured independently. Production option names and defaults are a later
-  integration deliverable, not frozen by this draft.
-- Use existing scanbench/parquetbench infrastructure and bounded JSONL evidence.
-  Put run artifacts in a new external evidence directory, not the completed
-  research directory or the repository.
-- Read applicable repository instructions before edits. New source files need
-  repository license headers. Local debug binary builds use
-  `CARGO_PROFILE_DEV_DEBUG=1` per `.local/AGENTS.md`.
-- Begin with focused tests and microbenchmarks. Full retained-dataset runs follow
-  only after correctness, resource, and cleanup checks pass.
+- Preserve current v2 and existing uncommitted research edits. Record source and
+  binary identity for measured implementations.
+- Keep development options for preparation concurrency, source policy,
+  per-query memory budget/spill threshold, IPC layout, batch size, and compression.
+  Reader and merge-input counts are metrics, not admission limits.
+  Production option names/defaults follow measured selection.
+- Use existing scanbench/parquetbench and bounded JSONL evidence. Store run
+  artifacts in a fresh external directory, not the completed research root.
+- Read applicable repository instructions before editing. Apply license headers
+  to new source files; local debug binary builds use CARGO_PROFILE_DEV_DEBUG=1.
+- Use focused tests/microbenchmarks before retained-dataset runs. Do not add
+  external merge passes, full-key replay fallback, or engine-wide spill
+  scheduling to the initial implementation.
 
-# Stage 1: Baseline and comparison harness
+# Stage 1: Baseline and preparation/readiness harness
 
-Extend the current tools to accept explicit implementation, source policy,
-reader limit, result-memory budget, workspace budget, merge fan-in, spill layout,
-segment target, compression, and spill quota. Reject contradictory settings and
-record the effective values, actual output partitions, and actual batch sizes.
+Extend the tools with explicit settings and report effective mode, source
+policy, query memory budget/spill threshold, actual output partitions,
+batch size, and IPC layout.
 
-Add measurements for candidate, source-read, range-merge, spill, replay, final
-merge, output conversion, and cleanup phases. Track reader current/peak counts,
-resident backing capacity, index/dictionary capacities, workspace, disk usage,
-rows decoded/emitted, storage bytes, first-output time, and complete latency.
+Measure candidate discovery, source reads, range merge, spill/finalization,
+readiness wait, final replay/merge, tag assembly, and cleanup. Count live
+readers, decoded primary-key pages in the data phase, retained capacities,
+catalog/index bytes, workspace, disk usage, rows, storage traffic, and
+first-output/complete latency.
 
-Implement a streaming comparison that checks logical values, per-partition
-ordering, and stable series assignment without retaining the full output.
-Separate diagnostic instrumentation from timing runs. Counts and checksums are
-useful for large runs but do not replace exact small-fixture comparisons.
+Build an exact streaming comparison for logical values, ordering within
+partitions, and series assignment. Separate timing runs from diagnostic runs.
 
-Gate: reproduce actual one/eight partition behavior and the complete Q03
-reference of 51,635,200 rows. Preserve the unresolved older output-count
-discrepancy rather than using its 54,579,200 figure as a new baseline.
+Prototype a preparation coordinator and owned readiness manifests. It starts
+once, schedules work outside partition streams, explicitly marks empty results
+complete, notifies consumers, and propagates errors/cancellation. Test
+sequential polling and consumers that are never polled.
 
-# Stage 2: Result-store prototype and microbenchmarks
+Gate: reproduce one/eight partitions and Q03's 51,635,200 rows. Keep the older
+54,579,200-row discrepancy unresolved rather than adopting it as the baseline.
+Readiness must not depend on every output partition being polled.
 
-Implement the private builder, handle, cursor, and resource interfaces from the
-design. Support resident segments, packed independent IPC streams, mixed
-resident/spilled results, stored row offsets, and complete-result publication.
-Initially use full primary keys and preserve current projected tags.
+# Stage 2: Compact identity reads and deferred tag assembly
 
-Implement byte-budgeted writes and reads, quota accounting, blocking-runtime
-dispatch, error propagation, ownership-based cleanup, and bounded index pages.
-Avoid concatenating an entire range for serialization or replay.
+Extend row-group data readers to synthesize 22-byte compact __primary_key values
+from (table_id, tsid) row mappings/range indexes. Exclude SST __primary_key from
+the data projection. Intersect identity runs with selections and keep identity
+arrays aligned with filtered field arrays.
 
-Use synthetic flat batches and representative selected row groups. Measure:
+Candidate discovery supplies mappings and decoded tag context. Without a range
+index, require mappings populated by discovery before data reads; fail clearly
+on missing coverage rather than reread full-key pages in the data phase.
 
-- Range-result retained capacity, including shared slices and dictionaries.
-- Spill throughput, serialized size, CPU, and peak staging memory.
-- Sequential replay and indexed seeks, including dictionary load costs.
-- Segment sizes, container count, and file-open overhead.
-- Cancellation and cleanup time after completed and partial writes.
+Create an accounted tag catalog keyed by identity, normalized to the required
+output schema. Data batches carry fields, timestamp, compact key, sequence, and
+operation type without expanded projected tags. After merge, join tags by
+identity and apply output projection.
 
-Compare packed independent streams with normalized IPC-file segments and larger
-packed stream segments. Add compression only after uncompressed round trips
-pass. Include changing dictionaries, unused dictionary values, nulls, and schema
-metadata in tests.
+Preserve snapshot/sequence rules, trusted overrides, field/time predicates,
+source compatibility, deduplication, and selectors. Memtable sources use the
+same compact identity model.
 
-Gate: exact round trips, no partially published results, observed bounded
-staging, and cleanup after errors/cancellation. Record the largest indivisible
-batch and minimum working memory separately from configured segment targets.
+Gate: output values/tags/order match reference metric scans. Equal TSIDs in
+different table IDs stay distinct. Instrumented data reads decode zero SST
+__primary_key pages, including cold-mapping and partial-index cases. Candidate
+key reads remain reported separately.
 
-# Stage 3: Sequential partition-range data phase
+# Stage 3: IPC-file result store and batch-layout experiments
 
-Add a buffered mode using v2's eligibility checks, candidate discovery,
-assignments, pruning, and current selected-series readers. Share one active
-range-processing permit across the scanner's output partitions.
+Implement result builders/handles/cursors with resident batches and actual
+Arrow IPC files. Record batch indices and per-series row spans, including a
+series crossing batches/files. Finish files before publishing random-access
+handles and use checked offset arithmetic.
 
-Drain each range stream into the store before releasing the permit. Instrument
-reader destruction so a "range complete" event cannot conceal retained decoder
-state. Replay the completed results through the existing final flat merger.
+Add query-local capacity accounting, bounded serialization staging, reader
+prefetch, disk quota, blocking-worker dispatch, and cleanup. Prepared results
+can remain resident, spill fully, or reference completed resident/file parts.
 
-Keep this milestone's limitations explicit: the largest range can still have
-large source fan-in, and replay can still retain one decoded batch per result.
-Do not describe it as a complete bounded-memory implementation.
+Implement two layouts from the start: one series per batch, and multiple
+series per batch. A large series has multiple bounded batches. Index exact
+positions for direct series access.
 
-Gate: output matches v2 on exact fixtures, range-reader lifetime is reduced,
-sequential partition consumption works, and output/cancellation errors reach
-all relevant consumers without detached producers.
+Use plain Binary compact keys in the first IPC benchmark and normalize
+dictionary-encoded fields to corresponding value arrays in its storage schema.
+Compare a consistent fixed compact-key dictionary separately; do not depend on
+IPC dictionary replacement. Reconstruct merge arrays on replay.
 
-# Stage 4: Bounded source fan-in and final replay
+Measure:
 
-Introduce scanner-wide reader permits held for actual reader lifetime. Acquire
-whole source-group allocations together. Add bounded intermediate merge passes
-for oversized ranges, without deduplication, selectors, or tombstone removal
-until the complete range boundary.
+- Write and sequential/random read throughput, CPU, and serialized size.
+- Direct series lookup and memory retained for unrelated series.
+- Per-series rows/bytes and distributions, not just average batch size.
+- Batch/footer/index overhead, file count, seeks, and file-open costs.
+- Dictionary conversion, serialization, and replay workspace.
+- Cancellation and cleanup after completed and partial writes.
 
-Characterize equal-sequence ties before changing merge topology. Preserve
-observable winner behavior; do not assume grouping is associative for every
-deduplication mode.
+Start uncompressed; compare LZ4/Zstd after exact round trips pass.
 
-Add indexed key-window replay with bounded decoded batches, byte-prefetch,
-open files, and merge fan-in. Use stored merge passes when needed. Keep full
-primary keys within a key window, but stream a large series in batches.
+Gate: both layouts round-trip compact data correctly, positions select the
+right series, partial files are never published, and all owned storage is
+released after cancellation/errors.
 
-Integrate managed-memory reservations with the existing engine-wide scan pool.
-Maintain separate scanner-local retention and workspace budgets. Spill on
-reservation pressure, and return a resource error for irreducible allocations.
-Account for transient input/output coexistence and pinned backing buffers.
+# Stage 4: Range preparation, spill threshold, and final merge
 
-Gate: one very large overlapping range, many ranges, and one series spanning
-all ranges respect reader and managed-memory limits. Increasing output
-partitions does not independently multiply these limits. Disk exhaustion and
-memory pressure terminate cleanly rather than deadlock.
+Integrate the current selected-series source pattern with the coordinator.
+Initially prepare one partition range at a time across the query. Drain its
+complete merged result into the store and release all associated SST readers.
 
-# Stage 5: Compact-key experiment
+Admit readers and merges through per-query memory reservations, including
+estimated decoder/fetch state and measured buffers/workspace. Keep reservations
+until state destruction; calibrate estimates with the reader experiments.
+Do not introduce a reader cap or fan-in limit.
 
-Add fresh 22-byte prefix dictionaries using the existing sparse codec, after
-source decoding, filtering, compatibility, and projected tag materialization.
-Track the full-key catalog, dictionaries, and transformation workspace.
+For streaming merges, evaluate the full simultaneous working set and avoid
+partial startup that waits for memory retained by the same merge. Defer tasks
+when runnable work can release memory and spill eligible unpublished results
+before retrying. Fail irreducible memory requests with stage/required/available
+bytes; do not retry with external merge passes.
 
-Add full-key variant detection and explicit full-key fallback for paths that
-cannot prove selected identity uniqueness. A late detected conflict discards
-compact results and restarts the data phase at the same snapshot before output.
-Index-backed reads require the same correctness evidence.
+Apply complete range-level deduplication and preserve selector placement.
+Characterize equal-sequence ties and verify the non-overlapping complete-range
+invariant used by final merge.
 
-Compare full-key and compact-key runs using identical source/spill policies.
-Measure retained capacity and serialized bytes separately; repeated projected
-tags may remain a significant cost even after keys shrink.
+Use one per-query tracker for catalogs, results, indexes, buffers, queues, and
+workspace. During preparation, crossing the threshold spills eligible range
+results. Keep writer workspace available and account for transient overlap.
 
-Gate: values, projected tags, ordering, and deduplication match references.
-Variants sharing an identity never collapse silently. Memory savings survive
-accounting for catalogs and temporary transformation allocations.
+Finalize result placement and expected replay workspace before readiness
+publication. Partition streams then replay/merge by compact identity, attach
+tags, and yield. They never write spill files or cause published results to
+migrate to disk. Further preparation can spill unpublished results only.
 
-# Stage 6: Shared selected-series SST reads
+Gate: reader destruction is observed at range completion; readiness and
+sequential partition consumption work; spill follows aggregate query accounting;
+final replay performs zero spill writes. Large reader/input counts alone never
+reject a query. Missing mappings, disk exhaustion, and irreducible memory
+requests fail and clean up.
 
-Add the alternative source policy: consume candidate discovery to completion,
-read the selected-series union once across output assignments in the data
-phase, materialize sorted source results, then merge complete partition ranges.
-Allow bounded parallel row-group reads while readers remain capped.
+# Stage 5: Independent preparation concurrency and shared SST reads
 
-Store large candidate assignments in accounted pageable sorted storage and
-adapt selection to read its pages. Preserve pruning and precise filters.
-Avoid unbounded queues for output partitions that have not been polled.
+Vary preparation concurrency outside partitions: 1, 2, and 4, with memory-based
+admission under the query budget. These are scheduling experiments, not reader
+or merge-input count limits. Preserve the consumer interface; changing
+the preparation schedule must not move tasks into output streams.
 
-Compare with the current per-assignment SST policy at equal budgets. Measure
-repeated row-group decoding, selected versus decoded rows, source spill bytes,
-merge passes, complete latency, and first-output latency. Separate costs saved
-by sharing reads from costs introduced by extra materialization.
+Add the shared selected-series policy. Read candidate-pruned groups for the
+union across output assignments, synthesize compact keys from identity mappings,
+buffer source results, and merge ranges in preparation. Independently schedule
+bounded row-group reads and range-result merging.
 
-Gate: no duplicated or missing rows across assignments; large candidate sets
-and sequential partition consumption work within managed budgets. The measured
-tradeoff determines whether this policy belongs in the integrated candidate.
+If source buffers spill, finalize their storage before merge consumers read
+them. This does not introduce spill during final partition replay. Begin with
+candidate unions that fit; retain existing chunked assignments for larger
+sets and report rereads across chunks. Pageable candidate storage remains a
+follow-up rather than a prerequisite.
 
-# Stage 7: File-backed cache for buffered data results
+Compare source policies at equal query budgets. Measure repeated decoding,
+selected versus decoded rows, source/result spill bytes, required merge memory,
+memory admission failures, complete latency, and first-output time.
 
-Add representation-aware cache keys while preserving current fingerprint and
-eligibility rules. Admit only complete self-contained data results. Transfer
-artifact ownership where safe, rather than copying the full result again.
+Gate: no duplicated/missing rows across assignments or readiness manifests.
+Memory does not acquire a separate budget per output partition; reader and
+merge-input counts remain measurements only.
+Performance evidence determines whether shared reads belong in the candidate.
 
-Implement disk capacity, metadata-memory limits, cursor pinning, delayed
-deletion, admission rejection, and startup cleanup. Pinned bytes remain charged
-until deletion. Keep candidate, mapping, SeqScan, and current v2 caches intact.
+# Stage 6: File-backed buffered-data cache
 
-Compare disabled, cold, and warm cache runs. Validate schema/sequence/filter
-changes, dynamic-filter bypass, memtable exclusion, concurrent consumers, and
-eviction while a cursor is active.
+Add representation-aware keys and preserve existing fingerprint/eligibility
+rules. Cache complete IPC results and indexes plus independently owned tag
+context required for output assembly.
 
-Gate: cache reuse preserves results, neither cache nor query handles outlive
-required dependencies, and admission/eviction cannot exceed accounted capacity.
+Perform cache admission and any conversion to files in preparation, before
+publishing final-replay handles. Do not write cache content in partition merge
+streams. Admission failure skips caching; required spill failures fail queries.
 
-# Stage 8: Integrated evaluation and rollout decision
+Implement disk/metadata capacities, pinning, delayed deletion, quota charging,
+and startup cleanup. Preserve current v2, candidate, mapping, and SeqScan caches.
 
-Select independently validated components and rerun correctness and resource
-tests for their combination. Preserve explicit modes in the tools so a
-regression can be attributed to a component.
+Compare disabled, cold, and warm cache runs. Test schema/sequence/filter
+changes, dynamic-filter bypass, memtable exclusion, concurrent cursors, eviction
+with active pins, and producing-query destruction.
 
-Add documented opt-in experimental configuration only after the measured
-selection. Keep current defaults until a separate decision to promote or
-replace v2. Configuration work includes example TOMLs, loading/serialization
-tests, generated configuration documentation, and matching user documentation.
+Gate: cached compact rows retain enough tag context to reproduce output,
+replay never depends on an expired query catalog, and final replay writes
+neither spill nor cache files.
 
-Produce a result summary with raw evidence links, source/binary bindings,
-effective settings, phase memory, latency, first-output time, spill
-amplification, cleanup, and remaining limitations. Report the Pareto curve
-rather than declaring one policy universally fastest.
+# Stage 7: Integrated evaluation and rollout decision
 
-Gate: the integrated candidate is correct, respects its resource contracts,
-cleans up, and has reproducible comparison evidence. A deployment or default
-change is a separate reviewed action.
+Combine independently validated components, rerun correctness/resource tests,
+and preserve tool options for attributing regressions.
+
+Select IPC batch layout/encoding, source policy, preparation concurrency, and
+experimental limits from measured evidence. Add opt-in configuration with
+examples, loading/serialization tests, generated configuration documentation,
+and matching user documentation. Keep existing defaults until a separate
+promotion decision.
+
+Produce a result summary with raw evidence, source/binary bindings, effective
+settings, phase memory, complete/first-output latency, spill amplification,
+memory admission coverage, and cleanup. A low-memory run rejected before
+execution is not a successful benchmark.
+
+Gate: correct output, enforced accepted-workload resource contracts, clean
+failure paths, no data-phase full-key decoding, no final-replay spill, and
+reproducible comparison evidence.
 
 # Experiment matrix and execution order
 
-Run focused sweeps before combinations; do not start with the full Cartesian
-product.
+Sweep focused variables before combinations.
 
 | Variable | Initial values |
 | --- | --- |
-| Reader cap | 8, 16, 32, 64 |
-| Resident result budget | 128, 256, 512, 1024 MiB |
-| Workspace | Explicit, recorded independently; determine minimum viable size in microbenchmarks |
-| Range concurrency | 1, 2, 4, constrained by reader/workspace limits |
+| Source count (workload variable) | Synthetic 8/16/32/64 inputs plus retained-dataset ranges; no count limit |
+| Source width/decoder footprint | Small and large readers at equal source counts |
+| Hard tracked-memory budget | Explicit sweep based on measured working sets; record required/available bytes |
+| Per-query spill threshold | 128, 256, 512, 1024 MiB |
+| Workspace | Record minimum working size and transient peak separately |
+| Preparation concurrency | 1, 2, 4, independent of output partition count |
 | Output partitions | 1 and 8 |
-| Batch rows | 1024 and 8192; smaller batches for storage microbenchmarks |
-| Source policy | Current filtered reads; shared selected-series union |
-| Result retention | Resident when it fits; forced spill; adaptive spill |
-| Keys | Full; compact where eligibility is established |
-| IPC segment target | 1, 8, 32 MiB; record oversized indivisible batches separately |
-| Compression | Uncompressed first, then LZ4 and Zstd |
-| Data-result cache | Disabled first, then cold and warm |
+| Batch rows | 1024 and 8192, plus smaller per-series samples |
+| Source policy | Current selected-series streams; shared selected-series union |
+| IPC batch layout | One series; multiple series |
+| IPC batch target | Row/byte targets informed by measured per-series size; split large series |
+| Result retention | Resident when it fits; forced spill; threshold-based spill before replay |
+| Storage key encoding | Plain Binary compact prefix; consistent fixed dictionary |
+| Compression | Uncompressed, then LZ4 and Zstd |
+| Data-result cache | Disabled, then cold and warm |
 
-Progress from synthetic overlap/selectivity cases to representative retained
-row groups, complete Q03, and then the remaining query suite. Include skew,
-many logical table IDs, high selected-series cardinality, and concurrent scans.
-Use exact requests for correctness; Q11's displayed regex must not be silently
-replaced by an unverified SQL translation.
+For one-series layouts, measure small-batch overhead and lookup latency; for
+multiple-series layouts, measure unrelated rows retained by final cursors.
+Include a series present in every range, very large series, many short series,
+skew, multiple table IDs, and low/high selection fractions.
 
-Fresh processes are required for runtime batch configuration and comparable
-peaks. Separate correctness/instrumented runs from timing runs. Record allocator,
-RSS, cgroup anonymous/file memory, effective caches, and pressure events; do not
-sum overlapping measurements as independent memory components.
+Progress from synthetic fixtures to representative retained row groups,
+complete Q03, and the remaining query suite. Use exact requests; Q11's display
+regex must not be silently replaced by an unverified SQL translation.
+
+Fresh processes are required for effective batch settings and comparable
+peaks. Separate diagnostic/correctness and timing runs. Report tracked memory,
+allocator, RSS, cgroup anonymous/file memory, effective caches, and pressure
+separately; do not add overlapping measurements together.
 
 Retained-dataset runs follow the research handoff: verified read-only data,
-scratch outside the dataset, no maintenance or WAL replay that modifies it,
-unique evidence roots, owned-process controls, and bounded guards. The original
-12 GiB setup is a useful guarded environment, not the chosen production budget.
+scratch outside it, maintenance disabled, appropriate WAL handling, new evidence
+roots, owned-process controls, and bounded guards. The original 12 GiB setup is
+a guarded environment, not a chosen production budget.
 
-For selection, first reject incorrect, incomplete, or over-budget variants.
-Compare surviving variants at equal reader, managed-memory, and disk budgets.
-Use complete-scan latency as the primary speed comparison and report first-row
-latency separately. If policies trade wins across workloads, retain their
-measured Pareto results for review rather than inventing an automatic heuristic.
+Reject incorrect, incomplete, or over-budget variants first. Compare successful
+variants at equal budgets and report complete-scan latency, first-output
+latency, and the Pareto curve. Include failures/rejections in coverage reports
+so comparisons cannot improve by silently omitting difficult workloads.
 
 # Correctness and validation
 
-Exact fixtures must cover:
+Exact fixtures cover:
 
-- Series crossing batches, segments, row groups, SSTs, and partition ranges.
-- Duplicate timestamps and sequences, deletes, append mode, `LastRow`,
-  `LastNonNull`, and selector placement.
-- Memtable/SST overlap, snapshot and exact-sequence reads.
-- Schema evolution, timestamp units, missing/null tags, and compatibility.
-- Table IDs, TSID boundaries, sparse selections, full-key variants, and unused
-  dictionary values.
-- Resident/spilled mixtures, repeated seeks, oversized batches, and multiple
-  merge passes.
-- Sequential partition consumption, abandoned consumers, cancellation, disk
-  exhaustion, corrupt segments, and cache eviction with active pins.
-- Assignments crossing the existing candidate chunking threshold.
+- Series spanning batches, IPC files, row groups, SSTs, and partition ranges.
+- Identity synthesis after row selection/filtering, missing mappings, partial
+  index coverage, and data projections excluding __primary_key.
+- Duplicate timestamps/sequences, deletes, append mode, LastRow, LastNonNull,
+  snapshot/exact-sequence reads, and selector placement.
+- Memtable/SST overlap, schema evolution, timestamp units, defaults/null tags,
+  and deferred tag attachment.
+- Equal TSIDs across different table IDs and stable partition assignment.
+- Resident/file mixtures, random batch seeks, per-series spans, changing input
+  dictionaries, large single series, and unrelated rows in mixed batches.
+- Memory-based admission across concurrent tasks, preparation-time reclamation,
+  irreducible working-set errors, and final replay with no spill writes.
+- Many small inputs that fit are accepted; fewer large inputs that cannot fit
+  fail for memory. Counts alone never decide admission.
+- Sequential partition polling, never-polled/abandoned consumers, notifications,
+  cancellation, corrupt files, disk exhaustion, and cache pinning.
+- Candidate chunk boundaries, catalog ownership, and cached output after the
+  producer query has been destroyed.
 
-Compare against v2 and appropriate SeqScan references, checking logical values,
-per-partition ordering, and stable assignment. Batch boundaries and dictionary
-layout may differ; compare their logical content rather than encoded equality.
-
-Run narrow tests as stages land, then `cargo nextest run -p mito2` for integrated
-read-path changes, focused command tests for tool changes, and relevant SQLness
-regressions for PromQL behavior. Before a PR, follow the repository's formatting,
-lint, license, full-test, dependency, and configuration checks.
+Compare logical values with v2 and appropriate SeqScan references. Batch
+boundaries and dictionary encoding may differ. Run focused stage tests,
+cargo nextest run -p mito2 for integration, relevant command tests, and focused
+SQLness PromQL regressions. Follow repository PR validation for formatting,
+lint, license, full tests, dependencies, and public configuration.
 
 # Review checkpoints
 
-1. Review this draft before implementing the harness and result-store prototype.
-2. Review spill/replay microbenchmarks before selecting IPC normalization and
-   segment defaults.
-3. Review sequential-range results before adding more range concurrency.
-4. Review bounded-merge correctness and measurements before combining compact
-   keys and shared reads.
-5. Review the integrated comparison before choosing configuration defaults or
-   changing the default scanner.
+1. Review compact-identity synthesis and the coordinator/partition boundary.
+2. Review IPC one-series/multiple-series measurements before choosing layout.
+3. Review range preparation, memory admission, and per-query spill accounting.
+4. Review shared reads and independent concurrency before selecting a policy.
+5. Review integrated evidence before selecting defaults or promoting the mode.
 
-The first review should focus on the proposed boundaries: separate mode,
-materialization barrier, range/source/replay limits, compact-key correctness,
-and how far shared-read assignment storage should extend beyond current v2.
+Full-key data-phase prototypes, collision-based rescans, packed IPC streams,
+external merge passes, final-replay spill, and global spill coordination from
+the initial draft have been removed.
