@@ -2898,7 +2898,6 @@ dependencies = [
  "common-base",
  "common-runtime",
  "common-telemetry",
- "nix 0.30.1",
  "num_cpus",
  "prometheus 0.14.0",
  "sysinfo",

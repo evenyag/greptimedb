@@ -15,134 +15,210 @@
 #![allow(dead_code)]
 
 use std::fs::read_to_string;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
-#[cfg(target_os = "linux")]
-use nix::sys::{statfs, statfs::statfs};
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::MetricFamily;
 use prometheus::{IntGauge, Opts};
 
-const CGROUP_UNIFIED_MOUNTPOINT: &str = "/sys/fs/cgroup";
+const MAX_MEMORY_IN_BYTES: i64 = 1125899906842624;
 
-const MEMORY_MAX_FILE_CGROUP_V2: &str = "memory.max";
-const MEMORY_MAX_FILE_CGROUP_V1: &str = "memory.limit_in_bytes";
-const MEMORY_USAGE_FILE_CGROUP_V2: &str = "memory.current";
-const CPU_MAX_FILE_CGROUP_V2: &str = "cpu.max";
-const CPU_QUOTA_FILE_CGROUP_V1: &str = "cpu.cfs_quota_us";
-const CPU_PERIOD_FILE_CGROUP_V1: &str = "cpu.cfs_period_us";
-const CPU_USAGE_FILE_CGROUP_V2: &str = "cpu.stat";
+/// A controller's process directory and the boundary of its visible mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerPath {
+    directory: PathBuf,
+    mount: PathBuf,
+    v2: bool,
+}
 
-// `MAX_VALUE_CGROUP_V2` string in `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to indicate that the resource is unlimited.
-const MAX_VALUE_CGROUP_V2: &str = "max";
+#[derive(Debug, Default)]
+struct CgroupPaths {
+    memory: Option<ControllerPath>,
+    cpu: Option<ControllerPath>,
+    cpuacct: Option<ControllerPath>,
+}
 
-// For cgroup v1, if the memory is unlimited, it will return a very large value(different from platform) that close to 2^63.
-// For easier comparison, if the memory limit is larger than 1PB we consider it as unlimited.
-const MAX_MEMORY_IN_BYTES: i64 = 1125899906842624; // 1PB
-
-/// Get the limit of memory in bytes from cgroups filesystem.
-///
-/// - If the cgroup total memory is unset, return `None`.
-/// - Return `None` if it fails to read the memory limit or not on linux.
-pub fn get_memory_limit_from_cgroups() -> Option<i64> {
+static PATHS: LazyLock<CgroupPaths> = LazyLock::new(|| {
     #[cfg(target_os = "linux")]
     {
-        let memory_max_file = if is_cgroup_v2()? {
-            // Read `/sys/fs/cgroup/memory.max` to get the memory limit.
-            MEMORY_MAX_FILE_CGROUP_V2
-        } else {
-            // Read `/sys/fs/cgroup/memory.limit_in_bytes` to get the memory limit.
-            MEMORY_MAX_FILE_CGROUP_V1
+        let paths = match (
+            read_to_string("/proc/self/cgroup"),
+            read_to_string("/proc/self/mountinfo"),
+        ) {
+            (Ok(membership), Ok(mounts)) => CgroupPaths::parse(&membership, &mounts),
+            _ => CgroupPaths::default(),
         };
+        common_telemetry::info!("Resolved process cgroup controllers: {:?}", paths);
+        paths
+    }
+    #[cfg(not(target_os = "linux"))]
+    CgroupPaths::default()
+});
 
-        // For cgroup v1, it will return a very large value(different from platform) if the memory is unset.
-        let memory_limit =
-            read_value_from_file(Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(memory_max_file))?;
+impl CgroupPaths {
+    fn parse(membership: &str, mounts: &str) -> Self {
+        Self {
+            memory: resolve_controller(membership, mounts, "memory"),
+            cpu: resolve_controller(membership, mounts, "cpu"),
+            cpuacct: resolve_controller(membership, mounts, "cpuacct"),
+        }
+    }
+}
 
-        // If memory limit exceeds 1PB(cgroup v1), consider it as unset.
-        if memory_limit > MAX_MEMORY_IN_BYTES {
+// mountinfo escapes spaces, tabs, newlines and backslashes as octal bytes.
+fn unescape_mount(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn resolve_controller(membership: &str, mounts: &str, controller: &str) -> Option<ControllerPath> {
+    let dedicated = membership.lines().any(|line| {
+        line.split(':')
+            .nth(1)
+            .is_some_and(|controllers| controllers.split(',').any(|c| c == controller))
+    });
+    let mut candidates = Vec::new();
+    for line in membership.lines() {
+        let fields: Vec<_> = line.splitn(3, ':').collect();
+        if fields.len() != 3 {
+            continue;
+        }
+        let unified = fields[0] == "0" && fields[1].is_empty();
+        if unified && dedicated {
+            continue;
+        }
+        if !unified && !fields[1].split(',').any(|c| c == controller) {
+            continue;
+        }
+        let group = Path::new(fields[2]);
+        if !group.is_absolute()
+            || group
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        for mount in mounts.lines() {
+            let Some((left, right)) = mount.split_once(" - ") else {
+                continue;
+            };
+            let left: Vec<_> = left.split_whitespace().collect();
+            let right: Vec<_> = right.split_whitespace().collect();
+            if left.len() < 6 || right.len() < 3 {
+                continue;
+            }
+            if unified {
+                if right[0] != "cgroup2" {
+                    continue;
+                }
+            } else if right[0] != "cgroup" || !right[2].split(',').any(|c| c == controller) {
+                continue;
+            }
+            let root = PathBuf::from(unescape_mount(left[3]));
+            let mount = PathBuf::from(unescape_mount(left[4]));
+            // In a cgroup namespace, membership is relative to the namespace
+            // root, even when mountinfo exposes the host's non-root mount root.
+            let relative = match group.strip_prefix(&root) {
+                Ok(relative) => relative,
+                Err(_) if group == Path::new("/") => Path::new(""),
+                Err(_) => continue,
+            };
+            candidates.push((
+                root.components().count(),
+                ControllerPath {
+                    directory: mount.join(relative),
+                    mount,
+                    v2: unified,
+                },
+            ));
+        }
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, path)| path)
+}
+
+impl ControllerPath {
+    fn minimum_limit(&self, read: impl Fn(&Path) -> Option<i64>) -> Option<i64> {
+        self.directory
+            .ancestors()
+            .take_while(|p| p.starts_with(&self.mount))
+            .filter_map(read)
+            .min()
+    }
+}
+
+/// Returns the smallest visible hard memory cap, excluding memory.high.
+pub fn get_memory_limit_from_cgroups() -> Option<i64> {
+    let path = PATHS.memory.as_ref()?;
+    path.minimum_limit(|dir| {
+        let value = read_value_from_file(dir.join(if path.v2 {
+            "memory.max"
+        } else {
+            "memory.limit_in_bytes"
+        }))?;
+        (value >= 0 && (path.v2 || value < MAX_MEMORY_IN_BYTES)).then_some(value)
+    })
+}
+
+/// Returns the process group's pressure threshold, independently of its hard cap.
+pub fn get_memory_high_from_cgroups() -> Option<i64> {
+    let path = PATHS.memory.as_ref()?;
+    if !path.v2 {
+        return None;
+    }
+    path.minimum_limit(|dir| read_value_from_file(dir.join("memory.high")))
+}
+
+/// Returns current memory usage of the process group, in bytes.
+pub fn get_memory_usage_from_cgroups() -> Option<i64> {
+    let path = PATHS.memory.as_ref()?;
+    read_value_from_file(path.directory.join(if path.v2 {
+        "memory.current"
+    } else {
+        "memory.usage_in_bytes"
+    }))
+}
+
+/// Returns the smallest visible CPU quota in millicores.
+pub fn get_cpu_limit_from_cgroups() -> Option<i64> {
+    let path = PATHS.cpu.as_ref()?;
+    path.minimum_limit(|dir| {
+        if path.v2 {
+            get_cgroup_v2_cpu_limit(dir.join("cpu.max"))
+        } else {
+            cpu_limit(
+                read_value_from_file(dir.join("cpu.cfs_quota_us"))?,
+                read_value_from_file(dir.join("cpu.cfs_period_us"))?,
+            )
+        }
+    })
+}
+
+/// Returns cumulative CPU usage in microseconds (v1 cpuacct is nanoseconds).
+pub fn get_cpu_usage_from_cgroups() -> Option<i64> {
+    let path = PATHS.cpuacct.as_ref()?;
+    if path.v2 {
+        cpu_usage_usec(&read_to_string(path.directory.join("cpu.stat")).ok()?)
+    } else {
+        read_value_from_file(path.directory.join("cpuacct.usage")).map(|value| value / 1000)
+    }
+}
+
+fn cpu_usage_usec(content: &str) -> Option<i64> {
+    content.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "usage_usec" {
             return None;
         }
-        Some(memory_limit)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    None
-}
-
-/// Get the usage of memory in bytes from cgroups filesystem.
-///
-/// - Return `None` if it fails to read the memory usage or not on linux or cgroup is v1.
-pub fn get_memory_usage_from_cgroups() -> Option<i64> {
-    #[cfg(target_os = "linux")]
-    {
-        if is_cgroup_v2()? {
-            let usage = read_value_from_file(
-                Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(MEMORY_USAGE_FILE_CGROUP_V2),
-            )?;
-            Some(usage)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    None
-}
-
-/// Get the limit of cpu in millicores from cgroups filesystem.
-///
-/// - If the cpu limit is unset, return `None`.
-/// - Return `None` if it fails to read the cpu limit or not on linux.
-pub fn get_cpu_limit_from_cgroups() -> Option<i64> {
-    #[cfg(target_os = "linux")]
-    if is_cgroup_v2()? {
-        // Read `/sys/fs/cgroup/cpu.max` to get the cpu limit.
-        get_cgroup_v2_cpu_limit(Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(CPU_MAX_FILE_CGROUP_V2))
-    } else {
-        // Read `/sys/fs/cgroup/cpu.cfs_quota_us` and `/sys/fs/cgroup/cpu.cfs_period_us` to get the cpu limit.
-        let quota = read_value_from_file(
-            Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(CPU_QUOTA_FILE_CGROUP_V1),
-        )?;
-
-        let period = read_value_from_file(
-            Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(CPU_PERIOD_FILE_CGROUP_V1),
-        )?;
-
-        // Return the cpu limit in millicores.
-        Some(quota * 1000 / period)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    None
-}
-
-/// Get the usage of cpu in millicores from cgroups filesystem.
-///
-/// - Return `None` if it's not in the cgroups v2 environment or fails to read the cpu usage.
-pub fn get_cpu_usage_from_cgroups() -> Option<i64> {
-    // In certain bare-metal environments, the `/sys/fs/cgroup/cpu.stat` file may be present and reflect system-wide CPU usage rather than container-specific metrics.
-    // To ensure accurate collection of container-level CPU usage, verify the existence of the `/sys/fs/cgroup/memory.current` file.
-    // The presence of this file typically indicates execution within a containerized environment, thereby validating the relevance of the collected CPU usage data.
-    if !Path::new(CGROUP_UNIFIED_MOUNTPOINT)
-        .join(MEMORY_USAGE_FILE_CGROUP_V2)
-        .exists()
-    {
-        return None;
-    }
-
-    // Read `/sys/fs/cgroup/cpu.stat` to get `usage_usec`.
-    let content =
-        read_to_string(Path::new(CGROUP_UNIFIED_MOUNTPOINT).join(CPU_USAGE_FILE_CGROUP_V2)).ok()?;
-
-    // Read the first line of the content. It will be like this: `usage_usec 447926`.
-    let first_line = content.lines().next()?;
-    let fields = first_line.split(' ').collect::<Vec<&str>>();
-    if fields.len() != 2 {
-        return None;
-    }
-
-    fields[1].trim().parse::<i64>().ok()
+        let value = fields.next()?.parse::<i64>().ok()?;
+        (value >= 0 && fields.next().is_none()).then_some(value)
+    })
 }
 
 // Calculate the cpu usage in millicores from cgroups filesystem.
@@ -161,53 +237,24 @@ pub(crate) fn calculate_cpu_usage(
     }
 }
 
-// Check whether the cgroup is v2.
-// - Return `true` if the cgroup is v2, otherwise return `false`.
-// - Return `None` if the detection fails or not on linux.
-fn is_cgroup_v2() -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = Path::new(CGROUP_UNIFIED_MOUNTPOINT);
-        let fs_stat = statfs(path).ok()?;
-        Some(fs_stat.filesystem_type() == statfs::CGROUP2_SUPER_MAGIC)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    None
+fn read_value_from_file<P: AsRef<Path>>(path: P) -> Option<i64> {
+    read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn read_value_from_file<P: AsRef<Path>>(path: P) -> Option<i64> {
-    let content = read_to_string(&path).ok()?;
-
-    // If the content starts with "max", return `None`.
-    if content.starts_with(MAX_VALUE_CGROUP_V2) {
+fn cpu_limit(quota: i64, period: i64) -> Option<i64> {
+    if quota <= 0 || period <= 0 {
         return None;
     }
-
-    content.trim().parse::<i64>().ok()
+    quota.checked_mul(1000)?.checked_div(period)
 }
 
 fn get_cgroup_v2_cpu_limit<P: AsRef<Path>>(path: P) -> Option<i64> {
-    let content = read_to_string(&path).ok()?;
-
-    let fields = content.trim().split(' ').collect::<Vec<&str>>();
+    let content = read_to_string(path).ok()?;
+    let fields: Vec<_> = content.split_whitespace().collect();
     if fields.len() != 2 {
         return None;
     }
-
-    // If the cgroup cpu limit is unset, return `None`.
-    let quota = fields[0].trim();
-    if quota == MAX_VALUE_CGROUP_V2 {
-        return None;
-    }
-
-    let quota = quota.parse::<i64>().ok()?;
-
-    let period = fields[1].trim();
-    let period = period.parse::<i64>().ok()?;
-
-    // Return the cpu limit in millicores.
-    Some(quota * 1000 / period)
+    cpu_limit(fields[0].parse().ok()?, fields[1].parse().ok()?)
 }
 
 /// A collector that collects cgroups metrics.
@@ -249,17 +296,15 @@ impl Collector for CgroupsMetricsCollector {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
+        let mut mfs = Vec::with_capacity(self.descs.len());
         if let Some(cpu_usage) = get_cpu_usage_from_cgroups() {
             self.cpu_usage.set(cpu_usage);
+            mfs.extend(self.cpu_usage.collect());
         }
-
         if let Some(memory_usage) = get_memory_usage_from_cgroups() {
             self.memory_usage.set(memory_usage);
+            mfs.extend(self.memory_usage.collect());
         }
-
-        let mut mfs = Vec::with_capacity(self.descs.len());
-        mfs.extend(self.cpu_usage.collect());
-        mfs.extend(self.memory_usage.collect());
         mfs
     }
 }
@@ -295,5 +340,77 @@ mod tests {
             get_cgroup_v2_cpu_limit(Path::new("non_existent_file")),
             None
         );
+    }
+    #[test]
+    fn test_process_mount_mapping() {
+        let mounts = "31 20 0:28 / /sys/fs/cgroup rw - cgroup2 cgroup rw";
+        let path = resolve_controller("0::/user.slice/user-1000.slice/job.scope", mounts, "memory")
+            .unwrap();
+        assert_eq!(
+            path.directory,
+            Path::new("/sys/fs/cgroup/user.slice/user-1000.slice/job.scope")
+        );
+        let mounts = "31 20 0:28 /tenant /visible rw - cgroup2 cgroup rw";
+        assert_eq!(
+            resolve_controller("0::/tenant/job", mounts, "cpu")
+                .unwrap()
+                .directory,
+            Path::new("/visible/job")
+        );
+        assert_eq!(
+            resolve_controller("0::/", mounts, "cpu").unwrap().directory,
+            Path::new("/visible")
+        );
+        assert!(resolve_controller("0::/elsewhere/job", mounts, "cpu").is_none());
+        assert!(resolve_controller("0::/../../escape", mounts, "cpu").is_none());
+        let mounts = "31 20 0:28 / /cg/memory rw - cgroup cgroup rw,memory\n32 20 0:29 / /cg/cpu rw - cgroup cgroup rw,cpu,cpuacct";
+        assert_eq!(
+            resolve_controller("5:memory:/job\n4:cpu,cpuacct:/job", mounts, "memory")
+                .unwrap()
+                .directory,
+            Path::new("/cg/memory/job")
+        );
+        assert!(
+            !resolve_controller("4:cpu,cpuacct:/job", mounts, "cpuacct")
+                .unwrap()
+                .v2
+        );
+        let hybrid_mounts = format!("{mounts}\n33 20 0:30 / /cg/unified rw - cgroup2 cgroup rw");
+        assert_eq!(
+            resolve_controller("4:cpu,cpuacct:/job\n0::/other", &hybrid_mounts, "cpu")
+                .unwrap()
+                .directory,
+            Path::new("/cg/cpu/job")
+        );
+        assert!(resolve_controller("bad", "bad", "cpu").is_none());
+    }
+
+    #[test]
+    fn test_inherited_limits_and_parsing() {
+        let path = ControllerPath {
+            directory: PathBuf::from("/cg/a/b"),
+            mount: PathBuf::from("/cg"),
+            v2: true,
+        };
+        let limit = path.minimum_limit(|p| {
+            // Assert that no inaccessible ancestor escapes the mount boundary.
+            assert!(p.starts_with("/cg"));
+            if p == Path::new("/cg/a") {
+                Some(100)
+            } else if p == Path::new("/cg") {
+                Some(200)
+            } else {
+                None
+            }
+        });
+        assert_eq!(limit, Some(100));
+        assert_eq!(
+            cpu_usage_usec("user_usec 99\nusage_usec 1234\nsystem_usec 5"),
+            Some(1234)
+        );
+        assert_eq!(cpu_usage_usec("usage_usec broken"), None);
+        assert_eq!(cpu_limit(-1, 1000), None);
+        assert_eq!(cpu_limit(1000, 0), None);
+        assert_eq!(cpu_limit(i64::MAX, 1), None);
     }
 }
