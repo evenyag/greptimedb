@@ -525,11 +525,12 @@ fn scan_series_file_ranges(
             let build_cost = build_start.elapsed();
             reader_metrics.build_cost += build_cost;
             part_metrics.inc_build_reader_cost(build_cost);
-            let Some(mut reader) = reader else {
+            let Some(reader) = reader else {
                 continue;
             };
 
             let _reader_guard = part_metrics.series_reader_guard();
+            let mut reader = reader;
             let scan_start = Instant::now();
             let file_sequence_trusted = range
                 .file_handle()

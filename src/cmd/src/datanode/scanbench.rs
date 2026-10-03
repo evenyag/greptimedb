@@ -125,6 +125,10 @@ pub struct ScanbenchCommand {
     #[clap(long, default_value = "bare")]
     path_type: String,
 
+    /// Skip verbose reader/fetch diagnostics for separate timing attempts.
+    #[clap(long, default_value_t = false, conflicts_with_all = ["verbose", "write_reference", "compare_reference", "check_series_order"])]
+    timing_only: bool,
+
     /// Verbose output
     #[clap(short, long, default_value_t = false)]
     verbose: bool,
@@ -1016,7 +1020,8 @@ impl ScanbenchCommand {
             .iter()
             .map(|config| QueryRunSummary::new(config.name.clone()))
             .collect::<Vec<_>>();
-        let collect_scanner_explain = self.verbose || self.result_file.is_some();
+        let collect_scanner_explain =
+            !self.timing_only && (self.verbose || self.result_file.is_some());
 
         for iteration in 0..run_count {
             let query_index = scan_config_set.query_index(iteration);
@@ -1325,12 +1330,13 @@ impl ScanbenchCommand {
                         })
                         .collect(),
                     effective_settings: serde_json::json!({
-                        "mode": scanner_explain.split("\"mode\":\"").nth(1).and_then(|s| s.split('"').next()),
-                        "source_policy": "selected_series_per_partition",
+                        "mode": format!("{}", VerboseScannerDisplay(scanner.as_ref())).split("\"mode\":\"").nth(1).and_then(|s| s.split('"').next()),
+                        "source_policy": if self.scanner == "series" && engine.mito_config().experimental_series_scan_v2 { "selected_series_per_partition" } else { "native" },
                         "query_memory_budget_bytes": null,
                         "spill_threshold_bytes": null,
                         "ipc_layout": "not_applicable",
-                        "batch_rows": 8192,
+                        "batch_rows": mito2::sst::parquet::DEFAULT_READ_BATCH_SIZE,
+                        "timing_only": self.timing_only,
                         "actual_output_partitions": num_partitions,
                         "retained_data": self.retained_data,
                         "exact_comparison": self.compare_reference.is_some(),

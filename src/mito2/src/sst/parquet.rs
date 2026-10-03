@@ -56,7 +56,7 @@ pub const PARQUET_METADATA_KEY: &str = "greptime:metadata";
 /// This is a runtime-only scan granularity, so we align it with DataFusion's
 /// default execution batch size to reduce rebatching and concatenation in the
 /// query pipeline.
-pub(crate) const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
+pub const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
 
 /// JSON2 physical layouts requested by a compaction read.
 pub(crate) type Json2RewriteTargets = Arc<BTreeMap<ColumnId, Json2TargetLayout>>;

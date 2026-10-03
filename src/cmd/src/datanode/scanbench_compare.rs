@@ -82,7 +82,7 @@ impl ExactRowComparison {
                 (f.name().clone(), ty.clone())
             })
             .collect::<Vec<_>>();
-        let schema = format!("{fields:?}");
+        let schema = format!("{fields:?}; order={}", self.check_order);
         if let Some(previous) = &self.schema {
             if previous != &schema {
                 return Err("logical schema changed within a partition".into());
@@ -138,31 +138,38 @@ impl ExactRowComparison {
             .ok_or("missing row converter")?
             .convert_columns(&columns)
             .map_err(|e| e.to_string())?;
-        if let Some(converter) = &self.order_converter {
-            let order = converter
-                .convert_columns(
+        let order = self
+            .order_converter
+            .as_ref()
+            .map(|converter| {
+                converter.convert_columns(
                     &self
                         .order_columns
                         .iter()
                         .map(|&i| columns[i].clone())
                         .collect::<Vec<_>>(),
                 )
-                .map_err(|e| e.to_string())?;
-            for row in order.iter() {
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        for (index, row) in rows.iter().enumerate() {
+            if let Some(order) = &order {
+                let key = order.row(index);
                 if self
                     .previous_order
                     .as_ref()
-                    .is_some_and(|previous| previous.as_slice() > row.as_ref())
+                    .is_some_and(|previous| previous.as_slice() > key.as_ref())
                 {
                     return Err(format!(
-                        "series/time ordering decreased near row {}",
+                        "series/time ordering decreased at row {}",
                         self.rows
                     ));
                 }
-                self.previous_order = Some(row.as_ref().to_vec());
+                self.previous_order = Some(key.as_ref().to_vec());
+                // An exact key frame also permits bounded cross-partition merging
+                // of reference artifacts without decoding logical-value frames.
+                self.frame(key.as_ref())?;
             }
-        }
-        for row in rows.iter() {
             self.frame(row.as_ref())?;
             self.rows += 1;
         }
