@@ -1325,7 +1325,7 @@ impl ScanbenchCommand {
                         })
                         .collect(),
                     effective_settings: serde_json::json!({
-                        "mode": scanner_explain.split("mode=").nth(1).map(|s| s.split([',', ' ']).next().unwrap_or(s)),
+                        "mode": scanner_explain.split("\"mode\":\"").nth(1).and_then(|s| s.split('"').next()),
                         "source_policy": "selected_series_per_partition",
                         "query_memory_budget_bytes": null,
                         "spill_threshold_bytes": null,
