@@ -82,6 +82,7 @@ struct PartitionScanStats {
     batches: u64,
     array_mem_size: u64,
     max_batch_array_mem_size: u64,
+    allocator_first_batch: serde_json::Value,
     estimated_size: u64,
     first_batch_elapsed: Option<Duration>,
     elapsed: Duration,
@@ -283,6 +284,7 @@ struct ScanRunResult {
     elapsed_ns: u64,
     array_mem_size_bytes: u64,
     max_output_batch_array_mem_size_bytes: u64,
+    allocator_snapshot: serde_json::Value,
     estimated_size_bytes: u64,
     partitions: Vec<PartitionResult>,
     scanner_explain: String,
@@ -297,6 +299,7 @@ struct PartitionResult {
     batches: u64,
     array_mem_size_bytes: u64,
     max_output_batch_array_mem_size_bytes: u64,
+    allocator_snapshot: serde_json::Value,
     estimated_size_bytes: u64,
     first_batch_elapsed_ns: Option<u64>,
     elapsed_ns: u64,
@@ -321,6 +324,18 @@ struct QueryResultSummary {
     total_elapsed_ns: u64,
     mean_rows: u64,
     mean_elapsed_ns: u64,
+}
+
+/// Process-wide point-in-time statistics, separate from Arrow ownership and RSS.
+fn allocator_snapshot() -> serde_json::Value {
+    common_mem_prof::allocator_stats()
+        .map(|stats| {
+            serde_json::json!({
+                "allocated": stats.allocated, "active": stats.active, "resident": stats.resident,
+                "mapped": stats.mapped, "retained": stats.retained,
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -1108,6 +1123,7 @@ impl ScanbenchCommand {
                     .as_ref()
                     .map(|d| d.join(format!("partition-{partition_idx}.rows")));
                 let check_order = self.check_series_order;
+                let diagnostic = !self.timing_only;
                 let exact = write.is_some() || compare.is_some() || check_order;
                 scan_futures.push(tokio::spawn(async move {
                     let mut comparison = if exact {
@@ -1131,11 +1147,15 @@ impl ScanbenchCommand {
                     let mut max_batch_array_mem_size = 0u64;
                     let mut estimated_size = 0u64;
                     let mut first_batch_elapsed = None;
+                    let mut allocator_first_batch = serde_json::Value::Null;
                     while let Some(batch_result) = stream.next().await {
                         match batch_result {
                             Ok(batch) => {
                                 if first_batch_elapsed.is_none() {
                                     first_batch_elapsed = Some(partition_start.elapsed());
+                                    if diagnostic {
+                                        allocator_first_batch = allocator_snapshot();
+                                    }
                                 }
                                 batches += 1;
                                 rows += batch.num_rows() as u64;
@@ -1193,6 +1213,7 @@ impl ScanbenchCommand {
                         batches,
                         array_mem_size,
                         max_batch_array_mem_size,
+                        allocator_first_batch,
                         estimated_size,
                         first_batch_elapsed,
                         elapsed: partition_start.elapsed(),
@@ -1329,6 +1350,7 @@ impl ScanbenchCommand {
                     scan_elapsed_ns: duration_ns(scan_elapsed),
                     elapsed_ns: duration_ns(elapsed),
                     array_mem_size_bytes: total_array_mem_size,
+                    allocator_snapshot: if self.timing_only { serde_json::Value::Null } else { allocator_snapshot() },
                     max_output_batch_array_mem_size_bytes: partition_stats.iter().map(|stats| stats.max_batch_array_mem_size).max().unwrap_or_default(),
                     estimated_size_bytes: total_estimated_size,
                     partitions: partition_stats
@@ -1339,6 +1361,7 @@ impl ScanbenchCommand {
                             batches: stats.batches,
                             array_mem_size_bytes: stats.array_mem_size,
                             max_output_batch_array_mem_size_bytes: stats.max_batch_array_mem_size,
+                            allocator_snapshot: stats.allocator_first_batch.clone(),
                             estimated_size_bytes: stats.estimated_size,
                             first_batch_elapsed_ns: stats.first_batch_elapsed.map(duration_ns),
                             elapsed_ns: duration_ns(stats.elapsed),
@@ -1748,6 +1771,7 @@ mod tests {
                 elapsed_ns: 90,
                 array_mem_size_bytes: 1024,
                 max_output_batch_array_mem_size_bytes: 1024,
+                allocator_snapshot: serde_json::Value::Null,
                 estimated_size_bytes: 512,
                 partitions: vec![PartitionResult {
                     partition: 0,
@@ -1755,6 +1779,7 @@ mod tests {
                     batches: 2,
                     array_mem_size_bytes: 1024,
                     max_output_batch_array_mem_size_bytes: 1024,
+                    allocator_snapshot: serde_json::Value::Null,
                     estimated_size_bytes: 512,
                     first_batch_elapsed_ns: Some(20),
                     elapsed_ns: 80,
