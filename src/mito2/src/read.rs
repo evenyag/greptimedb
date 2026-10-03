@@ -22,6 +22,7 @@ pub mod flat_merge;
 pub mod flat_projection;
 pub mod last_row;
 pub(crate) mod memory_diagnostics;
+pub use memory_diagnostics::{retained_batch_buffer_size, retained_batch_buffer_snapshot};
 pub mod projection;
 pub(crate) mod prune;
 pub(crate) mod pruner;

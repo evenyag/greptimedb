@@ -81,6 +81,25 @@ pub(crate) async fn build_object_store(config: &StorageConfig) -> error::Result<
         })
 }
 
+/// Opens existing file storage without the server initializer's temp cleanup.
+pub(crate) fn build_research_object_store(config: &StorageConfig) -> error::Result<ObjectStore> {
+    if !matches!(
+        config.store,
+        object_store::config::ObjectStoreConfig::File(_)
+    ) {
+        return error::IllegalConfigSnafu {
+            msg: "research mode currently requires file storage".to_string(),
+        }
+        .fail();
+    }
+    ObjectStore::new(object_store::services::Fs::default().root(&config.data_home)).map_err(|e| {
+        error::IllegalConfigSnafu {
+            msg: format!("failed to open research file storage: {e}"),
+        }
+        .build()
+    })
+}
+
 pub(crate) fn extract_region_metadata(
     file_path: &str,
     metadata: &ParquetMetaData,
@@ -221,6 +240,21 @@ pub(crate) fn compression_name(compression: Compression) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_research_storage_preserves_temp_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let temp = directory.path().join("tmp");
+        std::fs::create_dir(&temp).unwrap();
+        let retained = temp.join("retained");
+        std::fs::write(&retained, b"keep").unwrap();
+        let config = StorageConfig {
+            data_home: directory.path().display().to_string(),
+            ..Default::default()
+        };
+        build_research_object_store(&config).unwrap();
+        assert_eq!(std::fs::read(retained).unwrap(), b"keep");
+    }
 
     #[test]
     fn test_parse_region_and_path_type() {

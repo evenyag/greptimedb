@@ -67,7 +67,7 @@ static READ_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
 });
 
 /// Runtime SST read size, overridden once per process by `GREPTIME_MITO_READ_BATCH_SIZE`.
-pub(crate) fn read_batch_size() -> usize {
+pub fn read_batch_size() -> usize {
     *READ_BATCH_SIZE
 }
 

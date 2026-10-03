@@ -577,6 +577,14 @@ impl RegionScanner for SeriesScan {
 
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
         self.properties.prepare(request);
+        if crate::read::memory_diagnostics::plan_diagnostics_enabled() {
+            crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                "format_version": 1, "phase": "prepared",
+                "region_id": self.stream_ctx.input.region_metadata().region_id.as_u64(),
+                "actual_partitions": self.properties.partitions.len(),
+                "ranges_per_partition": self.properties.partitions.iter().map(Vec::len).collect::<Vec<_>>()
+            }));
+        }
 
         self.check_scan_limit().map_err(BoxedError::new)?;
 

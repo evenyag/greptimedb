@@ -554,6 +554,35 @@ impl ScanRegion {
             self.version.options.append_mode,
         );
 
+        if crate::read::memory_diagnostics::plan_diagnostics_enabled() {
+            let scan_id = format!("{region_id}:{:?}", self.start_time);
+            crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                "format_version": 1, "phase": "initial", "scan_id": scan_id,
+                "region_id": region_id.as_u64(), "schema": self.version.metadata,
+                "requested_projection": self.request.projection,
+                "read_column_ids": read_col_ids,
+                "filters": self.request.filters.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "region_predicate": format!("{:?}", predicate.region_partition_expr()),
+                "timestamp_range": format!("{time_range:?}"),
+                "distribution": format!("{:?}", self.request.distribution),
+                "series_selector": format!("{:?}", self.request.series_row_selector),
+                "file_count": files.len(), "batch_size": crate::sst::parquet::read_batch_size()
+            }));
+            for (index, file) in files.iter().enumerate() {
+                let (start, end) = file.time_range();
+                crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                    "format_version": 1, "phase": "manifest_file", "scan_id": scan_id,
+                    "index": index, "file_id": file.file_id().to_string(),
+                    "rows": file.num_rows(), "size": file.size(),
+                    "time_range": {"start": start.value(), "end": end.value(),
+                        "unit": format!("{:?}", start.unit()), "inclusive": true}
+                }));
+            }
+            crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                "format_version": 1, "phase": "manifest_files_complete", "scan_id": scan_id, "count": files.len()
+            }));
+        }
+
         let (non_field_filters, field_filters) = self.partition_by_field_filters();
         let inverted_index_appliers = [
             self.build_invereted_index_applier(&non_field_filters),
@@ -2155,6 +2184,13 @@ impl StreamContext {
         self: &Arc<Self>,
         filter_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
     ) -> Vec<bool> {
+        if crate::read::memory_diagnostics::plan_diagnostics_enabled() {
+            crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                "format_version": 1, "phase": "dynamic_filter_update",
+                "region_id": self.input.region_metadata().region_id.as_u64(),
+                "filters": filter_exprs.iter().map(ToString::to_string).collect::<Vec<_>>()
+            }));
+        }
         let mut supported = Vec::with_capacity(filter_exprs.len());
         let filter_expr = filter_exprs
             .into_iter()

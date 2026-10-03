@@ -604,8 +604,13 @@ impl FileRange {
         Ok(Some(FlatRowGroupReader::new(self.context.clone(), stream)))
     }
 
+    /// Selection retained for this row group, for opt-in diagnostic descriptions.
+    pub(crate) fn row_selection(&self) -> Option<&RowSelection> {
+        self.row_selection.as_ref()
+    }
+
     /// Returns the source SST row-group index.
-    pub(crate) fn row_group_index(&self) -> usize {
+    pub fn row_group_index(&self) -> usize {
         self.row_group_idx
     }
 

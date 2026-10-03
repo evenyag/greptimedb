@@ -66,3 +66,30 @@ pub fn set_gdump_active(_: bool) -> error::Result<()> {
 pub fn symbolicate_jeheap(_dump_content: &[u8]) -> error::Result<Vec<u8>> {
     error::ProfilingNotSupportedSnafu.fail()
 }
+
+/// Process-wide allocator statistics, independent of individual scan ownership.
+#[derive(Debug, Clone, Copy)]
+pub struct AllocatorStats {
+    pub allocated: usize,
+    pub active: usize,
+    pub resident: usize,
+    pub mapped: usize,
+    pub retained: usize,
+}
+
+/// Refreshes jemalloc's epoch before sampling; unavailable on unsupported platforms.
+pub fn allocator_stats() -> Option<AllocatorStats> {
+    #[cfg(not(windows))]
+    {
+        tikv_jemalloc_ctl::epoch::advance().ok()?;
+        Some(AllocatorStats {
+            allocated: tikv_jemalloc_ctl::stats::allocated::read().ok()?,
+            active: tikv_jemalloc_ctl::stats::active::read().ok()?,
+            resident: tikv_jemalloc_ctl::stats::resident::read().ok()?,
+            mapped: tikv_jemalloc_ctl::stats::mapped::read().ok()?,
+            retained: tikv_jemalloc_ctl::stats::retained::read().ok()?,
+        })
+    }
+    #[cfg(windows)]
+    None
+}

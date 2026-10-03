@@ -270,7 +270,7 @@ impl ParquetReaderBuilder {
 
     /// Sets the scan-wide hint for rows in a decoded batch.
     #[must_use]
-    pub(crate) fn batch_size(mut self, batch_size: usize) -> Self {
+    pub fn batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.clamp(1, read_batch_size());
         self
     }

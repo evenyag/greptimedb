@@ -23,6 +23,7 @@ mod parquet_meta;
 mod parquet_rewrite;
 #[allow(clippy::print_stdout)]
 pub mod parquetbench;
+mod research;
 #[allow(clippy::print_stdout)]
 pub mod scanbench;
 #[cfg(feature = "dev-tools")]

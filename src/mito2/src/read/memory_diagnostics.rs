@@ -127,6 +127,7 @@ pub(crate) struct MemoryUsage {
     sizes: BTreeMap<&'static str, u64>,
     enabled: bool,
     rows: u64,
+    allocations: BTreeMap<usize, usize>,
 }
 
 impl MemoryUsage {
@@ -143,6 +144,7 @@ impl MemoryUsage {
             sizes: BTreeMap::new(),
             enabled,
             rows: 0,
+            allocations: BTreeMap::new(),
         }
     }
 
@@ -181,6 +183,12 @@ impl MemoryUsage {
             return;
         }
         self.rows(batch.num_rows());
+        let allocations = batch_allocations(std::slice::from_ref(batch));
+        RETAINED_SET
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(&self.allocations, &allocations);
+        self.allocations = allocations;
         for (component, bytes) in batch_components(batch, tag_count) {
             self.set(component, bytes);
         }
@@ -192,6 +200,10 @@ impl Drop for MemoryUsage {
         if !self.enabled {
             return;
         }
+        RETAINED_SET
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(&self.allocations, &BTreeMap::new());
         let mut components = COMPONENTS.lock().unwrap_or_else(|e| e.into_inner());
         for (component, bytes) in &self.sizes {
             if let Some(entry) =
@@ -464,6 +476,21 @@ async fn process_rss() -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_live_owners_and_replacement() {
+        let mut set = RetainedSet::default();
+        let first = BTreeMap::from([(1, 128), (2, 64)]);
+        let second = BTreeMap::from([(1, 128), (3, 256)]);
+        set.replace(&BTreeMap::new(), &first);
+        set.replace(&BTreeMap::new(), &second);
+        assert_eq!(set.bytes, 448);
+        set.replace(&first, &BTreeMap::new());
+        assert_eq!(set.bytes, 384);
+        set.replace(&second, &BTreeMap::new());
+        assert_eq!(set.bytes, 0);
+        assert_eq!(set.peak, 448);
+    }
+
     #[tokio::test]
     async fn test_owner_releases_memory() {
         if !*ENABLED {
@@ -529,4 +556,97 @@ mod tests {
         .unwrap();
         assert!(scan.first_output.lock().unwrap().is_empty());
     }
+}
+
+/// Opt-in early scan descriptions, independent of successful ANALYZE completion.
+pub(crate) fn plan_diagnostics_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("GREPTIME_MITO_SCAN_PLAN_DIAGNOSTICS").is_ok_and(|v| v == "true")
+    });
+    *ENABLED
+}
+
+pub(crate) fn plan_event(event: serde_json::Value) {
+    if plan_diagnostics_enabled() {
+        common_telemetry::info!("mito_scan_plan {}", event);
+    }
+}
+
+/// Unique live allocations referenced by observed batch owners. Excludes decoder
+/// state and array/container overhead; it must not be summed with owner estimates.
+#[derive(Default)]
+struct RetainedSet {
+    allocations: BTreeMap<usize, (usize, usize)>,
+    bytes: usize,
+    peak: usize,
+}
+
+static RETAINED_SET: LazyLock<Mutex<RetainedSet>> = LazyLock::new(Mutex::default);
+
+impl RetainedSet {
+    fn replace(&mut self, old: &BTreeMap<usize, usize>, new: &BTreeMap<usize, usize>) {
+        for base in old.keys() {
+            if let Some((_, owners)) = self.allocations.get_mut(base) {
+                *owners -= 1;
+                if *owners == 0 {
+                    let bytes = self.allocations.remove(base).map_or(0, |(bytes, _)| bytes);
+                    self.bytes = self.bytes.saturating_sub(bytes);
+                }
+            }
+        }
+        for (base, size) in new {
+            let entry = self.allocations.entry(*base).or_insert_with(|| {
+                self.bytes += *size;
+                (*size, 0)
+            });
+            entry.1 += 1;
+        }
+        self.peak = self.peak.max(self.bytes);
+        MEMORY
+            .with_label_values(&["retained_set", "unique_batch_buffers", "shared"])
+            .set(self.bytes as i64);
+        MEMORY
+            .with_label_values(&["retained_set", "peak_unique_batch_buffers", "shared"])
+            .set(self.peak as i64);
+    }
+}
+
+fn batch_allocations(batches: &[RecordBatch]) -> BTreeMap<usize, usize> {
+    fn visit(data: &datatypes::arrow::array::ArrayData, allocations: &mut BTreeMap<usize, usize>) {
+        for buffer in data
+            .buffers()
+            .iter()
+            .chain(data.nulls().map(|n| n.buffer()))
+        {
+            let base = (buffer.as_ptr() as usize).wrapping_sub(buffer.ptr_offset());
+            let capacity = buffer.capacity().max(buffer.len());
+            allocations
+                .entry(base)
+                .and_modify(|size| *size = (*size).max(capacity))
+                .or_insert(capacity);
+        }
+        for child in data.child_data() {
+            visit(child, allocations);
+        }
+    }
+    let mut allocations = BTreeMap::new();
+    for batch in batches {
+        for array in batch.columns() {
+            visit(&array.to_data(), &mut allocations);
+        }
+    }
+    allocations
+}
+
+/// Retained buffer capacity, deduplicated across all supplied batches and slices.
+/// Excludes array/container overhead and allocator/codec state.
+pub fn retained_batch_buffer_size(batches: &[RecordBatch]) -> usize {
+    batch_allocations(batches).values().sum()
+}
+
+/// Process-wide current and peak retained capacity of observed live batch owners.
+/// The peak is process-lifetime; it excludes owners outside these diagnostics.
+pub fn retained_batch_buffer_snapshot() -> (usize, usize) {
+    let set = RETAINED_SET.lock().unwrap_or_else(|e| e.into_inner());
+    (set.bytes, set.peak)
 }

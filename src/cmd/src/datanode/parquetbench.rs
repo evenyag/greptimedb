@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,16 +43,24 @@ use store_api::region_request::PathType;
 use store_api::storage::consts::{PRIMARY_KEY_COLUMN_NAME, is_internal_column};
 use store_api::storage::{ColumnId, FileId, RegionId};
 
+use crate::datanode::research::{ResearchTrace, Trace, observe, process_memory};
 use crate::datanode::tool_util::{
-    build_object_store, extract_region_metadata, format_bytes, parse_config, parse_file_id,
-    parse_path_type, parse_region_id,
+    build_object_store, build_research_object_store, extract_region_metadata, format_bytes,
+    parse_config, parse_file_id, parse_path_type, parse_region_id,
 };
 use crate::error;
+use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray};
+use datatypes::arrow::datatypes::UInt32Type;
+use datatypes::arrow::record_batch::RecordBatch;
+use mito_codec::row_converter::{
+    CompositeValues, PrimaryKeyCodec, SparsePrimaryKeyCodec, build_primary_key_codec,
+};
+use serde_json::json;
 
 const DEFAULT_READ_BATCH_SIZE: usize = 8 * 1024;
 
 /// Parquet benchmark command - benchmarks scanning a single parquet SST directly.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub struct ParquetbenchCommand {
     /// Path to config TOML file (same format as standalone/datanode config)
     #[clap(long, value_name = "FILE")]
@@ -81,9 +90,9 @@ pub struct ParquetbenchCommand {
     #[clap(long, default_value = "1")]
     iterations: usize,
 
-    /// Number of rows per record batch for the direct reader.
-    #[clap(long, default_value_t = DEFAULT_READ_BATCH_SIZE, value_parser = parse_batch_size)]
-    batch_size: usize,
+    /// Number of rows per record batch. Flat-prune requires a matching runtime batch cap.
+    #[clap(long, value_parser = parse_batch_size)]
+    batch_size: Option<usize>,
 
     /// Path type for the region: bare, data, metadata
     #[clap(long, default_value = "bare")]
@@ -105,6 +114,18 @@ pub struct ParquetbenchCommand {
     /// Only affects the `direct` reader.
     #[clap(long, default_value_t = false)]
     pk_as_binary: bool,
+
+    /// Incremental bounded observations as JSONL (new file).
+    #[clap(long, value_name = "FILE")]
+    research_file: Option<PathBuf>,
+
+    /// Inventory referenced encoded keys and decoded source-schema tags.
+    #[clap(long, requires = "research_file")]
+    inventory_keys: bool,
+
+    /// JSON list of local SST paths; inventory keys across all files in one process.
+    #[clap(long, requires = "inventory_keys", conflicts_with_all = ["file_path", "file_id"])]
+    inventory_key_files: Option<PathBuf>,
 
     /// Reader implementation to benchmark.
     #[clap(long, value_enum, default_value = "direct")]
@@ -164,6 +185,68 @@ struct ParquetbenchSource {
 
 impl ParquetbenchCommand {
     pub async fn run(&self) -> error::Result<()> {
+        let trace = ResearchTrace::open(
+            self.research_file.as_deref(),
+            json!({
+                "tool": "parquetbench", "file_path": self.file_path, "file_id": self.file_id,
+                "config": self.config.as_ref().and_then(|p| std::fs::read_to_string(p).ok()),
+                "requested_batch_size": self.batch_size, "runtime_batch_cap": mito2::sst::parquet::read_batch_size(),
+                "reader": format!("{:?}", self.reader), "cache": "disabled",
+                "scan_config": self.scan_config.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+            }),
+        )?;
+        if self.inventory_keys && self.reader != ReaderMode::Direct {
+            return error::IllegalConfigSnafu {
+                msg: "key inventory requires direct reader".to_string(),
+            }
+            .fail();
+        }
+        let mut keys = KeyInventory::default();
+        if let Some(list) = &self.inventory_key_files {
+            let content = std::fs::read_to_string(list)
+                .map_err(|e| error::IllegalConfigSnafu { msg: e.to_string() }.build())?;
+            let paths: Vec<PathBuf> =
+                serde_json::from_str(&content).context(error::SerdeJsonSnafu)?;
+            for path in paths {
+                let mut command = self.clone();
+                command.file_path = Some(path);
+                command.run_file(&trace, &mut keys).await?;
+            }
+        } else {
+            self.run_file(&trace, &mut keys).await?;
+        }
+        observe(
+            &trace,
+            "key_inventory_summary",
+            json!({"unique_encoded_keys": keys.keys.len(),
+            "unique_series_identities": (keys.unknown_identity_keys == 0).then_some(keys.identities.len()),
+            "unknown_identity_encoded_keys": keys.unknown_identity_keys, "referenced_rows": keys.rows,
+            "encoded_key_bytes": keys.keys.iter().map(|k| k.len()).sum::<usize>(),
+            "encoded_key_capacity_bytes": keys.keys.iter().map(|k| k.capacity()).sum::<usize>(),
+            "key_set_capacity": keys.keys.capacity(), "identity_set_capacity": keys.identities.capacity(),
+            "inventory_own_structures": true, "process": process_memory()}),
+        );
+        drop(keys);
+        observe(&trace, "key_inventory_released", process_memory());
+        if let Some(trace) = trace {
+            trace.finish()?;
+        }
+        Ok(())
+    }
+
+    async fn run_file(&self, trace: &Trace, keys: &mut KeyInventory) -> error::Result<()> {
+        let batch_size = self.batch_size.unwrap_or_else(|| {
+            if self.reader == ReaderMode::Direct {
+                DEFAULT_READ_BATCH_SIZE
+            } else {
+                mito2::sst::parquet::read_batch_size()
+            }
+        });
+        observe(
+            trace,
+            "effective_batch_size",
+            json!({"requested": self.batch_size, "effective": batch_size}),
+        );
         if self.verbose {
             common_telemetry::init_default_ut_logging();
         }
@@ -179,7 +262,7 @@ impl ParquetbenchCommand {
         }
 
         let input = self.resolve_input()?;
-        let mut source = build_source(input).await?;
+        let mut source = build_source(input, trace.is_some()).await?;
 
         let file_size = source
             .object_store
@@ -206,6 +289,12 @@ impl ParquetbenchCommand {
                     }
                     .build()
                 })?;
+        observe(
+            trace,
+            "footer_loaded",
+            json!({"file": source.display_path,
+            "metadata_memory_size": parquet_meta.memory_size(), "process": process_memory()}),
+        );
         let region_meta = extract_region_metadata(&source.display_path, &parquet_meta)?;
         if source.table_dir.is_none() {
             source.region_id = region_meta.region_id;
@@ -213,6 +302,12 @@ impl ParquetbenchCommand {
             source.region_file_id = RegionFileId::new(source.region_id, source.file_id);
         }
         let scan_config = self.load_scan_config().await?;
+        observe(
+            trace,
+            "source_schema",
+            json!({"file": source.display_path, "schema": region_meta}),
+        );
+        let key_codec = build_primary_key_codec(&region_meta);
         let projection = if self.reader == ReaderMode::Direct {
             resolve_projection_names(&scan_config, &region_meta)?
         } else {
@@ -275,22 +370,13 @@ impl ParquetbenchCommand {
             }
             .cyan()
         );
-        match self.reader {
-            ReaderMode::Direct => {
-                println!("{} Batch size: {}", "✓".green(), self.batch_size);
-            }
-            ReaderMode::FlatPrune => {
-                println!(
-                    "{} Batch size: {} (flat-prune internal default)",
-                    "✓".green(),
-                    DEFAULT_READ_BATCH_SIZE
-                );
-                println!(
-                    "{} --batch-size is only used by the direct reader; ignoring {} in flat-prune mode",
-                    "ℹ".blue(),
-                    self.batch_size
-                );
-            }
+        println!("{} Batch size: {}", "✓".green(), batch_size);
+        if self.reader == ReaderMode::FlatPrune
+            && batch_size > mito2::sst::parquet::read_batch_size()
+        {
+            return error::IllegalConfigSnafu {
+                msg: "flat-prune batch exceeds GREPTIME_MITO_READ_BATCH_SIZE; set it before starting a fresh process".to_string(),
+            }.fail();
         }
         println!(
             "{} Parquet rows: {}, row groups: {}, file size: {}",
@@ -372,7 +458,10 @@ impl ParquetbenchCommand {
                         projection.clone(),
                         row_groups.clone(),
                         sst_schema.clone(),
-                        self.batch_size,
+                        batch_size,
+                        trace,
+                        keys,
+                        self.inventory_keys.then_some(key_codec.clone()),
                     )
                     .await?
                 }
@@ -396,6 +485,8 @@ impl ParquetbenchCommand {
                         projection_column_ids.clone(),
                         row_groups.clone(),
                         read_all_row_groups,
+                        batch_size,
+                        trace,
                     )
                     .await?
                 }
@@ -564,7 +655,10 @@ impl ParquetbenchCommand {
     }
 }
 
-async fn build_source(input: ParquetbenchInput) -> error::Result<ParquetbenchSource> {
+async fn build_source(
+    input: ParquetbenchInput,
+    research: bool,
+) -> error::Result<ParquetbenchSource> {
     match input {
         ParquetbenchInput::LocalFile { file_path } => build_local_file_source(&file_path),
         ParquetbenchInput::Region {
@@ -573,7 +667,12 @@ async fn build_source(input: ParquetbenchInput) -> error::Result<ParquetbenchSou
             table_dir,
             file_id,
             path_type,
-        } => build_region_source(&config, &region_id, table_dir, &file_id, path_type).await,
+        } => {
+            build_region_source(
+                &config, &region_id, table_dir, &file_id, path_type, research,
+            )
+            .await
+        }
     }
 }
 
@@ -652,6 +751,7 @@ async fn build_region_source(
     table_dir: String,
     file_id: &str,
     path_type: PathType,
+    research: bool,
 ) -> error::Result<ParquetbenchSource> {
     let region = parse_region_id(region_id)?;
     let file_id = parse_file_id(file_id)?;
@@ -659,7 +759,11 @@ async fn build_region_source(
     let file_path = sst_file_path(&table_dir, region_file_id, path_type);
 
     let (store_cfg, _mito_config, _wal_config) = parse_config(config)?;
-    let object_store = build_object_store(&store_cfg).await?;
+    let object_store = if research {
+        build_research_object_store(&store_cfg)?
+    } else {
+        build_object_store(&store_cfg).await?
+    };
 
     Ok(ParquetbenchSource {
         object_store,
@@ -684,6 +788,9 @@ async fn run_direct_iteration(
     row_groups: Vec<usize>,
     sst_schema: SchemaRef,
     batch_size: usize,
+    trace: &Trace,
+    keys: &mut KeyInventory,
+    codec: Option<Arc<dyn PrimaryKeyCodec>>,
 ) -> error::Result<IterationStats> {
     let parquet_meta = Arc::new(parquet_meta);
     let arrow_metadata = ArrowReaderMetadata::try_new(
@@ -707,7 +814,17 @@ async fn run_direct_iteration(
     };
     let start = Instant::now();
     let mut stats = IterationStats::default();
+    observe(
+        trace,
+        "arrow_metadata_constructed",
+        json!({"file": file_path, "process": process_memory()}),
+    );
     for row_group_idx in row_groups {
+        observe(
+            trace,
+            "reader_construction",
+            json!({"file": file_path, "row_group": row_group_idx, "process": process_memory()}),
+        );
         let fetcher = SstParquetRangeFetcher::new(
             region_file_id,
             file_path.clone(),
@@ -734,12 +851,42 @@ async fn run_direct_iteration(
             }
             .build()
         })?;
+        let mut first_batch = true;
         while let Some(batch) = stream.next().await.transpose().map_err(|e| {
             error::IllegalConfigSnafu {
                 msg: format!("Failed to scan parquet file {}: {e:?}", file_path),
             }
             .build()
         })? {
+            if first_batch {
+                observe(
+                    trace,
+                    "reader_first_batch",
+                    json!({"file": file_path, "row_group": row_group_idx,
+                    "rows": batch.num_rows(), "retained_batch_bytes": mito2::read::retained_batch_buffer_size(std::slice::from_ref(&batch)), "process": process_memory()}),
+                );
+                first_batch = false;
+            }
+            if let Some(trace) = trace {
+                trace.batch(
+                    &batch,
+                    json!({"file": file_path, "row_group": row_group_idx}),
+                );
+            }
+            if let Some(codec) = &codec {
+                let mut inventory = std::mem::take(keys);
+                let codec = codec.clone();
+                let batch = batch.clone();
+                let trace = trace.clone();
+                let source = file_path.clone();
+                inventory = tokio::task::spawn_blocking(move || {
+                    inventory.observe(&batch, codec.as_ref(), &trace, &source)?;
+                    Ok::<_, error::Error>(inventory)
+                })
+                .await
+                .map_err(|e| error::IllegalConfigSnafu { msg: e.to_string() }.build())??;
+                *keys = inventory;
+            }
             stats.rows += batch.num_rows();
             stats.record_batches += 1;
             stats.columns = batch.num_columns();
@@ -747,6 +894,12 @@ async fn run_direct_iteration(
                 stats.schema = Some(batch.schema());
             }
         }
+        drop(stream);
+        observe(
+            trace,
+            "reader_released",
+            json!({"file": file_path, "row_group": row_group_idx, "process": process_memory()}),
+        );
     }
     stats.elapsed = start.elapsed();
     Ok(stats)
@@ -762,8 +915,12 @@ async fn run_flat_prune_iteration(
     projection: Option<Vec<ColumnId>>,
     row_groups: Vec<usize>,
     read_all_row_groups: bool,
+    batch_size: usize,
+    trace: &Trace,
 ) -> error::Result<IterationStats> {
+    let file_id = file_handle.file_id().to_string();
     let reader_builder = ParquetReaderBuilder::new(table_dir, path_type, file_handle, object_store)
+        .batch_size(batch_size)
         .expected_metadata(Some(region_meta))
         .cache(CacheStrategy::Disabled)
         .projection(projection.map(ReadColumns::new));
@@ -794,7 +951,13 @@ async fn run_flat_prune_iteration(
         }
     }
 
-    for range in ranges {
+    for (range_index, range) in ranges.into_iter().enumerate() {
+        observe(
+            trace,
+            "reader_construction",
+            json!({"range": range_index, "process": process_memory()}),
+        );
+        let row_group = range.row_group_index();
         let Some(mut reader) = range.flat_reader(None, None).await.map_err(|e| {
             error::IllegalConfigSnafu {
                 msg: format!("build flat prune reader failed: {e:?}"),
@@ -804,12 +967,28 @@ async fn run_flat_prune_iteration(
         else {
             continue;
         };
+        let mut first_batch = true;
         while let Some(batch) = reader.next_batch().await.map_err(|e| {
             error::IllegalConfigSnafu {
                 msg: format!("scan flat prune reader failed: {e:?}"),
             }
             .build()
         })? {
+            if first_batch {
+                observe(
+                    trace,
+                    "reader_first_batch",
+                    json!({"file": file_id, "row_group": row_group,
+                    "rows": batch.num_rows(), "retained_batch_bytes": mito2::read::retained_batch_buffer_size(std::slice::from_ref(&batch)), "process": process_memory()}),
+                );
+                first_batch = false;
+            }
+            if let Some(trace) = trace {
+                trace.batch(
+                    &batch,
+                    json!({"range": range_index, "file": file_id, "row_group": row_group}),
+                );
+            }
             stats.rows += batch.num_rows();
             stats.record_batches += 1;
             stats.columns = batch.num_columns();
@@ -817,6 +996,12 @@ async fn run_flat_prune_iteration(
                 stats.schema = Some(batch.schema());
             }
         }
+        drop(reader);
+        observe(
+            trace,
+            "reader_released",
+            json!({"file": file_id, "row_group": row_group, "process": process_memory()}),
+        );
     }
 
     stats.elapsed = start.elapsed();
@@ -999,6 +1184,111 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec as u64))
 }
 
+/// Retains one encoded key per variant and one pair per actual series identity.
+#[derive(Default)]
+struct KeyInventory {
+    keys: HashSet<Vec<u8>>,
+    identities: HashSet<(u32, u64)>,
+    unknown_identity_keys: usize,
+    rows: u64,
+}
+
+impl KeyInventory {
+    fn observe(
+        &mut self,
+        batch: &RecordBatch,
+        codec: &dyn PrimaryKeyCodec,
+        trace: &Trace,
+        source: &str,
+    ) -> error::Result<()> {
+        let array = batch
+            .column_by_name(PRIMARY_KEY_COLUMN_NAME)
+            .ok_or_else(|| {
+                error::IllegalConfigSnafu {
+                    msg: "key inventory projection must include __primary_key".to_string(),
+                }
+                .build()
+            })?;
+        self.rows += batch.num_rows() as u64;
+        let mut referenced = HashSet::new();
+        let mut add = |key: &[u8]| -> error::Result<()> {
+            if self.keys.contains(key) {
+                return Ok(());
+            }
+            let decoded = codec.decode(key).map_err(|e| {
+                error::IllegalConfigSnafu {
+                    msg: format!("decode source key: {e}"),
+                }
+                .build()
+            })?;
+            let values = match decoded {
+                CompositeValues::Dense(values) => values,
+                CompositeValues::Sparse(values) => values
+                    .iter()
+                    .map(|(id, value)| (*id, value.clone()))
+                    .collect(),
+            };
+            let ids = SparsePrimaryKeyCodec::with_fields(Vec::new())
+                .decode_ids(key)
+                .ok();
+            if let Some(ids) = ids {
+                self.identities.insert(ids);
+            } else {
+                self.unknown_identity_keys += 1;
+            }
+            if let Some(trace) = trace {
+                trace.observe_required("unique_key", json!({
+                "source": source, "encoded_key_hex": key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "encoded_bytes": key.len(), "series_identity": ids, "decoded_source_values": values
+            }))?;
+            }
+            self.keys.insert(key.to_vec());
+            Ok(())
+        };
+        if let Some(dict) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            let values = dict
+                .values()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    error::IllegalConfigSnafu {
+                        msg: "key dictionary values must be binary".to_string(),
+                    }
+                    .build()
+                })?;
+            let mut previous = None;
+            for index in dict.keys().iter().flatten() {
+                if previous != Some(index) {
+                    referenced.insert(index as usize);
+                    previous = Some(index);
+                }
+            }
+            for index in &referenced {
+                if !values.is_null(*index) {
+                    add(values.value(*index))?;
+                }
+            }
+            observe(
+                trace,
+                "key_dictionary",
+                json!({"source": source, "dictionary_entries": values.len(),
+                "used_entries": referenced.len(), "value_array_memory_bytes": values.get_array_memory_size(),
+                "index_array_memory_bytes": dict.keys().get_array_memory_size(), "rows": batch.num_rows()}),
+            );
+        } else if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+            for key in values.iter().flatten() {
+                add(key)?;
+            }
+        } else {
+            return error::IllegalConfigSnafu {
+                msg: "key inventory needs binary or UInt32 dictionary keys".to_string(),
+            }
+            .fail();
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use api::v1::SemanticType;
@@ -1018,14 +1308,48 @@ mod tests {
             file_path: None,
             scan_config: None,
             iterations: 1,
-            batch_size: DEFAULT_READ_BATCH_SIZE,
+            batch_size: Some(DEFAULT_READ_BATCH_SIZE),
             path_type: "bare".to_string(),
             verbose: false,
             pprof_file: None,
             pprof_after_warmup: false,
             pk_as_binary: false,
             reader: ReaderMode::Direct,
+            research_file: None,
+            inventory_keys: false,
+            inventory_key_files: None,
         }
+    }
+
+    #[test]
+    fn test_referenced_keys_exclude_unused_dictionary_values() {
+        use datatypes::arrow::array::UInt32Array;
+        let codec = SparsePrimaryKeyCodec::with_fields(Vec::new());
+        let keys: Vec<Vec<u8>> = (1..=3)
+            .map(|tsid| {
+                let mut key = Vec::new();
+                codec.encode_internal(1071, tsid, &mut key).unwrap();
+                key
+            })
+            .collect();
+        let values = Arc::new(BinaryArray::from(
+            keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        ));
+        let dictionary =
+            DictionaryArray::<UInt32Type>::try_new(UInt32Array::from(vec![0, 0, 1]), values)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            PRIMARY_KEY_COLUMN_NAME,
+            dictionary.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dictionary)]).unwrap();
+        let mut inventory = KeyInventory::default();
+        inventory.observe(&batch, &codec, &None, "fixture").unwrap();
+        inventory.observe(&batch, &codec, &None, "fixture").unwrap();
+        assert_eq!(inventory.rows, 6);
+        assert_eq!(inventory.keys.len(), 2);
+        assert_eq!(inventory.identities.len(), 2);
     }
 
     fn new_test_metadata() -> RegionMetadata {

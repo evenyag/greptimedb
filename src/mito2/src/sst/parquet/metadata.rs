@@ -58,7 +58,7 @@ impl<'a> MetadataLoader<'a> {
         }
     }
 
-    pub(crate) fn with_page_index_policy(&mut self, page_index_policy: PageIndexPolicy) {
+    pub fn with_page_index_policy(&mut self, page_index_policy: PageIndexPolicy) {
         self.page_index_policy = page_index_policy;
     }
 

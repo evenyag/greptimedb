@@ -60,10 +60,13 @@ use store_api::region_request::{RegionOpenRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 use tokio::fs;
 
+use crate::datanode::research::{ResearchTrace, observe, process_memory};
 use crate::datanode::tool_util::{
-    build_object_store, format_bytes, parse_config, parse_path_type, parse_region_id,
+    build_object_store, build_research_object_store, format_bytes, parse_config, parse_path_type,
+    parse_region_id,
 };
 use crate::error;
+use serde_json::json;
 
 /// Displays a scanner using DataFusion's verbose explain format.
 struct VerboseScannerDisplay<'a, T: ?Sized>(&'a T);
@@ -134,6 +137,18 @@ pub struct ScanbenchCommand {
     /// Output structured benchmark and analyze results as JSON
     #[clap(long, value_name = "FILE")]
     result_file: Option<PathBuf>,
+
+    /// Incremental, bounded research observations as JSONL (new file).
+    #[clap(long, value_name = "FILE")]
+    research_file: Option<PathBuf>,
+
+    /// Inventory every active SST metadata, then exit without scanning samples.
+    #[clap(long, requires = "research_file")]
+    inventory_metadata: bool,
+
+    /// Inventory optional offset indexes in addition to footers (column indexes skipped).
+    #[clap(long, requires = "inventory_metadata")]
+    inventory_offset_index: bool,
 
     /// Enable WAL replay when opening the region.
     #[clap(long, default_value_t = false)]
@@ -775,6 +790,22 @@ impl ScanbenchCommand {
 
         println!("{}", "Starting scanbench...".cyan().bold());
         let benchmark_started_at_unix_ms = started_at_unix_ms();
+        let trace = ResearchTrace::open(
+            self.research_file.as_deref(),
+            json!({
+                "tool": "scanbench", "config_path": self.config, "config": std::fs::read_to_string(&self.config).ok(),
+                "region_id": self.region_id, "table_dir": self.table_dir, "path_type": self.path_type,
+                "requested_partitions": self.parallelism,
+                "effective_batch_size": mito2::sst::parquet::read_batch_size(),
+                "scan_config": self.scan_config.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+            }),
+        )?;
+        if self.parallelism == 0 {
+            return error::IllegalConfigSnafu {
+                msg: "parallelism must be positive".to_string(),
+            }
+            .fail();
+        }
 
         let scan_config_set = self.load_scan_config_set().await?;
 
@@ -788,10 +819,31 @@ impl ScanbenchCommand {
         );
 
         // Parse config and build object store
-        let (store_cfg, mito_config, wal_config) = parse_config(&self.config)?;
+        let (store_cfg, mut mito_config, wal_config) = parse_config(&self.config)?;
+        if trace.is_some() {
+            mito_config.experimental_enable_series_index = false;
+            mito_config.experimental_enable_range_index = false;
+            mito_config.gc.enable = false;
+            mito_config.schedule_compaction_after_edit = false;
+            mito_config.enable_write_cache = false;
+            mito_config.enable_refill_cache_on_read = false;
+            mito_config.preload_index_cache = false;
+            if let Some(parent) = self.research_file.as_ref().and_then(|path| path.parent()) {
+                mito_config.index.aux_path = parent.join("index-scratch").display().to_string();
+            }
+            observe(
+                &trace,
+                "engine_config",
+                json!({"config": format!("{mito_config:?}"), "process": process_memory()}),
+            );
+        }
         println!("{} Config parsed", "✓".green());
 
-        let object_store = build_object_store(&store_cfg).await?;
+        let object_store = if trace.is_some() {
+            build_research_object_store(&store_cfg)?
+        } else {
+            build_object_store(&store_cfg).await?
+        };
         println!("{} Object store initialized", "✓".green());
 
         let object_store_manager =
@@ -855,6 +907,12 @@ impl ScanbenchCommand {
             }
         };
 
+        observe(
+            &trace,
+            "engine_initialized",
+            json!({"effective_config": format!("{:?}", engine.mito_config()), "process": process_memory()}),
+        );
+
         // Open region
         let open_request = RegionOpenRequest {
             engine: "mito".to_string(),
@@ -878,6 +936,83 @@ impl ScanbenchCommand {
             .await
             .map_err(BoxedError::new)
             .context(error::BuildCliSnafu)?;
+        observe(
+            &trace,
+            "region_opened",
+            json!({"schema": metadata, "process": process_memory()}),
+        );
+        if self.inventory_metadata {
+            let (_, files) = engine
+                .find_memtable_and_sst_stats(region_id)
+                .map_err(BoxedError::new)
+                .context(error::BuildCliSnafu)?;
+            let mut retained = Vec::with_capacity(files.len());
+            observe(
+                &trace,
+                "metadata_inventory_start",
+                json!({"active_files": files.len(), "process": process_memory()}),
+            );
+            for file in &files {
+                let path = mito2::sst::location::sst_file_path(
+                    &self.table_dir,
+                    mito2::sst::file::RegionFileId::new(region_id, file.file_id),
+                    path_type,
+                );
+                let mut metrics = mito2::sst::parquet::reader::MetadataCacheMetrics::default();
+                let mut loader = mito2::sst::parquet::metadata::MetadataLoader::new(
+                    object_store.clone(),
+                    &path,
+                    file.file_size,
+                );
+                if self.inventory_offset_index {
+                    loader
+                        .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
+                }
+                let meta = loader
+                    .load(&mut metrics)
+                    .await
+                    .map_err(BoxedError::new)
+                    .context(error::BuildCliSnafu)?;
+                let groups: Vec<_> = meta.row_groups().iter().enumerate().map(|(index, group)| {
+                    json!({"index": index, "rows": group.num_rows(), "total_byte_size": group.total_byte_size(),
+                        "columns": group.columns().iter().map(|column| json!({
+                            "path": column.column_path().string(), "compressed_bytes": column.compressed_size(),
+                            "uncompressed_bytes": column.uncompressed_size(), "codec": format!("{:?}", column.compression()),
+                            "encodings": format!("{:?}", column.encodings().collect::<Vec<_>>()),
+                            "statistics": format!("{:?}", column.statistics())
+                        })).collect::<Vec<_>>()})
+                }).collect();
+                observe(
+                    &trace,
+                    "sst_metadata",
+                    json!({"file": file, "path": path,
+                    "metadata_memory_size": meta.memory_size(), "row_groups": groups,
+                    "offset_index_loaded": meta.offset_index().is_some(),
+                    "offset_index_page_locations_capacity_bytes": meta.offset_index().map(|groups| groups.iter().flatten()
+                        .map(|index| index.page_locations().capacity() * std::mem::size_of::<parquet::file::page_index::offset_index::PageLocation>()).sum::<usize>()),
+                    "schema": format!("{:?}", meta.file_metadata().schema_descr()),
+                    "metadata_policy": if self.inventory_offset_index { "Optional offset indexes; column indexes skipped" } else { "Skip offset/column indexes (default reader policy)" }, "process": process_memory()}),
+                );
+                retained.push(meta);
+            }
+            observe(
+                &trace,
+                "metadata_all_retained",
+                json!({"count": retained.len(),
+                "static_metadata_bytes": retained.iter().map(|m| m.memory_size()).sum::<usize>(), "process": process_memory()}),
+            );
+            drop(retained);
+            observe(&trace, "metadata_released", process_memory());
+            engine
+                .stop()
+                .await
+                .map_err(BoxedError::new)
+                .context(error::BuildCliSnafu)?;
+            if let Some(trace) = trace {
+                trace.finish()?;
+            }
+            return Ok(());
+        }
         let scan_configs = resolve_scan_configs(&scan_config_set, &metadata)?;
 
         // Build scan request
@@ -990,7 +1125,7 @@ impl ScanbenchCommand {
                 );
             }
 
-            if self.parallelism > 1 {
+            {
                 // Flatten all ranges
                 let all_ranges: Vec<_> = original_partitions.into_iter().flatten().collect();
 
@@ -1015,6 +1150,12 @@ impl ScanbenchCommand {
 
             // Scan all partitions
             let num_partitions = scanner.properties().partitions.len();
+            observe(
+                &trace,
+                "scanner_prepared",
+                json!({"iteration": iteration, "requested_partitions": self.parallelism,
+                "actual_partitions": num_partitions, "scanner": VerboseScannerDisplay(scanner.as_ref()).to_string(), "process": process_memory()}),
+            );
             let ctx = QueryScanContext {
                 explain_verbose: collect_scanner_explain,
             };
@@ -1030,6 +1171,7 @@ impl ScanbenchCommand {
                     .map_err(BoxedError::new)
                     .context(error::BuildCliSnafu)?;
 
+                let trace = trace.clone();
                 scan_futures.push(tokio::spawn(async move {
                     let partition_start = Instant::now();
                     let mut rows = 0u64;
@@ -1046,6 +1188,12 @@ impl ScanbenchCommand {
                                 batches += 1;
                                 rows += batch.num_rows() as u64;
                                 let df_batch = batch.df_record_batch();
+                                if let Some(trace) = &trace {
+                                    trace.batch(
+                                        df_batch,
+                                        json!({"partition": partition_idx, "iteration": iteration}),
+                                    );
+                                }
                                 array_mem_size += df_batch.get_array_memory_size() as u64;
                                 estimated_size +=
                                     mito2::memtable::record_batch_estimated_size(df_batch) as u64;
@@ -1330,6 +1478,9 @@ impl ScanbenchCommand {
         }
 
         println!("\n{}", "Benchmark completed!".green().bold());
+        if let Some(trace) = trace {
+            trace.finish()?;
+        }
         Ok(())
     }
 }

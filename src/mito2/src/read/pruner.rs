@@ -421,6 +421,17 @@ impl Pruner {
         // Build ranges
         let mut ranges = SmallVec::new();
         builder.build_ranges(index.row_group_index, &mut ranges);
+        if crate::read::memory_diagnostics::plan_diagnostics_enabled() {
+            let file = &self.inner.stream_ctx.input.files[file_index];
+            crate::read::memory_diagnostics::plan_event(serde_json::json!({
+                "format_version": 1, "phase": "selected_ranges",
+                "region_id": self.inner.stream_ctx.input.region_metadata().region_id.as_u64(),
+                "file_id": file.file_id().to_string(), "requested_row_group": index.row_group_index,
+                "ranges": ranges.iter().map(|range| serde_json::json!({
+                    "row_group": range.row_group_index(), "row_selection": format!("{:?}", range.row_selection())
+                })).collect::<Vec<_>>()
+            }));
+        }
 
         // Decrement ref count and clean up non-retained builders if needed.
         self.decrement_and_maybe_clear(file_index, reader_metrics);
