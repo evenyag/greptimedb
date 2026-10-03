@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_partition_releases_its_unpublished_payload() {
         let (publish, gate) = oneshot::channel();
-        let (dropped, mut released) = oneshot::channel();
+        let (dropped, released) = oneshot::channel();
         let mut receivers = start_preparation(2, async move {
             gate.await.unwrap();
             Ok(vec![DropSignal(Some(dropped)), DropSignal(None)])
