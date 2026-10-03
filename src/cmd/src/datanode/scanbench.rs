@@ -60,8 +60,10 @@ use store_api::region_request::{RegionOpenRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 use tokio::fs;
 
+use crate::datanode::scanbench_compare::ExactRowComparison;
 use crate::datanode::tool_util::{
-    build_object_store, format_bytes, parse_config, parse_path_type, parse_region_id,
+    build_object_store, build_research_object_store, format_bytes, parse_config, parse_path_type,
+    parse_region_id,
 };
 use crate::error;
 
@@ -134,6 +136,23 @@ pub struct ScanbenchCommand {
     /// Output structured benchmark and analyze results as JSON
     #[clap(long, value_name = "FILE")]
     result_file: Option<PathBuf>,
+
+    /// Open retained file storage with maintenance and temporary cleanup disabled.
+    /// The controller must also enforce a read-only data mount.
+    #[clap(long, default_value_t = false, conflicts_with = "enable_wal")]
+    retained_data: bool,
+
+    /// Write exact logical row references, one file per output partition.
+    #[clap(long, value_name = "DIRECTORY")]
+    write_reference: Option<PathBuf>,
+
+    /// Compare exact logical rows against per-partition reference files.
+    #[clap(long, value_name = "DIRECTORY")]
+    compare_reference: Option<PathBuf>,
+
+    /// Check increasing (table_id, tsid, timestamp) within each partition.
+    #[clap(long, default_value_t = false)]
+    check_series_order: bool,
 
     /// Enable WAL replay when opening the region.
     #[clap(long, default_value_t = false)]
@@ -261,6 +280,8 @@ struct ScanRunResult {
     estimated_size_bytes: u64,
     partitions: Vec<PartitionResult>,
     scanner_explain: String,
+    effective_settings: serde_json::Value,
+    execution_metrics: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -776,6 +797,25 @@ impl ScanbenchCommand {
         println!("{}", "Starting scanbench...".cyan().bold());
         let benchmark_started_at_unix_ms = started_at_unix_ms();
 
+        if self.parallelism == 0 || self.iterations == 0 {
+            return error::IllegalConfigSnafu {
+                msg: "parallelism and iterations must be positive".to_string(),
+            }
+            .fail();
+        }
+        if (self.write_reference.is_some() || self.compare_reference.is_some())
+            && (self.iterations != 1 || self.scan_configs.is_some())
+        {
+            return error::IllegalConfigSnafu {
+                msg: "exact comparison requires one scan config and one iteration".to_string(),
+            }
+            .fail();
+        }
+        if let Some(directory) = &self.write_reference {
+            fs::create_dir(directory)
+                .await
+                .context(error::FileIoSnafu)?;
+        }
         let scan_config_set = self.load_scan_config_set().await?;
 
         let region_id = parse_region_id(&self.region_id)?;
@@ -788,10 +828,31 @@ impl ScanbenchCommand {
         );
 
         // Parse config and build object store
-        let (store_cfg, mito_config, wal_config) = parse_config(&self.config)?;
+        let (store_cfg, mut mito_config, wal_config) = parse_config(&self.config)?;
         println!("{} Config parsed", "✓".green());
 
-        let object_store = build_object_store(&store_cfg).await?;
+        if self.retained_data {
+            mito_config.experimental_enable_series_index = false;
+            mito_config.experimental_enable_range_index = false;
+            mito_config.gc.enable = false;
+            mito_config.schedule_compaction_after_edit = false;
+            mito_config.enable_write_cache = false;
+            mito_config.enable_refill_cache_on_read = false;
+            mito_config.preload_index_cache = false;
+            mito_config.index.aux_path = self
+                .result_file
+                .as_ref()
+                .and_then(|p| p.parent())
+                .unwrap_or(std::path::Path::new("."))
+                .join("index-scratch")
+                .display()
+                .to_string();
+        }
+        let object_store = if self.retained_data {
+            build_research_object_store(&store_cfg)?
+        } else {
+            build_object_store(&store_cfg).await?
+        };
         println!("{} Object store initialized", "✓".green());
 
         let object_store_manager =
@@ -990,7 +1051,7 @@ impl ScanbenchCommand {
                 );
             }
 
-            if self.parallelism > 1 {
+            {
                 // Flatten all ranges
                 let all_ranges: Vec<_> = original_partitions.into_iter().flatten().collect();
 
@@ -1030,7 +1091,31 @@ impl ScanbenchCommand {
                     .map_err(BoxedError::new)
                     .context(error::BuildCliSnafu)?;
 
+                let write = self
+                    .write_reference
+                    .as_ref()
+                    .map(|d| d.join(format!("partition-{partition_idx}.rows")));
+                let compare = self
+                    .compare_reference
+                    .as_ref()
+                    .map(|d| d.join(format!("partition-{partition_idx}.rows")));
+                let check_order = self.check_series_order;
+                let exact = write.is_some() || compare.is_some() || check_order;
                 scan_futures.push(tokio::spawn(async move {
+                    let mut comparison = if exact {
+                        Some(
+                            ExactRowComparison::new(
+                                write.as_deref(),
+                                compare.as_deref(),
+                                check_order,
+                            )
+                            .map_err(|e| {
+                                BoxedError::new(PlainError::new(e, StatusCode::Unexpected))
+                            })?,
+                        )
+                    } else {
+                        None
+                    };
                     let partition_start = Instant::now();
                     let mut rows = 0u64;
                     let mut batches = 0u64;
@@ -1046,6 +1131,28 @@ impl ScanbenchCommand {
                                 batches += 1;
                                 rows += batch.num_rows() as u64;
                                 let df_batch = batch.df_record_batch();
+                                if let Some(mut comparator) = comparison.take() {
+                                    let owned = df_batch.clone();
+                                    comparison = Some(
+                                        common_runtime::spawn_blocking_global(move || {
+                                            comparator.consume(&owned)?;
+                                            Ok::<_, String>(comparator)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            BoxedError::new(PlainError::new(
+                                                e.to_string(),
+                                                StatusCode::Unexpected,
+                                            ))
+                                        })?
+                                        .map_err(|e| {
+                                            BoxedError::new(PlainError::new(
+                                                e,
+                                                StatusCode::Unexpected,
+                                            ))
+                                        })?,
+                                    );
+                                }
                                 array_mem_size += df_batch.get_array_memory_size() as u64;
                                 estimated_size +=
                                     mito2::memtable::record_batch_estimated_size(df_batch) as u64;
@@ -1054,6 +1161,19 @@ impl ScanbenchCommand {
                                 return Err(BoxedError::new(e));
                             }
                         }
+                    }
+                    if let Some(comparator) = comparison {
+                        common_runtime::spawn_blocking_global(move || comparator.finish())
+                            .await
+                            .map_err(|e| {
+                                BoxedError::new(PlainError::new(
+                                    e.to_string(),
+                                    StatusCode::Unexpected,
+                                ))
+                            })?
+                            .map_err(|e| {
+                                BoxedError::new(PlainError::new(e, StatusCode::Unexpected))
+                            })?;
                     }
                     Ok::<PartitionScanStats, BoxedError>(PartitionScanStats {
                         partition: partition_idx,
@@ -1204,6 +1324,22 @@ impl ScanbenchCommand {
                             elapsed_ns: duration_ns(stats.elapsed),
                         })
                         .collect(),
+                    effective_settings: serde_json::json!({
+                        "mode": scanner_explain.split("mode=").nth(1).map(|s| s.split([',', ' ']).next().unwrap_or(s)),
+                        "source_policy": "selected_series_per_partition",
+                        "query_memory_budget_bytes": null,
+                        "spill_threshold_bytes": null,
+                        "ipc_layout": "not_applicable",
+                        "batch_rows": 8192,
+                        "actual_output_partitions": num_partitions,
+                        "retained_data": self.retained_data,
+                        "exact_comparison": self.compare_reference.is_some(),
+                        "reference_written": self.write_reference.is_some(),
+                        "order_checked": self.check_series_order,
+                        "effective_engine_config": format!("{:?}", engine.mito_config()),
+                        "unavailable_phase_metrics": ["mapping_preflight", "spill_finalization", "readiness_wait", "final_replay", "tag_assembly", "cleanup", "data_phase_primary_key_pages", "catalog_index_capacity", "workspace_capacity"]
+                    }),
+                    execution_metrics: format!("{}", metrics_set.clone_inner()),
                     scanner_explain,
                 });
             }
@@ -1599,6 +1735,8 @@ mod tests {
                     first_batch_elapsed_ns: Some(20),
                     elapsed_ns: 80,
                 }],
+                effective_settings: serde_json::Value::Null,
+                execution_metrics: String::new(),
                 scanner_explain: "SeqScan: region=1024(0)".to_string(),
             }],
             summary: BenchmarkResultSummary {

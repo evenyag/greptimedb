@@ -26,6 +26,8 @@ pub mod parquetbench;
 #[allow(clippy::print_stdout)]
 pub mod scanbench;
 #[cfg(feature = "dev-tools")]
+mod scanbench_compare;
+#[cfg(feature = "dev-tools")]
 #[allow(clippy::print_stdout)]
 mod sst_replace;
 mod tool_util;

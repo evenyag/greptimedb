@@ -36,6 +36,9 @@ pub(crate) mod seq_scan;
 pub(crate) mod series_candidate;
 pub(crate) mod series_reader;
 pub mod series_scan;
+// Stage 1 harness; integrated with range preparation in Stage 4.
+#[cfg(test)]
+mod series_prepare;
 pub mod stream;
 pub(crate) mod unordered_scan;
 

@@ -81,6 +81,25 @@ pub(crate) async fn build_object_store(config: &StorageConfig) -> error::Result<
         })
 }
 
+/// Opens existing file storage without the server initializer's temp cleanup.
+pub(crate) fn build_research_object_store(config: &StorageConfig) -> error::Result<ObjectStore> {
+    if !matches!(
+        config.store,
+        object_store::config::ObjectStoreConfig::File(_)
+    ) {
+        return error::IllegalConfigSnafu {
+            msg: "research mode currently requires file storage".to_string(),
+        }
+        .fail();
+    }
+    ObjectStore::new(object_store::services::Fs::default().root(&config.data_home)).map_err(|e| {
+        error::IllegalConfigSnafu {
+            msg: format!("failed to open research file storage: {e}"),
+        }
+        .build()
+    })
+}
+
 pub(crate) fn extract_region_metadata(
     file_path: &str,
     metadata: &ParquetMetaData,
