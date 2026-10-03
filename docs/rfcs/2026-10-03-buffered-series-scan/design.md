@@ -2,7 +2,7 @@
 Feature Name: Buffered SeriesScan
 Date: 2026-10-03
 Updated: 2026-10-03
-Status: Draft revised after first review
+Status: Draft revised after VictoriaMetrics review
 ---
 
 # Summary
@@ -11,9 +11,11 @@ Add an experimental buffered SeriesScan mode while retaining current v2 as a
 baseline. Keep candidate discovery and change the series data-reading phase:
 prepare and merge partition-range results in independently scheduled tasks,
 buffer or spill those results, release their SST readers, and notify output
-partitions when their final-merge inputs are ready.
+partitions when their replay inputs and memory reservations are ready.
 
-Scan partition streams perform only final merge/replay and output assembly.
+Scan partition streams perform only final replay and output assembly. Enumerate
+compact identities in order and lazily concatenate each identity's complete,
+non-overlapping ranges in timestamp order, without opening every range payload.
 Source reading, range-result preparation, spilling, and readiness coordination
 run outside those streams. This keeps preparation concurrency independent of
 the number and polling order of output partitions.
@@ -68,12 +70,43 @@ reader. The existing reader_by_series path already uses range-index or cached
 row mappings to select absolute row runs; the new path changes key synthesis
 and postpones tag attachment.
 
+# VictoriaMetrics implementation comparison
+
+The local VictoriaMetrics report is at
+/Users/evenyag/Documents/test/promql-k8s-memory/reports/victoriametrics-range-query-storage-and-memory.md.
+The review used master revision f98ae84aea7bc850698d9e088a704ffda8ac0403 for
+storage iteration and cluster revision 1c8a01206261a899badfe21038858f70eee5a928
+for vmselect staging and evaluation. These are implementation observations,
+not comparative benchmarks.
+
+| Aspect | VictoriaMetrics cluster path | Buffered SeriesScan |
+| --- | --- | --- |
+| Staged payload | Compressed storage blocks, indexed by series. | Completely merged range results in resident Arrow batches or IPC files. |
+| Completion boundary | Accepted fetches finish and staging is finalized before series evaluation. | Complete preparation and reserve replay memory before publishing manifests. |
+| Active-series processing | Decode all collected blocks, merge samples, then invoke evaluation. | Replay bounded batches from complete ranges and attach tags during output assembly. |
+| Spill accounting | In-memory capacity per staging object; does not bound decoded samples or total query memory. | One query-local tracker across partitions, with separate spill threshold and hard budget. |
+
+VictoriaMetrics orders storage block references using series and minimum
+timestamp metadata, but blocks can overlap and still require a decoded sample
+merge. GreptimeDB can use a stronger invariant after overlapping sources have
+been completely merged into disjoint ranges. Share the ideas of indexed staging,
+explicit completion, and owned scratch cleanup while retaining our format and
+deduplication semantics. In particular, do not materialize a whole decoded
+series merely to replay it.
+
+Pinned source references:
+
+- [Storage block reads](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/f98ae84aea7bc850698d9e088a704ffda8ac0403/lib/storage/search.go): BlockRef.MustReadBlock.
+- [Storage reference ordering](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/f98ae84aea7bc850698d9e088a704ffda8ac0403/lib/storage/partition_search.go): partitionSearch.NextBlock.
+- [Fetch completion and series processing](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/1c8a01206261a899badfe21038858f70eee5a928/app/vmselect/netstorage/netstorage.go): ProcessSearchQuery, Finalize, unpackTo, and mergeSortBlocks.
+- [Temporary compressed staging](https://github.com/VictoriaMetrics/VictoriaMetrics/blob/1c8a01206261a899badfe21038858f70eee5a928/app/vmselect/netstorage/tmp_blocks_file.go): WriteBlockData, Finalize, and MustClose.
+
 # Review decisions and scope
 
-The first review establishes these requirements:
+The reviews establish these requirements:
 
 - Preparation tasks run outside scan partition streams. Notify a partition only
-  when the inputs needed for its final merge are complete and replayable.
+  when its inputs are complete and replayable and replay workspace is reserved.
 - Limit memory rather than reader count or merge fan-in. Fail a merge only if
   its required working memory cannot fit after preparation-time reclamation.
   Do not add intermediate external merge passes.
@@ -87,6 +120,13 @@ The first review establishes these requirements:
   batches containing multiple series.
 - Do not read SST __primary_key pages in the new series data phase. Obtain IDs
   from range indexes or cached row mappings and encode the compact key.
+- Preflight mapping coverage even when candidate caches or series indexes avoid
+  reading SST keys during discovery. Fill missing mappings before data reads.
+- Use an explicit tag-free internal schema for merge and deduplication.
+- Replay each identity by lazily concatenating complete non-overlapping ranges.
+  Reserve aggregate replay workspace before freezing resident result placement.
+- Share immutable IPC file metadata across independent replay cursors and
+  measure footer, dictionary, and initialization costs alongside payload bytes.
 
 Preserve v2 as a baseline, opt-in rollout, explicit budget sweeps, the shared
 selected-series read experiment, and file-backed data-result caching for the
@@ -111,7 +151,7 @@ external merge, and migration of every cache consumer are outside this work.
 | Series identity | The pair (table_id, tsid), also used for compact merge keys. |
 | Range result | Sorted, completely merged output for one partition range and its selected-series scope. |
 | Series span | Positions of one identity within resident batches or IPC-file batches. |
-| Readiness manifest | Complete result handles and tag context needed by an output partition for an assignment. |
+| Readiness manifest | Complete result handles, ordered range spans, tag context, and replay reservation needed by an output partition for an assignment. |
 | Live reader | Initialized Parquet reader retaining decoder/fetch state, including a paused reader. |
 
     existing candidate discovery and decoded tag catalog
@@ -121,7 +161,7 @@ external merge, and migration of every cache consumer are outside this work.
            query-local accounting -> resident results or Arrow IPC files
       -> complete readiness manifest for each output assignment
       -> notification to scan partition
-           indexed final replay/merge using (table_id, tsid)
+           indexed final replay by (table_id, tsid), then range timestamp order
            attach decoded tags and apply output projection
            yield output RecordBatches
 
@@ -135,9 +175,13 @@ by its current assignment. A missing/empty contribution must be explicitly
 complete, not mistaken for work still in progress. Manifest publication is the
 boundary after which those results are immutable and no longer spillable.
 
-A first prototype can publish after all preparation completes. Later it can
-publish complete assignments earlier; it must not treat one finished range as
-permission to emit a series whose other contributing ranges are still pending.
+The first prototype keeps a complete-preparation barrier, finalizes result
+placement, and acquires aggregate replay reservations before publishing any
+manifest. Later it can publish complete assignments earlier, provided frozen
+results, replay reservations, and remaining preparation workspace fit together.
+It must not treat one finished range as permission to emit a series whose other
+contributing ranges are still pending or wait for an unpolled partition to
+release memory needed to complete preparation.
 
 Use an owned readiness state or notification mechanism that does not block
 preparation on an unpolled output partition. Notifications carry handles and
@@ -158,12 +202,20 @@ __primary_key. Build compact dictionaries from identities, without constructing
 or slicing a full encoded tag key. Data merge order is compact key, timestamp
 ascending, and sequence descending; deduplication uses identity and timestamp.
 
-Candidate discovery supplies decoded projected tags and row mappings. Without
-a range index, candidate discovery can populate mappings while it reads keys.
-Before data reads start, require mapping coverage for their source row groups.
-If required identity metadata is unavailable, fail the buffered-mode query
-with a clear error. Do not silently read large primary-key pages in the new
-data phase or switch its merge identity to full keys.
+Candidate discovery supplies decoded projected tags and can populate row
+mappings while it reads keys. A candidate-cache hit can bypass those reads,
+and series-index coverage can exclude SSTs from candidate scanning; neither
+guarantees that data-phase row mappings exist.
+
+Before data reads start, preflight mapping coverage for every required source
+row group, independently of how candidates were discovered. Reuse range-index
+metadata or complete cached mappings. Populate missing mappings with key-only
+reads in the discovery phase before admitting data readers, and account for
+and report those reads separately from data reads. Keep the required mappings
+owned through their data readers so cache eviction cannot invalidate coverage.
+If coverage cannot be established, fail the buffered-mode query with source
+and row-group context. Do not call a lazy mapping builder that rereads primary
+keys in the data phase or switch its merge identity to full keys.
 
 Memtable inputs likewise expose or derive identity before entering the compact
 merge. Reuse snapshot and sequence filtering, trusted sequence overrides,
@@ -178,7 +230,7 @@ decoded values for projected tags and any tags needed by remaining predicates.
 Preserve source-schema/default/null handling during catalog preparation.
 
 Range-result batches contain fields, timestamp, compact identity, sequence, and
-operation type, but no per-row projected tag arrays. After the final merge,
+operation type, but no per-row projected tag arrays. After final replay,
 look up the identities of the resulting rows and join their decoded tag values
 to assemble the output RecordBatch, then apply the existing output projection.
 
@@ -186,6 +238,20 @@ The pair is the series identity by design. Do not add full-key variant catalogs,
 collision-based rescan, or full-key replay fallback. Test that equal TSIDs in
 different table IDs remain distinct and that output tags match the existing
 metric scan semantics.
+
+## Explicit compact batch schema
+
+Define a tag-free internal schema for compact source batches, range results,
+and replay. Preserve the existing flat-format internal column conventions and
+logical field types, with an explicit field-column boundary for this schema.
+Output tag projection belongs to the separate output schema.
+
+Merge construction, deduplication, LastNonNull, source compatibility, and
+residual field predicates must use the compact schema and its field offsets.
+Do not reuse the output mapper's tag-bearing input schema or field offsets.
+The IPC storage schema may normalize dictionaries as described below; replay
+reconstructs the same compact merge representation before output assembly.
+This is an internal interface change, not a new public scan API.
 
 # Preparation concurrency and memory admission
 
@@ -223,10 +289,19 @@ store. Release source readers at completion. Preserve selector placement,
 tombstone behavior, append mode, LastRow, and LastNonNull; do not apply these
 operations to incomplete subsets of a range.
 
-Existing grouping combines overlapping source time ranges, allowing final
-merge to skip duplicate resolution between complete ranges as v2 does today.
-Assert that invariant. Preserve existing equal-sequence winner behavior and
-characterize it with fixtures rather than assuming stable source order.
+Existing grouping combines overlapping source time ranges. Buffered mode must
+retain those complete groups without row-group splitting, as the PerSeries
+range path does today. Validate that successive groups satisfy previous maximum
+timestamp < next minimum timestamp, with both bounds inclusive and timestamp
+units compared correctly. Touching intervals belong to the same group.
+Validate prepared spans against their range bounds before publication. Fail
+clearly if the complete-range invariant is violated; do not publish overlapping
+results and rely on final replay to resolve them.
+
+Complete range results therefore need no cross-range duplicate resolution, as
+v2 assumes today, and can be concatenated per identity. Preserve existing
+equal-sequence winner behavior within range merges and characterize it with
+fixtures rather than assuming stable source order.
 
 # SST read-policy alternatives
 
@@ -272,9 +347,9 @@ partition count must not create an independent spill threshold per partition.
 
 Track unique retained Arrow backing allocations, index/catalog/container
 capacities, reader decoder/fetch reservations, merge buffers, and IPC/prefetch
-workspace. Shared dictionaries and
-slices must not be charged repeatedly or released while another internal owner
-still retains them. Enforcement is independent of diagnostic instrumentation.
+workspace. Shared dictionaries and slices must not be charged repeatedly or
+released while another internal owner still retains them. Enforcement is
+independent of diagnostic instrumentation.
 
 Distinguish the preparation spill threshold from the hard tracked-memory
 budget. The threshold starts reclamation; exceeding it alone is not a query
@@ -287,27 +362,48 @@ results. Append/spill incrementally while producing a range rather than requirin
 a whole range to fit. Keep serialization workspace available and account for
 input/output coexistence.
 
-Before publishing a readiness manifest, finalize the resident/disk placement
-of its results. Account for expected final-merge cursor/output workspace and
-tag assembly. Further preparation can spill unpublished results, but published
-results do not migrate to disk during replay.
+Before publishing any readiness manifest in the initial complete-preparation
+prototype, acquire aggregate replay reservations for all output partitions
+that may run concurrently. Include each partition's active payload, bounded
+prefetch, IPC decoding and compact-array reconstruction, selector state, output
+assembly, and decoded tag attachment. Use decoded backing-allocation sizes,
+including unrelated rows retained by a mixed-series batch, rather than spill
+file sizes to size those reservations. Empty partitions need no payload reserve.
+Reserve incremental workspace beyond already charged retained allocations;
+borrowing a resident batch does not reserve its backing buffers a second time.
+
+Finalize resident/disk placement so retained results and metadata plus aggregate
+replay reservations fit the hard budget. Spill eligible unpublished results
+until this fits; a spill threshold alone does not establish readiness. Fail
+irreducible requests with stage, required bytes, available bytes, and limit.
+Transfer reservation capacity to live allocation charges during replay rather
+than charging both for the same workspace. Return released workspace capacity
+to its partition reservation until that partition completes or is abandoned;
+other work cannot consume capacity promised to later batches of its replay.
+
+For future early publication, include remaining preparation and writer workspace
+in the same admission decision. Further preparation can spill unpublished
+results, but published results do not migrate to disk during replay. Do not
+depend on slow or unpolled partitions releasing their frozen results to admit
+remaining preparation.
 
 Final replay contributes to query accounting but never triggers new spill
 writes. Bound prefetch and queues. Fail on an allocation that cannot fit an
-applicable limit; do not spill or wait indefinitely to recover. A series that
-spans many ranges can still require one input batch per contributing range,
-which motivates the batch-layout experiments.
+applicable limit; do not spill or wait indefinitely to recover. Lazy per-series
+concatenation keeps active payload independent of the number of complete ranges;
+the series-span index and file metadata can still grow with that number.
 
 Per-query accounting drives the first spill policy. Existing engine resource
 checks remain respected, but a new engine-wide spill coordinator or global
 fairness policy is not part of the initial implementation.
 
 The threshold is a tracked-memory policy, not a total RSS limit. Decoder
-reservations are estimates where exact allocation tracking is unavailable;
-metadata, candidate discovery, allocator behavior, and filesystem page cache
-are separately measured. Record temporary overshoot, estimation error, and the
-largest indivisible batch rather than asserting that the threshold removes all
-peaks.
+reservations are estimates where exact allocation tracking is unavailable.
+Measure source metadata and candidate-discovery allocations outside the tracker,
+allocator behavior, and filesystem page cache separately from tracked catalogs,
+row mappings, and IPC metadata. Record temporary overshoot, estimation error,
+and the largest indivisible batch rather than asserting that the threshold
+removes all peaks.
 
 # Arrow IPC file storage and batch-layout experiment
 
@@ -324,7 +420,7 @@ Compare these layouts:
 
 | Layout | Expected benefit | Cost to measure |
 | --- | --- | --- |
-| Batches containing one series | Load a series without unrelated row payload; smaller active merge inputs. | Small batch/footer overhead, more seeks, and write/read throughput. |
+| Batches containing one series | Load a series without unrelated row payload; smaller active replay payload. | Small batch/footer overhead, reader initialization, more seeks, and write/read throughput. |
 | Batches containing multiple series | Larger sequential transfers and less per-batch metadata. | Unrelated rows retained on lookup and larger input-batch memory. |
 
 One series may have several bounded batches. Do not collect an arbitrarily
@@ -344,6 +440,20 @@ Start uncompressed, then compare LZ4 and Zstd. Measure dictionary normalization
 workspace, footer/index size, random lookup, complete replay, file count, and
 serialized bytes, not just sequential bandwidth.
 
+Share immutable schema, batch-directory, and applicable dictionary metadata per
+IPC file while keeping cursor positions and read buffers independent. The
+Arrow FileReader implementation loads dictionary blocks and copies the batch
+directory when opened; creating one reader per series can repeat that work.
+Use shared file metadata for direct batch decoding rather than reconstructing
+a complete reader for every lookup. Account for shared metadata once and keep
+it owned while any cursor or result handle needs it.
+
+For both layouts, measure initialization count/time, footer growth with batch
+count, retained dictionary bytes, and repeated metadata loading. In the fixed
+dictionary experiment, a direct series lookup may retain the file's whole
+dictionary. Bound files by payload and metadata growth; many tiny one-series
+batches must not create an unbounded directory in an otherwise small file.
+
 Files must be finished before their result handles are published for random
 access. During preparation, write incrementally and finish bounded files as
 needed; a result can reference multiple IPC files. Use shared blocking workers
@@ -356,22 +466,32 @@ cancellation/error stop preparation, close cursors, and release owned files.
 Disk usage remains charged until deletion. Startup cleanup targets only
 abandoned scan scratch artifacts.
 
-# Final merge and output in scan partitions
+# Final replay and output in scan partitions
 
 Each scan partition receives complete readiness manifests for its assigned
-series. It opens resident/IPC cursors, performs the final merge using compact
-identities, attaches decoded tags, and yields output batches.
+series and the replay reservation acquired before publication. Enumerate
+identities in compact-key order. For each identity, visit complete range spans
+in ascending timestamp order and lazily concatenate their already merged rows.
+Open only the current range payload and bounded prefetch; skip explicit empty
+contributions using metadata. Release consumed payloads before advancing,
+subject to output batches that still share their backing allocations.
 
-Start with indexed per-series replay so only batches covering the current
-identity participate. The one-series IPC layout avoids unrelated row payload;
-the multiple-series layout may still retain it and must be measured.
+Apply the final series selector across the entire concatenated identity, not
+independently to each emitted span. Preserve existing range-level selector
+placement and avoid collecting a full series for final selection. Attach
+decoded tags and assemble bounded output batches using the compact schema.
 
-Keep final cursor prefetch and merge workspace within the query memory budget.
-There is no final-merge input-count limit. Fail if required replay memory cannot
-fit. No spill writes, external regrouping passes, or compact-to-full-key fallback
-occur here. The
-first implementation can keep the preparation barrier; partition readiness
-allows later scheduling changes without putting preparation into the streams.
+The one-series IPC layout avoids unrelated row payload; the multiple-series
+layout may still retain it and must be measured. With bounded batches and
+prefetch, active replay payload for one partition does not grow with the number
+of complete ranges or the total samples in a series. Metadata, retained resident
+results, and consumer-owned output are separate from that payload bound.
+
+Keep replay workspace within its query reservation. Range counts remain metrics,
+not admission limits. Fail if required replay memory cannot fit. No spill writes,
+external regrouping passes, or compact-to-full-key fallback occur here. The
+first implementation keeps the preparation barrier; later readiness scheduling
+must preserve the publication reservation contract.
 
 # File-backed data-result cache
 
@@ -386,7 +506,7 @@ query-local tag catalog after that query ends. Compact data-only artifacts
 cannot by themselves reproduce tag projections.
 
 Cache admission and conversion to cache files occur during preparation, before
-publishing replay handles. The final merge does not write cache/spill content.
+publishing replay handles. Final replay does not write cache/spill content.
 An optional cache failure skips admission; mandatory range spill failure fails
 the query.
 
@@ -405,6 +525,8 @@ and SeqScan caches unchanged.
 | IPC batch scope | Prototype both layouts | Measure one-series versus multiple-series batches. |
 | Compact key storage | Plain Binary in first IPC benchmark | Compare a consistent fixed dictionary encoding. |
 | Compression | Uncompressed | Compare LZ4/Zstd CPU, size, and read/write throughput. |
+| Final replay traversal | Lazy per-identity concatenation of complete ranges | Verify bounded active payload as contributing range count grows. |
+| Readiness publication | Complete-preparation barrier with aggregate replay reservations | Early publication requires admission for remaining preparation too. |
 | Final replay spill | Disabled | No spill experiment in final replay. |
 | Reader/merge-input counts | Metrics only | Vary source counts and widths; memory determines admission. |
 | Required merge memory exceeds budget | Query error after eligible reclamation | Report required/available bytes; do not add external merge passes. |
