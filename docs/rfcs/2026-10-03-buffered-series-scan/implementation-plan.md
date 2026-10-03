@@ -46,12 +46,14 @@ an implementation stage.
   checkout; do not create another local worktree. Keep
   `perf/series-scan-key-reuse` at `2939662e6a` as the research baseline. Preserve
   unrelated edits and record source and binary identity for measurements.
-- Push changes, synchronize the existing remote checkout, and build and run
-  tests/experiments on the remote machine using its existing build cache.
+- Compile, test, and lint locally using the normal development/test profiles.
+  Push passing code, synchronize the existing remote checkout, and build the
+  measurement binary remotely using its existing build cache. Run retained-data
+  experiments remotely; do not run routine tests with the remote nightly profile.
   Machine-specific connection details and the exact build command are recorded
   only in the external
   [remote workflow document](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-remote-workflow.md),
-  not in tracked files. Do not build or run PoC experiments locally.
+  not in tracked files. Do not run retained-data PoC experiments locally.
 - Carry over only the row-mapping/reader primitives and benchmark tooling
   required by the relevant stage. Research-branch diagnostics and fixes are not
   automatically PoC dependencies. Compare main v2, research-branch v2, and the
