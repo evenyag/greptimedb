@@ -17,13 +17,14 @@
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use common_telemetry::tracing;
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, Time};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricBuilder, Time};
 use datatypes::arrow::record_batch::RecordBatch;
 use datatypes::timestamp::timestamp_array_to_primitive;
 use futures::Stream;
@@ -857,6 +858,10 @@ impl ScanMetricsSet {
 }
 
 struct PartitionMetricsInner {
+    live_series_readers: AtomicUsize,
+    series_readers_opened: datafusion::physical_plan::metrics::Count,
+    peak_series_readers: Gauge,
+
     region_id: RegionId,
     /// Index of the partition to scan.
     partition: usize,
@@ -975,6 +980,15 @@ impl PartitionMetricsList {
 #[derive(Clone)]
 pub struct PartitionMetrics(Arc<PartitionMetricsInner>);
 
+/// Releases the initialized-reader count on completion, error, or cancellation.
+pub(crate) struct SeriesReaderGuard(PartitionMetrics);
+
+impl Drop for SeriesReaderGuard {
+    fn drop(&mut self) {
+        self.0.0.live_series_readers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl PartitionMetrics {
     pub(crate) fn new(
         region_id: RegionId,
@@ -992,6 +1006,11 @@ impl PartitionMetrics {
             .with_prepare_scan_cost(query_start.elapsed())
             .with_convert_cost(convert_cost.clone());
         let inner = PartitionMetricsInner {
+            live_series_readers: AtomicUsize::new(0),
+            series_readers_opened: MetricBuilder::new(metrics_set)
+                .counter("series_data_readers_opened", partition),
+            peak_series_readers: MetricBuilder::new(metrics_set)
+                .gauge("series_data_readers_peak", partition),
             region_id,
             partition,
             scanner_type,
@@ -1009,6 +1028,14 @@ impl PartitionMetrics {
             elapsed_compute: MetricBuilder::new(metrics_set).elapsed_compute(partition),
         };
         Self(Arc::new(inner))
+    }
+
+    /// Counts initialized series-data readers through destruction, including paused readers.
+    pub(crate) fn series_reader_guard(&self) -> SeriesReaderGuard {
+        let live = self.0.live_series_readers.fetch_add(1, Ordering::Relaxed) + 1;
+        self.0.peak_series_readers.set_max(live);
+        self.0.series_readers_opened.add(1);
+        SeriesReaderGuard(self.clone())
     }
 
     pub(crate) fn on_first_poll(&self) {

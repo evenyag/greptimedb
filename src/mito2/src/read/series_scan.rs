@@ -870,6 +870,10 @@ impl SeriesCandidateDistributor {
         );
         part_metrics.on_first_poll();
 
+        let candidate_time =
+            datafusion::physical_plan::metrics::MetricBuilder::new(&self.metrics_set)
+                .subset_time("candidate_discovery_cost", self.partitions.len());
+        let _candidate_timer = candidate_time.timer();
         let candidate_scanner = SeriesCandidateScanner::try_new(
             self.stream_ctx.clone(),
             self.partitions.clone(),

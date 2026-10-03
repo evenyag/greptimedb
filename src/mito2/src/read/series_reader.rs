@@ -529,6 +529,7 @@ fn scan_series_file_ranges(
                 continue;
             };
 
+            let _reader_guard = part_metrics.series_reader_guard();
             let scan_start = Instant::now();
             let file_sequence_trusted = range
                 .file_handle()
