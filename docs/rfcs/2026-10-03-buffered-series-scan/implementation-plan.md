@@ -36,8 +36,19 @@ an implementation stage.
   [Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md)
   and external evidence under
   `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261003-stage1/`.
-- [ ] Stage 2: Mapping preflight, compact identity/schema, and deferred tags;
-  pass reference-output and zero data-phase primary-key-read gates.
+- [x] Stage 2: Mapping preflight, compact identity/schema, and deferred tags
+  implemented and validated at `2603f14aea` (2026-10-04). Local focused tests
+  (23), reference/compact SQLness, Clippy, formatting, and license checks passed.
+  Retained Q03 p1 and p8 each completed 51,635,200 rows; exact comparison against
+  Stage 1's p1 reference passed, including cross-partition ordering and unique
+  series ownership. Every compact decoder passed the primary-key projection/
+  byte-request audit, with zero data-phase key-page decoding and violations.
+  Warm candidates/cold mappings, partial indexes, multi-table identities, and
+  preflight failure before data reads passed local synthetic gates. See the
+  [Stage 2 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-report.md)
+  and evidence under
+  `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261004-stage2-remote/`.
+  Main v2's historical p8 exactness gap remains unchanged.
 - [ ] Stage 3: Resident/IPC result store, both batch layouts, shared metadata,
   and cleanup; pass exact round-trip and independent-cursor gates.
 - [ ] Stage 4: Complete range preparation, spill admission, publication
@@ -87,16 +98,23 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Stage 1's current baseline is accepted; Stage 2 is next. Read the external
-[Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md),
-[setup handoff](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-setup-handoff.md),
-and remote workflow before continuing. The report records measured source and
-binary identity, normal-profile local validation, expected main eight-partition
-timeouts, and the remaining exactness coverage. Remote research edits were
-preserved and verified; recovery details remain in the external evidence.
-Reuse the existing seven-day query bench and loaded eight-day dataset; do not
-regenerate or reload. Verify actual request windows because the historical
-plan collection used one-hour ANALYZE SQL despite seven-day dispatch parameters.
+Stage 2 passed at `2603f14aea`; Stage 3 is next. Read the external
+[Stage 2 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-report.md)
+and its linked evidence/checkpoints before continuing. Compact p1/p8 exactness
+and decoder audits passed; timing samples were 60.482s/46.430s with sampled RSS
+3.025/7.771 GiB under the unchanged controlled-cache guards. These are diagnostic
+samples, not production defaults or a statistical speedup claim. Source state,
+research artifacts, and owned-process cleanup were verified; raw evidence was
+retrieved and hash-checked. The user may stop the remote machine; obtain startup
+confirmation before any later remote work if it has been stopped.
+
+Stage 1's current baseline remains accepted as recorded in the
+[Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md).
+Its main eight-partition exactness remains unvalidated. Stage 2 compared compact
+p8 against the accepted p1 oracle and did not retune that baseline. Reuse the
+existing seven-day query bench and loaded eight-day dataset; do not regenerate
+or reload. Verify actual request windows because historical plan-collection SQL
+used one hour despite seven-day dispatch parameters.
 
 # Stage 1: Baseline and preparation/readiness harness
 
