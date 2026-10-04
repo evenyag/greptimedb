@@ -18,6 +18,7 @@ workspace = true
 [dependencies]
 api.workspace = true
 aquamarine.workspace = true
+arrow-ipc.workspace = true
 arrow-schema.workspace = true
 async-channel = "1.9"
 async-stream.workspace = true
@@ -149,6 +150,11 @@ required-features = ["testing"]
 
 [[bench]]
 name = "bench_pk_tag_column"
+harness = false
+required-features = ["testing"]
+
+[[bench]]
+name = "bench_series_result"
 harness = false
 required-features = ["testing"]
 

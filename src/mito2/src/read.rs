@@ -40,6 +40,9 @@ pub mod series_scan;
 // Stage 1 harness; integrated with range preparation in Stage 4.
 #[cfg(test)]
 mod series_prepare;
+// Stage 3 store is exercised independently until Stage 4 integrates preparation.
+#[cfg(any(test, feature = "test"))]
+pub mod series_result;
 pub mod stream;
 pub(crate) mod unordered_scan;
 

@@ -1,0 +1,745 @@
+// Copyright 2023 Greptime Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+use datatypes::arrow::array::{ArrayRef, Float64Array, StringArray, UInt8Array, UInt64Array};
+use datatypes::arrow::datatypes::Field;
+use mito_codec::row_converter::SparsePrimaryKeyCodec;
+
+pub(crate) fn fixture(series: &[(u32, u64, usize)]) -> RecordBatch {
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut strings = Vec::new();
+    let mut times = Vec::new();
+    for (table, tsid, rows) in series {
+        let mut key = vec![];
+        SparsePrimaryKeyCodec::schemaless()
+            .encode_internal(*table, *tsid, &mut key)
+            .unwrap();
+        for i in 0..*rows {
+            keys.push(key.clone());
+            values.push((i % 3 != 0).then_some(i as f64));
+            strings.push((i % 4 != 0).then_some(format!("v{}", i % 5)));
+            times.push(i as u64);
+        }
+    }
+    let key = BinaryArray::from_iter_values(keys.iter().map(|k| k.as_slice()));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Float64Array::from(values)),
+        Arc::new(StringArray::from(strings)),
+        Arc::new(UInt64Array::from(times)),
+        Arc::new(key),
+        Arc::new(UInt64Array::from(vec![7; keys.len()])),
+        Arc::new(UInt8Array::from(vec![1; keys.len()])),
+    ];
+    let fields = columns
+        .iter()
+        .enumerate()
+        .map(|(i, a)| Field::new(format!("c{i}"), a.data_type().clone(), i < 2))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    let mut fields = batch.schema().fields().to_vec();
+    fields[1] = Arc::new(
+        fields[1]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(DataType::Utf8),
+            )),
+    );
+    fields[3] = Arc::new(
+        fields[3]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(DataType::Binary),
+            )),
+    );
+    convert(&batch, &Arc::new(Schema::new(fields))).unwrap()
+}
+
+fn logical(batch: &RecordBatch) -> RecordBatch {
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            let typ = match f.data_type() {
+                DataType::Dictionary(_, value) => *value.clone(),
+                t => t.clone(),
+            };
+            Arc::new(f.as_ref().clone().with_data_type(typ))
+        })
+        .collect::<Vec<_>>();
+    convert(batch, &Arc::new(Schema::new(fields))).unwrap()
+}
+
+async fn collect(mut cursor: ResultCursor, schema: SchemaRef) -> RecordBatch {
+    let mut batches = vec![];
+    while let Some(lease) = cursor.next().await.unwrap() {
+        batches.push(lease.with_batch(logical));
+    }
+    let schema = logical(&RecordBatch::new_empty(schema)).schema();
+    concat_batches(&schema, &batches).unwrap()
+}
+
+#[tokio::test]
+async fn round_trip_layouts_placements_and_cross_file_series() {
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        for placements in [
+            vec![Placement::Resident],
+            vec![Placement::File],
+            vec![Placement::Resident, Placement::File],
+        ] {
+            for compression in [
+                None,
+                Some(CompressionType::LZ4_FRAME),
+                Some(CompressionType::ZSTD),
+            ] {
+                let dir = common_test_util::temp_dir::create_temp_dir("series-result");
+                let input = fixture(&[(1, 3, 3), (2, 3, 40), (2, 8, 2)]);
+                let options = StoreOptions {
+                    layout,
+                    batch_rows: 5,
+                    file_batches: 2,
+                    compression,
+                    ..Default::default()
+                };
+                let mut builder = ResultBuilder::new(dir.path(), input.schema(), options)
+                    .await
+                    .unwrap();
+                let resources = builder.resources();
+                for (i, start) in (0..input.num_rows()).step_by(7).enumerate() {
+                    // Re-encode input slices to force independently assigned dictionaries.
+                    let part = convert(
+                        &logical(&input.slice(start, 7.min(input.num_rows() - start))),
+                        &input.schema(),
+                    )
+                    .unwrap();
+                    builder = builder
+                        .append(part, placements[i % placements.len()])
+                        .await
+                        .unwrap();
+                }
+                let handle = builder.finish().await.unwrap();
+                assert_eq!(
+                    collect(handle.cursor().unwrap(), input.schema()).await,
+                    logical(&input)
+                );
+                let id = MetricSeriesId {
+                    table_id: 2,
+                    tsid: 3,
+                };
+                assert_eq!(
+                    collect(handle.series_cursor(id).unwrap(), input.schema()).await,
+                    logical(&input.slice(3, 40))
+                );
+                assert!(
+                    handle
+                        .series_cursor(MetricSeriesId {
+                            table_id: 9,
+                            tsid: 3
+                        })
+                        .unwrap()
+                        .next()
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop(handle);
+                resources.drain_cleanup().await.unwrap();
+                let snapshot = resources.snapshot();
+                assert_eq!(snapshot.disk_bytes, 0);
+                assert_eq!(snapshot.memory_bytes, snapshot.resource_bytes);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn independent_cursors_shared_metadata_and_leases() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-cursors");
+    let spec = (0..2000).map(|i| (1, i, 1)).collect::<Vec<_>>();
+    let input = fixture(&spec);
+    let options = StoreOptions {
+        layout: Layout::OneSeries,
+        batch_rows: 8,
+        file_batches: 97,
+        ..Default::default()
+    };
+    let builder = ResultBuilder::new(dir.path(), input.schema(), options)
+        .await
+        .unwrap();
+    let resources = builder.resources();
+    let handle = builder
+        .append(input.clone(), Placement::File)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(handle.num_batches(), 2000);
+    let baseline = resources.snapshot();
+    assert_eq!(baseline.counts["metadata_initializations"], 21);
+    let mut a = handle
+        .series_cursor(MetricSeriesId {
+            table_id: 1,
+            tsid: 5,
+        })
+        .unwrap();
+    let mut b = handle
+        .series_cursor(MetricSeriesId {
+            table_id: 1,
+            tsid: 1900,
+        })
+        .unwrap();
+    assert_eq!(baseline.metadata_bytes, resources.snapshot().metadata_bytes);
+    let (first, second) = tokio::join!(a.next(), b.next());
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(first.with_batch(logical), logical(&input.slice(5, 1)));
+    assert_eq!(second.with_batch(logical), logical(&input.slice(1900, 1)));
+    assert!(a.next().await.unwrap().is_none());
+    assert!(b.next().await.unwrap().is_none());
+    assert_eq!(resources.snapshot().counts["metadata_initializations"], 21);
+    drop(handle);
+    assert!(resources.snapshot().disk_bytes > 0);
+    drop(a);
+    drop(b);
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(resources.snapshot().disk_bytes, 0);
+    assert!(resources.snapshot().memory_bytes > 0); // Returned payload leases remain alive.
+    drop(first);
+    drop(second);
+    assert_eq!(
+        resources.snapshot().memory_bytes,
+        resources.snapshot().resource_bytes
+    );
+}
+
+#[tokio::test]
+async fn mixed_batch_lookup_retains_unrelated_rows_and_reuses_decoding() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-mixed");
+    let input = fixture(&[(1, 1, 2), (1, 2, 2), (1, 3, 2)]);
+    let builder = ResultBuilder::new(dir.path(), input.schema(), StoreOptions::default())
+        .await
+        .unwrap();
+    let resources = builder.resources();
+    let handle = builder
+        .append(input, Placement::File)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let mut cursor = handle
+        .series_cursor(MetricSeriesId {
+            table_id: 1,
+            tsid: 2,
+        })
+        .unwrap();
+    let lease = cursor.next().await.unwrap().unwrap();
+    assert_eq!(lease.num_rows(), 2);
+    assert_eq!(lease.retained_rows(), 6);
+    assert_eq!(resources.snapshot().peaks["lookup_unrelated_rows"], 4);
+    drop(lease);
+    drop(cursor);
+    drop(handle);
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(
+        resources.snapshot().memory_bytes,
+        resources.snapshot().resource_bytes
+    );
+}
+
+#[tokio::test]
+async fn fixed_dictionaries_are_immutable_and_shared() {
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        for compression in [
+            None,
+            Some(CompressionType::LZ4_FRAME),
+            Some(CompressionType::ZSTD),
+        ] {
+            let dir = common_test_util::temp_dir::create_temp_dir("series-result-dictionary");
+            let input = fixture(&[(1, 7, 20), (2, 7, 20)]);
+            let plain = logical(&input);
+            let keys = plain
+                .column(3)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            let fixed = Arc::new(BinaryArray::from_iter_values([
+                keys.value(0),
+                keys.value(20),
+            ]));
+            let options = StoreOptions {
+                layout,
+                compression,
+                fixed_keys: Some(fixed.clone()),
+                batch_rows: 3,
+                file_batches: 4,
+                ..Default::default()
+            };
+            let builder = ResultBuilder::new(dir.path(), input.schema(), options)
+                .await
+                .unwrap();
+            let resources = builder.resources();
+            let handle = builder
+                .append(input.clone(), Placement::File)
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect(handle.cursor().unwrap(), input.schema()).await,
+                logical(&input)
+            );
+            assert_eq!(
+                collect(
+                    handle
+                        .series_cursor(MetricSeriesId {
+                            table_id: 2,
+                            tsid: 7
+                        })
+                        .unwrap(),
+                    input.schema()
+                )
+                .await,
+                logical(&input.slice(20, 20))
+            );
+            drop(handle);
+            resources.drain_cleanup().await.unwrap();
+            assert_eq!(resources.snapshot().disk_bytes, 0);
+            assert_eq!(
+                resources.snapshot().memory_bytes,
+                resources.snapshot().resource_bytes
+            );
+        }
+    }
+}
+
+async fn assert_clean(resources: &Arc<StoreResources>) {
+    resources.drain_cleanup().await.unwrap();
+    let snapshot = resources.snapshot();
+    assert_eq!(
+        snapshot.memory_bytes, snapshot.resource_bytes,
+        "{snapshot:?}"
+    );
+    assert_eq!(snapshot.disk_bytes, 0, "{snapshot:?}");
+    assert_eq!(snapshot.failed_cleanup, 0);
+    assert_eq!(std::fs::read_dir(&resources.root).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn write_finalization_and_read_failures_release_owned_files() {
+    use std::sync::atomic::Ordering;
+    for phase in ["write", "finish", "read", "remove"] {
+        let dir = common_test_util::temp_dir::create_temp_dir("series-result-failure");
+        let sentinel = dir.path().join("unrelated.arrow");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let input = fixture(&[(1, 1, 100)]);
+        let builder = ResultBuilder::new(
+            dir.path(),
+            input.schema(),
+            StoreOptions {
+                batch_rows: 8,
+                file_batches: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let resources = builder.resources();
+        match phase {
+            "write" => *resources.faults.write_after.lock().unwrap() = Some(800),
+            "finish" => resources.faults.finish.store(true, Ordering::SeqCst),
+            _ => {}
+        }
+        let result = match builder.append(input, Placement::File).await {
+            Ok(builder) => builder.finish().await,
+            Err(e) => Err(e),
+        };
+        if phase == "write" || phase == "finish" {
+            assert!(result.is_err());
+        } else {
+            let handle = result.unwrap();
+            if phase == "read" {
+                resources.faults.read.store(true, Ordering::SeqCst);
+                let mut cursor = handle.cursor().unwrap();
+                assert!(cursor.next().await.is_err());
+                assert!(cursor.next().await.is_err());
+                drop(cursor);
+            } else {
+                resources.faults.remove.store(true, Ordering::SeqCst);
+            }
+            drop(handle);
+            if phase == "remove" {
+                assert!(resources.drain_cleanup().await.is_err());
+                assert!(resources.snapshot().disk_bytes > 0);
+                resources.faults.remove.store(false, Ordering::SeqCst);
+            }
+        }
+        assert_clean(&resources).await;
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    }
+}
+
+#[tokio::test]
+async fn cancellation_waits_for_blocking_writer_ownership() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-cancel");
+    let input = fixture(&[(1, 1, 100)]);
+    let builder = ResultBuilder::new(
+        dir.path(),
+        input.schema(),
+        StoreOptions {
+            batch_rows: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let resources = builder.resources();
+    let (started, receiver) = std::sync::mpsc::channel();
+    let (resume, gate) = std::sync::mpsc::channel();
+    *resources.faults.write_gate.lock().unwrap() = Some((started, gate));
+    let task = tokio::spawn(builder.append(input, Placement::File));
+    common_runtime::spawn_blocking_query(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    for file in std::fs::read_dir(&resources.root).unwrap() {
+        assert_eq!(file.unwrap().path().extension().unwrap(), "partial");
+    }
+    task.abort();
+    assert!(task.await.is_err());
+    assert!(resources.snapshot().memory_bytes > 0);
+    resume.send(()).unwrap();
+    // The detached blocking writer must finish/drop before cleanup can be drained.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            resources.drain_cleanup().await.unwrap();
+            if resources.snapshot().memory_bytes == resources.snapshot().resource_bytes
+                && resources.snapshot().disk_bytes == 0
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_clean(&resources).await;
+}
+
+#[tokio::test]
+async fn quotas_invalid_input_and_oversized_rows_fail_cleanly() {
+    for case in [
+        "disk", "memory", "metadata", "batch", "order", "fixed", "file",
+    ] {
+        let dir = common_test_util::temp_dir::create_temp_dir("series-result-quota");
+        let input = if case == "order" {
+            fixture(&[(2, 1, 20), (1, 1, 20)])
+        } else {
+            fixture(&[(1, 1, 20), (2, 1, 20)])
+        };
+        let mut options = StoreOptions {
+            batch_rows: 1,
+            ..Default::default()
+        };
+        match case {
+            "disk" => options.disk_bytes = 1000,
+            "memory" => options.memory_bytes = 64 * 1024,
+            "metadata" => {
+                options.metadata_bytes = 32 * 1024;
+                options.file_batches = 2;
+            }
+            "batch" => options.batch_bytes = 10,
+            "file" => options.file_bytes = 5000,
+            "fixed" => {
+                options.fixed_keys =
+                    Some(Arc::new(BinaryArray::from_iter_values([logical(&input)
+                        .column(3)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap()
+                        .value(0)])))
+            }
+            _ => {}
+        }
+        let builder = ResultBuilder::new(dir.path(), input.schema(), options).await;
+        let Ok(builder) = builder else {
+            assert!(case == "memory" || case == "metadata");
+            continue;
+        };
+        let resources = builder.resources();
+        let result = match builder.append(input, Placement::File).await {
+            Ok(b) => b.finish().await,
+            Err(e) => Err(e),
+        };
+        assert!(result.is_err(), "{case} unexpectedly passed");
+        resources.drain_cleanup().await.unwrap();
+        assert_eq!(resources.snapshot().disk_bytes, 0);
+        if case != "fixed" {
+            assert_eq!(
+                resources.snapshot().memory_bytes,
+                resources.snapshot().resource_bytes
+            );
+        }
+    }
+    assert!(checked_add(usize::MAX, 1).is_err());
+    assert!(checked_mul(usize::MAX, 2).is_err());
+}
+
+#[tokio::test]
+async fn corrupt_and_truncated_payloads_fail_without_publication_or_leaks() {
+    use std::io::{Seek, SeekFrom, Write};
+    for truncate in [false, true] {
+        let dir = common_test_util::temp_dir::create_temp_dir("series-result-corrupt");
+        let input = fixture(&[(1, 1, 10)]);
+        let builder = ResultBuilder::new(dir.path(), input.schema(), StoreOptions::default())
+            .await
+            .unwrap();
+        let resources = builder.resources();
+        let handle = builder
+            .append(input, Placement::File)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let path = std::fs::read_dir(&resources.root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        if truncate {
+            file.set_len(8).unwrap();
+        } else {
+            // Destroy the record message, leaving the already-shared footer alone.
+            let block = match &handle.0.directory[0].source {
+                Source::File { part, .. } => part.test_first_offset(),
+                _ => unreachable!(),
+            };
+            file.seek(SeekFrom::Start(block)).unwrap();
+            file.write_all(&[0; 8]).unwrap();
+        }
+        drop(file);
+        let mut cursor = handle.cursor().unwrap();
+        assert!(cursor.next().await.is_err());
+        drop(cursor);
+        drop(handle);
+        assert_clean(&resources).await;
+    }
+}
+
+#[tokio::test]
+async fn escaped_arrays_keep_their_allocation_charge() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-escaped");
+    for placement in [Placement::Resident, Placement::File] {
+        let input = fixture(&[(1, 1, 8)]);
+        let builder = ResultBuilder::new(dir.path(), input.schema(), StoreOptions::default())
+            .await
+            .unwrap();
+        let resources = builder.resources();
+        let handle = builder
+            .append(input, placement)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let mut cursor = handle.cursor().unwrap();
+        let lease = cursor.next().await.unwrap().unwrap();
+        let escaped = lease.with_batch(|b| b.column(0).clone());
+        let payload = lease.retained_bytes();
+        drop(lease);
+        drop(cursor);
+        drop(handle);
+        resources.drain_cleanup().await.unwrap();
+        assert_eq!(
+            resources.snapshot().memory_bytes,
+            payload + resources.snapshot().resource_bytes
+        );
+        drop(escaped);
+        assert_clean(&resources).await;
+    }
+}
+
+#[tokio::test]
+async fn metadata_and_payload_limits_rotate_files_independently() {
+    for metadata_limited in [false, true] {
+        let dir = common_test_util::temp_dir::create_temp_dir("series-result-rotation");
+        let input = fixture(&(0..100).map(|i| (1, i, 1)).collect::<Vec<_>>());
+        let options = StoreOptions {
+            layout: Layout::OneSeries,
+            file_batches: 10000,
+            file_metadata_bytes: if metadata_limited { 8192 } else { 1024 * 1024 },
+            file_bytes: if metadata_limited {
+                64 * 1024 * 1024
+            } else {
+                32 * 1024
+            },
+            ..Default::default()
+        };
+        let limit = options.file_bytes;
+        let builder = ResultBuilder::new(dir.path(), input.schema(), options)
+            .await
+            .unwrap();
+        let resources = builder.resources();
+        let handle = builder
+            .append(input.clone(), Placement::File)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(resources.snapshot().counts["files"] > 1);
+        for file in std::fs::read_dir(&resources.root).unwrap() {
+            assert!(file.unwrap().metadata().unwrap().len() <= limit as u64);
+        }
+        assert_eq!(
+            collect(handle.cursor().unwrap(), input.schema()).await,
+            logical(&input)
+        );
+        drop(handle);
+        assert_clean(&resources).await;
+    }
+}
+
+#[tokio::test]
+async fn empty_results_and_schema_metadata_survive_round_trip() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-empty");
+    let input = fixture(&[]);
+    let mut fields = input.schema().fields().to_vec();
+    fields[0] = Arc::new(fields[0].as_ref().clone().with_metadata(
+        std::collections::HashMap::from([("unit".to_string(), "bytes".to_string())]),
+    ));
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        std::collections::HashMap::from([("origin".to_string(), "compact".to_string())]),
+    ));
+    for nonempty in [false, true] {
+        let input = if nonempty {
+            fixture(&[(1, 1, 3)])
+        } else {
+            input.clone()
+        };
+        let input = RecordBatch::try_new(schema.clone(), input.columns().to_vec()).unwrap();
+        let builder = ResultBuilder::new(dir.path(), schema.clone(), StoreOptions::default())
+            .await
+            .unwrap();
+        let resources = builder.resources();
+        let handle = builder
+            .append(input.clone(), Placement::File)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let mut cursor = handle.cursor().unwrap();
+        if nonempty {
+            let lease = cursor.next().await.unwrap().unwrap();
+            lease.with_batch(|b| assert_eq!(b.schema(), schema));
+        }
+        assert!(cursor.next().await.unwrap().is_none());
+        drop(cursor);
+        drop(handle);
+        assert_clean(&resources).await;
+    }
+}
+
+#[tokio::test]
+async fn replay_payload_is_bounded_as_series_grows_across_files() {
+    let mut peaks = vec![];
+    for rows in [32, 512] {
+        let dir = common_test_util::temp_dir::create_temp_dir("series-result-bounded");
+        let input = fixture(&[(1, 1, rows)]);
+        let options = StoreOptions {
+            batch_rows: 8,
+            file_batches: 2,
+            ..Default::default()
+        };
+        let builder = ResultBuilder::new(dir.path(), input.schema(), options)
+            .await
+            .unwrap();
+        let resources = builder.resources();
+        let handle = builder
+            .append(input, Placement::File)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let mut cursor = handle
+            .series_cursor(MetricSeriesId {
+                table_id: 1,
+                tsid: 1,
+            })
+            .unwrap();
+        let mut seen = 0;
+        while let Some(lease) = cursor.next().await.unwrap() {
+            assert!(lease.num_rows() <= 8);
+            seen += lease.num_rows();
+        }
+        assert_eq!(seen, rows);
+        peaks.push(resources.snapshot().peaks["replay_payload_bytes"]);
+        drop(cursor);
+        drop(handle);
+        assert_clean(&resources).await;
+    }
+    assert_eq!(peaks[0], peaks[1]);
+}
+
+#[tokio::test]
+async fn publication_never_overwrites_an_existing_artifact() {
+    let dir = common_test_util::temp_dir::create_temp_dir("series-result-no-clobber");
+    let input = fixture(&[(1, 1, 8)]);
+    let builder = ResultBuilder::new(
+        dir.path(),
+        input.schema(),
+        StoreOptions {
+            batch_rows: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let resources = builder.resources();
+    let builder = builder.append(input, Placement::File).await.unwrap();
+    let partial = std::fs::read_dir(&resources.root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let sentinel = partial.with_extension("arrow");
+    std::fs::write(&sentinel, b"unrelated artifact").unwrap();
+    assert!(builder.finish().await.is_err());
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unrelated artifact");
+    assert!(!partial.exists());
+    assert_eq!(resources.snapshot().disk_bytes, 0);
+    assert_eq!(
+        resources.snapshot().memory_bytes,
+        resources.snapshot().resource_bytes
+    );
+}

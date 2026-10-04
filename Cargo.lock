@@ -8710,6 +8710,7 @@ version = "1.4.0-alpha.0"
 dependencies = [
  "api",
  "aquamarine",
+ "arrow-ipc 59.2.0",
  "arrow-schema 59.2.0",
  "async-channel 1.9.0",
  "async-stream",

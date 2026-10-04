@@ -62,7 +62,7 @@ pub(crate) struct OperationMetrics {
 }
 
 impl OperationMetrics {
-    fn new(set: &ExecutionPlanMetricsSet, partition: usize, name: &str) -> Self {
+    pub(crate) fn new(set: &ExecutionPlanMetricsSet, partition: usize, name: &str) -> Self {
         Self {
             calls: MetricBuilder::new(set).counter(format!("{name}_calls"), partition),
             elapsed: MetricBuilder::new(set).subset_time(format!("{name}_elapsed"), partition),
