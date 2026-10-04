@@ -57,8 +57,20 @@ an implementation stage.
   and the external
   [operation-cost report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-operation-metrics.md).
   These diagnostic captures do not replace Stage 2's exact-output evidence.
-- [ ] Stage 3: Resident/IPC result store, both batch layouts, shared metadata,
-  and cleanup; pass exact round-trip and independent-cursor gates.
+- [x] Stage 3: Standalone resident/IPC result store implemented and validated
+  at `a96f2b5d85` (2026-10-04). Both layouts, mixed placement, checked series
+  spans, shared metadata, bounded staging/replay, and owned-file cleanup passed
+  29 focused tests (13 new store tests plus existing preparation/compact gates),
+  normal-profile Clippy, formatting, and license checks. Local optimized
+  synthetic measurements passed 144 quick verification configurations and
+  576 full records (verification plus three timed samples per configuration),
+  including uncompressed, LZ4, Zstd, and fixed-dictionary comparisons.
+  Packing reduced tiny-batch overhead but amplified direct reads; neither a
+  layout nor a production default was selected. Query integration remains
+  Stage 4. See the external
+  [Stage 3 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage3-report.md)
+  and evidence under
+  `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261004-stage3-local/`.
 - [ ] Stage 4: Complete range preparation, spill admission, publication
   reservations, and lazy replay; pass resource and selector correctness gates.
 - [ ] Stage 5: Independent preparation concurrency and shared selected-series
@@ -106,7 +118,14 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Stage 2 passed at `2603f14aea`; Stage 3 is next. Read the external
+Stage 3's standalone store passed at `a96f2b5d85`; Stage 4 integration is next.
+Read the external [Stage 3 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage3-report.md)
+for local gates, layout/compression tradeoffs, accounting boundaries, and
+reproducible synthetic evidence. The store is test/development-only until
+integration. No remote machine was contacted for Stage 3, and its current
+power state is unknown; confirm availability before remote work.
+
+Stage 2 passed at `2603f14aea`. Read the external
 [Stage 2 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-report.md)
 and its linked evidence/checkpoints before continuing. Compact p1/p8 exactness
 and decoder audits passed; timing samples were 60.482s/46.430s with sampled RSS
