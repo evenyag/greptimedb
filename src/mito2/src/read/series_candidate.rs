@@ -497,7 +497,7 @@ impl SeriesCandidateRangeBuilder {
                 for range in ranges {
                     let build_start = Instant::now();
                     let reader = match &compact_metrics {
-                        Some(m) => range.primary_key_reader_measured(fetch_metrics.as_deref(), Some(m.discovery_key_bytes.clone())).await?,
+                        Some(m) => range.primary_key_reader_measured(fetch_metrics.as_deref(), Some((m.discovery_key_bytes.clone(), m.discovery_read.clone()))).await?,
                         None => range.primary_key_reader(fetch_metrics.as_deref()).await?,
                     };
                     let Some(mut reader) = reader else { continue; };
@@ -740,8 +740,13 @@ fn decode_metric_series_with_catalog(
                 .context(UnexpectedSnafu {
                     reason: "merged candidate primary key is not binary",
                 })?;
+            if let Some(catalog) = &catalog {
+                catalog.metrics.discovery_catalog.measure(|| -> Result<()> {
+                    for primary_key in array.iter().flatten() { catalog.insert_candidate(primary_key)?; }
+                    Ok(())
+                })?;
+            }
             for primary_key in array.iter().flatten() {
-                if let Some(catalog) = &catalog { catalog.insert_candidate(primary_key)?; }
                 let (table_id, tsid) = codec
                     .decode_ids(primary_key)
                     .context(crate::error::DecodeSnafu)?;

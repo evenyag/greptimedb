@@ -91,6 +91,9 @@ uuid.workspace = true
 winner_tree.workspace = true
 zstd.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { workspace = true, features = ["time"] }
+
 [dev-dependencies]
 common-function.workspace = true
 common-meta = { workspace = true, features = ["testing"] }

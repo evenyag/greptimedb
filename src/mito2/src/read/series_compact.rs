@@ -51,9 +51,142 @@ use crate::sst::parquet::file_range::FileRange;
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::reader::ReaderMetrics;
 
+/// Synchronous operation cost. Thread CPU clocks are sampled on the same thread,
+/// never across an await. Elapsed includes descheduling and mutex waits; CPU does not.
+#[derive(Clone)]
+pub(crate) struct OperationMetrics {
+    pub(crate) calls: Count,
+    pub(crate) elapsed: Time,
+    pub(crate) cpu: Time,
+    unavailable: Count,
+}
+
+impl OperationMetrics {
+    fn new(set: &ExecutionPlanMetricsSet, partition: usize, name: &str) -> Self {
+        Self {
+            calls: MetricBuilder::new(set).counter(format!("{name}_calls"), partition),
+            elapsed: MetricBuilder::new(set).subset_time(format!("{name}_elapsed"), partition),
+            cpu: MetricBuilder::new(set).subset_time(format!("{name}_cpu"), partition),
+            unavailable: MetricBuilder::new(set)
+                .counter(format!("{name}_cpu_unavailable"), partition),
+        }
+    }
+
+    pub(crate) fn measure<T>(&self, operation: impl FnOnce() -> T) -> T {
+        self.calls.add(1);
+        let _elapsed = self.elapsed.timer();
+        let start = thread_cpu_time();
+        let result = operation();
+        match (start, thread_cpu_time()) {
+            (Some(start), Some(end)) if end >= start => self.cpu.add_duration(end - start),
+            _ => self.unavailable.add(1),
+        }
+        result
+    }
+}
+
+fn thread_cpu_time() -> Option<std::time::Duration> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use nix::time::{ClockId, clock_gettime};
+        let time = clock_gettime(ClockId::CLOCK_THREAD_CPUTIME_ID).ok()?;
+        Some(std::time::Duration::new(
+            time.tv_sec().try_into().ok()?,
+            time.tv_nsec().try_into().ok()?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+pub(crate) fn measure_operation<T>(
+    metrics: Option<&OperationMetrics>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match metrics {
+        Some(metrics) => metrics.measure(operation),
+        None => operation(),
+    }
+}
+
+pub(crate) type MeasuredKeyRead = (Count, CompactReadMetrics);
+
+/// Query-owned read-path attribution. Storage time is awaited fetch latency, not
+/// physical disk wait; object-store reads may be served by the OS page cache.
+#[derive(Clone)]
+pub(crate) struct CompactReadMetrics {
+    pub(crate) decode: OperationMetrics,
+    pub(crate) cache_lookup: OperationMetrics,
+    pub(crate) cache_insert: OperationMetrics,
+    pub(crate) range_assembly: OperationMetrics,
+    pub(crate) fetch_elapsed: Time,
+    pub(crate) store_elapsed: Time,
+    pub(crate) write_cache_elapsed: Time,
+    pub(crate) requested_bytes: Count,
+    pub(crate) cache_bytes: Count,
+    pub(crate) store_bytes: Count,
+    pub(crate) write_cache_bytes: Count,
+    pub(crate) fetch_calls: Count,
+    pub(crate) store_calls: Count,
+    pub(crate) decoded_batches: Count,
+    pub(crate) decoded_rows: Count,
+}
+
+impl CompactReadMetrics {
+    fn new(set: &ExecutionPlanMetricsSet, partition: usize, phase: &str) -> Self {
+        let count =
+            |suffix| MetricBuilder::new(set).counter(format!("{phase}_{suffix}"), partition);
+        let time =
+            |suffix| MetricBuilder::new(set).subset_time(format!("{phase}_{suffix}"), partition);
+        let op = |suffix| OperationMetrics::new(set, partition, &format!("{phase}_{suffix}"));
+        Self {
+            decode: op("decode"),
+            cache_lookup: op("cache_lookup"),
+            cache_insert: op("cache_insert"),
+            range_assembly: op("range_assembly"),
+            fetch_elapsed: time("fetch_elapsed"),
+            store_elapsed: time("store_elapsed"),
+            write_cache_elapsed: time("write_cache_elapsed"),
+            requested_bytes: count("requested_bytes"),
+            cache_bytes: count("page_cache_bytes"),
+            store_bytes: count("store_payload_bytes"),
+            write_cache_bytes: count("write_cache_bytes"),
+            fetch_calls: count("fetch_calls"),
+            store_calls: count("store_calls"),
+            decoded_batches: count("decoded_batches"),
+            decoded_rows: count("decoded_rows"),
+        }
+    }
+}
+
 /// Metrics are query-owned and enabled independently of verbose fetch diagnostics.
 #[derive(Clone)]
 pub(crate) struct CompactMetrics {
+    pub(crate) discovery_read: CompactReadMetrics,
+    pub(crate) preflight_read: CompactReadMetrics,
+    pub(crate) data_read: CompactReadMetrics,
+    pub(crate) mapping_build: OperationMetrics,
+    pub(crate) mapping_select: OperationMetrics,
+    pub(crate) key_synthesis: OperationMetrics,
+    pub(crate) data_filter: OperationMetrics,
+    pub(crate) schema_adapt: OperationMetrics,
+    pub(crate) discovery_catalog: OperationMetrics,
+    pub(crate) catalog_entries: Count,
+    pub(crate) tag_fill: OperationMetrics,
+    pub(crate) assembly: OperationMetrics,
+    pub(crate) assembly_ids: OperationMetrics,
+    pub(crate) tag_column: OperationMetrics,
+    pub(crate) tag_lock_wait: Time,
+    pub(crate) assembly_rows: Count,
+    pub(crate) assembly_tag_columns: Count,
+    pub(crate) mapping_cache_hits: Count,
+    pub(crate) mapping_index_hits: Count,
+    pub(crate) mapping_key_reads: Count,
+    pub(crate) mapping_runs: Count,
+    pub(crate) mapping_index_elapsed: Time,
+    pub(crate) preflight_prune_elapsed: Time,
     pub(crate) preflight_keys: Count,
     pub(crate) preflight_key_bytes: Count,
     pub(crate) discovery_key_bytes: Count,
@@ -75,6 +208,31 @@ impl CompactMetrics {
         // Consequently successful audited readers cannot decode a primary-key page.
         count("compact_data_primary_key_pages_decoded");
         Self {
+            discovery_read: CompactReadMetrics::new(set, partition, "compact_discovery"),
+            preflight_read: CompactReadMetrics::new(set, partition, "compact_preflight"),
+            data_read: CompactReadMetrics::new(set, partition, "compact_data"),
+            mapping_select: OperationMetrics::new(set, partition, "compact_mapping_select"),
+            key_synthesis: OperationMetrics::new(set, partition, "compact_key_synthesis"),
+            data_filter: OperationMetrics::new(set, partition, "compact_data_filter"),
+            schema_adapt: OperationMetrics::new(set, partition, "compact_schema_adapt"),
+            discovery_catalog: OperationMetrics::new(set, partition, "compact_discovery_catalog"),
+            catalog_entries: count("compact_catalog_entries"),
+            mapping_build: OperationMetrics::new(set, partition, "compact_mapping_build"),
+            tag_fill: OperationMetrics::new(set, partition, "compact_preflight_tag_fill"),
+            assembly: OperationMetrics::new(set, partition, "compact_assembly"),
+            assembly_ids: OperationMetrics::new(set, partition, "compact_assembly_ids"),
+            tag_column: OperationMetrics::new(set, partition, "compact_tag_column"),
+            tag_lock_wait: MetricBuilder::new(set).subset_time("compact_tag_lock_wait", partition),
+            assembly_rows: count("compact_assembly_rows"),
+            assembly_tag_columns: count("compact_assembly_tag_columns"),
+            mapping_cache_hits: count("compact_mapping_cache_hits"),
+            mapping_index_hits: count("compact_mapping_index_hits"),
+            mapping_key_reads: count("compact_mapping_key_reads"),
+            mapping_runs: count("compact_mapping_runs"),
+            mapping_index_elapsed: MetricBuilder::new(set)
+                .subset_time("compact_mapping_index_elapsed", partition),
+            preflight_prune_elapsed: MetricBuilder::new(set)
+                .subset_time("compact_preflight_prune_elapsed", partition),
             preflight_key_bytes: count("preflight_primary_key_bytes"),
             discovery_key_bytes: count("discovery_primary_key_bytes"),
             catalog_bytes: MetricBuilder::new(set).gauge("compact_catalog_peak_bytes", partition),
@@ -380,7 +538,18 @@ impl CompactSchema {
 
     pub(crate) fn assemble(&self, batch: RecordBatch, catalog: &TagCatalog) -> Result<RecordBatch> {
         let _timer = catalog.metrics.tag_time.timer();
-        let ids = identities(batch.column(primary_key_column_index(batch.num_columns())))?;
+        catalog.metrics.assembly_rows.add(batch.num_rows());
+        catalog
+            .metrics
+            .assembly
+            .measure(|| self.assemble_inner(batch, catalog))
+    }
+
+    fn assemble_inner(&self, batch: RecordBatch, catalog: &TagCatalog) -> Result<RecordBatch> {
+        let ids = catalog
+            .metrics
+            .assembly_ids
+            .measure(|| identities(batch.column(primary_key_column_index(batch.num_columns()))))?;
         let mut columns = Vec::with_capacity(self.output_schema.fields().len());
         for field in self.output_schema.fields() {
             let array = if let Some(column) = batch.column_by_name(field.name()) {
@@ -392,6 +561,7 @@ impl CompactSchema {
                         .context(UnexpectedSnafu {
                             reason: "unknown output tag",
                         })?;
+                catalog.metrics.assembly_tag_columns.add(1);
                 catalog.column(column.column_id, &ids)?
             };
             columns.push(if array.data_type() == field.data_type() {
@@ -521,6 +691,7 @@ impl TagCatalog {
             .reservation
             .try_grow(value_size + 2 * size_of::<(MetricSeriesId, Vec<Value>)>())
             .context(MergeCandidateSeriesSnafu)?;
+        self.metrics.catalog_entries.add(1);
         inner.values.insert(id, tags);
         inner.missing.remove(&id);
         let additional = inner.values.capacity().saturating_sub(old_capacity)
@@ -534,6 +705,12 @@ impl TagCatalog {
     }
 
     pub(crate) fn column(&self, column_id: ColumnId, ids: &[MetricSeriesId]) -> Result<ArrayRef> {
+        self.metrics
+            .tag_column
+            .measure(|| self.column_inner(column_id, ids))
+    }
+
+    fn column_inner(&self, column_id: ColumnId, ids: &[MetricSeriesId]) -> Result<ArrayRef> {
         let index = self
             .metadata
             .primary_key_index(column_id)
@@ -550,7 +727,9 @@ impl TagCatalog {
             .column_schema
             .data_type
             .create_mutable_vector(ids.len());
+        let wait = self.metrics.tag_lock_wait.timer();
         let inner = self.inner.lock().unwrap();
+        drop(wait);
         for id in ids {
             let values = inner.values.get(id).context(UnexpectedSnafu {
                 reason: "data identity missing from tag catalog",
@@ -599,9 +778,11 @@ impl CompactReadContext {
                     continue;
                 }
                 let mut reader_metrics = ReaderMetrics::default();
+                let prune_timer = catalog.metrics.preflight_prune_elapsed.timer();
                 let sources = pruner
                     .build_file_ranges(*index, metrics, &mut reader_metrics)
                     .await?;
+                drop(prune_timer);
                 metrics.merge_reader_metrics(&reader_metrics, None);
                 let mut prepared = Vec::with_capacity(sources.len());
                 for source in sources {
@@ -657,6 +838,25 @@ mod tests {
     use futures::TryStreamExt;
     use parquet::arrow::arrow_reader::RowSelector;
     use store_api::codec::PrimaryKeyEncoding;
+
+    #[test]
+    fn compact_operation_metrics_record_cpu_and_errors() {
+        let metrics = OperationMetrics::new(&ExecutionPlanMetricsSet::default(), 0, "operation");
+        let result: std::result::Result<(), ()> = metrics.measure(|| {
+            for i in 0..10000 {
+                std::hint::black_box(i);
+            }
+            Err(())
+        });
+        assert!(result.is_err());
+        assert_eq!(1, metrics.calls.value());
+        assert!(metrics.elapsed.value() > 0);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(metrics.cpu.value() > 0);
+            assert_eq!(0, metrics.unavailable.value());
+        }
+    }
 
     #[test]
     fn compact_mapping_coverage_selection_and_cursor() {
@@ -776,5 +976,17 @@ mod tests {
         }
         assert_eq!(vec![7, 9], values);
         assert!(catalog.metrics.catalog_bytes.value() > 0);
+        assert_eq!(2, catalog.metrics.catalog_entries.value());
+        assert_eq!(2, catalog.metrics.assembly_rows.value());
+        assert!(catalog.metrics.assembly.calls.value() > 0);
+        assert_eq!(
+            catalog.metrics.assembly.calls.value(),
+            catalog.metrics.assembly_ids.calls.value()
+        );
+        assert_eq!(
+            catalog.metrics.assembly_tag_columns.value(),
+            catalog.metrics.tag_column.calls.value()
+        );
+        assert!(catalog.metrics.assembly.elapsed.value() > 0);
     }
 }

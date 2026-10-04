@@ -278,7 +278,7 @@ impl FileRange {
     pub(crate) async fn primary_key_reader_measured(
         &self,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-        bytes: Option<datafusion::physical_plan::metrics::Count>,
+        bytes: Option<crate::read::series_compact::MeasuredKeyRead>,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
         self.primary_key_reader_inner(fetch_metrics, true, bytes)
             .await
@@ -288,7 +288,7 @@ impl FileRange {
         &self,
         fetch_metrics: Option<&ParquetFetchMetrics>,
         check_dynamic_filter: bool,
-        bytes: Option<datafusion::physical_plan::metrics::Count>,
+        bytes: Option<crate::read::series_compact::MeasuredKeyRead>,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
         if check_dynamic_filter && !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -420,15 +420,20 @@ impl FileRange {
             && mapping.num_rows == rows
             && !catalog.needs_source_tags(&mapping)
         {
+            metrics.mapping_cache_hits.add(1);
             return Ok(mapping);
         }
         let result: Result<_> = async {
+            let index_timer = metrics.mapping_index_elapsed.timer();
             if let Ok(Some(index)) = self.range_index_searcher().await
                 && let Ok(mapping) = index.compact_mapping(self.row_group_idx as u32, rows).await
                 && !catalog.needs_source_tags(&mapping)
             {
+                metrics.mapping_index_hits.add(1);
                 return Ok(mapping);
             }
+            drop(index_timer);
+            metrics.mapping_key_reads.add(1);
             // Read all source rows: a pruned or predicate-selected mapping is not complete.
             let mut stream = builder
                 .build_primary_key_measured(
@@ -437,20 +442,28 @@ impl FileRange {
                         row_selection: None,
                         fetch_metrics: None,
                     },
-                    Some(metrics.preflight_key_bytes.clone()),
+                    Some((
+                        metrics.preflight_key_bytes.clone(),
+                        metrics.preflight_read.clone(),
+                    )),
                 )
                 .await?;
             let mut mapping = SeriesRowMappingBuilder::default();
             while let Some(batch) = stream.try_next().await? {
                 metrics.preflight_keys.add(batch.num_rows());
-                mapping.append(batch.column(0))?;
-                let keys = match self.context.compat_batch() {
-                    Some(compat) => compat.compat_primary_key(batch.column(0))?,
-                    None => batch.column(0).clone(),
-                };
-                catalog.fill_source_tags(&keys)?;
+                metrics
+                    .mapping_build
+                    .measure(|| mapping.append(batch.column(0)))?;
+                metrics.tag_fill.measure(|| -> Result<()> {
+                    let keys = match self.context.compat_batch() {
+                        Some(compat) => compat.compat_primary_key(batch.column(0))?,
+                        None => batch.column(0).clone(),
+                    };
+                    catalog.fill_source_tags(&keys)
+                })?;
             }
-            let mapping = mapping.finish(rows)?;
+            let mapping = metrics.mapping_build.measure(|| mapping.finish(rows))?;
+            metrics.mapping_runs.add(mapping.runs.len());
             ensure!(
                 !catalog.needs_source_tags(&mapping),
                 UnexpectedSnafu {
@@ -484,7 +497,9 @@ impl FileRange {
         metrics: &crate::read::series_compact::CompactMetrics,
     ) -> Result<ProjectedRecordBatchStream> {
         use crate::read::series_compact::CompactKeyCursor;
-        let runs = mapping.select(series, self.row_selection.as_ref());
+        let runs = metrics
+            .mapping_select
+            .measure(|| mapping.select(series, self.row_selection.as_ref()));
         let selection =
             row_selection_from_row_ranges(runs.iter().map(|r| r.rows.clone()), mapping.num_rows);
         let mut cursor = CompactKeyCursor::new(runs)?;
@@ -500,11 +515,12 @@ impl FileRange {
             .await?;
         let override_sequence = self.context.read_format().new_override_sequence_array(1);
         let mapping_pin = mapping;
+        let key_metrics = metrics.key_synthesis.clone();
         Ok(Box::pin(async_stream::try_stream! {
             let _mapping_pin = mapping_pin;
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
-                let key = cursor.next(batch.num_rows())?;
+                let key = key_metrics.measure(|| cursor.next(batch.num_rows()))?;
                 let mut columns = batch.columns().to_vec();
                 let mut fields = batch.schema().fields().to_vec();
                 let key_index = columns.len() - 2;

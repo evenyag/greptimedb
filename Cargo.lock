@@ -8755,6 +8755,7 @@ dependencies = [
  "log-store",
  "mito-codec",
  "moka",
+ "nix 0.30.1",
  "object-store",
  "parquet",
  "partition",

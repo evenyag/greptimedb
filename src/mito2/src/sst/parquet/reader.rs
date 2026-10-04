@@ -1970,7 +1970,7 @@ impl RowGroupReaderBuilder {
     pub(crate) async fn build_primary_key_measured(
         &self,
         build_ctx: RowGroupBuildContext<'_>,
-        bytes: Option<datafusion::physical_plan::metrics::Count>,
+        bytes: Option<crate::read::series_compact::MeasuredKeyRead>,
     ) -> Result<ProjectedRecordBatchStream> {
         let parquet_schema = self.parquet_meta.file_metadata().schema_descr();
         let primary_key_index = parquet_schema
@@ -2041,7 +2041,7 @@ impl RowGroupReaderBuilder {
         row_selection: Option<RowSelection>,
         projection: ProjectionMask,
         fetch_metrics: Option<&ParquetFetchMetrics>,
-        bytes: Option<datafusion::physical_plan::metrics::Count>,
+        bytes: Option<crate::read::series_compact::MeasuredKeyRead>,
     ) -> Result<ProjectedRecordBatchStream> {
         let range_fetcher = SstParquetRangeFetcher::new(
             self.file_handle.file_id(),
@@ -2051,7 +2051,7 @@ impl RowGroupReaderBuilder {
             row_group_idx,
             fetch_metrics.cloned(),
         )
-        .with_key_read_bytes(bytes);
+        .with_key_read_metrics(bytes);
 
         build_sst_parquet_record_batch_stream(
             self.arrow_metadata.clone(),

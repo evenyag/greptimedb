@@ -444,10 +444,12 @@ async fn build_series_partition_range(
                         let mut reader = range.compact_reader(mapping, &filter.sorted_series, &compact.catalog.metrics).await?;
                         let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
                         while let Some(batch) = reader.try_next().await? {
-                            let Some(batch) = filter_flat_batch_by_sequence(batch, ctx.input.sequence_range, trusted)? else { continue; };
-                            let Some(batch) = range.precise_filter_compact(batch, &compact.catalog)? else { continue; };
+                            let Some(batch) = compact.catalog.metrics.data_filter.measure(|| -> Result<_> {
+                                let Some(batch) = filter_flat_batch_by_sequence(batch, ctx.input.sequence_range, trusted)? else { return Ok(None); };
+                                range.precise_filter_compact(batch, &compact.catalog)
+                            })? else { continue; };
                             let key = batch.column(primary_key_column_index(batch.num_columns())).clone();
-                            yield compact.schema.adapt(&batch, key)?;
+                            yield compact.catalog.metrics.schema_adapt.measure(|| compact.schema.adapt(&batch, key))?;
                         }
                     }
                 }) as BoxedRecordBatchStream);

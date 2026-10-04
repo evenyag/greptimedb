@@ -31,6 +31,7 @@ use crate::cache::file_cache::{FileType, IndexKey};
 use crate::cache::{CacheStrategy, PageRangePart};
 use crate::error::{OpenDalSnafu, ReadParquetSnafu, Result, UnexpectedSnafu};
 use crate::metrics::{READ_STAGE_ELAPSED, READ_STAGE_FETCH_PAGES};
+use crate::read::series_compact::{CompactReadMetrics, MeasuredKeyRead, measure_operation};
 use crate::sst::file::RegionFileId;
 use crate::sst::parquet::helper::fetch_byte_ranges;
 use crate::sst::parquet::row_group::{ParquetFetchMetrics, compute_total_range_size};
@@ -41,6 +42,7 @@ use crate::sst::parquet::row_group::{ParquetFetchMetrics, compute_total_range_si
 /// fetcher keeps cache lookup, local write-cache reads, and remote I/O explicit
 /// in Greptime code.
 pub struct SstParquetRangeFetcher {
+    read_metrics: Option<CompactReadMetrics>,
     key_read_bytes: Option<datafusion::physical_plan::metrics::Count>,
     compact_audit: Option<(
         usize,
@@ -72,6 +74,7 @@ impl SstParquetRangeFetcher {
         fetch_metrics: Option<ParquetFetchMetrics>,
     ) -> Self {
         Self {
+            read_metrics: None,
             compact_audit: None,
             key_read_bytes: None,
             region_file_id,
@@ -83,11 +86,11 @@ impl SstParquetRangeFetcher {
         }
     }
 
-    pub(crate) fn with_key_read_bytes(
-        mut self,
-        bytes: Option<datafusion::physical_plan::metrics::Count>,
-    ) -> Self {
-        self.key_read_bytes = bytes;
+    pub(crate) fn with_key_read_metrics(mut self, metrics: Option<MeasuredKeyRead>) -> Self {
+        if let Some((bytes, reads)) = metrics {
+            self.key_read_bytes = Some(bytes);
+            self.read_metrics = Some(reads);
+        }
         self
     }
 
@@ -97,6 +100,7 @@ impl SstParquetRangeFetcher {
         range: (u64, u64),
         metrics: crate::read::series_compact::CompactMetrics,
     ) -> Self {
+        self.read_metrics = Some(metrics.data_read.clone());
         self.compact_audit = Some((column, range.0..range.0 + range.1, metrics));
         self
     }
@@ -117,17 +121,29 @@ impl SstParquetRangeFetcher {
         if let Some(bytes) = &self.key_read_bytes {
             bytes.add(ranges.iter().map(|r| (r.end - r.start) as usize).sum());
         }
+        let _fetch_timer = self.read_metrics.as_ref().map(|m| m.fetch_elapsed.timer());
+        if let Some(m) = &self.read_metrics {
+            m.fetch_calls.add(1);
+            m.requested_bytes
+                .add(ranges.iter().map(|r| (r.end - r.start) as usize).sum());
+        }
         let fetch_start = self
             .fetch_metrics
             .as_ref()
             .map(|_| std::time::Instant::now());
         let _timer = READ_STAGE_FETCH_PAGES.start_timer();
 
-        let mut page_lookup = self.cache_strategy.get_page_ranges(
-            self.region_file_id.file_id(),
-            self.row_group_idx,
-            &ranges,
-        );
+        let mut page_lookup =
+            measure_operation(self.read_metrics.as_ref().map(|m| &m.cache_lookup), || {
+                self.cache_strategy.get_page_ranges(
+                    self.region_file_id.file_id(),
+                    self.row_group_idx,
+                    &ranges,
+                )
+            });
+        if let (Some(m), Some(lookup)) = (&self.read_metrics, &page_lookup) {
+            m.cache_bytes.add(lookup.cached_bytes as usize);
+        }
         if let Some(lookup) = &page_lookup
             && lookup.cached_bytes > 0
             && let Some(metrics) = &self.fetch_metrics
@@ -151,7 +167,10 @@ impl SstParquetRangeFetcher {
             {
                 metrics.data.lock().unwrap().total_fetch_elapsed += start.elapsed();
             }
-            return assemble_ranges(&ranges, lookup.cached_parts, &[]);
+            return measure_operation(
+                self.read_metrics.as_ref().map(|m| &m.range_assembly),
+                || assemble_ranges(&ranges, lookup.cached_parts, &[]),
+            );
         }
 
         let missing_ranges = page_lookup
@@ -172,13 +191,21 @@ impl SstParquetRangeFetcher {
             .fetch_metrics
             .as_ref()
             .map(|_| std::time::Instant::now());
+        let write_timer = self
+            .read_metrics
+            .as_ref()
+            .map(|m| m.write_cache_elapsed.timer());
         let write_cache_result = match self.cache_strategy.write_cache() {
             Some(cache) => cache.file_cache().read_ranges(key, &missing_ranges).await,
             None => None,
         };
 
+        drop(write_timer);
         let fetched_pages = match write_cache_result {
             Some(data) => {
+                if let Some(m) = &self.read_metrics {
+                    m.write_cache_bytes.add(data.iter().map(|b| b.len()).sum());
+                }
                 if let Some(metrics) = &self.fetch_metrics {
                     let elapsed = fetch_write_cache_start
                         .map(|start| start.elapsed())
@@ -204,10 +231,18 @@ impl SstParquetRangeFetcher {
                     .fetch_metrics
                     .as_ref()
                     .map(|_| std::time::Instant::now());
+                let store_timer = self.read_metrics.as_ref().map(|m| m.store_elapsed.timer());
+                if let Some(m) = &self.read_metrics {
+                    m.store_calls.add(1);
+                }
                 let data =
                     fetch_byte_ranges(&self.file_path, self.object_store.clone(), &missing_ranges)
                         .await
                         .context(OpenDalSnafu)?;
+                drop(store_timer);
+                if let Some(m) = &self.read_metrics {
+                    m.store_bytes.add(data.iter().map(|b| b.len()).sum());
+                }
 
                 if let Some(metrics) = &self.fetch_metrics {
                     let elapsed = start.map(|start| start.elapsed()).unwrap_or_default();
@@ -234,12 +269,14 @@ impl SstParquetRangeFetcher {
             }
         );
 
-        self.cache_strategy.put_page_ranges(
-            self.region_file_id.file_id(),
-            self.row_group_idx,
-            &missing_ranges,
-            &fetched_pages,
-        );
+        measure_operation(self.read_metrics.as_ref().map(|m| &m.cache_insert), || {
+            self.cache_strategy.put_page_ranges(
+                self.region_file_id.file_id(),
+                self.row_group_idx,
+                &missing_ranges,
+                &fetched_pages,
+            )
+        });
 
         if let (Some(metrics), Some(start)) = (&self.fetch_metrics, fetch_start) {
             metrics.data.lock().unwrap().total_fetch_elapsed += start.elapsed();
@@ -251,7 +288,10 @@ impl SstParquetRangeFetcher {
                 .zip(fetched_pages)
                 .map(|(range, bytes)| PageRangePart { range, bytes })
                 .collect::<Vec<_>>();
-            return assemble_ranges(&ranges, lookup.cached_parts, &fetched_parts);
+            return measure_operation(
+                self.read_metrics.as_ref().map(|m| &m.range_assembly),
+                || assemble_ranges(&ranges, lookup.cached_parts, &fetched_parts),
+            );
         }
 
         Ok(fetched_pages)
@@ -387,14 +427,19 @@ pub fn build_sst_parquet_record_batch_stream(
 
     Ok(async_stream::try_stream! {
         loop {
-            match decoder.try_decode().context(ReadParquetSnafu { path: &file_path })? {
+            match measure_operation(fetcher.read_metrics.as_ref().map(|m| &m.decode), || decoder.try_decode()).context(ReadParquetSnafu { path: &file_path })? {
                 DecodeResult::NeedsData(ranges) => {
                     let data = fetcher.fetch_bytes_with_cache(ranges.clone()).await?;
-                    decoder
-                        .push_ranges(ranges, data)
+                    measure_operation(fetcher.read_metrics.as_ref().map(|m| &m.decode), || decoder.push_ranges(ranges, data))
                         .context(ReadParquetSnafu { path: &file_path })?;
                 }
-                DecodeResult::Data(batch) => yield batch,
+                DecodeResult::Data(batch) => {
+                    if let Some(m) = &fetcher.read_metrics {
+                        m.decoded_batches.add(1);
+                        m.decoded_rows.add(batch.num_rows());
+                    }
+                    yield batch;
+                },
                 DecodeResult::Finished => break,
             }
         }
@@ -405,6 +450,69 @@ pub fn build_sst_parquet_record_batch_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compact_read_metrics_separate_store_and_cached_payload() {
+        use crate::cache::CacheManager;
+        use crate::read::series_compact::CompactMetrics;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use std::sync::Arc;
+        use store_api::storage::{FileId, RegionId};
+        let metrics = CompactMetrics::new(&ExecutionPlanMetricsSet::default(), 0);
+        let reads = metrics.preflight_read.clone();
+        let store = ObjectStore::new(object_store::services::Memory::default()).unwrap();
+        store
+            .write("keys", Bytes::from_static(b"0123456789abcdef"))
+            .await
+            .unwrap();
+        let cache = CacheStrategy::EnableAll(Arc::new(
+            CacheManager::builder().page_cache_size(1024 * 1024).build(),
+        ));
+        let fetcher = SstParquetRangeFetcher::new(
+            RegionFileId::new(RegionId::new(1, 1), FileId::random()),
+            "keys".into(),
+            store.clone(),
+            cache,
+            0,
+            None,
+        )
+        .with_key_read_metrics(Some((metrics.preflight_key_bytes.clone(), reads.clone())));
+        let first = fetcher
+            .fetch_bytes_with_cache(std::iter::once(0..8).collect())
+            .await
+            .unwrap();
+        assert_eq!(b"01234567", first[0].as_ref());
+        let second = fetcher
+            .fetch_bytes_with_cache(std::iter::once(4..12).collect())
+            .await
+            .unwrap();
+        assert_eq!(b"456789ab", second[0].as_ref());
+        assert_eq!(12, reads.store_bytes.value());
+        assert_eq!(4, reads.cache_bytes.value());
+        store.delete("keys").await.unwrap();
+        let cached = fetcher
+            .fetch_bytes_with_cache(std::iter::once(0..12).collect())
+            .await
+            .unwrap();
+        assert_eq!(b"0123456789ab", cached[0].as_ref());
+        assert_eq!(28, reads.requested_bytes.value());
+        assert_eq!(28, metrics.preflight_key_bytes.value());
+        assert_eq!(16, reads.cache_bytes.value());
+        assert_eq!(12, reads.store_bytes.value());
+        assert_eq!(2, reads.store_calls.value());
+        assert_eq!(3, reads.fetch_calls.value());
+        assert_eq!(3, reads.cache_lookup.calls.value());
+        assert_eq!(2, reads.cache_insert.calls.value());
+        assert!(reads.fetch_elapsed.value() > 0);
+        assert!(
+            fetcher
+                .fetch_bytes_with_cache(std::iter::once(12..16).collect())
+                .await
+                .is_err()
+        );
+        assert_eq!(3, reads.store_calls.value());
+        assert_eq!(12, reads.store_bytes.value());
+    }
 
     #[tokio::test]
     async fn compact_key_audit_rejects_reads_before_cache_lookup() {
