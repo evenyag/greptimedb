@@ -1165,6 +1165,7 @@ impl EngineInner {
         .with_max_concurrent_scan_files(self.config.max_concurrent_scan_files)
         .with_scan_memory_pool(self.scan_memory_pool.clone())
         .with_experimental_series_scan_v2(self.config.experimental_series_scan_v2)
+        .with_experimental_series_scan_compact(self.config.experimental_series_scan_compact)
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())

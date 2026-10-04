@@ -66,6 +66,7 @@ use crate::sst::parquet::row_group::ParquetFetchMetrics;
 
 /// Builds candidate metric series from the ranges assigned to a [`SeriesScan`](super::series_scan::SeriesScan).
 pub(crate) struct SeriesCandidateScanner {
+    catalog: Option<Arc<crate::read::series_compact::TagCatalog>>,
     stream_ctx: Arc<StreamContext>,
     partitions: Vec<Vec<PartitionRange>>,
     partition_pruner: Arc<PartitionPruner>,
@@ -125,6 +126,7 @@ impl SeriesCandidateScanner {
             )
         };
         Ok(Self {
+            catalog: None,
             stream_ctx,
             partitions,
             partition_pruner,
@@ -137,6 +139,14 @@ impl SeriesCandidateScanner {
         })
     }
 
+    pub(crate) fn with_catalog(
+        mut self,
+        catalog: Arc<crate::read::series_compact::TagCatalog>,
+    ) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
     /// Builds a globally sorted stream of candidate metric-series IDs.
     pub(crate) async fn build_stream(&self) -> Result<MetricSeriesIdStream> {
         let all_ranges = self
@@ -146,6 +156,7 @@ impl SeriesCandidateScanner {
             .copied()
             .collect::<Vec<_>>();
         let range_builder = SeriesCandidateRangeBuilder {
+            compact_metrics: self.catalog.as_ref().map(|c| c.metrics.clone()),
             stream_ctx: self.stream_ctx.clone(),
             partition_pruner: self.candidate_pruner.clone(),
             coverage: self.coverage.clone(),
@@ -206,7 +217,11 @@ impl SeriesCandidateScanner {
             self.partitions.len(),
             "SeriesCandidateScanner::final_merge",
         )?;
-        decode_metric_series(merged, self.stream_ctx.input.region_metadata().clone())
+        decode_metric_series_with_catalog(
+            merged,
+            self.stream_ctx.input.region_metadata().clone(),
+            self.catalog.clone(),
+        )
     }
 
     /// Returns the partition pruner shared with the data phase.
@@ -344,6 +359,7 @@ fn index_primary_key_stream(
 
 #[derive(Clone)]
 struct SeriesCandidateRangeBuilder {
+    compact_metrics: Option<crate::read::series_compact::CompactMetrics>,
     stream_ctx: Arc<StreamContext>,
     coverage: Arc<SeriesIndexCoverage>,
     partition_pruner: Arc<PartitionPruner>,
@@ -469,6 +485,7 @@ impl SeriesCandidateRangeBuilder {
                 )
             });
             let part_metrics = self.part_metrics.clone();
+            let compact_metrics = self.compact_metrics.clone();
             let raw = Box::pin(try_stream! {
                 let fetch_metrics = part_metrics
                     .explain_verbose()
@@ -479,16 +496,16 @@ impl SeriesCandidateRangeBuilder {
                 };
                 for range in ranges {
                     let build_start = Instant::now();
-                    let Some(mut reader) = range
-                        .primary_key_reader(fetch_metrics.as_deref())
-                        .await?
-                    else {
-                        continue;
+                    let reader = match &compact_metrics {
+                        Some(m) => range.primary_key_reader_measured(fetch_metrics.as_deref(), Some(m.discovery_key_bytes.clone())).await?,
+                        None => range.primary_key_reader(fetch_metrics.as_deref()).await?,
                     };
+                    let Some(mut reader) = reader else { continue; };
                     reader_metrics.build_cost += build_start.elapsed();
 
                     let scan_start = Instant::now();
                     while let Some(batch) = reader.try_next().await? {
+                        if let Some(metrics) = &compact_metrics { metrics.discovery_keys.add(batch.num_rows()); }
                         reader_metrics.num_record_batches += 1;
                         reader_metrics.num_batches += 1;
                         reader_metrics.num_rows += batch.num_rows();
@@ -698,9 +715,18 @@ fn merge_primary_key_streams(
     }))
 }
 
+#[cfg(test)]
 fn decode_metric_series(
+    input: BoxedRecordBatchStream,
+    metadata: store_api::metadata::RegionMetadataRef,
+) -> Result<MetricSeriesIdStream> {
+    decode_metric_series_with_catalog(input, metadata, None)
+}
+
+fn decode_metric_series_with_catalog(
     mut input: BoxedRecordBatchStream,
     metadata: store_api::metadata::RegionMetadataRef,
+    catalog: Option<Arc<crate::read::series_compact::TagCatalog>>,
 ) -> Result<MetricSeriesIdStream> {
     let codec = SparsePrimaryKeyCodec::new(&metadata);
     Ok(Box::pin(try_stream! {
@@ -715,6 +741,7 @@ fn decode_metric_series(
                     reason: "merged candidate primary key is not binary",
                 })?;
             for primary_key in array.iter().flatten() {
+                if let Some(catalog) = &catalog { catalog.insert_candidate(primary_key)?; }
                 let (table_id, tsid) = codec
                     .decode_ids(primary_key)
                     .context(crate::error::DecodeSnafu)?;
@@ -902,6 +929,46 @@ mod tests {
         )
         .unwrap();
         (env, scanner, pruner)
+    }
+
+    #[tokio::test]
+    async fn compact_index_candidates_do_not_waive_preflight() {
+        use crate::read::series_compact::{CompactMetrics, CompactReadContext, TagCatalog};
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        let (_env, scanner, _pruner) = indexed_scanner().await;
+        let metrics = CompactMetrics::new(&scanner.metrics_set, 0);
+        let catalog = Arc::new(TagCatalog::new(
+            scanner.stream_ctx.input.region_metadata().clone(),
+            &scanner.memory_pool,
+            metrics.clone(),
+        ));
+        // This fixture has a valid series index but deliberately absent source SSTs.
+        let groups = scanner
+            .build_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(!groups.is_empty());
+        let ranges = scanner
+            .partitions
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let result = CompactReadContext::preflight(
+            &scanner.stream_ctx,
+            &ranges,
+            &scanner.partition_pruner(),
+            &scanner.part_metrics,
+            catalog,
+            MemoryConsumer::new("test assignments").register(&scanner.memory_pool),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(0, metrics.data_readers.value());
+        assert_eq!(0, metrics.audited_decoders.value());
     }
 
     #[tokio::test]

@@ -179,3 +179,33 @@ Scan with WAL replay enabled (uses `[wal]` config from TOML):
   --table-dir greptime/public/1024 \
   --enable-wal
 ```
+
+### Compact SeriesScan PoC
+
+Set `experimental_series_scan_compact = true` in the Mito engine configuration
+passed to scanbench to exercise Stage 2 on eligible sparse metric scans. It is
+disabled by default and takes precedence over the v2 option for those scans.
+The effective scanner mode is `compact`; this stage uses selected-series reads
+and does not yet implement buffered preparation, IPC spilling, or replay.
+
+Before opening any data reader, the query establishes complete row-group identity
+mappings from range indexes, the mapping cache, or preflight key-only reads.
+Missing coverage fails the query. Data readers synthesize 22-byte identity keys,
+merge tag-free batches, and assemble projected tags from an accounted catalog.
+Existing v2 data-result and selector caches are bypassed for compact batches;
+candidate caching remains enabled, and identity mappings share the range-result
+cache budget in a separate namespace.
+
+Metrics distinguish `discovery_primary_key_rows/bytes` from
+`preflight_primary_key_rows/bytes`, and expose `mapping_preflight_cost`,
+`mapping_preflight_row_groups`, `compact_mapping_retained_bytes`,
+`compact_catalog_peak_bytes`, and `tag_assembly_cost`. Byte counts include cache
+hits and represent decoder-requested bytes, not physical storage traffic.
+
+The zero-key-page gate uses a decoder audit: every compact decoder must exclude
+`__primary_key`, and every byte request is checked against that column before
+cache lookup. `compact_data_primary_key_pages_decoded` is therefore a certified
+zero for successful audited readers, not a general-purpose Parquet page counter.
+Require `compact_audited_decoders == compact_data_readers` and
+`compact_primary_key_decode_violations == 0`, together with a completed exact
+comparison. Discovery/preflight key reads are allowed and reported separately.

@@ -200,11 +200,37 @@ impl SeqScan {
     #[tracing::instrument(level = tracing::Level::DEBUG, skip_all)]
     pub(crate) async fn build_flat_reader_from_sources(
         stream_ctx: &StreamContext,
+        sources: Vec<BoxedRecordBatchStream>,
+        semaphore: Option<Arc<Semaphore>>,
+        part_metrics: Option<&PartitionMetrics>,
+        skip_dedup: bool,
+        channel_size: usize,
+    ) -> Result<BoxedRecordBatchStream> {
+        let mapper = &stream_ctx.input.mapper;
+        Self::build_flat_reader_with_schema(
+            stream_ctx,
+            sources,
+            semaphore,
+            part_metrics,
+            skip_dedup,
+            channel_size,
+            (
+                mapper.input_arrow_schema(stream_ctx.input.compaction),
+                mapper.field_column_start(),
+            ),
+        )
+        .await
+    }
+
+    /// Merges an explicit internal schema, independently of the output tag projection.
+    pub(crate) async fn build_flat_reader_with_schema(
+        stream_ctx: &StreamContext,
         mut sources: Vec<BoxedRecordBatchStream>,
         semaphore: Option<Arc<Semaphore>>,
         part_metrics: Option<&PartitionMetrics>,
         skip_dedup: bool,
         channel_size: usize,
+        merge_schema: (datatypes::arrow::datatypes::SchemaRef, usize),
     ) -> Result<BoxedRecordBatchStream> {
         if let Some(semaphore) = semaphore.as_ref() {
             // Read sources in parallel.
@@ -217,13 +243,12 @@ impl SeqScan {
             }
         }
 
-        let mapper = &stream_ctx.input.mapper;
         let reader: BoxedRecordBatchStream = if sources.len() == 1 {
             // Currently, we can't skip dedup when there is only one source because
             // that source may have duplicate rows.
             sources.pop().unwrap()
         } else {
-            let schema = mapper.input_arrow_schema(stream_ctx.input.compaction);
+            let schema = merge_schema.0;
             let metrics_reporter = part_metrics.map(|m| m.merge_metrics_reporter());
             let reader = FlatMergeReader::new(
                 schema,
@@ -250,10 +275,7 @@ impl SeqScan {
                 MergeMode::LastNonNull => Box::pin(
                     FlatDedupReader::new(
                         reader,
-                        FlatLastNonNull::new(
-                            mapper.field_column_start(),
-                            stream_ctx.input.filter_deleted,
-                        ),
+                        FlatLastNonNull::new(merge_schema.1, stream_ctx.input.filter_deleted),
                         dedup_metrics_reporter,
                     )
                     .into_stream(),

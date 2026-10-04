@@ -54,8 +54,8 @@ use table::predicate::Predicate;
 use crate::cache::index::result_cache::PredicateKey;
 use crate::cache::{CacheStrategy, CachedSstMeta, SstMetaPreparation, prepare_sst_meta};
 use crate::error::{
-    ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result, SerializePartitionExprSnafu,
-    UnexpectedSnafu,
+    ComputeArrowSnafu, ParquetToArrowSchemaSnafu, ReadDataPartSnafu, Result,
+    SerializePartitionExprSnafu, UnexpectedSnafu,
 };
 use crate::metrics::{
     PRECISE_FILTER_ROWS_TOTAL, READ_ROW_GROUPS_TOTAL, READ_ROWS_IN_ROW_GROUP_TOTAL,
@@ -1869,6 +1869,80 @@ impl RowGroupReaderBuilder {
         self.make_projected_stream(stream)
     }
 
+    /// Builds a tag-free data decoder with an enforced primary-key exclusion audit.
+    pub(crate) async fn build_compact(
+        &self,
+        group: usize,
+        selection: RowSelection,
+        metadata: &RegionMetadataRef,
+        metrics: crate::read::series_compact::CompactMetrics,
+    ) -> Result<ProjectedRecordBatchStream> {
+        let schema = self.parquet_meta.file_metadata().schema_descr();
+        let keep = |name: &str| {
+            name != PRIMARY_KEY_COLUMN_NAME
+                && metadata
+                    .column_by_name(name)
+                    .is_none_or(|c| c.semantic_type != api::v1::SemanticType::Tag)
+        };
+        let leaves = (0..schema.num_columns())
+            .filter(|i| {
+                self.projection.mask.leaf_included(*i)
+                    && keep(schema.column(*i).path().parts()[0].as_str())
+            })
+            .collect::<Vec<_>>();
+        let projection = ProjectionMask::leaves(schema, leaves);
+        let pk_index = schema
+            .columns()
+            .iter()
+            .position(|c| c.name() == PRIMARY_KEY_COLUMN_NAME)
+            .context(UnexpectedSnafu {
+                reason: "SST missing primary key for compact audit",
+            })?;
+        let fetcher = SstParquetRangeFetcher::new(
+            self.file_handle.file_id(),
+            self.file_path.clone(),
+            self.object_store.clone(),
+            self.cache_strategy.clone(),
+            group,
+            None,
+        )
+        .with_compact_audit(
+            pk_index,
+            self.parquet_meta
+                .row_group(group)
+                .column(pk_index)
+                .byte_range(),
+            metrics,
+        );
+        let stream = build_sst_parquet_record_batch_stream(
+            self.arrow_metadata.clone(),
+            group,
+            Some(selection),
+            projection,
+            fetcher,
+            self.file_path.clone(),
+            self.batch_size,
+        )?;
+        let indices = self
+            .output_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| keep(f.name()))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let output = Arc::new(
+            self.output_schema
+                .project(&indices)
+                .context(ComputeArrowSnafu)?,
+        );
+        let presence = indices
+            .iter()
+            .map(|i| self.projection.projected_root_presence[*i])
+            .collect();
+        Ok(JsonSchemaAligner::new(stream, presence, output, AlignMode::AlignToSchema)?.boxed())
+    }
+
     /// Builds the normal projection without running the generic predicate prefilter.
     ///
     /// The series reader uses this after computing its own primary-key-only row
@@ -1893,9 +1967,10 @@ impl RowGroupReaderBuilder {
     /// It preserves the normal reader's binary-or-dictionary decision. This path deliberately
     /// skips the normal prefilter pass: the caller reads `__primary_key` once and applies all
     /// encoded-primary-key filters to the returned batches.
-    pub(crate) async fn build_primary_key(
+    pub(crate) async fn build_primary_key_measured(
         &self,
         build_ctx: RowGroupBuildContext<'_>,
+        bytes: Option<datafusion::physical_plan::metrics::Count>,
     ) -> Result<ProjectedRecordBatchStream> {
         let parquet_schema = self.parquet_meta.file_metadata().schema_descr();
         let primary_key_index = parquet_schema
@@ -1907,11 +1982,12 @@ impl RowGroupReaderBuilder {
             })?;
         let projection = ProjectionMask::leaves(parquet_schema, [primary_key_index]);
 
-        self.build_with_projection(
+        self.build_with_projection_measured(
             build_ctx.row_group_idx,
             build_ctx.row_selection,
             projection,
             build_ctx.fetch_metrics,
+            bytes,
         )
         .await
     }
@@ -1949,6 +2025,24 @@ impl RowGroupReaderBuilder {
         projection: ProjectionMask,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<ProjectedRecordBatchStream> {
+        self.build_with_projection_measured(
+            row_group_idx,
+            row_selection,
+            projection,
+            fetch_metrics,
+            None,
+        )
+        .await
+    }
+
+    async fn build_with_projection_measured(
+        &self,
+        row_group_idx: usize,
+        row_selection: Option<RowSelection>,
+        projection: ProjectionMask,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+        bytes: Option<datafusion::physical_plan::metrics::Count>,
+    ) -> Result<ProjectedRecordBatchStream> {
         let range_fetcher = SstParquetRangeFetcher::new(
             self.file_handle.file_id(),
             self.file_path.clone(),
@@ -1956,7 +2050,8 @@ impl RowGroupReaderBuilder {
             self.cache_strategy.clone(),
             row_group_idx,
             fetch_metrics.cloned(),
-        );
+        )
+        .with_key_read_bytes(bytes);
 
         build_sst_parquet_record_batch_stream(
             self.arrow_metadata.clone(),

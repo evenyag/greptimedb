@@ -271,13 +271,24 @@ impl FileRange {
         &self,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
-        self.primary_key_reader_inner(fetch_metrics, true).await
+        self.primary_key_reader_inner(fetch_metrics, true, None)
+            .await
+    }
+
+    pub(crate) async fn primary_key_reader_measured(
+        &self,
+        fetch_metrics: Option<&ParquetFetchMetrics>,
+        bytes: Option<datafusion::physical_plan::metrics::Count>,
+    ) -> Result<Option<ProjectedRecordBatchStream>> {
+        self.primary_key_reader_inner(fetch_metrics, true, bytes)
+            .await
     }
 
     async fn primary_key_reader_inner(
         &self,
         fetch_metrics: Option<&ParquetFetchMetrics>,
         check_dynamic_filter: bool,
+        bytes: Option<datafusion::physical_plan::metrics::Count>,
     ) -> Result<Option<ProjectedRecordBatchStream>> {
         if check_dynamic_filter && !self.in_dynamic_filter_range() {
             return Ok(None);
@@ -285,11 +296,14 @@ impl FileRange {
         let stream = self
             .context
             .reader_builder
-            .build_primary_key(self.context.build_context(
-                self.row_group_idx,
-                self.row_selection.clone(),
-                fetch_metrics,
-            ))
+            .build_primary_key_measured(
+                self.context.build_context(
+                    self.row_group_idx,
+                    self.row_selection.clone(),
+                    fetch_metrics,
+                ),
+                bytes,
+            )
             .await?;
         if self.context.compat_batch().is_none() {
             return Ok(Some(stream));
@@ -320,7 +334,9 @@ impl FileRange {
         primary_key_filter: &mut dyn mito_codec::row_converter::PrimaryKeyFilter,
         fetch_metrics: Option<&ParquetFetchMetrics>,
     ) -> Result<Option<FlatRowGroupReader>> {
-        let Some(mut primary_keys) = self.primary_key_reader_inner(fetch_metrics, false).await?
+        let Some(mut primary_keys) = self
+            .primary_key_reader_inner(fetch_metrics, false, None)
+            .await?
         else {
             return Ok(None);
         };
@@ -381,6 +397,193 @@ impl FileRange {
             ))
             .await?;
         Ok(Some(FlatRowGroupReader::new(self.context.clone(), stream)))
+    }
+
+    /// Establishes complete mappings before compact data readers can be constructed.
+    pub(crate) async fn preflight_compact_mapping(
+        &self,
+        catalog: &crate::read::series_compact::TagCatalog,
+    ) -> Result<Arc<crate::read::series_compact::SeriesRowMapping>> {
+        use crate::read::series_compact::SeriesRowMappingBuilder;
+        use futures::TryStreamExt;
+        let metrics = &catalog.metrics;
+        let builder = &self.context.reader_builder;
+        let rows = builder
+            .parquet_metadata()
+            .row_group(self.row_group_idx)
+            .num_rows() as usize;
+        let file = self.file_handle().file_id();
+        metrics.preflight_groups.add(1);
+        if let Some(mapping) = builder
+            .cache_strategy()
+            .get_series_mapping(file, self.row_group_idx)
+            && mapping.num_rows == rows
+            && !catalog.needs_source_tags(&mapping)
+        {
+            return Ok(mapping);
+        }
+        let result: Result<_> = async {
+            if let Ok(Some(index)) = self.range_index_searcher().await
+                && let Ok(mapping) = index.compact_mapping(self.row_group_idx as u32, rows).await
+                && !catalog.needs_source_tags(&mapping)
+            {
+                return Ok(mapping);
+            }
+            // Read all source rows: a pruned or predicate-selected mapping is not complete.
+            let mut stream = builder
+                .build_primary_key_measured(
+                    RowGroupBuildContext {
+                        row_group_idx: self.row_group_idx,
+                        row_selection: None,
+                        fetch_metrics: None,
+                    },
+                    Some(metrics.preflight_key_bytes.clone()),
+                )
+                .await?;
+            let mut mapping = SeriesRowMappingBuilder::default();
+            while let Some(batch) = stream.try_next().await? {
+                metrics.preflight_keys.add(batch.num_rows());
+                mapping.append(batch.column(0))?;
+                let keys = match self.context.compat_batch() {
+                    Some(compat) => compat.compat_primary_key(batch.column(0))?,
+                    None => batch.column(0).clone(),
+                };
+                catalog.fill_source_tags(&keys)?;
+            }
+            let mapping = mapping.finish(rows)?;
+            ensure!(
+                !catalog.needs_source_tags(&mapping),
+                UnexpectedSnafu {
+                    reason: "source key reads did not establish compact tag coverage"
+                }
+            );
+            Ok(mapping)
+        }
+        .await;
+        let mapping = Arc::new(result.map_err(|error| {
+            UnexpectedSnafu {
+                reason: format!(
+                    "compact mapping preflight failed for {} row group {}: {error}",
+                    builder.file_path(),
+                    self.row_group_idx
+                ),
+            }
+            .build()
+        })?);
+        builder
+            .cache_strategy()
+            .put_series_mapping(file, self.row_group_idx, mapping.clone());
+        Ok(mapping)
+    }
+
+    /// Opens only field/time/sequence/op columns, using the pinned mapping for keys.
+    pub(crate) async fn compact_reader(
+        &self,
+        mapping: Arc<crate::read::series_compact::SeriesRowMapping>,
+        series: &[crate::series_index::MetricSeriesId],
+        metrics: &crate::read::series_compact::CompactMetrics,
+    ) -> Result<ProjectedRecordBatchStream> {
+        use crate::read::series_compact::CompactKeyCursor;
+        let runs = mapping.select(series, self.row_selection.as_ref());
+        let selection =
+            row_selection_from_row_ranges(runs.iter().map(|r| r.rows.clone()), mapping.num_rows);
+        let mut cursor = CompactKeyCursor::new(runs)?;
+        let mut stream = self
+            .context
+            .reader_builder
+            .build_compact(
+                self.row_group_idx,
+                selection,
+                self.region_metadata(),
+                metrics.clone(),
+            )
+            .await?;
+        let override_sequence = self.context.read_format().new_override_sequence_array(1);
+        let mapping_pin = mapping;
+        Ok(Box::pin(async_stream::try_stream! {
+            let _mapping_pin = mapping_pin;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let key = cursor.next(batch.num_rows())?;
+                let mut columns = batch.columns().to_vec();
+                let mut fields = batch.schema().fields().to_vec();
+                let key_index = columns.len() - 2;
+                columns.insert(key_index, key);
+                fields.insert(key_index, crate::sst::internal_fields()[0].clone());
+                if let Some(sequence) = &override_sequence {
+                    let indices = datatypes::arrow::array::UInt32Array::from_value(0, batch.num_rows());
+                    columns[key_index + 1] = datatypes::arrow::compute::take(sequence, &indices, None).context(ComputeArrowSnafu)?;
+                }
+                yield RecordBatch::try_new(Arc::new(datatypes::arrow::datatypes::Schema::new(fields)), columns).context(NewRecordBatchSnafu)?;
+            }
+            cursor.finish()?;
+        }))
+    }
+
+    /// Applies source filters by column name, without tag-bearing schema offsets.
+    pub(crate) fn precise_filter_compact(
+        &self,
+        input: RecordBatch,
+        catalog: &crate::read::series_compact::TagCatalog,
+    ) -> Result<Option<RecordBatch>> {
+        let base = &self.context.base;
+        let mut mask = BooleanBuffer::new_set(input.num_rows());
+        for context in &base.filters {
+            let filter = match context.filter() {
+                MaybeFilter::Matched => continue,
+                MaybeFilter::Pruned => return Ok(None),
+                MaybeFilter::Filter(filter) => filter,
+            };
+            if context.semantic_type() == SemanticType::Tag
+                || (base.pre_filter_mode.skip_fields()
+                    && context.semantic_type() == SemanticType::Field)
+            {
+                continue;
+            }
+            let Some(column) = self.region_metadata().column_by_id(context.column_id()) else {
+                continue;
+            };
+            if let Some(array) = input.column_by_name(&column.column_schema.name) {
+                mask = mask.bitand(&filter.evaluate_array(array).context(RecordBatchSnafu)?);
+            }
+        }
+        if let Some(filter) = &base.partition_filter {
+            let ids = crate::read::series_compact::identities(
+                input.column(primary_key_column_index(input.num_columns())),
+            )?;
+            let mut columns = Vec::new();
+            for field in filter.partition_schema.arrow_schema().fields() {
+                let array = if let Some(array) = input.column_by_name(field.name()) {
+                    array.clone()
+                } else {
+                    let column = self
+                        .region_metadata()
+                        .column_by_name(field.name())
+                        .context(UnexpectedSnafu {
+                            reason: "missing compact partition column",
+                        })?;
+                    catalog.column(column.column_id, &ids)?
+                };
+                columns.push(
+                    datatypes::arrow::compute::cast(&array, field.data_type())
+                        .context(ComputeArrowSnafu)?,
+                );
+            }
+            let batch =
+                RecordBatch::try_new(filter.partition_schema.arrow_schema().clone(), columns)
+                    .context(NewRecordBatchSnafu)?;
+            mask = mask.bitand(&base.evaluate_partition_filter(&batch, filter)?);
+        }
+        if mask.count_set_bits() == 0 {
+            return Ok(None);
+        }
+        if mask.count_set_bits() == input.num_rows() {
+            return Ok(Some(input));
+        }
+        Ok(Some(
+            datatypes::arrow::compute::filter_record_batch(&input, &BooleanArray::from(mask))
+                .context(ComputeArrowSnafu)?,
+        ))
     }
 
     /// Returns the helper to compat batches.

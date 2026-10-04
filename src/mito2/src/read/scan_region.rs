@@ -246,6 +246,7 @@ pub(crate) struct ScanRegion {
     scan_memory_pool: Arc<dyn MemoryPool>,
     /// Whether to enable the experimental two-phase metric series scan.
     experimental_series_scan_v2: bool,
+    experimental_series_scan_compact: bool,
     /// Whether to ignore range indexes during scans.
     ignore_range_index: bool,
     /// Whether to ignore inverted index.
@@ -284,6 +285,7 @@ impl ScanRegion {
             max_concurrent_scan_files: DEFAULT_MAX_CONCURRENT_SCAN_FILES,
             scan_memory_pool: Arc::new(UnboundedMemoryPool::default()),
             experimental_series_scan_v2: false,
+            experimental_series_scan_compact: false,
             ignore_range_index: false,
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
@@ -328,6 +330,12 @@ impl ScanRegion {
     #[must_use]
     pub(crate) fn with_scan_memory_pool(mut self, scan_memory_pool: Arc<dyn MemoryPool>) -> Self {
         self.scan_memory_pool = scan_memory_pool;
+        self
+    }
+
+    /// Enables the opt-in compact metric read path.
+    pub(crate) fn with_experimental_series_scan_compact(mut self, enabled: bool) -> Self {
+        self.experimental_series_scan_compact = enabled;
         self
     }
 
@@ -444,8 +452,9 @@ impl ScanRegion {
     #[tracing::instrument(skip_all, fields(region_id = %self.region_id()))]
     pub(crate) async fn series_scan(self) -> Result<SeriesScan> {
         let experimental_series_scan_v2 = self.experimental_series_scan_v2;
+        let compact = self.experimental_series_scan_compact;
         let input = self.scan_input().await?;
-        Ok(SeriesScan::new(input, experimental_series_scan_v2))
+        Ok(SeriesScan::new(input, experimental_series_scan_v2, compact))
     }
 
     /// Returns true if the region can use unordered scan for current request.

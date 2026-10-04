@@ -54,6 +54,7 @@ use crate::read::scan_util::{
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::{SeriesCandidateScanner, is_sparse_metric_metadata};
+use crate::read::series_compact::{CompactMetrics, CompactReadContext, TagCatalog};
 use crate::read::series_reader::{AssignedSeriesBatch, SeriesBatchCollector, SeriesReader};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -94,6 +95,7 @@ impl Drop for CandidateReceiver {
 
 /// Input required by a partition-local series reader.
 struct SeriesReaderInput {
+    compact: Option<Arc<CompactReadContext>>,
     assigned_series: AssignedSeriesBatch,
     partition_pruner: Arc<PartitionPruner>,
     range_semaphore: Arc<Semaphore>,
@@ -103,6 +105,7 @@ struct SeriesReaderInput {
 enum SeriesScanMode {
     Legacy,
     TwoPhase,
+    Compact,
 }
 
 impl SeriesScanMode {
@@ -110,6 +113,7 @@ impl SeriesScanMode {
         match self {
             Self::Legacy => "legacy",
             Self::TwoPhase => "two_phase",
+            Self::Compact => "compact",
         }
     }
 }
@@ -139,8 +143,10 @@ pub struct SeriesScan {
 
 impl SeriesScan {
     /// Creates a new [SeriesScan].
-    pub(crate) fn new(input: ScanInput, experimental_series_scan_v2: bool) -> Self {
-        let mode = if experimental_series_scan_v2 && Self::supports_two_phase(&input) {
+    pub(crate) fn new(input: ScanInput, experimental_series_scan_v2: bool, compact: bool) -> Self {
+        let mode = if compact && Self::supports_two_phase(&input) {
+            SeriesScanMode::Compact
+        } else if experimental_series_scan_v2 && Self::supports_two_phase(&input) {
             SeriesScanMode::TwoPhase
         } else {
             SeriesScanMode::Legacy
@@ -159,14 +165,16 @@ impl SeriesScan {
         let num_workers = common_stat::get_total_cpu_cores().max(1);
         let pruner = match mode {
             SeriesScanMode::Legacy => Arc::new(Pruner::new(stream_ctx.clone(), num_workers)),
-            SeriesScanMode::TwoPhase => Arc::new(Pruner::new_with_options(
-                stream_ctx.clone(),
-                num_workers,
-                PrunerOptions {
-                    retain_builders: true,
-                    enable_predicate_prefilter: false,
-                },
-            )),
+            SeriesScanMode::TwoPhase | SeriesScanMode::Compact => {
+                Arc::new(Pruner::new_with_options(
+                    stream_ctx.clone(),
+                    num_workers,
+                    PrunerOptions {
+                        retain_builders: true,
+                        enable_predicate_prefilter: false,
+                    },
+                ))
+            }
         };
 
         Self {
@@ -266,12 +274,13 @@ impl SeriesScan {
                 metrics_set,
                 ctx.explain_verbose,
             ),
-            SeriesScanMode::TwoPhase => self.scan_two_phase_batch_in_partition(
-                partition,
-                part_metrics,
-                metrics_set,
-                ctx.explain_verbose,
-            ),
+            SeriesScanMode::TwoPhase | SeriesScanMode::Compact => self
+                .scan_two_phase_batch_in_partition(
+                    partition,
+                    part_metrics,
+                    metrics_set,
+                    ctx.explain_verbose,
+                ),
         }
     }
 
@@ -340,6 +349,7 @@ impl SeriesScan {
                 metrics.scan_cost += fetch_start.elapsed();
 
                 let build_start = Instant::now();
+                let compact = input.compact.clone();
                 let reader = SeriesReader::try_new(
                     stream_ctx.clone(),
                     partition_ranges.clone(),
@@ -347,7 +357,7 @@ impl SeriesScan {
                     input.partition_pruner,
                     input.range_semaphore,
                     part_metrics.clone(),
-                )?;
+                )?.with_compact(compact.clone());
                 let mut reader_stream = reader.build_stream().await?;
                 metrics.scan_cost += build_start.elapsed();
                 fetch_start = Instant::now();
@@ -357,6 +367,10 @@ impl SeriesScan {
                     metrics.num_rows += record_batch.num_rows();
 
                     let yield_start = Instant::now();
+                    let record_batch = match &compact {
+                        Some(compact) => compact.schema.assemble(record_batch, &compact.catalog)?,
+                        None => record_batch,
+                    };
                     yield ScanBatch::RecordBatch(record_batch);
                     metrics.yield_cost += yield_start.elapsed();
                     fetch_start = Instant::now();
@@ -417,6 +431,8 @@ impl SeriesScan {
         let (senders, receivers, active_receivers) =
             new_candidate_channel_list(self.properties.num_partitions());
         let mut distributor = SeriesCandidateDistributor {
+            compact: self.mode == SeriesScanMode::Compact,
+            compact_context: None,
             stream_ctx: self.stream_ctx.clone(),
             range_semaphore: Arc::new(Semaphore::new(self.properties.num_partitions())),
             partitions: self.properties.partitions.clone(),
@@ -593,14 +609,16 @@ impl RegionScanner for SeriesScan {
         let num_workers = common_stat::get_total_cpu_cores().max(1);
         self.pruner = match self.mode {
             SeriesScanMode::Legacy => Arc::new(Pruner::new(self.stream_ctx.clone(), num_workers)),
-            SeriesScanMode::TwoPhase => Arc::new(Pruner::new_with_options(
-                self.stream_ctx.clone(),
-                num_workers,
-                PrunerOptions {
-                    retain_builders: true,
-                    enable_predicate_prefilter: false,
-                },
-            )),
+            SeriesScanMode::TwoPhase | SeriesScanMode::Compact => {
+                Arc::new(Pruner::new_with_options(
+                    self.stream_ctx.clone(),
+                    num_workers,
+                    PrunerOptions {
+                        retain_builders: true,
+                        enable_predicate_prefilter: false,
+                    },
+                ))
+            }
         };
         self.legacy_receivers.lock().unwrap().clear();
         self.candidate_receivers.lock().unwrap().clear();
@@ -842,6 +860,8 @@ impl SeriesDistributor {
 
 /// Discovers metric series and sends one reader assignment to each partition.
 struct SeriesCandidateDistributor {
+    compact: bool,
+    compact_context: Option<Arc<CompactReadContext>>,
     stream_ctx: Arc<StreamContext>,
     range_semaphore: Arc<Semaphore>,
     partitions: Vec<Vec<PartitionRange>>,
@@ -874,7 +894,7 @@ impl SeriesCandidateDistributor {
             datafusion::physical_plan::metrics::MetricBuilder::new(&self.metrics_set)
                 .subset_time("candidate_discovery_cost", self.partitions.len());
         let _candidate_timer = candidate_time.timer();
-        let candidate_scanner = SeriesCandidateScanner::try_new(
+        let mut candidate_scanner = SeriesCandidateScanner::try_new(
             self.stream_ctx.clone(),
             self.partitions.clone(),
             self.pruner.clone(),
@@ -884,6 +904,21 @@ impl SeriesCandidateDistributor {
             part_metrics.clone(),
         )?;
         let partition_pruner = candidate_scanner.partition_pruner();
+        let catalog = self.compact.then(|| {
+            Arc::new(TagCatalog::new(
+                self.stream_ctx.input.region_metadata().clone(),
+                &self.stream_ctx.input.scan_memory_pool,
+                CompactMetrics::new(&self.metrics_set, self.partitions.len()),
+            ))
+        });
+        if let Some(catalog) = &catalog {
+            candidate_scanner = candidate_scanner.with_catalog(catalog.clone());
+        }
+        let mut pending = Vec::new();
+        let assignment_memory = datafusion::execution::memory_pool::MemoryConsumer::new(
+            "SeriesScan::pending_assignments",
+        )
+        .register(&self.stream_ctx.input.scan_memory_pool);
         let mut candidates = candidate_scanner.build_stream().await?;
         let mut collector =
             SeriesBatchCollector::new(self.partitions.len()).context(InvalidSenderSnafu)?;
@@ -893,10 +928,23 @@ impl SeriesCandidateDistributor {
                 part_metrics.on_finish();
                 return Ok(());
             }
+            if self.compact {
+                assignment_memory
+                    .try_grow(
+                        batch.capacity()
+                            * std::mem::size_of::<crate::series_index::MetricSeriesId>(),
+                    )
+                    .context(crate::error::MergeCandidateSeriesSnafu)?;
+            }
             collector.push(batch);
             if collector.len() >= CANDIDATE_SERIES_ASSIGNMENT_THRESHOLD {
                 chunked = true;
-                self.send_assignments(collector.finish(false), &partition_pruner);
+                let assignments = collector.finish(false);
+                if self.compact {
+                    pending.push(assignments);
+                } else {
+                    self.send_assignments(assignments, &partition_pruner);
+                }
                 if !self.should_fetch_candidates() {
                     part_metrics.on_finish();
                     return Ok(());
@@ -907,7 +955,35 @@ impl SeriesCandidateDistributor {
         }
 
         if collector.len() > 0 {
-            self.send_assignments(collector.finish(!chunked), &partition_pruner);
+            let assignments = collector.finish(!chunked);
+            if self.compact {
+                pending.push(assignments);
+            } else {
+                self.send_assignments(assignments, &partition_pruner);
+            }
+        }
+        drop(_candidate_timer);
+        if let Some(catalog) = catalog {
+            let ranges = self
+                .partitions
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            self.compact_context = Some(Arc::new(
+                CompactReadContext::preflight(
+                    &self.stream_ctx,
+                    &ranges,
+                    &partition_pruner,
+                    &part_metrics,
+                    catalog,
+                    assignment_memory,
+                )
+                .await?,
+            ));
+            for assignments in pending {
+                self.send_assignments(assignments, &partition_pruner);
+            }
         }
         part_metrics.on_finish();
         Ok(())
@@ -927,6 +1003,7 @@ impl SeriesCandidateDistributor {
             };
             let sent = sender
                 .send(Ok(SeriesReaderInput {
+                    compact: self.compact_context.clone(),
                     assigned_series,
                     partition_pruner: partition_pruner.clone(),
                     range_semaphore: self.range_semaphore.clone(),

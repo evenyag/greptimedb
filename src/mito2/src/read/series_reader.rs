@@ -42,6 +42,7 @@ use crate::read::scan_util::{
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::validate_metric_metadata;
+use crate::read::series_compact::{CompactKeyCursor, CompactReadContext, SeriesRowMappingBuilder};
 use crate::series_index::MetricSeriesId;
 use crate::sst::parquet::DEFAULT_READ_BATCH_SIZE;
 use crate::sst::parquet::flat_format::primary_key_column_index;
@@ -259,6 +260,7 @@ fn filter_flat_stream_by_series(
 
 /// Reads all collected metric series assigned to one partition.
 pub(crate) struct SeriesReader {
+    compact: Option<Arc<CompactReadContext>>,
     stream_ctx: Arc<StreamContext>,
     partition_ranges: Vec<PartitionRange>,
     filter: MetricSeriesFilter,
@@ -269,6 +271,11 @@ pub(crate) struct SeriesReader {
 }
 
 impl SeriesReader {
+    pub(crate) fn with_compact(mut self, compact: Option<Arc<CompactReadContext>>) -> Self {
+        self.compact = compact;
+        self
+    }
+
     /// Creates a reader for the series assigned to one data partition.
     ///
     /// `partition_pruner` must come from the candidate scanner's pruner, which
@@ -299,6 +306,7 @@ impl SeriesReader {
         let filter = MetricSeriesFilter::new(&assigned_series);
         let codec = SparsePrimaryKeyCodec::new(stream_ctx.input.region_metadata());
         Ok(Self {
+            compact: None,
             stream_ctx,
             partition_ranges,
             filter,
@@ -322,6 +330,7 @@ impl SeriesReader {
             let partition_pruner = self.partition_pruner.clone();
             let range_semaphore = self.range_semaphore.clone();
             let part_metrics = self.part_metrics.clone();
+            let compact = self.compact.clone();
             tasks.push(common_runtime::spawn_query(async move {
                 let _permit = range_semaphore.acquire().await.map_err(|error| {
                     UnexpectedSnafu {
@@ -336,6 +345,7 @@ impl SeriesReader {
                     codec,
                     partition_pruner,
                     part_metrics,
+                    compact,
                 )
                 .await
             }));
@@ -352,13 +362,21 @@ impl SeriesReader {
         // Every range task above has finished, so all build permits are released
         // and the final merge can reuse the same semaphore.
         let estimated_batch_size = compute_average_batch_size(estimated_batch_sizes);
-        SeqScan::build_flat_reader_from_sources(
+        let merge_schema = match &self.compact {
+            Some(compact) => (compact.schema.schema.clone(), 0),
+            None => (
+                self.stream_ctx.input.mapper.input_arrow_schema(false),
+                self.stream_ctx.input.mapper.field_column_start(),
+            ),
+        };
+        SeqScan::build_flat_reader_with_schema(
             &self.stream_ctx,
             range_streams,
             Some(self.range_semaphore.clone()),
             Some(&self.part_metrics),
             true,
             compute_parallel_channel_size(estimated_batch_size),
+            merge_schema,
         )
         .await
     }
@@ -371,10 +389,10 @@ async fn build_series_partition_range(
     codec: SparsePrimaryKeyCodec,
     partition_pruner: Arc<PartitionPruner>,
     part_metrics: PartitionMetrics,
+    compact: Option<Arc<CompactReadContext>>,
 ) -> Result<(BoxedRecordBatchStream, usize)> {
     let range = filter.range;
-    let cache_key = filter
-        .enable_range_cache
+    let cache_key = (filter.enable_range_cache && compact.is_none())
         .then(|| build_series_range_cache_key(&stream_ctx, &part_range, range))
         .flatten();
     if let Some(key) = cache_key.as_ref() {
@@ -397,15 +415,44 @@ async fn build_series_partition_range(
                 index,
                 range_meta.time_range,
             ));
-            sources.push(filter_flat_stream_by_series(
-                stream,
-                codec.clone(),
-                filter.clone(),
-            ));
+            let mut stream = filter_flat_stream_by_series(stream, codec.clone(), filter.clone());
+            if let Some(compact) = compact.clone() {
+                sources.push(Box::pin(try_stream! {
+                    while let Some(batch) = stream.try_next().await? {
+                        let mut mapping = SeriesRowMappingBuilder::default();
+                        mapping.append(batch.column(primary_key_column_index(batch.num_columns())))?;
+                        let mapping = mapping.finish(batch.num_rows())?;
+                        let mut cursor = CompactKeyCursor::new(mapping.runs)?;
+                        let keys = cursor.next(batch.num_rows())?;
+                        yield compact.schema.adapt(&batch, keys)?;
+                    }
+                }) as BoxedRecordBatchStream);
+            } else {
+                sources.push(stream);
+            }
             continue;
         }
 
         if stream_ctx.is_file_range_index(index) {
+            if let Some(compact) = &compact {
+                let ranges = compact.files(index)?.to_vec();
+                let compact = compact.clone();
+                let filter = filter.clone();
+                let ctx = stream_ctx.clone();
+                sources.push(Box::pin(try_stream! {
+                    for (range, mapping) in ranges {
+                        let mut reader = range.compact_reader(mapping, &filter.sorted_series, &compact.catalog.metrics).await?;
+                        let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
+                        while let Some(batch) = reader.try_next().await? {
+                            let Some(batch) = filter_flat_batch_by_sequence(batch, ctx.input.sequence_range, trusted)? else { continue; };
+                            let Some(batch) = range.precise_filter_compact(batch, &compact.catalog)? else { continue; };
+                            let key = batch.column(primary_key_column_index(batch.num_columns())).clone();
+                            yield compact.schema.adapt(&batch, key)?;
+                        }
+                    }
+                }) as BoxedRecordBatchStream);
+                continue;
+            }
             let file = stream_ctx.input.file_from_index(index);
             if matches!(
                 file.primary_key_range(stream_ctx.input.primary_key_mapper())
@@ -471,13 +518,21 @@ async fn build_series_partition_range(
             .collect();
     }
     let estimated_batch_size = split_batch_size.unwrap_or(DEFAULT_READ_BATCH_SIZE);
-    let stream = SeqScan::build_flat_reader_from_sources(
+    let merge_schema = match &compact {
+        Some(compact) => (compact.schema.schema.clone(), 0),
+        None => (
+            stream_ctx.input.mapper.input_arrow_schema(false),
+            stream_ctx.input.mapper.field_column_start(),
+        ),
+    };
+    let stream = SeqScan::build_flat_reader_with_schema(
         &stream_ctx,
         sources,
         None,
         Some(&part_metrics),
         false,
         compute_parallel_channel_size(estimated_batch_size),
+        merge_schema,
     )
     .await?;
     let stream = match cache_key {

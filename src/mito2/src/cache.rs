@@ -68,6 +68,7 @@ use crate::metrics::{CACHE_BYTES, CACHE_EVICTION, CACHE_HIT, CACHE_MISS};
 use crate::read::Batch;
 use crate::read::range_cache::{RangeScanCacheKey, RangeScanCacheValue};
 use crate::read::read_columns::JsonTargetTypes;
+use crate::read::series_compact::SeriesRowMapping;
 use crate::sst::file::{RegionFileId, RegionIndexId};
 use crate::sst::parquet::PARQUET_METADATA_KEY;
 use crate::sst::parquet::read_columns::ParquetReadColumns;
@@ -920,6 +921,44 @@ impl CacheStrategy {
         }
     }
 
+    /// Immutable compact mappings share the existing cache budget, but not result keys.
+    pub(crate) fn get_series_mapping(
+        &self,
+        file: RegionFileId,
+        group: usize,
+    ) -> Option<Arc<SeriesRowMapping>> {
+        let Self::EnableAll(manager) = self else {
+            return None;
+        };
+        match manager
+            .range_result_cache
+            .as_ref()?
+            .get(&RangeResultKey::Mapping(file, group))?
+        {
+            RangeResultValue::Mapping(mapping) => Some(mapping),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_series_mapping(
+        &self,
+        file: RegionFileId,
+        group: usize,
+        mapping: Arc<SeriesRowMapping>,
+    ) {
+        let Self::EnableAll(manager) = self else {
+            return;
+        };
+        if let Some(cache) = &manager.range_result_cache {
+            let key = RangeResultKey::Mapping(file, group);
+            let value = RangeResultValue::Mapping(mapping);
+            CACHE_BYTES
+                .with_label_values(&[RANGE_RESULT_TYPE])
+                .add(range_result_cache_weight(&key, &value).into());
+            cache.insert(key, value);
+        }
+    }
+
     /// Returns true if the range result cache is enabled.
     pub(crate) fn has_range_result_cache(&self) -> bool {
         match self {
@@ -1389,6 +1428,18 @@ impl CacheManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn invalidate_series_mappings(&self) {
+        if let Some(cache) = &self.range_result_cache {
+            for (key, _) in cache.iter() {
+                if matches!(key.as_ref(), RangeResultKey::Mapping(_, _)) {
+                    cache.invalidate(key.as_ref());
+                }
+            }
+            cache.run_pending_tasks();
+        }
+    }
+
     /// Gets cached result for range scan.
     pub(crate) fn get_range_result(
         &self,
@@ -1396,7 +1447,16 @@ impl CacheManager {
     ) -> Option<Arc<RangeScanCacheValue>> {
         self.range_result_cache
             .as_ref()
-            .and_then(|cache| update_hit_miss(cache.get(key), RANGE_RESULT_TYPE))
+            .and_then(|cache| {
+                update_hit_miss(
+                    cache.get(&RangeResultKey::Scan(key.clone())),
+                    RANGE_RESULT_TYPE,
+                )
+            })
+            .and_then(|v| match v {
+                RangeResultValue::Scan(v) => Some(v),
+                _ => None,
+            })
     }
 
     /// Puts range scan result into cache.
@@ -1406,6 +1466,8 @@ impl CacheManager {
         result: Arc<RangeScanCacheValue>,
     ) {
         if let Some(cache) = &self.range_result_cache {
+            let key = RangeResultKey::Scan(key);
+            let result = RangeResultValue::Scan(result);
             CACHE_BYTES
                 .with_label_values(&[RANGE_RESULT_TYPE])
                 .add(range_result_cache_weight(&key, &result).into());
@@ -1711,8 +1773,16 @@ fn selector_result_cache_weight(k: &SelectorResultKey, v: &Arc<SelectorResultVal
     (mem::size_of_val(k) + v.estimated_size()) as u32
 }
 
-fn range_result_cache_weight(k: &RangeScanCacheKey, v: &Arc<RangeScanCacheValue>) -> u32 {
-    (k.estimated_size() + v.estimated_size()) as u32
+fn range_result_cache_weight(k: &RangeResultKey, v: &RangeResultValue) -> u32 {
+    let key = match k {
+        RangeResultKey::Scan(k) => k.estimated_size(),
+        _ => mem::size_of_val(k),
+    };
+    let value = match v {
+        RangeResultValue::Scan(v) => v.estimated_size(),
+        RangeResultValue::Mapping(v) => v.estimated_size(),
+    };
+    (key + value).min(u32::MAX as usize) as u32
 }
 
 /// Updates cache hit/miss metrics.
@@ -2093,7 +2163,19 @@ type VectorCache = Cache<(ConcreteDataType, Value), VectorRef>;
 /// Maps (file id, row group id, time series row selector) to [SelectorResultValue].
 type SelectorResultCache = Cache<SelectorResultKey, Arc<SelectorResultValue>>;
 /// Maps partition-range scan key to cached flat batches.
-type RangeResultCache = Cache<RangeScanCacheKey, Arc<RangeScanCacheValue>>;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RangeResultKey {
+    Scan(RangeScanCacheKey),
+    Mapping(RegionFileId, usize),
+}
+
+#[derive(Clone)]
+enum RangeResultValue {
+    Scan(Arc<RangeScanCacheValue>),
+    Mapping(Arc<SeriesRowMapping>),
+}
+
+type RangeResultCache = Cache<RangeResultKey, RangeResultValue>;
 
 #[cfg(test)]
 mod tests {

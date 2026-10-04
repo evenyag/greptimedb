@@ -1369,7 +1369,7 @@ impl ScanbenchCommand {
                         .collect(),
                     effective_settings: serde_json::json!({
                         "mode": effective_mode,
-                        "source_policy": if effective_mode == Some("two_phase") { "selected_series_per_partition" } else { "native" },
+                        "source_policy": if matches!(effective_mode, Some("two_phase" | "compact")) { "selected_series_per_partition" } else { "native" },
                         "query_memory_budget_bytes": null,
                         "baseline_shared_scan_memory_limit": format!("{:?}", engine.mito_config().scan_memory_limit),
                         "spill_threshold_bytes": null,
@@ -1382,7 +1382,12 @@ impl ScanbenchCommand {
                         "reference_written": self.write_reference.is_some(),
                         "order_checked": self.check_series_order,
                         "effective_engine_config": format!("{:?}", engine.mito_config()),
-                        "unavailable_phase_metrics": ["mapping_preflight", "spill_finalization", "readiness_wait", "final_replay", "tag_assembly", "cleanup", "data_phase_primary_key_pages", "catalog_index_capacity", "workspace_capacity"]
+                        "primary_key_page_audit": if effective_mode == Some("compact") { Some("decoder_projection_and_requested_bytes_including_cache_hits") } else { None },
+                        "unavailable_phase_metrics": if effective_mode == Some("compact") {
+                            vec!["spill_finalization", "readiness_wait", "final_replay", "cleanup", "workspace_capacity"]
+                        } else {
+                            vec!["mapping_preflight", "spill_finalization", "readiness_wait", "final_replay", "tag_assembly", "cleanup", "data_phase_primary_key_pages", "catalog_index_capacity", "workspace_capacity"]
+                        }
                     }),
                     execution_metrics: format!("{}", metrics_set.clone_inner()),
                     scanner_explain,

@@ -34,6 +34,7 @@ pub mod scan_region;
 pub mod scan_util;
 pub(crate) mod seq_scan;
 pub(crate) mod series_candidate;
+pub(crate) mod series_compact;
 pub(crate) mod series_reader;
 pub mod series_scan;
 // Stage 1 harness; integrated with range preparation in Stage 4.

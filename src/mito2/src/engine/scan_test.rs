@@ -1234,9 +1234,9 @@ async fn test_series_scan_with_format(flat_format: bool) {
 async fn test_two_phase_series_scan() {
     for use_index in [false, true] {
         for use_range_index in [false, true] {
-            check_two_phase_series_scan(use_index, use_range_index, true).await;
+            check_two_phase_series_scan(use_index, use_range_index, true, false).await;
         }
-        check_two_phase_series_scan(use_index, true, false).await;
+        check_two_phase_series_scan(use_index, true, false, false).await;
     }
 }
 
@@ -1244,11 +1244,13 @@ async fn check_two_phase_series_scan(
     use_index: bool,
     use_range_index: bool,
     enable_range_index: bool,
+    compact: bool,
 ) {
     let mut env = TestEnv::with_prefix("test_two_phase_series_scan").await;
     let engine = env
         .create_engine(MitoConfig {
             experimental_series_scan_v2: true,
+            experimental_series_scan_compact: compact,
             experimental_enable_series_index: true,
             experimental_enable_range_index: enable_range_index,
             ..Default::default()
@@ -1458,7 +1460,10 @@ async fn check_two_phase_series_scan(
     let Scanner::Series(mut scanner) = scanner else {
         panic!("Scanner should be series scan");
     };
-    assert_eq!("two_phase", scanner.mode());
+    assert_eq!(
+        if compact { "compact" } else { "two_phase" },
+        scanner.mode()
+    );
 
     let ranges = scanner
         .properties()
@@ -1491,6 +1496,23 @@ async fn check_two_phase_series_scan(
         .sum_by_name("candidate_index_files")
         .map_or(0, |value| value.as_usize());
     assert_eq!(usize::from(use_index), index_files);
+    if compact {
+        let value = |name| {
+            metrics_set
+                .clone_inner()
+                .sum_by_name(name)
+                .unwrap()
+                .as_usize()
+        };
+        assert!(value("mapping_preflight_row_groups") > 0);
+        assert!(value("compact_data_readers") > 0);
+        assert_eq!(
+            value("compact_data_readers"),
+            value("compact_audited_decoders")
+        );
+        assert_eq!(0, value("compact_data_primary_key_pages_decoded"));
+        assert_eq!(0, value("compact_primary_key_decode_violations"));
+    }
 
     let mut series_to_partition = BTreeMap::new();
     let mut actual_rows = Vec::new();
@@ -1536,7 +1558,10 @@ async fn check_two_phase_series_scan(
     assert_eq!(Some(&2), series_to_partition.get("d"));
 
     scanner.reset_state();
-    assert_eq!("two_phase", scanner.mode());
+    assert_eq!(
+        if compact { "compact" } else { "two_phase" },
+        scanner.mode()
+    );
     assert_eq!(
         vec![1, 0, 0],
         scanner
@@ -1634,7 +1659,7 @@ async fn check_two_phase_series_scan(
             )
             .await
             .unwrap();
-        if enable_range_index {
+        if enable_range_index && !compact {
             if let Ok(stream) = scanner.scan().await {
                 assert!(stream.try_collect::<Vec<_>>().await.is_err());
             }
@@ -3735,14 +3760,23 @@ async fn build_sparse_exact_metric_engine(
     experimental_series_scan_v2: bool,
     range_result_cache_size: ReadableSize,
 ) -> (TestEnv, crate::engine::MitoEngine, RegionId) {
-    let mut env = TestEnv::with_prefix(prefix).await;
-    let engine = env
-        .create_engine(MitoConfig {
+    build_sparse_metric_engine_with_config(
+        prefix,
+        MitoConfig {
             experimental_series_scan_v2,
             range_result_cache_size,
             ..Default::default()
-        })
-        .await;
+        },
+    )
+    .await
+}
+
+async fn build_sparse_metric_engine_with_config(
+    prefix: &str,
+    config: MitoConfig,
+) -> (TestEnv, crate::engine::MitoEngine, RegionId) {
+    let mut env = TestEnv::with_prefix(prefix).await;
+    let engine = env.create_engine(config).await;
 
     let region_id = RegionId::new(1, 1);
     let metadata = Arc::new(sst_region_metadata_with_encoding(
@@ -3848,6 +3882,12 @@ async fn build_sparse_exact_metric_engine(
 }
 
 fn canonical_sparse_rows(batches: &RecordBatches) -> Vec<(u32, u64, String, String, u64, i64)> {
+    let mut rows = ordered_sparse_rows(batches);
+    rows.sort();
+    rows
+}
+
+fn ordered_sparse_rows(batches: &RecordBatches) -> Vec<(u32, u64, String, String, u64, i64)> {
     let schema = batches.schema();
     // Verify the complete output schema before looking at batches so empty
     // scans are checked too.
@@ -3894,7 +3934,6 @@ fn canonical_sparse_rows(batches: &RecordBatches) -> Vec<(u32, u64, String, Stri
             ));
         }
     }
-    rows.sort();
     rows
 }
 
@@ -3954,6 +3993,15 @@ async fn test_two_phase_sparse_metric_exact_sequence_cases() {
     )
     .await;
 
+    let (_compact_env, compact, compact_region) = build_sparse_metric_engine_with_config(
+        "test_compact_exact_sequence",
+        MitoConfig {
+            experimental_series_scan_compact: true,
+            range_result_cache_size: ReadableSize::mb(8),
+            ..Default::default()
+        },
+    )
+    .await;
     let cases = [
         // (min, max], selector, expected canonical rows.
         (
@@ -4038,6 +4086,10 @@ async fn test_two_phase_sparse_metric_exact_sequence_cases() {
         .await;
         let (legacy_schema, legacy_rows) =
             scan_sparse_exact_metric(&legacy, legacy_region, min, max, selector, "legacy").await;
+        let (compact_schema, compact_rows) =
+            scan_sparse_exact_metric(&compact, compact_region, min, max, selector, "compact").await;
+        assert_eq!(expected, compact_rows, "compact {name}");
+        assert_eq!(compact_schema, legacy_schema);
         assert_eq!(expected, two_phase_rows, "two-phase {name}");
         assert_eq!(expected, legacy_rows, "legacy {name}");
         assert_eq!(
@@ -4370,4 +4422,119 @@ fn scan_field_values(batches: &[common_recordbatch::RecordBatch]) -> Vec<f64> {
             (0..batch.num_rows()).map(move |row| fields.value(row))
         })
         .collect()
+}
+
+/// Compare partitions and warm candidates/cold mappings with the v2 reference.
+#[tokio::test]
+async fn test_compact_scan_partitions_and_mapping_cache() {
+    let (_reference_env, reference, reference_region) =
+        build_sparse_exact_metric_engine("compact_reference", true, ReadableSize::mb(0)).await;
+    test_util::flush_region(&reference, reference_region, None).await;
+    let (_, expected) =
+        scan_sparse_exact_metric(&reference, reference_region, None, None, None, "two_phase").await;
+    {
+        let (_env, engine, region_id) = build_sparse_metric_engine_with_config(
+            "compact_matrix",
+            MitoConfig {
+                experimental_series_scan_compact: true,
+                range_result_cache_size: ReadableSize::mb(8),
+                ..Default::default()
+            },
+        )
+        .await;
+        test_util::flush_region(&engine, region_id, None).await;
+        for partitions in [1, 8] {
+            for cold_mapping in [false, true] {
+                if cold_mapping {
+                    engine.cache_manager().invalidate_series_mappings();
+                }
+                let scanner = engine
+                    .scanner(
+                        region_id,
+                        ScanRequest {
+                            distribution: Some(TimeSeriesDistribution::PerSeries),
+                            filters: vec![col("tag_0").gt_eq(lit("a"))],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let Scanner::Series(mut scanner) = scanner else {
+                    panic!("series scan expected")
+                };
+                assert_eq!("compact", scanner.mode());
+                let ranges = scanner
+                    .properties()
+                    .partitions
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>();
+                let mut assigned = vec![Vec::new(); partitions];
+                assigned[0] = ranges;
+                scanner
+                    .prepare(
+                        PrepareRequest::default()
+                            .with_ranges(assigned)
+                            .with_target_partitions(partitions),
+                    )
+                    .unwrap();
+                let metrics = ExecutionPlanMetricsSet::default();
+                let streams = (0..partitions)
+                    .map(|p| {
+                        scanner
+                            .scan_partition(&Default::default(), &metrics, p)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut actual = Vec::new();
+                let mut owners = HashMap::new();
+                for (partition, stream) in streams.into_iter().enumerate() {
+                    let batches = RecordBatches::try_collect(stream).await.unwrap();
+                    let rows = ordered_sparse_rows(&batches);
+                    assert!(
+                        rows.windows(2)
+                            .all(|w| (w[0].0, w[0].1, w[0].5) <= (w[1].0, w[1].1, w[1].5))
+                    );
+                    for row in &rows {
+                        if let Some(previous) = owners.insert((row.0, row.1), partition) {
+                            assert_eq!(previous, partition);
+                        }
+                    }
+                    actual.extend(rows);
+                }
+                actual.sort();
+                assert_eq!(
+                    expected, actual,
+                    "partitions={partitions}, cold={cold_mapping}"
+                );
+                let value = |name| metrics.clone_inner().sum_by_name(name).unwrap().as_usize();
+                assert!(value("mapping_preflight_row_groups") > 0);
+                assert!(value("compact_data_readers") > 0);
+                assert_eq!(
+                    value("compact_data_readers"),
+                    value("compact_audited_decoders")
+                );
+                assert_eq!(0, value("compact_data_primary_key_pages_decoded"));
+                assert_eq!(0, value("compact_primary_key_decode_violations"));
+                if cold_mapping {
+                    assert_eq!(
+                        0,
+                        value("discovery_primary_key_rows"),
+                        "candidate cache must be warm"
+                    );
+                    assert!(value("preflight_primary_key_rows") > 0);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_compact_scan_index_coverage() {
+    for use_index in [false, true] {
+        for use_range_index in [false, true] {
+            check_two_phase_series_scan(use_index, use_range_index, true, true).await;
+        }
+    }
 }

@@ -206,6 +206,8 @@ pub struct MitoConfig {
 
     /// Whether to enable the experimental two-phase mode for eligible metric series scans.
     pub experimental_series_scan_v2: bool,
+    /// Enables the PoC compact identity path for eligible metric series scans.
+    pub experimental_series_scan_compact: bool,
 
     pub gc: GcConfig,
 }
@@ -263,6 +265,7 @@ impl Default for MitoConfig {
             schedule_compaction_after_edit: true,
             default_flat_format: true,
             experimental_series_scan_v2: true,
+            experimental_series_scan_compact: false,
             gc: GcConfig::default(),
         };
 
@@ -502,6 +505,12 @@ mod tests {
     #[test]
     fn test_experimental_series_scan_v2_config() {
         assert!(MitoConfig::default().experimental_series_scan_v2);
+        assert!(!MitoConfig::default().experimental_series_scan_compact);
+        let compact: MitoConfig =
+            toml::from_str("experimental_series_scan_compact = true").unwrap();
+        assert!(compact.experimental_series_scan_compact);
+        let roundtrip: MitoConfig = toml::from_str(&toml::to_string(&compact).unwrap()).unwrap();
+        assert!(roundtrip.experimental_series_scan_compact);
 
         let config: MitoConfig = toml::from_str("experimental_series_scan_v2 = false").unwrap();
         assert!(!config.experimental_series_scan_v2);

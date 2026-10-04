@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use datafusion_expr::{col, lit};
-use datatypes::arrow::array::{Int64Array, UInt32Array, UInt64Array};
+use datatypes::arrow::array::{Array, Int64Array, UInt32Array, UInt64Array};
 use datatypes::arrow::datatypes::{DataType, SchemaRef};
 use futures::TryStreamExt;
 use object_store::ObjectStore;
@@ -41,6 +41,62 @@ impl SstRangeIndexSearcher {
         let reader = ParquetIndexReader::open(object_store, path).await?;
         validate_index_schema(reader.schema())?;
         Ok(Self { reader })
+    }
+
+    /// Loads identities as well as offsets, validating full source-row coverage.
+    pub(crate) async fn compact_mapping(
+        &self,
+        group: u32,
+        rows: usize,
+    ) -> Result<crate::read::series_compact::SeriesRowMapping> {
+        use crate::read::series_compact::{SeriesRowMapping, SeriesRowRange};
+        let predicate = Predicate::new(vec![col(ROW_GROUP_ID_COLUMN).eq(lit(group))]);
+        let mut batches = self.reader.read(
+            &predicate,
+            &[
+                ROW_GROUP_ID_COLUMN,
+                TABLE_ID_COLUMN,
+                TSID_COLUMN,
+                START_COLUMN,
+                END_COLUMN,
+            ],
+        )?;
+        let mut runs = Vec::new();
+        while let Some(batch) = batches.try_next().await? {
+            let groups = typed_column::<UInt32Array>(&batch, ROW_GROUP_ID_COLUMN, "UInt32")?;
+            let tables = typed_column::<UInt32Array>(&batch, TABLE_ID_COLUMN, "UInt32")?;
+            let tsids = typed_column::<UInt64Array>(&batch, TSID_COLUMN, "UInt64")?;
+            let starts = typed_column::<Int64Array>(&batch, START_COLUMN, "Int64")?;
+            let ends = typed_column::<Int64Array>(&batch, END_COLUMN, "Int64")?;
+            ensure!(
+                [groups as &dyn Array, tables, tsids, starts, ends]
+                    .iter()
+                    .all(|array| array.null_count() == 0),
+                InvalidRecordBatchSnafu {
+                    reason: "null compact range-index entry"
+                }
+            );
+            for row in 0..batch.num_rows() {
+                if groups.value(row) != group {
+                    continue;
+                }
+                ensure!(
+                    starts.value(row) >= 0 && ends.value(row) >= 0,
+                    InvalidRecordBatchSnafu {
+                        reason: "negative compact range-index offset"
+                    }
+                );
+                runs.push(SeriesRowRange {
+                    series: MetricSeriesId {
+                        table_id: tables.value(row),
+                        tsid: tsids.value(row),
+                    },
+                    rows: starts.value(row) as usize..ends.value(row) as usize,
+                });
+            }
+        }
+        runs.sort_unstable_by_key(|r| r.rows.start);
+        SeriesRowMapping::try_new(runs, rows)
     }
 
     /// Returns the row ranges for `series` in one source SST row group.

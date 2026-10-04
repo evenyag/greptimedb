@@ -41,6 +41,12 @@ use crate::sst::parquet::row_group::{ParquetFetchMetrics, compute_total_range_si
 /// fetcher keeps cache lookup, local write-cache reads, and remote I/O explicit
 /// in Greptime code.
 pub struct SstParquetRangeFetcher {
+    key_read_bytes: Option<datafusion::physical_plan::metrics::Count>,
+    compact_audit: Option<(
+        usize,
+        Range<u64>,
+        crate::read::series_compact::CompactMetrics,
+    )>,
     /// Region file ID for cache key.
     region_file_id: RegionFileId,
     /// Path to the parquet file in object storage.
@@ -66,6 +72,8 @@ impl SstParquetRangeFetcher {
         fetch_metrics: Option<ParquetFetchMetrics>,
     ) -> Self {
         Self {
+            compact_audit: None,
+            key_read_bytes: None,
             region_file_id,
             file_path,
             object_store,
@@ -75,8 +83,40 @@ impl SstParquetRangeFetcher {
         }
     }
 
+    pub(crate) fn with_key_read_bytes(
+        mut self,
+        bytes: Option<datafusion::physical_plan::metrics::Count>,
+    ) -> Self {
+        self.key_read_bytes = bytes;
+        self
+    }
+
+    pub(crate) fn with_compact_audit(
+        mut self,
+        column: usize,
+        range: (u64, u64),
+        metrics: crate::read::series_compact::CompactMetrics,
+    ) -> Self {
+        self.compact_audit = Some((column, range.0..range.0 + range.1, metrics));
+        self
+    }
+
     /// Fetches byte ranges from page cache, write cache, or object store.
     async fn fetch_bytes_with_cache(&self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        if let Some((_, key, metrics)) = &self.compact_audit
+            && ranges
+                .iter()
+                .any(|r| r.start < key.end && key.start < r.end)
+        {
+            metrics.key_decode_violations.add(1);
+            return UnexpectedSnafu {
+                reason: "compact data decoder requested SST primary-key bytes",
+            }
+            .fail();
+        }
+        if let Some(bytes) = &self.key_read_bytes {
+            bytes.add(ranges.iter().map(|r| (r.end - r.start) as usize).sum());
+        }
         let fetch_start = self
             .fetch_metrics
             .as_ref()
@@ -321,6 +361,17 @@ pub fn build_sst_parquet_record_batch_stream(
     file_path: String,
     batch_size: usize,
 ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    if let Some((key, _, metrics)) = &fetcher.compact_audit {
+        if projection.leaf_included(*key) {
+            metrics.key_decode_violations.add(1);
+            return UnexpectedSnafu {
+                reason: "compact data decoder projects SST primary key",
+            }
+            .fail();
+        }
+        metrics.audited_decoders.add(1);
+        metrics.data_readers.add(1);
+    }
     let mut builder = ParquetPushDecoderBuilder::new_with_metadata(arrow_metadata)
         .with_row_groups(vec![row_group_idx])
         .with_projection(projection)
@@ -354,6 +405,33 @@ pub fn build_sst_parquet_record_batch_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compact_key_audit_rejects_reads_before_cache_lookup() {
+        use crate::read::series_compact::CompactMetrics;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use store_api::storage::{FileId, RegionId};
+        let set = ExecutionPlanMetricsSet::default();
+        let metrics = CompactMetrics::new(&set, 0);
+        let store = ObjectStore::new(object_store::services::Memory::default()).unwrap();
+        let fetcher = SstParquetRangeFetcher::new(
+            RegionFileId::new(RegionId::new(1, 1), FileId::random()),
+            "unused".into(),
+            store,
+            CacheStrategy::Disabled,
+            0,
+            None,
+        )
+        .with_compact_audit(0, (100, 100), metrics.clone());
+        assert!(
+            fetcher
+                .fetch_bytes_with_cache(std::iter::once(150..160).collect())
+                .await
+                .is_err()
+        );
+        assert_eq!(1, metrics.key_decode_violations.value());
+        assert_eq!(0, metrics.data_readers.value());
+    }
 
     #[test]
     fn test_assemble_range_from_cached_subrange_and_fetched_tail() {
