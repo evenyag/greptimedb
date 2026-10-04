@@ -49,6 +49,14 @@ an implementation stage.
   and evidence under
   `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261004-stage2-remote/`.
   Main v2's historical p8 exactness gap remains unchanged.
+- [x] Stage 2 operation diagnostics added at `8b33dd7373` (2026-10-04).
+  Local focused tests (11), Clippy, and formatting passed. Six seven-day Q03
+  captures passed operation-count/byte reconciliation and zero data-phase
+  primary-key audits; verbose plans, two native CPU graphs, and eight heap
+  graphs were retrieved and verified. See [metric definitions](metrics.md)
+  and the external
+  [operation-cost report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-operation-metrics.md).
+  These diagnostic captures do not replace Stage 2's exact-output evidence.
 - [ ] Stage 3: Resident/IPC result store, both batch layouts, shared metadata,
   and cleanup; pass exact round-trip and independent-cursor gates.
 - [ ] Stage 4: Complete range preparation, spill admission, publication
@@ -107,6 +115,13 @@ samples, not production defaults or a statistical speedup claim. Source state,
 research artifacts, and owned-process cleanup were verified; raw evidence was
 retrieved and hash-checked. The user may stop the remote machine; obtain startup
 confirmation before any later remote work if it has been stopped.
+
+The subsequent diagnostics at `8b33dd7373` quantify CPU, fetch latency, read
+amplification, assembly calls, and tag-catalog lock waits. Read the linked
+operation-cost report before optimizing: p8 assembly included 90.148 cumulative
+seconds of catalog-lock waits, and requested data payload was 4.31 times p1's.
+These are individual diagnostic samples, not exclusive query-time shares.
+All evidence was retrieved and owned-process cleanup verified.
 
 Stage 1's current baseline remains accepted as recorded in the
 [Stage 1 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage1-report.md).
