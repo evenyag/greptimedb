@@ -2,7 +2,7 @@
 Feature Name: Buffered SeriesScan
 Date: 2026-10-03
 Updated: 2026-10-05
-Status: Development PoC through Stage 4 validated; rollout undecided
+Status: Development PoC through Stage 5 validated; rollout undecided
 ---
 
 # Summary

@@ -158,3 +158,70 @@ reclamation; final publication reservations may exceed that threshold while
 remaining within the hard query budget. Completion can retain the bounded
 resources/metrics object even when all dynamic payload, workspace, and disk are
 released. Pair snapshots with actual scratch/process cleanup checks.
+
+## Independent preparation and shared sources (Stage 5)
+
+Validated at `24d38239ba`; see the external
+[Stage 5 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage5-report.md)
+for equal-budget comparisons and preserved failed attempts. Development options
+add `source_policy` and `candidate_chunk_size`. `preparation_concurrency` is a
+per-stage ceiling: shared mode independently schedules up to N source reads
+and N complete-range merges. All tasks and output partitions share one budget.
+Selected-per-partition mode schedules complete range/assignment tasks instead.
+
+Additional cumulative elapsed counters, in nanoseconds:
+
+- `source_preparation_ns`: source stream materialization through builder finish;
+  includes source reading, normalization, append, and finalization. Admission
+  before starting the task is outside this scope.
+- `source_append_ns` and `source_spill_append_ns`: source-buffer append and the
+  subset choosing file placement. `source_finalization_ns` measures finish;
+  serialization mainly happens during append, and reclamation can also spill
+  completed buffers.
+- `range_merge_ns`: shared complete-range merge task, including input replay,
+  deduplication/selectors, result materialization, and source release.
+- `range_materialization_ns`: result stream materialization through finish.
+  Selected mode retains `range_preparation_ns` for combined source/merge work.
+
+These counters overlap, including between the independently scheduled stages;
+their sum is neither preparation wall time nor CPU. Synchronous operation CPU
+remains in `buffered_operations`, combining source/result stores within each
+named scope. It does not provide exclusive source-preparation or merge CPU.
+
+`source_parts_planned`, `source_parts_completed`, `candidate_chunks`,
+`source_parts_in_later_chunks`, and `source_rereads_across_chunks` describe
+candidate-pruned source scheduling. `source_selected_rows` and
+`range_result_rows` count different pipeline stages: summing them does not
+measure duplicate query output. Q03 fits one chunk; local fixtures exercise
+chunk boundaries. Source-reader starts are not decoded-row counts. Compare
+Stage 2 data decoder calls/CPU, selected versus decoded rows, logical requested
+bytes, and cache/store payload separately when assessing repeated source work.
+
+IPC counters have `source_` and `result_` variants for spill bytes, filesystem
+read/write bytes and calls, logical requested bytes, and decoded rows. Their
+unprefixed counterparts aggregate store work. Resident/file placement, unrelated
+lookup rows, and repeated decoding must accompany direct-read amplification
+comparisons; decoded IPC rows divided by all requested rows is insufficient.
+
+Peaks distinguish `active_source_tasks`, `active_merge_tasks`,
+`active_range_tasks`, `merge_inputs`, source/result metadata and payload,
+source-reader workspace, and source-reassembly workspace. The latter detaches
+each decoded IPC fragment before advancing, then reconstructs original source
+batch boundaries. Admission includes retained fragments, per-fragment overhead,
+and transient decoder/conversion overlap. Required-byte peaks for source
+preparation, range preparation, and range merge are estimates/prepaid requests,
+not RSS or proven bounds on opaque decoder allocations. Reader/input counts
+remain observations, never admission caps. Deferral counters distinguish
+temporarily unavailable capacity from irreducible rejection.
+
+The current publication rejection reports the failed reclamation increment
+(`available + 1`), not the full aggregate replay/output reservation. Do not
+interpret it as the extra capacity needed for success. Successful publication
+peaks record the actual reserved capacity, with placement-specific requirements.
+
+Query-end snapshots may precede asynchronous deletion. Pending deletion retains
+disk/metadata charges until removal completes; cleanup elapsed/CPU snapshots can
+therefore omit later cleanup work. Quiescent local cleanup tests and verified
+remote process/cgroup/scratch cleanup are separate gates. Escaped output charges
+likewise survive cursor/manifest destruction. Preserve the Stage 4 distinction
+between bounded active replay and complete-identity downstream retention.

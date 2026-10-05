@@ -1,6 +1,6 @@
 # Buffered SeriesScan implementation and experiment plan
 
-Status: Development PoC through Stage 4 validated, 2026-10-05.
+Status: Development PoC through Stage 5 validated, 2026-10-05.
 
 Read the [design](design.md) for execution semantics and interfaces. Preparation
 runs outside scan partition streams; those streams lazily concatenate complete
@@ -90,8 +90,29 @@ an implementation stage.
   `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261005-stage4-local/`
   and `20261005-stage4-remote/`. Retrieved evidence was hash-verified and owned
   remote workloads exited. Main v2's historical p8 exactness gap is unchanged.
-- [ ] Stage 5: Independent preparation concurrency and shared selected-series
-  reads; pass correctness gates and compare equal-budget measurements.
+- [x] Stage 5: Independent preparation concurrency and shared selected-series
+  reads implemented at `877387223f`, corrected and validated at `24d38239ba`
+  (2026-10-05). Normal-profile local gates passed 63 focused tests, Clippy,
+  build, formatting/license checks, 39 SQLness case executions, and 12 exact
+  integrated diagnostics. Both policies/layouts at concurrency 1/2/4 and p1/p8
+  matched the accepted Q03 reference under one 8 GiB query budget. Including
+  comparison-only repeats and 6 GiB pressure cases, 30 scans and two fresh
+  cross-partition comparisons passed; four 4 GiB cases rejected publication
+  and cleaned up. Shared reads reduced p8 reader starts from 8,520 to 1,065
+  while preserving the complete 159-input merge. Source IPC costs offset the
+  savings in several configurations; no policy/layout/default was selected.
+  Source reassembly preserves original batch boundaries and releases fragment
+  decoder backing before advancing. Pending asynchronous deletion retains
+  disk/metadata charges; query-end snapshots are not cleanup barriers.
+  Retrieved artifacts were hash-verified and owned remote workloads exited.
+  See the external
+  [Stage 5 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage5-report.md)
+  and evidence under
+  `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261005-stage5-local-r2/`,
+  `20261005-stage5-remote-r2/`, `20261005-stage5-remote-r2-continuation/`,
+  and `20261005-stage5-summary/`. The report preserves the initial rejected
+  revision, harness cleanup review, diagnostic limits, and omitted suites.
+  Main v2's historical p8 exactness gap remains unchanged.
 - [ ] Stage 6: File-backed buffered-data cache; pass ownership, invalidation,
   pinning, and replay-without-writes gates.
 - [ ] Stage 7: Integrated evaluation and rollout decision; record reproducible
@@ -135,7 +156,18 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Stage 4 integration passed at `3795f3f517`; Stage 5 is next. Read the external
+Stage 5 passed at `24d38239ba`; Stage 6 is next. Read the external
+[Stage 5 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage5-report.md)
+for the equal-budget matrix, source-buffer correction, phase/ownership metrics,
+pressure rejections, and cleanup evidence. Preparation concurrency is a
+per-stage ceiling: up to N source reads and N merges, independently scheduled
+under one query budget. No source policy, layout, or production default was
+selected. Retained groups may cross daily boundaries and contain over 100
+files; preserve complete ranges and byte-based admission. The machine was safe
+to stop after evidence retrieval; confirm availability before later remote
+work and never start or stop it. Preserve all existing stashes.
+
+Stage 4 integration passed at `3795f3f517`. Read the external
 [Stage 4 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage4-report.md)
 for focused gates, retained exactness, admission calibration, consumer retention,
 and retrieved evidence. Buffered mode remains development-only. No layout or
