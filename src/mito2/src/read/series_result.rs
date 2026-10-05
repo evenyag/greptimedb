@@ -226,6 +226,7 @@ struct SourceBatch {
 }
 
 struct ResultData {
+    plain_schema: SchemaRef,
     source_batches: Vec<SourceBatch>,
     phase: &'static str,
     schema: SchemaRef,
@@ -307,8 +308,10 @@ impl ResultHandle {
             let mut cursor = self.cursor_in(pool.clone())?;
             let mut pending: Option<BatchLease> = None;
             let mut offset = 0;
+            let mut directory_index = 0;
+            let mut directory_offset = 0;
             for source in &self.0.source_batches {
-                let workspace = checked_add(checked_mul(source.bytes, 4)?, checked_mul(source.rows, checked_add(128, checked_mul(self.0.schema.fields().len(), 16)?)?)?)?;
+                let (workspace, _) = self.source_window(source, &mut directory_index, &mut directory_offset)?;
                 let charge = self.0.resources.reserve_in(Kind::Workspace, workspace, &pool)?.with_owner("source_reassembly");
                 let mut pieces = Vec::new();
                 let mut remaining = source.rows;
@@ -316,17 +319,29 @@ impl ResultHandle {
                     if pending.is_none() { pending = cursor.next().await?; offset = 0; }
                     let lease = pending.as_ref().ok_or_else(|| fail("source buffer ended before its original batch"))?;
                     let rows = remaining.min(lease.num_rows() - offset);
-                    pieces.push(lease.with_batch(|batch| batch.slice(offset, rows)));
+                    // Release each decoded IPC allocation before advancing to the
+                    // next fragment. Keeping slices here would retain all decoded
+                    // windows for one original batch, multiplied by merge fan-in.
+                    // Plain arrays also detach dictionary values from IPC backing.
+                    let piece = self.0.resources.reconstruction.measure(|| {
+                        let plain = lease.with_batch(|batch| convert(&batch.slice(offset, rows), &self.0.plain_schema))?;
+                        let empty = RecordBatch::new_empty(self.0.plain_schema.clone());
+                        arrow(concat_batches(&self.0.plain_schema, [&plain, &empty]))
+                    })?;
+                    pieces.push(piece);
                     remaining -= rows;
                     offset += rows;
                     if offset == lease.num_rows() { pending = None; }
                 }
                 let schema = self.0.schema.clone();
+                let plain_schema = self.0.plain_schema.clone();
                 let resources = self.0.resources.clone();
                 let batch = resources.clone().blocking(move || {
-                    // Two inputs avoid concat's aliasing shortcut for a single batch.
-                    let empty = RecordBatch::new_empty(schema.clone());
-                    let batch = resources.reconstruction.measure(|| arrow(concat_batches(&schema, pieces.iter().chain(std::iter::once(&empty)))))?;
+                    let empty = RecordBatch::new_empty(plain_schema.clone());
+                    let plain = resources.reconstruction.measure(|| arrow(concat_batches(&plain_schema, pieces.iter().chain(std::iter::once(&empty)))))?;
+                    let batch = resources.reconstruction.measure(|| convert(&plain, &schema))?;
+                    drop(pieces);
+                    drop(plain);
                     let mut charge = charge;
                     charge.resize(unique_batch_bytes(&batch)?)?;
                     pin_batch(batch, charge)
@@ -338,42 +353,56 @@ impl ResultHandle {
         })
     }
 
+    /// Reassembly owns normalized fragments and bounded decoder windows, not all
+    /// decoded IPC allocations covering an original source batch.
+    fn source_window(
+        &self,
+        source: &SourceBatch,
+        index: &mut usize,
+        offset: &mut usize,
+    ) -> Result<(usize, usize)> {
+        let mut remaining = source.rows;
+        let mut decoder = 1024;
+        let mut pieces = 0;
+        while remaining > 0 {
+            let entry = self
+                .0
+                .directory
+                .get(*index)
+                .ok_or_else(|| fail("invalid source batch directory"))?;
+            let bytes = match &entry.source {
+                Source::Resident(_) => 1024,
+                Source::File { part, batch } => part.replay_bytes(*batch)?,
+                Source::Pending => return Err(fail("unfinalized source")),
+            };
+            decoder = decoder.max(bytes);
+            pieces = checked_add(pieces, 1)?;
+            let rows = remaining.min(entry.rows - *offset);
+            remaining -= rows;
+            *offset += rows;
+            if *offset == entry.rows {
+                *index += 1;
+                *offset = 0;
+            }
+        }
+        // Include per-fragment array objects/alignment, as well as overlapping
+        // normalized fragments, concatenation, and compact dictionary rebuilding.
+        let metadata = checked_mul(
+            pieces,
+            checked_add(1024, checked_mul(self.0.schema.fields().len(), 512)?)?,
+        )?;
+        let workspace = checked_add(checked_mul(source.bytes, 4)?, metadata)?;
+        Ok((workspace, checked_mul(decoder, 2)?))
+    }
+
     /// Complete simultaneous decoder/reassembly requirement for one source head.
     pub(crate) fn source_replay_bytes(&self) -> Result<usize> {
         let mut maximum = 1024;
         let mut index = 0;
         let mut offset = 0;
         for source in &self.0.source_batches {
-            let mut remaining = source.rows;
-            let mut inputs = 0;
-            while remaining > 0 {
-                let entry = self
-                    .0
-                    .directory
-                    .get(index)
-                    .ok_or_else(|| fail("invalid source batch directory"))?;
-                let bytes = match &entry.source {
-                    Source::Resident(_) => 1024,
-                    Source::File { part, batch } => part.replay_bytes(*batch)?,
-                    Source::Pending => return Err(fail("unfinalized source")),
-                };
-                inputs = checked_add(inputs, bytes)?;
-                let rows = remaining.min(entry.rows - offset);
-                remaining -= rows;
-                offset += rows;
-                if offset == entry.rows {
-                    index += 1;
-                    offset = 0;
-                }
-            }
-            let pieces = checked_mul(
-                source.rows,
-                checked_add(128, checked_mul(self.0.schema.fields().len(), 16)?)?,
-            )?;
-            maximum = maximum.max(checked_add(
-                inputs,
-                checked_add(checked_mul(source.bytes, 4)?, pieces)?,
-            )?);
+            let (workspace, decoder) = self.source_window(source, &mut index, &mut offset)?;
+            maximum = maximum.max(checked_add(workspace, decoder)?);
         }
         checked_add(maximum, 1024)
     }
@@ -847,6 +876,7 @@ impl ResultBuilder {
                 builder.flush_batch()?;
                 builder.finish_file()?;
                 Ok(ResultHandle(Arc::new(ResultData {
+                    plain_schema: builder.plain_schema,
                     source_batches: builder.source_batches,
                     phase: builder.phase,
                     schema: builder.schema,

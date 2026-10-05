@@ -1192,3 +1192,58 @@ async fn buffered_source_batch_boundaries_preserve_equal_sequence_winners() {
         assert_eq!(0, resources.snapshot().payload_bytes);
     }
 }
+
+#[tokio::test]
+async fn buffered_source_reassembly_releases_fragment_decoders() {
+    use futures::TryStreamExt;
+
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        let dir = common_test_util::temp_dir::create_temp_dir("buffered-source-fragments");
+        let resources = StoreResources::new(
+            dir.path(),
+            StoreOptions {
+                layout,
+                batch_rows: 16,
+                batch_bytes: 64 * 1024,
+                memory_bytes: 8 * 1024 * 1024,
+                metadata_bytes: 2 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // One original decoder batch spans hundreds of independently decoded
+        // one-series IPC fragments. Its compact fields include dictionaries.
+        let batch = fixture(&(0..512).map(|id| (1, id, 1)).collect::<Vec<_>>());
+        let handle = ResultBuilder::with_resources(resources.clone(), batch.schema())
+            .unwrap()
+            .with_phase("source")
+            .append(batch.clone(), Placement::File)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let window = handle.replay_bytes().unwrap();
+        let required = handle.source_replay_bytes().unwrap();
+        let pool =
+            budget::BudgetPool::prepaid(&resources.pool(), required, "source merge").unwrap();
+        let mut stream = handle.source_stream_in(pool.clone());
+        let output = stream.try_next().await.unwrap().unwrap();
+        assert_eq!(logical(&batch), logical(&output));
+        assert!(stream.try_next().await.unwrap().is_none());
+        drop(stream);
+        pool.close();
+        resources.drain_cleanup().await.unwrap();
+        let snapshot = resources.snapshot();
+        assert_eq!(512, snapshot.counts["source_ipc_decoded_rows"]);
+        assert!(snapshot.peaks["source_payload_bytes"] <= 2 * window);
+        assert_eq!(0, snapshot.ownership["source_payload_bytes"]);
+        assert!(snapshot.ownership["source_reassembly_workspace_bytes"] > 0);
+        assert_eq!(0, snapshot.disk_bytes);
+        drop(output);
+        let snapshot = resources.snapshot();
+        assert_eq!(0, snapshot.workspace_bytes);
+        assert_eq!(0, snapshot.payload_bytes);
+        assert!(snapshot.ownership.values().all(|bytes| *bytes == 0));
+    }
+}
