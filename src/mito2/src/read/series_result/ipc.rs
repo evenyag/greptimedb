@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow_ipc::{Block, root_as_footer, root_as_message};
+use datafusion::execution::memory_pool::MemoryPool;
 use datatypes::arrow::array::Array;
 use datatypes::arrow::buffer::Buffer;
 use datatypes::arrow::datatypes::SchemaRef;
@@ -87,6 +88,13 @@ impl Write for CountWriter {
         self.owned.resources.count("write_calls", 1);
         self.owned
             .resources
+            .count(&format!("{}_write_calls", self.owned.phase), 1);
+        self.owned.resources.count(
+            &format!("{}_filesystem_write_bytes", self.owned.phase),
+            written,
+        );
+        self.owned
+            .resources
             .count("filesystem_write_bytes", written);
         result
     }
@@ -96,6 +104,7 @@ impl Write for CountWriter {
 }
 
 pub(crate) struct OpenWriter {
+    workspace_pool: Arc<dyn MemoryPool>,
     // Closing the writer precedes releasing its file owner.
     writer: Option<FileWriter<CountWriter>>,
     owner: Arc<OwnedFile>,
@@ -115,7 +124,12 @@ impl Drop for OpenWriter {
 }
 
 impl OpenWriter {
-    pub(crate) fn new(resources: Arc<StoreResources>, schema: SchemaRef) -> Result<Self> {
+    pub(crate) fn with_workspace(
+        resources: Arc<StoreResources>,
+        schema: SchemaRef,
+        workspace_pool: Arc<dyn MemoryPool>,
+        phase: &'static str,
+    ) -> Result<Self> {
         let dictionary = resources
             .options
             .fixed_keys
@@ -126,10 +140,13 @@ impl OpenWriter {
         if checked_add(base, schema_bound)? > resources.options.file_metadata_bytes {
             return Err(fail("schema/dictionary exceeds file metadata limit"));
         }
-        let metadata = Arc::new(Mutex::new(resources.reserve(Kind::Metadata, base)?));
-        let _workspace = resources.reserve(
+        let metadata = Arc::new(Mutex::new(
+            resources.reserve(Kind::Metadata, base)?.with_owner(phase),
+        ));
+        let _workspace = resources.reserve_in(
             Kind::Workspace,
             checked_mul(checked_add(base, schema_bound)?, 2)?,
+            &workspace_pool,
         )?;
         let path = resources
             .root
@@ -140,6 +157,7 @@ impl OpenWriter {
             .open(&path)
             .map_err(|e| fail(format!("create {}: {e}", path.display())))?;
         let owner = Arc::new(OwnedFile {
+            phase,
             metadata: metadata.clone(),
             path,
             partial_link: None,
@@ -159,6 +177,7 @@ impl OpenWriter {
         resources.count("files", 1);
         resources.count("file_opens", 1);
         Ok(Self {
+            workspace_pool,
             writer: Some(writer),
             owner,
             schema,
@@ -198,7 +217,7 @@ impl OpenWriter {
         if !self.fits(bound) {
             return Err(fail("single batch exceeds IPC file limits"));
         }
-        let _workspace = resources.reserve(Kind::Workspace, bound)?;
+        let _workspace = resources.reserve_in(Kind::Workspace, bound, &self.workspace_pool)?;
         self.metadata
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -224,7 +243,7 @@ impl OpenWriter {
 
     pub(crate) fn finish(mut self) -> Result<Arc<FilePart>> {
         let resources = self.owner.resources.clone();
-        let _workspace = resources.reserve(
+        let _workspace = resources.reserve_in(
             Kind::Workspace,
             checked_mul(
                 checked_add(
@@ -236,6 +255,7 @@ impl OpenWriter {
                 )?,
                 3,
             )?,
+            &self.workspace_pool,
         )?;
         #[cfg(test)]
         if resources.faults.finish.load(Ordering::SeqCst) {
@@ -257,14 +277,26 @@ impl OpenWriter {
                 return Err(fail("truncated IPC file"));
             }
             let mut trailer = [0; 10];
-            read_at(&mut file, size - 10, &mut trailer, &resources)?;
+            read_at(
+                &mut file,
+                size - 10,
+                &mut trailer,
+                &resources,
+                self.owner.phase,
+            )?;
             let footer_len = arrow(read_footer_length(trailer))?;
             if footer_len > resources.options.file_metadata_bytes || footer_len > size - 10 {
                 return Err(fail("IPC footer exceeds bounds"));
             }
             let footer_offset = size - 10 - footer_len;
             let mut footer_bytes = vec![0; footer_len];
-            read_at(&mut file, footer_offset, &mut footer_bytes, &resources)?;
+            read_at(
+                &mut file,
+                footer_offset,
+                &mut footer_bytes,
+                &resources,
+                self.owner.phase,
+            )?;
             let footer = root_as_footer(&footer_bytes)
                 .map_err(|e| fail(format!("invalid IPC footer: {e}")))?;
             let blocks = footer
@@ -295,7 +327,13 @@ impl OpenWriter {
                         return Err(fail("dictionary block exceeds metadata bound"));
                     }
                     let mut bytes = vec![0; range.len()];
-                    read_at(&mut file, range.start, &mut bytes, &resources)?;
+                    read_at(
+                        &mut file,
+                        range.start,
+                        &mut bytes,
+                        &resources,
+                        self.owner.phase,
+                    )?;
                     let expected = resources
                         .options
                         .fixed_keys
@@ -314,6 +352,7 @@ impl OpenWriter {
             }
             resources.count("footer_bytes", footer_len);
             resources.count("serialized_bytes", size);
+            resources.count(&format!("{}_spill_bytes", self.owner.phase), size);
             resources.count("metadata_initializations", 1);
             resources.count(
                 "batch_directory_bytes",
@@ -365,6 +404,17 @@ impl FilePart {
     ) -> Result<Arc<BatchData>> {
         let resources = &self.owner.resources;
         #[cfg(test)]
+        if let Some((started, resume)) = resources
+            .faults
+            .read_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = started.send(());
+            let _ = resume.recv();
+        }
+        #[cfg(test)]
         if resources.faults.read.load(Ordering::SeqCst) {
             return Err(fail("injected read failure"));
         }
@@ -388,7 +438,11 @@ impl FilePart {
         let file = &mut open.as_mut().ok_or_else(|| fail("missing cursor file"))?.1;
         let mut bytes = vec![0; range.len()];
         resources.count("logical_requested_bytes", range.len());
-        read_at(file, range.start, &mut bytes, resources)?;
+        resources.count(
+            &format!("{}_logical_requested_bytes", self.owner.phase),
+            range.len(),
+        );
+        read_at(file, range.start, &mut bytes, resources, self.owner.phase)?;
         validate_message(&bytes, block, self.rows[batch], bound, false)?;
         let buffer = Buffer::from(bytes);
         let decoded = resources
@@ -399,10 +453,23 @@ impl FilePart {
             .reconstruction
             .measure(|| convert(&decoded, schema))?;
         let size = unique_batch_bytes(&compact)?;
-        let charge = resources.reserve_in(Kind::Payload, size, pool)?;
+        let charge = resources
+            .reserve_in(Kind::Payload, size, pool)?
+            .with_owner(self.owner.phase);
         resources.count("decoded_rows", compact.num_rows());
+        resources.count(
+            &format!("{}_ipc_decoded_rows", self.owner.phase),
+            compact.num_rows(),
+        );
         resources.count("decoded_batches", 1);
-        resources.peak("replay_payload_bytes", size);
+        resources.peak(
+            if self.owner.phase == "source" {
+                "merge_input_payload_bytes"
+            } else {
+                "replay_payload_bytes"
+            },
+            size,
+        );
         BatchData::new(compact, charge)
     }
 }
@@ -412,6 +479,7 @@ fn read_at(
     offset: usize,
     bytes: &mut [u8],
     resources: &StoreResources,
+    phase: &str,
 ) -> Result<()> {
     file.seek(SeekFrom::Start(
         u64::try_from(offset).map_err(|_| fail("seek overflow"))?,
@@ -425,6 +493,8 @@ fn read_at(
             .map_err(|e| fail(e.to_string()))?;
         resources.count("read_calls", 1);
         resources.count("filesystem_read_bytes", n);
+        resources.count(&format!("{phase}_filesystem_read_bytes"), n);
+        resources.count(&format!("{phase}_read_calls"), 1);
         if n == 0 {
             return Err(fail("unexpected EOF in IPC block"));
         }

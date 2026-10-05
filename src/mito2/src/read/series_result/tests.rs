@@ -1031,3 +1031,164 @@ async fn repeated_spill_checks_preserve_file_batch_packing() {
     resources.drain_cleanup().await.unwrap();
     assert_eq!(0, resources.snapshot().disk_bytes);
 }
+
+#[tokio::test]
+async fn preparation_detaches_result_from_source_allocation_charges() {
+    let dir = common_test_util::temp_dir::create_temp_dir("buffered-source-ownership");
+    let batch = fixture(&[(1, 1, 128)]);
+    let builder = ResultBuilder::new(
+        dir.path(),
+        batch.schema(),
+        StoreOptions {
+            batch_rows: 2,
+            batch_bytes: 8192,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let resources = builder.resources();
+    let source = builder
+        .with_phase("source")
+        .append(batch.clone(), Placement::File)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let mut cursor = source.cursor().unwrap();
+    let lease = cursor.next().await.unwrap().unwrap();
+    let budget = crate::read::series_result::budget::BudgetPool::prepaid(
+        &resources.pool(),
+        8 * 1024 * 1024,
+        "preparation",
+    )
+    .unwrap();
+    let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = budget.clone();
+    let result = ResultBuilder::with_workspace(resources.clone(), batch.schema(), pool)
+        .unwrap()
+        .with_phase("result")
+        .append(lease.with_batch(Clone::clone), Placement::Resident)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    drop(lease);
+    cursor.close().await.unwrap();
+    drop(cursor);
+    drop(source);
+    budget.close();
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(0, resources.snapshot().ownership["source_payload_bytes"]);
+    assert!(resources.snapshot().ownership["result_payload_bytes"] > 0);
+    drop(result);
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(0, resources.snapshot().payload_bytes);
+    assert_eq!(0, resources.snapshot().workspace_bytes);
+    assert_eq!(0, resources.snapshot().disk_bytes);
+}
+
+#[tokio::test]
+async fn buffered_source_batch_boundaries_preserve_equal_sequence_winners() {
+    use crate::read::BoxedRecordBatchStream;
+    use crate::read::flat_dedup::{FlatDedupReader, FlatLastRow};
+    use crate::read::flat_merge::FlatMergeReader;
+    use datatypes::arrow::array::TimestampMillisecondArray;
+    use futures::TryStreamExt;
+
+    async fn winners(
+        schema: SchemaRef,
+        sources: Vec<BoxedRecordBatchStream>,
+        rows: usize,
+    ) -> Vec<Option<f64>> {
+        let merge = FlatMergeReader::new(schema, sources, rows, None)
+            .await
+            .unwrap();
+        let mut stream = Box::pin(
+            FlatDedupReader::new(Box::pin(merge.into_stream()), FlatLastRow::new(true), None)
+                .into_stream(),
+        );
+        let mut output = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            output.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .iter(),
+            );
+        }
+        output
+    }
+
+    let inputs = (0..3)
+        .map(|source| {
+            let template = fixture(&[(1, 1, 16), (2, 1, 16)]);
+            let mut columns = template.columns().to_vec();
+            columns[0] = Arc::new(Float64Array::from(vec![source as f64; 32]));
+            columns[2] = Arc::new(TimestampMillisecondArray::from_iter_values(
+                (0..16).chain(0..16),
+            ));
+            let mut fields = template.schema().fields().to_vec();
+            fields[2] = Arc::new(
+                fields[2]
+                    .as_ref()
+                    .clone()
+                    .with_data_type(columns[2].data_type().clone()),
+            );
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let schema = inputs[0].schema();
+    let reference = winners(
+        schema.clone(),
+        inputs
+            .iter()
+            .map(|batch| {
+                Box::pin(futures::stream::iter([Ok(batch.clone())])) as BoxedRecordBatchStream
+            })
+            .collect(),
+        8192,
+    )
+    .await;
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        let dir = common_test_util::temp_dir::create_temp_dir("buffered-source-ties");
+        let resources = StoreResources::new(
+            dir.path(),
+            StoreOptions {
+                layout,
+                batch_rows: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut sources = Vec::new();
+        for (index, batch) in inputs.iter().enumerate() {
+            let placement = if index == 0 {
+                Placement::Resident
+            } else {
+                Placement::File
+            };
+            let handle = ResultBuilder::with_resources(resources.clone(), schema.clone())
+                .unwrap()
+                .with_phase("source")
+                .append(batch.clone(), placement)
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            sources.push(Box::pin(async_stream::try_stream! {
+                let pool = handle.0.resources.pool();
+                let mut stream = handle.source_stream_in(pool);
+                while let Some(batch) = stream.try_next().await? { yield batch; }
+            }) as BoxedRecordBatchStream);
+        }
+        assert_eq!(reference, winners(schema.clone(), sources, 2).await);
+        resources.drain_cleanup().await.unwrap();
+        assert_eq!(0, resources.snapshot().disk_bytes);
+        assert_eq!(0, resources.snapshot().payload_bytes);
+    }
+}

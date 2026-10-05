@@ -1379,7 +1379,7 @@ impl ScanbenchCommand {
                         .collect(),
                     effective_settings: serde_json::json!({
                         "mode": effective_mode,
-                        "source_policy": if matches!(effective_mode, Some("two_phase" | "compact" | "buffered")) { "selected_series_per_partition" } else { "native" },
+                        "source_policy": if effective_mode == Some("buffered") { buffered_settings.get("source_policy").cloned().unwrap_or(serde_json::Value::Null) } else if matches!(effective_mode, Some("two_phase" | "compact")) { serde_json::json!("selected_series_per_partition") } else { serde_json::json!("native") },
                         "query_memory_budget_bytes": buffered_settings.get("query_memory_budget_bytes"),
                         "baseline_shared_scan_memory_limit": format!("{:?}", engine.mito_config().scan_memory_limit),
                         "spill_threshold_bytes": buffered_settings.get("spill_threshold_bytes"),

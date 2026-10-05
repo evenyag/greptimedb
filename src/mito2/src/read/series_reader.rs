@@ -157,7 +157,7 @@ impl SeriesBatchCollector {
 
 /// Immutable allow-list for one partition's metric series.
 #[derive(Clone, Debug)]
-struct MetricSeriesFilter {
+pub(crate) struct MetricSeriesFilter {
     range: SeriesRange,
     series: Arc<HashSet<MetricSeriesId>>,
     sorted_series: Arc<Vec<MetricSeriesId>>,
@@ -175,6 +175,22 @@ impl MetricSeriesFilter {
             series: Arc::new(series),
             sorted_series: Arc::new(sorted_series),
             enable_range_cache: assigned.enable_range_cache(),
+        }
+    }
+
+    /// Shares one candidate union across all source tasks, including memtables.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn union(mut series: Vec<MetricSeriesId>) -> Self {
+        series.sort_unstable();
+        series.dedup();
+        Self {
+            range: SeriesRange {
+                start: 0,
+                end: TSID_DOMAIN_END,
+            },
+            series: Arc::new(series.iter().copied().collect()),
+            sorted_series: Arc::new(series),
+            enable_range_cache: false,
         }
     }
 
@@ -459,17 +475,9 @@ async fn build_series_partition_range(
                 let ctx = stream_ctx.clone();
                 sources.push(Box::pin(try_stream! {
                     for (range, mapping) in ranges {
-                        #[cfg(any(test, feature = "dev-tools"))]
-                        let _reader_lifetime = compact.buffered_resources.as_ref().map(|resources| resources.reader_lease());
-                        let mut reader = range.compact_reader(mapping, &filter.sorted_series, &compact.catalog.metrics).await?;
-                        let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
-                        while let Some(batch) = reader.try_next().await? {
-                            let Some(batch) = compact.catalog.metrics.data_filter.measure(|| -> Result<_> {
-                                let Some(batch) = filter_flat_batch_by_sequence(batch, ctx.input.sequence_range, trusted)? else { return Ok(None); };
-                                range.precise_filter_compact(batch, &compact.catalog)
-                            })? else { continue; };
-                            let key = batch.column(primary_key_column_index(batch.num_columns())).clone();
-                            yield compact.catalog.metrics.schema_adapt.measure(|| compact.schema.adapt(&batch, key))?;
+                        let mut source = compact_file_stream(ctx.clone(), compact.clone(), range, mapping, filter.sorted_series.clone());
+                        while let Some(batch) = source.try_next().await? {
+                            yield batch;
                         }
                     }
                 }) as BoxedRecordBatchStream);
@@ -567,6 +575,105 @@ async fn build_series_partition_range(
         None => stream,
     };
     Ok((stream, estimated_batch_size))
+}
+
+/// One independently materializable source part. Parts of a file retain their
+/// original order when reconstructed as a single range-merge input.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) struct BufferedSource {
+    pub(crate) ordinal: usize,
+    pub(crate) stream: BoxedRecordBatchStream,
+    pub(crate) reader_bytes: usize,
+}
+
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn buffered_sources(
+    ctx: Arc<StreamContext>,
+    range: PartitionRange,
+    compact: Arc<CompactReadContext>,
+    filter: MetricSeriesFilter,
+    metrics: PartitionMetrics,
+) -> Result<Vec<Vec<BufferedSource>>> {
+    use crate::read::series_result::{checked_add, fail};
+    let meta = &ctx.ranges[range.identifier];
+    let mut sources = Vec::new();
+    for index in &meta.row_group_indices {
+        if ctx.is_file_range_index(*index) {
+            let mut parts = Vec::new();
+            for (ordinal, (file, mapping)) in compact.files(*index)?.iter().enumerate() {
+                // Candidate pruning is independent of output partition boundaries.
+                if !mapping
+                    .runs
+                    .iter()
+                    .any(|run| filter.sorted_series.binary_search(&run.series).is_ok())
+                {
+                    continue;
+                }
+                parts.push(BufferedSource {
+                    ordinal,
+                    reader_bytes: file.buffered_reader_bytes()?,
+                    stream: compact_file_stream(
+                        ctx.clone(),
+                        compact.clone(),
+                        file.clone(),
+                        mapping.clone(),
+                        filter.sorted_series.clone(),
+                    ),
+                });
+            }
+            sources.push(parts);
+        } else if ctx.is_mem_range_index(*index) {
+            let stream = Box::pin(scan_flat_mem_ranges(
+                ctx.clone(),
+                metrics.clone(),
+                *index,
+                meta.time_range,
+            ));
+            let codec = SparsePrimaryKeyCodec::new(ctx.input.region_metadata());
+            let mut stream = filter_flat_stream_by_series(stream, codec, filter.clone());
+            let compact = compact.clone();
+            sources.push(vec![BufferedSource {
+                ordinal: 0,
+                reader_bytes: checked_add(ctx.input.memtables[index.index].stats().bytes_allocated(), 4 * 1024 * 1024)?,
+                stream: Box::pin(try_stream! {
+                    while let Some(batch) = stream.try_next().await? {
+                        let mut mapping = SeriesRowMappingBuilder::default();
+                        mapping.append(batch.column(primary_key_column_index(batch.num_columns())))?;
+                        let mapping = mapping.finish(batch.num_rows())?;
+                        let mut cursor = CompactKeyCursor::new(mapping.runs)?;
+                        let keys = cursor.next(batch.num_rows())?;
+                        yield compact.schema.adapt(&batch, keys)?;
+                    }
+                }),
+            }]);
+        } else {
+            return Err(fail("unsupported shared source index"));
+        }
+    }
+    Ok(sources)
+}
+
+fn compact_file_stream(
+    ctx: Arc<StreamContext>,
+    compact: Arc<CompactReadContext>,
+    range: crate::sst::parquet::file_range::FileRange,
+    mapping: Arc<crate::read::series_compact::SeriesRowMapping>,
+    ids: Arc<Vec<MetricSeriesId>>,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        #[cfg(any(test, feature = "dev-tools"))]
+        let _reader_lifetime = compact.buffered_resources.as_ref().map(|resources| resources.reader_lease());
+        let mut reader = range.compact_reader(mapping, &ids, &compact.catalog.metrics).await?;
+        let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
+        while let Some(batch) = reader.try_next().await? {
+            let Some(batch) = compact.catalog.metrics.data_filter.measure(|| -> Result<_> {
+                let Some(batch) = filter_flat_batch_by_sequence(batch, ctx.input.sequence_range, trusted)? else { return Ok(None); };
+                range.precise_filter_compact(batch, &compact.catalog)
+            })? else { continue; };
+            let key = batch.column(primary_key_column_index(batch.num_columns())).clone();
+            yield compact.catalog.metrics.schema_adapt.measure(|| compact.schema.adapt(&batch, key))?;
+        }
+    })
 }
 
 fn scan_series_file_ranges(

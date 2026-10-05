@@ -260,6 +260,17 @@ impl SeqScan {
             Box::pin(reader.into_stream())
         };
 
+        Self::finish_flat_reader(stream_ctx, reader, part_metrics, skip_dedup, merge_schema.1)
+    }
+
+    /// Applies the existing complete-range deduplication and selector semantics.
+    pub(crate) fn finish_flat_reader(
+        stream_ctx: &StreamContext,
+        reader: BoxedRecordBatchStream,
+        part_metrics: Option<&PartitionMetrics>,
+        skip_dedup: bool,
+        field_column_start: usize,
+    ) -> Result<BoxedRecordBatchStream> {
         let dedup = !skip_dedup && !stream_ctx.input.append_mode;
         let dedup_metrics_reporter = part_metrics.map(|m| m.dedup_metrics_reporter());
         let reader = if dedup {
@@ -275,7 +286,7 @@ impl SeqScan {
                 MergeMode::LastNonNull => Box::pin(
                     FlatDedupReader::new(
                         reader,
-                        FlatLastNonNull::new(merge_schema.1, stream_ctx.input.filter_deleted),
+                        FlatLastNonNull::new(field_column_start, stream_ctx.input.filter_deleted),
                         dedup_metrics_reporter,
                     )
                     .into_stream(),

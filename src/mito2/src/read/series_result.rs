@@ -219,7 +219,15 @@ enum Source {
     File { part: Arc<FilePart>, batch: usize },
 }
 
+#[derive(Clone, Copy)]
+struct SourceBatch {
+    rows: usize,
+    bytes: usize,
+}
+
 struct ResultData {
+    source_batches: Vec<SourceBatch>,
+    phase: &'static str,
     schema: SchemaRef,
     directory: Vec<DirectoryEntry>,
     spans: Vec<Span>,
@@ -237,6 +245,10 @@ impl ResultHandle {
     }
 
     /// Binary-searches the sorted identity spans, without touching unrelated payload.
+    pub(crate) fn cursor_in(&self, pool: Arc<dyn MemoryPool>) -> Result<ResultCursor> {
+        ResultCursor::with_pool(self.clone(), None, pool)
+    }
+
     pub fn series_cursor(&self, series: MetricSeriesId) -> Result<ResultCursor> {
         self.0.resources.lookup.measure(|| {
             let spans = &self.0.spans;
@@ -285,6 +297,107 @@ impl ResultHandle {
         })
     }
 
+    /// Bounded reassembly preserves the decoder's batch transitions, which the
+    /// existing merge algorithm observes when resolving equal-sequence ties.
+    pub(crate) fn source_stream_in(
+        self,
+        pool: Arc<dyn MemoryPool>,
+    ) -> crate::read::BoxedRecordBatchStream {
+        Box::pin(async_stream::try_stream! {
+            let mut cursor = self.cursor_in(pool.clone())?;
+            let mut pending: Option<BatchLease> = None;
+            let mut offset = 0;
+            for source in &self.0.source_batches {
+                let workspace = checked_add(checked_mul(source.bytes, 4)?, checked_mul(source.rows, checked_add(128, checked_mul(self.0.schema.fields().len(), 16)?)?)?)?;
+                let charge = self.0.resources.reserve_in(Kind::Workspace, workspace, &pool)?.with_owner("source_reassembly");
+                let mut pieces = Vec::new();
+                let mut remaining = source.rows;
+                while remaining > 0 {
+                    if pending.is_none() { pending = cursor.next().await?; offset = 0; }
+                    let lease = pending.as_ref().ok_or_else(|| fail("source buffer ended before its original batch"))?;
+                    let rows = remaining.min(lease.num_rows() - offset);
+                    pieces.push(lease.with_batch(|batch| batch.slice(offset, rows)));
+                    remaining -= rows;
+                    offset += rows;
+                    if offset == lease.num_rows() { pending = None; }
+                }
+                let schema = self.0.schema.clone();
+                let resources = self.0.resources.clone();
+                let batch = resources.clone().blocking(move || {
+                    // Two inputs avoid concat's aliasing shortcut for a single batch.
+                    let empty = RecordBatch::new_empty(schema.clone());
+                    let batch = resources.reconstruction.measure(|| arrow(concat_batches(&schema, pieces.iter().chain(std::iter::once(&empty)))))?;
+                    let mut charge = charge;
+                    charge.resize(unique_batch_bytes(&batch)?)?;
+                    pin_batch(batch, charge)
+                }).await?;
+                yield batch;
+            }
+            if pending.is_some() || cursor.next().await?.is_some() { Err(fail("source buffer exceeds original batch boundaries"))?; }
+            cursor.close().await?;
+        })
+    }
+
+    /// Complete simultaneous decoder/reassembly requirement for one source head.
+    pub(crate) fn source_replay_bytes(&self) -> Result<usize> {
+        let mut maximum = 1024;
+        let mut index = 0;
+        let mut offset = 0;
+        for source in &self.0.source_batches {
+            let mut remaining = source.rows;
+            let mut inputs = 0;
+            while remaining > 0 {
+                let entry = self
+                    .0
+                    .directory
+                    .get(index)
+                    .ok_or_else(|| fail("invalid source batch directory"))?;
+                let bytes = match &entry.source {
+                    Source::Resident(_) => 1024,
+                    Source::File { part, batch } => part.replay_bytes(*batch)?,
+                    Source::Pending => return Err(fail("unfinalized source")),
+                };
+                inputs = checked_add(inputs, bytes)?;
+                let rows = remaining.min(entry.rows - offset);
+                remaining -= rows;
+                offset += rows;
+                if offset == entry.rows {
+                    index += 1;
+                    offset = 0;
+                }
+            }
+            let pieces = checked_mul(
+                source.rows,
+                checked_add(128, checked_mul(self.0.schema.fields().len(), 16)?)?,
+            )?;
+            maximum = maximum.max(checked_add(
+                inputs,
+                checked_add(checked_mul(source.bytes, 4)?, pieces)?,
+            )?);
+        }
+        checked_add(maximum, 1024)
+    }
+
+    /// Bounds the backing referenced by any output-sized window, including the
+    /// batches straddling its edges. Input windows may start inside a batch.
+    pub(crate) fn merge_window_bytes(&self, rows: usize) -> Result<usize> {
+        let mut first = 0;
+        let mut count = 0;
+        let mut bytes = 0;
+        let mut maximum = 0;
+        for (last, batch) in self.0.source_batches.iter().enumerate() {
+            count = checked_add(count, batch.rows)?;
+            bytes = checked_add(bytes, batch.bytes)?;
+            while first < last && count.saturating_sub(self.0.source_batches[first].rows) > rows {
+                count -= self.0.source_batches[first].rows;
+                bytes -= self.0.source_batches[first].bytes;
+                first += 1;
+            }
+            maximum = maximum.max(bytes);
+        }
+        Ok(maximum)
+    }
+
     /// Extra backing capacity when a downstream consumer retains this whole
     /// identity. Resident payload is already charged to the immutable result.
     pub(crate) fn series_output_bytes(&self, id: MetricSeriesId, tags: usize) -> Result<usize> {
@@ -304,13 +417,22 @@ impl ResultHandle {
 
     /// Only an unpublished, exclusively owned result may change placement.
     pub(crate) async fn spill(self) -> Result<Self> {
+        let pool = self.0.resources.pool();
+        self.spill_in(pool).await
+    }
+
+    pub(crate) async fn spill_in(self, pool: Arc<dyn MemoryPool>) -> Result<Self> {
         let resources = self.0.resources.clone();
         resources
             .clone()
             .blocking(move || {
                 let mut data = Arc::try_unwrap(self.0)
                     .map_err(|_| fail("cannot spill a published/shared result"))?;
-                let helper = ResultBuilder::with_resources(resources.clone(), data.schema.clone())?;
+                let helper = ResultBuilder::with_workspace(
+                    resources.clone(),
+                    data.schema.clone(),
+                    pool.clone(),
+                )?;
                 let mut writer: Option<OpenWriter> = None;
                 let mut positions = Vec::new();
                 fn finish(
@@ -334,7 +456,8 @@ impl ResultHandle {
                         continue;
                     };
                     let bytes = normalized_size(&batch.batch)?;
-                    let _workspace = resources.reserve(Kind::Workspace, checked_mul(bytes, 4)?)?;
+                    let _workspace =
+                        resources.reserve_in(Kind::Workspace, checked_mul(bytes, 4)?, &pool)?;
                     let plain = helper.normalize(&batch.batch)?;
                     let storage = helper.storage_batch(&plain)?;
                     let bound = ipc::write_bound(&storage, &resources.options)?;
@@ -342,9 +465,11 @@ impl ResultHandle {
                         finish(&mut writer, &mut positions, &mut data)?;
                     }
                     if writer.is_none() {
-                        writer = Some(OpenWriter::new(
+                        writer = Some(OpenWriter::with_workspace(
                             resources.clone(),
                             helper.storage_schema.clone(),
+                            pool.clone(),
+                            data.phase,
                         )?);
                     }
                     writer
@@ -522,7 +647,11 @@ impl ResultCursor {
 /// Consuming async operations move ownership into the blocking task. Dropping the
 /// awaiting future cannot strand a partial writer or its reservations.
 pub struct ResultBuilder {
+    source_batches: Vec<SourceBatch>,
+    spill_on_pressure: bool,
+    phase: &'static str,
     resources: Arc<StoreResources>,
+    workspace_pool: Arc<dyn MemoryPool>,
     schema: SchemaRef,
     storage_schema: SchemaRef,
     plain_schema: SchemaRef,
@@ -551,6 +680,18 @@ impl ResultBuilder {
 
     /// Reuses the same query budget across independent builders/results/cursors.
     pub fn with_resources(resources: Arc<StoreResources>, schema: SchemaRef) -> Result<Self> {
+        let pool = resources.pool();
+        let mut builder = Self::with_workspace(resources, schema, pool)?;
+        builder.spill_on_pressure = false;
+        Ok(builder)
+    }
+
+    /// Serialization and bounded staging consume prepaid preparation capacity.
+    pub(crate) fn with_workspace(
+        resources: Arc<StoreResources>,
+        schema: SchemaRef,
+        workspace_pool: Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
         if schema.fields().len() < 4 {
             return Err(fail("incomplete compact schema"));
         }
@@ -588,9 +729,13 @@ impl ResultBuilder {
         let storage_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
         let shared_bytes = shared_schema_memory(&[&schema, &plain_schema, &storage_schema])?;
         metadata.resize(shared_bytes)?;
-        let pending_charge = resources.reserve(Kind::Payload, 0)?;
+        let pending_charge = resources.reserve_in(Kind::Payload, 0, &workspace_pool)?;
         Ok(Self {
+            source_batches: Vec::new(),
+            spill_on_pressure: true,
+            phase: "result",
             resources,
+            workspace_pool,
             schema,
             storage_schema,
             plain_schema,
@@ -605,6 +750,13 @@ impl ResultBuilder {
             last_series: None,
             writer: None,
         })
+    }
+
+    pub(crate) fn with_phase(mut self, phase: &'static str) -> Self {
+        self.phase = phase;
+        self.metadata = self.metadata.with_owner(phase);
+        self.pending_charge = self.pending_charge.with_owner(phase);
+        self
     }
 
     pub fn resources(&self) -> Arc<StoreResources> {
@@ -636,10 +788,11 @@ impl ResultBuilder {
         let _cancel = CancelOnDrop(cancelled.clone());
         // Charge before dispatch, including time spent queued on the blocking runtime.
         let input = if owner.is_none() {
-            Some(
-                self.resources
-                    .reserve(Kind::Workspace, unique_batch_bytes(&batch)?)?,
-            )
+            Some(self.resources.reserve_in(
+                Kind::Workspace,
+                unique_batch_bytes(&batch)?,
+                &self.workspace_pool,
+            )?)
         } else {
             None
         };
@@ -665,17 +818,22 @@ impl ResultBuilder {
             // threshold check would silently defeat multi-series batch packing.
             return Ok(self);
         }
+        let workspace_pool = self.workspace_pool.clone();
+        let spill_on_pressure = self.spill_on_pressure;
         let handle = self.finish().await?;
         let handle = if handle.has_resident() {
-            handle.spill().await?
+            handle.spill_in(workspace_pool.clone()).await?
         } else {
             handle
         };
         let data = Arc::try_unwrap(handle.0).map_err(|_| fail("shared unpublished builder"))?;
-        let mut builder = Self::with_resources(data.resources, data.schema)?;
+        let mut builder = Self::with_workspace(data.resources, data.schema, workspace_pool)?;
+        builder = builder.with_phase(data.phase);
+        builder.spill_on_pressure = spill_on_pressure;
         builder.last_series = data.spans.last().map(|s| s.series);
         builder.directory = data.directory;
         builder.spans = data.spans;
+        builder.source_batches = data.source_batches;
         builder.metadata = data._metadata;
         builder.placement = Placement::File;
         Ok(builder)
@@ -689,6 +847,8 @@ impl ResultBuilder {
                 builder.flush_batch()?;
                 builder.finish_file()?;
                 Ok(ResultHandle(Arc::new(ResultData {
+                    source_batches: builder.source_batches,
+                    phase: builder.phase,
                     schema: builder.schema,
                     directory: builder.directory,
                     spans: builder.spans,
@@ -707,6 +867,16 @@ impl ResultBuilder {
     ) -> Result<()> {
         if batch.schema() != self.schema {
             return Err(fail("compact input schema mismatch"));
+        }
+        if self.phase == "source" && batch.num_rows() > 0 {
+            self.metadata.grow(std::mem::size_of::<SourceBatch>())?;
+            self.source_batches
+                .try_reserve_exact(1)
+                .map_err(|e| fail(e.to_string()))?;
+            self.source_batches.push(SourceBatch {
+                rows: batch.num_rows(),
+                bytes: checked_mul(normalized_size(&batch)?, 2)?,
+            });
         }
         if self.placement != placement {
             self.flush_batch()?;
@@ -731,9 +901,11 @@ impl ResultBuilder {
                 }
                 rows /= 2;
             };
-            let _chunk = self
-                .resources
-                .reserve(Kind::Workspace, checked_mul(estimate, 3)?)?;
+            let _chunk = self.resources.reserve_in(
+                Kind::Workspace,
+                checked_mul(estimate, 3)?,
+                &self.workspace_pool,
+            )?;
             // Normalize once per bounded input chunk, avoiding repeated dictionary scans
             // for thousands of tiny series sharing the same input dictionary.
             let piece = self.normalize(&piece)?;
@@ -745,9 +917,11 @@ impl ResultBuilder {
             if keys.iter().flatten().any(|key| key.len() != 22) {
                 return Err(fail("expected 22-byte compact keys"));
             }
-            let _ids = self
-                .resources
-                .reserve(Kind::Workspace, checked_mul(rows, 32)?)?;
+            let _ids = self.resources.reserve_in(
+                Kind::Workspace,
+                checked_mul(rows, 32)?,
+                &self.workspace_pool,
+            )?;
             let ids = identities(piece.column(pk))?;
             if ids.windows(2).any(|w| w[0] > w[1]) {
                 return Err(fail("input series are not ordered"));
@@ -824,9 +998,11 @@ impl ResultBuilder {
 
     fn push_piece(&mut self, batch: &RecordBatch) -> Result<()> {
         let estimate = normalized_size(batch)?;
-        let _workspace = self
-            .resources
-            .reserve(Kind::Workspace, checked_mul(estimate, 3)?)?;
+        let _workspace = self.resources.reserve_in(
+            Kind::Workspace,
+            checked_mul(estimate, 3)?,
+            &self.workspace_pool,
+        )?;
         let normalized = self.normalize(batch)?;
         let bytes = normalized.get_array_memory_size();
         self.pending_charge
@@ -844,10 +1020,24 @@ impl ResultBuilder {
         if self.pending_rows == 0 {
             return Ok(());
         }
-        let _workspace = self
-            .resources
-            .reserve(Kind::Workspace, checked_mul(self.pending_bytes, 4)?)?;
-        let plain = arrow(concat_batches(&self.plain_schema, &self.pending))?;
+        let _workspace = self.resources.reserve_in(
+            Kind::Workspace,
+            checked_mul(self.pending_bytes, 4)?,
+            &self.workspace_pool,
+        )?;
+        // Arrow's single-input concat returns slices. Preparation must detach
+        // completed output from decoder/input leases instead of pinning an entire
+        // source batch through a tiny result slice. A second, empty input forces
+        // the normal concat path for the normalized value arrays.
+        let empty = RecordBatch::new_empty(self.plain_schema.clone());
+        let plain = if self.spill_on_pressure && self.pending.len() == 1 {
+            arrow(concat_batches(
+                &self.plain_schema,
+                self.pending.iter().chain(std::iter::once(&empty)),
+            ))?
+        } else {
+            arrow(concat_batches(&self.plain_schema, &self.pending))?
+        };
         self.pending.clear();
         self.pending.shrink_to_fit();
         self.pending_charge.clear();
@@ -884,37 +1074,58 @@ impl ResultBuilder {
                     .resources
                     .reconstruction
                     .measure(|| convert(&plain, &self.schema))?;
-                let charge = self
+                let charge = match self
                     .resources
-                    .reserve(Kind::Payload, unique_batch_bytes(&compact)?)?;
+                    .reserve(Kind::Payload, unique_batch_bytes(&compact)?)
+                {
+                    Ok(charge) => charge.with_owner(self.phase),
+                    Err(_) if self.spill_on_pressure => {
+                        // Concurrent preparation may consume free resident capacity
+                        // after placement selection. Protected writer credit still
+                        // permits this unpublished batch to go straight to disk.
+                        drop(compact);
+                        self.resources.count("resident_admission_spills", 1);
+                        self.placement = Placement::File;
+                        self.write_plain(&plain)?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 Source::Resident(BatchData::new(compact, charge)?)
             }
             Placement::File => {
-                let storage = self.storage_batch(&plain)?;
-                let predicted = ipc::write_bound(&storage, &self.resources.options)?;
-                if self.writer.as_ref().is_some_and(|w| !w.fits(predicted)) {
-                    self.finish_file()?;
-                }
-                if self.writer.is_none() {
-                    self.writer = Some(OpenWriter::new(
-                        self.resources.clone(),
-                        self.storage_schema.clone(),
-                    )?);
-                }
-                let writer = self
-                    .writer
-                    .as_mut()
-                    .ok_or_else(|| fail("missing IPC writer"))?;
-                writer.append(&storage)?;
-                // File references are installed only by finish_file. The builder is private.
-                self.resources.count("batches", 1);
-                self.resources.count("rows", rows);
+                self.write_plain(&plain)?;
                 return Ok(());
             }
         };
         self.directory.push(DirectoryEntry { source, rows });
         self.resources.count("batches", 1);
         self.resources.count("rows", rows);
+        Ok(())
+    }
+
+    fn write_plain(&mut self, plain: &RecordBatch) -> Result<()> {
+        let storage = self.storage_batch(plain)?;
+        let predicted = ipc::write_bound(&storage, &self.resources.options)?;
+        if self.writer.as_ref().is_some_and(|w| !w.fits(predicted)) {
+            self.finish_file()?;
+        }
+        if self.writer.is_none() {
+            self.writer = Some(OpenWriter::with_workspace(
+                self.resources.clone(),
+                self.storage_schema.clone(),
+                self.workspace_pool.clone(),
+                self.phase,
+            )?);
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| fail("missing IPC writer"))?;
+        writer.append(&storage)?;
+        // File references are installed only by finish_file. The builder is private.
+        self.resources.count("batches", 1);
+        self.resources.count("rows", plain.num_rows());
         Ok(())
     }
 

@@ -57,7 +57,16 @@ impl BudgetPool {
     }
 
     pub(crate) fn replay(parent: &Arc<dyn MemoryPool>, bytes: usize) -> Result<Arc<Self>> {
-        let reservation = MemoryConsumer::new("BufferedSeriesScan::publication").register(parent);
+        Self::prepaid(parent, bytes, "replay")
+    }
+
+    pub(crate) fn prepaid(
+        parent: &Arc<dyn MemoryPool>,
+        bytes: usize,
+        stage: &'static str,
+    ) -> Result<Arc<Self>> {
+        let reservation =
+            MemoryConsumer::new(format!("BufferedSeriesScan::{stage}")).register(parent);
         reservation.try_grow(bytes)?;
         Ok(Arc::new(Self {
             state: Mutex::new(State {
@@ -67,7 +76,7 @@ impl BudgetPool {
             }),
             limit: bytes,
             prepaid: true,
-            stage: "replay",
+            stage,
             peak: AtomicUsize::new(0),
         }))
     }

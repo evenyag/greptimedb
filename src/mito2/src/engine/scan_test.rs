@@ -4571,124 +4571,164 @@ async fn test_buffered_scan_semantics_and_polling() {
         put_buffered_row(&engine, region_id, (2 * p + 1) << 60, Some(p), 4000).await;
     }
     let scratch = common_test_util::temp_dir::create_temp_dir("buffered-stage4");
-    for selector in [
-        None,
-        Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+    for source_policy in [
+        crate::read::series_buffered::SourcePolicy::SelectedSeriesPerPartition,
+        crate::read::series_buffered::SourcePolicy::SharedSelectedSeries,
     ] {
-        for (min, max) in [(None, None), (Some(2), Some(5)), (Some(4), Some(4))] {
-            let (_, expected) =
-                scan_sparse_exact_metric(&engine, region_id, min, max, selector, "two_phase").await;
-            for layout in ["one_series", "multiple_series"] {
-                for spill in [false, true] {
-                    for partitions in [1, 8] {
-                        let scanner = engine
-                            .scanner(
-                                region_id,
-                                ScanRequest {
-                                    distribution: Some(TimeSeriesDistribution::PerSeries),
-                                    filters: vec![col("tag_0").gt_eq(lit("a"))],
-                                    memtable_min_sequence: min,
-                                    memtable_max_sequence: max,
-                                    exact_sequence_range: min.is_some(),
-                                    series_row_selector: selector,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        let Scanner::Series(scanner) = scanner else {
-                            panic!("series expected")
-                        };
-                        let mut scanner = scanner
-                            .into_buffered(Options {
-                                scratch: scratch.path().to_owned(),
-                                memory_bytes: 128 * 1024 * 1024,
-                                spill_threshold: if spill { 1 } else { 120 * 1024 * 1024 },
-                                disk_bytes: 64 * 1024 * 1024,
-                                batch_rows: 2,
-                                batch_bytes: 64 * 1024,
-                                layout: layout.to_owned(),
-                                compression: None,
-                            })
-                            .await
-                            .unwrap();
-                        let resources = scanner.buffered_resources();
-                        assert_eq!("buffered", scanner.mode());
-                        let ranges = scanner
-                            .properties()
-                            .partitions
-                            .iter()
-                            .flatten()
-                            .copied()
-                            .collect();
-                        let mut assigned = vec![Vec::new(); partitions];
-                        assigned[0] = ranges;
-                        scanner
-                            .prepare(
-                                PrepareRequest::default()
-                                    .with_ranges(assigned)
-                                    .with_target_partitions(partitions),
-                            )
-                            .unwrap();
-                        let metrics = ExecutionPlanMetricsSet::default();
-                        let streams = (0..partitions)
-                            .map(|p| {
+        for preparation_concurrency in [1, 2, 4] {
+            for selector in [
+                None,
+                Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+            ] {
+                for (min, max) in [(None, None), (Some(2), Some(5)), (Some(4), Some(4))] {
+                    let (_, expected) = scan_sparse_exact_metric(
+                        &engine,
+                        region_id,
+                        min,
+                        max,
+                        selector,
+                        "two_phase",
+                    )
+                    .await;
+                    for layout in ["one_series", "multiple_series"] {
+                        for spill in [false, true] {
+                            let mut shared_reads = None;
+                            for partitions in [1, 8] {
+                                let scanner = engine
+                                    .scanner(
+                                        region_id,
+                                        ScanRequest {
+                                            distribution: Some(TimeSeriesDistribution::PerSeries),
+                                            filters: vec![col("tag_0").gt_eq(lit("a"))],
+                                            memtable_min_sequence: min,
+                                            memtable_max_sequence: max,
+                                            exact_sequence_range: min.is_some(),
+                                            series_row_selector: selector,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                                let Scanner::Series(scanner) = scanner else {
+                                    panic!("series expected")
+                                };
+                                let mut scanner = scanner
+                                    .into_buffered(Options {
+                                        source_policy,
+                                        preparation_concurrency,
+                                        candidate_chunk_size: if preparation_concurrency == 2 {
+                                            3
+                                        } else {
+                                            1_000_000
+                                        },
+                                        scratch: scratch.path().to_owned(),
+                                        memory_bytes: 128 * 1024 * 1024,
+                                        spill_threshold: if spill { 1 } else { 120 * 1024 * 1024 },
+                                        disk_bytes: 64 * 1024 * 1024,
+                                        batch_rows: 2,
+                                        batch_bytes: 64 * 1024,
+                                        layout: layout.to_owned(),
+                                        compression: None,
+                                    })
+                                    .await
+                                    .unwrap();
+                                let resources = scanner.buffered_resources();
+                                assert_eq!("buffered", scanner.mode());
+                                let ranges = scanner
+                                    .properties()
+                                    .partitions
+                                    .iter()
+                                    .flatten()
+                                    .copied()
+                                    .collect();
+                                let mut assigned = vec![Vec::new(); partitions];
+                                assigned[0] = ranges;
                                 scanner
-                                    .scan_partition(&Default::default(), &metrics, p)
+                                    .prepare(
+                                        PrepareRequest::default()
+                                            .with_ranges(assigned)
+                                            .with_target_partitions(partitions),
+                                    )
+                                    .unwrap();
+                                let metrics = ExecutionPlanMetricsSet::default();
+                                let streams = (0..partitions)
+                                    .map(|p| {
+                                        scanner
+                                            .scan_partition(&Default::default(), &metrics, p)
+                                            .unwrap()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let mut actual = Vec::new();
+                                // Compare concurrent/interleaved polling with sequential
+                                // consumption while seven streams remain unpolled.
+                                let batches = if layout == "multiple_series" && partitions == 8 {
+                                    try_join_all(
+                                        streams.into_iter().map(collect_buffered_sparse_rows),
+                                    )
+                                    .await
                                     .unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        let mut actual = Vec::new();
-                        // Compare concurrent/interleaved polling with sequential
-                        // consumption while seven streams remain unpolled.
-                        let batches = if layout == "multiple_series" && partitions == 8 {
-                            try_join_all(streams.into_iter().map(collect_buffered_sparse_rows))
-                                .await
-                                .unwrap()
-                        } else {
-                            let mut batches = Vec::new();
-                            for stream in streams {
-                                batches.push(collect_buffered_sparse_rows(stream).await.unwrap());
-                            }
-                            batches
-                        };
-                        let mut owners = HashMap::new();
-                        for (partition, rows) in batches.into_iter().enumerate() {
-                            for row in &rows {
-                                if let Some(previous) = owners.insert((row.0, row.1), partition) {
-                                    assert_eq!(previous, partition);
+                                } else {
+                                    let mut batches = Vec::new();
+                                    for stream in streams {
+                                        batches.push(
+                                            collect_buffered_sparse_rows(stream).await.unwrap(),
+                                        );
+                                    }
+                                    batches
+                                };
+                                let mut owners = HashMap::new();
+                                for (partition, rows) in batches.into_iter().enumerate() {
+                                    for row in &rows {
+                                        if let Some(previous) =
+                                            owners.insert((row.0, row.1), partition)
+                                        {
+                                            assert_eq!(previous, partition);
+                                        }
+                                    }
+                                    assert!(
+                                        rows.windows(2).all(|w| (w[0].0, w[0].1, w[0].5)
+                                            <= (w[1].0, w[1].1, w[1].5))
+                                    );
+                                    actual.extend(rows);
+                                }
+                                actual.sort();
+                                assert_eq!(
+                                    expected, actual,
+                                    "{layout}, spill={spill}, partitions={partitions}, sequence={min:?}/{max:?}, selector={selector:?}"
+                                );
+                                let value = |name| {
+                                    metrics
+                                        .clone_inner()
+                                        .sum_by_name(name)
+                                        .map_or(0, |v| v.as_usize())
+                                };
+                                assert_eq!(
+                                    value("compact_data_readers"),
+                                    value("compact_audited_decoders")
+                                );
+                                assert_eq!(0, value("compact_data_primary_key_pages_decoded"));
+                                assert_eq!(0, value("compact_primary_key_decode_violations"));
+                                assert_eq!(0, resources.live_readers());
+                                drop(scanner);
+                                resources.drain_cleanup().await.unwrap();
+                                let snapshot = resources.snapshot();
+                                assert_eq!(0, snapshot.disk_bytes);
+                                assert_eq!(0, snapshot.payload_bytes);
+                                assert_eq!(0, snapshot.workspace_bytes);
+                                assert!(snapshot.peaks["memory_bytes"] <= 128 * 1024 * 1024);
+                                if source_policy == crate::read::series_buffered::SourcePolicy::SharedSelectedSeries {
+                                    assert!(snapshot.peaks.get("live_readers").copied().unwrap_or(0) <= preparation_concurrency);
+                                    let observed = (snapshot.counts.get("readers_started").copied(), snapshot.counts.get("source_selected_rows").copied());
+                                    if let Some(previous) = shared_reads { assert_eq!(previous, observed, "output partitions must not repeat shared source work"); }
+                                    shared_reads = Some(observed);
+                                    assert_eq!(snapshot.counts.get("source_parts_planned"), snapshot.counts.get("source_parts_completed"));
+                                    assert!(snapshot.counts.get("source_selected_rows").copied().unwrap_or(0) >= snapshot.counts.get("range_result_rows").copied().unwrap_or(0));
+                                    if preparation_concurrency == 2 && expected.iter().map(|row| (row.0, row.1)).collect::<std::collections::HashSet<_>>().len() > 3 {
+                                        assert!(snapshot.counts["candidate_chunks"] > 1);
+                                    }
                                 }
                             }
-                            assert!(
-                                rows.windows(2)
-                                    .all(|w| (w[0].0, w[0].1, w[0].5) <= (w[1].0, w[1].1, w[1].5))
-                            );
-                            actual.extend(rows);
                         }
-                        actual.sort();
-                        assert_eq!(
-                            expected, actual,
-                            "{layout}, spill={spill}, partitions={partitions}, sequence={min:?}/{max:?}, selector={selector:?}"
-                        );
-                        let value = |name| {
-                            metrics
-                                .clone_inner()
-                                .sum_by_name(name)
-                                .map_or(0, |v| v.as_usize())
-                        };
-                        assert_eq!(
-                            value("compact_data_readers"),
-                            value("compact_audited_decoders")
-                        );
-                        assert_eq!(0, value("compact_data_primary_key_pages_decoded"));
-                        assert_eq!(0, value("compact_primary_key_decode_violations"));
-                        assert_eq!(0, resources.live_readers());
-                        drop(scanner);
-                        resources.drain_cleanup().await.unwrap();
-                        let snapshot = resources.snapshot();
-                        assert_eq!(0, snapshot.disk_bytes);
-                        assert_eq!(0, snapshot.payload_bytes);
-                        assert_eq!(0, snapshot.workspace_bytes);
                     }
                 }
             }
@@ -4702,156 +4742,193 @@ async fn test_buffered_failures_and_unpolled_cleanup() {
     let (_env, engine, region_id) =
         build_sparse_exact_metric_engine("buffered_failures", true, ReadableSize::mb(0)).await;
     let scratch = common_test_util::temp_dir::create_temp_dir("buffered-failures");
-    for failure in ["memory", "disk", "write", "finalize", "cancel", "abandon"] {
-        let scanner = engine
-            .scanner(
-                region_id,
-                ScanRequest {
-                    distribution: Some(TimeSeriesDistribution::PerSeries),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let Scanner::Series(scanner) = scanner else {
-            panic!("series expected")
-        };
-        let mut scanner = scanner
-            .into_buffered(Options {
-                scratch: scratch.path().to_owned(),
-                memory_bytes: if failure == "memory" {
-                    1024 * 1024
-                } else {
-                    128 * 1024 * 1024
-                },
-                spill_threshold: 1,
-                disk_bytes: if failure == "disk" {
-                    1
-                } else {
-                    64 * 1024 * 1024
-                },
-                batch_rows: 2,
-                batch_bytes: 64 * 1024,
-                layout: "multiple_series".to_owned(),
-                compression: None,
-            })
-            .await
-            .unwrap();
-        let resources = scanner.buffered_resources();
-        let write_gate = if failure == "cancel" {
-            let (started, observed) = std::sync::mpsc::channel();
-            let (resume, paused) = std::sync::mpsc::channel();
-            *resources.faults.write_gate.lock().unwrap() = Some((started, paused));
-            Some((observed, resume))
-        } else {
-            None
-        };
-        if failure == "write" {
-            *resources.faults.write_after.lock().unwrap() = Some(0);
-        }
-        if failure == "finalize" {
-            resources
-                .faults
-                .finish
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        let ranges = scanner
-            .properties()
-            .partitions
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
-        let mut assigned = vec![Vec::new(); 8];
-        assigned[0] = ranges;
-        scanner
-            .prepare(
-                PrepareRequest::default()
-                    .with_ranges(assigned)
-                    .with_target_partitions(8),
-            )
-            .unwrap();
-        let metrics = ExecutionPlanMetricsSet::default();
-        let mut streams = (0..8)
-            .map(|p| {
-                scanner
-                    .scan_partition(&Default::default(), &metrics, p)
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        if let Some((observed, resume)) = write_gate {
-            common_runtime::spawn_blocking_query(move || {
-                observed.recv_timeout(std::time::Duration::from_secs(5))
-            })
-            .await
-            .unwrap()
-            .unwrap();
-            drop(streams);
-            assert!(
-                resources.snapshot().workspace_bytes > 0,
-                "queued/running writer must retain its admission"
-            );
-            resume.send(()).unwrap();
-        } else if failure == "abandon" {
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while resources.snapshot().counts.get("published_manifests") != Some(&8) {
-                    tokio::task::yield_now().await;
+    for source_policy in [
+        crate::read::series_buffered::SourcePolicy::SelectedSeriesPerPartition,
+        crate::read::series_buffered::SourcePolicy::SharedSelectedSeries,
+    ] {
+        for preparation_concurrency in [1, 2, 4] {
+            for failure in [
+                "memory",
+                "disk",
+                "write",
+                "finalize",
+                "read",
+                "cancel",
+                "cancel_read",
+                "abandon",
+            ] {
+                if matches!(failure, "read" | "cancel_read")
+                    && source_policy
+                        == crate::read::series_buffered::SourcePolicy::SelectedSeriesPerPartition
+                {
+                    // Replay errors are partition-local; the shared policy reads
+                    // source IPC before publishing, so every receiver must fail.
+                    continue;
                 }
-            })
-            .await
-            .unwrap();
-            assert_eq!(0, resources.live_readers());
-            let writes = resources
-                .snapshot()
-                .counts
-                .get("filesystem_write_bytes")
-                .copied();
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            // Complete one partition without polling any of the others, then abandon them.
-            let stream = streams.remove(0);
-            collect_buffered_sparse_rows(stream).await.unwrap();
-            assert_eq!(
-                writes,
-                resources
-                    .snapshot()
-                    .counts
-                    .get("filesystem_write_bytes")
+                let scanner = engine
+                    .scanner(
+                        region_id,
+                        ScanRequest {
+                            distribution: Some(TimeSeriesDistribution::PerSeries),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let Scanner::Series(scanner) = scanner else {
+                    panic!("series expected")
+                };
+                let mut scanner = scanner
+                    .into_buffered(Options {
+                        source_policy,
+                        preparation_concurrency,
+                        candidate_chunk_size: 1_000_000,
+                        scratch: scratch.path().to_owned(),
+                        memory_bytes: if failure == "memory" {
+                            1024 * 1024
+                        } else {
+                            128 * 1024 * 1024
+                        },
+                        spill_threshold: 1,
+                        disk_bytes: if failure == "disk" {
+                            1
+                        } else {
+                            64 * 1024 * 1024
+                        },
+                        batch_rows: 2,
+                        batch_bytes: 64 * 1024,
+                        layout: "multiple_series".to_owned(),
+                        compression: None,
+                    })
+                    .await
+                    .unwrap();
+                let resources = scanner.buffered_resources();
+                let write_gate = if matches!(failure, "cancel" | "cancel_read") {
+                    let (started, observed) = std::sync::mpsc::channel();
+                    let (resume, paused) = std::sync::mpsc::channel();
+                    if failure == "cancel_read" {
+                        *resources.faults.read_gate.lock().unwrap() = Some((started, paused));
+                    } else {
+                        *resources.faults.write_gate.lock().unwrap() = Some((started, paused));
+                    }
+                    Some((observed, resume))
+                } else {
+                    None
+                };
+                if failure == "write" {
+                    *resources.faults.write_after.lock().unwrap() = Some(0);
+                }
+                if failure == "read" {
+                    resources
+                        .faults
+                        .read
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if failure == "finalize" {
+                    resources
+                        .faults
+                        .finish
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let ranges = scanner
+                    .properties()
+                    .partitions
+                    .iter()
+                    .flatten()
                     .copied()
-            );
-            drop(streams);
-        } else {
-            for stream in streams {
-                let error = format!(
-                    "{:?}",
-                    collect_buffered_sparse_rows(stream).await.unwrap_err()
-                );
-                if failure == "memory" {
-                    assert!(error.contains("stage=mapping preflight"), "{error}");
+                    .collect();
+                let mut assigned = vec![Vec::new(); 8];
+                assigned[0] = ranges;
+                scanner
+                    .prepare(
+                        PrepareRequest::default()
+                            .with_ranges(assigned)
+                            .with_target_partitions(8),
+                    )
+                    .unwrap();
+                let metrics = ExecutionPlanMetricsSet::default();
+                let mut streams = (0..8)
+                    .map(|p| {
+                        scanner
+                            .scan_partition(&Default::default(), &metrics, p)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                if let Some((observed, resume)) = write_gate {
+                    common_runtime::spawn_blocking_query(move || {
+                        observed.recv_timeout(std::time::Duration::from_secs(5))
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    drop(streams);
                     assert!(
-                        error.contains("required=") && error.contains("available="),
-                        "{error}"
+                        resources.snapshot().workspace_bytes > 0,
+                        "queued/running writer must retain its admission"
                     );
+                    resume.send(()).unwrap();
+                } else if failure == "abandon" {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while resources.snapshot().counts.get("published_manifests") != Some(&8) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(0, resources.live_readers());
+                    let writes = resources
+                        .snapshot()
+                        .counts
+                        .get("filesystem_write_bytes")
+                        .copied();
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    // Complete one partition without polling any of the others, then abandon them.
+                    let stream = streams.remove(0);
+                    collect_buffered_sparse_rows(stream).await.unwrap();
+                    assert_eq!(
+                        writes,
+                        resources
+                            .snapshot()
+                            .counts
+                            .get("filesystem_write_bytes")
+                            .copied()
+                    );
+                    drop(streams);
+                } else {
+                    for stream in streams {
+                        let error = format!(
+                            "{:?}",
+                            collect_buffered_sparse_rows(stream).await.unwrap_err()
+                        );
+                        if failure == "memory" {
+                            assert!(error.contains("stage=mapping preflight"), "{error}");
+                            assert!(
+                                error.contains("required=") && error.contains("available="),
+                                "{error}"
+                            );
+                        }
+                    }
+                }
+                drop(scanner);
+                // Cancellation can be observed by the coordinator after its last caller drops.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        resources.drain_cleanup().await.unwrap();
+                        let snapshot = resources.snapshot();
+                        if snapshot.memory_bytes == snapshot.resource_bytes {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(0, resources.snapshot().disk_bytes, "{failure}");
+                assert_eq!(0, resources.live_readers(), "{failure}");
+                if failure == "memory" {
+                    assert_eq!(None, resources.snapshot().counts.get("readers_started"));
                 }
             }
-        }
-        drop(scanner);
-        // Cancellation can be observed by the coordinator after its last caller drops.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                resources.drain_cleanup().await.unwrap();
-                let snapshot = resources.snapshot();
-                if snapshot.memory_bytes == snapshot.resource_bytes {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(0, resources.snapshot().disk_bytes, "{failure}");
-        assert_eq!(0, resources.live_readers(), "{failure}");
-        if failure == "memory" {
-            assert_eq!(None, resources.snapshot().counts.get("readers_started"));
         }
     }
 }
@@ -4951,42 +5028,54 @@ async fn test_buffered_complete_range_last_non_null_and_delete() {
             .await
             .unwrap();
         let scratch = common_test_util::temp_dir::create_temp_dir("buffered-dedup");
-        for selector in [
-            None,
-            Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+        for source_policy in [
+            crate::read::series_buffered::SourcePolicy::SelectedSeriesPerPartition,
+            crate::read::series_buffered::SourcePolicy::SharedSelectedSeries,
         ] {
-            let request = ScanRequest {
-                distribution: Some(TimeSeriesDistribution::PerSeries),
-                series_row_selector: selector,
-                ..Default::default()
-            };
-            let Scanner::Series(reference) =
-                engine.scanner(region_id, request.clone()).await.unwrap()
-            else {
-                panic!("series expected")
-            };
-            let expected = collect_buffered_strings(reference.build_stream().await.unwrap()).await;
-            for layout in ["one_series", "multiple_series"] {
-                let Scanner::Series(scanner) =
-                    engine.scanner(region_id, request.clone()).await.unwrap()
-                else {
-                    panic!("series expected")
-                };
-                let scanner = scanner
-                    .into_buffered(Options {
-                        scratch: scratch.path().to_owned(),
-                        memory_bytes: 128 * 1024 * 1024,
-                        spill_threshold: 1,
-                        disk_bytes: 64 * 1024 * 1024,
-                        batch_rows: 2,
-                        batch_bytes: 64 * 1024,
-                        layout: layout.to_owned(),
-                        compression: None,
-                    })
-                    .await
-                    .unwrap();
-                let actual = collect_buffered_strings(scanner.build_stream().await.unwrap()).await;
-                assert_eq!(expected, actual, "merge={mode}, layout={layout}");
+            for preparation_concurrency in [1, 2, 4] {
+                for selector in [
+                    None,
+                    Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+                ] {
+                    let request = ScanRequest {
+                        distribution: Some(TimeSeriesDistribution::PerSeries),
+                        series_row_selector: selector,
+                        ..Default::default()
+                    };
+                    let Scanner::Series(reference) =
+                        engine.scanner(region_id, request.clone()).await.unwrap()
+                    else {
+                        panic!("series expected")
+                    };
+                    let expected =
+                        collect_buffered_strings(reference.build_stream().await.unwrap()).await;
+                    for layout in ["one_series", "multiple_series"] {
+                        let Scanner::Series(scanner) =
+                            engine.scanner(region_id, request.clone()).await.unwrap()
+                        else {
+                            panic!("series expected")
+                        };
+                        let scanner = scanner
+                            .into_buffered(Options {
+                                source_policy,
+                                preparation_concurrency,
+                                candidate_chunk_size: 1_000_000,
+                                scratch: scratch.path().to_owned(),
+                                memory_bytes: 128 * 1024 * 1024,
+                                spill_threshold: 1,
+                                disk_bytes: 64 * 1024 * 1024,
+                                batch_rows: 2,
+                                batch_bytes: 64 * 1024,
+                                layout: layout.to_owned(),
+                                compression: None,
+                            })
+                            .await
+                            .unwrap();
+                        let actual =
+                            collect_buffered_strings(scanner.build_stream().await.unwrap()).await;
+                        assert_eq!(expected, actual, "merge={mode}, layout={layout}");
+                    }
+                }
             }
         }
     }
@@ -5056,6 +5145,9 @@ async fn test_buffered_publication_funds_complete_series_consumer() {
     };
     let scanner = scanner
         .into_buffered(Options {
+            source_policy: Default::default(),
+            preparation_concurrency: 1,
+            candidate_chunk_size: 1_000_000,
             scratch: scratch.path().to_owned(),
             memory_bytes: 128 * 1024 * 1024,
             spill_threshold: 1,

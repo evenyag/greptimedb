@@ -45,9 +45,25 @@ pub(crate) struct Charge {
     pool: Arc<dyn MemoryPool>,
     resources: Arc<StoreResources>,
     kind: Kind,
+    owner: Option<String>,
 }
 
 impl Charge {
+    pub(crate) fn with_owner(mut self, phase: &str) -> Self {
+        if let Some(owner) = &self.owner {
+            self.resources.ownership_change(owner, self.bytes(), false);
+        }
+        let kind = match self.kind {
+            Kind::Payload => "payload",
+            Kind::Metadata => "metadata",
+            Kind::Workspace => "workspace",
+        };
+        let owner = format!("{phase}_{kind}_bytes");
+        self.resources.ownership_change(&owner, self.bytes(), true);
+        self.owner = Some(owner);
+        self
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.reservation.size()
     }
@@ -102,6 +118,9 @@ impl Charge {
                 self.resources.metadata.load(Ordering::SeqCst),
             );
         }
+        if let Some(owner) = &self.owner {
+            self.resources.ownership_change(owner, bytes, true);
+        }
         Ok(())
     }
 
@@ -119,11 +138,17 @@ impl Charge {
             Kind::Workspace => &self.resources.workspace,
         };
         current.fetch_sub(released, Ordering::SeqCst);
+        if let Some(owner) = &self.owner {
+            self.resources.ownership_change(owner, released, false);
+        }
         Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
         let bytes = self.reservation.free();
+        if let Some(owner) = &self.owner {
+            self.resources.ownership_change(owner, bytes, false);
+        }
         match self.kind {
             Kind::Metadata => {
                 self.resources.metadata.fetch_sub(bytes, Ordering::SeqCst);
@@ -157,6 +182,7 @@ pub struct Snapshot {
     pub pending_cleanup: usize,
     pub active_operations: usize,
     pub failed_cleanup: usize,
+    pub ownership: BTreeMap<String, usize>,
     pub counts: BTreeMap<String, usize>,
     pub peaks: BTreeMap<String, usize>,
 }
@@ -175,6 +201,7 @@ pub struct StoreResources {
     live_readers: AtomicUsize,
     failed: Mutex<Vec<FailedDelete>>,
     notify: Notify,
+    ownership: Mutex<BTreeMap<String, usize>>,
     counts: Mutex<BTreeMap<String, usize>>,
     peaks: Mutex<BTreeMap<String, usize>>,
     pub(crate) operations: ExecutionPlanMetricsSet,
@@ -260,6 +287,7 @@ impl StoreResources {
             live_readers: AtomicUsize::new(0),
             failed: Mutex::new(vec![]),
             notify: Notify::new(),
+            ownership: Mutex::new(BTreeMap::new()),
             counts: Mutex::new(BTreeMap::new()),
             peaks: Mutex::new(BTreeMap::new()),
             conversion: op("normalization"),
@@ -342,6 +370,7 @@ impl StoreResources {
             pool: pool.clone(),
             resources: self.clone(),
             kind,
+            owner: None,
         };
         charge.grow(bytes)?;
         Ok(charge)
@@ -366,6 +395,17 @@ impl StoreResources {
 
     pub(crate) fn disk_shrink(&self, bytes: usize) {
         self.disk.fetch_sub(bytes, Ordering::SeqCst);
+    }
+
+    fn ownership_change(&self, name: &str, bytes: usize, grow: bool) {
+        let mut values = self.ownership.lock().unwrap_or_else(|e| e.into_inner());
+        let value = values.entry(name.to_owned()).or_default();
+        if grow {
+            *value += bytes;
+            self.peak(name, *value);
+        } else {
+            *value -= bytes;
+        }
     }
 
     pub(crate) fn count(&self, name: &str, n: usize) {
@@ -397,6 +437,11 @@ impl StoreResources {
             pending_cleanup: self.pending.load(Ordering::SeqCst),
             active_operations: self.active.load(Ordering::SeqCst),
             failed_cleanup: self.failed.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            ownership: self
+                .ownership
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             counts: self
                 .counts
                 .lock()
@@ -491,6 +536,7 @@ impl Drop for StoreResources {
 }
 
 pub(crate) struct OwnedFile {
+    pub(crate) phase: &'static str,
     pub(crate) metadata: Arc<Mutex<Charge>>,
     pub(crate) path: PathBuf,
     pub(crate) partial_link: Option<PathBuf>,
@@ -534,6 +580,8 @@ pub(crate) struct Faults {
     pub(crate) finish: std::sync::atomic::AtomicBool,
     pub(crate) read: std::sync::atomic::AtomicBool,
     pub(crate) remove: std::sync::atomic::AtomicBool,
+    pub(crate) read_gate:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     pub(crate) write_gate:
         Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }

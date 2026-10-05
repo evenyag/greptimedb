@@ -14,6 +14,8 @@
 
 //! Development-only complete preparation and bounded range replay.
 
+mod scheduler;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -36,12 +38,11 @@ use crate::read::scan_util::PartitionMetrics;
 use crate::read::series_candidate::SeriesCandidateScanner;
 use crate::read::series_compact::{CompactMetrics, CompactReadContext, CompactSchema, TagCatalog};
 use crate::read::series_prepare::{ReadinessReceiver, start_preparation};
-use crate::read::series_reader::{SeriesBatchCollector, SeriesReader};
+use crate::read::series_reader::SeriesBatchCollector;
 use crate::read::series_result::budget::BudgetPool;
 use crate::read::series_result::resources::Kind;
 use crate::read::series_result::{
-    Placement, ResultBuilder, ResultHandle, StoreOptions, StoreResources, checked_add, checked_mul,
-    fail, pin_batch,
+    ResultHandle, StoreOptions, StoreResources, checked_add, checked_mul, fail, pin_batch,
 };
 use crate::read::stream::{ScanBatch, ScanBatchStream};
 use crate::series_index::MetricSeriesId;
@@ -61,10 +62,39 @@ pub(crate) struct Options {
     pub(crate) layout: String,
     #[serde(default)]
     pub(crate) compression: Option<String>,
+    #[serde(default)]
+    pub(crate) source_policy: SourcePolicy,
+    #[serde(default = "default_concurrency")]
+    pub(crate) preparation_concurrency: usize,
+    #[serde(default = "default_candidate_chunk_size")]
+    pub(crate) candidate_chunk_size: usize,
+}
+
+/// Development-only source strategy; neither policy changes production defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourcePolicy {
+    #[default]
+    SelectedSeriesPerPartition,
+    SharedSelectedSeries,
+}
+
+fn default_candidate_chunk_size() -> usize {
+    1_000_000
+}
+
+fn default_concurrency() -> usize {
+    1
 }
 
 impl Options {
     pub(crate) fn store(&self) -> Result<StoreOptions> {
+        if self.candidate_chunk_size == 0 {
+            return Err(fail("candidate chunk size must be positive"));
+        }
+        if self.preparation_concurrency == 0 {
+            return Err(fail("preparation concurrency must be positive"));
+        }
         if self.spill_threshold == 0 || self.spill_threshold > self.memory_bytes {
             return Err(fail(
                 "spill threshold must be positive and no greater than memory budget",
@@ -139,9 +169,10 @@ impl BufferedScan {
             "ipc_batch_rows": self.options.batch_rows,
             "ipc_batch_bytes": self.options.batch_bytes,
             "compression": self.options.compression,
-            "preparation_concurrency": 1,
+            "preparation_concurrency": self.options.preparation_concurrency,
             "prefetch_batches": 0,
-            "source_policy": "selected_series_per_partition",
+            "candidate_chunk_size": self.options.candidate_chunk_size,
+            "source_policy": self.options.source_policy,
             "consumer_retention": "one_complete_series_plus_next_batch",
         })
     }
@@ -223,6 +254,7 @@ impl BufferedScan {
     }
 }
 
+#[derive(Clone)]
 struct PreparedRange {
     bounds: FileTimeRange,
     result: Option<ResultHandle>,
@@ -343,11 +375,15 @@ async fn prepare(
                 2 * std::mem::size_of::<MetricSeriesId>(),
             )?)
             .map_err(|e| fail(e.to_string()))?;
-        collector.push(batch);
-        if collector.len() >= 1_000_000 {
-            chunks.push(collector.finish(false));
-            collector = SeriesBatchCollector::new(num_partitions)
-                .ok_or_else(|| fail("no output partitions"))?;
+        let mut batch = batch.into_iter();
+        while batch.len() > 0 {
+            let remaining = options.candidate_chunk_size - collector.len();
+            collector.push(batch.by_ref().take(remaining).collect());
+            if collector.len() == options.candidate_chunk_size {
+                chunks.push(collector.finish(false));
+                collector = SeriesBatchCollector::new(num_partitions)
+                    .ok_or_else(|| fail("no output partitions"))?;
+            }
         }
     }
     drop(candidates);
@@ -380,7 +416,7 @@ async fn prepare(
     .await?;
     compact.buffered_resources = Some(resources.clone());
     let compact = Arc::new(compact);
-    let mut results = (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut results;
     let mut identities = vec![Vec::new(); num_partitions];
     let mut metadata = (0..num_partitions)
         .map(|_| resources.reserve(Kind::Metadata, 256))
@@ -397,118 +433,26 @@ async fn prepare(
             identities[p].extend_from_slice(assignment.series());
         }
     }
-    // This workspace is kept free alongside every admitted merge, so reclamation
-    // cannot require releasing memory owned by that same merge.
-    let writer_bytes = checked_add(checked_mul(options.batch_bytes, 24)?, 4 * 1024 * 1024)?;
-    for range in &ranges {
-        let bounds = ctx.ranges[range.identifier].time_range;
-        let mut reader_bytes = 0;
-        for index in &ctx.ranges[range.identifier].row_group_indices {
-            let bytes = if ctx.is_file_range_index(*index) {
-                compact
-                    .files(*index)?
-                    .iter()
-                    .map(|(file, _)| file.buffered_reader_bytes())
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                // Memtable source allocations already belong to the engine. Reserve
-                // their scan materialization and merge head conservatively.
-                checked_add(
-                    ctx.input.memtables[index.index].stats().bytes_allocated(),
-                    checked_mul(options.batch_bytes, 4)?,
-                )?
-            };
-            reader_bytes = checked_add(reader_bytes, bytes)?;
-        }
-        for chunk in &chunks {
-            for (p, assignment) in chunk.iter().enumerate() {
-                if assignment.series().is_empty() {
-                    continue;
-                }
-                // The selected-series filter owns a sorted vector, a hash set and
-                // transient assignment copies for the duration of this merge.
-                let filter_bytes = checked_mul(assignment.series().len(), 128)?;
-                let reader_bytes = checked_add(reader_bytes, filter_bytes)?;
-                reclaim(
-                    &mut results,
-                    &resources,
-                    checked_add(reader_bytes, writer_bytes)?,
-                    "range preparation",
-                )
-                .await?;
-                resources.peak("range_reader_estimate_bytes", reader_bytes);
-                let range_started = Instant::now();
-                let reader_charge = Arc::new(resources.reserve(Kind::Workspace, reader_bytes)?);
-                let reader = SeriesReader::try_new(
-                    ctx.clone(),
-                    vec![*range],
-                    assignment.clone(),
-                    partition_pruner.clone(),
-                    semaphore.clone(),
-                    metrics.clone(),
-                )?
-                .with_compact(Some(compact.clone()));
-                let mut stream = reader.build_complete_range(*range).await?;
-                let mut builder = ResultBuilder::with_resources(
-                    resources.clone(),
-                    compact.schema.schema.clone(),
-                )?;
-                while let Some(batch) = stream.try_next().await? {
-                    validate_batch(&batch, bounds)?;
-                    resources.peak(
-                        "merge_batch_bytes",
-                        crate::read::series_result::unique_batch_bytes(&batch)?,
-                    );
-                    // Reserve writer headroom before retaining more payload. The builder
-                    // can mix completed resident and file batches within this range.
-                    let placement = if resources.pool().reserved() >= options.spill_threshold
-                        || resources.available() < checked_mul(writer_bytes, 2)?
-                    {
-                        builder = builder.spill_resident().await?;
-                        Placement::File
-                    } else {
-                        Placement::Resident
-                    };
-                    let append = Instant::now();
-                    builder = builder
-                        .append_prepared(batch, placement, reader_charge.clone())
-                        .await?;
-                    resources.count("result_append_ns", nanos(append));
-                    if placement == Placement::File {
-                        resources.count("spill_append_ns", nanos(append));
-                    }
-                }
-                drop(stream);
-                drop(reader);
-                resources.count("range_preparation_ns", nanos(range_started));
-                drop(reader_charge);
-                if resources.live_readers() != 0 {
-                    return Err(fail("range completed with live SST readers"));
-                }
-                resources.count("completed_range_sources_released", 1);
-                let finish = Instant::now();
-                let result = builder.finish().await?;
-                resources.count("spill_finalization_ns", nanos(finish));
-                metadata[p].grow(std::mem::size_of::<PreparedRange>())?;
-                results[p]
-                    .try_reserve_exact(1)
-                    .map_err(|e| fail(e.to_string()))?;
-                results[p].push(PreparedRange {
-                    bounds,
-                    result: Some(result),
-                });
-                if resources.pool().reserved() >= options.spill_threshold {
-                    let target = options
-                        .memory_bytes
-                        .saturating_sub(options.spill_threshold)
-                        .max(writer_bytes);
-                    reclaim(&mut results, &resources, target, "spill threshold").await?;
-                }
-            }
-        }
+    let shared = options.source_policy == SourcePolicy::SharedSelectedSeries;
+    results = scheduler::Preparation {
+        ctx: ctx.clone(),
+        compact: compact.clone(),
+        partition_pruner: partition_pruner.clone(),
+        metrics,
+        resources: resources.clone(),
+        options: options.clone(),
+    }
+    .run(&ranges, &chunks, num_partitions)
+    .await?;
+    for (p, charge) in metadata.iter_mut().enumerate() {
+        let ranges = if shared { &results[0] } else { &results[p] };
+        charge.grow(checked_mul(
+            ranges.len(),
+            std::mem::size_of::<PreparedRange>(),
+        )?)?;
+    }
+    if resources.live_readers() != 0 {
+        return Err(fail("preparation completed with live SST readers"));
     }
     let schema = Arc::new(CompactSchema::new(&ctx.input.mapper));
     let last_row = ctx.input.series_row_selector.is_some();
@@ -519,10 +463,14 @@ async fn prepare(
     let tag_bytes = catalog.buffered_tag_bytes(options.batch_rows)?;
     // Spill can increase replay requirements, so recompute after every reclamation.
     let reservations = loop {
-        let sizes = results
+        let sizes = identities
             .iter()
-            .zip(&identities)
-            .map(|(ranges, ids)| {
+            .enumerate()
+            .map(|(p, ids)| {
+                let ranges = if shared { &results[0] } else { &results[p] };
+                if ids.is_empty() {
+                    return Ok(0);
+                }
                 // PromSeriesDivide retains a complete identity before concatenation.
                 // Fund its escaped output leases separately from the bounded current
                 // replay batch; arbitrary collect-all consumers are not supported.
@@ -578,6 +526,23 @@ async fn prepare(
         )
         .await?;
     };
+    // Placement is frozen before sharing any result handle across manifests.
+    if shared {
+        let ranges = std::mem::take(&mut results[0]);
+        for (target, ids) in results.iter_mut().zip(&identities) {
+            target.extend(
+                ranges
+                    .iter()
+                    .filter(|range| {
+                        range
+                            .result
+                            .as_ref()
+                            .is_some_and(|handle| ids.iter().any(|id| handle.has_series(*id)))
+                    })
+                    .cloned(),
+            );
+        }
+    }
     let mut manifests = Vec::with_capacity(num_partitions);
     for (((mut ids, mut ranges), bytes), metadata) in identities
         .into_iter()
@@ -682,6 +647,7 @@ fn replay(manifest: Manifest) -> crate::read::BoxedRecordBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read::series_result::{Placement, ResultBuilder};
     use common_time::timestamp::TimeUnit;
     use datatypes::arrow::array::{
         ArrayRef, BinaryArray, TimestampMicrosecondArray, UInt8Array, UInt64Array,
