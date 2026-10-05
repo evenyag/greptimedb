@@ -1247,3 +1247,178 @@ async fn buffered_source_reassembly_releases_fragment_decoders() {
         assert!(snapshot.ownership.values().all(|bytes| *bytes == 0));
     }
 }
+
+#[tokio::test]
+async fn cached_files_outlive_producer_and_charge_independent_consumers() {
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        for placement in [Placement::Resident, Placement::File] {
+            let dir = common_test_util::temp_dir::create_temp_dir("cache-ownership");
+            let input = fixture(&[(1, 3, 5), (2, 3, 19)]);
+            let options = StoreOptions {
+                layout,
+                batch_rows: 4,
+                ..Default::default()
+            };
+            let mut builder = ResultBuilder::new(dir.path(), input.schema(), options.clone())
+                .await
+                .unwrap();
+            let producer = builder.resources();
+            let weak = Arc::downgrade(&producer);
+            builder = builder.append(input.clone(), placement).await.unwrap();
+            let original = builder.finish().await.unwrap();
+            let cache = StoreResources::new(dir.path(), options.clone()).unwrap();
+            let cached = original
+                .copy_to_cache(cache.clone(), producer.clone(), producer.pool())
+                .await
+                .unwrap();
+            assert!(!cached.has_resident());
+            drop(original);
+            producer.drain_cleanup().await.unwrap();
+            assert_eq!(producer.snapshot().disk_bytes, 0);
+            drop(producer);
+            assert!(weak.upgrade().is_none());
+            let writes = cache
+                .snapshot()
+                .counts
+                .get("write_calls")
+                .copied()
+                .unwrap_or(0);
+            let query = StoreResources::new(dir.path(), options).unwrap();
+            let id = MetricSeriesId {
+                table_id: 2,
+                tsid: 3,
+            };
+            let mut first = cached
+                .series_cursor_with_resources(id, query.pool(), query.clone())
+                .unwrap();
+            let second = cached
+                .series_cursor_with_resources(id, query.pool(), query.clone())
+                .unwrap();
+            let lease = first.next().await.unwrap().unwrap();
+            assert!(query.snapshot().payload_bytes > 0);
+            assert_eq!(cache.snapshot().payload_bytes, 0);
+            drop(cached); // Equivalent to eviction: only consumer pins remain.
+            assert!(cache.snapshot().disk_bytes > 0);
+            assert_eq!(
+                collect(second, input.schema()).await,
+                logical(&input.slice(5, 19))
+            );
+            first.close().await.unwrap();
+            drop(first);
+            query.drain_cleanup().await.unwrap();
+            cache.drain_cleanup().await.unwrap();
+            assert_eq!(cache.snapshot().disk_bytes, 0);
+            assert!(query.snapshot().payload_bytes > 0); // Escaped output owns its charge.
+            drop(lease);
+            query.drain_cleanup().await.unwrap();
+            assert_eq!(query.snapshot().payload_bytes, 0);
+            assert_eq!(query.snapshot().workspace_bytes, 0);
+            assert_eq!(
+                cache
+                    .snapshot()
+                    .counts
+                    .get("write_calls")
+                    .copied()
+                    .unwrap_or(0),
+                writes
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn optional_cache_copy_failure_preserves_original() {
+    let dir = common_test_util::temp_dir::create_temp_dir("cache-copy-failure");
+    let input = fixture(&[(1, 3, 20)]);
+    let builder = ResultBuilder::new(dir.path(), input.schema(), StoreOptions::default())
+        .await
+        .unwrap();
+    let producer = builder.resources();
+    let original = builder
+        .append(input.clone(), Placement::Resident)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    let cache = StoreResources::new(
+        dir.path(),
+        StoreOptions {
+            disk_bytes: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        original
+            .copy_to_cache(cache.clone(), producer.clone(), producer.pool())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        collect(original.cursor().unwrap(), input.schema()).await,
+        logical(&input)
+    );
+    cache.drain_cleanup().await.unwrap();
+    assert_eq!(cache.snapshot().disk_bytes, 0);
+    assert_eq!(
+        cache.snapshot().metadata_bytes,
+        cache.snapshot().resource_bytes
+    );
+}
+
+#[tokio::test]
+async fn cancelled_cache_copy_releases_staging_and_preserves_original() {
+    for placement in [Placement::File, Placement::Resident] {
+        let dir = common_test_util::temp_dir::create_temp_dir("cache-copy-cancel");
+        let input = fixture(&[(1, 3, 20)]);
+        let options = StoreOptions {
+            batch_rows: 2,
+            file_batches: 2,
+            ..Default::default()
+        };
+        let builder = ResultBuilder::new(dir.path(), input.schema(), options.clone())
+            .await
+            .unwrap();
+        let query = builder.resources();
+        let original = builder
+            .append(input.clone(), placement)
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let cache = StoreResources::new(dir.path(), options).unwrap();
+        let (started, receiver) = std::sync::mpsc::channel();
+        let (resume, gate) = std::sync::mpsc::channel();
+        *cache.faults.write_gate.lock().unwrap() = Some((started, gate));
+        let source = original.clone();
+        let producer = query.clone();
+        let destination = cache.clone();
+        let task = tokio::spawn(async move {
+            source
+                .copy_to_cache(destination, producer.clone(), producer.pool())
+                .await
+        });
+        common_runtime::spawn_blocking_query(move || {
+            receiver.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        task.abort();
+        assert!(task.await.is_err());
+        resume.send(()).unwrap();
+        query.drain_cleanup().await.unwrap();
+        cache.drain_cleanup().await.unwrap();
+        assert_eq!(cache.snapshot().disk_bytes, 0);
+        assert_eq!(
+            cache.snapshot().metadata_bytes,
+            cache.snapshot().resource_bytes
+        );
+        assert_eq!(
+            collect(original.cursor().unwrap(), input.schema()).await,
+            logical(&input)
+        );
+    }
+}

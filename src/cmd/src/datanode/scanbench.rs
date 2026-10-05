@@ -825,11 +825,12 @@ impl ScanbenchCommand {
             }
             .fail();
         }
-        if (self.write_reference.is_some() || self.compare_reference.is_some())
-            && (self.iterations != 1 || self.scan_configs.is_some())
+        if (self.write_reference.is_some() && self.iterations != 1)
+            || ((self.write_reference.is_some() || self.compare_reference.is_some())
+                && self.scan_configs.is_some())
         {
             return error::IllegalConfigSnafu {
-                msg: "exact comparison requires one scan config and one iteration".to_string(),
+                msg: "exact references require one scan config; reference writing requires one iteration".to_string(),
             }
             .fail();
         }
@@ -1407,6 +1408,10 @@ impl ScanbenchCommand {
                 });
             }
 
+            // Every repeated comparison opens independent reference readers above.
+            // Destroy the producer scanner before a warm query reuses engine caches.
+            drop(scanner);
+
             // Start profiling after the first iteration (warmup) if pprof_after_warmup is set
             #[cfg(unix)]
             if iteration == 0
@@ -1528,6 +1533,7 @@ impl ScanbenchCommand {
             );
         }
 
+        engine.stop().await.context(error::BuildCliSnafu)?;
         println!("\n{}", "Benchmark completed!".green().bold());
         Ok(())
     }

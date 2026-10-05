@@ -1057,6 +1057,9 @@ impl CacheStrategy {
 /// All caches are disabled by default.
 #[derive(Default)]
 pub struct CacheManager {
+    #[cfg(any(test, feature = "dev-tools"))]
+    buffered_data_cache:
+        tokio::sync::Mutex<Option<Arc<crate::read::series_buffered::cache::BufferedDataCache>>>,
     /// Cache for compact, authoritative SST metadata.
     sst_meta_cache: Option<SstMetaCache>,
     /// Cache for decoded SST metadata, used only as an acceleration tier.
@@ -1090,6 +1093,40 @@ pub struct CacheManager {
 pub type CacheManagerRef = Arc<CacheManager>;
 
 impl CacheManager {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) async fn buffered_data_cache(
+        &self,
+        options: crate::read::series_buffered::cache::Options,
+        store: crate::read::series_result::StoreOptions,
+    ) -> Result<Arc<crate::read::series_buffered::cache::BufferedDataCache>> {
+        let mut slot = self.buffered_data_cache.lock().await;
+        if let Some(cache) = slot.as_ref() {
+            if cache.options != options || !cache.supports(&store) {
+                return Err(crate::read::series_result::fail(
+                    "cache settings changed within one engine",
+                ));
+            }
+            return Ok(cache.clone());
+        }
+        let cache = common_runtime::spawn_blocking_query(move || {
+            crate::read::series_buffered::cache::BufferedDataCache::new(options, store)
+        })
+        .await
+        .context(crate::error::JoinSnafu)??;
+        *slot = Some(cache.clone());
+        Ok(cache)
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) async fn shutdown_buffered_data_cache(&self) -> Result<()> {
+        let cache = self.buffered_data_cache.lock().await.take();
+        if let Some(cache) = cache {
+            cache.invalidate_all();
+            cache.resources.drain_cleanup().await?;
+        }
+        Ok(())
+    }
+
     /// Returns a builder to build the cache.
     pub fn builder() -> CacheManagerBuilder {
         CacheManagerBuilder::default()
@@ -1727,6 +1764,8 @@ impl CacheManagerBuilder {
                 .build()
         });
         CacheManager {
+            #[cfg(any(test, feature = "dev-tools"))]
+            buffered_data_cache: tokio::sync::Mutex::new(None),
             sst_meta_cache,
             sst_decoded_meta_cache,
             vector_cache,

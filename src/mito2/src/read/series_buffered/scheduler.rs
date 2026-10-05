@@ -57,6 +57,7 @@ pub(crate) struct Preparation {
     pub(crate) metrics: PartitionMetrics,
     pub(crate) resources: Arc<StoreResources>,
     pub(crate) options: Options,
+    pub(crate) cache: Option<Arc<super::cache::BufferedDataCache>>,
 }
 
 /// Closing returns unused credit; in-flight blocking work keeps actual charges.
@@ -75,6 +76,7 @@ struct SourceJob {
 }
 
 struct RangeJob {
+    cache_key: Option<super::cache::Key>,
     bounds: FileTimeRange,
     pending: VecDeque<SourceJob>,
     parts: Vec<Vec<Option<ResultHandle>>>,
@@ -119,6 +121,48 @@ impl Preparation {
                 self.shared(ranges, chunks, partitions, pool).await
             }
         }
+    }
+
+    fn cache_key(
+        &self,
+        range: &PartitionRange,
+        ids: &[crate::series_index::MetricSeriesId],
+    ) -> Option<super::cache::Key> {
+        self.cache.as_ref()?;
+        let key = super::cache::Key::new(&self.ctx, range, ids, &self.resources.options);
+        if key.is_none() {
+            self.resources.count("buffered_cache_bypasses", 1);
+        }
+        key
+    }
+
+    fn cached(&self, key: Option<&super::cache::Key>) -> Result<Option<ResultHandle>> {
+        match (&self.cache, key) {
+            (Some(cache), Some(key)) => cache.get(key, &self.compact.catalog, &self.resources),
+            _ => Ok(None),
+        }
+    }
+
+    async fn cache_result(
+        &self,
+        key: Option<super::cache::Key>,
+        result: ResultHandle,
+        pool: Arc<dyn MemoryPool>,
+    ) -> ResultHandle {
+        if let (Some(cache), Some(key)) = (&self.cache, key)
+            && let Some(cached) = cache
+                .admit(
+                    key,
+                    &result,
+                    &self.compact.catalog,
+                    self.resources.clone(),
+                    pool,
+                )
+                .await
+        {
+            return cached;
+        }
+        result
     }
 
     fn writer_bytes(&self) -> Result<usize> {
@@ -175,17 +219,33 @@ impl Preparation {
             for chunk in chunks {
                 for (p, assignment) in chunk.iter().enumerate() {
                     if !assignment.series().is_empty() {
+                        let key = self.cache_key(range, assignment.series());
+                        if let Some(key) = &key {
+                            metadata.grow(checked_mul(key.bytes()?, 2)?)?;
+                        }
+                        if let Some(result) = self.cached(key.as_ref())? {
+                            Self::accept_range(
+                                Completed::Range {
+                                    partition: p,
+                                    bounds: self.ctx.ranges[range.identifier].time_range,
+                                    result,
+                                },
+                                &mut results,
+                                &mut metadata,
+                            )?;
+                            continue;
+                        }
                         let bytes =
                             checked_add(readers, checked_mul(assignment.series().len(), 128)?)?;
                         metadata.grow(128)?;
-                        jobs.push_back((*range, p, assignment, bytes));
+                        jobs.push_back((*range, p, assignment, bytes, key));
                     }
                 }
             }
         }
         while !jobs.is_empty() || !tasks.is_empty() {
             while tasks.len() < self.options.preparation_concurrency {
-                let Some((range, partition, assignment, readers)) = jobs.front() else {
+                let Some((range, partition, assignment, readers, key)) = jobs.front() else {
                     break;
                 };
                 let required = checked_add(*readers, self.writer_bytes()?)?;
@@ -204,6 +264,7 @@ impl Preparation {
                 let partition = *partition;
                 let assignment = (*assignment).clone();
                 let readers = *readers;
+                let key = key.clone();
                 jobs.pop_front();
                 let preparation = self.clone();
                 tasks.push(
@@ -231,9 +292,10 @@ impl Preparation {
                             .peak("range_reader_estimate_bytes", readers);
                         let stream = reader.build_complete_range(range).await?;
                         let result = preparation
-                            .materialize(stream, bounds, pool, charge, false)
+                            .materialize(stream, bounds, pool.clone(), charge, false)
                             .await?;
                         drop(reader);
+                        let result = preparation.cache_result(key, result, pool).await;
                         preparation
                             .resources
                             .count("range_preparation_ns", nanos(started));
@@ -278,8 +340,24 @@ impl Preparation {
             for assignment in chunk {
                 ids.extend_from_slice(assignment.series());
             }
-            let filter = MetricSeriesFilter::union(ids);
+            let filter = MetricSeriesFilter::union(ids.clone());
             for range in ranges {
+                let cache_key = self.cache_key(range, &ids);
+                if let Some(key) = &cache_key {
+                    metadata.grow(checked_mul(key.bytes()?, 2)?)?;
+                }
+                if let Some(result) = self.cached(cache_key.as_ref())? {
+                    Self::accept_range(
+                        Completed::Range {
+                            partition: 0,
+                            bounds: self.ctx.ranges[range.identifier].time_range,
+                            result,
+                        },
+                        &mut results,
+                        &mut metadata,
+                    )?;
+                    continue;
+                }
                 let sources = buffered_sources(
                     self.ctx.clone(),
                     *range,
@@ -310,6 +388,7 @@ impl Preparation {
                     }
                 }
                 jobs.push(RangeJob {
+                    cache_key,
                     bounds: self.ctx.ranges[range.identifier].time_range,
                     pending,
                     parts,
@@ -357,6 +436,7 @@ impl Preparation {
                 let budget = self.budget(required, "range merge")?;
                 let parts = std::mem::take(&mut jobs[index].parts);
                 let bounds = jobs[index].bounds;
+                let cache_key = jobs[index].cache_key.take();
                 let split = self
                     .ctx
                     .ranges
@@ -398,7 +478,8 @@ impl Preparation {
                         let stream = SeqScan::finish_flat_reader(
                             &preparation.ctx, Box::pin(merge.into_stream()), Some(&preparation.metrics), false, 0,
                         )?;
-                    let result = preparation.materialize(stream, bounds, pool, charge, false).await?;
+                    let result = preparation.materialize(stream, bounds, pool.clone(), charge, false).await?;
+                    let result = preparation.cache_result(cache_key, result, pool).await;
                     preparation.resources.count("range_merge_ns", nanos(started));
                     preparation.resources.count("completed_range_sources_released", 1);
                     drop(budget);

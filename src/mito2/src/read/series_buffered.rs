@@ -14,6 +14,7 @@
 
 //! Development-only complete preparation and bounded range replay.
 
+pub(crate) mod cache;
 mod scheduler;
 
 use std::path::PathBuf;
@@ -54,6 +55,8 @@ use crate::sst::parquet::flat_format::time_index_column_index;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Options {
     pub(crate) scratch: PathBuf,
+    #[serde(default)]
+    pub(crate) cache: Option<cache::Options>,
     pub(crate) memory_bytes: usize,
     pub(crate) spill_threshold: usize,
     pub(crate) disk_bytes: usize,
@@ -139,12 +142,30 @@ pub(crate) async fn development_options() -> Result<Option<Options>> {
 
 pub(crate) struct BufferedScan {
     options: Options,
+    cache: Option<Arc<cache::BufferedDataCache>>,
     pub(crate) resources: Arc<StoreResources>,
     receivers: Mutex<Vec<Option<ReadinessReceiver<Manifest>>>>,
 }
 
 impl BufferedScan {
-    pub(crate) async fn new(options: Options, parent: Arc<dyn MemoryPool>) -> Result<Self> {
+    pub(crate) async fn new(
+        options: Options,
+        parent: Arc<dyn MemoryPool>,
+        strategy: &crate::cache::CacheStrategy,
+    ) -> Result<Self> {
+        let cache = match (&options.cache, strategy) {
+            (Some(cache_options), crate::cache::CacheStrategy::EnableAll(manager)) => match manager
+                .buffered_data_cache(cache_options.clone(), options.store()?)
+                .await
+            {
+                Ok(cache) => Some(cache),
+                Err(error) => {
+                    common_telemetry::warn!(error; "Buffered data cache unavailable; continuing uncached");
+                    None
+                }
+            },
+            _ => None,
+        };
         let store = options.store()?;
         let pool: Arc<dyn MemoryPool> = BudgetPool::query(&parent, options.memory_bytes);
         let root = options.scratch.clone();
@@ -155,6 +176,7 @@ impl BufferedScan {
         .map_err(|e| fail(e.to_string()))??;
         Ok(Self {
             options,
+            cache,
             resources,
             receivers: Mutex::new(vec![]),
         })
@@ -162,6 +184,8 @@ impl BufferedScan {
 
     pub(crate) fn settings(&self) -> serde_json::Value {
         serde_json::json!({
+            "cache": self.options.cache,
+            "cache_resources": self.cache.as_ref().map(|cache| cache.snapshot()),
             "query_memory_budget_bytes": self.options.memory_bytes,
             "spill_threshold_bytes": self.options.spill_threshold,
             "disk_limit_bytes": self.options.disk_bytes,
@@ -196,27 +220,18 @@ impl BufferedScan {
         if receivers.is_empty() {
             let resources = self.resources.clone();
             let options = self.options.clone();
+            let cache = self.cache.clone();
             let prepare_metrics = metrics.clone();
             let num_partitions = partitions.len();
-            // Preparation alone owns retained source builders. The scanner's pruner
-            // must not keep prepared file contexts alive through replay.
-            let pruner = Arc::new(Pruner::new_with_options(
-                ctx.clone(),
-                1,
-                PrunerOptions {
-                    retain_builders: true,
-                    enable_predicate_prefilter: false,
-                },
-            ));
             *receivers = start_preparation(num_partitions, async move {
                 prepare(
                     ctx,
                     partitions,
-                    pruner,
                     prepare_metrics,
                     metrics_set,
                     resources,
                     options,
+                    cache,
                 )
                 .await
             })
@@ -337,12 +352,22 @@ async fn reclaim(
 async fn prepare(
     ctx: Arc<StreamContext>,
     partitions: Vec<Vec<PartitionRange>>,
-    pruner: Arc<Pruner>,
     metrics: PartitionMetrics,
     metrics_set: ExecutionPlanMetricsSet,
     resources: Arc<StoreResources>,
     options: Options,
+    cache: Option<Arc<cache::BufferedDataCache>>,
 ) -> Result<Vec<Manifest>> {
+    // Preparation alone owns retained source builders. The scanner's pruner
+    // must not keep prepared file contexts alive through replay.
+    let pruner = Arc::new(Pruner::new_with_options(
+        ctx.clone(),
+        1,
+        PrunerOptions {
+            retain_builders: true,
+            enable_predicate_prefilter: false,
+        },
+    ));
     let started = Instant::now();
     let num_partitions = partitions.len();
     let semaphore = Arc::new(Semaphore::new(1));
@@ -441,6 +466,7 @@ async fn prepare(
         metrics,
         resources: resources.clone(),
         options: options.clone(),
+        cache,
     }
     .run(&ranges, &chunks, num_partitions)
     .await?;
@@ -620,7 +646,7 @@ fn replay(manifest: Manifest) -> crate::read::BoxedRecordBatchStream {
                 if manifest.last_row && last != Some(index) { continue; }
                 let handle = range.result.as_ref().ok_or_else(|| fail("missing published result"))?;
                 if !handle.has_series(*id) { continue; }
-                let mut cursor = handle.series_cursor_in(*id, pool.clone())?;
+                let mut cursor = handle.series_cursor_with_resources(*id, pool.clone(), manifest.resources.clone())?;
                 loop {
                     let start = Instant::now();
                     let next = cursor.next().await?;

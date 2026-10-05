@@ -371,7 +371,7 @@ impl OpenWriter {
             owner.partial_link = None;
             Ok(Arc::new(FilePart {
                 owner: self.owner.clone(),
-                decoder,
+                decoder: Arc::new(decoder),
                 directory,
                 rows: std::mem::take(&mut self.rows),
                 bounds: std::mem::take(&mut self.bounds),
@@ -383,7 +383,7 @@ impl OpenWriter {
 
 pub(crate) struct FilePart {
     owner: Arc<OwnedFile>,
-    decoder: FileDecoder,
+    decoder: Arc<FileDecoder>,
     directory: Vec<Block>,
     pub(crate) rows: Vec<usize>,
     bounds: Vec<usize>,
@@ -391,6 +391,75 @@ pub(crate) struct FilePart {
 }
 
 impl FilePart {
+    /// Copy finalized bytes without decoding/repacking them. Metadata is immutable
+    /// and independently charged; it holds no reference to producer resources.
+    pub(crate) fn copy_to_cache(
+        &self,
+        resources: Arc<StoreResources>,
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> Result<Arc<Self>> {
+        let metadata_bytes = self
+            .owner
+            .metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bytes();
+        let metadata = Arc::new(Mutex::new(
+            resources.reserve(Kind::Metadata, metadata_bytes)?,
+        ));
+        let _workspace = resources.reserve_in(Kind::Workspace, 128 * 1024, pool)?;
+        let path = resources
+            .root
+            .join(format!("{}.partial", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| fail(e.to_string()))?;
+        let mut owner = Arc::new(OwnedFile {
+            phase: "cache",
+            metadata,
+            path,
+            partial_link: None,
+            bytes: AtomicUsize::new(0),
+            resources: resources.clone(),
+        });
+        let mut input = File::open(&self.owner.path).map_err(|e| fail(e.to_string()))?;
+        let mut output = CountWriter {
+            file,
+            owned: owner.clone(),
+        };
+        let bytes = resources
+            .cache_copy
+            .measure(|| std::io::copy(&mut input, &mut output))
+            .map_err(|e| fail(e.to_string()))?;
+        resources.count(
+            "cache_copy_read_bytes",
+            usize::try_from(bytes).map_err(|_| fail("copy size overflow"))?,
+        );
+        drop(output);
+        drop(input);
+        let owned = Arc::get_mut(&mut owner).ok_or_else(|| fail("cache copy has other owners"))?;
+        let finalized = owned.path.with_extension("arrow");
+        std::fs::hard_link(&owned.path, &finalized).map_err(|e| fail(e.to_string()))?;
+        let partial = std::mem::replace(&mut owned.path, finalized);
+        owned.partial_link = Some(partial.clone());
+        std::fs::remove_file(partial).map_err(|e| fail(e.to_string()))?;
+        owned.partial_link = None;
+        Ok(Arc::new(Self {
+            owner,
+            decoder: self.decoder.clone(),
+            directory: self.directory.clone(),
+            rows: self.rows.clone(),
+            bounds: self.bounds.clone(),
+            footer_offset: self.footer_offset,
+        }))
+    }
+
+    pub(crate) fn disk_bytes(&self) -> usize {
+        self.owner.bytes.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn replay_bytes(&self, batch: usize) -> Result<usize> {
         checked_mul(self.bounds[batch], 4)
     }
@@ -401,8 +470,8 @@ impl FilePart {
         schema: &SchemaRef,
         open: &mut Option<(usize, File)>,
         pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        resources: &Arc<StoreResources>,
     ) -> Result<Arc<BatchData>> {
-        let resources = &self.owner.resources;
         #[cfg(test)]
         if let Some((started, resume)) = resources
             .faults

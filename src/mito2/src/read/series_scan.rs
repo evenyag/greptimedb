@@ -205,6 +205,7 @@ impl SeriesScan {
         let buffered = crate::read::series_buffered::BufferedScan::new(
             options,
             input.scan_memory_pool.clone(),
+            &input.cache_strategy,
         )
         .await?;
         input.scan_memory_pool = buffered.resources.pool();

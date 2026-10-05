@@ -4614,6 +4614,7 @@ async fn test_buffered_scan_semantics_and_polling() {
                                 };
                                 let mut scanner = scanner
                                     .into_buffered(Options {
+                                        cache: None,
                                         source_policy,
                                         preparation_concurrency,
                                         candidate_chunk_size: if preparation_concurrency == 2 {
@@ -4780,6 +4781,7 @@ async fn test_buffered_failures_and_unpolled_cleanup() {
                 };
                 let mut scanner = scanner
                     .into_buffered(Options {
+                        cache: None,
                         source_policy,
                         preparation_concurrency,
                         candidate_chunk_size: 1_000_000,
@@ -5057,6 +5059,7 @@ async fn test_buffered_complete_range_last_non_null_and_delete() {
                         };
                         let scanner = scanner
                             .into_buffered(Options {
+                                cache: None,
                                 source_policy,
                                 preparation_concurrency,
                                 candidate_chunk_size: 1_000_000,
@@ -5145,6 +5148,7 @@ async fn test_buffered_publication_funds_complete_series_consumer() {
     };
     let scanner = scanner
         .into_buffered(Options {
+            cache: None,
             source_policy: Default::default(),
             preparation_concurrency: 1,
             candidate_chunk_size: 1_000_000,
@@ -5176,4 +5180,221 @@ async fn test_buffered_publication_funds_complete_series_consumer() {
     assert_eq!(0, resources.snapshot().disk_bytes);
     assert_eq!(0, resources.snapshot().payload_bytes);
     assert_eq!(0, resources.snapshot().workspace_bytes);
+}
+
+#[tokio::test]
+async fn test_buffered_cache_cold_warm_invalidation_and_bypass() {
+    use crate::read::series_buffered::{Options, SourcePolicy, cache};
+    for layout in ["one_series", "multiple_series"] {
+        for source_policy in [
+            SourcePolicy::SelectedSeriesPerPartition,
+            SourcePolicy::SharedSelectedSeries,
+        ] {
+            // The old range-result cache is deliberately disabled.
+            let (_env, engine, region_id) =
+                build_sparse_exact_metric_engine("buffered_cache", true, ReadableSize::mb(0)).await;
+            test_util::flush_region(&engine, region_id, None).await;
+            let scratch = common_test_util::temp_dir::create_temp_dir("buffered-cache-query");
+            let directory = common_test_util::temp_dir::create_temp_dir("buffered-cache-engine");
+            let options = Options {
+                cache: Some(cache::Options {
+                    directory: directory.path().to_owned(),
+                    disk_bytes: 64 * 1024 * 1024,
+                    metadata_bytes: 16 * 1024 * 1024,
+                }),
+                source_policy,
+                preparation_concurrency: 2,
+                candidate_chunk_size: 1_000_000,
+                scratch: scratch.path().to_owned(),
+                memory_bytes: 128 * 1024 * 1024,
+                spill_threshold: 1,
+                disk_bytes: 64 * 1024 * 1024,
+                batch_rows: 2,
+                batch_bytes: 64 * 1024,
+                layout: layout.to_owned(),
+                compression: None,
+            };
+            let cache = engine
+                .cache_manager()
+                .buffered_data_cache(options.cache.clone().unwrap(), options.store().unwrap())
+                .await
+                .unwrap();
+            for partitions in [1, 8] {
+                cache.invalidate_all();
+                cache.resources.drain_cleanup().await.unwrap();
+                for sequence in [None, Some(2), Some(4)] {
+                    let (_, expected) = scan_sparse_exact_metric(
+                        &engine,
+                        region_id,
+                        sequence,
+                        sequence,
+                        None,
+                        "two_phase",
+                    )
+                    .await;
+                    for warm in [false, true] {
+                        let scanner = engine
+                            .scanner(
+                                region_id,
+                                ScanRequest {
+                                    distribution: Some(TimeSeriesDistribution::PerSeries),
+                                    filters: vec![col("tag_0").gt_eq(lit("a"))],
+                                    memtable_min_sequence: sequence,
+                                    memtable_max_sequence: sequence,
+                                    exact_sequence_range: sequence.is_some(),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let Scanner::Series(scanner) = scanner else {
+                            panic!("series expected")
+                        };
+                        let mut scanner = scanner.into_buffered(options.clone()).await.unwrap();
+                        let resources = scanner.buffered_resources();
+                        let ranges = scanner
+                            .properties()
+                            .partitions
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect();
+                        let mut assigned = vec![Vec::new(); partitions];
+                        assigned[0] = ranges;
+                        scanner
+                            .prepare(
+                                PrepareRequest::default()
+                                    .with_ranges(assigned)
+                                    .with_target_partitions(partitions),
+                            )
+                            .unwrap();
+                        let metrics = ExecutionPlanMetricsSet::default();
+                        let streams = (0..partitions)
+                            .map(|p| {
+                                scanner
+                                    .scan_partition(&Default::default(), &metrics, p)
+                                    .unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let mut actual = Vec::new();
+                        // Sequential polling leaves the remaining partitions unpolled.
+                        for stream in streams {
+                            actual.extend(collect_buffered_sparse_rows(stream).await.unwrap());
+                        }
+                        actual.sort();
+                        assert_eq!(expected, actual);
+                        let snapshot = resources.snapshot();
+                        let count = |name| snapshot.counts.get(name).copied().unwrap_or(0);
+                        if warm {
+                            assert!(
+                                count("buffered_cache_hits") > 0,
+                                "{layout} {source_policy:?} {sequence:?}: {:?}",
+                                snapshot.counts
+                            );
+                            assert_eq!(
+                                metrics
+                                    .clone_inner()
+                                    .sum_by_name("compact_data_readers")
+                                    .map_or(0, |v| v.as_usize()),
+                                0
+                            );
+                            assert_eq!(count("buffered_cache_admissions"), 0);
+                        } else {
+                            assert_eq!(count("buffered_cache_hits"), 0);
+                            assert!(
+                                count("buffered_cache_admissions") > 0,
+                                "{:?}",
+                                snapshot.counts
+                            );
+                        }
+                        drop(scanner);
+                        resources.drain_cleanup().await.unwrap();
+                        assert_eq!(resources.snapshot().disk_bytes, 0);
+                        assert_eq!(resources.snapshot().payload_bytes, 0);
+                        assert_eq!(resources.snapshot().workspace_bytes, 0);
+                    }
+                }
+            }
+            // A dynamic filter must bypass even already-warm static fingerprints.
+            let scanner = engine
+                .scanner(
+                    region_id,
+                    ScanRequest {
+                        distribution: Some(TimeSeriesDistribution::PerSeries),
+                        filters: vec![col("tag_0").gt_eq(lit("a"))],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let Scanner::Series(scanner) = scanner else {
+                panic!("series expected")
+            };
+            let mut scanner = scanner.into_buffered(options.clone()).await.unwrap();
+            let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(vec![], physical_lit(true)));
+            scanner.add_dyn_filter_to_predicate(vec![dynamic]);
+            let resources = scanner.buffered_resources();
+            collect_buffered_sparse_rows(
+                scanner
+                    .scan_partition(&Default::default(), &ExecutionPlanMetricsSet::default(), 0)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                resources
+                    .snapshot()
+                    .counts
+                    .get("buffered_cache_bypasses")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            );
+            drop(scanner);
+            resources.drain_cleanup().await.unwrap();
+            // New overlapping memtable data cannot reuse an SST-only complete result.
+            put_buffered_row(&engine, region_id, 7, Some(42), 2000).await;
+            let (_, expected) =
+                scan_sparse_exact_metric(&engine, region_id, None, None, None, "two_phase").await;
+            let scanner = engine
+                .scanner(
+                    region_id,
+                    ScanRequest {
+                        distribution: Some(TimeSeriesDistribution::PerSeries),
+                        filters: vec![col("tag_0").gt_eq(lit("a"))],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let Scanner::Series(scanner) = scanner else {
+                panic!("series expected")
+            };
+            let scanner = scanner.into_buffered(options).await.unwrap();
+            let resources = scanner.buffered_resources();
+            let mut actual = collect_buffered_sparse_rows(
+                scanner
+                    .scan_partition(&Default::default(), &ExecutionPlanMetricsSet::default(), 0)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            actual.sort();
+            assert_eq!(expected, actual);
+            assert!(
+                resources
+                    .snapshot()
+                    .counts
+                    .get("buffered_cache_bypasses")
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            );
+            drop(scanner);
+            resources.drain_cleanup().await.unwrap();
+            cache.invalidate_all();
+            cache.resources.drain_cleanup().await.unwrap();
+            assert_eq!(cache.resources.snapshot().disk_bytes, 0);
+        }
+    }
 }

@@ -537,6 +537,26 @@ fn build_range_cache_key_inner(
         return None;
     }
 
+    eligible_range_cache_key(stream_ctx, part_range, stage)
+}
+
+/// Buffered results have an independent enablement switch, but identical eligibility.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn build_buffered_range_cache_key(
+    stream_ctx: &StreamContext,
+    part_range: &PartitionRange,
+) -> Option<RangeScanCacheKey> {
+    eligible_range_cache_key(stream_ctx, part_range, None)
+}
+
+fn eligible_range_cache_key(
+    stream_ctx: &StreamContext,
+    part_range: &PartitionRange,
+    stage: Option<RangeScanStage>,
+) -> Option<RangeScanCacheKey> {
+    if !matches!(stream_ctx.input.cache_strategy, CacheStrategy::EnableAll(_)) {
+        return None;
+    }
     let fingerprint = stream_ctx.input.scan_fingerprint()?;
 
     // Dyn filters can change at runtime, so we can't cache when they're present.
@@ -1034,6 +1054,72 @@ mod tests {
         };
 
         (stream_ctx, partition_range)
+    }
+
+    #[tokio::test]
+    async fn buffered_keys_preserve_fingerprints_and_separate_representations() {
+        use crate::read::series_buffered::cache::Key;
+        use crate::read::series_result::{Layout, StoreOptions};
+        use crate::series_index::MetricSeriesId;
+        let bounds = (
+            Timestamp::new_millisecond(1000),
+            Timestamp::new_millisecond(2000),
+        );
+        let (mut ctx, part) =
+            new_stream_context(vec![col("k0").eq(lit("foo"))], None, bounds).await;
+        // Buffered caching does not depend on v2's range cache capacity.
+        ctx.input.cache_strategy = CacheStrategy::EnableAll(Arc::new(CacheManager::default()));
+        let options = StoreOptions::default();
+        let ids = [MetricSeriesId {
+            table_id: 1,
+            tsid: 7,
+        }];
+        let key = Key::new(&ctx, &part, &ids, &options).unwrap();
+        assert!(build_range_cache_key(&ctx, &part).is_none());
+        assert!(key == Key::new(&ctx, &part, &ids, &options).unwrap());
+        assert!(
+            key != Key::new(
+                &ctx,
+                &part,
+                &[MetricSeriesId {
+                    table_id: 2,
+                    tsid: 7
+                }],
+                &options
+            )
+            .unwrap()
+        );
+        assert!(
+            key != Key::new(
+                &ctx,
+                &part,
+                &ids,
+                &StoreOptions {
+                    layout: Layout::OneSeries,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        assert!(
+            key != Key::new(
+                &ctx,
+                &part,
+                &ids,
+                &StoreOptions {
+                    batch_rows: options.batch_rows / 2,
+                    ..options.clone()
+                }
+            )
+            .unwrap()
+        );
+        let mut changed = ctx.input.region_metadata().as_ref().clone();
+        changed.schema_version += 1;
+        ctx.input.mapper =
+            Arc::new(FlatProjectionMapper::new(&Arc::new(changed), [0, 2, 3]).unwrap());
+        assert!(key != Key::new(&ctx, &part, &ids, &options).unwrap());
+        ctx.input.cache_strategy = CacheStrategy::Disabled;
+        assert!(Key::new(&ctx, &part, &ids, &options).is_none());
     }
 
     /// Helper to create a timestamp millisecond literal.

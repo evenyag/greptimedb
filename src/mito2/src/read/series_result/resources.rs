@@ -77,6 +77,7 @@ impl Charge {
                         .filter(|n| *n <= self.resources.options.metadata_bytes)
                 })
                 .map_err(|_| {
+                    self.resources.count("capacity_rejections", 1);
                     fail(format!(
                         "metadata admission: required {bytes}, used {}, limit {}",
                         self.resources.metadata.load(Ordering::SeqCst),
@@ -191,6 +192,7 @@ pub struct Snapshot {
 pub struct StoreResources {
     pub(crate) options: StoreOptions,
     pub(crate) root: PathBuf,
+    namespace_guard: Mutex<Option<Arc<std::fs::File>>>,
     pool: Arc<dyn MemoryPool>,
     metadata: AtomicUsize,
     payload: AtomicUsize,
@@ -208,6 +210,7 @@ pub struct StoreResources {
     pub(crate) conversion: OperationMetrics,
     pub(crate) lookup: OperationMetrics,
     pub(crate) serialization: OperationMetrics,
+    pub(crate) cache_copy: OperationMetrics,
     pub(crate) initialization: OperationMetrics,
     pub(crate) decoding: OperationMetrics,
     pub(crate) reconstruction: OperationMetrics,
@@ -219,6 +222,14 @@ pub struct StoreResources {
 }
 
 impl StoreResources {
+    /// Keep namespace ownership until every file and delayed deletion has retired.
+    pub(crate) fn retain_namespace(&self, guard: Arc<std::fs::File>) {
+        *self
+            .namespace_guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    }
+
     pub(crate) fn new(parent: &Path, options: StoreOptions) -> Result<Arc<Self>> {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(options.memory_bytes));
         Self::with_pool(parent, options, pool)
@@ -277,6 +288,7 @@ impl StoreResources {
         let op = |name| OperationMetrics::new(&operations, 0, name);
         Ok(Arc::new(Self {
             root,
+            namespace_guard: Mutex::new(None),
             pool,
             metadata: AtomicUsize::new(fixed_bytes),
             payload: AtomicUsize::new(0),
@@ -293,6 +305,7 @@ impl StoreResources {
             conversion: op("normalization"),
             lookup: op("index_lookup"),
             serialization: op("serialization"),
+            cache_copy: op("cache_copy"),
             initialization: op("metadata_initialization"),
             decoding: op("ipc_decoding"),
             reconstruction: op("reconstruction"),
@@ -383,6 +396,7 @@ impl StoreResources {
                     .filter(|n| *n <= self.options.disk_bytes)
             })
             .map_err(|_| {
+                self.count("capacity_rejections", 1);
                 std::io::Error::other(format!(
                     "series result disk quota: required {bytes}, used {}, limit {}",
                     self.disk.load(Ordering::SeqCst),
@@ -523,8 +537,14 @@ impl StoreResources {
 impl Drop for StoreResources {
     fn drop(&mut self) {
         let root = self.root.clone();
+        let guard = self
+            .namespace_guard
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         // remove_dir is deliberately nonrecursive: never delete unknown artifacts.
         common_runtime::spawn_blocking_query(move || {
+            let _guard = guard;
             if let Err(e) = std::fs::remove_dir(&root) {
                 common_telemetry::warn!(
                     "Cannot remove series scratch directory {}: {e}",

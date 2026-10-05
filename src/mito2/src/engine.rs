@@ -799,7 +799,13 @@ impl EngineInner {
 
     /// Stop the inner engine.
     async fn stop(&self) -> Result<()> {
-        self.workers.stop().await
+        let result = self.workers.stop().await;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.workers
+            .cache_manager()
+            .shutdown_buffered_data_cache()
+            .await?;
+        result
     }
 
     fn find_region(&self, region_id: RegionId) -> Result<MitoRegionRef> {

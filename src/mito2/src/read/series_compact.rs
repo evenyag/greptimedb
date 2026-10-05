@@ -588,7 +588,74 @@ struct TagCatalogState {
     reservation: MemoryReservation,
 }
 
+/// An immutable decoded catalog subset, with no producer-query reservations.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) struct CachedTags {
+    values: Vec<(MetricSeriesId, Vec<Value>)>,
+    _charge: crate::read::series_result::resources::Charge,
+}
+
 impl TagCatalog {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn snapshot_tags(
+        &self,
+        ids: &[MetricSeriesId],
+        resources: &Arc<crate::read::series_result::StoreResources>,
+    ) -> Result<CachedTags> {
+        use crate::read::series_result::{checked_add, checked_mul, fail};
+        let inner = self.inner.lock().unwrap();
+        let mut bytes = checked_mul(ids.len(), size_of::<(MetricSeriesId, Vec<Value>)>())?;
+        for id in ids {
+            let tags = inner
+                .values
+                .get(id)
+                .ok_or_else(|| fail("cached identity missing tags"))?;
+            bytes = checked_add(bytes, checked_mul(tags.len(), size_of::<Value>())?)?;
+            for value in tags {
+                bytes = checked_add(bytes, value.as_value_ref().data_size())?;
+            }
+        }
+        let charge =
+            resources.reserve(crate::read::series_result::resources::Kind::Metadata, bytes)?;
+        Ok(CachedTags {
+            values: ids
+                .iter()
+                .map(|id| (*id, inner.values[id].clone()))
+                .collect(),
+            _charge: charge,
+        })
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn import_tags(&self, tags: &CachedTags) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        for (id, values) in &tags.values {
+            if let Some(existing) = inner.values.get(id) {
+                if existing != values {
+                    return Err(crate::read::series_result::fail(
+                        "cached tags disagree with discovery",
+                    ));
+                }
+                continue;
+            }
+            let bytes = 4 * size_of::<(MetricSeriesId, Vec<Value>)>()
+                + values.len() * size_of::<Value>()
+                + values
+                    .iter()
+                    .map(|v| v.as_value_ref().data_size())
+                    .sum::<usize>();
+            inner
+                .reservation
+                .try_grow(bytes)
+                .context(MergeCandidateSeriesSnafu)?;
+            inner.values.insert(*id, values.clone());
+            inner.missing.remove(id);
+            self.metrics.catalog_entries.add(1);
+        }
+        self.metrics.catalog_bytes.set(inner.reservation.size());
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_tag_bytes(&self, rows: usize) -> Result<usize> {
         use crate::read::series_result::{checked_add, checked_mul};

@@ -259,6 +259,7 @@ impl ResultHandle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn series_cursor_in(
         &self,
         series: MetricSeriesId,
@@ -268,6 +269,106 @@ impl ResultHandle {
         let start = spans.partition_point(|s| s.series < series);
         let end = spans.partition_point(|s| s.series <= series);
         ResultCursor::with_pool(self.clone(), Some(start..end), pool)
+    }
+
+    /// Replay cached storage using the consuming query's accounting and metrics.
+    pub(crate) fn series_cursor_with_resources(
+        &self,
+        series: MetricSeriesId,
+        pool: Arc<dyn MemoryPool>,
+        resources: Arc<StoreResources>,
+    ) -> Result<ResultCursor> {
+        let start = self.0.spans.partition_point(|s| s.series < series);
+        let end = self.0.spans.partition_point(|s| s.series <= series);
+        ResultCursor::with_resources(self.clone(), Some(start..end), pool, resources)
+    }
+
+    /// Creates independent file storage before publication; the original stays usable
+    /// if optional admission fails. Staging/decoding use the producer's workspace.
+    pub(crate) async fn copy_to_cache(
+        &self,
+        resources: Arc<StoreResources>,
+        query: Arc<StoreResources>,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel = CancelOnDrop(cancelled.clone());
+        let worker_cancelled = cancelled.clone();
+        let original = self.clone();
+        let workspace = pool.clone();
+        let copied = query
+            .blocking(move || {
+                let metadata = resources.reserve(Kind::Metadata, original.0._metadata.bytes())?;
+                let mut files = BTreeMap::new();
+                let mut directory = Vec::with_capacity(original.0.directory.len());
+                for entry in &original.0.directory {
+                    if worker_cancelled.load(Ordering::SeqCst) {
+                        return Err(fail("cache copy cancelled"));
+                    }
+                    let source = match &entry.source {
+                        Source::Pending => return Err(fail("cannot cache unfinished result")),
+                        Source::Resident(batch) => Source::Resident(batch.clone()),
+                        Source::File { part, batch } => {
+                            let id = Arc::as_ptr(part) as usize;
+                            if let std::collections::btree_map::Entry::Vacant(entry) =
+                                files.entry(id)
+                            {
+                                entry.insert(part.copy_to_cache(resources.clone(), &workspace)?);
+                            }
+                            Source::File {
+                                part: files[&id].clone(),
+                                batch: *batch,
+                            }
+                        }
+                    };
+                    directory.push(DirectoryEntry {
+                        source,
+                        rows: entry.rows,
+                    });
+                }
+                Ok(Self(Arc::new(ResultData {
+                    plain_schema: original.0.plain_schema.clone(),
+                    source_batches: original.0.source_batches.clone(),
+                    phase: "cache",
+                    schema: original.0.schema.clone(),
+                    directory,
+                    spans: original.0.spans.clone(),
+                    resources,
+                    _metadata: metadata,
+                })))
+            })
+            .await?;
+        // This exclusive unpublished copy can safely release borrowed resident
+        // buffers as serialization proceeds. Failure leaves the original intact.
+        copied.spill_in_with_cancel(pool, Some(cancelled)).await
+    }
+
+    pub(crate) fn cache_disk_bytes(&self) -> usize {
+        let mut files = std::collections::BTreeSet::new();
+        self.0
+            .directory
+            .iter()
+            .filter_map(|entry| match &entry.source {
+                Source::File { part, .. } if files.insert(Arc::as_ptr(part) as usize) => {
+                    Some(part.disk_bytes())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    pub(crate) fn externally_pinned(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
+    pub(crate) fn stored_identities(&self) -> Vec<MetricSeriesId> {
+        let mut ids = Vec::new();
+        for span in &self.0.spans {
+            if ids.last() != Some(&span.series) {
+                ids.push(span.series);
+            }
+        }
+        ids
     }
 
     pub(crate) fn has_series(&self, id: MetricSeriesId) -> bool {
@@ -451,6 +552,14 @@ impl ResultHandle {
     }
 
     pub(crate) async fn spill_in(self, pool: Arc<dyn MemoryPool>) -> Result<Self> {
+        self.spill_in_with_cancel(pool, None).await
+    }
+
+    async fn spill_in_with_cancel(
+        self,
+        pool: Arc<dyn MemoryPool>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Self> {
         let resources = self.0.resources.clone();
         resources
             .clone()
@@ -481,6 +590,12 @@ impl ResultHandle {
                     Ok(())
                 }
                 for index in 0..data.directory.len() {
+                    if cancelled
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    {
+                        return Err(fail("cache conversion cancelled"));
+                    }
                     let Source::Resident(batch) = &data.directory[index].source else {
                         continue;
                     };
@@ -527,6 +642,7 @@ impl ResultHandle {
 /// Mutable positions/read state are never shared between cursors.
 pub struct ResultCursor {
     handle: ResultHandle,
+    resources: Arc<StoreResources>,
     spans: Option<Range<usize>>,
     position: usize,
     state: Option<CursorState>,
@@ -544,10 +660,7 @@ impl Drop for ResultCursor {
     fn drop(&mut self) {
         let state = self.state.take();
         // Pin the handle until the blocking worker closes the cursor's file.
-        self.handle
-            .0
-            .resources
-            .drop_blocking((state, self.handle.clone()));
+        self.resources.drop_blocking((state, self.handle.clone()));
     }
 }
 
@@ -562,13 +675,21 @@ impl ResultCursor {
         spans: Option<Range<usize>>,
         pool: Arc<dyn MemoryPool>,
     ) -> Result<Self> {
-        let charge = handle.0.resources.reserve_in(
-            Kind::Workspace,
-            std::mem::size_of::<Self>() + 256,
-            &pool,
-        )?;
+        let resources = handle.0.resources.clone();
+        Self::with_resources(handle, spans, pool, resources)
+    }
+
+    fn with_resources(
+        handle: ResultHandle,
+        spans: Option<Range<usize>>,
+        pool: Arc<dyn MemoryPool>,
+        resources: Arc<StoreResources>,
+    ) -> Result<Self> {
+        let charge =
+            resources.reserve_in(Kind::Workspace, std::mem::size_of::<Self>() + 256, &pool)?;
         Ok(Self {
             handle,
+            resources,
             pool,
             spans,
             position: 0,
@@ -584,9 +705,7 @@ impl ResultCursor {
     /// blocking close work cannot accumulate retained payload across many ranges.
     pub(crate) async fn close(&mut self) -> Result<()> {
         let state = self.state.take();
-        self.handle
-            .0
-            .resources
+        self.resources
             .blocking(move || {
                 drop(state);
                 Ok(())
@@ -622,25 +741,30 @@ impl ResultCursor {
             }
         };
         let result = self.handle.0.clone();
-        let resources = result.resources.clone();
+        let resources = self.resources.clone();
         let pool = self.pool.clone();
         let (state, lease) = resources
+            .clone()
             .blocking(move || {
                 let mut state = state;
                 let data = match &state.cached {
                     Some((batch, data)) if *batch == item.0 => {
-                        result.resources.count("cache_hits", 1);
+                        resources.count("cache_hits", 1);
                         data.clone()
                     }
                     _ => {
                         state.cached = None;
-                        result.resources.count("cache_misses", 1);
+                        resources.count("cache_misses", 1);
                         let data = match &result.directory[item.0].source {
                             Source::Pending => return Err(fail("unfinalized result")),
                             Source::Resident(data) => data.clone(),
-                            Source::File { part, batch } => {
-                                part.read(*batch, &result.schema, &mut state.file, &pool)?
-                            }
+                            Source::File { part, batch } => part.read(
+                                *batch,
+                                &result.schema,
+                                &mut state.file,
+                                &pool,
+                                &resources,
+                            )?,
                         };
                         state.cached = Some((item.0, data.clone()));
                         data
@@ -649,18 +773,16 @@ impl ResultCursor {
                 if item.1.end > data.batch.num_rows() {
                     return Err(fail("span exceeds batch"));
                 }
-                result.resources.count("requested_rows", item.1.len());
+                resources.count("requested_rows", item.1.len());
                 let full_logical = logical_bytes(&data.batch)?;
                 let selected_logical =
                     logical_bytes(&data.batch.slice(item.1.start, item.1.len()))?;
-                result.resources.peak(
+                resources.peak(
                     "lookup_unrelated_logical_bytes",
                     full_logical.saturating_sub(selected_logical),
                 );
-                result
-                    .resources
-                    .peak("lookup_backing_bytes", data._charge.bytes());
-                result.resources.peak(
+                resources.peak("lookup_backing_bytes", data._charge.bytes());
+                resources.peak(
                     "lookup_unrelated_rows",
                     data.batch.num_rows() - item.1.len(),
                 );
