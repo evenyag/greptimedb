@@ -86,3 +86,75 @@ existing metrics; these counters are not a complete exclusive CPU accounting
 of every task in the query. Use process CPU deltas and native CPU profiles to
 identify uninstrumented work. The original primary-key exclusion audit remains
 active and independent of these diagnostics.
+
+## Buffered preparation and replay (Stage 4)
+
+Development buffered mode adds `buffered_settings`, `buffered_resources`, and
+`buffered_operations` to the verbose scanner explanation. Scanbench records
+effective mode, query budget, spill threshold, layout, IPC/source batch bounds,
+compression, preparation concurrency, prefetch, and consumer retention profile.
+The Stage 4 profile funds one complete identity plus the next batch for existing
+downstream consumers. These explicit experiment settings are not defaults.
+
+`buffered_resources.counts` contains cumulative nanosecond elapsed timers:
+
+- `preparation_ns`: complete successful preparation through funded manifests,
+  including discovery, preflight, range preparation, and publication admission.
+- `range_preparation_ns`: admitted complete-range source/merge/append work through
+  reader destruction. Reader admission/reclamation before startup is outside it.
+- `result_append_ns`: result append, including resident/file preparation work.
+  `spill_append_ns` is the subset of append calls choosing file placement.
+- `spill_finalization_ns`: builder finish and completed-result spill calls.
+  Serialization can occur during append; this timer alone is not total spill
+  cost. Resident builder finish is also included.
+- `readiness_wait_ns`: sum of consumer waits for manifests. At eight concurrent
+  consumers it can approach eight times preparation latency.
+- `replay_ns`: cumulative cursor `next` awaits, excluding downstream suspension
+  and tag assembly. `tag_assembly_ns` times compact output/tag assembly separately.
+
+These timers overlap and are not CPU seconds or an exclusive latency breakdown.
+`buffered_operations` reports synchronous calls/elapsed/CPU/unavailable clocks
+for normalization, serialization, metadata initialization, IPC decoding,
+reconstruction, index lookup, and owned-file cleanup. Interpret those CPU scopes
+using the same-thread rules above. Zero calls can mean a path was not exercised;
+it does not establish that the broader operation is free.
+
+Resource counts also record reader starts/destructions, completed ranges with
+released sources, published manifests, stored rows/batches/files, decoded
+rows/batches, requested rows, cursor cache hits/misses, file opens, seeks,
+read/write calls, footer bytes, and batch-directory bytes. With mixed placement,
+requested rows include resident output while IPC decoded rows do not: their
+ratio alone is not file direct-read amplification. Report unrelated lookup rows
+and backing bytes, placement, metadata, and repeated reads together.
+
+IPC `logical_requested_bytes` counts requested batch ranges.
+`filesystem_read_bytes` includes data and metadata reads; write bytes count
+userspace writes. These are separate from Stage 2 source fetch/cache counters
+and from physical storage traffic. OS cache and writeback can make block-device
+traffic differ. Process/cgroup I/O sampling includes reference/harness work in
+exactness runs and may miss late writeback; record that scope and sampling limit.
+
+Resource snapshots report current payload, metadata, workspace, disk, pending
+cleanup, active operations, and failed cleanup. Peaks are per-category maxima,
+not necessarily simultaneous. `memory_bytes` is shared query admission,
+including estimates and prepaid reservations; it is not RSS. Publication
+capacity transfers to live allocation charges without double charging. Important
+peaks include:
+
+- `live_readers`, `range_reader_estimate_bytes`, and `merge_batch_bytes`: source
+  concurrency, its estimated simultaneous capacity, and observed input size.
+- `publication_reserved_bytes`: aggregate capacity promised to all manifests;
+  `publication_partition_active_replay_bytes` and
+  `publication_partition_output_bytes`: maximum per-partition components.
+- `replay_payload_bytes`: current decoded backing bound, distinct from peak
+  `payload_bytes`, which can include escaped downstream output.
+- `lookup_backing_bytes`, `lookup_unrelated_rows`, and
+  `lookup_unrelated_logical_bytes`: backing retained by indexed lookup slices.
+
+Measure reader estimates against retained-reader experiments, allocator/RSS
+observations, and shared engine/cache state. Whole-process and accounting peaks
+do not isolate decoder estimation error. The spill threshold initiates
+reclamation; final publication reservations may exceed that threshold while
+remaining within the hard query budget. Completion can retain the bounded
+resources/metrics object even when all dynamic payload, workspace, and disk are
+released. Pair snapshots with actual scratch/process cleanup checks.

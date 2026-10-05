@@ -1,8 +1,8 @@
 ---
 Feature Name: Buffered SeriesScan
 Date: 2026-10-03
-Updated: 2026-10-03
-Status: Draft revised after VictoriaMetrics review
+Updated: 2026-10-05
+Status: Development PoC through Stage 4 validated; rollout undecided
 ---
 
 # Summary
@@ -378,6 +378,17 @@ including unrelated rows retained by a mixed-series batch, rather than spill
 file sizes to size those reservations. Empty partitions need no payload reserve.
 Reserve incremental workspace beyond already charged retained allocations;
 borrowing a resident batch does not reserve its backing buffers a second time.
+
+Stage 4 supports the existing downstream retention profile of one complete
+identity plus the next batch: `PromSeriesDivide` retains an identity's output
+before evaluation. Fund escaped output ownership separately from bounded active
+replay. File-backed output capacity and tag buffers can therefore require a
+reservation that grows with identity length, even though the scanner never
+collects that identity's decoded payload. Arbitrary collect-all consumers are
+not covered by this profile. Preserve allocation charges in escaped arrays;
+closing a cursor or manifest releases only unused reservation capacity and
+allocations whose final owners have been dropped. This is development-only
+admission behavior, not a claim that total downstream memory is batch-bounded.
 
 Finalize resident/disk placement so retained results and metadata plus aggregate
 replay reservations fit the hard budget. Spill eligible unpublished results

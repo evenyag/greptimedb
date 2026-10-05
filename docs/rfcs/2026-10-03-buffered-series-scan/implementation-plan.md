@@ -1,6 +1,6 @@
 # Buffered SeriesScan implementation and experiment plan
 
-Status: Draft revised after VictoriaMetrics review, 2026-10-03.
+Status: Development PoC through Stage 4 validated, 2026-10-05.
 
 Read the [design](design.md) for execution semantics and interfaces. Preparation
 runs outside scan partition streams; those streams lazily concatenate complete
@@ -71,8 +71,25 @@ an implementation stage.
   [Stage 3 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage3-report.md)
   and evidence under
   `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261004-stage3-local/`.
-- [ ] Stage 4: Complete range preparation, spill admission, publication
-  reservations, and lazy replay; pass resource and selector correctness gates.
+- [x] Stage 4: Complete range preparation, spill admission, publication
+  reservations, and lazy replay implemented and validated at `3795f3f517`
+  (2026-10-05). Normal-profile local gates passed 58 focused tests, reference
+  SQLness and both forced-spill layouts, Clippy, formatting, and license checks.
+  Both layouts matched the accepted 51,635,200-row Q03 reference at one/eight
+  partitions, including exact cross-partition comparison. All source readers
+  were destroyed before readiness, all compact decoders passed the zero-key
+  audit, and scratch cleanup passed. Publication funds all partitions plus
+  the existing downstream consumer's complete-identity retention; bounded
+  active replay and escaped output ownership are reported separately.
+  Retained runs observed 159 live readers, about 1.85 GiB reader admission,
+  and 2.75–3.00 GiB process RSS; these are calibration observations, not a
+  decoder/RSS upper-bound proof. Development-only enablement and explicit
+  settings remain; no layout/default was selected. See the external
+  [Stage 4 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage4-report.md)
+  and evidence under
+  `/Users/evenyag/Documents/test/promql-k8s-memory/buffered-series-scan-poc/20261005-stage4-local/`
+  and `20261005-stage4-remote/`. Retrieved evidence was hash-verified and owned
+  remote workloads exited. Main v2's historical p8 exactness gap is unchanged.
 - [ ] Stage 5: Independent preparation concurrency and shared selected-series
   reads; pass correctness gates and compare equal-budget measurements.
 - [ ] Stage 6: File-backed buffered-data cache; pass ownership, invalidation,
@@ -118,12 +135,18 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Stage 3's standalone store passed at `a96f2b5d85`; Stage 4 integration is next.
-Read the external [Stage 3 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage3-report.md)
-for local gates, layout/compression tradeoffs, accounting boundaries, and
-reproducible synthetic evidence. The store is test/development-only until
-integration. No remote machine was contacted for Stage 3, and its current
-power state is unknown; confirm availability before remote work.
+Stage 4 integration passed at `3795f3f517`; Stage 5 is next. Read the external
+[Stage 4 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage4-report.md)
+for focused gates, retained exactness, admission calibration, consumer retention,
+and retrieved evidence. Buffered mode remains development-only. No layout or
+production default is selected. The machine could be stopped after validation;
+confirm its current availability before future remote work. Never start or stop
+it. Preserve the older Stage 3 scaffolding stash; do not apply it.
+
+Stage 3's standalone store passed at `a96f2b5d85`. Its external
+[report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage3-report.md)
+records layout/compression tradeoffs and 720 optimized synthetic records; that
+matrix was not repeated for Stage 4.
 
 Stage 2 passed at `2603f14aea`. Read the external
 [Stage 2 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage2-report.md)
@@ -306,6 +329,13 @@ aggregate reservations fit; fail irreducible requirements with the memory
 diagnostic contract. Transfer reserved capacity into live allocation charges
 without double charging and return it to the partition reservation when
 workspace is released. Release remaining reservations on completion/drop.
+
+The integrated Stage 4 consumer profile includes one complete identity plus
+the next batch, matching existing `PromSeriesDivide` retention. Reserve escaped
+output separately from bounded active replay; its capacity can grow with series
+length. Arbitrary collect-all consumers are not funded by that profile. Keep
+charges attached to output arrays beyond cursor/manifest destruction, returning
+only unused capacity on close.
 
 Partition streams enumerate compact identities in order and lazily concatenate
 each identity's complete ranges in timestamp order. Use indexed spans to open
