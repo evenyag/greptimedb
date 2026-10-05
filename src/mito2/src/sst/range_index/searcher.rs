@@ -36,6 +36,11 @@ pub struct SstRangeIndexSearcher {
 }
 
 impl SstRangeIndexSearcher {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn buffered_metadata_bytes(&self) -> usize {
+        self.reader.buffered_metadata_bytes()
+    }
+
     /// Opens the range-index file at `path` and loads its Parquet metadata.
     pub async fn open(object_store: ObjectStore, path: &str) -> Result<Self> {
         let reader = ParquetIndexReader::open(object_store, path).await?;

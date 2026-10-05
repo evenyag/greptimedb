@@ -42,6 +42,7 @@ pub(crate) enum Kind {
 /// A lease is shared with its allocation, never with cursor position.
 pub(crate) struct Charge {
     reservation: MemoryReservation,
+    pool: Arc<dyn MemoryPool>,
     resources: Arc<StoreResources>,
     kind: Kind,
 }
@@ -71,11 +72,18 @@ impl Charge {
             if matches!(self.kind, Kind::Metadata) {
                 self.resources.metadata.fetch_sub(bytes, Ordering::SeqCst);
             }
-            return Err(fail(format!(
-                "memory admission: required {bytes}, used {}, limit {}: {error}",
-                self.resources.pool.reserved(),
-                self.resources.options.memory_bytes
-            )));
+            let limit = match self.pool.memory_limit() {
+                datafusion::execution::memory_pool::MemoryLimit::Finite(limit) => limit,
+                _ => self.resources.options.memory_bytes,
+            };
+            return Err(crate::error::BufferedScanMemorySnafu {
+                stage: self.reservation.consumer().name().to_owned(),
+                required: bytes,
+                available: limit.saturating_sub(self.pool.reserved()),
+                limit,
+                reason: error.to_string(),
+            }
+            .build());
         }
         let (current, name) = match self.kind {
             Kind::Metadata => (&self.resources.metadata, "metadata_bytes"),
@@ -164,6 +172,7 @@ pub struct StoreResources {
     disk: AtomicUsize,
     pending: AtomicUsize,
     active: AtomicUsize,
+    live_readers: AtomicUsize,
     failed: Mutex<Vec<FailedDelete>>,
     notify: Notify,
     counts: Mutex<BTreeMap<String, usize>>,
@@ -184,6 +193,15 @@ pub struct StoreResources {
 
 impl StoreResources {
     pub(crate) fn new(parent: &Path, options: StoreOptions) -> Result<Arc<Self>> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(options.memory_bytes));
+        Self::with_pool(parent, options, pool)
+    }
+
+    pub(crate) fn with_pool(
+        parent: &Path,
+        options: StoreOptions,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<Arc<Self>> {
         if options.batch_rows == 0
             || options.batch_rows > u32::MAX as usize
             || options.batch_bytes == 0
@@ -211,7 +229,6 @@ impl StoreResources {
                 "fixed dictionary must contain sorted unique nonnull compact keys",
             ));
         }
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(options.memory_bytes));
         let fixed = MemoryConsumer::new("SeriesResult::fixed_dictionary").register(&pool);
         let fixed_bytes = checked_add(
             16 * 1024,
@@ -240,6 +257,7 @@ impl StoreResources {
             disk: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
+            live_readers: AtomicUsize::new(0),
             failed: Mutex::new(vec![]),
             notify: Notify::new(),
             counts: Mutex::new(BTreeMap::new()),
@@ -282,15 +300,46 @@ impl StoreResources {
         });
     }
 
+    pub(crate) fn reader_lease(self: &Arc<Self>) -> ReaderLease {
+        let live = self.live_readers.fetch_add(1, Ordering::SeqCst) + 1;
+        self.count("readers_started", 1);
+        self.peak("live_readers", live);
+        ReaderLease(self.clone())
+    }
+
+    pub(crate) fn live_readers(&self) -> usize {
+        self.live_readers.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn pool(&self) -> Arc<dyn MemoryPool> {
+        self.pool.clone()
+    }
+
+    pub(crate) fn available(&self) -> usize {
+        self.options
+            .memory_bytes
+            .saturating_sub(self.pool.reserved())
+    }
+
     pub(crate) fn reserve(self: &Arc<Self>, kind: Kind, bytes: usize) -> Result<Charge> {
+        self.reserve_in(kind, bytes, &self.pool)
+    }
+
+    pub(crate) fn reserve_in(
+        self: &Arc<Self>,
+        kind: Kind,
+        bytes: usize,
+        pool: &Arc<dyn MemoryPool>,
+    ) -> Result<Charge> {
         let reservation = MemoryConsumer::new(match kind {
             Kind::Payload => "SeriesResult::payload",
             Kind::Metadata => "SeriesResult::metadata",
             Kind::Workspace => "SeriesResult::workspace",
         })
-        .register(&self.pool);
+        .register(pool);
         let mut charge = Charge {
             reservation,
+            pool: pool.clone(),
             resources: self.clone(),
             kind,
         };
@@ -332,6 +381,12 @@ impl StoreResources {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        if let Some(pool) = self
+            .pool
+            .downcast_ref::<crate::read::series_result::budget::BudgetPool>()
+        {
+            self.peak("memory_bytes", pool.peak());
+        }
         Snapshot {
             resource_bytes: self._fixed_reservation.size(),
             memory_bytes: self.pool.reserved(),
@@ -494,5 +549,14 @@ impl Drop for ActiveOperation {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, Ordering::SeqCst);
         self.0.notify.notify_waiters();
+    }
+}
+
+/// Declared before the reader in its scope, so decoder destruction precedes release.
+pub(crate) struct ReaderLease(Arc<StoreResources>);
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        self.0.live_readers.fetch_sub(1, Ordering::SeqCst);
+        self.0.count("readers_destroyed", 1);
     }
 }

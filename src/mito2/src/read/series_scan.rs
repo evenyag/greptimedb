@@ -124,6 +124,8 @@ impl SeriesScanMode {
 /// partition.
 /// Always returns the same series (primary key) to the same partition.
 pub struct SeriesScan {
+    #[cfg(any(test, feature = "dev-tools"))]
+    buffered: Option<crate::read::series_buffered::BufferedScan>,
     /// Implementation used by this scan.
     mode: SeriesScanMode,
     /// Properties of the scanner.
@@ -178,6 +180,8 @@ impl SeriesScan {
         };
 
         Self {
+            #[cfg(any(test, feature = "dev-tools"))]
+            buffered: None,
             mode,
             properties,
             stream_ctx,
@@ -188,7 +192,37 @@ impl SeriesScan {
         }
     }
 
-    fn supports_two_phase(input: &ScanInput) -> bool {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) async fn new_buffered(
+        mut input: ScanInput,
+        options: crate::read::series_buffered::Options,
+    ) -> Result<Self> {
+        if !Self::supports_two_phase(&input) {
+            return Err(crate::read::series_result::fail(
+                "buffered mode requires native sparse metric sources",
+            ));
+        }
+        let buffered = crate::read::series_buffered::BufferedScan::new(
+            options,
+            input.scan_memory_pool.clone(),
+        )
+        .await?;
+        input.scan_memory_pool = buffered.resources.pool();
+        input.distribution = Some(store_api::storage::TimeSeriesDistribution::PerSeries);
+        let mut scanner = Self::new(input, true, true);
+        scanner.buffered = Some(buffered);
+        Ok(scanner)
+    }
+
+    fn effective_mode(&self) -> &'static str {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if self.buffered.is_some() {
+            return "buffered";
+        }
+        self.mode.as_str()
+    }
+
+    pub(crate) fn supports_two_phase(input: &ScanInput) -> bool {
         if !is_sparse_metric_metadata(input.region_metadata()) {
             return false;
         }
@@ -266,6 +300,17 @@ impl SeriesScan {
                 all: self.properties.num_partitions(),
             }
         );
+
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some(buffered) = &self.buffered {
+            return buffered.stream(
+                partition,
+                self.stream_ctx.clone(),
+                self.properties.partitions.clone(),
+                part_metrics,
+                metrics_set.clone(),
+            );
+        }
 
         match self.mode {
             SeriesScanMode::Legacy => self.scan_legacy_batch_in_partition(
@@ -498,6 +543,10 @@ impl SeriesScan {
 
     /// Checks resource limit for the scanner.
     pub(crate) fn check_scan_limit(&self) -> Result<()> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if self.buffered.is_some() {
+            return Ok(());
+        }
         // Sum the total number of files across all partitions
         let total_files: usize = self
             .properties
@@ -605,6 +654,10 @@ impl RegionScanner for SeriesScan {
     }
 
     fn reset_state(&mut self) {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some(buffered) = &self.buffered {
+            buffered.reset();
+        }
         self.stream_ctx.input.predicate.clear_dyn_filters();
         let num_workers = common_stat::get_total_cpu_cores().max(1);
         self.pruner = match self.mode {
@@ -653,7 +706,22 @@ impl DisplayAs for SeriesScan {
                 self.stream_ctx.format_for_explain(true, f)?;
             }
         }
-        write!(f, ", \"mode\":\"{}\"", self.mode.as_str())?;
+        write!(f, ", \"mode\":\"{}\"", self.effective_mode())?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some(buffered) = &self.buffered {
+            let snapshot =
+                serde_json::to_string(&buffered.resources.snapshot()).map_err(|_| fmt::Error)?;
+            write!(
+                f,
+                ", \"buffered_resources\":{snapshot}, \"buffered_settings\":{}",
+                buffered.settings()
+            )?;
+            let operations = serde_json::to_string(&crate::read::series_result::operation_values(
+                &buffered.resources,
+            ))
+            .map_err(|_| fmt::Error)?;
+            write!(f, ", \"buffered_operations\":{operations}")?;
+        }
         if matches!(t, DisplayFormatType::Verbose) {
             self.metrics_list.format_verbose_metrics(f)?;
         }
@@ -677,9 +745,34 @@ impl SeriesScan {
         &self.stream_ctx.input
     }
 
+    pub(crate) async fn into_buffered(
+        self,
+        options: crate::read::series_buffered::Options,
+    ) -> Result<Self> {
+        drop(self.pruner);
+        let ctx = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut ctx = self.stream_ctx;
+            loop {
+                match Arc::try_unwrap(ctx) {
+                    Ok(ctx) => break ctx,
+                    Err(shared) => ctx = shared,
+                }
+                // Pruner workers release their context after their channels close.
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| crate::read::series_result::fail("scan already shared"))?;
+        Self::new_buffered(ctx.input, options).await
+    }
+
+    pub(crate) fn buffered_resources(&self) -> Arc<crate::read::series_result::StoreResources> {
+        self.buffered.as_ref().unwrap().resources.clone()
+    }
+
     /// Returns the scan mode for tests.
     pub(crate) fn mode(&self) -> &'static str {
-        self.mode.as_str()
+        self.effective_mode()
     }
 }
 

@@ -454,6 +454,12 @@ impl ScanRegion {
         let experimental_series_scan_v2 = self.experimental_series_scan_v2;
         let compact = self.experimental_series_scan_compact;
         let input = self.scan_input().await?;
+        #[cfg(feature = "dev-tools")]
+        if let Some(options) = crate::read::series_buffered::development_options().await?
+            && SeriesScan::supports_two_phase(&input)
+        {
+            return SeriesScan::new_buffered(input, options).await;
+        }
         Ok(SeriesScan::new(input, experimental_series_scan_v2, compact))
     }
 

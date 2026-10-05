@@ -3775,6 +3775,14 @@ async fn build_sparse_metric_engine_with_config(
     prefix: &str,
     config: MitoConfig,
 ) -> (TestEnv, crate::engine::MitoEngine, RegionId) {
+    build_sparse_metric_engine_with_options(prefix, config, &[]).await
+}
+
+async fn build_sparse_metric_engine_with_options(
+    prefix: &str,
+    config: MitoConfig,
+    options: &[(&str, &str)],
+) -> (TestEnv, crate::engine::MitoEngine, RegionId) {
     let mut env = TestEnv::with_prefix(prefix).await;
     let engine = env.create_engine(config).await;
 
@@ -3797,6 +3805,11 @@ async fn build_sparse_metric_engine_with_config(
     request
         .options
         .insert("sst_format".to_string(), "flat".to_string());
+    for (key, value) in options {
+        request
+            .options
+            .insert((*key).to_owned(), (*value).to_owned());
+    }
     let full_row_schema = test_util::rows_schema(&request);
     let mut encoded_primary_key_schema = full_row_schema[0].clone();
     encoded_primary_key_schema.column_name = PRIMARY_KEY_COLUMN_NAME.to_string();
@@ -4537,4 +4550,538 @@ async fn test_compact_scan_index_coverage() {
             check_two_phase_series_scan(use_index, use_range_index, true, true).await;
         }
     }
+}
+
+/// Complete preparation must match v2 under different layouts, placements,
+/// partition counts, sequence fences, selectors and polling orders.
+#[tokio::test]
+async fn test_buffered_scan_semantics_and_polling() {
+    use crate::read::series_buffered::Options;
+    let (_env, engine, region_id) = build_sparse_metric_engine_with_config(
+        "buffered_matrix",
+        MitoConfig {
+            experimental_series_scan_v2: true,
+            max_concurrent_scan_files: 1,
+            range_result_cache_size: ReadableSize::mb(8),
+            ..Default::default()
+        },
+    )
+    .await;
+    for p in 0..8 {
+        put_buffered_row(&engine, region_id, (2 * p + 1) << 60, Some(p), 4000).await;
+    }
+    let scratch = common_test_util::temp_dir::create_temp_dir("buffered-stage4");
+    for selector in [
+        None,
+        Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+    ] {
+        for (min, max) in [(None, None), (Some(2), Some(5)), (Some(4), Some(4))] {
+            let (_, expected) =
+                scan_sparse_exact_metric(&engine, region_id, min, max, selector, "two_phase").await;
+            for layout in ["one_series", "multiple_series"] {
+                for spill in [false, true] {
+                    for partitions in [1, 8] {
+                        let scanner = engine
+                            .scanner(
+                                region_id,
+                                ScanRequest {
+                                    distribution: Some(TimeSeriesDistribution::PerSeries),
+                                    filters: vec![col("tag_0").gt_eq(lit("a"))],
+                                    memtable_min_sequence: min,
+                                    memtable_max_sequence: max,
+                                    exact_sequence_range: min.is_some(),
+                                    series_row_selector: selector,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        let Scanner::Series(scanner) = scanner else {
+                            panic!("series expected")
+                        };
+                        let mut scanner = scanner
+                            .into_buffered(Options {
+                                scratch: scratch.path().to_owned(),
+                                memory_bytes: 128 * 1024 * 1024,
+                                spill_threshold: if spill { 1 } else { 120 * 1024 * 1024 },
+                                disk_bytes: 64 * 1024 * 1024,
+                                batch_rows: 2,
+                                batch_bytes: 64 * 1024,
+                                layout: layout.to_owned(),
+                                compression: None,
+                            })
+                            .await
+                            .unwrap();
+                        let resources = scanner.buffered_resources();
+                        assert_eq!("buffered", scanner.mode());
+                        let ranges = scanner
+                            .properties()
+                            .partitions
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect();
+                        let mut assigned = vec![Vec::new(); partitions];
+                        assigned[0] = ranges;
+                        scanner
+                            .prepare(
+                                PrepareRequest::default()
+                                    .with_ranges(assigned)
+                                    .with_target_partitions(partitions),
+                            )
+                            .unwrap();
+                        let metrics = ExecutionPlanMetricsSet::default();
+                        let streams = (0..partitions)
+                            .map(|p| {
+                                scanner
+                                    .scan_partition(&Default::default(), &metrics, p)
+                                    .unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let mut actual = Vec::new();
+                        // Compare concurrent/interleaved polling with sequential
+                        // consumption while seven streams remain unpolled.
+                        let batches = if layout == "multiple_series" && partitions == 8 {
+                            try_join_all(streams.into_iter().map(collect_buffered_sparse_rows))
+                                .await
+                                .unwrap()
+                        } else {
+                            let mut batches = Vec::new();
+                            for stream in streams {
+                                batches.push(collect_buffered_sparse_rows(stream).await.unwrap());
+                            }
+                            batches
+                        };
+                        let mut owners = HashMap::new();
+                        for (partition, rows) in batches.into_iter().enumerate() {
+                            for row in &rows {
+                                if let Some(previous) = owners.insert((row.0, row.1), partition) {
+                                    assert_eq!(previous, partition);
+                                }
+                            }
+                            assert!(
+                                rows.windows(2)
+                                    .all(|w| (w[0].0, w[0].1, w[0].5) <= (w[1].0, w[1].1, w[1].5))
+                            );
+                            actual.extend(rows);
+                        }
+                        actual.sort();
+                        assert_eq!(
+                            expected, actual,
+                            "{layout}, spill={spill}, partitions={partitions}, sequence={min:?}/{max:?}, selector={selector:?}"
+                        );
+                        let value = |name| {
+                            metrics
+                                .clone_inner()
+                                .sum_by_name(name)
+                                .map_or(0, |v| v.as_usize())
+                        };
+                        assert_eq!(
+                            value("compact_data_readers"),
+                            value("compact_audited_decoders")
+                        );
+                        assert_eq!(0, value("compact_data_primary_key_pages_decoded"));
+                        assert_eq!(0, value("compact_primary_key_decode_violations"));
+                        assert_eq!(0, resources.live_readers());
+                        drop(scanner);
+                        resources.drain_cleanup().await.unwrap();
+                        let snapshot = resources.snapshot();
+                        assert_eq!(0, snapshot.disk_bytes);
+                        assert_eq!(0, snapshot.payload_bytes);
+                        assert_eq!(0, snapshot.workspace_bytes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_buffered_failures_and_unpolled_cleanup() {
+    use crate::read::series_buffered::Options;
+    let (_env, engine, region_id) =
+        build_sparse_exact_metric_engine("buffered_failures", true, ReadableSize::mb(0)).await;
+    let scratch = common_test_util::temp_dir::create_temp_dir("buffered-failures");
+    for failure in ["memory", "disk", "write", "finalize", "cancel", "abandon"] {
+        let scanner = engine
+            .scanner(
+                region_id,
+                ScanRequest {
+                    distribution: Some(TimeSeriesDistribution::PerSeries),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let Scanner::Series(scanner) = scanner else {
+            panic!("series expected")
+        };
+        let mut scanner = scanner
+            .into_buffered(Options {
+                scratch: scratch.path().to_owned(),
+                memory_bytes: if failure == "memory" {
+                    1024 * 1024
+                } else {
+                    128 * 1024 * 1024
+                },
+                spill_threshold: 1,
+                disk_bytes: if failure == "disk" {
+                    1
+                } else {
+                    64 * 1024 * 1024
+                },
+                batch_rows: 2,
+                batch_bytes: 64 * 1024,
+                layout: "multiple_series".to_owned(),
+                compression: None,
+            })
+            .await
+            .unwrap();
+        let resources = scanner.buffered_resources();
+        let write_gate = if failure == "cancel" {
+            let (started, observed) = std::sync::mpsc::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            *resources.faults.write_gate.lock().unwrap() = Some((started, paused));
+            Some((observed, resume))
+        } else {
+            None
+        };
+        if failure == "write" {
+            *resources.faults.write_after.lock().unwrap() = Some(0);
+        }
+        if failure == "finalize" {
+            resources
+                .faults
+                .finish
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let ranges = scanner
+            .properties()
+            .partitions
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut assigned = vec![Vec::new(); 8];
+        assigned[0] = ranges;
+        scanner
+            .prepare(
+                PrepareRequest::default()
+                    .with_ranges(assigned)
+                    .with_target_partitions(8),
+            )
+            .unwrap();
+        let metrics = ExecutionPlanMetricsSet::default();
+        let mut streams = (0..8)
+            .map(|p| {
+                scanner
+                    .scan_partition(&Default::default(), &metrics, p)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        if let Some((observed, resume)) = write_gate {
+            common_runtime::spawn_blocking_query(move || {
+                observed.recv_timeout(std::time::Duration::from_secs(5))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            drop(streams);
+            assert!(
+                resources.snapshot().workspace_bytes > 0,
+                "queued/running writer must retain its admission"
+            );
+            resume.send(()).unwrap();
+        } else if failure == "abandon" {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while resources.snapshot().counts.get("published_manifests") != Some(&8) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(0, resources.live_readers());
+            let writes = resources
+                .snapshot()
+                .counts
+                .get("filesystem_write_bytes")
+                .copied();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            // Complete one partition without polling any of the others, then abandon them.
+            let stream = streams.remove(0);
+            collect_buffered_sparse_rows(stream).await.unwrap();
+            assert_eq!(
+                writes,
+                resources
+                    .snapshot()
+                    .counts
+                    .get("filesystem_write_bytes")
+                    .copied()
+            );
+            drop(streams);
+        } else {
+            for stream in streams {
+                let error = format!(
+                    "{:?}",
+                    collect_buffered_sparse_rows(stream).await.unwrap_err()
+                );
+                if failure == "memory" {
+                    assert!(error.contains("stage=mapping preflight"), "{error}");
+                    assert!(
+                        error.contains("required=") && error.contains("available="),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        drop(scanner);
+        // Cancellation can be observed by the coordinator after its last caller drops.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                resources.drain_cleanup().await.unwrap();
+                let snapshot = resources.snapshot();
+                if snapshot.memory_bytes == snapshot.resource_bytes {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(0, resources.snapshot().disk_bytes, "{failure}");
+        assert_eq!(0, resources.live_readers(), "{failure}");
+        if failure == "memory" {
+            assert_eq!(None, resources.snapshot().counts.get("readers_started"));
+        }
+    }
+}
+
+fn buffered_fixture_rows(tsid: u64, value: Option<u64>, ts: i64) -> Rows {
+    let metadata = Arc::new(sst_region_metadata_with_encoding(
+        PrimaryKeyEncoding::Sparse,
+    ));
+    let mut request = CreateRequestBuilder::new().build();
+    request.column_metadatas = metadata.column_metadatas.clone();
+    request.primary_key = metadata.primary_key.clone();
+    let full = test_util::rows_schema(&request);
+    let mut key = full[0].clone();
+    key.column_name = PRIMARY_KEY_COLUMN_NAME.to_owned();
+    key.datatype = ColumnDataType::Binary.into();
+    Rows {
+        schema: vec![key, full[5].clone(), full[4].clone()],
+        rows: vec![api::v1::Row {
+            values: vec![
+                api::v1::Value {
+                    value_data: Some(ValueData::BinaryValue(new_sparse_primary_key(
+                        &["a", "x"],
+                        &metadata,
+                        10,
+                        tsid,
+                    ))),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(ts)),
+                },
+                api::v1::Value {
+                    value_data: value.map(ValueData::U64Value),
+                },
+            ],
+        }],
+    }
+}
+
+async fn put_buffered_row(
+    engine: &crate::engine::MitoEngine,
+    region_id: RegionId,
+    tsid: u64,
+    value: Option<u64>,
+    ts: i64,
+) {
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Put(RegionPutRequest {
+                skip_wal: false,
+                rows: buffered_fixture_rows(tsid, value, ts),
+                hint: Some(WriteHint {
+                    primary_key_encoding: api::v1::PrimaryKeyEncoding::Sparse.into(),
+                }),
+                partition_expr_version: None,
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_buffered_complete_range_last_non_null_and_delete() {
+    use crate::read::series_buffered::Options;
+    for mode in ["last_row", "last_non_null"] {
+        let (_env, engine, region_id) = build_sparse_metric_engine_with_options(
+            "buffered_dedup",
+            MitoConfig {
+                experimental_series_scan_v2: true,
+                ..Default::default()
+            },
+            &[
+                ("append_mode", "false"),
+                ("preserve_row_sequence", "false"),
+                ("merge_mode", mode),
+            ],
+        )
+        .await;
+        // A newer null at the same timestamp must merge with the older SST value
+        // for LastNonNull, while LastRow keeps the null.
+        put_buffered_row(&engine, region_id, 0, None, 1000).await;
+        test_util::flush_region(&engine, region_id, None).await;
+        let mut deleted = buffered_fixture_rows(0, None, 2000);
+        deleted.schema.pop();
+        deleted.rows[0].values.pop();
+        engine
+            .handle_request(
+                region_id,
+                RegionRequest::Delete(store_api::region_request::RegionDeleteRequest {
+                    rows: deleted,
+                    hint: Some(WriteHint {
+                        primary_key_encoding: api::v1::PrimaryKeyEncoding::Sparse.into(),
+                    }),
+                    partition_expr_version: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let scratch = common_test_util::temp_dir::create_temp_dir("buffered-dedup");
+        for selector in [
+            None,
+            Some(TimeSeriesRowSelector::LastRow { after_merge: false }),
+        ] {
+            let request = ScanRequest {
+                distribution: Some(TimeSeriesDistribution::PerSeries),
+                series_row_selector: selector,
+                ..Default::default()
+            };
+            let Scanner::Series(reference) =
+                engine.scanner(region_id, request.clone()).await.unwrap()
+            else {
+                panic!("series expected")
+            };
+            let expected = collect_buffered_strings(reference.build_stream().await.unwrap()).await;
+            for layout in ["one_series", "multiple_series"] {
+                let Scanner::Series(scanner) =
+                    engine.scanner(region_id, request.clone()).await.unwrap()
+                else {
+                    panic!("series expected")
+                };
+                let scanner = scanner
+                    .into_buffered(Options {
+                        scratch: scratch.path().to_owned(),
+                        memory_bytes: 128 * 1024 * 1024,
+                        spill_threshold: 1,
+                        disk_bytes: 64 * 1024 * 1024,
+                        batch_rows: 2,
+                        batch_bytes: 64 * 1024,
+                        layout: layout.to_owned(),
+                        compression: None,
+                    })
+                    .await
+                    .unwrap();
+                let actual = collect_buffered_strings(scanner.build_stream().await.unwrap()).await;
+                assert_eq!(expected, actual, "merge={mode}, layout={layout}");
+            }
+        }
+    }
+}
+
+/// Copy logical oracle values, releasing every scan batch before polling again.
+/// Retaining arbitrary output batches is a separate downstream memory workload.
+async fn collect_buffered_sparse_rows(
+    mut stream: common_recordbatch::SendableRecordBatchStream,
+) -> common_recordbatch::error::Result<Vec<(u32, u64, String, String, u64, i64)>> {
+    let schema = stream.schema();
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.try_next().await? {
+        rows.extend(ordered_sparse_rows(&RecordBatches::try_new(
+            schema.clone(),
+            vec![batch],
+        )?));
+    }
+    Ok(rows)
+}
+
+async fn collect_buffered_strings(
+    mut stream: common_recordbatch::SendableRecordBatchStream,
+) -> Vec<Vec<String>> {
+    let schema = stream.schema();
+    let mut output = Vec::new();
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let batches = RecordBatches::try_new(schema.clone(), vec![batch]).unwrap();
+        let pretty = batches.pretty_print().unwrap();
+        for line in pretty.lines().skip(3).filter(|line| line.starts_with('|')) {
+            output.push(
+                line.split('|')
+                    .skip(1)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.trim().to_owned())
+                    .collect(),
+            );
+        }
+    }
+    output
+}
+
+#[tokio::test]
+async fn test_buffered_publication_funds_complete_series_consumer() {
+    use crate::read::series_buffered::Options;
+    let (_env, engine, region_id) =
+        build_sparse_exact_metric_engine("buffered_retained_series", true, ReadableSize::mb(0))
+            .await;
+    for ts in 0..128 {
+        put_buffered_row(&engine, region_id, 12345, Some(ts as u64), ts * 1000).await;
+    }
+    test_util::flush_region(&engine, region_id, None).await;
+    let scratch = common_test_util::temp_dir::create_temp_dir("buffered-retained-series");
+    let scanner = engine
+        .scanner(
+            region_id,
+            ScanRequest {
+                distribution: Some(TimeSeriesDistribution::PerSeries),
+                filters: vec![col("__tsid").eq(lit(12345u64))],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let Scanner::Series(scanner) = scanner else {
+        panic!("series expected")
+    };
+    let scanner = scanner
+        .into_buffered(Options {
+            scratch: scratch.path().to_owned(),
+            memory_bytes: 128 * 1024 * 1024,
+            spill_threshold: 1,
+            disk_bytes: 64 * 1024 * 1024,
+            batch_rows: 2,
+            batch_bytes: 64 * 1024,
+            layout: "multiple_series".to_owned(),
+            compression: None,
+        })
+        .await
+        .unwrap();
+    let resources = scanner.buffered_resources();
+    let metrics = ExecutionPlanMetricsSet::default();
+    let stream = scanner
+        .scan_partition(&Default::default(), &metrics, 0)
+        .unwrap();
+    // Mirrors the existing PromQL series-divider ownership: retain every batch
+    // in one identity while continuing to poll the scanner to its next boundary.
+    let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(128, batches.iter().map(|b| b.num_rows()).sum::<usize>());
+    assert!(batches.len() > 2);
+    assert!(resources.snapshot().workspace_bytes > 0);
+    drop(batches);
+    drop(scanner);
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(0, resources.snapshot().disk_bytes);
+    assert_eq!(0, resources.snapshot().payload_bytes);
+    assert_eq!(0, resources.snapshot().workspace_bytes);
 }

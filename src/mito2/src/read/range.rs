@@ -530,6 +530,49 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_groups_touching_mixed_timestamp_units() {
+        let mut ranges = Vec::new();
+        for (index, start, end) in [
+            (0, Timestamp::new_second(-1), Timestamp::new_second(1)),
+            (
+                1,
+                Timestamp::new_millisecond(1000),
+                Timestamp::new_microsecond(2_000_000),
+            ),
+            (
+                2,
+                Timestamp::new_nanosecond(2_000_000_001),
+                Timestamp::new_second(3),
+            ),
+        ] {
+            ranges.push(RangeMeta {
+                time_range: (start, end),
+                indices: smallvec![SourceIndex {
+                    index,
+                    num_row_groups: 2
+                }],
+                row_group_indices: smallvec![RowGroupIndex {
+                    index,
+                    row_group_index: ALL_ROW_GROUPS
+                }],
+                num_rows: 2,
+            });
+        }
+        let groups = group_ranges_for_seq_scan(ranges);
+        assert_eq!(2, groups.len());
+        assert_eq!(2, groups[0].indices.len());
+        assert_eq!(Timestamp::new_second(-1), groups[0].time_range.0);
+        assert_eq!(Timestamp::new_second(2), groups[0].time_range.1);
+        assert!(groups[0].time_range.1 < groups[1].time_range.0);
+        assert!(
+            groups
+                .iter()
+                .flat_map(|g| &g.row_group_indices)
+                .all(|r| r.row_group_index == ALL_ROW_GROUPS)
+        );
+    }
+
+    #[test]
     fn test_group_ranges() {
         // Group 1 part.
         run_group_ranges_test(&[(1, 0, 2000)], &[(vec![1], 0, 2000)]);

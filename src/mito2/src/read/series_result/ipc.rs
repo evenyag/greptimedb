@@ -352,11 +352,16 @@ pub(crate) struct FilePart {
 }
 
 impl FilePart {
+    pub(crate) fn replay_bytes(&self, batch: usize) -> Result<usize> {
+        checked_mul(self.bounds[batch], 4)
+    }
+
     pub(crate) fn read(
         &self,
         batch: usize,
         schema: &SchemaRef,
         open: &mut Option<(usize, File)>,
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     ) -> Result<Arc<BatchData>> {
         let resources = &self.owner.resources;
         #[cfg(test)]
@@ -372,7 +377,7 @@ impl FilePart {
         if range.len() > bound {
             return Err(fail("encoded block exceeds admitted bound"));
         }
-        let _workspace = resources.reserve(Kind::Workspace, checked_mul(bound, 3)?)?;
+        let _workspace = resources.reserve_in(Kind::Workspace, checked_mul(bound, 3)?, pool)?;
         let id = Arc::as_ptr(&self.owner) as usize;
         if open.as_ref().is_none_or(|(current, _)| *current != id) {
             let file = File::open(&self.owner.path)
@@ -394,7 +399,7 @@ impl FilePart {
             .reconstruction
             .measure(|| convert(&decoded, schema))?;
         let size = unique_batch_bytes(&compact)?;
-        let charge = resources.reserve(Kind::Payload, size)?;
+        let charge = resources.reserve_in(Kind::Payload, size, pool)?;
         resources.count("decoded_rows", compact.num_rows());
         resources.count("decoded_batches", 1);
         resources.peak("replay_payload_bytes", size);

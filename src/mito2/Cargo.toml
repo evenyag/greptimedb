@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+dev-tools = []
 test = ["common-test-util", "rstest", "rstest_reuse", "rskafka"]
 testing = ["test"]
 test-shared-fs-region-migration = []

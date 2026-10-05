@@ -743,3 +743,291 @@ async fn publication_never_overwrites_an_existing_artifact() {
         resources.snapshot().resource_bytes
     );
 }
+
+#[tokio::test]
+async fn unpublished_spill_and_prepaid_independent_replay() {
+    use crate::read::series_result::budget::BudgetPool;
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        let root = common_test_util::temp_dir::create_temp_dir("buffered-stage4");
+        let input = fixture(&[(1, 1, 33), (2, 1, 19)]);
+        let mut builder = ResultBuilder::new(
+            root.path(),
+            input.schema(),
+            StoreOptions {
+                layout,
+                batch_rows: 8,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let resources = builder.resources();
+        builder = builder
+            .append(input.slice(0, 20), Placement::Resident)
+            .await
+            .unwrap();
+        builder = builder.spill_resident().await.unwrap();
+        builder = builder
+            .append(input.slice(20, 32), Placement::File)
+            .await
+            .unwrap();
+        let handle = builder.finish().await.unwrap();
+        assert!(!handle.has_resident());
+        let before = resources.snapshot();
+        let bytes = handle.replay_bytes().unwrap() * 2;
+        let credit = BudgetPool::replay(&resources.pool(), bytes).unwrap();
+        let pool: Arc<dyn MemoryPool> = credit.clone();
+        let mut first = handle
+            .series_cursor_in(
+                MetricSeriesId {
+                    table_id: 1,
+                    tsid: 1,
+                },
+                pool.clone(),
+            )
+            .unwrap();
+        let mut second = handle
+            .series_cursor_in(
+                MetricSeriesId {
+                    table_id: 2,
+                    tsid: 1,
+                },
+                pool,
+            )
+            .unwrap();
+        let mut rows = [0, 0];
+        loop {
+            let a = first.next().await.unwrap();
+            let b = second.next().await.unwrap();
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            rows[0] += a.map_or(0, |b| b.num_rows());
+            rows[1] += b.map_or(0, |b| b.num_rows());
+        }
+        assert_eq!([33, 19], rows);
+        assert_eq!(
+            before.counts.get("filesystem_write_bytes"),
+            resources.snapshot().counts.get("filesystem_write_bytes")
+        );
+        drop((first, second, handle));
+        credit.close();
+        drop(credit);
+        resources.drain_cleanup().await.unwrap();
+        assert_eq!(0, resources.snapshot().disk_bytes);
+        assert_eq!(0, resources.snapshot().payload_bytes);
+    }
+}
+
+#[tokio::test]
+async fn spilling_shared_results_is_rejected_and_partial_spill_cleans_up() {
+    let root = common_test_util::temp_dir::create_temp_dir("buffered-stage4");
+    let input = fixture(&[(1, 1, 64)]);
+    let builder = ResultBuilder::new(root.path(), input.schema(), StoreOptions::default())
+        .await
+        .unwrap();
+    let resources = builder.resources();
+    let handle = builder
+        .append(input, Placement::Resident)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(handle.clone().spill().await.is_err());
+    *resources.faults.write_after.lock().unwrap() = Some(0);
+    assert!(handle.spill().await.is_err());
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(0, resources.snapshot().disk_bytes);
+    assert_eq!(0, resources.snapshot().payload_bytes);
+}
+
+#[tokio::test]
+async fn lazy_replay_payload_is_independent_of_complete_range_count() {
+    use crate::read::series_result::budget::BudgetPool;
+    for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+        let mut baseline = None;
+        for count in [1, 8, 64] {
+            let dir = common_test_util::temp_dir::create_temp_dir("lazy-range-replay");
+            let input = fixture(&[(1, 1, 16), (1, 2, 16)]);
+            let builder = ResultBuilder::new(
+                dir.path(),
+                input.schema(),
+                StoreOptions {
+                    layout,
+                    batch_rows: 8,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let resources = builder.resources();
+            drop(builder);
+            let mut handles = Vec::new();
+            for _ in 0..count {
+                handles.push(
+                    ResultBuilder::with_resources(resources.clone(), input.schema())
+                        .unwrap()
+                        .append(input.clone(), Placement::File)
+                        .await
+                        .unwrap()
+                        .finish()
+                        .await
+                        .unwrap(),
+                );
+            }
+            let metadata = resources.snapshot().metadata_bytes;
+            let bytes = handles[0].replay_bytes().unwrap();
+            let credit = BudgetPool::replay(&resources.pool(), bytes).unwrap();
+            let pool: Arc<dyn MemoryPool> = credit.clone();
+            for handle in &handles {
+                let mut cursor = handle
+                    .series_cursor_in(
+                        MetricSeriesId {
+                            table_id: 1,
+                            tsid: 1,
+                        },
+                        pool.clone(),
+                    )
+                    .unwrap();
+                let mut rows = 0;
+                while let Some(batch) = cursor.next().await.unwrap() {
+                    rows += batch.num_rows();
+                }
+                assert_eq!(16, rows);
+                cursor.close().await.unwrap();
+                assert_eq!(0, resources.snapshot().payload_bytes);
+            }
+            let snapshot = resources.snapshot();
+            let payload = snapshot.peaks["replay_payload_bytes"];
+            if let Some(first) = baseline {
+                assert_eq!(first, payload);
+            } else {
+                baseline = Some(payload);
+            }
+            assert!(metadata > count * std::mem::size_of::<ResultHandle>());
+            drop(handles);
+            credit.close();
+            drop((credit, pool));
+            resources.drain_cleanup().await.unwrap();
+            assert_eq!(0, resources.snapshot().disk_bytes);
+        }
+    }
+}
+
+/// Equal-sequence winners are inherited from the merge's source ordering; IPC
+/// placement must preserve the chosen row rather than introduce a new tie-break.
+#[tokio::test]
+async fn equal_sequence_ties_preserve_the_range_merge_winner() {
+    use crate::read::BoxedRecordBatchStream;
+    use crate::read::flat_dedup::{FlatDedupReader, FlatLastRow};
+    use crate::read::flat_merge::FlatMergeReader;
+    use datatypes::arrow::array::TimestampMillisecondArray;
+    use futures::TryStreamExt;
+    for order in [[10.0, 20.0], [20.0, 10.0]] {
+        let template = fixture(&[(1, 1, 1)]);
+        let inputs = order
+            .into_iter()
+            .map(|value| {
+                let mut columns = template.columns().to_vec();
+                columns[0] = Arc::new(Float64Array::from(vec![value]));
+                columns[2] = Arc::new(TimestampMillisecondArray::from(vec![1000]));
+                let mut fields = template.schema().fields().to_vec();
+                fields[2] = Arc::new(
+                    fields[2]
+                        .as_ref()
+                        .clone()
+                        .with_data_type(columns[2].data_type().clone()),
+                );
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = inputs[0].schema();
+        let streams = inputs
+            .into_iter()
+            .map(|batch| Box::pin(futures::stream::iter([Ok(batch)])) as BoxedRecordBatchStream)
+            .collect();
+        let merge = FlatMergeReader::new(schema.clone(), streams, 8, None)
+            .await
+            .unwrap();
+        let output =
+            FlatDedupReader::new(Box::pin(merge.into_stream()), FlatLastRow::new(true), None)
+                .into_stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+        assert_eq!(1, output.iter().map(RecordBatch::num_rows).sum::<usize>());
+        let chosen = logical(&output[0]);
+        let winner = chosen
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0);
+        // This fixture's two equal cursors preserve the first source's row. It
+        // characterizes this shape, not a promise of stable ordering for all ties.
+        assert_eq!(order[0], winner);
+        for layout in [Layout::OneSeries, Layout::MultipleSeries] {
+            for placement in [Placement::Resident, Placement::File] {
+                let dir = common_test_util::temp_dir::create_temp_dir("buffered-ties");
+                let builder = ResultBuilder::new(
+                    dir.path(),
+                    schema.clone(),
+                    StoreOptions {
+                        layout,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let resources = builder.resources();
+                let handle = builder
+                    .append(output[0].clone(), placement)
+                    .await
+                    .unwrap()
+                    .finish()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    chosen,
+                    collect(handle.cursor().unwrap(), schema.clone()).await
+                );
+                drop(handle);
+                resources.drain_cleanup().await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn repeated_spill_checks_preserve_file_batch_packing() {
+    let dir = common_test_util::temp_dir::create_temp_dir("file-packing");
+    let first = fixture(&[(1, 1, 2)]);
+    let second = fixture(&[(1, 2, 2)]);
+    let builder = ResultBuilder::new(
+        dir.path(),
+        first.schema(),
+        StoreOptions {
+            layout: Layout::MultipleSeries,
+            batch_rows: 128,
+            ..StoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let resources = builder.resources();
+    let builder = builder.append(first, Placement::File).await.unwrap();
+    let builder = builder.spill_resident().await.unwrap();
+    let result = builder
+        .append(second, Placement::File)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert_eq!(1, result.num_batches());
+    assert_eq!(2, result.num_spans());
+    drop(result);
+    resources.drain_cleanup().await.unwrap();
+    assert_eq!(0, resources.snapshot().disk_bytes);
+}

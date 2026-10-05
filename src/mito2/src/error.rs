@@ -1232,6 +1232,19 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display(
+        "Buffered scan memory admission: stage={stage}, required={required}, available={available}, limit={limit}: {reason}"
+    ))]
+    BufferedScanMemory {
+        stage: String,
+        required: usize,
+        available: usize,
+        limit: usize,
+        reason: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Failed to scan series"))]
     ScanSeries {
         #[snafu(implicit)]
@@ -1624,6 +1637,8 @@ impl ErrorExt for Error {
             InconsistentTimestampLength { .. } => StatusCode::InvalidArguments,
 
             TooManyFilesToRead { .. } | TooManyGcJobs { .. } => StatusCode::RateLimited,
+
+            BufferedScanMemory { .. } => StatusCode::RuntimeResourcesExhausted,
 
             PruneFile { source, .. } => source.status_code(),
 

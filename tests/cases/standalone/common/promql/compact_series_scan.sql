@@ -31,6 +31,18 @@ TQL EVAL (2, 2, '1s') compact_scan_metric{job=~"api|db"};
 TQL EVAL (2, 2, '1s') sum_over_time(compact_scan_metric{host="a"}[3s]);
 SELECT host, job, ts, greptime_value FROM compact_scan_metric WHERE greptime_value > 1 ORDER BY host, ts;
 
+-- The third SST touches the second at an inclusive timestamp boundary. The
+-- fourth SST is disjoint; the final selector must visit the complete identity.
+INSERT INTO compact_scan_metric (host, job, ts, greptime_value) VALUES
+  ('a', 'api', 2000, 4), ('a', 'api', 9000, 9);
+ADMIN FLUSH_TABLE('compact_scan_physical');
+INSERT INTO compact_scan_metric (host, job, ts, greptime_value) VALUES
+  ('a', 'api', 10000, 10);
+ADMIN FLUSH_TABLE('compact_scan_physical');
+TQL EVAL (10, 10, '1s') compact_scan_metric{host="a"};
+TQL EVAL (10, 10, '1s') sum_over_time(compact_scan_metric{host="a"}[11s]);
+SELECT host, ts, greptime_value FROM compact_scan_metric WHERE host = 'a' AND ts >= 2000 ORDER BY ts;
+
 ALTER TABLE compact_scan_metric ADD COLUMN zone STRING NULL PRIMARY KEY;
 INSERT INTO compact_scan_metric (host, job, zone, ts, greptime_value) VALUES ('c', 'api', 'west', 2000, 30);
 TQL EVAL (2, 2, '1s') compact_scan_metric{host="c"};

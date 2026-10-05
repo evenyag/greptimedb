@@ -33,16 +33,16 @@ pub mod read_columns;
 pub mod scan_region;
 pub mod scan_util;
 pub(crate) mod seq_scan;
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) mod series_buffered;
 pub(crate) mod series_candidate;
 pub(crate) mod series_compact;
-pub(crate) mod series_reader;
-pub mod series_scan;
-// Stage 1 harness; integrated with range preparation in Stage 4.
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 mod series_prepare;
-// Stage 3 store is exercised independently until Stage 4 integrates preparation.
-#[cfg(any(test, feature = "test"))]
+pub(crate) mod series_reader;
+#[cfg(any(test, feature = "test", feature = "dev-tools"))]
 pub mod series_result;
+pub mod series_scan;
 pub mod stream;
 pub(crate) mod unordered_scan;
 

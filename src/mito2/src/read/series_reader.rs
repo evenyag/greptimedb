@@ -83,7 +83,7 @@ impl SeriesRange {
 }
 
 /// All series assigned to one data-reader partition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AssignedSeriesBatch {
     range: SeriesRange,
     series: Vec<MetricSeriesId>,
@@ -317,6 +317,24 @@ impl SeriesReader {
         })
     }
 
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) async fn build_complete_range(
+        &self,
+        range: PartitionRange,
+    ) -> Result<BoxedRecordBatchStream> {
+        build_series_partition_range(
+            self.stream_ctx.clone(),
+            range,
+            self.filter.clone(),
+            self.codec.clone(),
+            self.partition_pruner.clone(),
+            self.part_metrics.clone(),
+            self.compact.clone(),
+        )
+        .await
+        .map(|(stream, _)| stream)
+    }
+
     pub(crate) async fn build_stream(&self) -> Result<BoxedRecordBatchStream> {
         if self.partition_ranges.is_empty() || self.filter.series.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
@@ -441,6 +459,8 @@ async fn build_series_partition_range(
                 let ctx = stream_ctx.clone();
                 sources.push(Box::pin(try_stream! {
                     for (range, mapping) in ranges {
+                        #[cfg(any(test, feature = "dev-tools"))]
+                        let _reader_lifetime = compact.buffered_resources.as_ref().map(|resources| resources.reader_lease());
                         let mut reader = range.compact_reader(mapping, &filter.sorted_series, &compact.catalog.metrics).await?;
                         let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
                         while let Some(batch) = reader.try_next().await? {

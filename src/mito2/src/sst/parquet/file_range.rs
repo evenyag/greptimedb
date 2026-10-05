@@ -104,6 +104,72 @@ pub struct FileRange {
 }
 
 impl FileRange {
+    /// Keep shared source metadata charged until its final context owner disappears.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn admit_buffered_context(
+        &self,
+        resources: &Arc<crate::read::series_result::StoreResources>,
+    ) -> Result<()> {
+        let mut charge = self.context.buffered_charge.lock().unwrap();
+        let bytes = crate::read::series_result::checked_add(
+            self.context.memory_size(),
+            self.context
+                .range_index_searcher
+                .get()
+                .map_or(0, |index| index.buffered_metadata_bytes()),
+        )?;
+        match charge.as_mut() {
+            Some(charge) => charge.resize(bytes)?,
+            None => {
+                *charge = Some(
+                    resources
+                        .reserve(crate::read::series_result::resources::Kind::Metadata, bytes)?,
+                )
+            }
+        }
+        Ok(())
+    }
+
+    /// Conservative simultaneous decoder/fetch and decoded-input estimate. Compressed
+    /// and uncompressed source bytes are distinct; neither represents physical I/O.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn buffered_reader_bytes(&self) -> Result<usize> {
+        self.buffered_decode_bytes(false)
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn buffered_preflight_bytes(&self) -> Result<usize> {
+        self.buffered_decode_bytes(true)
+    }
+
+    #[cfg(any(test, feature = "dev-tools"))]
+    fn buffered_decode_bytes(&self, preflight: bool) -> Result<usize> {
+        use crate::read::series_result::{checked_add, checked_mul, fail};
+        let metadata = self.context.reader_builder.parquet_metadata();
+        let group = metadata.row_group(self.row_group_idx);
+        let pk = primary_key_column_index(group.num_columns());
+        group
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| preflight || *i != pk)
+            .try_fold(0, |sum, (_, column)| {
+                let compressed = usize::try_from(column.compressed_size())
+                    .map_err(|_| fail("negative compressed size"))?;
+                let decoded = usize::try_from(column.uncompressed_size())
+                    .map_err(|_| fail("negative uncompressed size"))?;
+                // Includes dictionary expansion, decompression contexts, source arrays
+                // and one merge head. These admission estimates remain separate from RSS.
+                checked_add(
+                    sum,
+                    checked_add(
+                        2 * 1024 * 1024,
+                        checked_add(compressed, checked_mul(decoded, 3)?)?,
+                    )?,
+                )
+            })
+    }
+
     /// Returns the shared range-index searcher, opening it on first use.
     pub(crate) async fn range_index_searcher(&self) -> Result<Option<&SstRangeIndexSearcher>> {
         self.context.range_index_searcher().await
@@ -685,6 +751,8 @@ pub struct FileRangeContext {
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.
     base: RangeBase,
+    #[cfg(any(test, feature = "dev-tools"))]
+    buffered_charge: std::sync::Mutex<Option<crate::read::series_result::resources::Charge>>,
 }
 
 pub type FileRangeContextRef = Arc<FileRangeContext>;
@@ -701,6 +769,8 @@ impl FileRangeContext {
             base,
             range_index_store,
             range_index_searcher: OnceCell::new(),
+            #[cfg(any(test, feature = "dev-tools"))]
+            buffered_charge: std::sync::Mutex::new(None),
         }
     }
 

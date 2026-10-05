@@ -589,6 +589,23 @@ struct TagCatalogState {
 }
 
 impl TagCatalog {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) fn buffered_tag_bytes(&self, rows: usize) -> Result<usize> {
+        use crate::read::series_result::{checked_add, checked_mul};
+        let inner = self.inner.lock().unwrap();
+        let mut maximum = 0;
+        for values in inner.values.values() {
+            let row = values.iter().try_fold(64usize, |n, value| {
+                checked_add(n, checked_add(64, value.as_value_ref().data_size())?)
+            })?;
+            maximum = maximum.max(row);
+        }
+        // Include per-column builder minimum capacities and array bookkeeping,
+        // even for one-row slices. This is admission headroom, not measured RSS.
+        let fixed = checked_mul(self.metadata.column_metadatas.len(), 4096)?;
+        checked_add(fixed, checked_mul(checked_mul(maximum, rows)?, 4)?)
+    }
+
     pub(crate) fn new(
         metadata: RegionMetadataRef,
         pool: &Arc<dyn MemoryPool>,
@@ -746,6 +763,8 @@ type MappedFileRange = (FileRange, Arc<SeriesRowMapping>);
 
 /// All source handles are established before any partition receives an assignment.
 pub(crate) struct CompactReadContext {
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) buffered_resources: Option<Arc<crate::read::series_result::StoreResources>>,
     pub(crate) schema: CompactSchema,
     pub(crate) catalog: Arc<TagCatalog>,
     files: HashMap<(usize, i64), Vec<MappedFileRange>>,
@@ -761,6 +780,30 @@ impl CompactReadContext {
         metrics: &PartitionMetrics,
         catalog: Arc<TagCatalog>,
         assignment_reservation: MemoryReservation,
+    ) -> Result<Self> {
+        Self::preflight_inner(
+            ctx,
+            ranges,
+            pruner,
+            metrics,
+            catalog,
+            assignment_reservation,
+            #[cfg(any(test, feature = "dev-tools"))]
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn preflight_inner(
+        ctx: &StreamContext,
+        ranges: &[PartitionRange],
+        pruner: &PartitionPruner,
+        metrics: &PartitionMetrics,
+        catalog: Arc<TagCatalog>,
+        assignment_reservation: MemoryReservation,
+        #[cfg(any(test, feature = "dev-tools"))] resources: Option<
+            Arc<crate::read::series_result::StoreResources>,
+        >,
     ) -> Result<Self> {
         let timer_metric = catalog.metrics.preflight_time.clone();
         let _timer = timer_metric.timer();
@@ -786,7 +829,36 @@ impl CompactReadContext {
                 metrics.merge_reader_metrics(&reader_metrics, None);
                 let mut prepared = Vec::with_capacity(sources.len());
                 for source in sources {
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    let _preflight_charge = if let Some(resources) = &resources {
+                        source.admit_buffered_context(resources)?;
+                        let bytes = source.buffered_preflight_bytes()?;
+                        Some(
+                            resources
+                                .reserve(
+                                    crate::read::series_result::resources::Kind::Workspace,
+                                    bytes,
+                                )
+                                .map_err(|error| {
+                                    crate::error::BufferedScanMemorySnafu {
+                                        stage: "mapping preflight".to_owned(),
+                                        required: bytes,
+                                        available: resources.available(),
+                                        limit: resources.options.memory_bytes,
+                                        reason: error.to_string(),
+                                    }
+                                    .build()
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
                     let mapping = source.preflight_compact_mapping(&catalog).await?;
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    if let Some(resources) = &resources {
+                        // Opening an index during preflight also retains its metadata.
+                        source.admit_buffered_context(resources)?;
+                    }
                     reservation
                         .try_grow(mapping.estimated_size())
                         .context(MergeCandidateSeriesSnafu)?;
@@ -806,6 +878,8 @@ impl CompactReadContext {
             .context(MergeCandidateSeriesSnafu)?;
         catalog.metrics.mapping_bytes.set(reservation.size());
         Ok(Self {
+            #[cfg(any(test, feature = "dev-tools"))]
+            buffered_resources: None,
             schema: CompactSchema::new(&ctx.input.mapper),
             catalog,
             files,

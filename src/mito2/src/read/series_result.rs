@@ -17,10 +17,11 @@
 //! This PoC module is available to tests/developer benchmarks until Stage 4.
 //! Files are ephemeral, query-owned IPC artifacts, not a persisted engine format.
 
+pub(crate) mod budget;
 mod ipc;
-mod resources;
+pub(crate) mod resources;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_ipc::CompressionType;
+use datafusion::execution::memory_pool::MemoryPool;
 use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray, UInt32Array};
 use datatypes::arrow::compute::{cast, concat_batches, take};
 use datatypes::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
@@ -212,6 +214,7 @@ struct DirectoryEntry {
 }
 
 enum Source {
+    Pending,
     Resident(Arc<BatchData>),
     File { part: Arc<FilePart>, batch: usize },
 }
@@ -243,6 +246,122 @@ impl ResultHandle {
         })
     }
 
+    pub(crate) fn series_cursor_in(
+        &self,
+        series: MetricSeriesId,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<ResultCursor> {
+        let spans = &self.0.spans;
+        let start = spans.partition_point(|s| s.series < series);
+        let end = spans.partition_point(|s| s.series <= series);
+        ResultCursor::with_pool(self.clone(), Some(start..end), pool)
+    }
+
+    pub(crate) fn has_series(&self, id: MetricSeriesId) -> bool {
+        let spans = &self.0.spans;
+        let index = spans.partition_point(|s| s.series < id);
+        spans.get(index).is_some_and(|s| s.series == id)
+    }
+
+    pub(crate) fn has_resident(&self) -> bool {
+        self.0
+            .directory
+            .iter()
+            .any(|entry| matches!(entry.source, Source::Resident(_)))
+    }
+
+    /// Maximum incremental cursor/decode memory, including unrelated backing rows.
+    pub(crate) fn replay_bytes(&self) -> Result<usize> {
+        if self.0.directory.is_empty() {
+            return Ok(0);
+        }
+        self.0.directory.iter().try_fold(1024, |maximum, entry| {
+            let bytes = match &entry.source {
+                Source::Resident(_) => 1024,
+                Source::File { part, batch } => checked_add(part.replay_bytes(*batch)?, 1024)?,
+                Source::Pending => return Err(fail("unfinalized result")),
+            };
+            Ok(maximum.max(bytes))
+        })
+    }
+
+    /// Extra backing capacity when a downstream consumer retains this whole
+    /// identity. Resident payload is already charged to the immutable result.
+    pub(crate) fn series_output_bytes(&self, id: MetricSeriesId, tags: usize) -> Result<usize> {
+        let start = self.0.spans.partition_point(|span| span.series < id);
+        self.0.spans[start..]
+            .iter()
+            .take_while(|span| span.series == id)
+            .try_fold(0, |sum, span| {
+                let payload = match &self.0.directory[span.batch].source {
+                    Source::Resident(_) => 0,
+                    Source::File { part, batch } => part.replay_bytes(*batch)?,
+                    Source::Pending => return Err(fail("unfinalized result")),
+                };
+                checked_add(sum, checked_add(payload, tags)?)
+            })
+    }
+
+    /// Only an unpublished, exclusively owned result may change placement.
+    pub(crate) async fn spill(self) -> Result<Self> {
+        let resources = self.0.resources.clone();
+        resources
+            .clone()
+            .blocking(move || {
+                let mut data = Arc::try_unwrap(self.0)
+                    .map_err(|_| fail("cannot spill a published/shared result"))?;
+                let helper = ResultBuilder::with_resources(resources.clone(), data.schema.clone())?;
+                let mut writer: Option<OpenWriter> = None;
+                let mut positions = Vec::new();
+                fn finish(
+                    writer: &mut Option<OpenWriter>,
+                    positions: &mut Vec<usize>,
+                    data: &mut ResultData,
+                ) -> Result<()> {
+                    if let Some(writer) = writer.take() {
+                        let part = writer.finish()?;
+                        for (batch, index) in positions.drain(..).enumerate() {
+                            data.directory[index].source = Source::File {
+                                part: part.clone(),
+                                batch,
+                            };
+                        }
+                    }
+                    Ok(())
+                }
+                for index in 0..data.directory.len() {
+                    let Source::Resident(batch) = &data.directory[index].source else {
+                        continue;
+                    };
+                    let bytes = normalized_size(&batch.batch)?;
+                    let _workspace = resources.reserve(Kind::Workspace, checked_mul(bytes, 4)?)?;
+                    let plain = helper.normalize(&batch.batch)?;
+                    let storage = helper.storage_batch(&plain)?;
+                    let bound = ipc::write_bound(&storage, &resources.options)?;
+                    if writer.as_ref().is_some_and(|w| !w.fits(bound)) {
+                        finish(&mut writer, &mut positions, &mut data)?;
+                    }
+                    if writer.is_none() {
+                        writer = Some(OpenWriter::new(
+                            resources.clone(),
+                            helper.storage_schema.clone(),
+                        )?);
+                    }
+                    writer
+                        .as_mut()
+                        .ok_or_else(|| fail("missing spill writer"))?
+                        .append(&storage)?;
+                    positions.push(index);
+                    // Serialization has consumed this backing allocation. Pending references
+                    // stay private until every corresponding file has finalized successfully.
+                    data.directory[index].source = Source::Pending;
+                }
+                finish(&mut writer, &mut positions, &mut data)?;
+                Ok(Self(Arc::new(data)))
+            })
+            .await
+    }
+
     pub fn num_batches(&self) -> usize {
         self.0.directory.len()
     }
@@ -257,6 +376,7 @@ pub struct ResultCursor {
     spans: Option<Range<usize>>,
     position: usize,
     state: Option<CursorState>,
+    pool: Arc<dyn MemoryPool>,
 }
 
 struct CursorState {
@@ -279,12 +399,23 @@ impl Drop for ResultCursor {
 
 impl ResultCursor {
     fn new(handle: ResultHandle, spans: Option<Range<usize>>) -> Result<Self> {
-        let charge = handle
-            .0
-            .resources
-            .reserve(Kind::Workspace, std::mem::size_of::<Self>() + 256)?;
+        let pool = handle.0.resources.pool();
+        Self::with_pool(handle, spans, pool)
+    }
+
+    fn with_pool(
+        handle: ResultHandle,
+        spans: Option<Range<usize>>,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
+        let charge = handle.0.resources.reserve_in(
+            Kind::Workspace,
+            std::mem::size_of::<Self>() + 256,
+            &pool,
+        )?;
         Ok(Self {
             handle,
+            pool,
             spans,
             position: 0,
             state: Some(CursorState {
@@ -293,6 +424,20 @@ impl ResultCursor {
                 _charge: charge,
             }),
         })
+    }
+
+    /// Await normal cursor destruction before opening another range, so deferred
+    /// blocking close work cannot accumulate retained payload across many ranges.
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        let state = self.state.take();
+        self.handle
+            .0
+            .resources
+            .blocking(move || {
+                drop(state);
+                Ok(())
+            })
+            .await
     }
 
     /// Cancellation poisons this cursor and drops its in-flight workspace after the
@@ -324,6 +469,7 @@ impl ResultCursor {
         };
         let result = self.handle.0.clone();
         let resources = result.resources.clone();
+        let pool = self.pool.clone();
         let (state, lease) = resources
             .blocking(move || {
                 let mut state = state;
@@ -336,9 +482,10 @@ impl ResultCursor {
                         state.cached = None;
                         result.resources.count("cache_misses", 1);
                         let data = match &result.directory[item.0].source {
+                            Source::Pending => return Err(fail("unfinalized result")),
                             Source::Resident(data) => data.clone(),
                             Source::File { part, batch } => {
-                                part.read(*batch, &result.schema, &mut state.file)?
+                                part.read(*batch, &result.schema, &mut state.file, &pool)?
                             }
                         };
                         state.cached = Some((item.0, data.clone()));
@@ -465,16 +612,73 @@ impl ResultBuilder {
     }
 
     pub async fn append(self, batch: RecordBatch, placement: Placement) -> Result<Self> {
+        self.append_owned(batch, placement, None).await
+    }
+
+    /// The complete merge admission already covers this batch. Pin that admission
+    /// through queued/running serialization instead of charging its buffers twice.
+    pub(crate) async fn append_prepared(
+        self,
+        batch: RecordBatch,
+        placement: Placement,
+        owner: Arc<Charge>,
+    ) -> Result<Self> {
+        self.append_owned(batch, placement, Some(owner)).await
+    }
+
+    async fn append_owned(
+        self,
+        batch: RecordBatch,
+        placement: Placement,
+        owner: Option<Arc<Charge>>,
+    ) -> Result<Self> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelOnDrop(cancelled.clone());
+        // Charge before dispatch, including time spent queued on the blocking runtime.
+        let input = if owner.is_none() {
+            Some(
+                self.resources
+                    .reserve(Kind::Workspace, unique_batch_bytes(&batch)?)?,
+            )
+        } else {
+            None
+        };
         self.resources
             .clone()
             .blocking(move || {
+                let _input = (input, owner);
                 let mut builder = self;
                 builder.append_blocking(batch, placement, &cancelled)?;
                 Ok(builder)
             })
             .await
+    }
+
+    pub(crate) async fn spill_resident(self) -> Result<Self> {
+        if !self
+            .directory
+            .iter()
+            .any(|entry| matches!(entry.source, Source::Resident(_)))
+            && (self.pending_rows == 0 || self.placement == Placement::File)
+        {
+            // File-bound staging is already bounded. Flushing it on every
+            // threshold check would silently defeat multi-series batch packing.
+            return Ok(self);
+        }
+        let handle = self.finish().await?;
+        let handle = if handle.has_resident() {
+            handle.spill().await?
+        } else {
+            handle
+        };
+        let data = Arc::try_unwrap(handle.0).map_err(|_| fail("shared unpublished builder"))?;
+        let mut builder = Self::with_resources(data.resources, data.schema)?;
+        builder.last_series = data.spans.last().map(|s| s.series);
+        builder.directory = data.directory;
+        builder.spans = data.spans;
+        builder.metadata = data._metadata;
+        builder.placement = Placement::File;
+        Ok(builder)
     }
 
     pub async fn finish(self) -> Result<ResultHandle> {
@@ -504,10 +708,6 @@ impl ResultBuilder {
         if batch.schema() != self.schema {
             return Err(fail("compact input schema mismatch"));
         }
-        // Input is caller-owned, but the store's temporary retention is admitted too.
-        let _input = self
-            .resources
-            .reserve(Kind::Workspace, unique_batch_bytes(&batch)?)?;
         if self.placement != placement {
             self.flush_batch()?;
             self.finish_file()?;
@@ -838,7 +1038,7 @@ pub fn operation_values(resources: &StoreResources) -> BTreeMap<String, usize> {
 }
 
 /// Counts unique backing buffers (IPC arrays can share one whole encoded block).
-fn unique_batch_bytes(batch: &RecordBatch) -> Result<usize> {
+pub(crate) fn unique_batch_bytes(batch: &RecordBatch) -> Result<usize> {
     fn visit(data: &datatypes::arrow::array::ArrayData, allocations: &mut BTreeMap<usize, usize>) {
         for buffer in data
             .buffers()
@@ -862,6 +1062,46 @@ fn unique_batch_bytes(batch: &RecordBatch) -> Result<usize> {
         .try_fold(checked_mul(batch.num_columns(), 256)?, |n, size| {
             checked_add(n, *size)
         })
+}
+
+/// Output fields can borrow a resident batch; only newly allocated backing buffers
+/// consume replay credit. Existing buffers retain their original ownership leases.
+pub(crate) fn incremental_batch_bytes(
+    batch: &RecordBatch,
+    borrowed: &RecordBatch,
+) -> Result<usize> {
+    fn buffers(data: &datatypes::arrow::array::ArrayData, output: &mut BTreeMap<usize, usize>) {
+        for buffer in data
+            .buffers()
+            .iter()
+            .chain(data.nulls().map(|n| n.buffer()))
+        {
+            output
+                .entry(buffer.data_ptr().as_ptr() as usize)
+                .or_insert(buffer.capacity());
+        }
+        for child in data.child_data() {
+            buffers(child, output);
+        }
+    }
+    let mut existing = BTreeMap::new();
+    let mut output = BTreeMap::new();
+    for array in borrowed.columns() {
+        buffers(&array.to_data(), &mut existing);
+    }
+    for array in batch.columns() {
+        buffers(&array.to_data(), &mut output);
+    }
+    output
+        .iter()
+        .filter(|(address, _)| !existing.contains_key(address))
+        .try_fold(checked_mul(batch.num_columns(), 256)?, |n, (_, bytes)| {
+            checked_add(n, *bytes)
+        })
+}
+
+pub(crate) fn pin_batch(batch: RecordBatch, charge: Charge) -> Result<RecordBatch> {
+    Ok(BatchData::new(batch, charge)?.batch.clone())
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);

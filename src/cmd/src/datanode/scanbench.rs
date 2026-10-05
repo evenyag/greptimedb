@@ -1334,6 +1334,16 @@ impl ScanbenchCommand {
                     .split("\"mode\":\"")
                     .nth(1)
                     .and_then(|s| s.split('"').next());
+                let buffered_settings = effective_scanner
+                    .split("\"buffered_settings\":")
+                    .nth(1)
+                    .and_then(|json| {
+                        serde_json::Deserializer::from_str(json)
+                            .into_iter::<serde_json::Value>()
+                            .next()
+                    })
+                    .and_then(std::result::Result::ok)
+                    .unwrap_or(serde_json::Value::Null);
                 run_results.push(ScanRunResult {
                     iteration: iteration + 1,
                     query_index: query_index + 1,
@@ -1369,11 +1379,12 @@ impl ScanbenchCommand {
                         .collect(),
                     effective_settings: serde_json::json!({
                         "mode": effective_mode,
-                        "source_policy": if matches!(effective_mode, Some("two_phase" | "compact")) { "selected_series_per_partition" } else { "native" },
-                        "query_memory_budget_bytes": null,
+                        "source_policy": if matches!(effective_mode, Some("two_phase" | "compact" | "buffered")) { "selected_series_per_partition" } else { "native" },
+                        "query_memory_budget_bytes": buffered_settings.get("query_memory_budget_bytes"),
                         "baseline_shared_scan_memory_limit": format!("{:?}", engine.mito_config().scan_memory_limit),
-                        "spill_threshold_bytes": null,
-                        "ipc_layout": "not_applicable",
+                        "spill_threshold_bytes": buffered_settings.get("spill_threshold_bytes"),
+                        "ipc_layout": buffered_settings.get("ipc_layout").cloned().unwrap_or_else(|| serde_json::json!("not_applicable")),
+                        "buffered": buffered_settings,
                         "batch_rows": mito2::sst::parquet::DEFAULT_READ_BATCH_SIZE,
                         "timing_only": self.timing_only,
                         "actual_output_partitions": num_partitions,
@@ -1382,8 +1393,10 @@ impl ScanbenchCommand {
                         "reference_written": self.write_reference.is_some(),
                         "order_checked": self.check_series_order,
                         "effective_engine_config": format!("{:?}", engine.mito_config()),
-                        "primary_key_page_audit": if effective_mode == Some("compact") { Some("decoder_projection_and_requested_bytes_including_cache_hits") } else { None },
-                        "unavailable_phase_metrics": if effective_mode == Some("compact") {
+                        "primary_key_page_audit": if matches!(effective_mode, Some("compact" | "buffered")) { Some("decoder_projection_and_requested_bytes_including_cache_hits") } else { None },
+                        "unavailable_phase_metrics": if effective_mode == Some("buffered") {
+                            vec!["physical_storage_traffic"]
+                        } else if effective_mode == Some("compact") {
                             vec!["spill_finalization", "readiness_wait", "final_replay", "cleanup", "workspace_capacity"]
                         } else {
                             vec!["mapping_preflight", "spill_finalization", "readiness_wait", "final_replay", "tag_assembly", "cleanup", "data_phase_primary_key_pages", "catalog_index_capacity", "workspace_capacity"]
