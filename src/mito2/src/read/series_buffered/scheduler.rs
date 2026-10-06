@@ -774,68 +774,87 @@ mod tests {
     use super::*;
     use crate::read::series_result::tests::fixture;
     use crate::read::series_result::{Layout, StoreOptions};
-    use datatypes::arrow::array::TimestampMillisecondArray;
+    use datatypes::arrow::array::{StringArray, TimestampMillisecondArray};
+    use datatypes::arrow::compute::cast;
     use datatypes::arrow::datatypes::Schema;
     use datatypes::arrow::record_batch::RecordBatch;
 
     #[tokio::test]
     async fn buffered_large_fan_in_uses_bytes_and_finalized_sources() {
+        common_telemetry::init_default_ut_logging();
         for layout in [Layout::OneSeries, Layout::MultipleSeries] {
-            let dir = common_test_util::temp_dir::create_temp_dir("buffered-159-inputs");
-            let template = fixture(&[(1, 1, 8), (2, 1, 8)]);
-            let mut columns = template.columns().to_vec();
-            columns[2] = Arc::new(TimestampMillisecondArray::from_iter_values(
-                (0..8).chain(0..8),
-            ));
-            let mut fields = template.schema().fields().to_vec();
-            fields[2] = Arc::new(
-                fields[2]
-                    .as_ref()
-                    .clone()
-                    .with_data_type(columns[2].data_type().clone()),
-            );
-            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
-            let resources = StoreResources::new(
-                dir.path(),
-                StoreOptions {
-                    layout,
-                    batch_rows: 4,
-                    batch_bytes: 8192,
-                    memory_bytes: 64 * 1024 * 1024,
-                    metadata_bytes: 8 * 1024 * 1024,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-            let mut parts = Vec::new();
-            for index in 0..159 {
-                let placement = if index % 2 == 0 {
-                    Placement::File
-                } else {
-                    Placement::Resident
-                };
-                let result = ResultBuilder::with_resources(resources.clone(), batch.schema())
-                    .unwrap()
-                    .with_phase("source")
-                    .append(batch.clone(), placement)
-                    .await
-                    .unwrap()
-                    .finish()
-                    .await
-                    .unwrap();
-                parts.push(vec![Some(result)]);
+            for count in [8, 16, 32, 64, 159] {
+                for width in [8, 4096] {
+                    check_buffered_sources(layout, count, width).await;
+                }
             }
-            let required = merge_bytes(&parts, 4).unwrap();
-            assert!(
-                required < resources.available(),
-                "merge requires {required}, available {}",
-                resources.available()
-            );
-            let budget = TaskBudget(
-                BudgetPool::prepaid(&resources.pool(), required, "range merge").unwrap(),
-            );
+        }
+    }
+
+    async fn check_buffered_sources(layout: Layout, count: usize, width: usize) {
+        let dir = common_test_util::temp_dir::create_temp_dir("buffered-source-matrix");
+        let template = fixture(&[(1, 1, 8), (2, 1, 8)]);
+        let mut columns = template.columns().to_vec();
+        let labels =
+            StringArray::from_iter_values((0..16).map(|i| format!("{i}:{}", "x".repeat(width))));
+        columns[1] = cast(&labels, template.schema().field(1).data_type()).unwrap();
+        columns[2] = Arc::new(TimestampMillisecondArray::from_iter_values(
+            (0..8).chain(0..8),
+        ));
+        let mut fields = template.schema().fields().to_vec();
+        fields[2] = Arc::new(
+            fields[2]
+                .as_ref()
+                .clone()
+                .with_data_type(columns[2].data_type().clone()),
+        );
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let resources = StoreResources::new(
+            dir.path(),
+            StoreOptions {
+                layout,
+                batch_rows: 4,
+                batch_bytes: 8192,
+                memory_bytes: 64 * 1024 * 1024,
+                metadata_bytes: 8 * 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut parts = Vec::new();
+        for index in 0..count {
+            let placement = if index % 2 == 0 {
+                Placement::File
+            } else {
+                Placement::Resident
+            };
+            let result = ResultBuilder::with_resources(resources.clone(), batch.schema())
+                .unwrap()
+                .with_phase("source")
+                .append(batch.clone(), placement)
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            parts.push(vec![Some(result)]);
+        }
+        let required = merge_bytes(&parts, 4).unwrap();
+        let available = resources.available();
+        let reservation = BudgetPool::prepaid(&resources.pool(), required, "range merge");
+        // Many narrow inputs fit; fewer wide inputs exhaust the same byte budget.
+        if width == 8 || count <= 16 {
+            assert!(reservation.is_ok());
+        }
+        if width == 4096 && count >= 64 {
+            assert!(reservation.is_err());
+        }
+        let admitted = reservation.is_ok();
+        let writes = resources.snapshot().counts["filesystem_write_bytes"];
+        let mut rows = 0;
+        if let Ok(credit) = reservation {
+            let budget = TaskBudget(credit);
             let pool: Arc<dyn MemoryPool> = budget.0.clone();
-            let writes = resources.snapshot().counts["filesystem_write_bytes"];
             let sources = parts
                 .into_iter()
                 .map(|mut part| {
@@ -851,26 +870,36 @@ mod tests {
                 .await
                 .unwrap();
             let mut stream = Box::pin(merge.into_stream());
-            let mut rows = 0;
             while let Some(batch) = stream.try_next().await.unwrap() {
                 rows += batch.num_rows();
             }
-            assert_eq!(159 * 16, rows);
+            assert_eq!(count * 16, rows);
             drop(stream);
             drop(budget);
-            resources.drain_cleanup().await.unwrap();
-            let snapshot = resources.snapshot();
-            assert_eq!(writes, snapshot.counts["filesystem_write_bytes"]);
-            assert_eq!(0, snapshot.workspace_bytes);
-            assert_eq!(0, snapshot.payload_bytes);
-            assert_eq!(0, snapshot.disk_bytes);
-            assert!(snapshot.ownership.values().all(|bytes| *bytes == 0));
-            // A byte request larger than the same query budget fails even though
-            // it could represent just one wide input; there is no count gate.
-            assert!(
-                BudgetPool::prepaid(&resources.pool(), 65 * 1024 * 1024, "range merge").is_err()
-            );
+        } else {
+            drop(parts);
         }
+        resources.drain_cleanup().await.unwrap();
+        let snapshot = resources.snapshot();
+        assert_eq!(writes, snapshot.counts["filesystem_write_bytes"]);
+        assert_eq!(0, snapshot.workspace_bytes);
+        assert_eq!(0, snapshot.payload_bytes);
+        assert_eq!(0, snapshot.disk_bytes);
+        assert!(snapshot.ownership.values().all(|bytes| *bytes == 0));
+        common_telemetry::info!(
+            "buffered_source_matrix {}",
+            serde_json::json!({
+                "layout": format!("{layout:?}"), "source_count": count,
+                "label_bytes": width, "rows": rows, "admitted": admitted,
+                "memory_budget_bytes": 64 * 1024 * 1024, "available_bytes": available,
+                "input_array_bytes": batch.get_array_memory_size(),
+                "merge_required_bytes": required, "resources_after_cleanup": snapshot,
+                "scope": "finalized IPC sources, not SST decoder or PromQL timing",
+            })
+        );
+        // A byte request larger than the same query budget fails even though
+        // it could represent just one wide input; there is no count gate.
+        assert!(BudgetPool::prepaid(&resources.pool(), 65 * 1024 * 1024, "range merge").is_err());
     }
 
     #[tokio::test]
