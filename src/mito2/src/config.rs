@@ -14,6 +14,8 @@
 
 //! Configurations.
 
+pub mod buffered_scan;
+
 use std::cmp;
 use std::path::Path;
 use std::time::Duration;
@@ -209,6 +211,9 @@ pub struct MitoConfig {
     /// Enables the PoC compact identity path for eligible metric series scans.
     pub experimental_series_scan_compact: bool,
 
+    /// Opt-in buffered preparation and replay for eligible metric series scans.
+    pub experimental_buffered_series_scan: buffered_scan::BufferedScanConfig,
+
     pub gc: GcConfig,
 }
 
@@ -266,6 +271,7 @@ impl Default for MitoConfig {
             default_flat_format: true,
             experimental_series_scan_v2: true,
             experimental_series_scan_compact: false,
+            experimental_buffered_series_scan: buffered_scan::BufferedScanConfig::default(),
             gc: GcConfig::default(),
         };
 
@@ -283,6 +289,7 @@ impl MitoConfig {
     ///
     /// Returns an error if there is a configuration that unable to sanitize.
     pub fn sanitize(&mut self, data_home: &str) -> Result<()> {
+        self.experimental_buffered_series_scan.sanitize(data_home)?;
         if self.experimental_enable_series_index {
             snafu::ensure!(
                 self.experimental_series_index_max_size.as_bytes() >= 1024,

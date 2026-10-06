@@ -36,7 +36,6 @@ pub struct SstRangeIndexSearcher {
 }
 
 impl SstRangeIndexSearcher {
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_metadata_bytes(&self) -> usize {
         self.reader.buffered_metadata_bytes()
     }

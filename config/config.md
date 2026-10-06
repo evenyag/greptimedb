@@ -219,7 +219,23 @@
 | `region_engine.mito.default_flat_format` | Bool | `true` | Whether to enable flat format as the default SST format. |
 | `region_engine.mito.experimental_series_scan_v2` | Bool | `true` | Whether to enable the experimental two-phase mode for eligible metric series scans. |
 | `region_engine.mito.experimental_series_scan_compact` | Bool | `false` | Whether to enable the PoC compact identity path for eligible metric series scans. |
-| `region_engine.mito.index` | -- | -- | The options for index in Mito engine. |
+| `region_engine.mito.experimental_buffered_series_scan` | -- | -- | Experimental complete-range preparation and replay for eligible metric series scans.<br/>Disabled by default. These provisional settings are not a production recommendation. |
+| `region_engine.mito.experimental_buffered_series_scan.enabled` | Bool | `false` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.memory_limit` | String | `50%` | Hard tracked-memory budget per SeriesScan, shared by its tasks and partitions.<br/>Percentages use cgroup-aware startup memory. This is not an RSS limit or a whole-PromQL-query limit. |
+| `region_engine.mito.experimental_buffered_series_scan.disk_limit` | String | `20GB` | Omit to use one quarter of the resolved memory budget. Reclamation happens only during preparation.<br/>Per-scan spill quota; cache storage is provisioned separately. |
+| `region_engine.mito.experimental_buffered_series_scan.preparation_concurrency` | Integer | `0` | Omit to use {data_home}/buffered-scan-scratch. Use a writable path outside SST storage.<br/>Zero resolves once at startup to clamp(cpu_cores / 4, 1, 4).<br/>Shared mode applies this ceiling independently to source tasks and range merges; byte admission governs both. |
+| `region_engine.mito.experimental_buffered_series_scan.source_policy` | String | `selected_series_per_partition` | selected_series_per_partition or shared_selected_series. |
+| `region_engine.mito.experimental_buffered_series_scan.candidate_chunk_size` | Integer | `1000000` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.layout` | String | `multiple_series` | one_series or multiple_series. |
+| `region_engine.mito.experimental_buffered_series_scan.key_encoding` | String | `plain` | plain or fixed_dictionary. Fixed dictionaries include all selected identities and count toward metadata limits. |
+| `region_engine.mito.experimental_buffered_series_scan.compression` | String | `none` | none, lz4, or zstd. |
+| `region_engine.mito.experimental_buffered_series_scan.batch_rows` | Integer | `1024` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.batch_bytes` | String | `1MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_bytes` | String | `64MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_batches` | Integer | `1024` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_metadata_bytes` | String | `1MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.retention` | String | `threshold` | threshold, forced_spill, or resident. Resident mode fails if admission requires spilling. |
+| `region_engine.mito.index` | -- | -- | Optional ephemeral cache; disabled when this table is absent. Preserve separate disk and metadata budgets.<br/>The options for index in Mito engine. |
 | `region_engine.mito.index.aux_path` | String | `""` | Auxiliary directory path for the index in filesystem, used to store intermediate files for<br/>creating the index and staging files for searching the index, defaults to `{data_home}/index_intermediate`.<br/>The default name for this directory is `index_intermediate` for backward compatibility.<br/><br/>This path contains two subdirectories:<br/>- `__intm`: for storing intermediate files used during creating index.<br/>- `staging`: for storing staging files used during searching index. |
 | `region_engine.mito.index.staging_size` | String | `2GB` | The max capacity of the staging directory. |
 | `region_engine.mito.index.staging_ttl` | String | `7d` | The TTL of the staging directory.<br/>Defaults to 7 days.<br/>Setting it to "0s" to disable TTL. |
@@ -690,7 +706,23 @@
 | `region_engine.mito.default_flat_format` | Bool | `true` | Whether to enable flat format as the default SST format. |
 | `region_engine.mito.experimental_series_scan_v2` | Bool | `true` | Whether to enable the experimental two-phase mode for eligible metric series scans. |
 | `region_engine.mito.experimental_series_scan_compact` | Bool | `false` | Whether to enable the PoC compact identity path for eligible metric series scans. |
-| `region_engine.mito.index` | -- | -- | The options for index in Mito engine. |
+| `region_engine.mito.experimental_buffered_series_scan` | -- | -- | Experimental complete-range preparation and replay for eligible metric series scans.<br/>Disabled by default. These provisional settings are not a production recommendation. |
+| `region_engine.mito.experimental_buffered_series_scan.enabled` | Bool | `false` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.memory_limit` | String | `50%` | Hard tracked-memory budget per SeriesScan, shared by its tasks and partitions.<br/>Percentages use cgroup-aware startup memory. This is not an RSS limit or a whole-PromQL-query limit. |
+| `region_engine.mito.experimental_buffered_series_scan.disk_limit` | String | `20GB` | Omit to use one quarter of the resolved memory budget. Reclamation happens only during preparation.<br/>Per-scan spill quota; cache storage is provisioned separately. |
+| `region_engine.mito.experimental_buffered_series_scan.preparation_concurrency` | Integer | `0` | Omit to use {data_home}/buffered-scan-scratch. Use a writable path outside SST storage.<br/>Zero resolves once at startup to clamp(cpu_cores / 4, 1, 4).<br/>Shared mode applies this ceiling independently to source tasks and range merges; byte admission governs both. |
+| `region_engine.mito.experimental_buffered_series_scan.source_policy` | String | `selected_series_per_partition` | selected_series_per_partition or shared_selected_series. |
+| `region_engine.mito.experimental_buffered_series_scan.candidate_chunk_size` | Integer | `1000000` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.layout` | String | `multiple_series` | one_series or multiple_series. |
+| `region_engine.mito.experimental_buffered_series_scan.key_encoding` | String | `plain` | plain or fixed_dictionary. Fixed dictionaries include all selected identities and count toward metadata limits. |
+| `region_engine.mito.experimental_buffered_series_scan.compression` | String | `none` | none, lz4, or zstd. |
+| `region_engine.mito.experimental_buffered_series_scan.batch_rows` | Integer | `1024` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.batch_bytes` | String | `1MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_bytes` | String | `64MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_batches` | Integer | `1024` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.file_metadata_bytes` | String | `1MB` | -- |
+| `region_engine.mito.experimental_buffered_series_scan.retention` | String | `threshold` | threshold, forced_spill, or resident. Resident mode fails if admission requires spilling. |
+| `region_engine.mito.index` | -- | -- | Optional ephemeral cache; disabled when this table is absent. Preserve separate disk and metadata budgets.<br/>The options for index in Mito engine. |
 | `region_engine.mito.index.aux_path` | String | `""` | Auxiliary directory path for the index in filesystem, used to store intermediate files for<br/>creating the index and staging files for searching the index, defaults to `{data_home}/index_intermediate`.<br/>The default name for this directory is `index_intermediate` for backward compatibility.<br/><br/>This path contains two subdirectories:<br/>- `__intm`: for storing intermediate files used during creating index.<br/>- `staging`: for storing staging files used during searching index. |
 | `region_engine.mito.index.staging_size` | String | `2GB` | The max capacity of the staging directory. |
 | `region_engine.mito.index.staging_ttl` | String | `7d` | The TTL of the staging directory.<br/>Defaults to 7 days.<br/>Setting it to "0s" to disable TTL. |

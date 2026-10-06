@@ -23,9 +23,10 @@ use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow_ipc::{Block, root_as_footer, root_as_message};
 use datafusion::execution::memory_pool::MemoryPool;
-use datatypes::arrow::array::Array;
+use datatypes::arrow::array::{Array, BinaryArray, DictionaryArray};
 use datatypes::arrow::buffer::Buffer;
 use datatypes::arrow::datatypes::SchemaRef;
+use datatypes::arrow::datatypes::UInt32Type;
 use datatypes::arrow::record_batch::RecordBatch;
 
 use crate::error::Result;
@@ -36,11 +37,14 @@ use crate::read::series_result::{
 };
 
 /// Conservatively reserves per-batch IPC/compression scratch before Arrow allocates.
-pub(crate) fn write_bound(batch: &RecordBatch, options: &StoreOptions) -> Result<usize> {
-    let dictionary = options
-        .fixed_keys
-        .as_ref()
-        .map_or(0, |a| a.get_array_memory_size());
+pub(crate) fn write_bound(batch: &RecordBatch, _options: &StoreOptions) -> Result<usize> {
+    let dictionary = batch
+        .column(crate::sst::parquet::flat_format::primary_key_column_index(
+            batch.num_columns(),
+        ))
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .map_or(0, |a| a.values().get_array_memory_size());
     checked_add(
         checked_mul(normalized_size(batch)?, 3)?,
         checked_add(dictionary, 4096)?,
@@ -104,6 +108,7 @@ impl Write for CountWriter {
 }
 
 pub(crate) struct OpenWriter {
+    fixed_keys: Option<Arc<BinaryArray>>,
     workspace_pool: Arc<dyn MemoryPool>,
     // Closing the writer precedes releasing its file owner.
     writer: Option<FileWriter<CountWriter>>,
@@ -129,12 +134,9 @@ impl OpenWriter {
         schema: SchemaRef,
         workspace_pool: Arc<dyn MemoryPool>,
         phase: &'static str,
+        fixed_keys: Option<Arc<BinaryArray>>,
     ) -> Result<Self> {
-        let dictionary = resources
-            .options
-            .fixed_keys
-            .as_ref()
-            .map_or(0, |a| a.get_array_memory_size());
+        let dictionary = fixed_keys.as_ref().map_or(0, |a| a.get_array_memory_size());
         let base = checked_add(dictionary, 4096)?;
         let schema_bound = checked_mul(schema_memory(&schema)?, 2)?;
         if checked_add(base, schema_bound)? > resources.options.file_metadata_bytes {
@@ -177,6 +179,7 @@ impl OpenWriter {
         resources.count("files", 1);
         resources.count("file_opens", 1);
         Ok(Self {
+            fixed_keys,
             workspace_pool,
             writer: Some(writer),
             owner,
@@ -334,8 +337,7 @@ impl OpenWriter {
                         &resources,
                         self.owner.phase,
                     )?;
-                    let expected = resources
-                        .options
+                    let expected = self
                         .fixed_keys
                         .as_ref()
                         .ok_or_else(|| fail("unexpected dictionary"))?

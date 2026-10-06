@@ -33,14 +33,11 @@ pub mod read_columns;
 pub mod scan_region;
 pub mod scan_util;
 pub(crate) mod seq_scan;
-#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) mod series_buffered;
 pub(crate) mod series_candidate;
 pub(crate) mod series_compact;
-#[cfg(any(test, feature = "dev-tools"))]
 mod series_prepare;
 pub(crate) mod series_reader;
-#[cfg(any(test, feature = "test", feature = "dev-tools"))]
 pub mod series_result;
 pub mod series_scan;
 pub mod stream;

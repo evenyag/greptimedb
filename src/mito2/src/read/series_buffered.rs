@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Development-only complete preparation and bounded range replay.
+//! Opt-in complete preparation and bounded range replay.
 
 pub(crate) mod cache;
 mod scheduler;
@@ -50,12 +50,10 @@ use crate::series_index::MetricSeriesId;
 use crate::sst::file::FileTimeRange;
 use crate::sst::parquet::flat_format::time_index_column_index;
 
-/// Explicit development experiment, never part of serialized MitoConfig.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Validated runtime options resolved by engine startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Options {
     pub(crate) scratch: PathBuf,
-    #[serde(default)]
     pub(crate) cache: Option<cache::Options>,
     pub(crate) memory_bytes: usize,
     pub(crate) spill_threshold: usize,
@@ -63,31 +61,24 @@ pub(crate) struct Options {
     pub(crate) batch_rows: usize,
     pub(crate) batch_bytes: usize,
     pub(crate) layout: String,
-    #[serde(default)]
     pub(crate) compression: Option<String>,
-    #[serde(default)]
+    pub(crate) file_bytes: usize,
+    pub(crate) file_batches: usize,
+    pub(crate) file_metadata_bytes: usize,
+    pub(crate) retention: crate::config::buffered_scan::Retention,
+    pub(crate) key_encoding: crate::config::buffered_scan::KeyEncoding,
     pub(crate) source_policy: SourcePolicy,
-    #[serde(default = "default_concurrency")]
     pub(crate) preparation_concurrency: usize,
-    #[serde(default = "default_candidate_chunk_size")]
     pub(crate) candidate_chunk_size: usize,
 }
 
-/// Development-only source strategy; neither policy changes production defaults.
+/// Experimental source strategy; neither policy changes production defaults.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SourcePolicy {
+pub enum SourcePolicy {
     #[default]
     SelectedSeriesPerPartition,
     SharedSelectedSeries,
-}
-
-fn default_candidate_chunk_size() -> usize {
-    1_000_000
-}
-
-fn default_concurrency() -> usize {
-    1
 }
 
 impl Options {
@@ -107,8 +98,12 @@ impl Options {
             memory_bytes: self.memory_bytes,
             metadata_bytes: self.memory_bytes,
             disk_bytes: self.disk_bytes,
+            key_encoding: self.key_encoding,
             batch_rows: self.batch_rows,
             batch_bytes: self.batch_bytes,
+            file_bytes: self.file_bytes,
+            file_batches: self.file_batches,
+            file_metadata_bytes: self.file_metadata_bytes,
             layout: match self.layout.as_str() {
                 "one_series" => crate::read::series_result::Layout::OneSeries,
                 "multiple_series" => crate::read::series_result::Layout::MultipleSeries,
@@ -123,21 +118,6 @@ impl Options {
             ..StoreOptions::default()
         })
     }
-}
-
-/// A fresh process selects its experiment using an external JSON options file.
-#[cfg(feature = "dev-tools")]
-pub(crate) async fn development_options() -> Result<Option<Options>> {
-    let Some(path) = std::env::var_os("GREPTIME_BUFFERED_SERIES_SCAN_OPTIONS") else {
-        return Ok(None);
-    };
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| fail(format!("development options: {e}")))?;
-    let options: Options =
-        serde_json::from_slice(&bytes).map_err(|e| fail(format!("development options: {e}")))?;
-    options.store()?;
-    Ok(Some(options))
 }
 
 pub(crate) struct BufferedScan {
@@ -168,9 +148,21 @@ impl BufferedScan {
         };
         let store = options.store()?;
         let pool: Arc<dyn MemoryPool> = BudgetPool::query(&parent, options.memory_bytes);
-        let root = options.scratch.clone();
+        let (root, guard) = match strategy {
+            crate::cache::CacheStrategy::EnableAll(manager) => {
+                let (root, guard) = manager.buffered_scratch(&options.scratch).await?;
+                (root, Some(guard))
+            }
+            _ => (options.scratch.clone(), None),
+        };
         let resources = common_runtime::spawn_blocking_query(move || {
-            StoreResources::with_pool(&root, store, pool)
+            std::fs::create_dir_all(&root)
+                .map_err(|e| fail(format!("create scratch parent: {e}")))?;
+            let resources = StoreResources::with_pool(&root, store, pool)?;
+            if let Some(guard) = guard {
+                resources.retain_namespace(guard);
+            }
+            Ok::<_, crate::error::Error>(resources)
         })
         .await
         .map_err(|e| fail(e.to_string()))??;
@@ -193,6 +185,12 @@ impl BufferedScan {
             "ipc_batch_rows": self.options.batch_rows,
             "ipc_batch_bytes": self.options.batch_bytes,
             "compression": self.options.compression,
+            "file_bytes": self.options.file_bytes,
+            "file_batches": self.options.file_batches,
+            "file_metadata_bytes": self.options.file_metadata_bytes,
+            "retention": self.options.retention,
+            "key_encoding": self.options.key_encoding,
+            "budget_scope": "series_scan",
             "preparation_concurrency": self.options.preparation_concurrency,
             "prefetch_batches": 0,
             "candidate_chunk_size": self.options.candidate_chunk_size,
@@ -416,6 +414,35 @@ async fn prepare(
     if collector.len() > 0 {
         chunks.push(collector.finish(false));
     }
+    if options.key_encoding == crate::config::buffered_scan::KeyEncoding::FixedDictionary {
+        use datatypes::arrow::array::BinaryBuilder;
+        use mito_codec::row_converter::SparsePrimaryKeyCodec;
+        use snafu::ResultExt;
+        let count = chunks
+            .iter()
+            .flatten()
+            .try_fold(0, |n, assignment| checked_add(n, assignment.series().len()))?;
+        let _workspace =
+            resources.reserve(Kind::Workspace, checked_add(checked_mul(count, 64)?, 1024)?)?;
+        let mut ids = chunks
+            .iter()
+            .flatten()
+            .flat_map(|assignment| assignment.series().iter().copied())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut dictionary = BinaryBuilder::with_capacity(ids.len(), checked_mul(ids.len(), 22)?);
+        let codec = SparsePrimaryKeyCodec::schemaless();
+        let mut key = Vec::with_capacity(22);
+        for id in ids {
+            key.clear();
+            codec
+                .encode_internal(id.table_id, id.tsid, &mut key)
+                .context(crate::error::EncodeSnafu)?;
+            dictionary.append_value(&key);
+        }
+        resources.install_fixed_keys(Arc::new(dictionary.finish()))?;
+    }
     let mut ranges = partitions.into_iter().flatten().collect::<Vec<_>>();
     ranges.sort_unstable_by_key(|r| ctx.ranges[r.identifier].time_range.0);
     for range in &ranges {
@@ -544,6 +571,9 @@ async fn prepare(
             break sizes;
         }
         let before = resources.available();
+        if options.retention == crate::config::buffered_scan::Retention::Resident {
+            return Err(admission(&resources, "resident publication", total));
+        }
         reclaim(
             &mut results,
             &resources,

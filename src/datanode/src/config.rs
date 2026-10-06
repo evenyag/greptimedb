@@ -196,6 +196,18 @@ mod tests {
     fn test_toml() {
         let opts = DatanodeOptions::default();
         let toml_string = toml::to_string(&opts).unwrap();
+        assert!(toml_string.contains("experimental_buffered_series_scan"));
+        let enabled = toml_string.replace(
+            "[region_engine.mito.experimental_buffered_series_scan]\nenabled = false",
+            "[region_engine.mito.experimental_buffered_series_scan]\nenabled = true",
+        );
+        assert_ne!(enabled, toml_string);
+        let buffered: DatanodeOptions = toml::from_str(&enabled).unwrap();
+        let RegionEngineConfig::Mito(mito) = &buffered.region_engine[0] else {
+            panic!("expected mito config")
+        };
+        assert!(mito.experimental_buffered_series_scan.enabled);
+        assert_eq!(enabled, toml::to_string(&buffered).unwrap());
         let _parsed: DatanodeOptions = toml::from_str(&toml_string).unwrap();
     }
 

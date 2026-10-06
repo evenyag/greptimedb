@@ -14,7 +14,6 @@
 
 //! Bounded, immutable compact results. Independent of scan preparation (Stage 3).
 //!
-//! This PoC module is available to tests/developer benchmarks until Stage 4.
 //! Files are ephemeral, query-owned IPC artifacts, not a persisted engine format.
 
 pub(crate) mod budget;
@@ -75,6 +74,8 @@ pub struct StoreOptions {
     pub compression: Option<CompressionType>,
     /// Complete, sorted, unique 22-byte compact identities. Never extended/replaced.
     pub fixed_keys: Option<Arc<BinaryArray>>,
+    /// Encoding selected by the integrated scanner before discovery.
+    pub key_encoding: crate::config::buffered_scan::KeyEncoding,
 }
 
 impl Default for StoreOptions {
@@ -91,6 +92,7 @@ impl Default for StoreOptions {
             disk_bytes: 1024 * 1024 * 1024,
             compression: None,
             fixed_keys: None,
+            key_encoding: crate::config::buffered_scan::KeyEncoding::Plain,
         }
     }
 }
@@ -226,6 +228,8 @@ struct SourceBatch {
 }
 
 struct ResultData {
+    fixed_keys: Option<Arc<BinaryArray>>,
+    _dictionary_charge: Option<Charge>,
     plain_schema: SchemaRef,
     source_batches: Vec<SourceBatch>,
     phase: &'static str,
@@ -299,6 +303,15 @@ impl ResultHandle {
         let copied = query
             .blocking(move || {
                 let metadata = resources.reserve(Kind::Metadata, original.0._metadata.bytes())?;
+                let (fixed_keys, dictionary_charge) = if let Some(keys) = &original.0.fixed_keys {
+                    let mut charge =
+                        resources.reserve(Kind::Metadata, keys.get_array_memory_size())?;
+                    let keys = Arc::new(BinaryArray::from_iter_values(keys.iter().flatten()));
+                    charge.resize(keys.get_array_memory_size())?;
+                    (Some(keys), Some(charge))
+                } else {
+                    (None, None)
+                };
                 let mut files = BTreeMap::new();
                 let mut directory = Vec::with_capacity(original.0.directory.len());
                 for entry in &original.0.directory {
@@ -327,6 +340,8 @@ impl ResultHandle {
                     });
                 }
                 Ok(Self(Arc::new(ResultData {
+                    fixed_keys,
+                    _dictionary_charge: dictionary_charge,
                     plain_schema: original.0.plain_schema.clone(),
                     source_batches: original.0.source_batches.clone(),
                     phase: "cache",
@@ -566,10 +581,11 @@ impl ResultHandle {
             .blocking(move || {
                 let mut data = Arc::try_unwrap(self.0)
                     .map_err(|_| fail("cannot spill a published/shared result"))?;
-                let helper = ResultBuilder::with_workspace(
+                let helper = ResultBuilder::with_dictionary(
                     resources.clone(),
                     data.schema.clone(),
                     pool.clone(),
+                    data.fixed_keys.clone(),
                 )?;
                 let mut writer: Option<OpenWriter> = None;
                 let mut positions = Vec::new();
@@ -614,6 +630,7 @@ impl ResultHandle {
                             helper.storage_schema.clone(),
                             pool.clone(),
                             data.phase,
+                            helper.fixed_keys.clone(),
                         )?);
                     }
                     writer
@@ -798,6 +815,7 @@ impl ResultCursor {
 /// Consuming async operations move ownership into the blocking task. Dropping the
 /// awaiting future cannot strand a partial writer or its reservations.
 pub struct ResultBuilder {
+    fixed_keys: Option<Arc<BinaryArray>>,
     source_batches: Vec<SourceBatch>,
     spill_on_pressure: bool,
     phase: &'static str,
@@ -829,6 +847,11 @@ impl ResultBuilder {
         .context(JoinSnafu)?
     }
 
+    pub(crate) fn with_spill_on_pressure(mut self, enabled: bool) -> Self {
+        self.spill_on_pressure = enabled;
+        self
+    }
+
     /// Reuses the same query budget across independent builders/results/cursors.
     pub fn with_resources(resources: Arc<StoreResources>, schema: SchemaRef) -> Result<Self> {
         let pool = resources.pool();
@@ -842,6 +865,16 @@ impl ResultBuilder {
         resources: Arc<StoreResources>,
         schema: SchemaRef,
         workspace_pool: Arc<dyn MemoryPool>,
+    ) -> Result<Self> {
+        let fixed_keys = resources.fixed_keys().cloned();
+        Self::with_dictionary(resources, schema, workspace_pool, fixed_keys)
+    }
+
+    fn with_dictionary(
+        resources: Arc<StoreResources>,
+        schema: SchemaRef,
+        workspace_pool: Arc<dyn MemoryPool>,
+        fixed_keys: Option<Arc<BinaryArray>>,
     ) -> Result<Self> {
         if schema.fields().len() < 4 {
             return Err(fail("incomplete compact schema"));
@@ -872,7 +905,7 @@ impl ResultBuilder {
             .collect::<Vec<_>>();
         let plain_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
         let mut fields = plain_schema.fields().to_vec();
-        if resources.options.fixed_keys.is_some() {
+        if fixed_keys.is_some() {
             fields[pk] = Arc::new(fields[pk].as_ref().clone().with_data_type(
                 DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Binary)),
             ));
@@ -882,6 +915,7 @@ impl ResultBuilder {
         metadata.resize(shared_bytes)?;
         let pending_charge = resources.reserve_in(Kind::Payload, 0, &workspace_pool)?;
         Ok(Self {
+            fixed_keys,
             source_batches: Vec::new(),
             spill_on_pressure: true,
             phase: "result",
@@ -998,6 +1032,8 @@ impl ResultBuilder {
                 builder.flush_batch()?;
                 builder.finish_file()?;
                 Ok(ResultHandle(Arc::new(ResultData {
+                    fixed_keys: builder.fixed_keys,
+                    _dictionary_charge: None,
                     plain_schema: builder.plain_schema,
                     source_batches: builder.source_batches,
                     phase: builder.phase,
@@ -1268,6 +1304,7 @@ impl ResultBuilder {
                 self.storage_schema.clone(),
                 self.workspace_pool.clone(),
                 self.phase,
+                self.fixed_keys.clone(),
             )?);
         }
         let writer = self
@@ -1282,7 +1319,7 @@ impl ResultBuilder {
     }
 
     fn storage_batch(&self, plain: &RecordBatch) -> Result<RecordBatch> {
-        let Some(values) = &self.resources.options.fixed_keys else {
+        let Some(values) = &self.fixed_keys else {
             return Ok(plain.clone());
         };
         let pk = primary_key_column_index(plain.num_columns());

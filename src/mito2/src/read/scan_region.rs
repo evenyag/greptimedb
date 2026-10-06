@@ -247,6 +247,7 @@ pub(crate) struct ScanRegion {
     /// Whether to enable the experimental two-phase metric series scan.
     experimental_series_scan_v2: bool,
     experimental_series_scan_compact: bool,
+    buffered_options: Option<crate::read::series_buffered::Options>,
     /// Whether to ignore range indexes during scans.
     ignore_range_index: bool,
     /// Whether to ignore inverted index.
@@ -286,6 +287,7 @@ impl ScanRegion {
             scan_memory_pool: Arc::new(UnboundedMemoryPool::default()),
             experimental_series_scan_v2: false,
             experimental_series_scan_compact: false,
+            buffered_options: None,
             ignore_range_index: false,
             ignore_inverted_index: false,
             ignore_fulltext_index: false,
@@ -334,6 +336,14 @@ impl ScanRegion {
     }
 
     /// Enables the opt-in compact metric read path.
+    pub(crate) fn with_buffered_options(
+        mut self,
+        options: Option<crate::read::series_buffered::Options>,
+    ) -> Self {
+        self.buffered_options = options;
+        self
+    }
+
     pub(crate) fn with_experimental_series_scan_compact(mut self, enabled: bool) -> Self {
         self.experimental_series_scan_compact = enabled;
         self
@@ -453,9 +463,9 @@ impl ScanRegion {
     pub(crate) async fn series_scan(self) -> Result<SeriesScan> {
         let experimental_series_scan_v2 = self.experimental_series_scan_v2;
         let compact = self.experimental_series_scan_compact;
+        let buffered_options = self.buffered_options.clone();
         let input = self.scan_input().await?;
-        #[cfg(feature = "dev-tools")]
-        if let Some(options) = crate::read::series_buffered::development_options().await?
+        if let Some(options) = buffered_options
             && SeriesScan::supports_two_phase(&input)
         {
             return SeriesScan::new_buffered(input, options).await;

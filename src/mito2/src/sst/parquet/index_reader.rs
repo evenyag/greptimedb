@@ -66,7 +66,6 @@ impl ParquetIndexReader {
         })
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_metadata_bytes(&self) -> usize {
         crate::cache::cache_size::parquet_meta_size(self.arrow_metadata.metadata())
             + self.path.capacity()

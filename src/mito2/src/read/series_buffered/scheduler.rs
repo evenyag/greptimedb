@@ -20,6 +20,7 @@ use std::time::Instant;
 
 use async_stream::try_stream;
 use datafusion::execution::memory_pool::MemoryPool;
+use datatypes::arrow::array::Array;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -166,7 +167,19 @@ impl Preparation {
     }
 
     fn writer_bytes(&self) -> Result<usize> {
-        checked_add(checked_mul(self.options.batch_bytes, 24)?, 4 * 1024 * 1024)
+        // Protect dictionary serialization and footer finalization before a task
+        // starts, including configurations with larger metadata limits.
+        let dictionary = self
+            .resources
+            .fixed_keys()
+            .map_or(0, |keys| keys.get_array_memory_size());
+        checked_add(
+            checked_mul(self.options.batch_bytes, 24)?,
+            checked_add(
+                checked_mul(self.options.file_metadata_bytes, 4)?,
+                checked_mul(dictionary, 8)?,
+            )?,
+        )
     }
 
     fn budget(&self, bytes: usize, stage: &'static str) -> Result<TaskBudget> {
@@ -607,6 +620,9 @@ impl Preparation {
         required: usize,
         reclamation: &Arc<dyn MemoryPool>,
     ) -> Result<bool> {
+        if self.options.retention == crate::config::buffered_scan::Retention::Resident {
+            return Ok(self.resources.available() >= required);
+        }
         for ranges in results {
             for range in ranges {
                 if self.resources.available() >= required {
@@ -652,7 +668,10 @@ impl Preparation {
             self.compact.schema.schema.clone(),
             pool,
         )?
-        .with_phase(if source { "source" } else { "result" });
+        .with_phase(if source { "source" } else { "result" })
+        .with_spill_on_pressure(
+            self.options.retention != crate::config::buffered_scan::Retention::Resident,
+        );
         while let Some(batch) = stream.try_next().await? {
             validate_batch(&batch, bounds)?;
             self.resources.count(
@@ -671,8 +690,11 @@ impl Preparation {
                 },
                 crate::read::series_result::unique_batch_bytes(&batch)?,
             );
-            let placement = if self.resources.pool().reserved() >= self.options.spill_threshold
-                || self.resources.available() < checked_mul(self.writer_bytes()?, 2)?
+            let placement = if self.options.retention
+                == crate::config::buffered_scan::Retention::ForcedSpill
+                || (self.options.retention == crate::config::buffered_scan::Retention::Threshold
+                    && (self.resources.pool().reserved() >= self.options.spill_threshold
+                        || self.resources.available() < checked_mul(self.writer_bytes()?, 2)?))
             {
                 builder = builder.spill_resident().await?;
                 Placement::File

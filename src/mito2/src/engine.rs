@@ -800,7 +800,6 @@ impl EngineInner {
     /// Stop the inner engine.
     async fn stop(&self) -> Result<()> {
         let result = self.workers.stop().await;
-        #[cfg(any(test, feature = "dev-tools"))]
         self.workers
             .cache_manager()
             .shutdown_buffered_data_cache()
@@ -1172,6 +1171,12 @@ impl EngineInner {
         .with_scan_memory_pool(self.scan_memory_pool.clone())
         .with_experimental_series_scan_v2(self.config.experimental_series_scan_v2)
         .with_experimental_series_scan_compact(self.config.experimental_series_scan_compact)
+        .with_buffered_options(
+            self.config
+                .experimental_buffered_series_scan
+                .resolved
+                .clone(),
+        )
         .with_ignore_inverted_index(self.config.inverted_index.apply_on_query.disabled())
         .with_ignore_fulltext_index(self.config.fulltext_index.apply_on_query.disabled())
         .with_ignore_bloom_filter(self.config.bloom_filter_index.apply_on_query.disabled())

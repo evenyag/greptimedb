@@ -124,7 +124,6 @@ impl SeriesScanMode {
 /// partition.
 /// Always returns the same series (primary key) to the same partition.
 pub struct SeriesScan {
-    #[cfg(any(test, feature = "dev-tools"))]
     buffered: Option<crate::read::series_buffered::BufferedScan>,
     /// Implementation used by this scan.
     mode: SeriesScanMode,
@@ -180,7 +179,6 @@ impl SeriesScan {
         };
 
         Self {
-            #[cfg(any(test, feature = "dev-tools"))]
             buffered: None,
             mode,
             properties,
@@ -192,7 +190,6 @@ impl SeriesScan {
         }
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) async fn new_buffered(
         mut input: ScanInput,
         options: crate::read::series_buffered::Options,
@@ -216,7 +213,6 @@ impl SeriesScan {
     }
 
     fn effective_mode(&self) -> &'static str {
-        #[cfg(any(test, feature = "dev-tools"))]
         if self.buffered.is_some() {
             return "buffered";
         }
@@ -302,7 +298,6 @@ impl SeriesScan {
             }
         );
 
-        #[cfg(any(test, feature = "dev-tools"))]
         if let Some(buffered) = &self.buffered {
             return buffered.stream(
                 partition,
@@ -544,7 +539,6 @@ impl SeriesScan {
 
     /// Checks resource limit for the scanner.
     pub(crate) fn check_scan_limit(&self) -> Result<()> {
-        #[cfg(any(test, feature = "dev-tools"))]
         if self.buffered.is_some() {
             return Ok(());
         }
@@ -655,7 +649,6 @@ impl RegionScanner for SeriesScan {
     }
 
     fn reset_state(&mut self) {
-        #[cfg(any(test, feature = "dev-tools"))]
         if let Some(buffered) = &self.buffered {
             buffered.reset();
         }
@@ -708,7 +701,6 @@ impl DisplayAs for SeriesScan {
             }
         }
         write!(f, ", \"mode\":\"{}\"", self.effective_mode())?;
-        #[cfg(any(test, feature = "dev-tools"))]
         if let Some(buffered) = &self.buffered {
             let snapshot =
                 serde_json::to_string(&buffered.resources.snapshot()).map_err(|_| fmt::Error)?;

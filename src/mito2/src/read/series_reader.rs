@@ -179,7 +179,6 @@ impl MetricSeriesFilter {
     }
 
     /// Shares one candidate union across all source tasks, including memtables.
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn union(mut series: Vec<MetricSeriesId>) -> Self {
         series.sort_unstable();
         series.dedup();
@@ -333,7 +332,6 @@ impl SeriesReader {
         })
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) async fn build_complete_range(
         &self,
         range: PartitionRange,
@@ -579,14 +577,12 @@ async fn build_series_partition_range(
 
 /// One independently materializable source part. Parts of a file retain their
 /// original order when reconstructed as a single range-merge input.
-#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) struct BufferedSource {
     pub(crate) ordinal: usize,
     pub(crate) stream: BoxedRecordBatchStream,
     pub(crate) reader_bytes: usize,
 }
 
-#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) fn buffered_sources(
     ctx: Arc<StreamContext>,
     range: PartitionRange,
@@ -661,8 +657,7 @@ fn compact_file_stream(
     ids: Arc<Vec<MetricSeriesId>>,
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
-        #[cfg(any(test, feature = "dev-tools"))]
-        let _reader_lifetime = compact.buffered_resources.as_ref().map(|resources| resources.reader_lease());
+                let _reader_lifetime = compact.buffered_resources.as_ref().map(|resources| resources.reader_lease());
         let mut reader = range.compact_reader(mapping, &ids, &compact.catalog.metrics).await?;
         let trusted = range.file_handle().is_effective_target_sequence_trusted(ctx.input.region_metadata().region_id);
         while let Some(batch) = reader.try_next().await? {

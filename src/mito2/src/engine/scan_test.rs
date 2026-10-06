@@ -3989,6 +3989,47 @@ async fn scan_sparse_exact_metric(
     (schema, canonical_sparse_rows(&batches))
 }
 
+/// The public configuration selects buffered execution without a process override.
+#[tokio::test]
+async fn test_buffered_scan_config_wiring() {
+    let mut config: MitoConfig = toml::from_str(
+        r#"
+        [experimental_buffered_series_scan]
+        enabled = true
+        memory_limit = "128MB"
+        spill_threshold = "32MB"
+        batch_bytes = "64KB"
+        batch_rows = 2
+        preparation_concurrency = 1
+        key_encoding = "fixed_dictionary"
+        retention = "forced_spill"
+    "#,
+    )
+    .unwrap();
+    let cache = common_test_util::temp_dir::create_temp_dir("buffered-config-cache");
+    config.experimental_buffered_series_scan.cache =
+        Some(crate::config::buffered_scan::BufferedCacheConfig {
+            directory: cache.path().to_owned(),
+            disk_limit: ReadableSize::mb(64),
+            metadata_limit: ReadableSize::mb(16),
+        });
+    let (_env, engine, region) =
+        build_sparse_metric_engine_with_config("buffered_config", config).await;
+    test_util::flush_region(&engine, region, None).await;
+    let (_reference_env, reference, reference_region) =
+        build_sparse_exact_metric_engine("buffered_config_reference", true, ReadableSize::mb(0))
+            .await;
+    let (_, expected) =
+        scan_sparse_exact_metric(&reference, reference_region, None, None, None, "two_phase").await;
+    let (_, actual) = scan_sparse_exact_metric(&engine, region, None, None, None, "buffered").await;
+    assert_eq!(expected, actual);
+    let (_, repeated) =
+        scan_sparse_exact_metric(&engine, region, None, None, None, "buffered").await;
+    assert_eq!(expected, repeated);
+    engine.stop().await.unwrap();
+    reference.stop().await.unwrap();
+}
+
 /// Exact sparse-metric reads must use two-phase scanning and preserve the same
 /// complete rows as the legacy series scanner at every sequence boundary.
 #[tokio::test]
@@ -4630,6 +4671,13 @@ async fn test_buffered_scan_semantics_and_polling() {
                                         batch_bytes: 64 * 1024,
                                         layout: layout.to_owned(),
                                         compression: None,
+                                        file_bytes: 64 * 1024 * 1024,
+                                        file_batches: 1024,
+                                        file_metadata_bytes: 1024 * 1024,
+                                        retention:
+                                            crate::config::buffered_scan::Retention::Threshold,
+                                        key_encoding:
+                                            crate::config::buffered_scan::KeyEncoding::Plain,
                                     })
                                     .await
                                     .unwrap();
@@ -4801,6 +4849,11 @@ async fn test_buffered_failures_and_unpolled_cleanup() {
                         batch_bytes: 64 * 1024,
                         layout: "multiple_series".to_owned(),
                         compression: None,
+                        file_bytes: 64 * 1024 * 1024,
+                        file_batches: 1024,
+                        file_metadata_bytes: 1024 * 1024,
+                        retention: crate::config::buffered_scan::Retention::Threshold,
+                        key_encoding: crate::config::buffered_scan::KeyEncoding::Plain,
                     })
                     .await
                     .unwrap();
@@ -5071,6 +5124,11 @@ async fn test_buffered_complete_range_last_non_null_and_delete() {
                                 batch_bytes: 64 * 1024,
                                 layout: layout.to_owned(),
                                 compression: None,
+                                file_bytes: 64 * 1024 * 1024,
+                                file_batches: 1024,
+                                file_metadata_bytes: 1024 * 1024,
+                                retention: crate::config::buffered_scan::Retention::Threshold,
+                                key_encoding: crate::config::buffered_scan::KeyEncoding::Plain,
                             })
                             .await
                             .unwrap();
@@ -5160,6 +5218,11 @@ async fn test_buffered_publication_funds_complete_series_consumer() {
             batch_bytes: 64 * 1024,
             layout: "multiple_series".to_owned(),
             compression: None,
+            file_bytes: 64 * 1024 * 1024,
+            file_batches: 1024,
+            file_metadata_bytes: 1024 * 1024,
+            retention: crate::config::buffered_scan::Retention::Threshold,
+            key_encoding: crate::config::buffered_scan::KeyEncoding::Plain,
         })
         .await
         .unwrap();
@@ -5213,6 +5276,11 @@ async fn test_buffered_cache_cold_warm_invalidation_and_bypass() {
                 batch_bytes: 64 * 1024,
                 layout: layout.to_owned(),
                 compression: None,
+                file_bytes: 64 * 1024 * 1024,
+                file_batches: 1024,
+                file_metadata_bytes: 1024 * 1024,
+                retention: crate::config::buffered_scan::Retention::Threshold,
+                key_encoding: crate::config::buffered_scan::KeyEncoding::Plain,
             };
             let cache = engine
                 .cache_manager()

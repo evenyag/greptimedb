@@ -17,13 +17,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
 };
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datatypes::arrow::array::Array;
+use datatypes::arrow::array::{Array, BinaryArray};
 use serde::Serialize;
 use snafu::ResultExt;
 use tokio::sync::Notify;
@@ -193,6 +193,7 @@ pub struct StoreResources {
     pub(crate) options: StoreOptions,
     pub(crate) root: PathBuf,
     namespace_guard: Mutex<Option<Arc<std::fs::File>>>,
+    fixed_keys: OnceLock<Arc<BinaryArray>>,
     pool: Arc<dyn MemoryPool>,
     metadata: AtomicUsize,
     payload: AtomicUsize,
@@ -221,7 +222,113 @@ pub struct StoreResources {
     pub(crate) faults: Faults,
 }
 
+/// Acquires exclusive ownership before deleting only recognized abandoned payloads.
+pub(crate) fn open_namespace(root: &Path, lock_name: &str) -> Result<Arc<std::fs::File>> {
+    std::fs::create_dir_all(root).map_err(|e| fail(e.to_string()))?;
+    let lock = Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(lock_name))
+            .map_err(|e| fail(e.to_string()))?,
+    );
+    lock.try_lock()
+        .map_err(|e| fail(format!("buffered namespace already owned: {e}")))?;
+    cleanup_abandoned(root)?;
+    Ok(lock)
+}
+
+/// The exclusive namespace lock is held. Unknown files and symlinks are preserved.
+fn cleanup_abandoned(root: &std::path::Path) -> Result<()> {
+    for entry in std::fs::read_dir(root).map_err(|e| fail(e.to_string()))? {
+        let entry = entry.map_err(|e| fail(e.to_string()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry.file_type().map_err(|e| fail(e.to_string()))?.is_dir()
+            || name
+                .strip_prefix("series-result-")
+                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+        {
+            continue;
+        }
+        for file in std::fs::read_dir(entry.path()).map_err(|e| fail(e.to_string()))? {
+            let file = file.map_err(|e| fail(e.to_string()))?;
+            let path = file.path();
+            if file.file_type().map_err(|e| fail(e.to_string()))?.is_file()
+                && matches!(
+                    path.extension().and_then(|v| v.to_str()),
+                    Some("arrow" | "partial")
+                )
+                && path
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|v| uuid::Uuid::parse_str(v).is_ok())
+            {
+                std::fs::remove_file(path).map_err(|e| fail(e.to_string()))?;
+            }
+        }
+        match std::fs::remove_dir(entry.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => return Err(fail(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
 impl StoreResources {
+    pub(crate) fn fixed_keys(&self) -> Option<&Arc<BinaryArray>> {
+        self.options
+            .fixed_keys
+            .as_ref()
+            .or_else(|| self.fixed_keys.get())
+    }
+
+    /// Installed once after discovery, before any result builder or writer starts.
+    pub(crate) fn install_fixed_keys(&self, keys: Arc<BinaryArray>) -> Result<()> {
+        if let Some(existing) = self.fixed_keys() {
+            return if existing == &keys {
+                Ok(())
+            } else {
+                Err(fail("fixed dictionary changed after initialization"))
+            };
+        }
+        if keys.null_count() != 0
+            || keys.iter().flatten().any(|key| key.len() != 22)
+            || keys
+                .iter()
+                .flatten()
+                .zip(keys.iter().flatten().skip(1))
+                .any(|(a, b)| a >= b)
+        {
+            return Err(fail(
+                "fixed dictionary must contain sorted unique compact keys",
+            ));
+        }
+        let bytes = keys.get_array_memory_size();
+        let previous = self
+            .metadata
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                n.checked_add(bytes)
+                    .filter(|n| *n <= self.options.metadata_bytes)
+            })
+            .map_err(|_| fail("fixed dictionary exceeds metadata budget"))?;
+        if let Err(error) = self._fixed_reservation.try_grow(bytes) {
+            self.metadata.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(fail(error.to_string()));
+        }
+        if self.fixed_keys.set(keys).is_err() {
+            self._fixed_reservation.shrink(bytes);
+            self.metadata.fetch_sub(bytes, Ordering::SeqCst);
+            return Err(fail("fixed dictionary already initialized"));
+        }
+        self.peak("metadata_bytes", previous + bytes);
+        self.count("fixed_dictionary_bytes", bytes);
+        Ok(())
+    }
+
     /// Keep namespace ownership until every file and delayed deletion has retired.
     pub(crate) fn retain_namespace(&self, guard: Arc<std::fs::File>) {
         *self
@@ -289,6 +396,7 @@ impl StoreResources {
         Ok(Arc::new(Self {
             root,
             namespace_guard: Mutex::new(None),
+            fixed_keys: OnceLock::new(),
             pool,
             metadata: AtomicUsize::new(fixed_bytes),
             payload: AtomicUsize::new(0),

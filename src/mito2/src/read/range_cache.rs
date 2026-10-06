@@ -541,7 +541,6 @@ fn build_range_cache_key_inner(
 }
 
 /// Buffered results have an independent enablement switch, but identical eligibility.
-#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) fn build_buffered_range_cache_key(
     stream_ctx: &StreamContext,
     part_range: &PartitionRange,

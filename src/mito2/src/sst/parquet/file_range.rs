@@ -105,7 +105,6 @@ pub struct FileRange {
 
 impl FileRange {
     /// Keep shared source metadata charged until its final context owner disappears.
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn admit_buffered_context(
         &self,
         resources: &Arc<crate::read::series_result::StoreResources>,
@@ -132,17 +131,14 @@ impl FileRange {
 
     /// Conservative simultaneous decoder/fetch and decoded-input estimate. Compressed
     /// and uncompressed source bytes are distinct; neither represents physical I/O.
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_reader_bytes(&self) -> Result<usize> {
         self.buffered_decode_bytes(false)
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_preflight_bytes(&self) -> Result<usize> {
         self.buffered_decode_bytes(true)
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     fn buffered_decode_bytes(&self, preflight: bool) -> Result<usize> {
         use crate::read::series_result::{checked_add, checked_mul, fail};
         let metadata = self.context.reader_builder.parquet_metadata();
@@ -751,7 +747,6 @@ pub struct FileRangeContext {
     reader_builder: RowGroupReaderBuilder,
     /// Base of the context.
     base: RangeBase,
-    #[cfg(any(test, feature = "dev-tools"))]
     buffered_charge: std::sync::Mutex<Option<crate::read::series_result::resources::Charge>>,
 }
 
@@ -769,7 +764,6 @@ impl FileRangeContext {
             base,
             range_index_store,
             range_index_searcher: OnceCell::new(),
-            #[cfg(any(test, feature = "dev-tools"))]
             buffered_charge: std::sync::Mutex::new(None),
         }
     }

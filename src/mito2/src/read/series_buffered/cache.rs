@@ -15,7 +15,6 @@
 //! Ephemeral engine-owned complete results. Admission is preparation-only.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +26,7 @@ use crate::error::Result;
 use crate::read::range_cache::{RangeScanCacheKey, build_buffered_range_cache_key};
 use crate::read::scan_region::StreamContext;
 use crate::read::series_compact::{CachedTags, TagCatalog};
-use crate::read::series_result::resources::{Charge, Kind};
+use crate::read::series_result::resources::{Charge, Kind, open_namespace};
 use crate::read::series_result::{
     ResultHandle, StoreOptions, StoreResources, checked_add, checked_mul, fail,
 };
@@ -96,14 +95,16 @@ impl Key {
 
 fn representation(options: &StoreOptions) -> String {
     format!(
-        "compact-ipc-v1/layout-v1/{:?}/{:?}/{}/{}/{}/{}/{}",
+        "compact-ipc-v1/layout-v1/{:?}/{:?}/{}/{}/{}/{}/{}/{:?}/{}",
         options.layout,
         options.compression,
         options.batch_rows,
         options.batch_bytes,
         options.file_bytes,
         options.file_batches,
-        options.file_metadata_bytes
+        options.file_metadata_bytes,
+        options.key_encoding,
+        options.fixed_keys.is_some()
     )
 }
 
@@ -133,19 +134,7 @@ impl BufferedDataCache {
             return Err(fail("cache capacities must be positive"));
         }
         let root = options.directory.join("buffered-data-cache-v1");
-        std::fs::create_dir_all(&root).map_err(|e| fail(e.to_string()))?;
-        let lock = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(root.join("buffered-cache.lock"))
-                .map_err(|e| fail(e.to_string()))?,
-        );
-        lock.try_lock()
-            .map_err(|e| fail(format!("cache namespace already owned: {e}")))?;
-        cleanup_abandoned(&root)?;
+        let lock = open_namespace(&root, "buffered-cache.lock")?;
         store.disk_bytes = options.disk_bytes;
         store.metadata_bytes = options.metadata_bytes;
         store.memory_bytes = options.metadata_bytes;
@@ -314,44 +303,6 @@ impl BufferedDataCache {
             .get(key)
             .map(|(_, e)| e.result.clone())
     }
-}
-
-/// The exclusive namespace lock is held. Unknown files and symlinks are preserved.
-fn cleanup_abandoned(root: &std::path::Path) -> Result<()> {
-    for entry in std::fs::read_dir(root).map_err(|e| fail(e.to_string()))? {
-        let entry = entry.map_err(|e| fail(e.to_string()))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !entry.file_type().map_err(|e| fail(e.to_string()))?.is_dir()
-            || name
-                .strip_prefix("series-result-")
-                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
-        {
-            continue;
-        }
-        for file in std::fs::read_dir(entry.path()).map_err(|e| fail(e.to_string()))? {
-            let file = file.map_err(|e| fail(e.to_string()))?;
-            let path = file.path();
-            if file.file_type().map_err(|e| fail(e.to_string()))?.is_file()
-                && matches!(
-                    path.extension().and_then(|v| v.to_str()),
-                    Some("arrow" | "partial")
-                )
-                && path
-                    .file_stem()
-                    .and_then(|v| v.to_str())
-                    .is_some_and(|v| uuid::Uuid::parse_str(v).is_ok())
-            {
-                std::fs::remove_file(path).map_err(|e| fail(e.to_string()))?;
-            }
-        }
-        match std::fs::remove_dir(entry.path()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(e) => return Err(fail(e.to_string())),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

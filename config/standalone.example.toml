@@ -896,6 +896,44 @@ experimental_series_scan_v2 = true
 ## Whether to enable the PoC compact identity path for eligible metric series scans.
 experimental_series_scan_compact = false
 
+## Experimental complete-range preparation and replay for eligible metric series scans.
+## Disabled by default. These provisional settings are not a production recommendation.
+[region_engine.mito.experimental_buffered_series_scan]
+enabled = false
+## Hard tracked-memory budget per SeriesScan, shared by its tasks and partitions.
+## Percentages use cgroup-aware startup memory. This is not an RSS limit or a whole-PromQL-query limit.
+memory_limit = "50%"
+## Omit to use one quarter of the resolved memory budget. Reclamation happens only during preparation.
+# spill_threshold = "2GB"
+## Per-scan spill quota; cache storage is provisioned separately.
+disk_limit = "20GB"
+## Omit to use {data_home}/buffered-scan-scratch. Use a writable path outside SST storage.
+# scratch = "/var/lib/greptimedb/buffered-scan-scratch"
+## Zero resolves once at startup to clamp(cpu_cores / 4, 1, 4).
+## Shared mode applies this ceiling independently to source tasks and range merges; byte admission governs both.
+preparation_concurrency = 0
+## selected_series_per_partition or shared_selected_series.
+source_policy = "selected_series_per_partition"
+candidate_chunk_size = 1000000
+## one_series or multiple_series.
+layout = "multiple_series"
+## plain or fixed_dictionary. Fixed dictionaries include all selected identities and count toward metadata limits.
+key_encoding = "plain"
+## none, lz4, or zstd.
+compression = "none"
+batch_rows = 1024
+batch_bytes = "1MB"
+file_bytes = "64MB"
+file_batches = 1024
+file_metadata_bytes = "1MB"
+## threshold, forced_spill, or resident. Resident mode fails if admission requires spilling.
+retention = "threshold"
+## Optional ephemeral cache; disabled when this table is absent. Preserve separate disk and metadata budgets.
+# [region_engine.mito.experimental_buffered_series_scan.cache]
+# directory = "/var/lib/greptimedb/buffered-cache"
+# disk_limit = "20GB"
+# metadata_limit = "1GB"
+
 ## The options for index in Mito engine.
 [region_engine.mito.index]
 

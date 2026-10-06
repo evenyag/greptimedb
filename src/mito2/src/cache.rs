@@ -1057,7 +1057,7 @@ impl CacheStrategy {
 /// All caches are disabled by default.
 #[derive(Default)]
 pub struct CacheManager {
-    #[cfg(any(test, feature = "dev-tools"))]
+    buffered_scratch: tokio::sync::Mutex<BTreeMap<std::path::PathBuf, Arc<std::fs::File>>>,
     buffered_data_cache:
         tokio::sync::Mutex<Option<Arc<crate::read::series_buffered::cache::BufferedDataCache>>>,
     /// Cache for compact, authoritative SST metadata.
@@ -1093,7 +1093,25 @@ pub struct CacheManager {
 pub type CacheManagerRef = Arc<CacheManager>;
 
 impl CacheManager {
-    #[cfg(any(test, feature = "dev-tools"))]
+    pub(crate) async fn buffered_scratch(
+        &self,
+        parent: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, Arc<std::fs::File>)> {
+        let root = parent.join("buffered-query-spill-v1");
+        let mut slot = self.buffered_scratch.lock().await;
+        if let Some(guard) = slot.get(&root) {
+            return Ok((root, guard.clone()));
+        }
+        let owned = root.clone();
+        let guard = common_runtime::spawn_blocking_query(move || {
+            crate::read::series_result::resources::open_namespace(&owned, "buffered-spill.lock")
+        })
+        .await
+        .context(crate::error::JoinSnafu)??;
+        slot.insert(root.clone(), guard.clone());
+        Ok((root, guard))
+    }
+
     pub(crate) async fn buffered_data_cache(
         &self,
         options: crate::read::series_buffered::cache::Options,
@@ -1117,8 +1135,8 @@ impl CacheManager {
         Ok(cache)
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) async fn shutdown_buffered_data_cache(&self) -> Result<()> {
+        self.buffered_scratch.lock().await.clear();
         let cache = self.buffered_data_cache.lock().await.take();
         if let Some(cache) = cache {
             cache.invalidate_all();
@@ -1764,7 +1782,7 @@ impl CacheManagerBuilder {
                 .build()
         });
         CacheManager {
-            #[cfg(any(test, feature = "dev-tools"))]
+            buffered_scratch: tokio::sync::Mutex::new(BTreeMap::new()),
             buffered_data_cache: tokio::sync::Mutex::new(None),
             sst_meta_cache,
             sst_decoded_meta_cache,

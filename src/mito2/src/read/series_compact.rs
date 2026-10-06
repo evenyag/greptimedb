@@ -589,14 +589,12 @@ struct TagCatalogState {
 }
 
 /// An immutable decoded catalog subset, with no producer-query reservations.
-#[cfg(any(test, feature = "dev-tools"))]
 pub(crate) struct CachedTags {
     values: Vec<(MetricSeriesId, Vec<Value>)>,
     _charge: crate::read::series_result::resources::Charge,
 }
 
 impl TagCatalog {
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn snapshot_tags(
         &self,
         ids: &[MetricSeriesId],
@@ -626,7 +624,6 @@ impl TagCatalog {
         })
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn import_tags(&self, tags: &CachedTags) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         for (id, values) in &tags.values {
@@ -656,7 +653,6 @@ impl TagCatalog {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn buffered_tag_bytes(&self, rows: usize) -> Result<usize> {
         use crate::read::series_result::{checked_add, checked_mul};
         let inner = self.inner.lock().unwrap();
@@ -830,7 +826,6 @@ type MappedFileRange = (FileRange, Arc<SeriesRowMapping>);
 
 /// All source handles are established before any partition receives an assignment.
 pub(crate) struct CompactReadContext {
-    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) buffered_resources: Option<Arc<crate::read::series_result::StoreResources>>,
     pub(crate) schema: CompactSchema,
     pub(crate) catalog: Arc<TagCatalog>,
@@ -855,7 +850,6 @@ impl CompactReadContext {
             metrics,
             catalog,
             assignment_reservation,
-            #[cfg(any(test, feature = "dev-tools"))]
             None,
         )
         .await
@@ -868,9 +862,7 @@ impl CompactReadContext {
         metrics: &PartitionMetrics,
         catalog: Arc<TagCatalog>,
         assignment_reservation: MemoryReservation,
-        #[cfg(any(test, feature = "dev-tools"))] resources: Option<
-            Arc<crate::read::series_result::StoreResources>,
-        >,
+        resources: Option<Arc<crate::read::series_result::StoreResources>>,
     ) -> Result<Self> {
         let timer_metric = catalog.metrics.preflight_time.clone();
         let _timer = timer_metric.timer();
@@ -896,7 +888,6 @@ impl CompactReadContext {
                 metrics.merge_reader_metrics(&reader_metrics, None);
                 let mut prepared = Vec::with_capacity(sources.len());
                 for source in sources {
-                    #[cfg(any(test, feature = "dev-tools"))]
                     let _preflight_charge = if let Some(resources) = &resources {
                         source.admit_buffered_context(resources)?;
                         let bytes = source.buffered_preflight_bytes()?;
@@ -921,7 +912,6 @@ impl CompactReadContext {
                         None
                     };
                     let mapping = source.preflight_compact_mapping(&catalog).await?;
-                    #[cfg(any(test, feature = "dev-tools"))]
                     if let Some(resources) = &resources {
                         // Opening an index during preflight also retains its metadata.
                         source.admit_buffered_context(resources)?;
@@ -945,7 +935,6 @@ impl CompactReadContext {
             .context(MergeCandidateSeriesSnafu)?;
         catalog.metrics.mapping_bytes.set(reservation.size());
         Ok(Self {
-            #[cfg(any(test, feature = "dev-tools"))]
             buffered_resources: None,
             schema: CompactSchema::new(&ctx.input.mapper),
             catalog,
