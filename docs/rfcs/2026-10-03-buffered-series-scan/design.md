@@ -1,8 +1,8 @@
 ---
 Feature Name: Buffered SeriesScan
 Date: 2026-10-03
-Updated: 2026-10-05
-Status: Development PoC through Stage 5 validated; rollout undecided
+Updated: 2026-10-06
+Status: Development PoC through Stage 6 validated; rollout undecided
 ---
 
 # Summary
@@ -512,6 +512,13 @@ first implementation keeps the preparation barrier; later readiness scheduling
 must preserve the publication reservation contract.
 
 # File-backed data-result cache
+
+Stage 6 is implemented at `77df493f95`, with benchmark error-path cleanup
+corrected at `9e71852ef4`. Ownership, invalidation, pinning, startup cleanup,
+and replay-without-content-writes gates passed. See the
+[progress and evidence](implementation-plan.md) and
+[cache metric definitions](metrics.md#file-backed-buffered-data-cache-stage-6).
+The cache remains development-only; no production capacity or default is selected.
 
 Add a separate namespace for buffered-mode complete data results. Preserve
 fingerprint rules for projection, predicates, sequence range, schema/partition

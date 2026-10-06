@@ -1,6 +1,6 @@
 # Buffered SeriesScan implementation and experiment plan
 
-Status: Development PoC through Stage 5 validated, 2026-10-05.
+Status: Development PoC through Stage 6 validated, 2026-10-06.
 
 Read the [design](design.md) for execution semantics and interfaces. Preparation
 runs outside scan partition streams; those streams lazily concatenate complete
@@ -113,8 +113,32 @@ an implementation stage.
   and `20261005-stage5-summary/`. The report preserves the initial rejected
   revision, harness cleanup review, diagnostic limits, and omitted suites.
   Main v2's historical p8 exactness gap remains unchanged.
-- [ ] Stage 6: File-backed buffered-data cache; pass ownership, invalidation,
-  pinning, and replay-without-writes gates.
+- [x] Stage 6: File-backed buffered-data cache implemented at `77df493f95`,
+  with scanbench error-path cleanup corrected at `9e71852ef4` (2026-10-06).
+  Representation/fingerprint eligibility, independent tag ownership, concurrent
+  cursors, pinning/delayed deletion, quotas, startup cleanup, and preparation-only
+  admission passed. Normal-profile local gates include 1,676 tests, 70 focused
+  stage tests, Clippy/build/format/license checks, and 27 SQLness case executions.
+  The correction additionally passed 14 scanbench tests and 24 functional CLI
+  runs, including eight intentional errors with complete payload cleanup.
+  Retained evidence covers 36 exact query iterations, a fresh complete p8-to-p1
+  comparison, 96 timing-only iterations, and two clean 4 GiB rejections.
+  Warm exact queries started no data readers and wrote no spill/cache content;
+  cache-owned write counters were unchanged in all 36 warm iterations.
+  Three equal-query-budget timing sweeps observed warm median reductions of
+  23.4–72.2% against disabled-repeat controls; cold admission was roughly neutral
+  to 4.6% slower. The extra engine cache budget is reported separately.
+  The initial cached rejection's CLI cleanup failure and its archived payload
+  remain preserved; corrected startup recovery and rejection cleanup passed.
+  Evidence bundles were retrieved and hash-verified, owned workloads exited,
+  and the accepted SST inventory was unchanged. See the external
+  [Stage 6 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage6-report.md)
+  and `20261005-stage6-local/`, `20261006-stage6-cleanup-r2/`,
+  `20261005-stage6-remote/retrieved/`, and
+  `20261006-stage6-remote-resume/retrieved/` under the external evidence root.
+  No policy/layout/production default was selected. Admission is not an RSS
+  bound; query-end snapshots can precede asynchronous deletion. The Stage 1
+  main-v2 p8 exactness gap remains unchanged.
 - [ ] Stage 7: Integrated evaluation and rollout decision; record reproducible
   evidence and select experimental settings without changing existing defaults.
 
@@ -156,7 +180,18 @@ an implementation stage.
 
 # Fresh-thread resumption
 
-Stage 5 passed at `24d38239ba`; Stage 6 is next. Read the external
+Stage 6 passed at `77df493f95` plus the benchmark cleanup correction
+`9e71852ef4`; Stage 7 is next. Read the external
+[Stage 6 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage6-report.md)
+for exactness, three equal-budget timing sweeps, cache footprints, preserved
+failures, startup recovery, and verified cleanup. Cached entries own complete
+IPC results/indexes and independent tags; active pins retain capacity until
+deletion. Admission/conversion happens only in preparation. Warm replay does
+not write spill/cache content. Existing caches and production defaults remain
+unchanged. Preserve all stashes and the main-v2 p8 exactness gap. Confirm machine
+availability before later remote work; never start or stop it.
+
+Stage 5 passed at `24d38239ba`. Read the external
 [Stage 5 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage5-report.md)
 for the equal-budget matrix, source-buffer correction, phase/ownership metrics,
 pressure rejections, and cleanup evidence. Preparation concurrency is a

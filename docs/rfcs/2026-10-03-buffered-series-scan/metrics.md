@@ -225,3 +225,58 @@ therefore omit later cleanup work. Quiescent local cleanup tests and verified
 remote process/cgroup/scratch cleanup are separate gates. Escaped output charges
 likewise survive cursor/manifest destruction. Preserve the Stage 4 distinction
 between bounded active replay and complete-identity downstream retention.
+
+## File-backed buffered-data cache (Stage 6)
+
+Validated at `77df493f95` with scanbench shutdown correction `9e71852ef4`;
+see the external
+[Stage 6 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage6-report.md).
+Development settings record the optional cache's disk and metadata capacities
+separately from the consuming query's memory/spill/disk budgets. Equal query
+budgets do not imply equal total provisioning. Existing engine caches and OS
+file-cache memory remain separate.
+
+Query-owned `buffered_resources.counts` adds `buffered_cache_hits`,
+`buffered_cache_misses`, `buffered_cache_bypasses`, `buffered_cache_admissions`,
+`buffered_cache_admission_skips`, and `buffered_cache_evictions`. These describe
+complete range/identity-set results, not rows, IPC batches, or physical files.
+For retained p8 Q03, shared mode observes six entries/hits and selected mode
+48; these are measurements, never caps. An optional admission skip is not a
+query failure. Required spill failure still fails the query.
+
+`buffered_cache_admission_ns` is cumulative successful admission elapsed after
+acquiring the serial admission lock, including copying/conversion and any
+eviction/retry work. It is not exclusive CPU or a final-replay phase timer.
+Cache resource `operations.cache_copy_*` instruments synchronous finalized-file
+copy calls with the existing same-thread elapsed/CPU/unavailable-clock rules;
+resident conversion also uses normalization/serialization scopes. Copying
+finalized IPC records `cache_copy_read_bytes` separately from metadata reads.
+
+`buffered_settings.cache_resources` is an engine-owned cumulative snapshot:
+
+- `visible_entries` and `visible_disk_bytes`: lookup-visible complete results.
+- `visible_pinned_disk_bytes`: visible results with external result/file owners.
+  Evicted pins are not included in this visible-only field.
+- `retired_or_staging_disk_bytes`: charged disk not represented by visible
+  entries, including staging, evicted pins, and pending deletion. It is not an
+  exclusive measure of pinned bytes.
+- `resources` and `operations`: cache-owned capacities, peaks, pending/failed
+  cleanup, and cumulative content I/O/operation counters. Cache metadata covers
+  keys, indexes, and independent decoded tags. Consumer decoding/output is
+  charged to the consuming query, not the cache's metadata allowance.
+
+Compare cumulative cache write counters before/after a warm query, alongside
+that query's own content-write counters. Do not attribute the cache's lifetime
+totals to every query or interpret filesystem/cleanup metadata traffic as IPC
+content writes. Physical I/O and RSS require separate observations. Pins keep
+disk/index charges until ownership and deletion permit release; lookup eviction
+alone does not reclaim them. Query-end snapshots can precede asynchronous
+cleanup, and zero visible pins at that snapshot says nothing about earlier pins.
+
+Scanbench now stops its engine on success and error, joining cancelled partition
+tasks first. Engine shutdown invalidates lookup ownership and drains cleanup;
+escaped owners still retain their charges. Retained tests pair snapshots with
+actual process/timer/cgroup/payload cleanup. Three timing-only repetitions use
+disabled-first/repeat controls and cold/warm cache pairs; exact-reference I/O is
+kept in separate diagnostics. Timing-only still retains buffered accounting and
+operation instrumentation, and its process-pair peaks do not isolate warm RSS.
