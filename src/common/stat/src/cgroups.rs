@@ -40,6 +40,139 @@ const MAX_VALUE_CGROUP_V2: &str = "max";
 // For easier comparison, if the memory limit is larger than 1PB we consider it as unlimited.
 const MAX_MEMORY_IN_BYTES: i64 = 1125899906842624; // 1PB
 
+/// Finite limits for the current process and its visible cgroup ancestors.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ProcessCgroupLimits {
+    /// Hard memory limit; unrelated to current usage or reclaimable page cache.
+    pub memory_bytes: Option<u64>,
+    /// CPU quota, in millicores. CPU affinity must be considered separately.
+    pub cpu_millicores: Option<u64>,
+}
+
+/// Resolves process membership against cgroup mounts, including systemd scopes.
+/// Missing, unreadable, and unlimited controls contribute no finite limit.
+/// This does not change the existing mount-root resource helpers.
+pub fn get_process_cgroup_limits() -> ProcessCgroupLimits {
+    #[cfg(target_os = "linux")]
+    {
+        process_cgroup_limits(
+            &read_to_string("/proc/self/cgroup").unwrap_or_default(),
+            &read_to_string("/proc/self/mountinfo").unwrap_or_default(),
+            |path| read_to_string(path).ok(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    ProcessCgroupLimits::default()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn process_cgroup_limits(
+    membership: &str,
+    mounts: &str,
+    read: impl Fn(&Path) -> Option<String>,
+) -> ProcessCgroupLimits {
+    let mut limits = ProcessCgroupLimits::default();
+    for mount in mounts.lines() {
+        let Some((description, filesystem)) = mount.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<_> = description.split_whitespace().collect();
+        let fs: Vec<_> = filesystem.split_whitespace().collect();
+        if fields.len() < 6 || fs.len() < 3 || !matches!(fs[0], "cgroup" | "cgroup2") {
+            continue;
+        }
+        let root = unescape_mount_path(fields[3]);
+        let mountpoint = unescape_mount_path(fields[4]);
+        let mountpoint = Path::new(&mountpoint);
+        for member in membership.lines() {
+            let member: Vec<_> = member.splitn(3, ':').collect();
+            if member.len() != 3 {
+                continue;
+            }
+            let unified = fs[0] == "cgroup2" && member[1].is_empty();
+            let controller = |name| {
+                fs[0] == "cgroup"
+                    && fs[2].split(',').any(|v| v == name)
+                    && member[1].split(',').any(|v| v == name)
+            };
+            let memory = unified || controller("memory");
+            let cpu = unified || controller("cpu");
+            if !memory && !cpu {
+                continue;
+            }
+            let path = Path::new(member[2]);
+            // A cgroup namespace reports membership relative to its root,
+            // while mountinfo can retain the original subtree mount root.
+            let relative = path.strip_prefix(&root).or_else(|_| path.strip_prefix("/"));
+            let Ok(relative) = relative else { continue };
+            if relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let mut directory = mountpoint.join(relative);
+            loop {
+                if memory {
+                    let file = if unified {
+                        MEMORY_MAX_FILE_CGROUP_V2
+                    } else {
+                        MEMORY_MAX_FILE_CGROUP_V1
+                    };
+                    if let Some(value) =
+                        read(&directory.join(file)).and_then(|v| v.trim().parse::<u64>().ok())
+                        && (unified || value < MAX_MEMORY_IN_BYTES as u64)
+                    {
+                        limits.memory_bytes =
+                            Some(limits.memory_bytes.map_or(value, |old| old.min(value)));
+                    }
+                }
+                if cpu {
+                    let quota_period = if unified {
+                        read(&directory.join(CPU_MAX_FILE_CGROUP_V2)).and_then(|v| {
+                            let mut values = v.split_whitespace();
+                            Some((
+                                values.next()?.parse::<u64>().ok()?,
+                                values.next()?.parse::<u64>().ok()?,
+                            ))
+                        })
+                    } else {
+                        read(&directory.join(CPU_QUOTA_FILE_CGROUP_V1)).and_then(|quota| {
+                            Some((
+                                quota.trim().parse::<u64>().ok()?,
+                                read(&directory.join(CPU_PERIOD_FILE_CGROUP_V1))?
+                                    .trim()
+                                    .parse::<u64>()
+                                    .ok()?,
+                            ))
+                        })
+                    };
+                    if let Some((quota, period)) = quota_period
+                        && quota > 0
+                        && period > 0
+                        && let Some(value) = quota.checked_mul(1000).map(|v| v.div_ceil(period))
+                    {
+                        limits.cpu_millicores =
+                            Some(limits.cpu_millicores.map_or(value, |old| old.min(value)));
+                    }
+                }
+                if directory == mountpoint || !directory.pop() {
+                    break;
+                }
+            }
+        }
+    }
+    limits
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount_path(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
 /// Get the limit of memory in bytes from cgroups filesystem.
 ///
 /// - If the cgroup total memory is unset, return `None`.
@@ -267,6 +400,80 @@ impl Collector for CgroupsMetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_process_cgroup_limits() {
+        let files = [
+            ("/cg/memory.max", "max"),
+            ("/cg/system.slice/memory.max", "2048"),
+            ("/cg/system.slice/db.service/memory.max", "4096"),
+            ("/cg/system.slice/cpu.max", "150000 100000"),
+            ("/cg/system.slice/db.service/cpu.max", "max 100000"),
+        ];
+        let read = |path: &Path| {
+            files
+                .iter()
+                .find(|(p, _)| path == Path::new(p))
+                .map(|(_, v)| v.to_string())
+        };
+        let mounts = "1 0 0:1 / /cg rw - cgroup2 cgroup rw";
+        assert_eq!(
+            process_cgroup_limits("0::/system.slice/db.service", mounts, read),
+            ProcessCgroupLimits {
+                memory_bytes: Some(2048),
+                cpu_millicores: Some(1500)
+            }
+        );
+        assert_eq!(
+            process_cgroup_limits("0::/", mounts, read),
+            ProcessCgroupLimits::default()
+        );
+        assert_eq!(
+            process_cgroup_limits("0::/../outside", mounts, read),
+            ProcessCgroupLimits::default()
+        );
+    }
+
+    #[test]
+    fn test_process_cgroup_subtree_mounts() {
+        let mount = "1 0 0:1 /host/container /cg\\040space rw - cgroup2 cgroup rw";
+        for membership in ["0::/host/container/worker", "0::/worker"] {
+            let limits = process_cgroup_limits(membership, mount, |path| {
+                (path == Path::new("/cg space/worker/memory.max")).then(|| "1024".to_owned())
+            });
+            assert_eq!(limits.memory_bytes, Some(1024));
+        }
+    }
+
+    #[test]
+    fn test_process_cgroup_v1_limits() {
+        let mounts = "1 0 0:1 / /memory rw - cgroup cgroup rw,memory\n2 0 0:2 / /cpu rw - cgroup cgroup rw,cpu,cpuacct";
+        let files = [
+            ("/memory/service/memory.limit_in_bytes", "2048"),
+            ("/memory/memory.limit_in_bytes", "9223372036854771712"),
+            ("/cpu/service/cpu.cfs_quota_us", "25000"),
+            ("/cpu/service/cpu.cfs_period_us", "100000"),
+            ("/cpu/cpu.cfs_quota_us", "-1"),
+            ("/cpu/cpu.cfs_period_us", "0"),
+        ];
+        let limits = process_cgroup_limits(
+            "5:memory:/service\n4:cpu,cpuacct:/service",
+            mounts,
+            |path| {
+                files
+                    .iter()
+                    .find(|(p, _)| path == Path::new(p))
+                    .map(|(_, v)| v.to_string())
+            },
+        );
+        assert_eq!(
+            limits,
+            ProcessCgroupLimits {
+                memory_bytes: Some(2048),
+                cpu_millicores: Some(250)
+            }
+        );
+    }
 
     #[test]
     fn test_read_value_from_file() {

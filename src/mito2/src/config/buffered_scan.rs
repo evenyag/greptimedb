@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use common_base::memory_limit::MemoryLimit;
 use common_base::readable_size::ReadableSize;
-use common_stat::{get_total_cpu_cores, get_total_memory_bytes};
+use common_stat::{get_process_cgroup_limits, get_total_cpu_cores, get_total_memory_bytes};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{InvalidConfigSnafu, Result};
@@ -159,8 +159,22 @@ impl BufferedScanConfig {
     pub(crate) fn sanitize(&mut self, data_home: &str) -> Result<()> {
         self.resolved = None;
         if self.enabled {
-            let memory = u64::try_from(get_total_memory_bytes()).unwrap_or_default();
-            let cores = get_total_cpu_cores().max(1);
+            let limits = get_process_cgroup_limits();
+            let mut memory = u64::try_from(get_total_memory_bytes()).unwrap_or_default();
+            let mut cores = get_total_cpu_cores().max(1);
+            if let Ok(available) = std::thread::available_parallelism() {
+                cores = cores.min(available.get());
+            }
+            if let Some(limit) = limits.memory_bytes {
+                memory = memory.min(limit);
+            }
+            if let Some(limit) = limits.cpu_millicores {
+                cores = cores.min(
+                    usize::try_from(limit.div_ceil(1000))
+                        .unwrap_or(cores)
+                        .max(1),
+                );
+            }
             let options = self.resolve(data_home, memory, cores)?;
             common_telemetry::info!(
                 "Buffered scan startup settings: memory_available={memory}, cpu_cores={cores}, configured={self:?}, resolved={options:?}"
