@@ -1,8 +1,8 @@
 ---
 Feature Name: Buffered SeriesScan
 Date: 2026-10-03
-Updated: 2026-10-06
-Status: Development PoC through Stage 6 validated; rollout undecided
+Updated: 2026-10-07
+Status: Stage 7 reduced evaluation complete; experimental opt-in only
 ---
 
 # Summary
@@ -31,10 +31,11 @@ replay does not write spill files or perform external merge passes. Resource
 admission and rejection depend on memory, not reader or merge-input counts.
 
 The [implementation and experiment plan](implementation-plan.md) separates
-prototype work and comparisons. The preferred spill format is decided; whether
-IPC batches contain one series or multiple series remains an experiment. Its
-progress checklist tracks stage completion and validation evidence. The PoC
-uses `perf/buffered-series-scan-poc`, created from main in the existing checkout;
+prototype work and comparisons. Stage 7 selects multiple-series, plain-key,
+uncompressed IPC for the experimental profile; alternative layouts, encodings
+and compression remain available for attribution. Its progress checklist tracks
+stage completion, the user-approved smaller matrix and validation evidence.
+The PoC uses `perf/buffered-series-scan-poc`, created from main in the existing checkout;
 the research branch remains available as a baseline. Edit code locally and
 build/run experiments remotely using the external workflow linked from the
 implementation plan. Retrieved uncommitted results and artifacts live in fresh
@@ -387,8 +388,8 @@ reservation that grows with identity length, even though the scanner never
 collects that identity's decoded payload. Arbitrary collect-all consumers are
 not covered by this profile. Preserve allocation charges in escaped arrays;
 closing a cursor or manifest releases only unused reservation capacity and
-allocations whose final owners have been dropped. This is development-only
-admission behavior, not a claim that total downstream memory is batch-bounded.
+allocations whose final owners have been dropped. This experimental
+per-SeriesScan admission does not claim that total downstream memory is batch-bounded.
 
 Finalize resident/disk placement so retained results and metadata plus aggregate
 replay reservations fit the hard budget. Spill eligible unpublished results
@@ -518,7 +519,9 @@ corrected at `9e71852ef4`. Ownership, invalidation, pinning, startup cleanup,
 and replay-without-content-writes gates passed. See the
 [progress and evidence](implementation-plan.md) and
 [cache metric definitions](metrics.md#file-backed-buffered-data-cache-stage-6).
-The cache remains development-only; no production capacity or default is selected.
+Stage 7 exposes it through optional buffered-scan configuration, with disk and
+metadata budgets separate from scan budgets. It remains disabled unless
+configured. Existing engine caches and production defaults are unchanged.
 
 Add a separate namespace for buffered-mode complete data results. Preserve
 fingerprint rules for projection, predicates, sequence range, schema/partition
@@ -540,23 +543,45 @@ eviction removes lookup visibility immediately and deletes content after the
 last pin drops. Keep pinned bytes charged. Leave current v2, candidate, mapping,
 and SeqScan caches unchanged.
 
-# Decisions reserved for measurement
+# Experimental choices and remaining decisions
 
-| Question | Initial choice | Experiment |
+Stage 7 completed the user-approved reduced evaluation. The public opt-in block
+is `region_engine.mito.experimental_buffered_series_scan`; `enabled` defaults to
+false. Startup resolves a 50% tracked-memory budget against host memory capacity
+and process/ancestor cgroup limits, and preparation concurrency as
+`(cores / 4).clamp(1, 4)` using effective CPU limits/affinity. Explicit overrides
+remain available. These limits apply to one SeriesScan, not all scans in a query
+or all concurrent queries. Admission estimates are not process RSS bounds.
+
+| Question | Experimental choice | Evidence or remaining decision |
 | --- | --- | --- |
-| Preparation concurrency | One active partition-range preparation | Compare 1/2/4 independently of output partition count. |
-| Source policy | Current selected-series streaming | Compare shared selected-series reads and source buffering. |
-| Spill format | Arrow IPC file | Format is fixed; compare encoding and batch layouts. |
-| IPC batch scope | Prototype both layouts | Measure one-series versus multiple-series batches. |
-| Compact key storage | Plain Binary in first IPC benchmark | Compare a consistent fixed dictionary encoding. |
-| Compression | Uncompressed | Compare LZ4/Zstd CPU, size, and read/write throughput. |
-| Final replay traversal | Lazy per-identity concatenation of complete ranges | Verify bounded active payload as contributing range count grows. |
-| Readiness publication | Complete-preparation barrier with aggregate replay reservations | Early publication requires admission for remaining preparation too. |
-| Final replay spill | Disabled | No spill experiment in final replay. |
-| Reader/merge-input counts | Metrics only | Vary source counts and widths; memory determines admission. |
+| Preparation concurrency | Startup-based; 2 on the measured 8-core resource basis | c2 improved the Q03 samples over c1; c4 did not improve c2. A separate 2-core quota control selected c1. |
+| Source policy | Selected-series per partition | Shared reads reduced source work but increased IPC work and sampled latency; keep the diagnostic alternative. |
+| Spill format/layout | Arrow IPC file, multiple-series batches | One-series did not improve both parallelisms; retain both layouts. |
+| Compact key storage | Plain Binary | Fixed keys reduced cache storage but cost cold preparation/latency; matched metadata controls are retained. |
+| Compression | None | LZ4/Zstd did not improve both timing samples; preserve them for diagnosis. |
+| IPC batch/file limits | 1024 rows/1 MiB; 64 MiB files, 1024 batches, 1 MiB file metadata | Tested conservative limits, not exhaustive optima; 8192-row IPC batches rejected p8 publication under the tested budget. |
+| Memory/placement | 50% startup resource basis, threshold one quarter of that budget | Automatic Q03/Q05/Q11 p1/p8 passed; explicit 8 GiB/c1 full-suite controls are separate evidence. |
+| Spill disk quota | 20 GiB per SeriesScan | Full-query live spill reached 4.332 GiB; the Q03-only 4 GiB success does not size every query. |
+| Buffered cache | Optional, independently provisioned | Disabled/cold/warm comparisons retain pair-level peaks; no universal cache winner. |
+| Final replay traversal | Lazy per-identity concatenation of complete ranges | Bounded active payload is separate from indexes, retained results and escaped output. |
+| Readiness publication | Complete-preparation barrier with aggregate replay reservations | Earlier publication requires admission for remaining preparation too. |
+| Final replay spill | Disabled | Preparation is the only content-write phase. |
+| Reader/merge-input counts | Metrics only | Counts and widths were varied; memory determines admission. |
 | Required merge memory exceeds budget | Query error after eligible reclamation | Report required/available bytes; do not add external merge passes. |
-| Spill accounting | Per query | Global spill coordination is follow-up work. |
-| Production defaults | Not selected | Decide from correctness and equal-budget measurements. |
+| Spill accounting | Per SeriesScan | Global/concurrent-query coordination remains follow-up work. |
+| Production defaults | Unchanged | Controlled opt-in recommendation; any promotion requires a separate decision. |
+
+The retained original Q01–Q12 comparison includes both output parallelisms.
+Independent scanner settings use one descriptive timing pass after the user
+reduced the matrix; automatic sizing uses representative Q03/Q05/Q11 checks.
+Main/research have no equivalent buffered tracked pool, so three-way full-query
+results share external guards rather than equivalent tracked-memory accounting.
+Full PromQL uses the pinned numerical tolerance, while scanner fixtures/references
+use exact comparison. Main-v2 scanner p8 timed out again and remains unvalidated.
+Short reader probes and finalized IPC source fixtures are not live SST decoder
+RSS bounds. See the [progress/evidence](implementation-plan.md) and external
+Stage 7 report for source bindings, accepted contracts and limitations.
 
 Compact merge identity and deferred tag attachment are core behavior, not
 optional optimizations. Full-key data-phase modes and collision-based retries

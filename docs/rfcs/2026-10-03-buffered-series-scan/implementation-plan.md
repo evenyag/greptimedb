@@ -1,6 +1,6 @@
 # Buffered SeriesScan implementation and experiment plan
 
-Status: Development PoC through Stage 6 validated, 2026-10-06.
+Status: Stage 7 reduced evaluation complete; experimental opt-in only, 2026-10-07.
 
 Read the [design](design.md) for execution semantics and interfaces. Preparation
 runs outside scan partition streams; those streams lazily concatenate complete
@@ -139,8 +139,38 @@ an implementation stage.
   No policy/layout/production default was selected. Admission is not an RSS
   bound; query-end snapshots can precede asynchronous deletion. The Stage 1
   main-v2 p8 exactness gap remains unchanged.
-- [ ] Stage 7: Integrated evaluation and rollout decision; record reproducible
-  evidence and select experimental settings without changing existing defaults.
+- [x] Stage 7: Opt-in integration at `d1af7ab6dd`, startup cgroup correction at
+  `ca4243fcff`, and test-only source-count/width extension at `70685c3494`
+  evaluated on 2026-10-06, with the decision recorded on 2026-10-07.
+  Normal-profile affected tests, command/configuration
+  checks, SQLness, builds, Clippy, formatting/license/dependency checks, generated
+  configuration documentation and matching EN/ZH user documentation passed.
+  Workspace-wide unrelated suites remain omitted and recorded.
+  The original seven-day Q01–Q12 p1/p8 diagnostic matrix yielded 63 matches and
+  nine main-v2 p8 timeouts; buffered and research v2 completed all 24 cases each.
+  Separate fresh timing yielded 62 matches and one main-v2 Q12 p8 timeout.
+  All 24 separate full-query plans passed per-scan resource limits and zero
+  data-phase full-key decoding audits. Numerical comparison uses the pinned benchmark tolerance;
+  full PromQL output is not universally bitwise identical.
+  At the user's request, retain one scanner timing pass (36 processes,
+  44 iterations) and validate automatic settings on Q03/Q05/Q11 at p1/p8,
+  rather than repeating every query for every setting. All retained timing and
+  representative automatic-sizing cases passed; omitted repetitions are not
+  passed gates or significance evidence.
+  Select multiple-series/plain/uncompressed IPC, selected-series sources,
+  startup-based preparation concurrency and memory with explicit overrides,
+  threshold retention and optional separately budgeted cache. Production
+  defaults remain unchanged. Full-suite timings use the explicit 8 GiB/c1
+  control; automatic 6 GiB/c2 evidence is separate diagnostic validation.
+  The guarded main-v2 scanner p8 retry timed out at 300 seconds; exactness
+  remains unvalidated. Reader-width probes and finalized-source fixtures do
+  not establish live SST decoder RSS bounds. Final evidence was retrieved and
+  hash-verified, owned workloads/scratch were cleaned, and the accepted SST
+  inventory and all stashes were unchanged. See the external
+  [Stage 7 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage7-report.md)
+  and `20261006-stage7-local/`, `20261006-stage7-remote/` under the existing
+  evidence root. Recommendation: controlled opt-in only; production-default
+  promotion requires a separate decision.
 
 # Working conventions
 
@@ -160,10 +190,12 @@ an implementation stage.
   required by the relevant stage. Research-branch diagnostics and fixes are not
   automatically PoC dependencies. Compare main v2, research-branch v2, and the
   buffered mode with their effective settings recorded.
-- Keep development options for preparation concurrency, source policy,
-  per-query memory budget/spill threshold, IPC layout, batch size, and compression.
-  Reader and merge-input counts are metrics, not admission limits.
-  Production option names/defaults follow measured selection.
+- Keep diagnostic alternatives in the opt-in buffered configuration for
+  preparation concurrency, source policy, per-SeriesScan memory/spill budgets,
+  IPC layout, batch size, encoding and compression. The old development-only
+  enablement and JSON environment loader are removed. Reader and merge-input
+  counts remain metrics, not admission limits. Existing production defaults
+  stay unchanged; promotion is a separate decision.
 - Use existing scanbench/parquetbench and bounded JSONL evidence. Keep remote
   results and scratch outside the Git checkout and read-only dataset, in fresh
   run directories. Store retrieved results, logs, profiles, and other local
@@ -180,8 +212,20 @@ an implementation stage.
 
 # Fresh-thread resumption
 
+Stage 7 is complete within the user-approved reduced evaluation scope. Read the
+external [Stage 7 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage7-report.md)
+and the leading completion section in `20261006-stage7-remote/execution-checkpoint.md`
+under the existing evidence root. Runtime evidence is pinned to `ca4243fcff`;
+`70685c3494` changes tests only. The measured candidate remains opt-in, cache is
+optional, and no production default is promoted. Single timing samples, the
+main-v2 p8 timeout/exactness gap, and decoder-footprint limitations are explicit.
+Do not restart the superseded full repetition/query matrix. All owned remote
+workloads and transfers are finished; confirm availability before future SSH
+and never start or stop the machine. Preserve all stashes and retained evidence.
+
+Earlier stage handoffs below are historical bindings, not outstanding work.
 Stage 6 passed at `77df493f95` plus the benchmark cleanup correction
-`9e71852ef4`; Stage 7 is next. Read the external
+`9e71852ef4`. Read the external
 [Stage 6 report](/Users/evenyag/Documents/test/promql-k8s-memory/reports/buffered-series-scan-poc-stage6-report.md)
 for exactness, three equal-budget timing sweeps, cache footprints, preserved
 failures, startup recovery, and verified cleanup. Cached entries own complete

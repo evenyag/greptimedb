@@ -280,3 +280,40 @@ actual process/timer/cgroup/payload cleanup. Three timing-only repetitions use
 disabled-first/repeat controls and cold/warm cache pairs; exact-reference I/O is
 kept in separate diagnostics. Timing-only still retains buffered accounting and
 operation instrumentation, and its process-pair peaks do not isolate warm RSS.
+
+## Integrated evaluation scopes (Stage 7)
+
+Stage 7 keeps full PromQL, scanner-only diagnostics and timing-only observations
+separate. HTTP first-response latency is not scanner first-output latency.
+Scanbench's minimum partition-relative first-batch wait excludes setup and task
+launch delay; setup plus that wait is an approximation, not a query-wide clock.
+The user-approved smaller matrix retains one timing sample per independent
+configuration/parallelism. Do not infer statistical significance or treat omitted
+reverse-order repetitions as completed evidence.
+
+Full-query records retain pre-query baseline and query/server peak RSS, cgroup
+anonymous/file/current memory, pressure/events and available allocator snapshots.
+Scanner baselines are first process-start samples, not steady-state pre-query
+baselines. Cache cold/warm pairs share one process; their reported peaks cover
+the pair. Allocator before/after observations are not allocator peaks, and timing
+runs omit diagnostic allocator/explain collection. Short raw reader probes can
+finish between samples and therefore do not establish decoder peak memory.
+
+The tracked budget and phase/category peaks belong to one SeriesScan. A query
+can contain multiple scans; do not sum their peaks or add them to RSS, allocator
+or cgroup observations. Admission estimates and publication reservations are not
+RSS bounds. Query-end ownership snapshots can precede asynchronous deletion;
+verify process, pin, file and namespace cleanup independently.
+
+IPC filesystem bytes divided by logical requested bytes describe direct read
+overhead. Decoded/requested row ratios can mix resident and file-backed paths;
+they are not a filesystem amplification measure. Source/result spill counters
+belong to different pipeline stages, and total final snapshots cannot establish
+replay-only writes. Use the preparation/replay invariants and cold/warm counter
+audits for that claim. Cache budgets remain separate from scan budgets.
+
+Keep deadlines, required-spill failures and admission rejections in the matrix.
+A failed reservation's required/available bytes are not the total memory needed
+to complete a query. Main-v2 p8's guarded retry remains unvalidated. Refer to the
+[Stage 7 progress](implementation-plan.md) and its external report for exact
+source/configuration bindings and the accepted-workload resource contracts.
