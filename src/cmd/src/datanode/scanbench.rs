@@ -37,7 +37,6 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::compute;
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use log_store::kafka::log_store::KafkaLogStore;
 use log_store::noop::log_store::NoopLogStore;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
@@ -56,7 +55,7 @@ use sqlparser::parser::Parser as SqlParser;
 use store_api::metadata::RegionMetadata;
 use store_api::path_utils::WAL_DIR;
 use store_api::region_engine::{PrepareRequest, QueryScanContext, RegionEngine};
-use store_api::region_request::{RegionOpenRequest, RegionRequest};
+use store_api::region_request::{PathType, RegionOpenRequest, RegionRequest};
 use store_api::storage::{RegionId, ScanRequest, TimeSeriesDistribution, TimeSeriesRowSelector};
 use tokio::fs;
 
@@ -939,6 +938,34 @@ impl ScanbenchCommand {
             }
         };
 
+        let result = self
+            .run_with_engine(
+                &engine,
+                region_id,
+                path_type,
+                scan_config_set,
+                benchmark_started_at_unix_ms,
+            )
+            .await;
+        // Query errors must also retire engine-owned cache files before the CLI exits.
+        // run_with_engine drops its scanners and joins cancelled partition tasks first.
+        let shutdown = engine.stop().await.context(error::BuildCliSnafu);
+        if let Err(error) = &shutdown {
+            common_telemetry::warn!("Failed to stop scanbench engine: {error}");
+        }
+        result.and(shutdown)?;
+        println!("\n{}", "Benchmark completed!".green().bold());
+        Ok(())
+    }
+
+    async fn run_with_engine(
+        &self,
+        engine: &MitoEngine,
+        region_id: RegionId,
+        path_type: PathType,
+        scan_config_set: ScanConfigSet,
+        benchmark_started_at_unix_ms: u64,
+    ) -> error::Result<()> {
         // Open region
         let open_request = RegionOpenRequest {
             engine: "mito".to_string(),
@@ -1105,7 +1132,7 @@ impl ScanbenchCommand {
             };
             let metrics_set = ExecutionPlanMetricsSet::new();
 
-            let mut scan_futures = FuturesUnordered::new();
+            let mut scan_futures = tokio::task::JoinSet::new();
             let setup_elapsed = start.elapsed();
             let scan_start = Instant::now();
 
@@ -1126,7 +1153,7 @@ impl ScanbenchCommand {
                 let check_order = self.check_series_order;
                 let diagnostic = !self.timing_only;
                 let exact = write.is_some() || compare.is_some() || check_order;
-                scan_futures.push(tokio::spawn(async move {
+                scan_futures.spawn(async move {
                     let mut comparison = if exact {
                         Some(
                             ExactRowComparison::new(
@@ -1219,7 +1246,7 @@ impl ScanbenchCommand {
                         first_batch_elapsed,
                         elapsed: partition_start.elapsed(),
                     })
-                }));
+                });
             }
 
             let mut total_rows = 0u64;
@@ -1227,7 +1254,7 @@ impl ScanbenchCommand {
             let mut total_array_mem_size = 0u64;
             let mut total_estimated_size = 0u64;
             let mut partition_stats = Vec::with_capacity(num_partitions);
-            while let Some(task) = scan_futures.next().await {
+            while let Some(task) = scan_futures.join_next().await {
                 let result = task
                     .map_err(|e| {
                         BoxedError::new(PlainError::new(
@@ -1235,8 +1262,15 @@ impl ScanbenchCommand {
                             StatusCode::Unexpected,
                         ))
                     })
-                    .context(error::BuildCliSnafu)?;
-                let stats = result.context(error::BuildCliSnafu)?;
+                    .and_then(|result| result)
+                    .context(error::BuildCliSnafu);
+                let stats = match result {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        scan_futures.shutdown().await;
+                        return Err(error);
+                    }
+                };
                 total_rows += stats.rows;
                 total_batches += stats.batches;
                 total_array_mem_size += stats.array_mem_size;
@@ -1533,8 +1567,6 @@ impl ScanbenchCommand {
             );
         }
 
-        engine.stop().await.context(error::BuildCliSnafu)?;
-        println!("\n{}", "Benchmark completed!".green().bold());
         Ok(())
     }
 }
