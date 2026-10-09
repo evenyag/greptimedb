@@ -55,7 +55,9 @@ use crate::read::scan_util::{
 };
 use crate::read::seq_scan::SeqScan;
 use crate::read::series_candidate::{SeriesCandidateScanner, is_sparse_metric_metadata};
-use crate::read::series_reader::{AssignedSeriesBatch, SeriesBatchCollector, SeriesReader};
+use crate::read::series_reader::{
+    AssignedSeriesBatch, SeriesBatchCollector, SeriesReadSemaphores, SeriesReader,
+};
 use crate::read::stream::{ConvertBatchStream, ScanBatch, ScanBatchStream};
 use crate::sst::parquet::flat_format::primary_key_column_index;
 use crate::sst::parquet::format::PrimaryKeyArray;
@@ -100,7 +102,7 @@ impl Drop for CandidateReceiver {
 struct SeriesReaderInput {
     assigned_series: AssignedSeriesBatch,
     partition_pruner: Arc<PartitionPruner>,
-    range_semaphore: Arc<Semaphore>,
+    semaphores: SeriesReadSemaphores,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,7 +345,7 @@ impl SeriesScan {
                     partition_ranges.clone(),
                     input.assigned_series,
                     input.partition_pruner,
-                    input.range_semaphore,
+                    input.semaphores,
                     reader_metrics.clone(),
                 )?;
                 let mut reader_stream = reader.build_stream().await?;
@@ -429,6 +431,7 @@ impl SeriesScan {
         let mut distributor = SeriesCandidateDistributor {
             stream_ctx: self.stream_ctx.clone(),
             range_semaphore: Arc::new(Semaphore::new(self.properties.num_partitions())),
+            file_semaphore: Arc::new(Semaphore::new(self.properties.num_partitions())),
             partitions: self.properties.partitions.clone(),
             pruner: self.pruner.clone(),
             senders,
@@ -919,6 +922,7 @@ impl SeriesDistributor {
 struct SeriesCandidateDistributor {
     stream_ctx: Arc<StreamContext>,
     range_semaphore: Arc<Semaphore>,
+    file_semaphore: Arc<Semaphore>,
     partitions: Vec<Vec<PartitionRange>>,
     pruner: Arc<Pruner>,
     senders: CandidateSenderList,
@@ -1000,7 +1004,10 @@ impl SeriesCandidateDistributor {
                 .send(Ok(SeriesReaderInput {
                     assigned_series,
                     partition_pruner: partition_pruner.clone(),
-                    range_semaphore: self.range_semaphore.clone(),
+                    semaphores: SeriesReadSemaphores {
+                        range: self.range_semaphore.clone(),
+                        file: self.file_semaphore.clone(),
+                    },
                 }))
                 .is_ok();
             if !sent {

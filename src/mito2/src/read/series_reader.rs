@@ -257,6 +257,16 @@ fn filter_flat_stream_by_series(
     })
 }
 
+/// Separate budgets for range work and buffered file-source reads.
+///
+/// Range builders and final merge tasks can wait for file-source output while
+/// holding a range permit, so file sources must use an independent pool.
+#[derive(Clone)]
+pub(crate) struct SeriesReadSemaphores {
+    pub(crate) range: Arc<Semaphore>,
+    pub(crate) file: Arc<Semaphore>,
+}
+
 /// Reads all collected metric series assigned to one partition.
 pub(crate) struct SeriesReader {
     stream_ctx: Arc<StreamContext>,
@@ -264,7 +274,7 @@ pub(crate) struct SeriesReader {
     filter: MetricSeriesFilter,
     codec: SparsePrimaryKeyCodec,
     partition_pruner: Arc<PartitionPruner>,
-    range_semaphore: Arc<Semaphore>,
+    semaphores: SeriesReadSemaphores,
     part_metrics: PartitionMetrics,
 }
 
@@ -276,14 +286,14 @@ impl SeriesReader {
     /// filters with tag filtering skipped because candidate discovery has already
     /// enforced tag predicates through the exact assigned-series set.
     ///
-    /// A single `range_semaphore` covers both the range-build phase and the final
-    /// merge.
+    /// Range building and final merging share a budget; file sources use a
+    /// separate budget so they can produce batches while a merge holds a permit.
     pub(crate) fn try_new(
         stream_ctx: Arc<StreamContext>,
         partition_ranges: Vec<PartitionRange>,
         assigned_series: AssignedSeriesBatch,
         partition_pruner: Arc<PartitionPruner>,
-        range_semaphore: Arc<Semaphore>,
+        semaphores: SeriesReadSemaphores,
         part_metrics: PartitionMetrics,
     ) -> Result<Self> {
         validate_metric_metadata(&stream_ctx)?;
@@ -304,7 +314,7 @@ impl SeriesReader {
             filter,
             codec,
             partition_pruner,
-            range_semaphore,
+            semaphores,
             part_metrics,
         })
     }
@@ -320,7 +330,8 @@ impl SeriesReader {
             let filter = self.filter.clone();
             let codec = self.codec.clone();
             let partition_pruner = self.partition_pruner.clone();
-            let range_semaphore = self.range_semaphore.clone();
+            let range_semaphore = self.semaphores.range.clone();
+            let file_semaphore = self.semaphores.file.clone();
             let part_metrics = self.part_metrics.clone();
             tasks.push(common_runtime::spawn_query(async move {
                 let _permit = range_semaphore.acquire().await.map_err(|error| {
@@ -336,6 +347,7 @@ impl SeriesReader {
                     codec,
                     partition_pruner,
                     part_metrics,
+                    file_semaphore,
                 )
                 .await
             }));
@@ -355,7 +367,7 @@ impl SeriesReader {
         SeqScan::build_flat_reader_from_sources(
             &self.stream_ctx,
             range_streams,
-            Some(self.range_semaphore.clone()),
+            Some(self.semaphores.range.clone()),
             Some(&self.part_metrics),
             true,
             compute_parallel_channel_size(estimated_batch_size),
@@ -371,6 +383,7 @@ async fn build_series_partition_range(
     codec: SparsePrimaryKeyCodec,
     partition_pruner: Arc<PartitionPruner>,
     part_metrics: PartitionMetrics,
+    file_semaphore: Arc<Semaphore>,
 ) -> Result<(BoxedRecordBatchStream, usize)> {
     let range = filter.range;
     let cache_key = filter
@@ -474,7 +487,7 @@ async fn build_series_partition_range(
     let stream = SeqScan::build_flat_reader_from_sources(
         &stream_ctx,
         sources,
-        None,
+        Some(file_semaphore),
         Some(&part_metrics),
         false,
         compute_parallel_channel_size(estimated_batch_size),

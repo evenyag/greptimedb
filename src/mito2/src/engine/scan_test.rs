@@ -1580,6 +1580,38 @@ async fn check_two_phase_series_scan(
     replay_rows.sort();
     assert_eq!(actual_rows, replay_rows);
 
+    // A range builder/merge holding the only range permit must still receive
+    // batches from independently budgeted file sources.
+    scanner.reset_state();
+    let ranges = scanner
+        .properties()
+        .partitions
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    scanner
+        .prepare(
+            PrepareRequest::default()
+                .with_ranges(vec![ranges])
+                .with_target_partitions(1),
+        )
+        .unwrap();
+    let batches = tokio::time::timeout(Duration::from_secs(10), async {
+        scanner
+            .scan_partition(&context, &metrics_set, 0)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .expect("single-permit series scan stalled")
+    .unwrap();
+    assert_eq!(
+        actual_rows.len(),
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>()
+    );
+
     // Exercise precise field/time filtering and candidate tag filtering on both paths.
     let filtered = engine
         .scanner(
