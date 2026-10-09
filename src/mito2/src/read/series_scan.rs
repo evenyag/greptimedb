@@ -25,7 +25,7 @@ use common_recordbatch::util::ChainedRecordBatchStream;
 use common_recordbatch::{RecordBatchStreamWrapper, SendableRecordBatchStream};
 use common_telemetry::tracing::{self, Instrument};
 use common_telemetry::warn;
-use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, Time};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datatypes::arrow::array::BinaryArray;
 use datatypes::arrow::record_batch::RecordBatch;
@@ -45,6 +45,7 @@ use crate::error::{
     Error, InvalidSenderSnafu, JoinSnafu, PartitionOutOfRangeSnafu, Result, ScanMultiTimesSnafu,
     ScanSeriesSnafu, TooManyFilesToReadSnafu,
 };
+use crate::read::BoxedRecordBatchStream;
 use crate::read::ScannerMetrics;
 use crate::read::pruner::{PartitionPruner, Pruner, PrunerOptions};
 use crate::read::scan_region::{ScanInput, StreamContext};
@@ -330,37 +331,43 @@ impl SeriesScan {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        let stream = try_stream! {
-            part_metrics.on_first_poll();
-
-            let mut fetch_start = Instant::now();
-            let mut metrics = ScannerMetrics::default();
+        let reader_metrics = part_metrics.clone();
+        let reader_stream = try_stream! {
             while let Some(input) = receiver.recv().await {
                 let input = input?;
-                metrics.scan_cost += fetch_start.elapsed();
-
-                let build_start = Instant::now();
                 let reader = SeriesReader::try_new(
                     stream_ctx.clone(),
                     partition_ranges.clone(),
                     input.assigned_series,
                     input.partition_pruner,
                     input.range_semaphore,
-                    part_metrics.clone(),
+                    reader_metrics.clone(),
                 )?;
                 let mut reader_stream = reader.build_stream().await?;
-                metrics.scan_cost += build_start.elapsed();
-                fetch_start = Instant::now();
                 while let Some(record_batch) = reader_stream.try_next().await? {
-                    metrics.scan_cost += fetch_start.elapsed();
-                    metrics.num_batches += 1;
-                    metrics.num_rows += record_batch.num_rows();
-
-                    let yield_start = Instant::now();
-                    yield ScanBatch::RecordBatch(record_batch);
-                    metrics.yield_cost += yield_start.elapsed();
-                    fetch_start = Instant::now();
+                    yield record_batch;
                 }
+            }
+        };
+        let mut receiver = phase2_read_ahead(
+            Box::pin(reader_stream),
+            MetricBuilder::new(metrics_set).subset_time("phase2_scan_cost", partition),
+            MetricBuilder::new(metrics_set).subset_time("phase2_send_wait_cost", partition),
+        );
+        let stream = try_stream! {
+            part_metrics.on_first_poll();
+
+            let mut fetch_start = Instant::now();
+            let mut metrics = ScannerMetrics::default();
+            while let Some(record_batch) = receiver.try_next().await? {
+                metrics.scan_cost += fetch_start.elapsed();
+                metrics.num_batches += 1;
+                metrics.num_rows += record_batch.num_rows();
+
+                let yield_start = Instant::now();
+                yield ScanBatch::RecordBatch(record_batch);
+                metrics.yield_cost += yield_start.elapsed();
+                fetch_start = Instant::now();
             }
             metrics.scan_cost += fetch_start.elapsed();
 
@@ -504,6 +511,61 @@ impl SeriesScan {
         }
 
         Ok(())
+    }
+}
+
+/// Reads phase-2 batches independently of the downstream consumer, starting on first poll.
+///
+/// The single reserved channel slot bounds read-ahead to one batch, excluding existing
+/// reader buffers. Producer scan and capacity-wait times overlap consumer timings and
+/// must not be summed with them to reconstruct elapsed query time.
+fn phase2_read_ahead(
+    mut input: BoxedRecordBatchStream,
+    scan_cost: Time,
+    send_wait_cost: Time,
+) -> BoxedRecordBatchStream {
+    Box::pin(try_stream! {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut task = Phase2ProducerTask(common_runtime::spawn_query(
+            async move {
+                loop {
+                    let wait_start = Instant::now();
+                    let permit = sender.reserve().await;
+                    send_wait_cost.add_duration(wait_start.elapsed());
+                    let Ok(permit) = permit else {
+                        break;
+                    };
+
+                    let scan_start = Instant::now();
+                    let batch = input.next().await;
+                    scan_cost.add_duration(scan_start.elapsed());
+                    let Some(batch) = batch else {
+                        break;
+                    };
+                    let is_error = batch.is_err();
+                    permit.send(batch);
+                    if is_error {
+                        break;
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        ));
+        while let Some(batch) = receiver.recv().await {
+            yield batch?;
+        }
+        // A closed channel can also mean a producer panic; do not report a truncated
+        // result as successful EOF.
+        (&mut task.0).await.context(JoinSnafu)?;
+    })
+}
+
+/// Cancels the producer when its consumer is dropped, including while a read is pending.
+struct Phase2ProducerTask(common_runtime::JoinHandle<()>);
+
+impl Drop for Phase2ProducerTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1238,6 +1300,136 @@ mod tests {
     use crate::read::scan_region::PredicateGroup;
     use crate::test_util::scheduler_util::SchedulerEnv;
     use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+
+    fn read_ahead_test_batch(value: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![value]))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_phase2_read_ahead_order_and_backpressure() {
+        let (polled_tx, mut polled_rx) = mpsc::unbounded_channel();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let input_consumed = consumed.clone();
+        let input = try_stream! {
+            for value in 0..4 {
+                // Before the consumer requests another batch, only one additional
+                // batch may be polled. This assertion runs on the producer task.
+                assert!(value <= input_consumed.load(Ordering::SeqCst) + 1);
+                polled_tx.send(value).unwrap();
+                yield read_ahead_test_batch(value as i64);
+            }
+        };
+        let mut stream = phase2_read_ahead(Box::pin(input), Time::default(), Time::default());
+        assert!(matches!(
+            polled_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            read_ahead_test_batch(0),
+            stream.try_next().await.unwrap().unwrap()
+        );
+        assert_eq!(Some(0), polled_rx.recv().await);
+        // No consumer poll is pending: the producer must independently read ahead.
+        assert_eq!(
+            Some(1),
+            tokio::time::timeout(Duration::from_secs(5), polled_rx.recv())
+                .await
+                .unwrap()
+        );
+        for value in 1..4 {
+            consumed.store(value, Ordering::SeqCst);
+            assert_eq!(
+                read_ahead_test_batch(value as i64),
+                stream.try_next().await.unwrap().unwrap()
+            );
+        }
+        assert!(stream.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_phase2_read_ahead_error_and_empty() {
+        let input = futures::stream::iter(vec![
+            Ok(read_ahead_test_batch(1)),
+            Err(crate::error::UnexpectedSnafu {
+                reason: "read-ahead test",
+            }
+            .build()),
+            Ok(read_ahead_test_batch(2)),
+        ]);
+        let mut stream = phase2_read_ahead(Box::pin(input), Time::default(), Time::default());
+        assert_eq!(
+            read_ahead_test_batch(1),
+            stream.try_next().await.unwrap().unwrap()
+        );
+        assert!(matches!(
+            stream.try_next().await,
+            Err(Error::Unexpected { .. })
+        ));
+        assert!(stream.next().await.is_none());
+
+        let mut empty = phase2_read_ahead(
+            Box::pin(futures::stream::empty()),
+            Time::default(),
+            Time::default(),
+        );
+        assert!(empty.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_phase2_read_ahead_producer_panic() {
+        let input = futures::stream::poll_fn(|_| -> std::task::Poll<Option<Result<RecordBatch>>> {
+            panic!("injected producer failure");
+        });
+        let mut stream = phase2_read_ahead(Box::pin(input), Time::default(), Time::default());
+        assert!(matches!(stream.try_next().await, Err(Error::Join { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_phase2_read_ahead_drop() {
+        // Dropping the source closes this channel, even if it is never polled.
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let input =
+            futures::stream::poll_fn(move |_| -> std::task::Poll<Option<Result<RecordBatch>>> {
+                let _guard = &dropped_tx;
+                panic!("an unpolled producer must not run");
+            });
+        drop(phase2_read_ahead(
+            Box::pin(input),
+            Time::default(),
+            Time::default(),
+        ));
+        assert!(dropped_rx.await.is_err());
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        let input = try_stream! {
+            let _guard = dropped_tx;
+            yield read_ahead_test_batch(0);
+            pending_tx.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        };
+        let mut stream = phase2_read_ahead(Box::pin(input), Time::default(), Time::default());
+        assert!(stream.try_next().await.unwrap().is_some());
+        tokio::time::timeout(Duration::from_secs(5), pending_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(stream);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn two_phase_eligibility_allows_exact_sequence_range() {
