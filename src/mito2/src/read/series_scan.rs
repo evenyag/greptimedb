@@ -63,6 +63,9 @@ use crate::sst::parquet::format::PrimaryKeyArray;
 /// Timeout to send a batch to a sender.
 const SEND_TIMEOUT: Duration = Duration::from_micros(100);
 
+/// Maximum ready batches transferred in one phase-2 channel message.
+const PHASE2_READ_AHEAD_BATCHES: usize = 32;
+
 /// Maximum number of candidate series retained before distributing assignments.
 const CANDIDATE_SERIES_ASSIGNMENT_THRESHOLD: usize = 1_000_000;
 
@@ -516,16 +519,20 @@ impl SeriesScan {
 
 /// Reads phase-2 batches independently of the downstream consumer, starting on first poll.
 ///
-/// The single reserved channel slot bounds read-ahead to one batch, excluding existing
-/// reader buffers. Producer scan and capacity-wait times overlap consumer timings and
+/// Like the legacy distributor, amortizes channel handoffs across several batches.
+/// Flushes a partial group when the reader is pending, so a slow source does not delay
+/// already available output. One reserved slot bounds producer read-ahead to one group
+/// of at most `PHASE2_READ_AHEAD_BATCHES`, excluding existing reader buffers and the
+/// group being consumed. Producer scan and capacity-wait times overlap consumer timings and
 /// must not be summed with them to reconstruct elapsed query time.
 fn phase2_read_ahead(
-    mut input: BoxedRecordBatchStream,
+    input: BoxedRecordBatchStream,
     scan_cost: Time,
     send_wait_cost: Time,
 ) -> BoxedRecordBatchStream {
     Box::pin(try_stream! {
         let (sender, mut receiver) = mpsc::channel(1);
+        let mut input = input.ready_chunks(PHASE2_READ_AHEAD_BATCHES);
         let mut task = Phase2ProducerTask(common_runtime::spawn_query(
             async move {
                 loop {
@@ -537,13 +544,17 @@ fn phase2_read_ahead(
                     };
 
                     let scan_start = Instant::now();
-                    let batch = input.next().await;
+                    let batches = input.next().await;
                     scan_cost.add_duration(scan_start.elapsed());
-                    let Some(batch) = batch else {
+                    let Some(mut batches) = batches else {
                         break;
                     };
-                    let is_error = batch.is_err();
-                    permit.send(batch);
+                    let error_index = batches.iter().position(Result::is_err);
+                    if let Some(index) = error_index {
+                        batches.truncate(index + 1);
+                    }
+                    let is_error = error_index.is_some();
+                    permit.send(batches);
                     if is_error {
                         break;
                     }
@@ -551,8 +562,10 @@ fn phase2_read_ahead(
             }
             .instrument(tracing::Span::current()),
         ));
-        while let Some(batch) = receiver.recv().await {
-            yield batch?;
+        while let Some(batches) = receiver.recv().await {
+            for batch in batches {
+                yield batch?;
+            }
         }
         // A closed channel can also mean a producer panic; do not report a truncated
         // result as successful EOF.
@@ -1318,11 +1331,11 @@ mod tests {
         let (polled_tx, mut polled_rx) = mpsc::unbounded_channel();
         let consumed = Arc::new(AtomicUsize::new(0));
         let input_consumed = consumed.clone();
+        let count = PHASE2_READ_AHEAD_BATCHES * 3;
         let input = try_stream! {
-            for value in 0..4 {
-                // Before the consumer requests another batch, only one additional
-                // batch may be polled. This assertion runs on the producer task.
-                assert!(value <= input_consumed.load(Ordering::SeqCst) + 1);
+            for value in 0..count {
+                // One group is being consumed and at most one is queued or building.
+                assert!(value < input_consumed.load(Ordering::SeqCst) + 2 * PHASE2_READ_AHEAD_BATCHES);
                 polled_tx.send(value).unwrap();
                 yield read_ahead_test_batch(value as i64);
             }
@@ -1344,7 +1357,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        for value in 1..4 {
+        for value in 1..count {
             consumed.store(value, Ordering::SeqCst);
             assert_eq!(
                 read_ahead_test_batch(value as i64),
