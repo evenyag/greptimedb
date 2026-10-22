@@ -20,6 +20,10 @@ use datatypes::series::histogram::HistogramBatchBuilder;
 use datatypes::series::samples::{FieldSpec, Samples, SeriesFields};
 use datatypes::series::time::{EvalGrid, GridRange, GridSpec, TimeAxis};
 
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
+
 use super::*;
 use crate::golden::{assert_result, cases};
 use crate::grid_series::reference::{Labels, piece_ranges};
@@ -42,6 +46,10 @@ const OPS: [AggregateOp; 6] = [
 ];
 
 fn schema(fields: &[&str]) -> Arc<SeriesSchema> {
+    schema_with_grid_len(fields, 128)
+}
+
+fn schema_with_grid_len(fields: &[&str], len: u64) -> Arc<SeriesSchema> {
     Arc::new(SeriesSchema {
         fields: fields
             .iter()
@@ -50,7 +58,7 @@ fn schema(fields: &[&str]) -> Arc<SeriesSchema> {
             })
             .collect(),
         eval_grid: Some(Arc::new(
-            EvalGrid::try_new(GridSpec::try_new(-1000, 250, 128).unwrap()).unwrap(),
+            EvalGrid::try_new(GridSpec::try_new(-1000, 250, len).unwrap()).unwrap(),
         )),
     })
 }
@@ -195,6 +203,42 @@ fn aggregates_match_prometheus() {
                 .copied()
                 .unwrap_or_default();
             assert!(count >= 8, "{op} {grouping}: {count}");
+        }
+    }
+}
+
+/// `stddev`, `stdvar`, `quantile` and `count_values` evaluated by the Prometheus v3.15.0 engine;
+/// see the header of `stat_cases.txt`.
+#[test]
+fn stat_aggregates_match_prometheus() {
+    let mut matched = BTreeMap::<String, usize>::new();
+    for case in cases(include_str!("stat_cases.txt")) {
+        let h = &case.header;
+        let labels = h[3]
+            .split(',')
+            .filter(|label| *label != "-")
+            .collect::<Vec<_>>();
+        let grouping = grouping(h, &labels);
+        let output = match h[1].as_str() {
+            "stddev" => aggregate_float(&case.schema, &case.series, AggregateOp::Stddev, grouping),
+            "stdvar" => aggregate_float(&case.schema, &case.series, AggregateOp::Stdvar, grouping),
+            "quantile" => {
+                let q = case.scalar.as_ref().expect("quantile cases carry q");
+                aggregate_quantile(&case.schema, &case.series, q, grouping)
+            }
+            "count_values" => count_values(&case.schema, &case.series, &h[4], grouping),
+            other => panic!("unmapped aggregate {other}"),
+        };
+        assert_result(&case, output.unwrap());
+        *matched.entry(format!("{} {}", h[1], h[2])).or_default() += 1;
+    }
+    for op in ["stddev", "stdvar", "quantile", "count_values"] {
+        for grouping in ["none", "by", "without"] {
+            let count = matched
+                .get(&format!("{op} {grouping}"))
+                .copied()
+                .unwrap_or_default();
+            assert!(count >= 12, "{op} {grouping}: {count}");
         }
     }
 }
@@ -351,18 +395,50 @@ fn fields_are_aggregated_independently() {
             })
             .collect()
     };
+    let grid_len = multi.eval_grid.as_ref().unwrap().spec().len as usize;
+    let q_values: Vec<Option<f64>> = (0..grid_len)
+        .map(|i| Some([0.0, 0.25, 0.5, 0.9, 1.0][i % 5]))
+        .collect();
+    let q = input(
+        &schema(&["scalar"]),
+        MetricName::try_new(None, Vec::new()).unwrap(),
+        0,
+        &[q_values],
+    );
+    type Kernel<'a> = Box<dyn Fn(&Arc<SeriesSchema>, &[Series], Grouping<'_>) -> Vec<Series> + 'a>;
+    let mut kernels: Vec<(String, Kernel<'_>)> = OPS
+        .iter()
+        .chain(&[AggregateOp::Stddev, AggregateOp::Stdvar])
+        .map(|&op| -> (String, Kernel<'_>) {
+            (
+                format!("{op:?}"),
+                Box::new(move |schema, input, grouping| {
+                    aggregate_float(schema, input, op, grouping).unwrap()
+                }),
+            )
+        })
+        .collect();
+    kernels.push((
+        "quantile".into(),
+        Box::new(|schema, input, grouping| {
+            aggregate_quantile(schema, input, &q, grouping).unwrap()
+        }),
+    ));
+    kernels.push((
+        "count_values".into(),
+        Box::new(|schema, input, grouping| count_values(schema, input, "value", grouping).unwrap()),
+    ));
     for grouping in [
         Grouping::By(&[]),
         Grouping::By(&["host"]),
         Grouping::Without(&["i"]),
     ] {
-        for op in OPS {
-            let output = aggregate_float(&multi, &series, op, grouping).unwrap();
+        for (op, kernel) in &kernels {
+            let output = kernel(&multi, &series, grouping);
             for field in [0, 1] {
-                let expected = aggregate_float(&single, &project(field), op, grouping).unwrap();
+                let expected = kernel(&single, &project(field), grouping);
                 // The multi-field result is cut into pieces where its values are interrupted, so
                 // the comparison is over the dense values of each label set, not over pieces.
-                let grid_len = multi.eval_grid.as_ref().unwrap().timestamps().len();
                 let grouped = |pieces: &[Series], field: usize| {
                     let mut by_metric: BTreeMap<LabelKey, Positions> = BTreeMap::new();
                     for piece in pieces {
@@ -394,7 +470,7 @@ fn fields_are_aggregated_independently() {
                 };
                 let actual = grouped(&output, field);
                 let expected = grouped(&expected, 0);
-                assert_eq!(actual, expected, "{op:?} {grouping:?} field {field}");
+                assert_eq!(actual, expected, "{op} {grouping:?} field {field}");
             }
         }
     }
@@ -632,6 +708,16 @@ fn unsupported_shapes_and_mutated_schema_fail_without_partial_output() {
         11,
         &[vec![Some(1.0)], vec![Some(2.0)]],
     );
+    // Prometheus rejects an empty `count_values` label name at evaluation.
+    assert!(matches!(
+        count_values(
+            &schema,
+            std::slice::from_ref(&source),
+            "",
+            Grouping::By(&[])
+        ),
+        Err(DataFusionError::Execution(_))
+    ));
     assert!(matches!(
         aggregate_float(
             &schema,
@@ -814,4 +900,494 @@ fn an_aggregation_of_sparse_inputs_is_compared_in_full_against_the_reference() {
     counted[6] = vec![Some(1.0)];
     assert_pieces_eq(&counts, &counted, &metric_of(&Labels::new()));
     assert_eq!(piece_ranges(&counts), vec![(2, 1), (6, 1)]);
+}
+
+/// A point where the `q` scalar has no value has no `quantile` result, as a missing scalar point
+/// yields no output in the other scalar operators.
+#[test]
+fn quantile_without_q_at_a_point_has_no_result() {
+    let schema = schema(&["value"]);
+    let series = [
+        input(
+            &schema,
+            metric("a", &[("i", "0")]),
+            10,
+            &[vec![Some(1.0); 3]],
+        ),
+        input(
+            &schema,
+            metric("a", &[("i", "1")]),
+            10,
+            &[vec![Some(3.0); 3]],
+        ),
+    ];
+    let q = input(
+        &schema,
+        MetricName::try_new(None, Vec::new()).unwrap(),
+        10,
+        &[vec![Some(0.5), None, Some(0.5)]],
+    );
+    let output = aggregate_quantile(&schema, &series, &q, Grouping::By(&[])).unwrap();
+    let (start, values) = values_of(&output, 0, 128);
+    assert_eq!((start, values), (10, vec![Some(2.0), None, Some(2.0)]));
+}
+
+/// Listing the value label in `by` repeats what `count_values` adds to the grouping, also when an
+/// input field has that name; listing another field name is still unsupported.
+#[test]
+fn count_values_accepts_its_own_label_in_by() {
+    let schema = schema(&["value"]);
+    let series = [
+        input(&schema, metric("m", &[("i", "0")]), 10, &[vec![Some(1.0)]]),
+        input(&schema, metric("m", &[("i", "1")]), 10, &[vec![Some(2.0)]]),
+    ];
+    let rendered = |grouping| {
+        let mut output: Vec<_> = count_values(&schema, &series, "value", grouping)
+            .unwrap()
+            .iter()
+            .map(|series| (format!("{:?}", series.metric), values(series, 0)))
+            .collect();
+        output.sort_by(|a, b| a.0.cmp(&b.0));
+        output
+    };
+    let implicit = rendered(Grouping::By(&[]));
+    assert_eq!(implicit.len(), 2);
+    assert_eq!(implicit, rendered(Grouping::By(&["value"])));
+    assert!(matches!(
+        count_values(&schema, &series, "c", Grouping::By(&["value"])),
+        Err(DataFusionError::NotImplemented(_))
+    ));
+}
+
+/// A series the aggregator rejects is not folded in part: the series after it aggregate as if it
+/// had never been offered.
+#[test]
+fn a_rejected_series_leaves_the_aggregator_unchanged() {
+    let schema = schema(&["value"]);
+    let other = schema_with_grid_len(&["value"], 64);
+    let first = input(&schema, metric("m", &[("i", "0")]), 10, &[vec![Some(1.0)]]);
+    let second = input(&schema, metric("m", &[("i", "1")]), 10, &[vec![Some(2.0)]]);
+    let foreign = input(&other, metric("m", &[("i", "2")]), 10, &[vec![Some(4.0)]]);
+
+    let mut aggregator =
+        FloatAggregator::try_new(&schema, AggregateOp::Sum, Grouping::By(&[])).unwrap();
+    aggregator.update(&first).unwrap();
+    assert!(aggregator.update(&foreign).is_err());
+    aggregator.update(&second).unwrap();
+    let output = aggregator.finish().unwrap();
+    assert_eq!(values_of(&output, 0, 128), (10, vec![Some(3.0)]));
+}
+
+/// A group of short-lived series, one sample each at its own point: every point aggregates the one
+/// member present there, the shape whose cost must follow the samples and not members × points.
+#[test]
+fn quantile_over_one_point_members_reads_each_member_at_its_point() {
+    let schema = schema(&["value"]);
+    let series: Vec<Series> = (0..128)
+        .map(|point| {
+            input(
+                &schema,
+                metric("m", &[("i", &point.to_string())]),
+                point,
+                &[vec![Some(point as f64)]],
+            )
+        })
+        .collect();
+    let q = input(
+        &schema,
+        MetricName::try_new(None, Vec::new()).unwrap(),
+        0,
+        &[vec![Some(0.5); 128]],
+    );
+    let output = aggregate_quantile(&schema, &series, &q, Grouping::By(&[])).unwrap();
+    let expected: Vec<Option<f64>> = (0..128).map(|point| Some(point as f64)).collect();
+    assert_eq!(values_of(&output, 0, 128), (0, expected));
+}
+
+/// A float sample for the partial tests: ordinary values, repeats, signed zeros, NaN and
+/// infinities, but no finite values large enough to overflow when regrouped.
+fn partial_sample(rng: &mut StdRng) -> f64 {
+    match rng.random_range(0..20) {
+        0 => f64::NAN,
+        1 => f64::INFINITY,
+        2 => f64::NEG_INFINITY,
+        3 => 0.0,
+        4 => -0.0,
+        5..=8 => rng.random_range(0..4) as f64,
+        _ => (rng.random::<f64>() - 0.5) * 2e6,
+    }
+}
+
+/// Every valued (point, field) of `output` by rendered label set.
+fn flatten(output: &[Series]) -> BTreeMap<String, BTreeMap<(usize, usize), f64>> {
+    let mut flat: BTreeMap<String, BTreeMap<(usize, usize), f64>> = BTreeMap::new();
+    for series in output {
+        let points = flat.entry(format!("{:?}", series.metric)).or_default();
+        for (field, samples) in series.fields.iter().enumerate() {
+            for ((point, _), sample) in series.time.positions().zip(samples.iter()) {
+                if let SampleRef::Float(value) = sample {
+                    assert!(points.insert((point, field), value).is_none());
+                }
+            }
+        }
+    }
+    flat
+}
+
+fn assert_flat_close(
+    actual: &[Series],
+    expected: &[Series],
+    epsilon: f64,
+    context: &dyn std::fmt::Display,
+) {
+    let (actual, expected) = (flatten(actual), flatten(expected));
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "{context}"
+    );
+    for (labels, expected) in &expected {
+        let actual = &actual[labels];
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "{context} {labels}"
+        );
+        for (key, &value) in expected {
+            // An epsilon of 0 asks for the same bits, NaN payloads aside.
+            let same = if epsilon == 0.0 {
+                actual[key].to_bits() == value.to_bits() || (actual[key].is_nan() && value.is_nan())
+            } else {
+                crate::grid_series::reference::close(actual[key], value, epsilon)
+            };
+            assert!(
+                same,
+                "{context} {labels} {key:?}: merged {} serial {value}",
+                actual[key]
+            );
+        }
+    }
+}
+
+/// `partial` with only the components its aggregation declares in `state_fields`, as an encoder
+/// that stores the layout and nothing else would hand it over.
+fn to_layout(mut partial: PartialAggregate) -> PartialAggregate {
+    let kept = partial.op.state_fields();
+    for group in &mut partial.groups {
+        for (_, states) in &mut group.points {
+            for state in states.iter_mut().flatten() {
+                let mut stripped = AccumulatorState::default();
+                for field in kept {
+                    match field {
+                        StateField::Value => stripped.value = state.value,
+                        StateField::Mean => stripped.mean = state.mean,
+                        StateField::Compensation => stripped.compensation = state.compensation,
+                        StateField::Count => stripped.count = state.count,
+                        StateField::IncrementalMean => {
+                            stripped.incremental_mean = state.incremental_mean
+                        }
+                    }
+                }
+                *state = stripped;
+            }
+        }
+    }
+    partial
+}
+
+/// One group's value at point 0, folding each list of samples in its own partition and merging
+/// the partitions in order, next to the serial fold of all samples.
+fn merged_and_serial(op: AggregateOp, partitions: &[&[f64]]) -> (f64, f64) {
+    let schema = schema(&["value"]);
+    let series = |samples: &[f64]| -> Vec<Series> {
+        samples
+            .iter()
+            .map(|&value| input(&schema, metric("m", &[]), 0, &[vec![Some(value)]]))
+            .collect()
+    };
+    let mut merger = FloatMerger::try_new(&schema, op).unwrap();
+    for samples in partitions {
+        let mut aggregator = FloatAggregator::try_new(&schema, op, Grouping::By(&[])).unwrap();
+        for series in series(samples) {
+            aggregator.update(&series).unwrap();
+        }
+        merger
+            .merge(to_layout(aggregator.finish_partial()))
+            .unwrap();
+    }
+    let all: Vec<Series> = partitions
+        .iter()
+        .flat_map(|samples| series(samples))
+        .collect();
+    let value = |output: Vec<Series>| values_of(&output, 0, 128).1[0].unwrap();
+    (
+        value(merger.finish().unwrap()),
+        value(aggregate_float(&schema, &all, op, Grouping::By(&[])).unwrap()),
+    )
+}
+
+/// Partial states merged in any partition and merge order give the serial result, within the
+/// rounding a regrouped fold may change: the same groups, points and fields, the same NaN and
+/// infinities. Each partial keeps only the components its aggregation declares, so the layout
+/// in `state_fields` is all a merge needs.
+#[test]
+fn partials_merge_to_the_serial_result() {
+    const OPS: [AggregateOp; 8] = [
+        AggregateOp::Sum,
+        AggregateOp::Count,
+        AggregateOp::Avg,
+        AggregateOp::Min,
+        AggregateOp::Max,
+        AggregateOp::Group,
+        AggregateOp::Stddev,
+        AggregateOp::Stdvar,
+    ];
+    for seed in 0..300 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let fields: Vec<String> = (0..rng.random_range(1..=3))
+            .map(|field| format!("f{field}"))
+            .collect();
+        let names: Vec<&str> = fields.iter().map(String::as_str).collect();
+        let schema = schema_with_grid_len(&names, rng.random_range(1..80));
+        let points = schema.eval_grid.as_ref().unwrap().spec().len as usize;
+        let mut builder = GridSeriesBuilder::try_new(schema.clone()).unwrap();
+        let mut series = Vec::new();
+        for index in 0..rng.random_range(1..12) {
+            builder.begin_series();
+            for point in 0..points {
+                let row: Vec<Option<f64>> = (0..names.len())
+                    .map(|_| rng.random_bool(0.6).then(|| partial_sample(&mut rng)))
+                    .collect();
+                builder.push(point, &row).unwrap();
+            }
+            let job = ["x", "y"][rng.random_range(0..2)];
+            let index = index.to_string();
+            series.extend(
+                builder
+                    .finish(metric("m", &[("job", job), ("i", &index)]))
+                    .unwrap(),
+            );
+        }
+        let parts: Vec<usize> = series.iter().map(|_| rng.random_range(0..4)).collect();
+        let mut order: Vec<usize> = (0..4).collect();
+        order.shuffle(&mut rng);
+        let grouping = if rng.random_bool(0.5) {
+            Grouping::By(&["job"])
+        } else {
+            Grouping::Without(&["i"])
+        };
+
+        for op in OPS {
+            let serial = aggregate_float(&schema, &series, op, grouping).unwrap();
+            let mut merger = FloatMerger::try_new(&schema, op).unwrap();
+            for &part in &order {
+                let mut aggregator = FloatAggregator::try_new(&schema, op, grouping).unwrap();
+                for (series, _) in series.iter().zip(&parts).filter(|(_, p)| **p == part) {
+                    aggregator.update(series).unwrap();
+                }
+                merger
+                    .merge(to_layout(aggregator.finish_partial()))
+                    .unwrap();
+            }
+            let merged = merger.finish().unwrap();
+            assert_flat_close(&merged, &serial, 1e-10, &format!("seed {seed} {op:?}"));
+
+            // One partition holding every series is the serial fold, bit for bit.
+            let mut aggregator = FloatAggregator::try_new(&schema, op, grouping).unwrap();
+            for series in &series {
+                aggregator.update(series).unwrap();
+            }
+            let mut merger = FloatMerger::try_new(&schema, op).unwrap();
+            merger
+                .merge(to_layout(aggregator.finish_partial()))
+                .unwrap();
+            assert_flat_close(
+                &merger.finish().unwrap(),
+                &serial,
+                0.0,
+                &format!("seed {seed} {op:?} one partition"),
+            );
+        }
+
+        let serial = count_values(&schema, &series, "value", grouping).unwrap();
+        let partials = order.iter().flat_map(|&part| {
+            let members: Vec<Series> = series
+                .iter()
+                .zip(&parts)
+                .filter(|(_, p)| **p == part)
+                .map(|(series, _)| series.clone())
+                .collect();
+            count_values(&schema, &members, "value", grouping).unwrap()
+        });
+        let merged = merge_count_values(&schema, partials).unwrap();
+        assert_flat_close(&merged, &serial, 0.0, &format!("seed {seed} count_values"));
+    }
+}
+
+/// The compensation travels with a partial and absorbs what adding two partial sums loses: `1`
+/// survives next to `1e100` and `-1e100` whether it is a partition's own compensation or the
+/// error of a merge, and `avg` divides it like the sum.
+#[test]
+fn compensation_survives_partials_and_merges() {
+    assert_eq!(
+        merged_and_serial(AggregateOp::Sum, &[&[-1e100], &[1e100, 1.0]]),
+        (1.0, 1.0)
+    );
+    assert_eq!(
+        merged_and_serial(AggregateOp::Sum, &[&[1e100], &[1.0], &[-1e100]]),
+        (1.0, 1.0)
+    );
+    let (merged, serial) = merged_and_serial(AggregateOp::Avg, &[&[-1e100], &[1e100, 1.0]]);
+    assert_eq!(merged, serial);
+    assert!(crate::grid_series::reference::close(
+        merged,
+        1.0 / 3.0,
+        1e-10
+    ));
+    // A partial's own compensation must survive a later cancellation of the sums: `1` rides in
+    // the first partial's compensation while `1e84` and `-1e84` cancel across partials.
+    let cancelling: &[&[f64]] = &[&[1e100, 1.0], &[-1e100, 1e84], &[-1e84]];
+    assert_eq!(merged_and_serial(AggregateOp::Sum, cancelling), (1.0, 1.0));
+    let (merged, serial) = merged_and_serial(AggregateOp::Avg, cancelling);
+    assert_eq!(serial, 0.2);
+    assert!(
+        crate::grid_series::reference::close(merged, serial, 1e-10),
+        "{merged}"
+    );
+    let (merged, serial) =
+        merged_and_serial(AggregateOp::Avg, &[&[1e32, 1.0], &[-1e32, 1e16], &[-1e16]]);
+    assert_eq!(serial, 0.2);
+    assert!(
+        crate::grid_series::reference::close(merged, serial, 1e-10),
+        "{merged}"
+    );
+}
+
+/// Merging finite partials does not overflow where the result is finite: `avg` switches to a
+/// count-weighted mean when the summed partials overflow, and `stdvar` does not square the mean
+/// difference on its own.
+#[test]
+fn merges_of_large_finite_partials_stay_finite() {
+    for partitions in [
+        &[&[1e308][..], &[1e308][..]][..],
+        // Unequal counts, one partition already a mean: the weights decide the result.
+        &[&[1e308, 1e308][..], &[0.0][..]][..],
+        &[&[0.0][..], &[1e308, 1e308][..]][..],
+    ] {
+        let (merged, serial) = merged_and_serial(AggregateOp::Avg, partitions);
+        assert!(
+            merged.is_finite() && crate::grid_series::reference::close(merged, serial, 1e-10),
+            "{partitions:?}: merged {merged} serial {serial}"
+        );
+    }
+    let (stdvar, serial) = merged_and_serial(AggregateOp::Stdvar, &[&[0.0], &[1.5e154]]);
+    assert!(stdvar.is_finite(), "{stdvar}");
+    assert!(crate::grid_series::reference::close(stdvar, serial, 1e-10));
+}
+
+/// Samples that differ by about the rounding of their mean are outside the merge's agreement with
+/// Prometheus: its serial Welford update rounds the mean back and doubles the variance, while the
+/// pairwise merge keeps the exact one.
+#[test]
+fn ill_conditioned_variance_merges_to_the_exact_value() {
+    let partitions: &[&[f64]] = &[&[1e16], &[1e16 + 2.0]];
+    assert_eq!(
+        merged_and_serial(AggregateOp::Stdvar, partitions),
+        (1.0, 2.0)
+    );
+    assert_eq!(
+        merged_and_serial(AggregateOp::Stddev, partitions),
+        (1.0, std::f64::consts::SQRT_2)
+    );
+}
+
+/// `min` and `max` keep the first of two equal values, so with `0` and `-0` the sign is that of
+/// the partial merged first.
+#[test]
+fn equal_zero_extremes_follow_the_merge_order() {
+    let schema = schema(&["value"]);
+    for op in [AggregateOp::Min, AggregateOp::Max] {
+        for (first, second) in [(0.0, -0.0), (-0.0, 0.0)] {
+            let mut merger = FloatMerger::try_new(&schema, op).unwrap();
+            for value in [first, second] {
+                let mut aggregator =
+                    FloatAggregator::try_new(&schema, op, Grouping::By(&[])).unwrap();
+                aggregator
+                    .update(&input(&schema, metric("m", &[]), 0, &[vec![Some(value)]]))
+                    .unwrap();
+                merger.merge(aggregator.finish_partial()).unwrap();
+            }
+            let value = values_of(&merger.finish().unwrap(), 0, 128).1[0].unwrap();
+            assert_eq!(
+                value.to_bits(),
+                f64::to_bits(first),
+                "{op:?} {first} {second}"
+            );
+        }
+    }
+}
+
+/// A partial of another aggregation, field count or grid fails the merge.
+#[test]
+fn a_merge_rejects_state_that_does_not_fit() {
+    let schema = schema(&["value"]);
+    let partial = |op| {
+        let mut aggregator = FloatAggregator::try_new(&schema, op, Grouping::By(&[])).unwrap();
+        aggregator
+            .update(&input(&schema, metric("m", &[]), 5, &[vec![Some(1.0)]]))
+            .unwrap();
+        aggregator.finish_partial()
+    };
+    let mut merger = FloatMerger::try_new(&schema, AggregateOp::Sum).unwrap();
+    assert!(merger.merge(partial(AggregateOp::Avg)).is_err());
+    let mut wide = partial(AggregateOp::Sum);
+    wide.groups[0].points[0].1.push(None);
+    assert!(merger.merge(wide).is_err());
+    let mut late = partial(AggregateOp::Sum);
+    late.groups[0].points[0].0 = 128;
+    assert!(merger.merge(late).is_err());
+    assert!(merger.finish().unwrap().is_empty());
+}
+
+/// `2^-24` and the float below it format to different labels, so they count as two values: the
+/// even 16-digit candidate for `2^-24` names the lower neighbour.
+#[test]
+fn count_values_keeps_neighbours_of_a_power_of_two_apart() {
+    let schema = schema(&["value"]);
+    let series = [0x3e70_0000_0000_0000, 0x3e6f_ffff_ffff_ffff]
+        .into_iter()
+        .enumerate()
+        .map(|(index, bits)| {
+            input(
+                &schema,
+                metric("m", &[("i", &index.to_string())]),
+                0,
+                &[vec![Some(f64::from_bits(bits))]],
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut groups: Vec<_> = count_values(&schema, &series, "v", Grouping::By(&[]))
+        .unwrap()
+        .iter()
+        .map(|series| {
+            (
+                series.metric.get("v").unwrap().to_string(),
+                values(series, 0),
+            )
+        })
+        .collect();
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        groups,
+        [
+            (
+                "0.00000005960464477539062".to_string(),
+                (0, vec![Some(1.0)])
+            ),
+            (
+                "0.00000005960464477539063".to_string(),
+                (0, vec![Some(1.0)])
+            ),
+        ]
+    );
 }

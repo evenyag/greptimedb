@@ -17,11 +17,13 @@ pub mod error;
 pub mod evaluated;
 pub mod extension_plan;
 pub mod functions;
+mod go_format;
 mod go_sort;
 #[cfg(test)]
 mod golden;
 pub mod grid_series;
 pub mod histogram_eval;
+pub mod info;
 pub mod instant_eval;
 pub mod map;
 pub mod map_label;
