@@ -20,7 +20,7 @@ use api::v1::region::build_index_request;
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema, Rows};
 use common_error::ext::ErrorExt;
-use common_query::series_frame::{raw_series_frame_ordering, unpack_raw_series};
+use common_query::series_frame::unpack_raw_series;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet};
 use datafusion_expr::{col, lit};
@@ -398,8 +398,7 @@ async fn native_scan_reports_incomplete_coverage_and_uses_prepared_source() {
         .unwrap()
         .unwrap();
     let frame = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-    let ordering = raw_series_frame_ordering(frame.schema().as_ref()).unwrap();
-    let chunks = unpack_raw_series(frame, plan.series_schema().clone(), binding, ordering)
+    let chunks = unpack_raw_series(frame, Some(plan.series_schema().clone()))
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
