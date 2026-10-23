@@ -912,7 +912,6 @@ async fn visibility_uses_named_columns_and_region_time_unit(
     use common_time::{Timestamp, range::TimestampRange};
     use datatypes::arrow::array::Int64Array;
     use datatypes::arrow::datatypes::{DataType, Field, Schema};
-    use store_api::storage::SequenceRange;
 
     let (_env, engine, region) = fixture().await;
     let mut metadata = (*region.version().metadata).clone();
@@ -927,7 +926,6 @@ async fn visibility_uses_named_columns_and_region_time_unit(
     let mapper = FlatProjectionMapper::new(&Arc::new(metadata), vec![]).unwrap();
     let input = ScanInput::builder(region.access_layer.clone(), mapper)
         .with_snapshot_sequence(Some(4))
-        .with_sequence_range(SequenceRange::new(Some(1), Some(5)))
         .with_time_range(TimestampRange::new(
             Timestamp::new(-1, unit),
             Timestamp::new(2, unit),
@@ -1047,6 +1045,37 @@ async fn preflight_rejects_unsupported_assignments_without_artifact_io() {
     let mut context = make_context();
     let ranges = context.partition_ranges();
     validate_inputs(&context, &ranges).unwrap();
+    context.input.sequence_range = store_api::storage::SequenceRange::new(Some(1), Some(5));
+    assert!(
+        validate_inputs(&context, &ranges)
+            .unwrap_err()
+            .to_string()
+            .contains("do not support sequence ranges")
+    );
+    let scan = SeriesScan::new(context.input, false);
+    let binding = labels(scan.metadata());
+    assert!(scan.raw_series_schema(&binding).is_err());
+    assert!(
+        scan.scan_series_partition(
+            &QueryScanContext::default(),
+            &ExecutionPlanMetricsSet::new(),
+            0,
+            &binding,
+        )
+        .is_err()
+    );
+    assert!(
+        scan.prepare_series(
+            &QueryScanContext::default(),
+            &ExecutionPlanMetricsSet::new(),
+            &binding,
+        )
+        .await
+        .is_err()
+    );
+    assert!(reads.lock().unwrap().is_empty());
+
+    let mut context = make_context();
     context.ranges[ranges[0].identifier].row_group_indices = vec![RowGroupIndex {
         index: context.input.num_files(),
         row_group_index: -1,

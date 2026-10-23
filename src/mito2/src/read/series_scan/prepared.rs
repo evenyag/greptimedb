@@ -146,6 +146,13 @@ fn collect_inputs(
     ranges: &[PartitionRange],
 ) -> Result<(Vec<usize>, HashSet<FileId>)> {
     let input = &context.input;
+    // Samples do not carry the per-file sequence trust needed for range filtering.
+    // Flushed SSTs may replace row sequences with the flush's maximum sequence.
+    if input.sequence_range.is_some() {
+        return Err(invalid(
+            "columnar prepared reads do not support sequence ranges",
+        ));
+    }
     let metadata = input.region_metadata();
     let index = input
         .series_index
@@ -599,12 +606,6 @@ fn filter_visibility(batch: RecordBatch, context: &StreamContext) -> Result<Reco
             timestamp.name
         )));
     }
-    let sequence_filter = context
-        .input
-        .sequence_range
-        .map(|range| range.filter(sequence_column))
-        .transpose()
-        .context(ComputeArrowSnafu)?;
     let filter = BooleanArray::from(
         (0..batch.num_rows())
             .map(|i| {
@@ -614,9 +615,6 @@ fn filter_visibility(batch: RecordBatch, context: &StreamContext) -> Result<Reco
                         .input
                         .snapshot_sequence
                         .is_none_or(|max| sequence.value(i) <= max)
-                    && sequence_filter
-                        .as_ref()
-                        .is_none_or(|filter| filter.value(i))
                     && context.input.time_range.as_ref().is_none_or(|range| {
                         range.contains(&common_time::Timestamp::new(time.value(i), unit))
                     })
