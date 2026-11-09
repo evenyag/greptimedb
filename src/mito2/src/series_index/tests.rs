@@ -136,6 +136,7 @@ pub(crate) async fn prepare_region_with_metadata_and_flush(
     // Flush completion can precede compaction scheduling. Keep background TTL
     // cleanup from racing tests that alter options after preparing the SSTs.
     let region = engine.get_region(region_id).unwrap();
+    region.version_control.pause_automatic_series_index(true);
     region.update_schedule_compaction_millis();
     for &ts in timestamps {
         engine
@@ -237,7 +238,7 @@ impl IndexTest {
 }
 
 #[rstest::rstest]
-#[case::range_only(vec![1000], 0)]
+#[case::early_single_sst(vec![1000], 1)]
 #[case::series_bucket(vec![1000, 2000, 3000, 4000], 1)]
 #[tokio::test]
 async fn test_reconcile_range_index_disabled(
@@ -347,7 +348,10 @@ async fn test_reconcile_range_index_disabled(
         (stats.built_range, stats.removed_range)
     );
     assert!(writes.lock().unwrap().contains(&range_catalog));
-    assert!(!writes.lock().unwrap().contains(&series_catalog));
+    assert_eq!(
+        writes.lock().unwrap().contains(&series_catalog),
+        expected_series > 0
+    );
     let restored = load_version_control(&store, region.region_id, &test.purger).await;
     assert!(restored.current().range_indexes.is_empty());
     writes.lock().unwrap().clear();
@@ -413,17 +417,36 @@ async fn test_reconcile_restores_and_reuses_indexes() {
     for path in &missing_paths {
         assert!(!store.exists(path).await.unwrap());
     }
+    // A damaged authoritative catalog cannot resurrect interrupted legacy mirrors.
+    store
+        .write(
+            &super::catalog::samples_catalog_path(region.region_id),
+            "{broken",
+        )
+        .await
+        .unwrap();
+    let rejected = load_version_control(store, region.region_id, purger).await;
+    assert!(rejected.current().range_indexes.is_empty());
+    assert!(rejected.current().series_indexes.is_empty());
+    let stream = engine
+        .scan_to_stream(region.region_id, store_api::storage::ScanRequest::default())
+        .await
+        .unwrap();
+    let rows = common_recordbatch::RecordBatches::try_collect(stream)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 4);
     engine.stop().await.unwrap();
 }
 
 #[tokio::test]
-async fn test_reconcile_range_only_build_and_removal() {
+async fn test_reconcile_single_sst_build_and_removal() {
     let mut env = TestEnv::with_prefix("series-range-lifecycle").await;
     let (engine, region) = prepare_region_with_timestamps(&mut env, &[1000]).await;
     let (test, _receiver) = IndexTest::new(region.clone());
     let initial = region.series_index_version();
     let stats = test.reconcile(test.store.clone()).await.unwrap();
-    assert_eq!((1, 0), (stats.built_range, stats.built_series));
+    assert_eq!((1, 1), (stats.built_range, stats.built_series));
     let built = region.series_index_version();
     assert!(!Arc::ptr_eq(&initial, &built));
     let files = region
@@ -462,9 +485,9 @@ async fn test_reconcile_range_only_build_and_removal() {
     engine.stop().await.unwrap();
 }
 
-struct FailingSeriesWriter {
-    inner: oio::Writer,
-    fail: bool,
+pub(crate) struct FailingSeriesWriter {
+    pub(crate) inner: oio::Writer,
+    pub(crate) fail: bool,
 }
 
 #[rstest::rstest]
@@ -538,6 +561,10 @@ async fn test_reconcile_replaces_whole_bucket_after_failure(#[case] failure: &st
             .is_err()
     );
     assert!(Arc::ptr_eq(&previous, &region.series_index_version()));
+    {
+        let reopened = load_version_control(&test.store, region.region_id, &test.purger).await;
+        assert_eq!(reopened.current().index_buckets, previous.index_buckets);
+    }
     // Failed catalog publication may retire a completed replacement, never its predecessor.
     while let Ok(request) = receiver.try_recv() {
         assert_ne!(old_id, request.file_id.file_id());
@@ -746,17 +773,19 @@ async fn test_failed_reconcile_retires_only_unpublished_series() {
             .flat_map(|level| level.files())
             .cloned()
             .collect::<Vec<_>>();
-        let plan = plan_series_indexes(
-            group_files_into_series_buckets(
-                &files,
-                100,
-                version.compaction_time_window.unwrap().as_secs() as i64,
-            ),
-            Default::default(),
-            None,
-            0,
+        let mut buckets = group_files_into_series_buckets(
+            &files,
+            100,
+            version.compaction_time_window.unwrap().as_secs() as i64,
         );
-        assert_eq!(if failure == "range" { 2 } else { 3 }, plan.builds.len());
+        for bucket in &mut buckets {
+            bucket.requires_exact_coverage = bucket
+                .files
+                .iter()
+                .any(|file| !file.meta_ref().preserve_row_sequence);
+        }
+        let plan = plan_series_indexes(buckets, Default::default(), None, 0);
+        assert_eq!(3, plan.builds.len());
         let (bucket, entry) = &plan.builds[0];
         let mut ranges = HashMap::new();
         for file in &bucket.files {
@@ -839,7 +868,7 @@ async fn test_failed_reconcile_retires_only_unpublished_series() {
         assert!(store.exists(&reused_path).await.unwrap());
 
         let stats = test.reconcile(store.clone()).await.unwrap();
-        assert_eq!(if failure == "range" { 1 } else { 2 }, stats.built_series);
+        assert_eq!(2, stats.built_series);
         let published = region.series_index_version();
         for handle in published.series_indexes.values() {
             assert!(
@@ -936,6 +965,9 @@ async fn test_drop_catalogs_and_retained_snapshot_after_task_stop() {
         index_uuid: FileId::random(),
         bucket_start: Timestamp::new_second(0),
         bucket_end: Timestamp::new_second(100),
+        exact_source_coverage: false,
+        target_partition_expr: None,
+        source_metadata: Default::default(),
         source_file_ids: vec![FileId::random()],
         min_file_sequence: 1,
         max_file_sequence: 2,
@@ -1115,5 +1147,372 @@ async fn test_manual_reconcile_returns_storage_failure(#[case] catalog_failure: 
     );
     state.stop();
     task.await.unwrap();
+    engine.stop().await.unwrap();
+}
+
+/// Publication notifications must cover the first SST without a manual build or timer.
+#[tokio::test]
+async fn test_visible_publication_builds_single_sst_automatically() {
+    let mut env = TestEnv::with_prefix("series-auto-first-sst").await;
+    let (engine, region) = prepare_region_with_config(
+        &mut env,
+        &[],
+        MitoConfig {
+            experimental_enable_series_index: true,
+            experimental_series_index_maintenance_interval: Duration::from_secs(3600),
+            ..Default::default()
+        },
+    )
+    .await;
+    region.version_control.pause_automatic_series_index(false);
+    let metadata = region.metadata();
+    let mut create = CreateRequestBuilder::new().build();
+    create.column_metadatas = metadata.column_metadatas.clone();
+    create.primary_key = metadata.primary_key.clone();
+    let full_schema = rows_schema(&create);
+    let mut pk = full_schema[0].clone();
+    pk.column_name = PRIMARY_KEY_COLUMN_NAME.into();
+    pk.datatype = ColumnDataType::Binary.into();
+    pk.semantic_type = SemanticType::Tag.into();
+    engine
+        .handle_request(
+            region.region_id,
+            RegionRequest::Put(RegionPutRequest {
+                rows: Rows {
+                    schema: vec![pk, full_schema[5].clone(), full_schema[4].clone()],
+                    rows: vec![row(vec![
+                        ValueData::BinaryValue(new_sparse_primary_key(
+                            &["a", "x"],
+                            &metadata,
+                            10,
+                            0,
+                        )),
+                        ValueData::TimestampMillisecondValue(1000),
+                        ValueData::U64Value(1),
+                    ])],
+                },
+                skip_wal: false,
+                hint: Some(WriteHint {
+                    primary_key_encoding: api::v1::PrimaryKeyEncoding::Sparse.into(),
+                }),
+                partition_expr_version: None,
+            }),
+        )
+        .await
+        .unwrap();
+    flush_region(&engine, region.region_id, None).await;
+    wait_for(|| !region.series_index_version().series_indexes.is_empty()).await;
+    let installed = region.series_index_version();
+    assert_eq!(installed.series_indexes.len(), 1);
+    let file = region
+        .version()
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .next()
+        .unwrap()
+        .meta_ref()
+        .clone();
+    assert!(
+        installed
+            .series_indexes
+            .values()
+            .next()
+            .unwrap()
+            .entry()
+            .covers_file(&file, region.region_id)
+    );
+    let store = region.series_index_store.clone().unwrap();
+    let (purger, _) = series_index_channel(store.clone());
+    let reopened = load_version_control(&store, region.region_id, &purger).await;
+    assert_eq!(installed.index_buckets, reopened.current().index_buckets);
+    let handle = installed.series_indexes.values().next().unwrap();
+    let bytes = store
+        .read(&series_index_path(
+            region.region_id,
+            handle.entry().index_uuid,
+        ))
+        .await
+        .unwrap()
+        .to_bytes();
+    let batches = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    engine.stop().await.unwrap();
+}
+
+/// Additions may follow a valid captured publication; removed inputs must never publish.
+#[rstest::rstest]
+#[case::add(false)]
+#[case::remove(true)]
+#[tokio::test]
+async fn test_reconcile_revalidates_sources_changed_during_construction(#[case] remove: bool) {
+    use crate::manifest::action::RegionEdit;
+    let mut env = TestEnv::with_prefix("series-source-race").await;
+    let (engine, region) =
+        prepare_region_with_timestamps(&mut env, &[1000, 2000, 3000, 4000, 5000]).await;
+    let pinned = region.version();
+    let newest = pinned
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .max_by_key(|file| file.meta_ref().sequence)
+        .unwrap()
+        .meta_ref()
+        .clone();
+    let edit = |add| RegionEdit {
+        files_to_add: if add { vec![newest.clone()] } else { vec![] },
+        files_to_remove: if add { vec![] } else { vec![newest.clone()] },
+        timestamp_ms: None,
+        compaction_time_window: None,
+        flushed_entry_id: None,
+        flushed_sequence: None,
+        committed_sequence: None,
+    };
+    if !remove {
+        region.version_control.apply_edit(
+            Some(edit(false)),
+            &[],
+            crate::test_util::new_noop_file_purger(),
+        );
+    }
+    let (test, mut purges) = IndexTest::new(region.clone());
+    let target = region.clone();
+    let mutation = edit(!remove);
+    let once = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let layer = MockLayerBuilder::default()
+        .writer_factory(Arc::new(move |path, _, inner| {
+            if path.contains("/series/") && once.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                target.version_control.apply_edit(
+                    Some(mutation.clone()),
+                    &[],
+                    crate::test_util::new_noop_file_purger(),
+                );
+            }
+            inner
+        }))
+        .build()
+        .unwrap();
+    let first = test
+        .reconcile(test.store.clone().layer(layer))
+        .await
+        .unwrap();
+    if remove {
+        assert_eq!(first.built_series, 0);
+        assert!(first.pending);
+        assert!(region.series_index_version().series_indexes.is_empty());
+        assert!(
+            !test
+                .store
+                .exists(&series_catalog_path(region.region_id))
+                .await
+                .unwrap()
+        );
+        assert!(purges.try_recv().is_ok());
+    } else {
+        assert_eq!(first.built_series, 1);
+        assert_eq!(
+            region
+                .series_index_version()
+                .series_indexes
+                .values()
+                .next()
+                .unwrap()
+                .entry()
+                .source_file_ids
+                .len(),
+            4
+        );
+    }
+    let next = test.reconcile(test.store.clone()).await.unwrap();
+    assert_eq!(next.built_series, 1);
+    let installed = region.series_index_version();
+    let entry = installed.series_indexes.values().next().unwrap().entry();
+    assert_eq!(entry.source_file_ids.len(), if remove { 4 } else { 5 });
+    assert_eq!(entry.source_file_ids.contains(&newest.file_id), !remove);
+    assert_eq!(
+        test.reconcile(test.store.clone())
+            .await
+            .unwrap()
+            .built_series,
+        0
+    );
+    assert!(Arc::ptr_eq(&installed, &region.series_index_version()));
+    let restored = load_version_control(&test.store, region.region_id, &test.purger).await;
+    assert_eq!(installed.index_buckets, restored.current().index_buckets);
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_series_consolidation_reduces_artifacts_and_preserves_pinned_reader() {
+    use super::bucket::{group_files_into_series_buckets, plan_series_indexes};
+    use super::builder::build_series_index;
+    use super::columnar::ColumnarSeriesFormat;
+    use super::format::{SeriesFormats, SeriesIndexFormat, SeriesReadRequest};
+    use super::version::SeriesIndexVersion;
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
+
+    let mut env = TestEnv::with_prefix("series-consolidation").await;
+    let (engine, region) = prepare_region(&mut env).await;
+    let data = region.version();
+    let mut files: Vec<_> = data
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .cloned()
+        .collect();
+    files.sort_by_key(|file| file.meta_ref().sequence);
+    let (test, mut purges) = IndexTest::new(region.clone());
+    let backend = ColumnarSeriesFormat::default();
+    let mut indexes = HashMap::new();
+    for sources in files.chunks(2) {
+        let plan = plan_series_indexes(
+            group_files_into_series_buckets(sources, 100, 100),
+            Default::default(),
+            None,
+            0,
+        );
+        let (bucket, entry) = &plan.builds[0];
+        let handle = build_series_index(
+            &test.store,
+            &region,
+            &data,
+            bucket,
+            entry,
+            Some(&backend),
+            &test.purger,
+        )
+        .await
+        .unwrap();
+        indexes.insert(entry.index_uuid, handle);
+    }
+    *region.series_index_version_control.formats.write().unwrap() = Arc::new(SeriesFormats {
+        index: Some(Arc::new(backend)),
+        samples: None,
+    });
+    region
+        .series_index_version_control
+        .publish(Arc::new(SeriesIndexVersion::new(HashMap::new(), indexes)));
+    let original = region.series_index_version();
+    assert_eq!(original.series_indexes.len(), 2);
+    assert_eq!(original.index_buckets.len(), 1);
+    super::catalog::store_catalog(
+        &test.store,
+        &series_catalog_path(region.region_id),
+        &super::catalog::SeriesIndexCatalog {
+            indexes: original
+                .series_indexes
+                .values()
+                .map(|handle| handle.entry().clone())
+                .collect(),
+        },
+    )
+    .await
+    .unwrap();
+    let reopened = load_version_control(&test.store, region.region_id, &test.purger).await;
+    let old = reopened
+        .current()
+        .series_indexes
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    drop(reopened);
+    let reader = ColumnarSeriesFormat::default()
+        .reader(test.store.clone(), old)
+        .await
+        .unwrap();
+    let request = SeriesReadRequest {
+        projection: reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect(),
+        ..Default::default()
+    };
+    let rows = reader
+        .read(request.clone())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+    let result = test
+        .reconcile_with_range_index(test.store.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(result.consolidated_series, 1);
+    assert_eq!(result.removed_series, 2);
+    let installed = region.series_index_version();
+    assert_eq!(installed.series_indexes.len(), 1);
+    let replacement = installed.series_indexes.values().next().unwrap();
+    assert_eq!(replacement.entry().source_file_ids.len(), 4);
+    let merged = ColumnarSeriesFormat::default()
+        .reader(test.store.clone(), replacement.clone())
+        .await
+        .unwrap();
+    let merged_rows = merged
+        .read(request.clone())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        merged_rows
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        merged_rows[0]
+            .column_by_name(crate::series_index::ROW_COUNT_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
+    let restored = load_version_control(&test.store, region.region_id, &test.purger).await;
+    assert_eq!(installed.index_buckets, restored.current().index_buckets);
+    assert_eq!(
+        test.reconcile_with_range_index(test.store.clone(), false)
+            .await
+            .unwrap()
+            .built_series,
+        0
+    );
+    assert!(Arc::ptr_eq(&installed, &region.series_index_version()));
+    drop(original);
+    // The unpinned predecessor retires, while this reader still decodes the other one.
+    assert!(purges.try_recv().unwrap().objects.is_some());
+    assert!(purges.try_recv().is_err());
+    assert_eq!(
+        reader
+            .read(request)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
+    drop(reader);
+    assert!(purges.try_recv().unwrap().objects.is_some());
     engine.stop().await.unwrap();
 }

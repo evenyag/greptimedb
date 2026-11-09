@@ -14,7 +14,7 @@
 
 //! Index catalog persistence, coverage metadata, and file paths.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use common_telemetry::warn;
 use common_time::Timestamp;
@@ -74,6 +74,15 @@ pub(crate) struct SeriesIndexEntry {
     /// Source SST IDs retained for diagnostics and exact coverage of unknown-sequence files. Compaction can replace these
     /// files without changing indexed data, so known-sequence reuse does not depend on IDs.
     pub(crate) source_file_ids: Vec<FileId>,
+    /// Coverage relies on immutable source identity rather than file-sequence summaries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) exact_source_coverage: bool,
+    /// Admission provenance for identity-based coverage of imported/untrusted SSTs.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) source_metadata: HashMap<FileId, crate::series_index::artifact::SourceSst>,
+    /// Destination visibility predicate used for the Parquet build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_partition_expr: Option<String>,
     pub(crate) min_file_sequence: u64,
     pub(crate) max_file_sequence: u64,
     /// Width used to align the half-open compaction windows, in seconds.
@@ -101,6 +110,14 @@ impl SeriesIndexEntry {
         file: &crate::sst::file::FileMeta,
         region_id: RegionId,
     ) -> bool {
+        if self.exact_source_coverage {
+            return file.time_range.0 <= file.time_range.1
+                && self.source_file_ids.contains(&file.file_id)
+                && self.source_metadata.get(&file.file_id)
+                    == Some(&crate::series_index::artifact::SourceSst::from_file(file))
+                && self.bucket_start <= file.time_range.0
+                && file.time_range.1 < self.bucket_end;
+        }
         file.region_id == region_id
             && file.time_range.0 <= file.time_range.1
             && self.bucket_start <= file.time_range.0
@@ -137,7 +154,7 @@ pub(crate) struct RangeIndexCatalog {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct SamplesCatalog {
     pub(crate) entries: Vec<crate::series_index::artifact::SamplesEntry>,
-    /// Once samples are enabled this single catalog commits all artifact references together.
+    /// This single catalog commits all artifact references together, including legacy writers.
     pub(crate) series: Vec<SeriesIndexEntry>,
     pub(crate) ranges: Vec<RangeIndexEntry>,
 }
@@ -225,10 +242,15 @@ pub(crate) async fn load_version_control(
     let series = load_catalog::<SeriesIndexCatalog>(store, &series_catalog_path(region_id))
         .await
         .unwrap_or_default();
-    let samples = load_catalog::<SamplesCatalog>(store, &samples_catalog_path(region_id)).await;
+    let committed_path = samples_catalog_path(region_id);
+    let samples = load_catalog::<SamplesCatalog>(store, &committed_path).await;
+    let committed_exists = samples.is_some() || store.exists(&committed_path).await.unwrap_or(true);
     let (ranges, indexes, sample_entries) = match samples {
         Some(catalog) => (catalog.ranges, catalog.series, catalog.entries),
-        None => (range.indexes, series.indexes, Vec::new()),
+        None if !committed_exists => (range.indexes, series.indexes, Vec::new()),
+        // Mirrors can contain an interrupted publication. A corrupt/unreadable
+        // authoritative catalog recovers through Parquet, never those mirrors.
+        None => (Vec::new(), Vec::new(), Vec::new()),
     };
     let mut version = SeriesIndexVersion::new(
         ranges
@@ -340,6 +362,9 @@ mod tests {
             index_uuid: FileId::random(),
             bucket_start: Timestamp::new_second(1),
             bucket_end: Timestamp::new_second(2),
+            exact_source_coverage: false,
+            target_partition_expr: None,
+            source_metadata: Default::default(),
             source_file_ids: Vec::new(),
             min_file_sequence: 2,
             max_file_sequence: 4,
@@ -438,6 +463,9 @@ mod tests {
             index_uuid: FileId::random(),
             bucket_start: Timestamp::new_second(0),
             bucket_end: Timestamp::new_second(100),
+            exact_source_coverage: false,
+            target_partition_expr: None,
+            source_metadata: Default::default(),
             source_file_ids: vec![FileId::random()],
             min_file_sequence: 1,
             max_file_sequence: 2,

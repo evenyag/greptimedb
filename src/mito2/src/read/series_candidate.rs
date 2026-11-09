@@ -246,6 +246,8 @@ impl SeriesIndexCoverage {
             // Unimplemented formats cannot replace authoritative SST candidates.
             .filter(|index| {
                 index.entry().format() == crate::series_index::artifact::ArtifactFormat::Parquet
+                    && index.entry().target_partition_expr
+                        == stream_ctx.input.region_metadata().partition_expr
             })
             .map(|index| {
                 let files: HashSet<_> = uncovered
@@ -787,6 +789,9 @@ mod tests {
             index_uuid: FileId::random(),
             bucket_start: Timestamp::new_millisecond(0),
             bucket_end: Timestamp::new_millisecond(20),
+            exact_source_coverage: false,
+            target_partition_expr: None,
+            source_metadata: Default::default(),
             source_file_ids: Vec::new(),
             min_file_sequence: 1,
             max_file_sequence: 2,

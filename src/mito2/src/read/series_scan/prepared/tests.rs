@@ -59,7 +59,19 @@ async fn fixture() -> (TestEnv, MitoEngine, MitoRegionRef) {
 }
 
 async fn fixture_with(experimental_series_scan_v2: bool) -> (TestEnv, MitoEngine, MitoRegionRef) {
-    let mut env = TestEnv::with_prefix("prepared-columnar").await;
+    fixture_with_environment(
+        experimental_series_scan_v2,
+        TestEnv::with_prefix("prepared-columnar").await,
+        false,
+    )
+    .await
+}
+
+async fn fixture_with_environment(
+    experimental_series_scan_v2: bool,
+    mut env: TestEnv,
+    enable_range_index: bool,
+) -> (TestEnv, MitoEngine, MitoRegionRef) {
     let mut metadata = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
     metadata
         .column_metadatas
@@ -73,6 +85,7 @@ async fn fixture_with(experimental_series_scan_v2: bool) -> (TestEnv, MitoEngine
         &[1000, 1000, 2000],
         MitoConfig {
             experimental_enable_series_index: true,
+            experimental_enable_range_index: enable_range_index,
             experimental_series_index_format: SelectedFormat::Columnar,
             experimental_series_scan_v2,
             experimental_series_index_maintenance_interval: Duration::from_secs(3600),
@@ -800,6 +813,27 @@ async fn manual_build_covers_unknown_sequences_without_a_compaction_window() {
     for file in &mut unknown {
         file.sequence = None;
     }
+    region
+        .manifest_ctx
+        .update_manifest(
+            crate::region::RegionLeaderState::Writable,
+            crate::manifest::action::RegionMetaActionList::with_action(
+                crate::manifest::action::RegionMetaAction::Edit(
+                    crate::manifest::action::RegionEdit {
+                        files_to_add: unknown.clone(),
+                        files_to_remove: vec![],
+                        timestamp_ms: None,
+                        compaction_time_window: None,
+                        flushed_entry_id: None,
+                        flushed_sequence: None,
+                        committed_sequence: None,
+                    },
+                ),
+            ),
+            false,
+        )
+        .await
+        .unwrap();
     let version = VersionBuilder::from_version(original.clone())
         .options(options)
         .compaction_time_window(None)
@@ -822,7 +856,6 @@ async fn manual_build_covers_unknown_sequences_without_a_compaction_window() {
             manual,
         )
     };
-    assert_eq!(0, reconcile(false, true).await.unwrap().built_series);
     assert!(
         reconcile(true, false)
             .await
@@ -830,7 +863,7 @@ async fn manual_build_covers_unknown_sequences_without_a_compaction_window() {
             .to_string()
             .contains("capacity")
     );
-    assert_eq!(1, reconcile(true, true).await.unwrap().built_series);
+    assert_eq!(1, reconcile(false, true).await.unwrap().built_series);
     assert_eq!(0, reconcile(true, true).await.unwrap().built_series);
     let scanner = scanner(&region, store.clone());
     let binding = labels(scanner.metadata());
@@ -1967,10 +2000,10 @@ async fn series_pushdown_skips_unrelated_table_payloads() {
     engine.stop().await.unwrap();
 }
 
-/// Sparse timestamps must not create empty-day artifacts, and new SSTs must leave existing
-/// source groups intact. Reopening exercises the persisted explicit coverage used by preflight.
+/// Sparse timestamps must not create empty-day artifacts. Consolidation replaces complete
+/// source groups, and reopening exercises the explicit coverage used by preflight.
 #[tokio::test]
-async fn daily_samples_preserve_sparse_coverage_and_existing_groups() {
+async fn daily_samples_preserve_sparse_coverage_across_consolidation() {
     let (_env, engine, region) = fixture().await;
     const LATER: i64 = 20_000 * 86_400_000;
     write(&engine, &region, 0, 0, Some(1.0)).await;
@@ -2064,10 +2097,60 @@ async fn daily_samples_preserve_sparse_coverage_and_existing_groups() {
     flush_region(&engine, region.region_id, None).await;
     build(&engine, &region).await;
     let updated = region.series_index_version();
-    assert_eq!(updated.samples.len(), original.samples.len() + 1);
-    for (id, old) in &original.samples {
-        assert_eq!(updated.samples[id].entry(), old.entry());
+    assert_eq!(updated.samples.len(), 2);
+    assert!(
+        original
+            .samples
+            .keys()
+            .all(|id| !updated.samples.contains_key(id))
+    );
+    let mut timestamps = Vec::new();
+    for handle in updated.samples.values() {
+        let batches = ColumnarSamplesFormat::default()
+            .reader(store.clone(), handle.clone())
+            .await
+            .unwrap()
+            .read(crate::series_index::format::SamplesReadRequest {
+                projection: vec!["ts".into()],
+                ..Default::default()
+            })
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for batch in batches {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::TimestampMillisecondArray>()
+                .unwrap();
+            assert!(
+                values
+                    .values()
+                    .iter()
+                    .all(|value| value.div_euclid(86_400_000) == handle.entry().window.unwrap())
+            );
+            timestamps.extend_from_slice(values.values());
+        }
     }
+    timestamps.sort_unstable();
+    assert_eq!(timestamps, vec![0, 1000, 1000, 2000, 3000, LATER]);
+    let reloaded =
+        crate::series_index::load_version_control(&store, region.region_id, &purger).await;
+    for file in region
+        .version()
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+    {
+        assert!(crate::series_index::artifact::samples_cover_file(
+            &reloaded.current().samples,
+            file
+        ));
+    }
+    build(&engine, &region).await;
+    assert!(Arc::ptr_eq(&updated, &region.series_index_version()));
     engine.stop().await.unwrap();
 }
 
@@ -2384,5 +2467,860 @@ async fn visibility_fast_path_preserves_buffers_and_partial_filtering() {
             }
         }
     }
+    engine.stop().await.unwrap();
+}
+
+/// Automatic turns fill coverage before rebuilding fragmented generations; decoded rows
+/// and pinned readers provide independent evidence beyond scheduler counters.
+#[tokio::test]
+async fn automatic_artifacts_converge_preserve_versions_and_pin_replacements() {
+    use crate::series_index::format::SamplesReadRequest;
+    use crate::series_index::reconcile_series_indexes_with_budget;
+
+    let (_env, engine, region) = fixture().await;
+    let store = region.series_index_store.clone().unwrap();
+    let (purger, mut purges) = crate::series_index::series_index_channel(store.clone());
+    // Daily sample outputs already exist when a required range build fails.
+    // They must be retired even though they never reached a published catalog.
+    let failing = store.clone().layer(
+        MockLayerBuilder::default()
+            .writer_factory(Arc::new(|path, _, inner| {
+                Box::new(crate::series_index::FailingSeriesWriter {
+                    inner,
+                    fail: path.contains("/range/"),
+                })
+            }))
+            .build()
+            .unwrap(),
+    );
+    let result = reconcile_series_indexes_with_budget(
+        0,
+        failing,
+        region.clone(),
+        Duration::from_secs(100),
+        0,
+        purger.clone(),
+        true,
+        true,
+        false,
+        1,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(region.series_index_version().samples.is_empty());
+    assert!(
+        !store
+            .exists(&crate::series_index::samples_catalog_path(region.region_id))
+            .await
+            .unwrap()
+    );
+    let retired = purges.try_recv().unwrap();
+    let speculative = retired.objects.clone().unwrap();
+    assert!(speculative.iter().all(|path| path.contains("/samples/")));
+    assert!(purges.try_recv().is_err());
+    let (cleanup, receiver) = crate::series_index::series_index_channel(store.clone());
+    cleanup.purge(retired);
+    drop(cleanup);
+    crate::series_index::run_index_purge_task(0, store.clone(), receiver).await;
+    for path in speculative {
+        assert!(!store.exists(&path).await.unwrap());
+    }
+    let turn = || {
+        reconcile_series_indexes_with_budget(
+            0,
+            store.clone(),
+            region.clone(),
+            Duration::from_secs(100),
+            0,
+            purger.clone(),
+            true,
+            true,
+            false,
+            1,
+        )
+    };
+    let first = turn().await.unwrap();
+    assert!(first.built_samples > 0);
+    assert_eq!(first.built_series, 0);
+    assert!(first.pending);
+    let second = turn().await.unwrap();
+    assert_eq!(second.built_series, 1);
+    assert_eq!(second.built_samples, 0);
+    let original = region.series_index_version();
+    assert_eq!(original.samples.len(), 1);
+    let reopened =
+        crate::series_index::load_version_control(&store, region.region_id, &purger).await;
+    let old_handle = reopened.current().samples.values().next().unwrap().clone();
+    drop(reopened);
+    let reader = ColumnarSamplesFormat::default()
+        .reader(store.clone(), old_handle.clone())
+        .await
+        .unwrap();
+    let request = SamplesReadRequest {
+        projection: reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect(),
+        ..Default::default()
+    };
+    let old_rows = reader
+        .read(request.clone())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let old_count: usize = old_rows.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(old_count, 3);
+
+    // Same key and timestamp: retain the old values, a delete, and a new version.
+    write(&engine, &region, 0, 1000, None).await;
+    flush_region(&engine, region.region_id, None).await;
+    write(&engine, &region, 0, 1000, Some(99.0)).await;
+    flush_region(&engine, region.region_id, None).await;
+    let coverage = turn().await.unwrap();
+    assert_eq!(coverage.built_series, 0);
+    assert_eq!(coverage.consolidated_samples, 0);
+    assert_eq!(region.series_index_version().samples.len(), 2);
+    assert_eq!(turn().await.unwrap().built_series, 1);
+    let merged = turn().await.unwrap();
+    assert_eq!(merged.consolidated_samples, 1);
+    let installed = region.series_index_version();
+    assert_eq!(installed.samples.len(), 1);
+    let merged_handle = installed.samples.values().next().unwrap().clone();
+    assert_eq!(merged_handle.entry().source_file_ids.len(), 5);
+    let merged_reader = ColumnarSamplesFormat::default()
+        .reader(store.clone(), merged_handle)
+        .await
+        .unwrap();
+    let decoded = merged_reader
+        .read(request.clone())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        decoded.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        old_count + 2
+    );
+    let operations: Vec<_> = decoded
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("__op_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::UInt8Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert!(operations.contains(&(api::v1::OpType::Delete as u8)));
+    let sequences: std::collections::BTreeSet<_> = decoded
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("__sequence")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::UInt64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(sequences.len(), 5);
+    let restored =
+        crate::series_index::load_version_control(&store, region.region_id, &purger).await;
+    assert_eq!(restored.current().samples.len(), 1);
+    assert_eq!(turn().await.unwrap().built_samples, 0);
+    assert!(Arc::ptr_eq(&installed, &region.series_index_version()));
+
+    // Old generations remain readable until both snapshots and the reader are released.
+    drop(original);
+    drop(old_handle);
+    let pinned = reader
+        .read(request)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        old_count
+    );
+    let mut retired_samples = 0;
+    while let Ok(purge) = purges.try_recv() {
+        retired_samples += usize::from(
+            purge
+                .objects
+                .as_ref()
+                .is_some_and(|paths| paths.iter().any(|path| path.contains("/samples/"))),
+        );
+    }
+    assert_eq!(retired_samples, 1);
+    drop(reader);
+    assert!(purges.try_recv().unwrap().objects.is_some());
+    region.version_control.pause_automatic_series_index(false);
+    engine
+        .handle_request(
+            region.region_id,
+            RegionRequest::Compact(store_api::region_request::RegionCompactRequest {
+                options: api::v1::region::compact_request::Options::StrictWindow(
+                    api::v1::region::StrictWindow {
+                        window_seconds: 100,
+                    },
+                ),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let data = region.version();
+            let indexes = region.series_index_version();
+            let files: Vec<_> = data
+                .ssts
+                .levels()
+                .iter()
+                .flat_map(|level| level.files())
+                .collect();
+            if files.len() < 5
+                && files.iter().all(|file| {
+                    crate::series_index::artifact::samples_cover_file(&indexes.samples, file)
+                        && indexes.series_indexes.values().any(|handle| {
+                            handle
+                                .entry()
+                                .covers_file(file.meta_ref(), region.region_id)
+                        })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    engine.stop().await.unwrap();
+}
+
+/// Foreign rows have source-region sequences, while admission and artifacts use the
+/// destination barrier. Reimporting the same physical SST must invalidate old coverage.
+#[rstest::rstest]
+#[case::direct(true, false)]
+#[case::same_region(false, false)]
+#[case::staging(true, true)]
+#[tokio::test]
+async fn automatic_import_uses_destination_sequences(#[case] foreign: bool, #[case] staging: bool) {
+    use crate::manifest::action::RegionEdit;
+    use crate::series_index::format::SamplesReadRequest;
+    use store_api::region_engine::SettableRegionRoleState;
+    use store_api::region_request::{EnterStagingRequest, StagingPartitionDirective};
+    use store_api::storage::RegionId;
+
+    let (_env, engine, source) = fixture().await;
+    let metadata = source.metadata();
+    let target_id = if foreign {
+        RegionId::new(1, 2)
+    } else {
+        source.region_id
+    };
+    if foreign {
+        let mut request = crate::test_util::CreateRequestBuilder::new()
+            .table_dir(source.table_dir())
+            .build();
+        request.column_metadatas = metadata.column_metadatas.clone();
+        request.primary_key = metadata.primary_key.clone();
+        for (name, value) in [
+            ("primary_key_encoding", "sparse"),
+            ("memtable.type", "bulk"),
+            ("sst_format", "flat"),
+        ] {
+            request.options.insert(name.into(), value.into());
+        }
+        engine
+            .handle_request(target_id, RegionRequest::Create(request))
+            .await
+            .unwrap();
+    }
+    let target = engine.get_region(target_id).unwrap();
+    target.version_control.pause_automatic_series_index(false);
+    let pinned_source = source.version();
+    let file = pinned_source
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .max_by_key(|file| file.meta_ref().sequence)
+        .unwrap()
+        .meta_ref()
+        .clone();
+    assert_eq!(file.sequence.unwrap().get(), 3);
+    if staging {
+        engine
+            .handle_request(
+                target_id,
+                RegionRequest::EnterStaging(EnterStagingRequest {
+                    partition_directive: StagingPartitionDirective::UpdatePartitionExpr(
+                        partition::expr::col("tag_0")
+                            .eq(datatypes::value::Value::String("a".into()))
+                            .as_json_str()
+                            .unwrap(),
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let edit = || RegionEdit {
+        files_to_add: vec![file.clone()],
+        files_to_remove: vec![],
+        timestamp_ms: None,
+        compaction_time_window: None,
+        flushed_entry_id: None,
+        flushed_sequence: None,
+        committed_sequence: None,
+    };
+    if !foreign {
+        let mut first_edit = edit();
+        first_edit.files_to_remove = pinned_source
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files())
+            .filter(|source| source.file_id().file_id() != file.file_id)
+            .map(|source| source.meta_ref().clone())
+            .collect();
+        engine.edit_region(target_id, first_edit).await.unwrap();
+    } else {
+        engine.edit_region(target_id, edit()).await.unwrap();
+    }
+    if staging {
+        assert!(
+            target
+                .version()
+                .ssts
+                .levels()
+                .iter()
+                .all(|level| level.files().next().is_none())
+        );
+        assert!(target.series_index_version().samples.is_empty());
+        engine
+            .set_region_role_state_gracefully(target_id, SettableRegionRoleState::Leader)
+            .await
+            .unwrap();
+    }
+    let wait = |sequence| {
+        let target = target.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let data = target.version();
+                    let indexes = target.series_index_version();
+                    let files: Vec<_> = data
+                        .ssts
+                        .levels()
+                        .iter()
+                        .flat_map(|level| level.files())
+                        .collect();
+                    if files.len() == 1
+                        && files[0].meta_ref().sequence.unwrap().get() == sequence
+                        && crate::series_index::artifact::samples_cover_file(
+                            &indexes.samples,
+                            files[0],
+                        )
+                        && indexes.series_indexes.values().any(|handle| {
+                            handle.entry().covers_file(files[0].meta_ref(), target_id)
+                        })
+                    {
+                        return indexes;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("import coverage timeout: {error}; expected {sequence}, files: {:?}, artifacts: {:?}", target.version().ssts, target.series_index_version());
+            })
+        }
+    };
+    let store = target.series_index_store.clone().unwrap();
+    let initial_barrier = if foreign { 1 } else { 4 };
+    for barrier in initial_barrier..=initial_barrier + 1 {
+        let indexes = wait(barrier).await;
+        assert_eq!(indexes.samples.len(), 1);
+        let handle = indexes.samples.values().next().unwrap().clone();
+        let reader = ColumnarSamplesFormat::default()
+            .reader(store.clone(), handle)
+            .await
+            .unwrap();
+        let batches = reader
+            .read(SamplesReadRequest {
+                projection: vec!["__sequence".into(), "ts".into()],
+                ..Default::default()
+            })
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let sequences = batches[0]
+            .column_by_name("__sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt64Array>()
+            .unwrap();
+        let visible = target.version();
+        let file = visible
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files())
+            .next()
+            .unwrap();
+        let mut parquet = target
+            .access_layer
+            .read_sst(file.clone())
+            .expected_metadata(Some(target.metadata()))
+            .build()
+            .await
+            .unwrap()
+            .unwrap();
+        let authoritative = parquet.next_record_batch().await.unwrap().unwrap();
+        let effective = authoritative
+            .column_by_name("__sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datatypes::arrow::array::UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sequences.value(0), effective);
+        if foreign {
+            assert_eq!(effective, barrier);
+        }
+        if barrier == initial_barrier {
+            engine.edit_region(target_id, edit()).await.unwrap();
+        }
+    }
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_sample_groups_bound_sources_and_preserve_utc_days() {
+    use crate::series_index::reconcile_series_indexes_with_budget;
+    let (_env, engine, region) = fixture().await;
+    const DAY: i64 = 86_400_000;
+    for i in 0..62 {
+        write(&engine, &region, 0, (i % 3) * DAY - 1, Some(i as f64)).await;
+        flush_region(&engine, region.region_id, None).await;
+    }
+    let data = region.version();
+    let files: Vec<_> = data
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .collect();
+    assert_eq!(files.len(), 65);
+    let store = region.series_index_store.clone().unwrap();
+    let (purger, _receiver) = crate::series_index::series_index_channel(store.clone());
+    let turn = || {
+        reconcile_series_indexes_with_budget(
+            0,
+            store.clone(),
+            region.clone(),
+            Duration::from_secs(100),
+            0,
+            purger.clone(),
+            false,
+            true,
+            false,
+            1,
+        )
+    };
+    let first = turn().await.unwrap();
+    assert_eq!(first.sample_groups, 1);
+    assert_eq!(first.built_series, 0);
+    let first_version = region.series_index_version();
+    assert!(
+        first_version
+            .samples
+            .values()
+            .all(|handle| handle.entry().source_file_ids.len() == 64)
+    );
+    assert_eq!(
+        files
+            .iter()
+            .filter(|file| crate::series_index::artifact::samples_cover_file(
+                &first_version.samples,
+                file
+            ))
+            .count(),
+        64
+    );
+    let second = turn().await.unwrap();
+    assert_eq!(second.sample_groups, 1);
+    assert_eq!(second.built_series, 0);
+    for _ in 0..10 {
+        if !turn().await.unwrap().pending {
+            break;
+        }
+    }
+    let installed = region.series_index_version();
+    assert!(
+        files
+            .iter()
+            .all(|file| crate::series_index::artifact::samples_cover_file(
+                &installed.samples,
+                file
+            ))
+    );
+    let days: std::collections::BTreeSet<_> = installed
+        .samples
+        .values()
+        .map(|handle| handle.entry().window.unwrap())
+        .collect();
+    assert_eq!(days, [-1, 0, 1].into());
+    let mut total_rows = 0;
+    for handle in installed.samples.values() {
+        assert!(handle.entry().source_file_ids.len() <= 64);
+        let reader = ColumnarSamplesFormat::default()
+            .reader(store.clone(), handle.clone())
+            .await
+            .unwrap();
+        let batches = reader
+            .read(crate::series_index::format::SamplesReadRequest {
+                projection: vec!["ts".into()],
+                ..Default::default()
+            })
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for batch in batches {
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datatypes::arrow::array::TimestampMillisecondArray>()
+                .unwrap();
+            total_rows += batch.num_rows();
+            assert!(
+                timestamps
+                    .values()
+                    .iter()
+                    .all(|ts| ts.div_euclid(DAY) == handle.entry().window.unwrap())
+            );
+        }
+    }
+    assert_eq!(total_rows, 65);
+    assert!(!turn().await.unwrap().changed());
+    assert!(Arc::ptr_eq(&installed, &region.series_index_version()));
+    engine.stop().await.unwrap();
+}
+
+/// A rejected manifest edit must retain both visible admission semantics and catalogs;
+/// retrying the real edit then repairs coverage without a manual build.
+#[tokio::test]
+async fn failed_edit_preserves_artifact_catalog_and_retry_recovers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fail = Arc::new(AtomicBool::new(false));
+    let injected = fail.clone();
+    let layer = MockLayerBuilder::default()
+        .writer_factory(Arc::new(move |path, _, inner| {
+            Box::new(crate::series_index::FailingSeriesWriter {
+                inner,
+                fail: path.contains("/manifest/") && injected.load(Ordering::Relaxed),
+            })
+        }))
+        .build()
+        .unwrap();
+    let env = TestEnv::with_prefix("native-failed-edit")
+        .await
+        .with_mock_layer(layer);
+    let (_env, engine, region) = fixture_with_environment(false, env, false).await;
+    build(&engine, &region).await;
+    let original = region.series_index_version();
+    let version = region.version();
+    let file = version
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files())
+        .next()
+        .unwrap()
+        .meta_ref()
+        .clone();
+    let edit = || crate::manifest::action::RegionEdit {
+        files_to_add: vec![file.clone()],
+        files_to_remove: vec![],
+        timestamp_ms: None,
+        compaction_time_window: None,
+        flushed_entry_id: None,
+        flushed_sequence: None,
+        committed_sequence: None,
+    };
+    let store = region.series_index_store.clone().unwrap();
+    let catalog_path = crate::series_index::samples_catalog_path(region.region_id);
+    let bytes = store.read(&catalog_path).await.unwrap().to_bytes();
+    let committed = region.version_control.committed_sequence();
+    fail.store(true, Ordering::Relaxed);
+    assert!(engine.edit_region(region.region_id, edit()).await.is_err());
+    assert_eq!(region.version_control.committed_sequence(), committed);
+    assert_eq!(
+        region
+            .version()
+            .ssts
+            .levels()
+            .iter()
+            .flat_map(|level| level.files())
+            .find(|source| source.file_id().file_id() == file.file_id)
+            .unwrap()
+            .meta_ref()
+            .sequence,
+        file.sequence
+    );
+    assert!(Arc::ptr_eq(&original, &region.series_index_version()));
+    assert_eq!(bytes, store.read(&catalog_path).await.unwrap().to_bytes());
+    fail.store(false, Ordering::Relaxed);
+    engine.edit_region(region.region_id, edit()).await.unwrap();
+    region.version_control.pause_automatic_series_index(false);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let data = region.version();
+            let indexes = region.series_index_version();
+            if !Arc::ptr_eq(&original, &indexes)
+                && data
+                    .ssts
+                    .levels()
+                    .iter()
+                    .flat_map(|level| level.files())
+                    .all(|source| {
+                        crate::series_index::artifact::samples_cover_file(&indexes.samples, source)
+                    })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for handle in original.samples.values() {
+        let reader = ColumnarSamplesFormat::default()
+            .reader(store.clone(), handle.clone())
+            .await
+            .unwrap();
+        let batches = reader
+            .read(crate::series_index::format::SamplesReadRequest {
+                projection: vec!["__sequence".into()],
+                ..Default::default()
+            })
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    }
+    engine.stop().await.unwrap();
+}
+
+/// Changing only the destination partition must invalidate row coverage, including
+/// sources filtered to zero rows. Physical range indexes remain valid across both moves.
+#[rstest::rstest]
+#[case::tag(false)]
+#[case::field(true)]
+#[tokio::test]
+async fn staging_partition_changes_rebuild_empty_and_nonempty_coverage(#[case] field: bool) {
+    use crate::series_index::format::SamplesReadRequest;
+    use store_api::region_engine::SettableRegionRoleState;
+    use store_api::region_request::{EnterStagingRequest, StagingPartitionDirective};
+    let (_env, engine, region) = fixture_with_environment(
+        false,
+        TestEnv::with_prefix("native-partition-fence").await,
+        true,
+    )
+    .await;
+    build(&engine, &region).await;
+    let original = region.series_index_version();
+    let store = region.series_index_store.clone().unwrap();
+    let old = ColumnarSamplesFormat::default()
+        .reader(
+            store.clone(),
+            original.samples.values().next().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+    let ranges = original.range_indexes.clone();
+    for include in [false, true] {
+        region.version_control.pause_automatic_series_index(true);
+        let expression = if field {
+            partition::expr::col("field_0").gt(datatypes::value::Value::Float64(
+                if include { 0.0 } else { 10.0 }.into(),
+            ))
+        } else {
+            partition::expr::col("tag_0").eq(datatypes::value::Value::String(
+                if include { "a" } else { "z" }.into(),
+            ))
+        }
+        .as_json_str()
+        .unwrap();
+        engine
+            .handle_request(
+                region.region_id,
+                RegionRequest::EnterStaging(EnterStagingRequest {
+                    partition_directive: StagingPartitionDirective::UpdatePartitionExpr(
+                        expression.clone(),
+                    ),
+                }),
+            )
+            .await
+            .unwrap();
+        // Staging promotion requires an edit action. Record the empty internal
+        // staging edit used by an empty staging manifest, without re-admitting SSTs.
+        region
+            .manifest_ctx
+            .update_manifest(
+                crate::region::RegionLeaderState::Staging,
+                crate::manifest::action::RegionMetaActionList::with_action(
+                    crate::manifest::action::RegionMetaAction::Edit(
+                        crate::manifest::action::RegionEdit {
+                            files_to_add: vec![],
+                            files_to_remove: vec![],
+                            timestamp_ms: None,
+                            compaction_time_window: None,
+                            flushed_entry_id: None,
+                            flushed_sequence: None,
+                            committed_sequence: None,
+                        },
+                    ),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+        engine
+            .set_region_role_state_gracefully(region.region_id, SettableRegionRoleState::Leader)
+            .await
+            .unwrap();
+        if !include {
+            let before = region.series_index_version();
+            region.series_index_version_control.publish(Arc::new(
+                crate::series_index::SeriesIndexVersion {
+                    samples: before.samples.clone(),
+                    series_indexes: before.series_indexes.clone(),
+                    index_buckets: before.index_buckets.clone(),
+                    range_indexes: Default::default(),
+                },
+            ));
+        }
+        region.version_control.pause_automatic_series_index(false);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let data = region.version();
+                let indexes = region.series_index_version();
+                if !indexes.samples.is_empty()
+                    && indexes.samples.values().all(|handle| {
+                        handle.entry().target_partition_expr.as_ref() == Some(&expression)
+                    })
+                    && !indexes.series_indexes.is_empty()
+                    && indexes.series_indexes.values().all(|handle| {
+                        handle.entry().target_partition_expr.as_ref() == Some(&expression)
+                    })
+                    && data
+                        .ssts
+                        .levels()
+                        .iter()
+                        .flat_map(|level| level.files())
+                        .all(|file| {
+                            crate::series_index::artifact::samples_cover_file(
+                                &indexes.samples,
+                                file,
+                            )
+                        })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let installed = region.series_index_version();
+        assert_eq!(installed.range_indexes, ranges);
+        let mut rows = 0;
+        for handle in installed.samples.values() {
+            let reader = ColumnarSamplesFormat::default()
+                .reader(store.clone(), handle.clone())
+                .await
+                .unwrap();
+            rows += reader
+                .read(SamplesReadRequest {
+                    projection: vec!["ts".into()],
+                    ..Default::default()
+                })
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            if !include {
+                assert!(handle.entry().window.is_none());
+                assert_eq!(handle.entry().source_windows.len(), 3);
+                assert!(handle.entry().source_windows.values().all(Vec::is_empty));
+                assert_eq!(handle.entry().artifact.objects.len(), 1);
+            }
+        }
+        assert_eq!(rows, if include { 3 } else { 0 });
+        let canonical = engine
+            .scan_to_stream(region.region_id, store_api::storage::ScanRequest::default())
+            .await
+            .unwrap();
+        let canonical = common_recordbatch::RecordBatches::try_collect(canonical)
+            .await
+            .unwrap();
+        // Samples preserve both versions at timestamp 1000; ordinary scans dedup.
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            if include { 2 } else { 0 }
+        );
+        let (purger, _) = crate::series_index::series_index_channel(store.clone());
+        region.version_control.pause_automatic_series_index(true);
+        assert!(
+            !crate::series_index::reconcile_series_indexes_with_budget(
+                0,
+                store.clone(),
+                region.clone(),
+                Duration::from_secs(100),
+                0,
+                purger,
+                true,
+                true,
+                false,
+                1,
+            )
+            .await
+            .unwrap()
+            .changed()
+        );
+    }
+    let pinned = old
+        .read(SamplesReadRequest {
+            projection: vec!["ts".into()],
+            ..Default::default()
+        })
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(pinned.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
     engine.stop().await.unwrap();
 }

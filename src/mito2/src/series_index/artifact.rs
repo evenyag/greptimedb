@@ -15,12 +15,11 @@
 //! Immutable, potentially multi-object format outputs and reader-owned lifetimes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use store_api::storage::FileId;
 
-use crate::series_index::purger::IndexFilePurger;
+use crate::series_index::purger::{ArtifactLease, IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
 
 /// Persisted artifact identifiers. Concrete codecs are added with their implementations.
@@ -57,6 +56,30 @@ pub(crate) struct ArtifactMetadata {
     pub(crate) file_size: u64,
 }
 
+/// Source admission semantics captured before reading authoritative Parquet rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceSst {
+    region_id: store_api::storage::RegionId,
+    sequence: Option<std::num::NonZeroU64>,
+    preserve_row_sequence: bool,
+    time_range: (common_time::Timestamp, common_time::Timestamp),
+    file_size: u64,
+    partition_expr: Option<partition::expr::PartitionExpr>,
+}
+
+impl SourceSst {
+    pub(crate) fn from_file(file: &crate::sst::file::FileMeta) -> Self {
+        Self {
+            region_id: file.region_id,
+            sequence: file.sequence,
+            preserve_row_sequence: file.preserve_row_sequence,
+            time_range: file.time_range,
+            file_size: file.file_size,
+            partition_expr: file.partition_expr.clone(),
+        }
+    }
+}
+
 /// One samples artifact derived from immutable Parquet SSTs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SamplesEntry {
@@ -71,11 +94,17 @@ pub(crate) struct SamplesEntry {
     /// Complete nonempty UTC-day coverage, stored on one anchor entry per source group.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub(crate) source_windows: std::collections::HashMap<FileId, Vec<i64>>,
+    /// Effective sequence provenance, on the same anchor as populated-day coverage.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub(crate) source_metadata: std::collections::HashMap<FileId, SourceSst>,
+    /// Destination visibility predicate used while reading the source Parquet files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_partition_expr: Option<String>,
 }
 
 impl SamplesEntry {
     pub(crate) fn covers(&self, id: FileId) -> bool {
-        if self.window.is_some() {
+        if !self.source_file_ids.is_empty() {
             self.source_file_ids.contains(&id)
         } else {
             self.file_id == id
@@ -83,7 +112,7 @@ impl SamplesEntry {
     }
 
     pub(crate) fn sources_visible(&self, visible: &std::collections::HashSet<FileId>) -> bool {
-        if self.window.is_some() {
+        if self.window.is_some() || !self.source_file_ids.is_empty() {
             !self.source_file_ids.is_empty()
                 && self.source_file_ids.iter().all(|id| visible.contains(id))
         } else {
@@ -98,10 +127,9 @@ pub(crate) fn samples_cover_file(
     file: &crate::sst::file::FileHandle,
 ) -> bool {
     let id = file.file_id().file_id();
-    if samples
-        .values()
-        .any(|h| h.entry().window.is_none() && h.entry().covers(id))
-    {
+    if samples.values().any(|h| {
+        h.entry().window.is_none() && h.entry().source_file_ids.is_empty() && h.entry().covers(id)
+    }) {
         return true;
     }
     samples.values().any(|handle| {
@@ -109,7 +137,7 @@ pub(crate) fn samples_cover_file(
             // Earlier daily catalogs require rebuilding to establish actual row coverage.
             return false;
         };
-        !days.is_empty()
+        handle.entry().source_metadata.get(&id) == Some(&SourceSst::from_file(file.meta_ref()))
             && days.iter().all(|day| {
                 samples.values().any(|h| {
                     h.entry().window == Some(*day)
@@ -127,17 +155,30 @@ pub(crate) struct SamplesFileHandle(Arc<SamplesFileInner>);
 struct SamplesFileInner {
     file_id: RegionFileId,
     entry: SamplesEntry,
-    retired: AtomicBool,
-    purger: IndexFilePurger,
+    lease: ArtifactLease,
 }
 
 impl SamplesFileHandle {
     pub(crate) fn new(file_id: RegionFileId, entry: SamplesEntry, purger: IndexFilePurger) -> Self {
+        let lease = purger.pin(
+            PurgeRequest {
+                file_id,
+                objects: Some(
+                    entry
+                        .artifact
+                        .objects
+                        .iter()
+                        .map(|object| object.path.clone())
+                        .collect(),
+                ),
+            },
+            Some(entry.artifact.generation),
+            true,
+        );
         Self(Arc::new(SamplesFileInner {
             file_id,
             entry,
-            retired: AtomicBool::new(false),
-            purger,
+            lease,
         }))
     }
 
@@ -150,23 +191,7 @@ impl SamplesFileHandle {
     }
 
     pub(crate) fn mark_deleted(&self) {
-        self.0.retired.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for SamplesFileInner {
-    fn drop(&mut self) {
-        if self.retired.load(Ordering::Acquire) {
-            self.purger.purge_objects(
-                self.file_id,
-                self.entry
-                    .artifact
-                    .objects
-                    .iter()
-                    .map(|object| object.path.clone())
-                    .collect(),
-            );
-        }
+        self.0.lease.mark_deleted();
     }
 }
 

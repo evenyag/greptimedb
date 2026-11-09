@@ -532,7 +532,7 @@ async fn series_index_store_from_config(
 }
 
 /// Bump when the rebuildable local index layout becomes incompatible.
-const SERIES_INDEX_CACHE_VERSION: &str = "2";
+const SERIES_INDEX_CACHE_VERSION: &str = "3";
 
 /// Resets incompatible caches before any worker or reader can use their catalogs.
 async fn initialize_series_index_cache(store: &ObjectStore) -> Result<()> {
@@ -1049,6 +1049,9 @@ struct RegionWorkerLoop<S> {
 impl<S: LogStore> RegionWorkerLoop<S> {
     /// Publishes a loaded region together with its resident compaction state.
     fn register_region(&mut self, region: MitoRegionRef) {
+        if let Some(state) = &self.series_index_task_state {
+            region.version_control.set_series_index_task(state);
+        }
         self.compaction_scheduler
             .register_region(&region.version_control, &region.access_layer);
         self.regions.insert_region(region);

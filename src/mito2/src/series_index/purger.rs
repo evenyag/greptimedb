@@ -14,7 +14,12 @@
 
 //! Deferred deletion of aggregate series-index files.
 
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+
+use store_api::storage::FileId;
 
 use common_telemetry::{info, warn};
 use object_store::{ErrorKind, ObjectStore};
@@ -45,10 +50,20 @@ pub(crate) struct PurgeRequest {
     pub(crate) objects: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ArtifactKey {
+    file_id: RegionFileId,
+    generation: Option<FileId>,
+    sample: bool,
+}
+
+type ArtifactLeases = HashMap<ArtifactKey, Weak<ArtifactLeaseInner>>;
+
 #[derive(Clone)]
 pub(crate) struct IndexFilePurger {
     store: ObjectStore,
     sender: UnboundedSender<PurgeRequest>,
+    leases: Arc<Mutex<ArtifactLeases>>,
 }
 
 impl Debug for IndexFilePurger {
@@ -57,12 +72,78 @@ impl Debug for IndexFilePurger {
     }
 }
 
+/// Shares retirement across handles restored by close/reopen while old readers remain.
+#[derive(Debug)]
+pub(crate) struct ArtifactLease(Arc<ArtifactLeaseInner>);
+
+#[derive(Debug)]
+struct ArtifactLeaseInner {
+    key: ArtifactKey,
+    retired: AtomicBool,
+    request: PurgeRequest,
+    purger: IndexFilePurger,
+}
+
+impl ArtifactLease {
+    pub(crate) fn mark_deleted(&self) {
+        self.0.retired.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.0.retired.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ArtifactLeaseInner {
+    fn drop(&mut self) {
+        {
+            let mut leases = self
+                .purger
+                .leases
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // A concurrent reload may already have replaced this expired weak
+            // reference. Remove only our dead entry, without scanning all pins.
+            if leases
+                .get(&self.key)
+                .is_some_and(|lease| lease.strong_count() == 0)
+            {
+                leases.remove(&self.key);
+            }
+        }
+        if self.retired.load(Ordering::Acquire) {
+            self.purger.purge(self.request.clone());
+        }
+    }
+}
+
 impl IndexFilePurger {
-    pub(crate) fn purge_objects(&self, file_id: RegionFileId, objects: Vec<String>) {
-        self.purge(PurgeRequest {
-            file_id,
-            objects: Some(objects),
+    pub(crate) fn pin(
+        &self,
+        request: PurgeRequest,
+        generation: Option<FileId>,
+        sample: bool,
+    ) -> ArtifactLease {
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let key = ArtifactKey {
+            file_id: request.file_id,
+            generation,
+            sample,
+        };
+        if let Some(lease) = leases.get(&key).and_then(Weak::upgrade) {
+            return ArtifactLease(lease);
+        }
+        let lease = Arc::new(ArtifactLeaseInner {
+            key,
+            retired: AtomicBool::new(false),
+            request,
+            purger: self.clone(),
         });
+        leases.insert(key, Arc::downgrade(&lease));
+        ArtifactLease(lease)
     }
 
     pub(crate) fn purge(&self, request: PurgeRequest) {
@@ -121,7 +202,14 @@ pub(crate) fn series_index_channel(
     store: ObjectStore,
 ) -> (IndexFilePurger, UnboundedReceiver<PurgeRequest>) {
     let (sender, receiver) = unbounded_channel();
-    (IndexFilePurger { store, sender }, receiver)
+    (
+        IndexFilePurger {
+            store,
+            sender,
+            leases: Arc::default(),
+        },
+        receiver,
+    )
 }
 
 #[cfg(test)]

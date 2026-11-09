@@ -488,7 +488,9 @@ impl MitoRegion {
         self.manifest_ctx.exit_staging(
             self.region_id,
             RegionRoleState::Leader(RegionLeaderState::Writable),
-        )
+        )?;
+        self.version_control.notify_series_index_task();
+        Ok(())
     }
 
     /// Sets the region role state gracefully. This acquires the manifest write lock.
@@ -676,6 +678,8 @@ impl MitoRegion {
             .compare_exchange_state(expect, RegionRoleState::Leader(RegionLeaderState::Writable))
         {
             error!(e; "failed to switch region state to writable, expect state is {:?}", expect);
+        } else {
+            self.version_control.notify_series_index_task();
         }
     }
 

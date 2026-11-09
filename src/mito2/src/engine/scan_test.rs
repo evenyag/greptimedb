@@ -1460,6 +1460,7 @@ async fn check_two_phase_series_scan(
             experimental_series_scan_v2: true,
             experimental_enable_series_index: true,
             experimental_enable_range_index: enable_range_index,
+            min_compaction_interval: std::time::Duration::from_secs(3600),
             ..Default::default()
         })
         .await;
@@ -1495,6 +1496,12 @@ async fn check_two_phase_series_scan(
         .handle_request(region_id, RegionRequest::Create(request))
         .await
         .unwrap();
+
+    // This fixture installs partial catalogs and removes an index to test read
+    // fallback/error behavior. Keep automatic repair from racing those states.
+    let region = engine.find_region(region_id).unwrap();
+    region.version_control.pause_automatic_series_index(true);
+    region.update_schedule_compaction_millis();
 
     let rows = |values: &[(u32, u64, &str, &str, u64, i64)]| Rows {
         schema: row_schema.clone(),
@@ -1554,6 +1561,9 @@ async fn check_two_phase_series_scan(
             index_uuid: FileId::random(),
             bucket_start: Timestamp::new_millisecond(0),
             bucket_end: Timestamp::new_millisecond(2001),
+            exact_source_coverage: false,
+            target_partition_expr: None,
+            source_metadata: Default::default(),
             source_file_ids: Vec::new(),
             min_file_sequence: sequence,
             max_file_sequence: sequence,

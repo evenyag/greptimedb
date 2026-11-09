@@ -337,6 +337,26 @@ lazy_static! {
     pub static ref SERIES_INDEX_DISK_BYTES: IntGauge = register_int_gauge!(
         "greptime_mito_series_index_disk_bytes", "estimated series and range index bytes in open regions"
     ).unwrap();
+    /// Current open-region coverage gaps and artifact counts, aggregated by worker.
+    pub static ref SERIES_INDEX_BACKLOG: IntGaugeVec = register_int_gauge_vec!(
+        "greptime_mito_series_index_backlog", "series-index coverage gaps and published artifact counts",
+        &["worker", "kind"]
+    ).unwrap();
+    /// Bounded work units, distinguishing coverage from consolidation.
+    pub static ref SERIES_INDEX_WORK_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_series_index_work_total", "series-index completed work units",
+        &["kind"]
+    ).unwrap();
+    /// Nominal compressed source bytes and completed artifact bytes for published work.
+    pub static ref SERIES_INDEX_WORK_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "greptime_mito_series_index_work_bytes_total", "series-index source and artifact bytes",
+        &["direction"]
+    ).unwrap();
+    /// Lag from the first coalesced publication notification until maintenance catches up.
+    pub static ref SERIES_INDEX_COVERAGE_LAG: Histogram = register_histogram!(
+        "greptime_mito_series_index_coverage_lag", "seconds until notified series-index work catches up",
+        exponential_buckets(0.001, 10.0, 8).unwrap()
+    ).unwrap();
     /// Maintenance passes deferred by the estimated disk usage.
     pub static ref SERIES_INDEX_CAPACITY_DEFERRED: IntCounter = register_int_counter!(
         "greptime_mito_series_index_capacity_deferred_total", "series-index capacity deferrals"

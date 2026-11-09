@@ -14,8 +14,9 @@
 
 //! Worker-owned background maintenance for series indexes.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use common_telemetry::{info, warn};
@@ -32,7 +33,7 @@ use crate::metrics::{
 };
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionMapRef, RegionRoleState};
-use crate::series_index::maintenance::{ReconcileStats, reconcile_series_indexes_with_mode};
+use crate::series_index::maintenance::{ReconcileStats, reconcile_series_indexes_with_budget};
 use crate::series_index::purger::{IndexFilePurger, PurgeRequest, run_index_purge_task};
 use crate::time_provider::TimeProviderRef;
 
@@ -52,6 +53,10 @@ pub(crate) enum SeriesIndexCommand {
 pub(crate) struct SeriesIndexTaskState {
     worker_id: u32,
     running: AtomicBool,
+    pending: AtomicBool,
+    #[cfg(test)]
+    automatic_paused: AtomicBool,
+    coverage_since: Mutex<Option<Instant>>,
     sender: Sender<SeriesIndexCommand>,
 }
 
@@ -62,6 +67,10 @@ impl SeriesIndexTaskState {
             Self {
                 worker_id,
                 running: AtomicBool::new(true),
+                pending: AtomicBool::new(false),
+                #[cfg(test)]
+                automatic_paused: AtomicBool::new(false),
+                coverage_since: Mutex::new(None),
                 sender,
             },
             receiver,
@@ -73,10 +82,26 @@ impl SeriesIndexTaskState {
     }
 
     pub(crate) fn wake(&self) {
-        // Queued work already wakes the task. Periodic maintenance still runs even
-        // if the queued command only reconciles one region.
-        if self.is_running() && self.sender.capacity() == self.sender.max_capacity() {
+        // The pending flag coalesces notifications independently of manual requests.
+        if !self.is_running() {
+            return;
+        }
+        self.coverage_since
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_or_insert_with(Instant::now);
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            // The flag survives a full manual-command queue and publications during I/O.
             let _ = self.sender.try_send(SeriesIndexCommand::Wake);
+        }
+    }
+
+    /// Lets behavioral fixtures control reconciliation without racing automatic work.
+    #[cfg(test)]
+    pub(crate) fn pause_automatic(&self, paused: bool) {
+        self.automatic_paused.store(paused, Ordering::Release);
+        if !paused {
+            self.wake();
         }
     }
 
@@ -145,6 +170,7 @@ pub(crate) fn spawn_series_index_tasks(
             interval,
             time_provider,
             enable_range_index,
+            retry_after: HashMap::new(),
         }
         .run()
         .await;
@@ -166,6 +192,7 @@ struct SeriesIndexTask {
     interval: Duration,
     time_provider: TimeProviderRef,
     enable_range_index: bool,
+    retry_after: HashMap<store_api::storage::RegionId, (Weak<crate::region::MitoRegion>, Instant)>,
 }
 
 impl SeriesIndexTask {
@@ -175,24 +202,30 @@ impl SeriesIndexTask {
         info!("Start series-index background task, worker: {worker_id}");
         let interval = self.time_provider.wait_duration(self.interval);
         let mut deadline = Instant::now() + interval;
+        let mut continuing = false;
         while self.state.is_running() {
-            // Check before receiving so a busy channel cannot starve periodic maintenance.
-            if Instant::now() >= deadline {
-                self.maintain().await;
-                deadline = Instant::now() + interval;
-                continue;
+            // Publication wakes and manual traffic never postpone periodic recovery.
+            let periodic = Instant::now() >= deadline;
+            if self.state.pending.swap(false, Ordering::AcqRel) || continuing || periodic {
+                continuing = self.maintain().await;
+                if periodic {
+                    deadline = Instant::now() + interval;
+                }
+                tokio::task::yield_now().await;
             }
-            match tokio::time::timeout_at(deadline, self.receiver.recv()).await {
+            // Immediate continuation still services queued manual requests between rounds.
+            let receive_deadline = if continuing { Instant::now() } else { deadline };
+            match tokio::time::timeout_at(receive_deadline, self.receiver.recv()).await {
                 Err(_) => continue,
                 Ok(None | Some(SeriesIndexCommand::Stop)) => break,
-                Ok(Some(SeriesIndexCommand::Wake)) => {
-                    if self.state.is_running() {
-                        self.maintain().await;
-                        deadline = Instant::now() + interval;
-                    }
-                }
+                // `wake` sets pending before sending. Re-arming it here would
+                // repeat a round already serviced before consuming the queued wake.
+                Ok(Some(SeriesIndexCommand::Wake)) => {}
                 Ok(Some(SeriesIndexCommand::Reconcile { region, sender })) => {
                     let result = self.reconcile_manual(region).await;
+                    continuing |= result
+                        .as_ref()
+                        .is_ok_and(|stats| stats.pending && stats.changed());
                     let _ = sender.send(result);
                 }
             }
@@ -236,6 +269,7 @@ impl SeriesIndexTask {
         self.refresh_usage();
         let result = self.reconcile_region_with_mode(region.clone(), true).await;
         self.refresh_usage();
+        self.report_backlog();
         let result = result?;
         self.validate_manual_region(&region)?;
         Ok(result)
@@ -255,7 +289,7 @@ impl SeriesIndexTask {
         if !allow_builds {
             SERIES_INDEX_CAPACITY_DEFERRED.inc();
         }
-        let result = reconcile_series_indexes_with_mode(
+        let result = reconcile_series_indexes_with_budget(
             self.worker_id,
             self.store.clone(),
             region,
@@ -265,6 +299,7 @@ impl SeriesIndexTask {
             self.enable_range_index,
             allow_builds,
             manual,
+            if manual { usize::MAX } else { 1 },
         )
         .await;
         if result.is_err() {
@@ -286,6 +321,86 @@ impl SeriesIndexTask {
         self.report_usage(usage);
     }
 
+    /// Coverage checks run once per round, rather than once per region's disk refresh.
+    fn report_backlog(&self) {
+        let mut sample_gaps = 0;
+        let mut series_gaps = 0;
+        let mut samples = 0;
+        let mut series = 0;
+        for region in self.regions.list_regions() {
+            let data = region.version();
+            if !is_sparse_metric_metadata(&data.metadata) {
+                continue;
+            }
+            let indexes = region.series_index_version();
+            samples += indexes.samples.len();
+            series += indexes.series_indexes.len();
+            let samples_enabled = region
+                .series_index_version_control
+                .formats
+                .read()
+                .unwrap()
+                .samples
+                .is_some();
+            let eligible_samples = indexes
+                .samples
+                .iter()
+                .filter(|(_, handle)| {
+                    handle.entry().target_partition_expr == data.metadata.partition_expr
+                })
+                .map(|(id, handle)| (*id, handle.clone()))
+                .collect();
+            for file in data.ssts.levels().iter().flat_map(|level| level.files()) {
+                if data.options.ttl.is_some_and(|ttl| {
+                    ttl.is_expired(
+                        &file.time_range().1,
+                        &common_time::Timestamp::new_millisecond(
+                            self.time_provider.current_time_millis(),
+                        ),
+                    )
+                    .unwrap_or(false)
+                }) {
+                    continue;
+                }
+                sample_gaps += usize::from(
+                    samples_enabled
+                        && !crate::series_index::artifact::samples_cover_file(
+                            &eligible_samples,
+                            file,
+                        ),
+                );
+                series_gaps += usize::from(!indexes.series_indexes.values().any(|handle| {
+                    handle.entry().target_partition_expr == data.metadata.partition_expr
+                        && handle
+                            .entry()
+                            .covers_file(file.meta_ref(), region.region_id)
+                }));
+            }
+        }
+        let worker = self.worker_id.to_string();
+        for (kind, count) in [
+            ("samples_uncovered", sample_gaps),
+            ("series_uncovered", series_gaps),
+            ("sample_artifacts", samples),
+            ("series_artifacts", series),
+        ] {
+            crate::metrics::SERIES_INDEX_BACKLOG
+                .with_label_values(&[&worker, kind])
+                .set(count as i64);
+        }
+        if sample_gaps == 0
+            && series_gaps == 0
+            && let Some(start) = self
+                .state
+                .coverage_since
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+        {
+            crate::metrics::SERIES_INDEX_COVERAGE_LAG.observe(start.elapsed().as_secs_f64());
+        }
+    }
+
     fn report_usage(&mut self, usage: u64) {
         if usage >= self.reported_usage {
             let delta = usage - self.reported_usage;
@@ -300,9 +415,28 @@ impl SeriesIndexTask {
     }
 
     /// Runs periodic maintenance independently of incoming deletion requests.
-    async fn maintain(&mut self) {
+    async fn maintain(&mut self) -> bool {
+        #[cfg(test)]
+        if self.state.automatic_paused.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut continuing = false;
         self.refresh_usage();
-        for region in self.regions.list_regions() {
+        let mut regions = self.regions.list_regions();
+        regions.sort_unstable_by_key(|region| region.region_id);
+        for region in regions {
+            if self
+                .retry_after
+                .get(&region.region_id)
+                .is_some_and(|(failed, deadline)| {
+                    Instant::now() < *deadline
+                        && failed
+                            .upgrade()
+                            .is_some_and(|old| Arc::ptr_eq(&old, &region))
+                })
+            {
+                continue;
+            }
             if !self.state.is_running() {
                 break;
             }
@@ -314,22 +448,59 @@ impl SeriesIndexTask {
             ) {
                 continue;
             }
-            if let Err(error) = self.reconcile_region(region.clone()).await {
-                warn!(error; "Failed to reconcile series indexes, worker: {}, region: {}", self.worker_id, region.region_id);
-            }
+            let result = self.reconcile_region(region.clone()).await;
             self.refresh_usage();
+            match result {
+                Ok(stats) => {
+                    continuing |= stats.pending
+                        && stats.changed()
+                        && self.disk_usage.load(Ordering::Relaxed) < self.max_size;
+                    // Full capacity never self-requeues builds. Notifications can still
+                    // run cheap cleanup, allowing removed coverage to release capacity.
+                    self.retry_after.remove(&region.region_id);
+                }
+                Err(error) => {
+                    self.retry_after.insert(
+                        region.region_id,
+                        (
+                            Arc::downgrade(&region),
+                            Instant::now() + self.time_provider.wait_duration(self.interval),
+                        ),
+                    );
+                    warn!(error; "Failed to reconcile series indexes, worker: {}, region: {}", self.worker_id, region.region_id);
+                }
+            }
         }
+        self.report_backlog();
+        self.retry_after.retain(|id, (failed, _)| {
+            failed
+                .upgrade()
+                .zip(self.regions.get_region(*id))
+                .is_some_and(|(old, current)| Arc::ptr_eq(&old, &current))
+        });
+        continuing
     }
 }
 
 impl Drop for SeriesIndexTask {
     fn drop(&mut self) {
+        let worker = self.worker_id.to_string();
+        for kind in [
+            "samples_uncovered",
+            "series_uncovered",
+            "sample_artifacts",
+            "series_artifacts",
+        ] {
+            let _ = crate::metrics::SERIES_INDEX_BACKLOG.remove_label_values(&[&worker, kind]);
+        }
         self.report_usage(0);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use object_store::layers::mock::{self, MockLayerBuilder, oio};
     use object_store::services::Memory;
     use store_api::region_engine::{RegionEngine, RegionRole};
@@ -392,9 +563,236 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 time_provider: Arc::new(crate::time_provider::StdTimeProvider),
                 enable_range_index: true,
+                retry_after: HashMap::new(),
             },
             purge_receiver,
         )
+    }
+
+    /// Cancellation during catalog I/O cannot delete outputs after a durable commit.
+    #[tokio::test]
+    async fn test_catalog_commit_survives_caller_cancellation() {
+        let mut env = TestEnv::with_prefix("series-cancel-publication").await;
+        let (engine, region) = prepare_region(&mut env).await;
+        let (mut task, mut purges) = new_task(region.clone());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let waiting = entered.clone();
+        let resume = release.clone();
+        let once = AtomicBool::new(true);
+        let path = series_catalog_path(region.region_id);
+        task.store = task.store.clone().layer(
+            MockLayerBuilder::default()
+                .writer_factory(Arc::new(move |name, _, inner| {
+                    if name == path && once.swap(false, Ordering::Relaxed) {
+                        Box::new(BlockingCatalogWriter {
+                            inner,
+                            entered: waiting.clone(),
+                            release: resume.clone(),
+                        })
+                    } else {
+                        inner
+                    }
+                }))
+                .build()
+                .unwrap(),
+        );
+        let store = task.store.clone();
+        let purger = task.purger.clone();
+        let target = region.clone();
+        let caller = tokio::spawn(async move { task.reconcile_region(target).await });
+        tokio::time::timeout(Duration::from_secs(10), entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(region.series_index_version().series_indexes.is_empty());
+        assert!(purges.try_recv().is_err());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while region.series_index_version().series_indexes.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let installed = region.series_index_version();
+        let reopened =
+            crate::series_index::catalog::load_version_control(&store, region.region_id, &purger)
+                .await;
+        assert_eq!(installed.index_buckets, reopened.current().index_buckets);
+        for handle in installed.series_indexes.values() {
+            let bytes = store
+                .read(&crate::series_index::catalog::series_index_path(
+                    region.region_id,
+                    handle.entry().index_uuid,
+                ))
+                .await
+                .unwrap()
+                .to_bytes();
+            let batches =
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                1
+            );
+        }
+        assert!(purges.try_recv().is_err());
+        engine.stop().await.unwrap();
+    }
+
+    /// One bucket per region is built before returning to either region's next bucket.
+    #[tokio::test]
+    async fn test_automatic_turns_rotate_regions_and_continue_without_timer() {
+        use crate::test_util::CreateRequestBuilder;
+        use store_api::region_request::RegionRequest;
+        use store_api::storage::RegionId;
+        let mut env = TestEnv::with_prefix("series-auto-rotation").await;
+        let (engine, first) =
+            crate::series_index::tests::prepare_region_with_timestamps(&mut env, &[1000, 101000])
+                .await;
+        let second_id = RegionId::new(1, 2);
+        let mut create = CreateRequestBuilder::new()
+            .table_dir(first.table_dir())
+            .build();
+        create.column_metadatas = first.metadata().column_metadatas.clone();
+        create.primary_key = first.metadata().primary_key.clone();
+        for (key, value) in [
+            ("primary_key_encoding", "sparse"),
+            ("sst_format", "flat"),
+            ("memtable.type", "bulk"),
+        ] {
+            create.options.insert(key.into(), value.into());
+        }
+        engine
+            .handle_request(second_id, RegionRequest::Create(create))
+            .await
+            .unwrap();
+        let sources = first.version();
+        engine
+            .edit_region(
+                second_id,
+                crate::manifest::action::RegionEdit {
+                    files_to_add: sources
+                        .ssts
+                        .levels()
+                        .iter()
+                        .flat_map(|level| level.files())
+                        .map(|file| file.meta_ref().clone())
+                        .collect(),
+                    files_to_remove: vec![],
+                    timestamp_ms: None,
+                    compaction_time_window: None,
+                    flushed_entry_id: None,
+                    flushed_sequence: None,
+                    committed_sequence: None,
+                },
+            )
+            .await
+            .unwrap();
+        let second = engine.get_region(second_id).unwrap();
+        let (mut task, _purges) = new_task(first.clone());
+        task.regions.insert_region(second.clone());
+        let builds = Arc::new(Mutex::new(Vec::new()));
+        let recorded = builds.clone();
+        task.store = task.store.clone().layer(
+            MockLayerBuilder::default()
+                .writer_factory(Arc::new(move |path, _, inner| {
+                    if path.contains("/series/") {
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(path.split('/').next().unwrap().to_string());
+                    }
+                    inner
+                }))
+                .build()
+                .unwrap(),
+        );
+        let state = task.state.clone();
+        for _ in 0..20 {
+            state.wake();
+        }
+        let running = tokio::spawn(task.run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first.series_index_version().series_indexes.len() != 2
+                || second.series_index_version().series_indexes.len() != 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.stop();
+        running.await.unwrap();
+        assert_eq!(
+            *builds.lock().unwrap(),
+            vec![
+                first.region_id.as_u64().to_string(),
+                second_id.as_u64().to_string(),
+                first.region_id.as_u64().to_string(),
+                second_id.as_u64().to_string()
+            ]
+        );
+        engine.stop().await.unwrap();
+    }
+
+    /// Repeated wakes after an injected failure must not rebuild until retry admission.
+    #[tokio::test]
+    async fn test_automatic_failure_backoff_and_recovery() {
+        let mut env = TestEnv::with_prefix("series-auto-backoff").await;
+        let (engine, region) = prepare_region(&mut env).await;
+        let (mut task, _purges) = new_task(region.clone());
+        let attempts = Arc::new(AtomicU64::new(0));
+        let recorded = attempts.clone();
+        let fail = Arc::new(AtomicBool::new(true));
+        let injected = fail.clone();
+        task.store = task.store.clone().layer(
+            MockLayerBuilder::default()
+                .writer_factory(Arc::new(move |path, _, inner| {
+                    if path.contains("/series/") {
+                        recorded.fetch_add(1, Ordering::Relaxed);
+                        Box::new(crate::series_index::tests::FailingSeriesWriter {
+                            inner,
+                            fail: injected.load(Ordering::Relaxed),
+                        })
+                    } else {
+                        inner
+                    }
+                }))
+                .build()
+                .unwrap(),
+        );
+        assert!(!task.maintain().await);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(region.series_index_version().series_indexes.is_empty());
+        fail.store(false, Ordering::Relaxed);
+        for _ in 0..10 {
+            task.state.wake();
+            assert!(!task.maintain().await);
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        task.retry_after
+            .insert(region.region_id, (Arc::downgrade(&region), Instant::now()));
+        task.maintain().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(region.series_index_version().series_indexes.len(), 1);
+        let restored = crate::series_index::catalog::load_version_control(
+            &task.store,
+            region.region_id,
+            &task.purger,
+        )
+        .await;
+        assert_eq!(
+            restored.current().index_buckets,
+            region.series_index_version().index_buckets
+        );
+        engine.stop().await.unwrap();
     }
 
     #[test]
@@ -407,6 +805,7 @@ mod tests {
             SeriesIndexCommand::Wake
         ));
         assert!(receiver.try_recv().is_err());
+        state.pending.store(false, Ordering::Release);
         state.wake();
         assert!(matches!(
             receiver.try_recv().unwrap(),
@@ -431,6 +830,7 @@ mod tests {
         let (engine, region) = prepare_region(&mut env).await;
         let (mut task, _purge_receiver) = new_task(region.clone());
         task.enable_range_index = range_enabled;
+        task.state.pause_automatic(true);
         let state = task.state.clone();
         let store = task.store.clone();
         let first = state.try_reconcile(region.clone()).unwrap();
@@ -693,12 +1093,20 @@ mod tests {
             .manifest_ctx
             .exit_staging(region.region_id, role)
             .unwrap();
+        let visible = region.version();
+        // Refreshing a follower publishes a complete replacement version rather
+        // than individual edits. Keep its sources hidden until the task is attached.
+        region.version_control.overwrite_current(Arc::new(
+            crate::region::version::VersionBuilder::from_version(visible.clone())
+                .clear_files()
+                .build(),
+        ));
         let store = ObjectStore::new(Memory::default()).unwrap();
         let (purger, _receiver) = series_index_channel(store.clone());
         let regions = Arc::new(RegionMap::default());
         regions.insert_region(region.clone());
         let (state, receiver) = SeriesIndexTaskState::new(0, 2);
-        let mut task = SeriesIndexTask {
+        let task = SeriesIndexTask {
             store: store.clone(),
             regions,
             bucket_width: Duration::from_secs(100),
@@ -712,12 +1120,61 @@ mod tests {
             interval: Duration::from_secs(3600),
             time_provider: Arc::new(crate::time_provider::StdTimeProvider),
             enable_range_index: true,
+            retry_after: HashMap::new(),
         };
         assert_eq!(
             role == RegionRoleState::Leader(RegionLeaderState::Writable),
             task.validate_manual_region(&region).is_ok(),
         );
-        task.maintain().await;
+        let state = task.state.clone();
+        let purger = task.purger.clone();
+        region.version_control.set_series_index_task(&state);
+        region.version_control.overwrite_current(visible.clone());
+        let running = tokio::spawn(task.run());
+        if builds {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while region.series_index_version().series_indexes.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let restored = crate::series_index::catalog::load_version_control(
+                &store,
+                region.region_id,
+                &purger,
+            )
+            .await;
+            let indexes = restored.current();
+            assert_eq!(1, indexes.series_indexes.len());
+            for file in visible.ssts.levels().iter().flat_map(|level| level.files()) {
+                assert!(indexes.series_indexes.values().any(|handle| {
+                    handle
+                        .entry()
+                        .covers_file(file.meta_ref(), region.region_id)
+                }));
+            }
+        } else {
+            // This queued command is a barrier behind the publication wake.
+            assert!(
+                state
+                    .try_reconcile(region.clone())
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        state.stop();
+        running.await.unwrap();
+        // The same manifest can be refreshed repeatedly. With no consumer to
+        // drain notifications, verify that unchanged visibility stays quiet.
+        let (quiet, _quiet_receiver) = SeriesIndexTaskState::new(0, 2);
+        let quiet = Arc::new(quiet);
+        region.version_control.set_series_index_task(&quiet);
+        region.version_control.overwrite_current(visible);
+        assert!(!quiet.pending.load(Ordering::Acquire));
+        quiet.stop();
         assert_eq!(
             builds,
             !region.series_index_version().series_indexes.is_empty()
@@ -796,6 +1253,7 @@ mod tests {
             interval: Duration::from_secs(3600),
             time_provider: clock.clone(),
             enable_range_index,
+            retry_after: HashMap::new(),
         };
         task.maintain().await;
         let previous = region.series_index_version();
@@ -839,32 +1297,51 @@ mod tests {
             usize::from(enable_range_index) * 4,
             cleaned.range_indexes.len()
         );
-        assert_eq!(previous.index_buckets, cleaned.index_buckets);
-        assert_eq!(1, cleaned.series_indexes.len());
-        assert!(cleaned.series_indexes.contains_key(&old_id));
+        // These SSTs lack trusted row sequences, so removing a source retires
+        // exact series coverage as well as its range companion, even at capacity.
+        assert!(cleaned.index_buckets.is_empty());
+        assert!(cleaned.series_indexes.is_empty());
         assert_eq!(cleaned.disk_usage(), usage.load(Ordering::Relaxed));
         assert_eq!(
-            previous.disk_usage()
-                - previous
-                    .range_indexes
-                    .get(&newest.file_id)
-                    .map_or(0, |e| e.file_size),
+            previous
+                .range_indexes
+                .values()
+                .filter(|entry| entry.file_id != newest.file_id)
+                .map(|entry| entry.file_size)
+                .sum::<u64>(),
             cleaned.disk_usage()
         );
+        let written = writes.lock().unwrap().clone();
+        assert!(written.contains(&series_catalog_path(region.region_id)));
         assert!(
-            writes
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|path| path == &range_catalog_path(region.region_id))
+            written.contains(&crate::series_index::catalog::samples_catalog_path(
+                region.region_id
+            ))
+        );
+        assert_eq!(
+            enable_range_index,
+            written.contains(&range_catalog_path(region.region_id))
         );
         let restored = load_version_control(&store, region.region_id, &task.purger).await;
         assert_eq!(cleaned.range_indexes, restored.current().range_indexes);
         assert_eq!(cleaned.index_buckets, restored.current().index_buckets);
         drop(restored);
 
-        // Expiration must work even when the shared estimate remains full.
-        task.max_size = cleaned.disk_usage() - excess;
+        // Reclaimed capacity promptly admits replacement coverage.
+        task.maintain().await;
+        let replacement = region.series_index_version();
+        assert_eq!(1, replacement.series_indexes.len());
+        let replacement_id = *replacement.series_indexes.keys().next().unwrap();
+        assert_ne!(old_id, replacement_id);
+        assert_eq!(
+            4,
+            replacement.series_indexes[&replacement_id]
+                .entry()
+                .source_file_ids
+                .len()
+        );
+        // Expiration must also work when the shared estimate is full again.
+        task.max_size = replacement.disk_usage() - excess;
         clock.set_now(201_000);
         writes.lock().unwrap().clear();
         task.maintain().await;
@@ -876,16 +1353,23 @@ mod tests {
         assert!(usage.load(Ordering::Relaxed) < task.max_size);
         assert_eq!(
             *writes.lock().unwrap(),
-            vec![series_catalog_path(region.region_id)]
+            vec![
+                series_catalog_path(region.region_id),
+                crate::series_index::catalog::samples_catalog_path(region.region_id)
+            ]
         );
         let restored = load_version_control(&store, region.region_id, &task.purger).await;
         assert!(restored.current().series_indexes.is_empty());
         assert_eq!(expired.range_indexes, restored.current().range_indexes);
         assert!(receiver.try_recv().is_err());
         drop(previous);
-        assert!(receiver.try_recv().is_err());
-        drop(cleaned);
         assert_eq!(old_id, receiver.try_recv().unwrap().file_id.file_id());
+        assert!(receiver.try_recv().is_err());
+        drop(replacement);
+        assert_eq!(
+            replacement_id,
+            receiver.try_recv().unwrap().file_id.file_id()
+        );
         assert!(receiver.try_recv().is_err());
 
         // Make the remaining SSTs eligible again; reclaimed capacity admits a build
@@ -932,6 +1416,7 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 time_provider: Arc::new(crate::time_provider::StdTimeProvider),
                 enable_range_index: true,
+                retry_after: HashMap::new(),
             }
         };
         let mut task = make_task();

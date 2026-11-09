@@ -183,6 +183,9 @@ async fn format_skeleton_build_reopen_and_retire() {
     drop(snapshot);
     assert!(purges.try_recv().is_err());
     drop(old);
+    assert!(purges.try_recv().is_err());
+    // A separately restored handle pins the same generation too.
+    drop(reopened);
     let request = purges.try_recv().unwrap();
     assert_eq!(2, request.objects.unwrap().len());
     engine.stop().await.unwrap();

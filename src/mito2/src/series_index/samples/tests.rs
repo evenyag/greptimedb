@@ -144,6 +144,8 @@ async fn build(
             source_file_ids: Vec::new(),
             window: None,
             source_windows: Default::default(),
+            target_partition_expr: None,
+            source_metadata: Default::default(),
         },
         purger,
     )
@@ -889,6 +891,8 @@ async fn fixture(store: &ObjectStore) -> SamplesFileHandle {
             source_file_ids: Vec::new(),
             window: None,
             source_windows: Default::default(),
+            target_partition_expr: None,
+            source_metadata: Default::default(),
             file_id: manifest.source_file_id,
             artifact,
         },

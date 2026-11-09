@@ -14,6 +14,7 @@
 
 //! Independently builds range and aggregate series indexes from SST readers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -47,16 +48,43 @@ use crate::sst::range_index::{SstRangeIndexWriter, SstRangeIndexWriterOptions};
 async fn reader_input(
     region: &MitoRegionRef,
     file: FileHandle,
+    version: &VersionRef,
+    filter_partition: bool,
 ) -> Result<
     Option<(
         Arc<crate::sst::parquet::file_range::FileRangeContext>,
         crate::sst::parquet::row_selection::RowGroupSelection,
     )>,
 > {
+    let metadata = if filter_partition {
+        version.metadata.clone()
+    } else {
+        // Range indexes describe physical Parquet row positions, independently of
+        // destination partition pruning. Filtering would corrupt their row offsets.
+        let mut metadata = version.metadata.as_ref().clone();
+        metadata.set_partition_expr(None);
+        Arc::new(metadata)
+    };
+    let mut projection = Vec::new();
+    if filter_partition
+        && let Some(predicate) =
+            crate::region::parse_partition_expr(metadata.partition_expr.as_deref())?
+    {
+        let mut columns = HashSet::new();
+        predicate.collect_column_names(&mut columns);
+        projection.extend(
+            metadata
+                .column_metadatas
+                .iter()
+                .filter(|column| columns.contains(&column.column_schema.name))
+                .map(|column| column.column_id),
+        );
+    }
     Ok(region
         .access_layer
         .read_sst(file)
-        .projection(Some(ReadColumns::new([])))
+        .expected_metadata(Some(metadata))
+        .projection(Some(ReadColumns::new(projection)))
         .build_reader_input(&mut ReaderMetrics::default())
         .await?
         .map(|(context, selection)| (Arc::new(context), selection)))
@@ -70,7 +98,7 @@ pub(crate) async fn build_range_index(
     file: FileHandle,
 ) -> Result<Option<RangeIndexEntry>> {
     let file_id = file.file_id().file_id();
-    let Some((context, mut selection)) = reader_input(region, file).await? else {
+    let Some((context, mut selection)) = reader_input(region, file, version, false).await? else {
         return Ok(None);
     };
     let mapper = FlatProjectionMapper::new(&version.metadata, [])?;
@@ -134,18 +162,18 @@ pub(crate) async fn build_series_index(
     backend: Option<&dyn SeriesIndexFormat>,
     purger: &IndexFilePurger,
 ) -> Result<SeriesIndexFileHandle> {
+    let entry = &SeriesIndexEntry {
+        target_partition_expr: version.metadata.partition_expr.clone(),
+        ..entry.clone()
+    };
     let mut sources = Vec::<BoxedRecordBatchStream>::new();
     let mapper = FlatProjectionMapper::new(&version.metadata, [])?;
     let schema = mapper.input_arrow_schema(false);
     for file in &bucket.files {
-        let Some((context, mut selection)) = reader_input(region, file.clone()).await? else {
-            return UnexpectedSnafu {
-                reason: format!(
-                    "series-index source SST {} has no readable input",
-                    file.file_id()
-                ),
-            }
-            .fail();
+        let Some((context, mut selection)) =
+            reader_input(region, file.clone(), version, true).await?
+        else {
+            continue;
         };
         let compat = FlatCompatBatch::try_new(&mapper, context.read_format(), false)?;
         sources.push(Box::pin(try_stream! {
@@ -170,13 +198,9 @@ pub(crate) async fn build_series_index(
             }
         }));
     }
-    ensure!(
-        !sources.is_empty(),
-        UnexpectedSnafu {
-            reason: "series-index bucket has no readable SST",
-        }
-    );
-    let mut visible: BoxedRecordBatchStream = if sources.len() == 1 {
+    let mut visible: BoxedRecordBatchStream = if sources.is_empty() {
+        Box::pin(futures::stream::empty())
+    } else if sources.len() == 1 {
         sources.pop().context(UnexpectedSnafu {
             reason: "series-index source disappeared",
         })?
@@ -265,6 +289,7 @@ pub(crate) async fn build_samples(
     let Some((context, mut selection)) = region
         .access_layer
         .read_sst(file)
+        .expected_metadata(Some(version.metadata.clone()))
         .build_reader_input(&mut ReaderMetrics::default())
         .await?
     else {
@@ -323,6 +348,8 @@ pub(crate) async fn build_samples(
             source_file_ids: Vec::new(),
             window: None,
             source_windows: Default::default(),
+            target_partition_expr: version.metadata.partition_expr.clone(),
+            source_metadata: Default::default(),
             file_id: file_id.file_id(),
             artifact,
         },
@@ -372,6 +399,12 @@ pub(crate) async fn build_sample_windows(
     use datatypes::arrow::compute::filter_record_batch;
     use datatypes::timestamp::timestamp_array_to_primitive;
 
+    ensure!(
+        !files.is_empty() && files.len() <= 64,
+        UnexpectedSnafu {
+            reason: "daily sample builds require between one and 64 source SSTs",
+        }
+    );
     let mapper = FlatProjectionMapper::new(
         &version.metadata,
         0..version.metadata.column_metadatas.len(),
@@ -386,17 +419,22 @@ pub(crate) async fn build_sample_windows(
     let coverage = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         store_api::storage::FileId,
         std::collections::BTreeSet<i64>,
-    >::new()));
+    >::from_iter(
+        files
+            .iter()
+            .map(|file| (file.file_id().file_id(), Default::default())),
+    )));
     let mut sources = Vec::<BoxedRecordBatchStream>::new();
     for file in files {
-        let (context, mut selection) = region
+        let Some((context, mut selection)) = region
             .access_layer
             .read_sst(file.clone())
+            .expected_metadata(Some(version.metadata.clone()))
             .build_reader_input(&mut ReaderMetrics::default())
             .await?
-            .context(UnexpectedSnafu {
-                reason: "daily samples source has no readable input",
-            })?;
+        else {
+            continue;
+        };
         let context = Arc::new(context);
         let compat = FlatCompatBatch::try_new(&mapper, context.read_format(), false)?;
         let timestamp_name = timestamp_name.clone();
@@ -426,13 +464,17 @@ pub(crate) async fn build_sample_windows(
             }
         }));
     }
-    let mut merged = Box::pin(
-        FlatMergeReader::new(schema, sources, 8192, None)
-            .await?
-            .into_stream(),
-    );
+    let mut merged: BoxedRecordBatchStream = if sources.is_empty() {
+        Box::pin(futures::stream::empty())
+    } else {
+        Box::pin(
+            FlatMergeReader::new(schema, sources, 8192, None)
+                .await?
+                .into_stream(),
+        )
+    };
     let mut writers = std::collections::BTreeMap::<
-        i64,
+        Option<i64>,
         (
             store_api::storage::FileId,
             Box<dyn crate::series_index::format::FormatWriter>,
@@ -458,7 +500,8 @@ pub(crate) async fn build_sample_windows(
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
             {
-                if let std::collections::btree_map::Entry::Vacant(entry) = writers.entry(day) {
+                if let std::collections::btree_map::Entry::Vacant(entry) = writers.entry(Some(day))
+                {
                     let generation = store_api::storage::FileId::random();
                     let prefix = crate::series_index::samples::samples_prefix(
                         region.region_id.as_u64(),
@@ -482,7 +525,7 @@ pub(crate) async fn build_sample_windows(
                     }
                     .build()
                 })?;
-                if let Some((_, writer)) = writers.get_mut(&day) {
+                if let Some((_, writer)) = writers.get_mut(&Some(day)) {
                     writer.write(&batch).await?;
                 }
             }
@@ -498,6 +541,21 @@ pub(crate) async fn build_sample_windows(
         }
         return Err(error);
     }
+    if writers.is_empty() {
+        let generation = store_api::storage::FileId::random();
+        let prefix =
+            crate::series_index::samples::samples_prefix(region.region_id.as_u64(), generation);
+        let writer = backend
+            .writer(
+                version.metadata.clone(),
+                store.clone(),
+                &prefix,
+                generation,
+                generation,
+            )
+            .await?;
+        writers.insert(None, (generation, writer));
+    }
     let mut source_windows: std::collections::HashMap<_, Vec<_>> = coverage
         .lock()
         .map_err(|_| {
@@ -509,6 +567,15 @@ pub(crate) async fn build_sample_windows(
         .iter()
         .map(|(id, days)| (*id, days.iter().copied().collect()))
         .collect();
+    let mut source_metadata = files
+        .iter()
+        .map(|file| {
+            (
+                file.file_id().file_id(),
+                crate::series_index::artifact::SourceSst::from_file(file.meta_ref()),
+            )
+        })
+        .collect();
     let mut handles = UnpublishedSamples::default();
     for (day, (generation, writer)) in writers {
         // Finished generations remain unpublished until the complete source group succeeds.
@@ -519,8 +586,10 @@ pub(crate) async fn build_sample_windows(
                 file_id: generation,
                 artifact,
                 source_file_ids: files.iter().map(|f| f.file_id().file_id()).collect(),
-                window: Some(day),
+                window: day,
                 source_windows: std::mem::take(&mut source_windows),
+                target_partition_expr: version.metadata.partition_expr.clone(),
+                source_metadata: std::mem::take(&mut source_metadata),
             },
             purger.clone(),
         ));

@@ -207,7 +207,8 @@ fn collect_inputs(
         .samples
         .iter()
         .filter(|(_, handle)| {
-            handle.entry().sources_visible(&allowed)
+            handle.entry().target_partition_expr == metadata.partition_expr
+                && handle.entry().sources_visible(&allowed)
                 && assigned.iter().any(|id| handle.entry().covers(*id))
         })
         .map(|(id, handle)| (*id, handle.clone()))
@@ -234,6 +235,7 @@ fn collect_inputs(
         let mut covered = false;
         for handle in index.version.series_indexes.values() {
             if handle.entry().format() == ArtifactFormat::ColumnarSeries
+                && handle.entry().target_partition_expr == metadata.partition_expr
                 && handle
                     .entry()
                     .covers_file(file.meta_ref(), metadata.region_id)
@@ -417,7 +419,8 @@ impl ColumnarPreparedSource {
             .copied()
             .collect();
         for handle in index.version.samples.values().filter(|h| {
-            if !h.entry().sources_visible(&allowed)
+            if h.entry().target_partition_expr != metadata.partition_expr
+                || !h.entry().sources_visible(&allowed)
                 || !assigned.iter().any(|id| h.entry().covers(*id))
             {
                 return false;

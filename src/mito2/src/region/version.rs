@@ -23,7 +23,7 @@
 //! Reason: data may be flushed/compacted and some data with old sequence may be removed
 //! and became invisible between step 1 and 2, so need to acquire version at first.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use common_telemetry::info;
@@ -48,6 +48,7 @@ use crate::wal::EntryId;
 #[derive(Debug)]
 pub(crate) struct VersionControl {
     data: RwLock<VersionControlData>,
+    series_index_task: RwLock<Weak<crate::series_index::SeriesIndexTaskState>>,
 }
 
 impl VersionControl {
@@ -57,12 +58,48 @@ impl VersionControl {
         let (flushed_sequence, flushed_entry_id) =
             (version.flushed_sequence, version.flushed_entry_id);
         VersionControl {
+            series_index_task: Default::default(),
             data: RwLock::new(VersionControlData {
                 version: Arc::new(version),
                 committed_sequence: flushed_sequence,
                 last_entry_id: flushed_entry_id,
                 is_dropped: false,
             }),
+        }
+    }
+
+    /// Connects visible-version publication to worker-owned background maintenance.
+    pub(crate) fn set_series_index_task(
+        &self,
+        state: &Arc<crate::series_index::SeriesIndexTaskState>,
+    ) {
+        *self
+            .series_index_task
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(state);
+    }
+
+    /// Coalesces a notification after visible SST or region lifecycle changes.
+    pub(crate) fn notify_series_index_task(&self) {
+        if let Some(state) = self
+            .series_index_task
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+        {
+            state.wake();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_automatic_series_index(&self, paused: bool) {
+        if let Some(state) = self
+            .series_index_task
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade()
+        {
+            state.pause_automatic(paused);
         }
     }
 
@@ -146,6 +183,9 @@ impl VersionControl {
         memtables_to_remove: &[MemtableId],
         purger: FilePurgerRef,
     ) {
+        let notify = edit
+            .as_ref()
+            .is_some_and(|edit| !edit.files_to_add.is_empty() || !edit.files_to_remove.is_empty());
         let version = self.current().version;
         let builder = VersionBuilder::from_version(version);
         let committed_sequence = edit.as_ref().and_then(|e| e.committed_sequence);
@@ -163,6 +203,10 @@ impl VersionControl {
             version_data.committed_sequence
         };
         version_data.version = new_version;
+        drop(version_data);
+        if notify {
+            self.notify_series_index_task();
+        }
     }
 
     /// Mark all opened files as deleted and set the delete marker in [VersionControlData]
@@ -312,7 +356,31 @@ impl VersionControl {
     /// Overwrites the current version with a new version.
     pub(crate) fn overwrite_current(&self, version: VersionRef) {
         let mut version_data = self.data.write().unwrap();
+        let previous = &version_data.version;
+        let notify = previous.metadata != version.metadata
+            || previous.options.ttl != version.options.ttl
+            || previous.compaction_time_window != version.compaction_time_window
+            || previous
+                .ssts
+                .levels()
+                .iter()
+                .zip(version.ssts.levels())
+                .any(|(old, new)| {
+                    old.files().count() != new.files().count()
+                        || new.files().any(|file| {
+                            previous
+                                .ssts
+                                .file_for_compaction(file)
+                                .is_none_or(|old| old.meta_ref() != file.meta_ref())
+                        })
+                });
         version_data.version = version;
+        drop(version_data);
+        // Follower manifest refresh publishes sources without applying individual edits.
+        // Unchanged polls must not turn into repeated maintenance rounds.
+        if notify {
+            self.notify_series_index_task();
+        }
     }
 
     fn new_mutable_from_version(

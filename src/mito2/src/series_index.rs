@@ -36,9 +36,13 @@ mod version;
 mod writer;
 
 #[cfg(test)]
-pub(crate) use maintenance::reconcile_series_indexes_with_mode;
+pub(crate) use maintenance::{
+    reconcile_series_indexes_with_budget, reconcile_series_indexes_with_mode,
+};
 #[cfg(test)]
-pub(crate) use tests::prepare_region_with_metadata;
+pub(crate) use purger::run_index_purge_task;
+#[cfg(test)]
+pub(crate) use tests::{FailingSeriesWriter, prepare_region_with_metadata};
 
 use std::sync::Arc;
 
@@ -51,7 +55,9 @@ use store_api::metric_engine_consts::{
 
 use crate::error::Result;
 #[cfg(test)]
-pub(crate) use crate::series_index::catalog::{RangeIndexEntry, SeriesIndexEntry};
+pub(crate) use crate::series_index::catalog::{
+    RangeIndexEntry, SeriesIndexEntry, samples_catalog_path,
+};
 pub(crate) use crate::series_index::catalog::{
     delete_catalogs, load_version_control, series_index_path,
 };

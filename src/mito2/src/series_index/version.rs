@@ -16,7 +16,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use common_time::Timestamp;
@@ -24,7 +23,7 @@ use store_api::storage::{FileId, RegionId};
 
 use crate::series_index::bucket::IndexBucket;
 use crate::series_index::catalog::{RangeIndexEntry, SeriesIndexEntry};
-use crate::series_index::purger::{IndexFilePurger, PurgeRequest};
+use crate::series_index::purger::{ArtifactLease, IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
 
 /// A reference-counted series-index file with deferred deletion semantics.
@@ -37,7 +36,7 @@ impl Debug for SeriesIndexFileHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SeriesIndexFileHandle")
             .field("file_id", &self.inner.file_id)
-            .field("deleted", &self.inner.deleted.load(Ordering::Relaxed))
+            .field("deleted", &self.inner.lease.is_deleted())
             .finish()
     }
 }
@@ -48,12 +47,26 @@ impl SeriesIndexFileHandle {
         entry: SeriesIndexEntry,
         purger: IndexFilePurger,
     ) -> Self {
+        let file_id = RegionFileId::new(region_id, entry.index_uuid);
+        let lease = purger.pin(
+            PurgeRequest {
+                file_id,
+                objects: entry.artifact.as_ref().map(|artifact| {
+                    artifact
+                        .objects
+                        .iter()
+                        .map(|object| object.path.clone())
+                        .collect()
+                }),
+            },
+            entry.artifact.as_ref().map(|artifact| artifact.generation),
+            false,
+        );
         Self {
             inner: Arc::new(SeriesIndexFileHandleInner {
-                file_id: RegionFileId::new(region_id, entry.index_uuid),
+                file_id,
                 entry,
-                deleted: AtomicBool::new(false),
-                purger,
+                lease,
             }),
         }
     }
@@ -68,37 +81,14 @@ impl SeriesIndexFileHandle {
     }
 
     pub(crate) fn mark_deleted(&self) {
-        self.inner.deleted.store(true, Ordering::Release);
+        self.inner.lease.mark_deleted();
     }
 }
 
 struct SeriesIndexFileHandleInner {
     file_id: RegionFileId,
     entry: SeriesIndexEntry,
-    deleted: AtomicBool,
-    purger: IndexFilePurger,
-}
-
-impl Drop for SeriesIndexFileHandleInner {
-    fn drop(&mut self) {
-        if self.deleted.load(Ordering::Acquire) {
-            if let Some(artifact) = &self.entry.artifact {
-                self.purger.purge_objects(
-                    self.file_id,
-                    artifact
-                        .objects
-                        .iter()
-                        .map(|object| object.path.clone())
-                        .collect(),
-                );
-            } else {
-                self.purger.purge(PurgeRequest {
-                    file_id: self.file_id,
-                    objects: None,
-                });
-            }
-        }
-    }
+    lease: ArtifactLease,
 }
 
 /// Immutable series-index snapshot for one region.
