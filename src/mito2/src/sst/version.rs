@@ -88,8 +88,19 @@ impl SstVersion {
                 .files
                 .entry(file.file_id)
                 .and_modify(|f| {
-                    if *f.meta_ref() == file || f.meta_ref().is_index_up_to_date(&file) {
-                        // same file meta or current file handle's index is up-to-date, skip adding
+                    let previous = f.meta_ref();
+                    // Reimports can change destination visibility without changing the
+                    // physical SST or its index version. Never discard that admission.
+                    let same_source = previous.region_id == file.region_id
+                        && previous.sequence == file.sequence
+                        && previous.preserve_row_sequence == file.preserve_row_sequence
+                        && previous.partition_expr == file.partition_expr
+                        && previous.time_range == file.time_range
+                        && previous.file_size == file.file_size;
+                    if *previous == file
+                        || (same_source && previous.is_index_up_to_date(&file))
+                    {
+                        // The source admission is unchanged and its index is current.
                         if f.index_id().version > new_index_version {
                             // what does it mean for us to see older index version?
                             common_telemetry::warn!(
