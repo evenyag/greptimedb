@@ -399,3 +399,29 @@ The local series-index cache has a root `version` marker independent of this
 format version. Before workers start, a missing or incompatible marker causes
 the entire derived cache (including samples, ranges, and catalogs) to be reset.
 Matching-version restarts preserve the cache.
+
+## Reconciliation and coverage
+
+Series indexes are built asynchronously after visible SST publication, following
+missing sample coverage. Automatic construction no longer requires four SSTs or
+an established compaction window. Until a compaction window exists, maintenance
+uses the configured series bucket width. The manual build command remains
+available for complete snapshot builds and diagnostics.
+
+Catalog and Parquet footer entries may include `exact_source_coverage`,
+`source_metadata`, and `target_partition_expr`. With exact coverage, source ID
+and admission provenance must match; a file-sequence interval cannot claim
+coverage of an unrelated replacement SST. This mode covers imports and sources
+without trusted sequence summaries.
+Older entries without the marker retain their sequence-summary semantics.
+The destination partition predicate must match the query metadata; source schema
+and partition changes cannot reuse an incompatible generation.
+
+Fragmented buckets are rebuilt from authoritative Parquet after coverage gaps
+are filled. The current source snapshot and schema are validated before catalog
+publication. All writers commit one combined authoritative catalog. Legacy range
+and series catalogs are mirrors; a failed mirror or final catalog write leaves
+the prior committed snapshot available on reopen. Existing handles retain
+superseded artifacts for active readers.
+See [sample lifecycle](mito-samples.md#automatic-maintenance) for scheduling,
+resource-pressure behavior, lifecycle metrics, and cache rollout.

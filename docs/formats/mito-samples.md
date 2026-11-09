@@ -26,23 +26,42 @@ these objects:
 
 Daily catalog entries add `source_file_ids` (the complete, sorted source SST
 set) and `window` (signed UTC day number since the Unix epoch). Missing fields
-retain legacy whole-SST semantics. The catalog key and manifest owner ID for a
-daily artifact are its unique generation ID, not an individual source SST.
-Each source group is merged once and rows are routed to nonempty days; sequence numbers, deletion markers,
-and duplicate versions are preserved. Blocks and parts retain their existing
-size bounds. An SST crossing midnight contributes to multiple artifacts.
+retain legacy whole-SST semantics when `source_file_ids` is empty. The catalog
+key and manifest owner ID for a daily artifact are its unique generation ID,
+not an individual source SST. Each source group is merged once and rows are
+routed to nonempty days; sequence numbers, deletion markers, and duplicate
+versions are preserved. Blocks and parts retain their existing size bounds.
+An SST crossing midnight contributes to multiple artifacts.
 
 Publication uses the existing atomic samples catalog, which also commits series
 and range indexes. Readers pin each generation once. A grouped artifact is
 ineligible if any source SST is absent from the query's data snapshot; exact
 sequence-range or SST-sequence-pruned scans fall back to the existing path.
-Maintenance retains complete visible groups and groups only uncovered sources,
-with at most 64 sources per merge. One anchor entry per group records `source_windows`, the
-actual populated days for every source in its group. Other daily entries share
-the same ordered source set without repeating the coverage map. Coverage checks use this
-record rather than enumerating the timestamp span. Earlier daily entries without
-this record require rebuilding. Publication commits all days together; retired
+Maintenance fills uncovered sources before consolidating existing groups,
+with at most 64 sources per merge. Consolidation selects complete source groups
+sharing a populated UTC day and publishes a replacement only when their union
+reduces daily generation count. Groups that cannot be combined within the source
+limit remain separate; native-to-native merging is not performed. One anchor
+entry per group records `source_windows`, the actual populated days for every
+source in its group. Other daily entries share the same ordered source set
+without repeating the coverage map. Coverage checks use this record rather
+than enumerating the timestamp span. The same anchor stores
+`source_metadata`, keyed by SST ID, with the source `region_id`, destination
+`sequence` admission marker, `preserve_row_sequence` flag, time bounds, file size,
+and source partition expression. Reimporting an SST
+with different admission semantics invalidates its group even if the ID remains
+unchanged. Earlier daily entries without complete coverage and provenance require
+rebuilding. Publication commits all days together; retired
 objects remain pinned until readers release them. Source Parquet SSTs are unchanged.
+
+Entries also record `target_partition_expr`, the destination visibility predicate
+used by the builder. Changing only that predicate invalidates old coverage.
+`source_windows` includes an empty array for a source whose effective rows were
+all filtered out. An entirely empty group owns one metadata-only artifact with
+`window = null`, a nonempty `source_file_ids` list, and explicit empty coverage;
+it is distinct from legacy whole-SST entries. Empty coverage groups can be folded
+into another bounded group during consolidation. Range indexes always retain
+physical SST row offsets and are not filtered by destination partitions.
 
 The source file ID and generation use existing `FileId` serialization. The
 generation is unique for each build. A manifest contains:
@@ -464,9 +483,9 @@ contain several generations with disjoint source sets (at most 64 SSTs per merge
 and each generation may contain multiple bounded part files. Source Parquet files
 are never rewritten.
 
-The local series-index cache layout version is 2. On upgrade from layout 1,
+The local series-index cache layout version is 3. On upgrade from layout 1 or 2,
 startup resets the rebuildable index cache before opening regions; ordinary SST
-reads remain available while artifacts rebuild. Rolling back to a layout-1 binary
+reads remain available while artifacts rebuild. Rolling back to an earlier-layout binary
 likewise resets the incompatible cache. Allow for rebuild time and I/O in either
 direction; do not reuse daily catalogs with an older reader outside this startup
 check. Existing per-SST catalog entries remain readable by the new reader.
@@ -475,3 +494,48 @@ A prepared scan uses a grouped artifact only when all of its sources belong to
 that scan's assignment or were excluded solely by its time filter. Partial coverage
 or a stale source set selects the
 ordinary SST path until reconciliation supplies complete valid coverage.
+
+
+### Automatic maintenance
+
+Successful visible SST publication from flush, compaction, direct edits/imports,
+and copy operations coalesces a worker-owned background notification. Follower
+manifest refreshes also notify after replacing the visible source version. Staged
+edits stay invisible until staging promotion, which sends its own notification.
+The worker scans the current visible sources, rather than retaining an event's
+file list. Publication does not run the builders or wait for coverage. The
+existing interval remains a recovery mechanism for missed notifications.
+
+Each automatic turn builds one sample source group or one series bucket per
+region, with required companion range indexes. Regions rotate between turns;
+successful pending work continues promptly. Missing samples take precedence over
+series coverage, followed by optional consolidation. Series coverage can start
+with one SST and without a compaction window. Manual builds retain their complete
+snapshot behavior and the existing soft disk limit.
+
+Failures and full capacity suppress immediate retries. Cleanup still retires
+obsolete coverage, and later maintenance can recover after pressure or failures
+clear. The disk estimate covers installed artifacts in open regions; pinned old
+readers and speculative outputs can temporarily consume additional disk.
+
+Builders read authoritative Parquet using destination metadata. They preserve
+all effective sequences, duplicate versions, and delete markers. Source and
+schema validation plus the catalog commit share the manifest lock; artifact I/O
+runs outside that lock. All days of a replacement commit together before the new
+in-memory snapshot is installed. Once catalog I/O starts, an owned commit task
+finishes publication or rejection even if its caller is cancelled; cancellation
+cannot purge objects referenced by a catalog write that has already committed.
+Retired generations remain readable through pinned handles and are purged only
+after the final reader releases them. Retirement leases are shared across catalog
+reloads in the same worker, so closing and reopening a region does not break
+readers holding the earlier handles.
+
+`greptime_mito_series_index_backlog` reports uncovered sample/series sources and
+published artifact counts per worker. `greptime_mito_series_index_work_total`
+distinguishes coverage and consolidation; `work_bytes_total` reports nominal
+compressed source bytes and completed artifact bytes for published work, not
+physical device I/O. Existing reconcile phase timings, failure outcomes,
+capacity deferrals, and disk estimates remain available. `coverage_lag` measures
+from the first coalesced notification until observed source coverage catches up;
+it includes queueing and retry delays. These metrics do not establish a
+performance guarantee.
