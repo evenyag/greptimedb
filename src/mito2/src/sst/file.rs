@@ -535,8 +535,12 @@ impl FileMeta {
     ///
     /// Foreign files use their target-local sequence barrier; local files require
     /// the preserve marker because their physical sequences belong to this region.
+    /// Native imports explicitly replace every row sequence with the admission
+    /// barrier, including physical copies now owned by the target region.
     pub(crate) fn is_effective_target_sequence_trusted(&self, target_region_id: RegionId) -> bool {
-        if self.region_id != target_region_id {
+        if self.region_id != target_region_id
+            || matches!(&self.format, FileFormat::Native(native) if native.use_file_sequence)
+        {
             self.sequence.is_some()
         } else {
             self.preserve_row_sequence
@@ -759,6 +763,8 @@ impl FileHandle {
     ///
     /// Foreign files use their target-local sequence barrier; local files require
     /// the preserve marker because their physical sequences belong to this region.
+    /// Native imports explicitly replace every row sequence with the admission
+    /// barrier, including physical copies now owned by the target region.
     pub(crate) fn is_effective_target_sequence_trusted(&self, target_region_id: RegionId) -> bool {
         self.meta_ref()
             .is_effective_target_sequence_trusted(target_region_id)

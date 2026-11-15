@@ -91,13 +91,14 @@ impl<S> RegionWorkerLoop<S> {
 
             match region_edit {
                 Some(region_edit)
-                    if region_edit
-                        .files_to_add
-                        .iter()
-                        .any(|file| file.level == file::LEVEL_SHARED) =>
+                    if !region_edit.series_indexes_to_add.is_empty()
+                        || region_edit.files_to_add.iter().any(|file| {
+                            file.level == file::LEVEL_SHARED
+                                || !matches!(file.format, file::FileFormat::Parquet)
+                        }) =>
                 {
-                    // Shared references and their target admission sequence must enter
-                    // the serialized edit lane, not the asynchronous physical-copy path.
+                    // Shared references and native artifacts enter the serialized
+                    // edit lane for admission sequences and coverage validation.
                     // The response lists installed references, including shared SSTs
                     // whose objects stay in place; it is not a physical COPY count.
                     let copied_file_ids = region_edit
@@ -227,24 +228,56 @@ impl<S> RegionWorkerLoop<S> {
             "source region files: {:?}, source region id: {}",
             source_region_manifest.files, source_region_id
         );
+        let mut file_descriptors = Vec::new();
         for (file_id, file_meta) in &source_region_manifest.files {
-            if !target_region_manifest.files.contains_key(file_id) {
-                new_file_metas.push(if file_meta.level == file::LEVEL_SHARED {
-                    file_meta.clone()
-                } else {
-                    remap_copied_file_meta(file_meta, target_region_id)
-                });
+            if target_region_manifest.files.contains_key(file_id) {
+                continue;
+            }
+            if file_meta.level == file::LEVEL_SHARED {
+                new_file_metas.push(file_meta.clone());
+            } else if matches!(file_meta.format, file::FileFormat::Native(_)) {
+                let (copied, objects) = prepare_native_copy(region, file_meta).await?;
+                new_file_metas.push(copied);
+                file_descriptors.extend(objects);
+            } else {
+                let copied = remap_copied_file_meta(file_meta, target_region_id);
+                file_descriptors.extend(file_descriptors_for_meta(&copied));
+                new_file_metas.push(copied);
             }
         }
-        if new_file_metas.is_empty() {
+        let target_samples: std::collections::HashMap<_, _> = target_region_manifest
+            .files
+            .values()
+            .chain(new_file_metas.iter())
+            .map(|file| (file.file_id, file.file_id()))
+            .collect();
+        let mut new_series_indexes = Vec::new();
+        for (id, index) in &source_region_manifest.series_indexes {
+            if target_region_manifest.series_indexes.contains_key(id) {
+                continue;
+            }
+            let (mut copied, objects) = prepare_native_copy(region, index).await?;
+            if let file::FileFormat::NativeSeries(native) = &mut copied.format {
+                for source in &mut native.sources {
+                    *source =
+                        *target_samples
+                            .get(&source.file_id())
+                            .context(InvalidRequestSnafu {
+                                region_id: target_region_id,
+                                reason: "Native copy index has missing samples",
+                            })?;
+                }
+            }
+            // This index has its own physical target objects, even when some
+            // samples remain shared references to a different owner.
+            copied.level = 0;
+            new_series_indexes.push(copied);
+            file_descriptors.extend(objects);
+        }
+        if new_file_metas.is_empty() && new_series_indexes.is_empty() {
             return Ok((None, source_file_ids));
         }
 
-        let file_descriptors = new_file_metas
-            .iter()
-            .filter(|file| file.level != file::LEVEL_SHARED)
-            .flat_map(file_descriptors_for_meta)
-            .collect();
         debug!("File descriptors to copy: {:?}", file_descriptors);
         let copier = RegionFileCopier::new(region.access_layer());
         // TODO(weny): ensure the target region is empty.
@@ -257,7 +290,7 @@ impl<S> RegionWorkerLoop<S> {
             )
             .await?;
         let edit = RegionEdit {
-            series_indexes_to_add: Vec::new(),
+            series_indexes_to_add: new_series_indexes,
             series_indexes_to_remove: Vec::new(),
             files_to_add: new_file_metas,
             files_to_remove: vec![],
@@ -268,10 +301,11 @@ impl<S> RegionWorkerLoop<S> {
             committed_sequence: None,
             wal_recovery: Default::default(),
         };
-        if edit
-            .files_to_add
-            .iter()
-            .any(|file| file.level == file::LEVEL_SHARED)
+        if !edit.series_indexes_to_add.is_empty()
+            || edit.files_to_add.iter().any(|file| {
+                file.level == file::LEVEL_SHARED
+                    || !matches!(file.format, file::FileFormat::Parquet)
+            })
         {
             return Ok((Some(edit), source_file_ids));
         }
@@ -327,4 +361,94 @@ fn file_descriptors_for_meta(file_meta: &FileMeta) -> Vec<FileDescriptor> {
     } else {
         vec![data]
     }
+}
+
+/// Prepares a physical native copy without rewriting encoded parts. The artifact
+/// manifest records the physical owner; paths are resolved from FileMeta on read.
+async fn prepare_native_copy(
+    region: &MitoRegionRef,
+    source: &FileMeta,
+) -> Result<(FileMeta, Vec<FileDescriptor>)> {
+    use crate::series_index::columnar::{invalid, require};
+    use crate::sst::file::{FileFormat, NativeObjectMeta};
+
+    let layer = region.access_layer();
+    crate::sst::native::validate_inventory(&layer, source)?;
+    let source_manifest = match &source.format {
+        FileFormat::Native(native) => &native.manifest,
+        FileFormat::NativeSeries(native) => &native.manifest,
+        FileFormat::Parquet => return Err(invalid("expected native copy source")),
+    };
+    let bytes = layer
+        .object_store()
+        .read(&source_manifest.path)
+        .await
+        .context(crate::error::OpenDalSnafu)?
+        .to_bytes();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    require(
+        manifest["region_id"].as_u64() == Some(source.region_id.as_u64())
+            && manifest["generation"].as_str() == Some(source.file_id.to_string().as_str()),
+        "native copy manifest identity mismatch",
+    )?;
+    manifest["region_id"] = serde_json::json!(region.region_id.as_u64());
+    let bytes = bytes::Bytes::from(
+        serde_json::to_vec(&manifest).map_err(|error| invalid(error.to_string()))?,
+    );
+    let source_prefix = format!(
+        "{}native/{}/",
+        layer.build_region_dir(source.region_id),
+        source.file_id
+    );
+    let target_prefix = format!(
+        "{}native/{}/",
+        layer.build_region_dir(region.region_id),
+        source.file_id
+    );
+    let mut descriptors = Vec::new();
+    let mut remap = |object: &mut NativeObjectMeta| -> Result<()> {
+        let name = object
+            .path
+            .strip_prefix(&source_prefix)
+            .ok_or_else(|| invalid("native copy object outside owner namespace"))?;
+        let target = format!("{target_prefix}{name}");
+        let manifest = (object.path == source_manifest.path).then(|| bytes.clone());
+        let size = manifest
+            .as_ref()
+            .map_or(object.file_size, |bytes| bytes.len() as u64);
+        descriptors.push(FileDescriptor::NativeObject {
+            source: object.path.clone(),
+            target: target.clone(),
+            size,
+            manifest,
+        });
+        *object = NativeObjectMeta {
+            path: target,
+            file_size: size,
+        };
+        Ok(())
+    };
+    let mut copied = remap_copied_file_meta(source, region.region_id);
+    match &mut copied.format {
+        FileFormat::Native(native) => {
+            for part in &mut native.parts {
+                remap(&mut part.object)?;
+            }
+            remap(&mut native.manifest)?;
+        }
+        FileFormat::NativeSeries(native) => {
+            for part in &mut native.parts {
+                remap(part)?;
+            }
+            remap(&mut native.manifest)?;
+        }
+        FileFormat::Parquet => return Err(invalid("expected native copy source")),
+    }
+    copied.file_size = descriptors.iter().try_fold(0u64, |size, object| {
+        size.checked_add(object.size())
+            .ok_or_else(|| invalid("native copy size overflow"))
+    })?;
+    crate::sst::native::validate_inventory(&layer, &copied)?;
+    Ok((copied, descriptors))
 }

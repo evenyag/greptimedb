@@ -96,7 +96,7 @@ pub struct RegionFileCopier {
 }
 
 /// A descriptor for a file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum FileDescriptor {
     /// An index file.
     Index {
@@ -106,6 +106,13 @@ pub enum FileDescriptor {
     },
     /// A data file.
     Data { file_id: FileId, size: u64 },
+    /// One native object; manifests carry rewritten owner metadata.
+    NativeObject {
+        source: String,
+        target: String,
+        size: u64,
+        manifest: Option<bytes::Bytes>,
+    },
 }
 
 impl FileDescriptor {
@@ -113,11 +120,13 @@ impl FileDescriptor {
         match self {
             FileDescriptor::Index { size, .. } => *size,
             FileDescriptor::Data { size, .. } => *size,
+            FileDescriptor::NativeObject { size, .. } => *size,
         }
     }
 
     fn file_path(&self, region_id: RegionId, table_dir: &str, path_type: PathType) -> String {
         match *self {
+            FileDescriptor::NativeObject { ref target, .. } => target.clone(),
             FileDescriptor::Index {
                 file_id, version, ..
             } => location::index_file_path(
@@ -150,6 +159,9 @@ fn build_copy_file_paths(
     table_dir: &str,
     path_type: PathType,
 ) -> (String, String) {
+    if let FileDescriptor::NativeObject { source, target, .. } = file_descriptor {
+        return (source, target);
+    }
     (
         file_descriptor.file_path(source_region_id, table_dir, path_type),
         file_descriptor.file_path(target_region_id, table_dir, path_type),
@@ -207,21 +219,34 @@ impl RegionFileCopier {
         );
         let mut tasks = Vec::with_capacity(parallelism);
         for skip in 0..parallelism {
-            let target_file_ids = file_ids.iter().skip(skip).step_by(parallelism).copied();
+            let target_file_ids = file_ids.iter().skip(skip).step_by(parallelism).cloned();
             let object_store = object_store.clone();
             tasks.push(async move {
                 for file_desc in target_file_ids {
                     let (source_path, target_path) = build_copy_file_paths(
                         source_region_id,
                         target_region_id,
-                        file_desc,
+                        file_desc.clone(),
                         table_dir,
                         path_type,
                     );
                     let now = Instant::now();
-                    object_store
-                        .copy(&source_path, &target_path)
-                        .await
+                    let result = if let FileDescriptor::NativeObject {
+                        manifest: Some(bytes),
+                        ..
+                    } = &file_desc
+                    {
+                        object_store
+                            .write(&target_path, bytes.clone())
+                            .await
+                            .map(|_| ())
+                    } else {
+                        object_store
+                            .copy(&source_path, &target_path)
+                            .await
+                            .map(|_| ())
+                    };
+                    result
                         .inspect_err(
                             |e| error!(e; "Failed to copy file {} to {}", source_path, target_path),
                         )
@@ -393,7 +418,7 @@ mod tests {
         let (source_path, target_path) = build_copy_file_paths(
             source_region_id,
             target_region_id,
-            descriptor,
+            descriptor.clone(),
             "table_dir",
             PathType::Bare,
         );

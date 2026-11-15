@@ -93,6 +93,10 @@ pending. DDL cancellation retains its existing scheduling fence and priority.
   samples retires the whole index. Coverage does not own samples: readers pin
   samples and indexes independently through ordinary file references. Native
   artifacts use `native/<FileId>/` and must never use local sidecar eviction.
+  Remap/staging preserves samples and series owners. Physical region copy rewrites
+  artifact-manifest owners, object inventories and index source owners, then uses
+  the serialized edit lane for destination admission sequences. Encoded parts
+  remain unchanged; the ordinary bounded copier owns failed-copy cleanup.
   Metadata fixture: `tests/compatibility/manifest/native_metric_storage/`.
 - **Series-index disk limit**: tasks estimate usage from entry sizes in open-region snapshots
   and defer new builds when the shared estimate is full. Cleanup still prunes obsolete

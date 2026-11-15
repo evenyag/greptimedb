@@ -1156,14 +1156,35 @@ pub(crate) async fn read_native_file(
         handle,
     )
     .await?;
-    let schema = context
+    let output_schema = context
         .input
         .mapper
         .input_arrow_schema(context.input.compaction);
+    // Sparse compaction output omits labels. Materialize them for partition
+    // evaluation, then restore the expected encoded-key schema before merging.
+    let schema =
+        if context.input.compaction && context.input.region_metadata().partition_expr.is_some() {
+            context.input.mapper.input_arrow_schema(false)
+        } else {
+            output_schema.clone()
+        };
+    let output_projection = (schema != output_schema)
+        .then(|| {
+            output_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    schema
+                        .index_of(field.name())
+                        .map_err(|error| invalid(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
     let projection = sample_projection(&reader.schema(), &context);
     // Apply only key/time predicates before merging. Field predicates remain residuals,
     // otherwise an older matching value could replace a newer nonmatching value.
-    let filters = context
+    let mut filters = context
         .input
         .predicate_for_file(&file)
         .into_iter()
@@ -1179,6 +1200,20 @@ pub(crate) async fn read_native_file(
         })
         .map(|expr| Predicate::to_physical_expr(&expr, &schema).map_err(|e| invalid(e.to_string())))
         .collect::<Result<Vec<_>>>()?;
+    // Compaction does not build a query PredicateGroup. Match the Parquet
+    // reader's per-file partition check before writing target-owned output;
+    // otherwise remapped rows outside the target partition become permanent.
+    if let Some(json) = &context.input.region_metadata().partition_expr
+        && let Some(partition) = partition::expr::PartitionExpr::from_json_str(json)
+            .map_err(|error| invalid(error.to_string()))?
+        && file.meta_ref().partition_expr.as_ref() != Some(&partition)
+    {
+        filters.push(
+            partition
+                .try_as_physical_expr(&schema)
+                .map_err(|error| invalid(error.to_string()))?,
+        );
+    }
     let stream = async_stream::try_stream! {
         let mut batches = reader.read(SamplesReadRequest { projection, keys: selected_keys, ..Default::default() })?;
         let codec = SparsePrimaryKeyCodec::schemaless();
@@ -1216,6 +1251,11 @@ pub(crate) async fn read_native_file(
                 let predicate = predicate.as_any().downcast_ref::<BooleanArray>()
                     .ok_or_else(|| invalid("native predicate is not boolean"))?;
                 batch = filter_record_batch(&batch, predicate).context(ComputeArrowSnafu)?;
+            }
+            if let Some(projection) = &output_projection {
+                batch = RecordBatch::try_new(output_schema.clone(),
+                    projection.iter().map(|index| batch.column(*index).clone()).collect())
+                    .context(NewRecordBatchSnafu)?;
             }
             if batch.num_rows() > 0 { yield batch; }
         }
