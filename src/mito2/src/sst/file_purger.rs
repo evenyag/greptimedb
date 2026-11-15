@@ -185,6 +185,16 @@ impl LocalFilePurger {
                     return;
                 }
             }
+            if let Some(objects) = file_meta.format.native_objects() {
+                // Shared-file protection applies to every object; delete the manifest last.
+                for object in objects {
+                    if let Err(error) = sst_layer.object_store().delete(&object.path).await {
+                        error!(error; "Failed to delete native object {}", object.path);
+                        return;
+                    }
+                }
+                return;
+            }
             if let Err(e) = delete_files(
                 file_meta.region_id,
                 &[(file_meta.file_id, file_meta.index_id().version)],

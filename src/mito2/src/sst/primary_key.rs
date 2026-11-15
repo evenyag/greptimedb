@@ -734,6 +734,8 @@ mod tests {
         let changed = VersionBuilder::from_version(Arc::new(changed))
             .apply_edit(
                 RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![added_meta],
                     files_to_remove: vec![],
                     timestamp_ms: None,

@@ -303,6 +303,16 @@ impl AccessLayer {
             file_ids: attempted_files,
         })?;
 
+        // The caller has already fenced this physical artifact ID against live
+        // and foreign references. Reclaim all native objects for the same ID.
+        for file_id in file_ids {
+            let prefix = format!("{}native/{file_id}/", self.build_region_dir(region_id));
+            self.object_store
+                .delete_with(&prefix)
+                .recursive(true)
+                .await
+                .context(OpenDalSnafu)?;
+        }
         Ok(())
     }
 
@@ -400,6 +410,10 @@ impl AccessLayer {
         metrics: &mut Metrics,
         context: Option<crate::sst::parquet::writer::SstWriteContext>,
     ) -> Result<SstInfoArray> {
+        if request.sst_write_format == FormatType::Native {
+            return crate::sst::native::write_samples(self, request, context.map(|ctx| ctx.guard))
+                .await;
+        }
         let limits = context.as_ref().map(|context| context.limits);
         let guard = context.map(|context| context.guard);
         let op_type = request.op_type;
@@ -485,6 +499,12 @@ impl AccessLayer {
                             write_opts,
                         )
                         .await?
+                }
+                FormatType::Native => {
+                    return crate::error::UnsupportedOperationSnafu {
+                        err_msg: "native writer must bypass Parquet cache",
+                    }
+                    .fail();
                 }
                 FormatType::Flat => {
                     writer
@@ -641,7 +661,8 @@ impl AccessLayer {
                 }
 
                 let path = entry.path();
-                if !path.ends_with(".parquet") && !path.ends_with(".puffin") {
+                if !path.ends_with(".parquet") && !path.ends_with(".puffin")
+                    && crate::sst::native::file_id_from_path(path).is_none() {
                     continue;
                 }
 
@@ -966,6 +987,7 @@ mod tests {
                 &encoded,
                 file_id.region_id(),
                 &mut SstInfo {
+                    format: Default::default(),
                     file_id: file_id.file_id(),
                     ..Default::default()
                 },

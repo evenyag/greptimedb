@@ -527,6 +527,8 @@ impl RegionFlushTask {
         }
 
         let edit = RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: file_metas,
             files_to_remove: Vec::new(),
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
@@ -820,6 +822,7 @@ impl RegionFlushTask {
             None => (None, None),
         };
         Ok(FileMeta {
+            format: sst_info.format.clone(),
             region_id,
             file_id: sst_info.file_id,
             time_range: sst_info.time_range,
@@ -837,7 +840,8 @@ impl RegionFlushTask {
             num_series: sst_info.num_series,
             primary_key_min,
             primary_key_max,
-            preserve_row_sequence,
+            preserve_row_sequence: preserve_row_sequence
+                || matches!(sst_info.format, crate::sst::file::FileFormat::Native(_)),
         })
     }
 
@@ -862,7 +866,9 @@ impl RegionFlushTask {
             // contain Puts and retained delete barriers for the same row.
             max_sequence: (version.options.merge_mode() != MergeMode::LastNonNull)
                 .then_some(max_sequence),
-            sst_write_format: if flat_format {
+            sst_write_format: if version.options.sst_format == Some(FormatType::Native) {
+                FormatType::Native
+            } else if flat_format {
                 FormatType::Flat
             } else {
                 FormatType::PrimaryKey
@@ -952,7 +958,11 @@ fn memtable_flat_sources(
     };
     let mut rows_remaining = components
         .iter()
-        .filter(|component| component.len() != 1 || component[0].encoded().is_none())
+        .filter(|component| {
+            options.sst_format == Some(FormatType::Native)
+                || component.len() != 1
+                || component[0].encoded().is_none()
+        })
         .flatten()
         .map(MemtableRange::num_rows)
         .sum::<usize>();
@@ -961,7 +971,8 @@ fn memtable_flat_sources(
     for component in components {
         // A standalone encoded component is an ordering barrier. Do not merge
         // raw ranges on either side while uploading the intervening rows as-is.
-        if component.len() == 1
+        if options.sst_format != Some(FormatType::Native)
+            && component.len() == 1
             && let Some(encoded) = component[0].encoded()
         {
             if !pending.is_empty() {
@@ -1937,6 +1948,8 @@ mod tests {
                 senders: vec![OutputTx::new(output_tx)],
                 _timer: FLUSH_ELAPSED.with_label_values(&["total"]).start_timer(),
                 edit: RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: Vec::new(),
                     files_to_remove: Vec::new(),
                     timestamp_ms: None,
@@ -2077,6 +2090,7 @@ mod tests {
 
         let uncommitted = UncommittedSsts::new(region_id, env.access_layer.clone(), None);
         uncommitted.track(&[SstInfo {
+            format: Default::default(),
             file_id,
             ..Default::default()
         }]);
@@ -2192,6 +2206,8 @@ mod tests {
         // Assumes the flush job is finished.
         version_control.apply_edit(
             Some(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,
@@ -2501,6 +2517,8 @@ mod tests {
         // Assumes the flush job is finished.
         version_control.apply_edit(
             Some(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,
@@ -2576,6 +2594,8 @@ mod tests {
         let version_data = version_control.current();
         version_control.apply_edit(
             Some(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,

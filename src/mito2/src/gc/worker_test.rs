@@ -318,6 +318,8 @@ async fn test_gc_reclaims_obsolete_index_after_readers_and_linger_release(
             .update_manifest(
                 RegionLeaderState::Writable,
                 RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![meta],
                     files_to_remove: vec![],
                     timestamp_ms: Some(removed_at),
@@ -1874,4 +1876,400 @@ async fn test_full_listing_gc_skips_region(#[case] cause: &str) {
     run_gc().await;
 
     assert_eq!(1, hook.gc_calls.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn test_native_artifact_gc_inventory_and_references() {
+    let env = IndexGcTestEnv::new(true).await;
+    let region_id = env.meta.region_id;
+    let layer = &env.region.access_layer;
+    let id = FileId::random();
+    let prefix = format!("{}native/{id}/", layer.build_region_dir(region_id));
+    let paths = [
+        format!("{prefix}manifest.json"),
+        format!("{prefix}part-0"),
+        format!("{prefix}part-1"),
+    ];
+    for path in &paths {
+        layer
+            .object_store()
+            .write(path, "native".as_bytes())
+            .await
+            .unwrap();
+    }
+    let entries = env
+        .worker
+        .list_from_object_store(region_id, 3)
+        .await
+        .unwrap();
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| crate::sst::native::file_id_from_path(entry.path()) == Some(id))
+        .collect();
+    assert_eq!(entries.len(), 3);
+    let removed = RemovedFile::File(id, None);
+    let threshold = chrono::Utc::now() + chrono::Duration::days(1);
+    for (manifest, readers) in [
+        (HashMap::from([(id, None)]), HashSet::new()),
+        (HashMap::new(), HashSet::from([(id, None)])),
+    ] {
+        let (delete, _) = env.worker.filter_deletable_files(
+            entries.clone(),
+            &manifest,
+            &readers,
+            &HashSet::new(),
+            &HashSet::from([&removed]),
+            threshold,
+        );
+        assert!(delete.is_empty());
+    }
+    let (delete, _) = env.worker.filter_deletable_files(
+        entries,
+        &HashMap::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::from([&removed]),
+        threshold,
+    );
+    assert_eq!(delete, vec![removed]);
+    layer.delete_ssts(region_id, &[id]).await.unwrap();
+    for path in paths {
+        assert!(!layer.object_store().exists(&path).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn test_native_artifact_gc_requires_age_for_every_object() {
+    let env = IndexGcTestEnv::new(true).await;
+    let layer = &env.region.access_layer;
+    let id = FileId::random();
+    let prefix = format!("{}native/{id}/", layer.build_region_dir(env.meta.region_id));
+    let old = write_and_list_entry(layer.object_store(), &format!("{prefix}part-0")).await;
+    // A missing timestamp must withhold the entire artifact even if another
+    // part has a known, sufficiently old timestamp.
+    let memory = ObjectStore::new(services::Memory::default()).unwrap();
+    let unknown = write_and_list_entry(&memory, &format!("{prefix}manifest.json")).await;
+    let threshold = chrono::Utc::now() + chrono::Duration::days(1);
+    assert!(should_delete_file(
+        false, false, false, false, &old, threshold
+    ));
+    let (delete, deferred) = env.worker.filter_deletable_files(
+        vec![old, unknown],
+        &HashMap::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+        threshold,
+    );
+    assert!(delete.is_empty());
+    assert!(deferred);
+}
+
+#[tokio::test]
+async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
+    use crate::series_index::format::{FormatReader, SamplesFormatReader};
+    use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+    use api::v1::helper::row;
+    use api::v1::value::ValueData;
+    use common_recordbatch::RecordBatches;
+    use store_api::codec::PrimaryKeyEncoding;
+    use store_api::region_request::RegionDropRequest;
+    use store_api::storage::ScanRequest;
+
+    let mut env = TestEnv::new().await;
+    env = env.with_file_ref_manager(Arc::new(
+        crate::sst::file_ref::FileReferenceManager::with_gc_enabled(None, true),
+    ));
+    let engine = env
+        .create_engine(MitoConfig {
+            gc: GcConfig {
+                enable: true,
+                lingering_time: None,
+                unknown_file_lingering_time: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await;
+    let owner = RegionId::new(1024, 1);
+    let destination = RegionId::new(1024, 2);
+    let mut request = CreateRequestBuilder::new()
+        .tag_num(1)
+        .field_num(1)
+        .insert_option("primary_key_encoding", "sparse")
+        .insert_option("sst_format", "native")
+        .insert_option("append_mode", "true")
+        .insert_option("preserve_row_sequence", "true")
+        .build();
+    let reserved = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
+    request
+        .column_metadatas
+        .extend(reserved.column_metadatas.into_iter().take(2));
+    request
+        .primary_key
+        .splice(0..0, reserved.primary_key.into_iter().take(2));
+    let schema = rows_schema(&request);
+    for region in [owner, destination] {
+        engine
+            .handle_request(region, RegionRequest::Create(request.clone()))
+            .await
+            .unwrap();
+    }
+    for (label, tsid, time) in [("api", 7, 1000), ("worker", 8, 2000)] {
+        put_rows(
+            &engine,
+            owner,
+            Rows {
+                schema: schema.clone(),
+                rows: vec![row(vec![
+                    ValueData::StringValue(label.into()),
+                    ValueData::F64Value(1.0),
+                    ValueData::TimestampMillisecondValue(time),
+                    ValueData::U32Value(42),
+                    ValueData::U64Value(tsid),
+                ])],
+            },
+        )
+        .await;
+        flush_region(&engine, owner, None).await;
+    }
+    let region = engine.get_region(owner).unwrap();
+    let layer = region.access_layer.clone();
+    let sources: Vec<_> = region
+        .version()
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files.values().cloned())
+        .collect();
+    assert_eq!(sources.len(), 2);
+    let flat = crate::compaction::CompactionSstReaderBuilder {
+        metadata: region.metadata(),
+        sst_layer: layer.clone(),
+        cache: engine.cache_manager(),
+        inputs: &sources,
+        append_mode: true,
+        filter_deleted: false,
+        time_range: None,
+        merge_mode: crate::region::options::MergeMode::LastRow,
+        read_parallelism: 1,
+    }
+    .build_flat_sst_reader()
+    .await
+    .unwrap();
+    let index = crate::sst::native::write_series(&layer, region.metadata(), &sources, flat)
+        .await
+        .unwrap();
+    let index_id = index.file_id();
+    engine
+        .edit_region(
+            owner,
+            RegionEdit {
+                series_indexes_to_add: vec![index.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let sample_metas: Vec<_> = sources.iter().map(|file| file.meta_ref().clone()).collect();
+    engine
+        .edit_region(
+            destination,
+            RegionEdit {
+                files_to_add: sample_metas.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let samples_only = engine
+        .scan_to_stream(destination, ScanRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        RecordBatches::try_collect(samples_only)
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+    engine
+        .edit_region(
+            destination,
+            RegionEdit {
+                series_indexes_to_add: vec![index.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut sample_reader = Some(
+        crate::series_index::samples::reader::SamplesReader::open(
+            layer.object_store().clone(),
+            crate::series_index::artifact::SamplesFileHandle::from_native(sources[0].clone())
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut index_reader = Some(
+        crate::series_index::columnar::reader::ColumnarReader::open(
+            layer.object_store().clone(),
+            crate::series_index::SeriesIndexFileHandle::from_native(
+                region.version().ssts.series_indexes()[&index.file_id].clone(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let inventories: Vec<Vec<String>> = sample_metas
+        .iter()
+        .chain(std::iter::once(&index))
+        .map(|file| {
+            file.format
+                .native_objects()
+                .unwrap()
+                .iter()
+                .map(|object| object.path.clone())
+                .collect()
+        })
+        .collect();
+    drop(sources);
+    drop(region);
+    engine
+        .handle_request(
+            owner,
+            RegionRequest::Drop(RegionDropRequest {
+                partial_drop: true,
+                fast_path: false,
+                force: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(engine.find_region(owner).is_none());
+
+    for paths in &inventories {
+        for path in paths {
+            assert!(
+                layer.object_store().exists(path).await.unwrap(),
+                "after drop: {path}"
+            );
+        }
+    }
+    for phase in 0..5 {
+        match phase {
+            1 => engine
+                .edit_region(
+                    destination,
+                    RegionEdit {
+                        series_indexes_to_remove: vec![index_id],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            2 => engine
+                .edit_region(
+                    destination,
+                    RegionEdit {
+                        files_to_remove: sample_metas.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            3 => drop(sample_reader.take()),
+            4 => drop(index_reader.take()),
+            _ => {}
+        }
+        let refs = engine
+            .get_snapshot_of_file_refs(
+                [owner],
+                HashMap::from([(owner, HashSet::from([destination]))]),
+            )
+            .await
+            .unwrap();
+        let worker = LocalGcWorker::try_new(
+            layer.clone(),
+            Some(engine.cache_manager()),
+            BTreeMap::from([(owner, None)]),
+            engine.mito_config().gc.clone(),
+            refs,
+            &engine.gc_limiter(),
+            true,
+            engine.region_hook(),
+        )
+        .await
+        .unwrap();
+        worker.run().await.unwrap();
+        let expected = match phase {
+            0 | 1 => [true, true, true],
+            2 => [true, false, true], // Series coverage does not own the unpinned samples.
+            3 => [false, false, true],
+            _ => [false, false, false],
+        };
+        for (paths, exists) in inventories.iter().zip(expected) {
+            for path in paths {
+                assert_eq!(
+                    layer.object_store().exists(path).await.unwrap(),
+                    exists,
+                    "phase {phase}: {path}"
+                );
+            }
+        }
+        if phase < 2 {
+            let stream = engine
+                .scan_to_stream(
+                    destination,
+                    ScanRequest {
+                        memtable_min_sequence: Some(0),
+                        memtable_max_sequence: Some(1),
+                        exact_sequence_range: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let batches = RecordBatches::try_collect(stream).await.unwrap();
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                2
+            );
+        }
+        if let Some(reader) = &sample_reader {
+            assert!(
+                reader
+                    .read(Default::default())
+                    .unwrap()
+                    .try_next()
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        if let Some(reader) = &index_reader {
+            assert!(
+                reader
+                    .read(crate::series_index::format::SeriesReadRequest {
+                        projection: reader
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.name().clone())
+                            .collect(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .try_next()
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    engine.stop().await.unwrap();
 }

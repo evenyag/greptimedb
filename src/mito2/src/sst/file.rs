@@ -30,6 +30,7 @@ use datatypes::schema::FulltextBackend;
 use partition::expr::PartitionExpr;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use snafu::ResultExt;
 use store_api::metadata::ColumnMetadata;
 use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, FileId, IndexVersion, RegionId};
@@ -152,7 +153,7 @@ pub type IndexTypes = SmallVec<[IndexType; 6]>;
 /// Cross-region file id.
 ///
 /// It contains a region id and a file id. The string representation is `{region_id}/{file_id}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RegionFileId {
     /// The region that creates the file.
     region_id: RegionId,
@@ -231,10 +232,89 @@ pub(crate) fn overlaps(l: &FileTimeRange, r: &FileTimeRange) -> bool {
     r_start <= l_end
 }
 
+/// Physical encoding of an immutable SST. Legacy manifests contain Parquet files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    #[default]
+    Parquet,
+    Native(NativeFileMeta),
+    NativeSeries(NativeSeriesIndexMeta),
+}
+
+impl FileFormat {
+    /// All objects in deletion order (manifest last), for authoritative native artifacts.
+    pub(crate) fn native_objects(&self) -> Option<Vec<&NativeObjectMeta>> {
+        match self {
+            Self::Parquet => None,
+            Self::Native(meta) => Some(
+                meta.parts
+                    .iter()
+                    .map(|part| &part.object)
+                    .chain(std::iter::once(&meta.manifest))
+                    .collect(),
+            ),
+            Self::NativeSeries(meta) => Some(
+                meta.parts
+                    .iter()
+                    .chain(std::iter::once(&meta.manifest))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn is_parquet(&self) -> bool {
+        matches!(self, Self::Parquet)
+    }
+}
+
+/// Native samples objects owned by one immutable file ID.
+/// Common bounds, statistics and sequence semantics remain in [`FileMeta`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeFileMeta {
+    /// Imported rows use the destination file admission sequence.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_file_sequence: bool,
+    pub manifest: NativeObjectMeta,
+    pub parts: Vec<NativeSamplesPart>,
+}
+
+/// Immutable native series index. Coverage identifies samples; it does not own them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSeriesIndexMeta {
+    pub manifest: NativeObjectMeta,
+    pub parts: Vec<NativeObjectMeta>,
+    pub sources: Vec<RegionFileId>,
+}
+
+/// One native object's location and encoded size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeObjectMeta {
+    pub path: String,
+    pub file_size: u64,
+}
+
+/// One independently readable samples part.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSamplesPart {
+    pub part_id: u32,
+    pub object: NativeObjectMeta,
+}
+
+impl NativeFileMeta {
+    /// Enumerates the complete object inventory, including the manifest.
+    pub fn objects(&self) -> impl Iterator<Item = &NativeObjectMeta> {
+        std::iter::once(&self.manifest).chain(self.parts.iter().map(|part| &part.object))
+    }
+}
+
 /// Metadata of a SST file.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FileMeta {
+    /// Physical file encoding; absent in legacy Parquet manifests.
+    #[serde(default, skip_serializing_if = "FileFormat::is_parquet")]
+    pub format: FileFormat,
     /// Region that created the file. The region id may not be the id of the current region.
     pub region_id: RegionId,
     /// Compared to normal file names, FileId ignore the extension
@@ -347,6 +427,7 @@ impl Debug for FileMeta {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut debug_struct = f.debug_struct("FileMeta");
         debug_struct
+            .field("format", &self.format)
             .field("region_id", &self.region_id)
             .field("file_id", &DebugFmt(|f| write!(f, "{} ", self.file_id)))
             .field(
@@ -695,7 +776,11 @@ impl FileHandle {
 
     /// Returns the complete file path of the file.
     pub fn file_path(&self, table_dir: &str, path_type: PathType) -> String {
-        location::sst_file_path(table_dir, self.file_id(), path_type)
+        match &self.meta_ref().format {
+            FileFormat::Parquet => location::sst_file_path(table_dir, self.file_id(), path_type),
+            FileFormat::Native(native) => native.manifest.path.clone(),
+            FileFormat::NativeSeries(native) => native.manifest.path.clone(),
+        }
     }
 
     /// Returns the time range of the file.
@@ -994,7 +1079,7 @@ pub async fn delete_files(
 #[derive(Clone)]
 pub(crate) struct UncommittedSsts {
     region_id: RegionId,
-    files: Arc<Mutex<HashMap<FileId, (u64, bool)>>>,
+    files: Arc<Mutex<HashMap<FileId, (u64, bool, FileFormat)>>>,
     access_layer: AccessLayerRef,
     cache_manager: Option<CacheManagerRef>,
 }
@@ -1019,14 +1104,21 @@ impl UncommittedSsts {
         for sst in ssts {
             files.insert(
                 sst.file_id,
-                (sst.index_metadata.version, sst.index_metadata.file_size > 0),
+                (
+                    sst.index_metadata.version,
+                    sst.index_metadata.file_size > 0,
+                    sst.format.clone(),
+                ),
             );
         }
     }
 
     /// Tracks an SST before it is uploaded, so a cancelled upload is still removed.
     pub(crate) fn track_before_upload(&self, file_id: FileId, with_index: bool) {
-        self.files.lock().unwrap().insert(file_id, (0, with_index));
+        self.files
+            .lock()
+            .unwrap()
+            .insert(file_id, (0, with_index, FileFormat::Parquet));
     }
 
     /// Disarms cleanup after the manifest edit has committed or may have committed.
@@ -1055,11 +1147,21 @@ impl UncommittedSsts {
             return Ok(());
         }
 
-        let delete_index = files.values().any(|(_, exists_index)| *exists_index);
-        let file_ids = files
-            .into_iter()
-            .map(|(file_id, (index_version, _))| (file_id, index_version))
-            .collect::<Vec<_>>();
+        let delete_index = files.values().any(|(_, exists_index, _)| *exists_index);
+        let mut file_ids = Vec::new();
+        for (file_id, (index_version, _, format)) in files {
+            if let Some(objects) = format.native_objects() {
+                for object in objects {
+                    self.access_layer
+                        .object_store()
+                        .delete(&object.path)
+                        .await
+                        .context(crate::error::OpenDalSnafu)?;
+                }
+            } else {
+                file_ids.push((file_id, index_version));
+            }
+        }
         delete_files(
             self.region_id,
             &file_ids,

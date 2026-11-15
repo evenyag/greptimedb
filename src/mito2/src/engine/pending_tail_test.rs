@@ -81,6 +81,8 @@ async fn create_region_with_entries(
 
 pub(crate) fn pending_tails_edit(pending_tails: Vec<PendingTail>) -> RegionEdit {
     RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![],
         files_to_remove: vec![],
         timestamp_ms: None,

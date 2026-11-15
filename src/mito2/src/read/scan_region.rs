@@ -495,6 +495,15 @@ impl ScanRegion {
     /// Returns true if the region can use series scan for current request.
     fn use_series_scan(&self) -> bool {
         self.request.distribution == Some(TimeSeriesDistribution::PerSeries)
+            || self.version.options.sst_format == Some(crate::sst::FormatType::Native)
+            || self.version.ssts.levels().iter().any(|level| {
+                level.files.values().any(|file| {
+                    matches!(
+                        file.meta_ref().format,
+                        crate::sst::file::FileFormat::Native(_)
+                    )
+                })
+            })
     }
 
     /// Creates a scan input.
@@ -623,6 +632,14 @@ impl ScanRegion {
             .with_predicate(predicate)
             .with_memtables(mem_range_builders)
             .with_files(files)
+            .with_native_series_indexes(
+                self.version
+                    .ssts
+                    .series_indexes()
+                    .values()
+                    .cloned()
+                    .collect(),
+            )
             .with_time_pruned_files(time_pruned_files)
             .with_primary_key_mapper(self.version.ssts.primary_key_mapper())
             .with_cache(self.cache_strategy)
@@ -964,7 +981,7 @@ pub struct ScanInput {
     /// Whether to ignore range indexes while retaining series-index candidate discovery.
     ignore_range_index: bool,
     /// Region SST access layer.
-    access_layer: AccessLayerRef,
+    pub(crate) access_layer: AccessLayerRef,
     /// Maps projected Batches to RecordBatches.
     pub(crate) mapper: Arc<FlatProjectionMapper>,
     /// The columns to read from memtables and SSTs.
@@ -983,6 +1000,7 @@ pub struct ScanInput {
     pub(crate) memtables: Vec<MemRangeBuilder>,
     /// Handles to SST files to scan.
     pub(crate) files: Vec<FileHandle>,
+    pub(crate) native_series_indexes: Vec<FileHandle>,
     /// Visible sources excluded solely by the query time range.
     pub(crate) time_pruned_files: HashSet<store_api::storage::FileId>,
     /// Shares the pinned schema's encoded defaults across parallel range readers.
@@ -1073,6 +1091,7 @@ impl ScanInput {
                 region_partition_expr: None,
                 memtables: Vec::new(),
                 files: Vec::new(),
+                native_series_indexes: Vec::new(),
                 time_pruned_files: HashSet::new(),
                 primary_key_mapper: OnceLock::new(),
                 batch_size: crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
@@ -1306,6 +1325,11 @@ impl ScanInputBuilder {
 
     /// Sets files to read.
     #[must_use]
+    fn with_native_series_indexes(mut self, indexes: Vec<FileHandle>) -> Self {
+        self.input.native_series_indexes = indexes;
+        self
+    }
+
     pub(crate) fn with_files(mut self, files: Vec<FileHandle>) -> Self {
         self.input.files = files;
         self

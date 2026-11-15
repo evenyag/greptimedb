@@ -530,8 +530,14 @@ impl VersionBuilder {
         if let Some(pending_tails) = edit.wal_recovery.pending_tails {
             self.pending_tails = pending_tails;
         }
-        if !edit.files_to_add.is_empty() || !edit.files_to_remove.is_empty() {
+        if !edit.files_to_add.is_empty()
+            || !edit.files_to_remove.is_empty()
+            || !edit.series_indexes_to_add.is_empty()
+            || !edit.series_indexes_to_remove.is_empty()
+        {
             let mut ssts = (*self.ssts).clone();
+            ssts.add_series_indexes(file_purger.clone(), edit.series_indexes_to_add.into_iter());
+            ssts.remove_series_indexes(edit.series_indexes_to_remove.into_iter());
             ssts.add_files(file_purger, edit.files_to_add.into_iter());
             ssts.remove_files(edit.files_to_remove.into_iter());
             self.ssts = Arc::new(ssts);
@@ -551,6 +557,15 @@ impl VersionBuilder {
     }
 
     /// Add files to the builder.
+    pub(crate) fn add_series_indexes(
+        mut self,
+        file_purger: FilePurgerRef,
+        files: impl Iterator<Item = FileMeta>,
+    ) -> Self {
+        Arc::make_mut(&mut self.ssts).add_series_indexes(file_purger, files);
+        self
+    }
+
     pub(crate) fn add_files(
         mut self,
         file_purger: FilePurgerRef,
@@ -645,6 +660,8 @@ mod tests {
         for sequence in [25, 11] {
             vc.apply_edit(
                 Some(RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![],
                     files_to_remove: vec![],
                     timestamp_ms: None,

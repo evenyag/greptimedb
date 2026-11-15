@@ -2196,6 +2196,8 @@ async fn add_manifest_scan_region(
         .unwrap();
     let region = engine.get_region(region_id).unwrap();
     let edit = RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: (0..files_per_region)
             .map(|index| FileMeta {
                 region_id,

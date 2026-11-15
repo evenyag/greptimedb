@@ -227,6 +227,8 @@ impl RegionManifestManager {
         })];
         if flushed_entry_id > 0 {
             actions.push(RegionMetaAction::Edit(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![],
                 files_to_remove: vec![],
                 timestamp_ms: None,
@@ -613,6 +615,12 @@ impl RegionManifestManager {
 
         for action in &action_list.actions {
             if let RegionMetaAction::Edit(edit) = action {
+                let manifest = if is_staging {
+                    self.staging_manifest.as_ref().unwrap_or(&self.manifest)
+                } else {
+                    &self.manifest
+                };
+                edit.validate_native_series(manifest)?;
                 for file in edit.files_to_add.iter().chain(&edit.files_to_remove) {
                     ensure!(
                         file::is_supported_level(file.level),
@@ -1066,6 +1074,8 @@ mod test {
             manager
                 .update(
                     RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
+                        series_indexes_to_add: Vec::new(),
+                        series_indexes_to_remove: Vec::new(),
                         files_to_add: vec![],
                         files_to_remove: vec![],
                         timestamp_ms: None,

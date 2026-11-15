@@ -200,6 +200,8 @@ async fn wal_recovery_records_survive_reopen(#[case] checkpoint_distance: u64) {
         upto_kind: UptoKind::Listed,
     }];
     let edit = RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![],
         files_to_remove: vec![],
         timestamp_ms: None,
@@ -309,6 +311,8 @@ async fn checkpoint_with_different_compression_types() {
             ..Default::default()
         };
         let action = RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![file_meta],
             files_to_remove: vec![],
             timestamp_ms: None,
@@ -376,6 +380,8 @@ fn generate_action_lists(num: usize) -> (Vec<FileId>, Vec<RegionMetaActionList>)
             ..Default::default()
         };
         let action = RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![file_meta],
             files_to_remove: vec![],
             timestamp_ms: None,

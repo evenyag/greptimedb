@@ -257,6 +257,8 @@ impl<S> RegionWorkerLoop<S> {
             )
             .await?;
         let edit = RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: new_file_metas,
             files_to_remove: vec![],
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),

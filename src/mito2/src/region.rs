@@ -888,6 +888,7 @@ impl MitoRegion {
         let region_options = serde_json::to_string(&version.options)
             .unwrap_or_else(|err| serde_json::json!({ "error": err.to_string() }).to_string());
         let sst_format = match version.options.sst_format.unwrap_or_default() {
+            crate::sst::FormatType::Native => "native",
             crate::sst::FormatType::PrimaryKey => "primary_key",
             crate::sst::FormatType::Flat => "flat",
         }
@@ -1514,6 +1515,8 @@ impl ManifestContext {
         committed.index_version = updated.index_version;
 
         let edit = crate::manifest::action::RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![committed.clone()],
             files_to_remove: Vec::new(),
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
@@ -2600,6 +2603,8 @@ mod tests {
 
     fn empty_edit() -> RegionEdit {
         RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: Vec::new(),
             files_to_remove: Vec::new(),
             timestamp_ms: None,
@@ -2637,6 +2642,8 @@ mod tests {
 
         let file_id = FileId::random();
         let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![crate::sst::file::FileMeta {
                 region_id: region.region_id,
                 file_id,

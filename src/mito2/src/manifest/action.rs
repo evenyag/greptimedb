@@ -85,6 +85,10 @@ pub struct RegionChange {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegionEdit {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series_indexes_to_add: Vec<FileMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series_indexes_to_remove: Vec<crate::sst::file::RegionFileId>,
     pub files_to_add: Vec<FileMeta>,
     pub files_to_remove: Vec<FileMeta>,
     /// event unix timestamp in milliseconds, help to determine file deletion time.
@@ -154,6 +158,56 @@ pub(crate) fn cap_wal_release(
 }
 
 impl RegionEdit {
+    /// Rechecked under the manifest lock before publication, after any concurrent compaction.
+    pub(crate) fn validate_native_series(&self, manifest: &RegionManifest) -> Result<()> {
+        let region_id = manifest.metadata.region_id;
+        snafu::ensure!(
+            self.files_to_add
+                .iter()
+                .all(|file| !matches!(file.format, file::FileFormat::NativeSeries(_))),
+            crate::error::InvalidRequestSnafu {
+                region_id,
+                reason: "Series indexes cannot be data SSTs"
+            }
+        );
+        let sources: HashSet<_> = manifest
+            .files
+            .values()
+            .chain(self.files_to_add.iter())
+            .filter(|file| {
+                matches!(file.format, file::FileFormat::Native(_))
+                    && !self
+                        .files_to_remove
+                        .iter()
+                        .any(|removed| removed.file_id() == file.file_id())
+            })
+            .map(|file| file.file_id())
+            .collect();
+        for file in &self.series_indexes_to_add {
+            let valid = matches!(&file.format, file::FileFormat::NativeSeries(index)
+                if !index.sources.is_empty() && index.sources.iter().all(|id| sources.contains(id))
+                    && index.sources.iter().collect::<HashSet<_>>().len() == index.sources.len());
+            snafu::ensure!(
+                valid
+                    && file.region_id.table_id() == region_id.table_id()
+                    && !manifest.files.contains_key(&file.file_id)
+                    && !self
+                        .files_to_add
+                        .iter()
+                        .any(|data| data.file_id == file.file_id)
+                    && manifest
+                        .series_indexes
+                        .get(&file.file_id)
+                        .is_none_or(|existing| existing == file),
+                crate::error::InvalidRequestSnafu {
+                    region_id,
+                    reason: "Stale native series coverage or conflicting immutable identity"
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// Shared reclassification must be add-only for a file ID: the manifest removes
     /// by ID, while the in-memory Version removes from the specified level.
     pub(crate) fn validate_shared_reclassification(&self, region_id: RegionId) -> Result<()> {
@@ -218,6 +272,8 @@ pub struct RegionManifest {
     pub metadata: RegionMetadataRef,
     /// SST files.
     pub files: HashMap<FileId, FileMeta>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub series_indexes: HashMap<FileId, FileMeta>,
     /// Removed files, which are not in the current manifest but may still be kept for a while.
     /// This is a list of (set of files, timestamp) pairs, where the timestamp is the time when
     /// the files are removed from manifest. The timestamp is in milliseconds since unix epoch.
@@ -263,6 +319,11 @@ pub struct RegionManifest {
 }
 
 impl RegionManifest {
+    /// Physical artifacts protected by this manifest, including optional series indexes.
+    pub(crate) fn all_files(&self) -> impl Iterator<Item = &FileMeta> {
+        self.files.values().chain(self.series_indexes.values())
+    }
+
     /// Returns the entry id after which node `node_id` replays its WAL when it opens
     /// the region. Entries up to it are flushed, left to the pending tails, or below
     /// the handoff floor of the node.
@@ -286,6 +347,7 @@ impl PartialEq for RegionManifest {
     fn eq(&self, other: &Self) -> bool {
         self.metadata == other.metadata
             && self.files == other.files
+            && self.series_indexes == other.series_indexes
             && self.flushed_entry_id == other.flushed_entry_id
             && self.flushed_sequence == other.flushed_sequence
             && self.manifest_version == other.manifest_version
@@ -310,6 +372,7 @@ impl RegionManifest {
 pub struct RegionManifestBuilder {
     metadata: Option<RegionMetadataRef>,
     files: HashMap<FileId, FileMeta>,
+    series_indexes: HashMap<FileId, FileMeta>,
     pub removed_files: RemovedFilesRecord,
     flushed_entry_id: EntryId,
     flushed_sequence: SequenceNumber,
@@ -339,6 +402,7 @@ impl RegionManifestBuilder {
             Self {
                 metadata: Some(s.metadata),
                 files: s.files,
+                series_indexes: s.series_indexes,
                 removed_files: s.removed_files,
                 flushed_entry_id: s.flushed_entry_id,
                 manifest_version: s.manifest_version,
@@ -391,6 +455,16 @@ impl RegionManifestBuilder {
         self.manifest_version = manifest_version;
 
         let mut removed_files = vec![];
+        for file in edit.series_indexes_to_add {
+            self.series_indexes.insert(file.file_id, file);
+        }
+        self.series_indexes.retain(|_, file| {
+            let retired = edit.series_indexes_to_remove.contains(&file.file_id())
+                || matches!(&file.format, crate::sst::file::FileFormat::NativeSeries(index)
+                    if index.sources.iter().any(|source| edit.files_to_remove.iter().any(|removed| removed.file_id() == *source)));
+            if retired { removed_files.push(RemovedFile::File(file.file_id, None)); }
+            !retired
+        });
         for file in edit.files_to_add {
             if let Some(old_file) = self.files.insert(file.file_id, file.clone())
                 && let Some(old_index) = old_file.index_version()
@@ -450,6 +524,7 @@ impl RegionManifestBuilder {
                 self.removed_files.add_removed_files(
                     self.files
                         .values()
+                        .chain(self.series_indexes.values())
                         .map(|f| RemovedFile::File(f.file_id, f.index_version()))
                         .collect(),
                     truncate
@@ -457,8 +532,22 @@ impl RegionManifestBuilder {
                         .unwrap_or_else(|| Utc::now().timestamp_millis()),
                 );
                 self.files.clear();
+                self.series_indexes.clear();
             }
             TruncateKind::Partial { files_to_remove } => {
+                let mut retired = vec![];
+                self.series_indexes.retain(|_, file| {
+                    let retire = matches!(&file.format, crate::sst::file::FileFormat::NativeSeries(index)
+                        if index.sources.iter().any(|source| files_to_remove.iter().any(|removed| removed.file_id() == *source)));
+                    if retire { retired.push(RemovedFile::File(file.file_id, None)); }
+                    !retire
+                });
+                self.removed_files.add_removed_files(
+                    retired,
+                    truncate
+                        .timestamp_ms
+                        .unwrap_or_else(|| Utc::now().timestamp_millis()),
+                );
                 // With GC disabled, VersionControl may still hold an older
                 // FileMeta and LocalFilePurger can miss a just-committed newer
                 // index generation. We accept this narrow local-mode orphan
@@ -497,6 +586,7 @@ impl RegionManifestBuilder {
         Ok(RegionManifest {
             metadata,
             files: self.files,
+            series_indexes: self.series_indexes,
             removed_files: self.removed_files,
             flushed_entry_id: self.flushed_entry_id,
             flushed_sequence: self.flushed_sequence,
@@ -695,6 +785,8 @@ impl RegionMetaActionList {
         RegionEdit,
     ) {
         let mut edit = RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: Vec::new(),
             files_to_remove: Vec::new(),
             timestamp_ms: None,
@@ -718,6 +810,10 @@ impl RegionMetaActionList {
                     // Merge file adds/removes
                     edit.files_to_add.extend(region_edit.files_to_add);
                     edit.files_to_remove.extend(region_edit.files_to_remove);
+                    edit.series_indexes_to_add
+                        .extend(region_edit.series_indexes_to_add);
+                    edit.series_indexes_to_remove
+                        .extend(region_edit.series_indexes_to_remove);
                     // Max of flushed entry id / sequence
                     if let Some(eid) = region_edit.flushed_entry_id {
                         edit.flushed_entry_id =
@@ -1079,6 +1175,7 @@ mod tests {
         let metadata: RegionMetadataRef =
             serde_json::from_str(region_metadata).expect("Failed to parse region metadata");
         let manifest = RegionManifest {
+            series_indexes: Default::default(),
             metadata: metadata.clone(),
             files: HashMap::new(),
             flushed_entry_id: 0,
@@ -1128,6 +1225,8 @@ mod tests {
         builder.apply_edit(
             1,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![current.clone()],
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,
@@ -1141,6 +1240,8 @@ mod tests {
         builder.apply_edit(
             2,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: Vec::new(),
                 files_to_remove: vec![stale.clone()],
                 timestamp_ms: Some(42),
@@ -1161,6 +1262,8 @@ mod tests {
         builder.apply_edit(
             1,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![current],
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,
@@ -1272,6 +1375,7 @@ mod tests {
         assert_eq!(
             new_from_old,
             RegionManifest {
+                series_indexes: Default::default(),
                 metadata: metadata.clone(),
                 files: HashMap::new(),
                 removed_files: Default::default(),
@@ -1289,6 +1393,7 @@ mod tests {
         );
 
         let new_manifest = RegionManifest {
+            series_indexes: Default::default(),
             metadata: metadata.clone(),
             files: HashMap::new(),
             removed_files: Default::default(),
@@ -1339,6 +1444,8 @@ mod tests {
         let new_from_old: RegionEdit = serde_json::from_str(&json).unwrap();
         assert_eq!(
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![],
                 files_to_remove: vec![],
                 timestamp_ms: None,
@@ -1353,6 +1460,8 @@ mod tests {
 
         // test new version with timestamp_ms set can deserialize to old version
         let new = RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![],
             files_to_remove: vec![],
             timestamp_ms: Some(42),
@@ -1536,6 +1645,8 @@ mod tests {
         wal_recovery: WalRecoveryEdit,
     ) -> RegionEdit {
         RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![],
             files_to_remove: vec![],
             timestamp_ms: None,
@@ -1690,6 +1801,62 @@ mod tests {
         assert_eq!(cap_wal_release(&tails, Some(1), 10), 10);
         assert_eq!(cap_wal_release(&tails, Some(3), 50), 50);
         assert_eq!(cap_wal_release(&tails, None, 50), 50);
+    }
+
+    #[test]
+    fn test_native_metric_manifest_fixture() {
+        let bytes = include_bytes!(
+            "../../../../tests/compatibility/manifest/native_metric_storage/delta.json"
+        );
+        let (_, _, edit) = RegionMetaActionList::decode(bytes)
+            .unwrap()
+            .split_region_change_and_edit();
+        let mut builder = manifest_builder();
+        edit.validate_native_series(&manifest_builder().try_build().unwrap())
+            .unwrap();
+        assert_eq!(edit.files_to_add.len(), 2);
+        assert_eq!(edit.series_indexes_to_add.len(), 1);
+        let index = edit.series_indexes_to_add[0].clone();
+        let first = edit.files_to_add[0].clone();
+        builder.apply_edit(1, edit);
+        let checkpoint = builder.try_build().unwrap();
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let restored = RegionManifest::decode(&encoded).unwrap();
+        assert_eq!(checkpoint, restored);
+        assert_eq!(restored.series_indexes[&index.file_id], index);
+        let mut builder = RegionManifestBuilder::with_checkpoint(Some(restored));
+        builder.apply_edit(
+            2,
+            RegionEdit {
+                files_to_remove: vec![first],
+                ..Default::default()
+            },
+        );
+        let replaced = builder.try_build().unwrap();
+        assert_eq!(replaced.files.len(), 1);
+        assert!(replaced.series_indexes.is_empty());
+        assert_eq!(checkpoint.series_indexes.len(), 1);
+        assert!(
+            RegionEdit {
+                series_indexes_to_add: vec![index],
+                ..Default::default()
+            }
+            .validate_native_series(&replaced)
+            .is_err()
+        );
+        let legacy = include_bytes!(
+            "../../../../tests/compatibility/manifest/table_compaction/legacy-edit.json"
+        );
+        let (_, _, legacy) = RegionMetaActionList::decode(legacy)
+            .unwrap()
+            .split_region_change_and_edit();
+        assert!(
+            legacy
+                .files_to_add
+                .iter()
+                .all(|file| matches!(file.format, file::FileFormat::Parquet))
+        );
+        assert!(legacy.series_indexes_to_add.is_empty());
     }
 
     const PENDING_TAILS_DELTA: &str =

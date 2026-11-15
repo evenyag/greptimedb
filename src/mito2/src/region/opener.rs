@@ -382,7 +382,7 @@ impl RegionOpener {
             FormatType::PrimaryKey
         };
         ensure_json2_uses_flat_format(&metadata, &options)?;
-        options.validate_column_compression(&metadata)?;
+        options.validate_schema(&metadata)?;
         // The region's WAL history starts in this log store, so reopening
         // the region on it passes the history check without any entry. It is
         // recorded before the manifest exists: a log store that gave up its
@@ -559,7 +559,7 @@ impl RegionOpener {
         // Updates the region options with the manifest.
         sanitize_region_options(&manifest, &mut region_options);
         ensure_json2_uses_flat_format(&metadata, &region_options)?;
-        region_options.validate_column_compression(&metadata)?;
+        region_options.validate_schema(&metadata)?;
 
         let region_id = self.region_id;
         let provider = self.provider::<S>(&region_options.wal_options)?;
@@ -813,6 +813,10 @@ pub(crate) fn version_builder_from_manifest(
     region_options: RegionOptions,
 ) -> VersionBuilder {
     VersionBuilder::new(metadata, mutable)
+        .add_series_indexes(
+            file_purger.clone(),
+            manifest.series_indexes.values().cloned(),
+        )
         .add_files(file_purger, manifest.files.values().cloned())
         .flushed_entry_id(manifest.flushed_entry_id)
         .flushed_sequence(manifest.flushed_sequence)
@@ -835,7 +839,9 @@ pub(crate) fn sanitize_region_options(manifest: &RegionManifest, options: &mut R
         );
     }
     options.primary_key_encoding = Some(manifest.metadata.primary_key_encoding);
-    if manifest.metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse {
+    if manifest.metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse
+        && options.sst_format.unwrap_or(manifest.sst_format) != FormatType::Native
+    {
         options.sst_format = Some(FormatType::Flat);
     }
     // Caller options take precedence over the manifest, except JSON2 always requires flat output.
@@ -1538,6 +1544,7 @@ mod tests {
 
     fn build_test_manifest(sst_format: FormatType) -> RegionManifest {
         RegionManifest {
+            series_indexes: Default::default(),
             metadata: Arc::new(sst_region_metadata()),
             files: HashMap::new(),
             removed_files: RemovedFilesRecord::default(),

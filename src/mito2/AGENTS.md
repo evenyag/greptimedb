@@ -86,6 +86,14 @@ pending. DDL cancellation retains its existing scheduling fence and priority.
   `tests/compatibility/manifest/table_compaction/` and
   `tests/compatibility/manifest/pending_tails/`.
 - **SST/Parquet layout** (`sst/`): readers must stay compatible with existing files.
+- **Native storage PoC**: `sst_format=native` makes samples authoritative SSTs
+  (`sst/native.rs`), with native bulk parts, SeriesScan queries and SeqScan
+  compaction. `FileMeta::format` carries native object inventories; manifest and
+  `SstVersion` also own optional immutable series indexes. Replacing any covered
+  samples retires the whole index. Coverage does not own samples: readers pin
+  samples and indexes independently through ordinary file references. Native
+  artifacts use `native/<FileId>/` and must never use local sidecar eviction.
+  Metadata fixture: `tests/compatibility/manifest/native_metric_storage/`.
 - **Series-index disk limit**: tasks estimate usage from entry sizes in open-region snapshots
   and defer new builds when the shared estimate is full. Cleanup still prunes obsolete
   range entries and expires series indexes to reclaim published usage. Concurrent builds may

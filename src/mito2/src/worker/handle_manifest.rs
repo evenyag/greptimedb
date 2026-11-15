@@ -115,6 +115,8 @@ impl RegionEditQueue {
             // be noticed for editing region.
             edit.files_to_add.iter().all(|f| f.sequence.is_none())
                 && edit.files_to_remove.is_empty()
+                && edit.series_indexes_to_add.is_empty()
+                && edit.series_indexes_to_remove.is_empty()
                 && edit.timestamp_ms.is_none()
                 && edit.compaction_time_window.is_none()
                 && edit.flushed_entry_id.is_none()
@@ -705,6 +707,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             // WAL after a restart skips everything the memtables held. The WAL must be
             // durable through that entry before the manifest names it.
             let edit = RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: Vec::new(),
                 files_to_remove: Vec::new(),
                 timestamp_ms: None,
@@ -827,6 +831,66 @@ fn prepare_region_edit(region: &MitoRegionRef, edit: &mut RegionEdit) -> Result<
     let region_id = region.region_id;
     edit.validate_shared_reclassification(region_id)?;
     let current = region.version_control.current();
+    for file in edit
+        .files_to_add
+        .iter()
+        .chain(edit.series_indexes_to_add.iter())
+    {
+        crate::sst::native::validate_inventory(&region.access_layer, file)?;
+    }
+    snafu::ensure!(
+        edit.files_to_add
+            .iter()
+            .all(|file| !matches!(file.format, file::FileFormat::NativeSeries(_))),
+        crate::error::InvalidRequestSnafu {
+            region_id,
+            reason: "Series indexes cannot be data SSTs"
+        }
+    );
+    let sources: std::collections::HashSet<_> = current
+        .version
+        .ssts
+        .levels()
+        .iter()
+        .flat_map(|level| level.files.values().map(|file| file.meta_ref()))
+        .chain(edit.files_to_add.iter())
+        .filter(|file| {
+            matches!(file.format, file::FileFormat::Native(_))
+                && !edit
+                    .files_to_remove
+                    .iter()
+                    .any(|removed| removed.file_id() == file.file_id())
+        })
+        .map(|file| file.file_id())
+        .collect();
+    for file in &edit.series_indexes_to_add {
+        let valid = matches!(&file.format, file::FileFormat::NativeSeries(index)
+            if !index.sources.is_empty() && index.sources.iter().all(|id| sources.contains(id)));
+        snafu::ensure!(
+            valid
+                && file.region_id.table_id() == region_id.table_id()
+                && !current
+                    .version
+                    .ssts
+                    .levels()
+                    .iter()
+                    .any(|level| level.files.contains_key(&file.file_id))
+                && !edit
+                    .files_to_add
+                    .iter()
+                    .any(|data| data.file_id == file.file_id)
+                && current
+                    .version
+                    .ssts
+                    .series_indexes()
+                    .get(&file.file_id)
+                    .is_none_or(|existing| existing.meta_ref() == file),
+            crate::error::InvalidRequestSnafu {
+                region_id,
+                reason: "Invalid native series coverage or immutable identity"
+            }
+        );
+    }
     let shared = &current.version.ssts.levels()[file::SHARED_LEVEL_SLOT].files;
     // Shared adoption is L0-only. The manifest is keyed by FileId and would
     // replace an existing reference, but installing a shared handle detaches
@@ -885,7 +949,7 @@ fn prepare_region_edit(region: &MitoRegionRef, edit: &mut RegionEdit) -> Result<
             .iter()
             .all(|file| existing_sequence(file).is_some());
     let sequence =
-        if same_import {
+        if same_import || (edit.files_to_add.is_empty() && edit.files_to_remove.is_empty()) {
             None
         } else {
             let sequence = current.last_sequence.checked_add(1).context(
@@ -898,6 +962,9 @@ fn prepare_region_edit(region: &MitoRegionRef, edit: &mut RegionEdit) -> Result<
             NonZeroU64::new(sequence)
         };
     for file in &mut edit.files_to_add {
+        if let file::FileFormat::Native(native) = &mut file.format {
+            native.use_file_sequence = true;
+        }
         file.sequence = existing_sequence(file).or(sequence);
         file.preserve_row_sequence = false;
     }
@@ -914,10 +981,40 @@ async fn edit_region(
     preload_sst_cache: bool,
 ) -> Result<()> {
     let region_id = region.region_id;
+    for samples in &edit.files_to_add {
+        if matches!(samples.format, file::FileFormat::Native(_)) {
+            use crate::series_index::format::SamplesFormatReader;
+            let handle = file::FileHandle::new(samples.clone(), region.file_purger.clone());
+            let handle = crate::series_index::artifact::SamplesFileHandle::from_native(handle)?;
+            let reader = crate::series_index::samples::reader::SamplesReader::open(
+                region.access_layer.object_store().clone(),
+                handle,
+            )
+            .await?;
+            crate::series_index::format::validate_sample_schema(
+                &reader.schema(),
+                &region.metadata(),
+            )?;
+        }
+    }
+    for index in &edit.series_indexes_to_add {
+        let handle = file::FileHandle::new(index.clone(), region.file_purger.clone());
+        let handle = crate::series_index::SeriesIndexFileHandle::from_native(handle)?;
+        use crate::series_index::format::FormatReader;
+        let reader = crate::series_index::columnar::reader::ColumnarReader::open(
+            region.access_layer.object_store().clone(),
+            handle,
+        )
+        .await?;
+        crate::series_index::format::validate_series_schema(&reader.schema(), &region.metadata())?;
+    }
     if let Some(write_cache) = cache_manager.write_cache()
         && preload_sst_cache
     {
         for file_meta in &edit.files_to_add {
+            if matches!(file_meta.format, file::FileFormat::Native(_)) {
+                continue;
+            }
             let write_cache = write_cache.clone();
             let layer = region.access_layer.clone();
             let listener = listener.clone();

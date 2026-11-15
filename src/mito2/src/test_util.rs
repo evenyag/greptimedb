@@ -98,6 +98,8 @@ use crate::worker::WorkerGroup;
 /// Returns a manifest action list with one empty edit.
 pub(crate) fn nop_action() -> RegionMetaActionList {
     RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![],
         files_to_remove: vec![],
         timestamp_ms: None,
@@ -442,6 +444,12 @@ impl TestEnv {
     /// Sets the node identity used by engines created in this environment.
     pub fn with_node_id(mut self, node_id: u64) -> Self {
         self.file_ref_manager = Arc::new(FileReferenceManager::new(Some(node_id)));
+        self
+    }
+
+    /// Sets reference tracking and GC mode for engines created in this environment.
+    pub(crate) fn with_file_ref_manager(mut self, manager: FileReferenceManagerRef) -> Self {
+        self.file_ref_manager = manager;
         self
     }
 

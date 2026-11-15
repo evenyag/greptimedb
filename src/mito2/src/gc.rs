@@ -544,16 +544,15 @@ impl LocalGcWorker {
             .map(|s| s.len())
             .sum::<usize>();
 
-        let current_files = manifest.as_ref().map(|m| &m.files);
-
-        let in_manifest = if let Some(current_files) = current_files {
-            current_files
-                .iter()
-                .map(|(file_id, meta)| (*file_id, meta.index_version()))
-                .collect::<HashMap<_, _>>()
-        } else {
-            Default::default()
-        };
+        let in_manifest = manifest
+            .as_ref()
+            .map(|manifest| {
+                manifest
+                    .all_files()
+                    .map(|file| (file.file_id, file.index_version()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         let is_region_dropped = region.is_none();
 
@@ -593,7 +592,7 @@ impl LocalGcWorker {
             } else {
                 ""
             },
-            current_files.map(|c| c.len()).unwrap_or(0),
+            in_manifest.len(),
             tmp_ref_files.len(),
             removed_file_cnt,
             deletable_files.len(),
@@ -874,6 +873,26 @@ impl LocalGcWorker {
             })?;
         let index_cnt = index_entries.len();
         all_entries.extend(index_entries);
+        // Native artifacts consist of a manifest and parts below one immutable ID.
+        let native_dir = format!("{}native/", self.access_layer.build_region_dir(region_id));
+        let listing = self
+            .access_layer
+            .object_store()
+            .lister_with(&native_dir)
+            .recursive(true)
+            .await;
+        match listing {
+            Ok(mut lister) => {
+                while let Some(entry) = lister.next().await {
+                    let entry = entry.context(OpenDalSnafu)?;
+                    if entry.metadata().is_file() {
+                        all_entries.push(entry);
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context(OpenDalSnafu),
+        }
         info!(
             "gc: full listing mode cost {} secs using {lister_cnt} lister for root={root_cnt} index={index_cnt} files in region {}.",
             start.elapsed().as_secs_f64(),
@@ -1020,7 +1039,34 @@ impl LocalGcWorker {
                 acc
             });
 
+        // Every listed object must be eligible before deleting an artifact. In
+        // particular, an old part cannot bypass a younger manifest's grace period.
+        let mut native_eligibility: HashMap<FileId, bool> = HashMap::new();
         for entry in entries {
+            if let Some(file_id) = crate::sst::native::file_id_from_path(entry.path()) {
+                let in_manifest = in_manifest.contains_key(&file_id);
+                let in_tmp_ref = referenced_ssts.contains(&file_id);
+                let linger = may_linger_files.contains_key(&file_id);
+                let eligible = eligible_for_delete.contains_key(&file_id);
+                deferred_unknown |= is_deferred_unknown_file(
+                    in_manifest,
+                    in_tmp_ref,
+                    linger,
+                    eligible,
+                    &entry,
+                    unknown_file_may_linger_until,
+                );
+                let delete = should_delete_file(
+                    in_manifest,
+                    in_tmp_ref,
+                    linger,
+                    eligible,
+                    &entry,
+                    unknown_file_may_linger_until,
+                );
+                *native_eligibility.entry(file_id).or_insert(true) &= delete;
+                continue;
+            }
             if entry.name() == DROPPING_MARKER_FILE {
                 continue;
             }
@@ -1106,6 +1152,11 @@ impl LocalGcWorker {
                 ready_for_delete.push(removed_file);
             }
         }
+        ready_for_delete.extend(
+            native_eligibility
+                .into_iter()
+                .filter_map(|(id, eligible)| eligible.then_some(RemovedFile::File(id, None))),
+        );
         (ready_for_delete, deferred_unknown)
     }
 

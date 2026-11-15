@@ -118,6 +118,8 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
             let files_to_add = staging_manifest.files.values().cloned().collect::<Vec<_>>();
             let edit = RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add,
                 files_to_remove: vec![],
                 timestamp_ms: Some(Utc::now().timestamp_millis()),

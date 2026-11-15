@@ -854,6 +854,8 @@ async fn test_apply_staging_manifest_change_edit_different_columns_fails_with_fo
                     append_mode: None,
                 }),
                 RegionMetaAction::Edit(RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: Vec::new(),
                     files_to_remove: Vec::new(),
                     timestamp_ms: None,

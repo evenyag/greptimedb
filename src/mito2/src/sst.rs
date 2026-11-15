@@ -46,6 +46,7 @@ pub mod file_purger;
 pub mod file_ref;
 pub mod index;
 pub mod location;
+pub(crate) mod native;
 pub mod parquet;
 pub(crate) mod primary_key;
 pub mod range_index;
@@ -67,6 +68,8 @@ pub enum FormatType {
     PrimaryKey,
     /// Flat Parquet format.
     Flat,
+    /// Native samples and optional series indexes.
+    Native,
 }
 
 /// Iceberg-compatible column field ID key stored in Parquet column metadata.

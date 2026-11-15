@@ -340,6 +340,12 @@ impl WriteCache {
                     )
                     .await?
             }
+            crate::sst::FormatType::Native => {
+                return crate::error::UnsupportedOperationSnafu {
+                    err_msg: "native writer bypasses Parquet write cache",
+                }
+                .fail();
+            }
             crate::sst::FormatType::Flat => {
                 writer
                     .write_all_flat(write_request.source, override_sequence, write_opts)

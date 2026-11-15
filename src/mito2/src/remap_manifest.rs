@@ -105,6 +105,7 @@ impl RemapManifest {
             new_metadata.set_partition_expr(Some(new_partition_expr));
 
             let manifest = RegionManifest {
+                series_indexes: Default::default(),
                 metadata: Arc::new(new_metadata),
                 files: HashMap::new(),
                 removed_files: RemovedFilesRecord::default(),
@@ -458,6 +459,7 @@ mod tests {
         }
 
         RegionManifest {
+            series_indexes: Default::default(),
             metadata: create_region_metadata(region_id),
             files,
             removed_files: RemovedFilesRecord::default(),

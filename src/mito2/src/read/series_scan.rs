@@ -17,6 +17,8 @@
 mod prepared;
 mod raw;
 
+pub(crate) use prepared::read_native_file;
+
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -207,7 +209,14 @@ pub struct SeriesScan {
 impl SeriesScan {
     /// Creates a new [SeriesScan].
     pub(crate) fn new(input: ScanInput, experimental_series_scan_v2: bool) -> Self {
-        let mode = if experimental_series_scan_v2 && Self::supports_two_phase(&input) {
+        let mode = if experimental_series_scan_v2
+            && Self::supports_two_phase(&input)
+            && !input.files.iter().any(|file| {
+                matches!(
+                    file.meta_ref().format,
+                    crate::sst::file::FileFormat::Native(_)
+                )
+            }) {
             SeriesScanMode::TwoPhase
         } else {
             SeriesScanMode::Legacy

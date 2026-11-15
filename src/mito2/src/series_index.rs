@@ -59,6 +59,8 @@ pub(crate) use crate::series_index::catalog::{
 pub(crate) use crate::series_index::purger::{IndexFilePurger, series_index_channel};
 pub use crate::series_index::searcher::SeriesIndexSearcher;
 pub(crate) use crate::series_index::task::{SeriesIndexTaskState, spawn_series_index_tasks};
+#[cfg(any(test, feature = "test"))]
+pub(crate) use crate::series_index::version::native_series_entry;
 pub(crate) use crate::series_index::version::{
     SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl,
 };

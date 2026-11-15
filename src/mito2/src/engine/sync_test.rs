@@ -203,6 +203,8 @@ async fn test_sync_after_flush_region_with_format(flat_format: bool) {
         .edit_region(
             region_id,
             crate::manifest::action::RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![file],
                 files_to_remove: vec![],
                 timestamp_ms: None,

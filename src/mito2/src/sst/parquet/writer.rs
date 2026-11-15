@@ -466,6 +466,7 @@ where
                 .unwrap_or(0);
             let num_series = stats.series_estimator.finish();
             ssts.push(SstInfo {
+                format: Default::default(),
                 file_id: self.current_file,
                 time_range,
                 file_size,
@@ -956,6 +957,7 @@ mod tests {
         let batch = new_record_batch_by_range(&["a", "b"], 0, 4);
         let retained_field = Arc::downgrade(batch.column(2));
         let converter = match format {
+            FormatType::Native => panic!("Parquet codec test"),
             FormatType::Flat => FlatBatchConverter::Flat(FlatWriteFormat::new(
                 metadata.clone(),
                 &FlatSchemaOptions::default(),
@@ -1023,6 +1025,7 @@ mod tests {
         let mut write = Box::pin(async {
             let _budget = budget;
             match format {
+                FormatType::Native => panic!("Parquet codec test"),
                 FormatType::Flat => writer.write_all_flat(source, None, &opts).await,
                 FormatType::PrimaryKey => {
                     writer

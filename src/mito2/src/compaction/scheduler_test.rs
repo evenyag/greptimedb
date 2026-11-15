@@ -1187,6 +1187,8 @@ async fn test_pick_result_refreshes_replaced_selected_file() {
     replacement.index_file_size = 128;
     version_control.apply_edit(
         Some(crate::manifest::action::RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: vec![replacement],
             files_to_remove: Vec::new(),
             timestamp_ms: None,
@@ -3355,6 +3357,8 @@ async fn test_compaction_tasks_partial_memory_admission() {
         .collect();
     version.apply_edit(
         Some(crate::manifest::action::RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add,
             files_to_remove: Vec::new(),
             timestamp_ms: None,

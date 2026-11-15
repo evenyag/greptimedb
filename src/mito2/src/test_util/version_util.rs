@@ -219,6 +219,8 @@ pub(crate) fn apply_edit(
 
     version_control.apply_edit(
         Some(RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add,
             files_to_remove: files_to_remove.to_vec(),
             timestamp_ms: None,

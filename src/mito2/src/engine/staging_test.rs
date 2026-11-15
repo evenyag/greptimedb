@@ -762,6 +762,8 @@ async fn test_staging_exit_success_with_manifests_with_format(flat_format: bool)
             .edit_region(
                 region_id,
                 RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![file],
                     files_to_remove: vec![],
                     timestamp_ms: None,
@@ -901,6 +903,8 @@ async fn test_staging_exit_success_with_manifests_with_format(flat_format: bool)
                 .await
                 .update(
                     RegionMetaActionList::new(vec![RegionMetaAction::Edit(RegionEdit {
+                        series_indexes_to_add: Vec::new(),
+                        series_indexes_to_remove: Vec::new(),
                         files_to_add: vec![metadata.clone()],
                         files_to_remove: vec![],
                         timestamp_ms: None,
@@ -1142,6 +1146,8 @@ async fn test_staging_exit_conflict_partition_expr_change_and_change_with_format
                     append_mode: None,
                 }),
                 RegionMetaAction::Edit(RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: Vec::new(),
                     files_to_remove: Vec::new(),
                     timestamp_ms: None,
@@ -1623,6 +1629,8 @@ async fn first_file(region: &MitoRegionRef) -> FileMeta {
 
 fn edit_adding(file: FileMeta) -> RegionEdit {
     RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![file],
         files_to_remove: vec![],
         timestamp_ms: None,
@@ -1983,6 +1991,8 @@ async fn test_successful_staging_end_keeps_rows_of_rejected_flush() {
         .edit_region(
             region_id,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![imported_file],
                 files_to_remove: vec![],
                 timestamp_ms: None,
@@ -2408,6 +2418,8 @@ async fn test_close_after_end_of_staging_is_queued_keeps_committed_result() {
         .edit_region(
             region_id,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![file],
                 files_to_remove: vec![],
                 timestamp_ms: None,

@@ -119,6 +119,8 @@ async fn test_edit_region_schedule_compaction_with_format(
     assert_eq!(initial_time, initial_schedule_time);
 
     let new_edit = |file_starts: &[i64]| RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: file_starts
             .iter()
             .map(|start| FileMeta {
@@ -260,6 +262,8 @@ async fn test_edit_region_fill_cache(
         .await
         .unwrap();
     let edit = RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![meta],
         files_to_remove: vec![],
         timestamp_ms: None,
@@ -765,6 +769,8 @@ async fn wait_worker_recv_event(rx: &mut mpsc::UnboundedReceiver<usize>) {
 
 fn test_region_edit(region_id: RegionId, file_id: FileId) -> RegionEdit {
     RegionEdit {
+        series_indexes_to_add: Vec::new(),
+        series_indexes_to_remove: Vec::new(),
         files_to_add: vec![FileMeta {
             region_id,
             file_id,
@@ -860,6 +866,8 @@ async fn test_edit_region_concurrently_with_format(flat_format: bool) {
         async fn edit_region(self, engine: MitoEngine) {
             for sst in self.ssts {
                 let edit = RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![sst],
                     files_to_remove: vec![],
                     timestamp_ms: None,

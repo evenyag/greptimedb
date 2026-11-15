@@ -107,6 +107,8 @@ async fn get_snapshot_preserves_related_region_old_index_readers() {
         .update_manifest(
             RegionLeaderState::Writable,
             RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![meta.clone()],
                 files_to_remove: vec![],
                 timestamp_ms: None,
@@ -213,6 +215,8 @@ async fn get_snapshot_preserves_old_index_readers_until_release(
         .update_manifest(
             RegionLeaderState::Writable,
             RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![current_meta],
                 files_to_remove: vec![],
                 timestamp_ms: None,

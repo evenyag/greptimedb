@@ -68,6 +68,14 @@ impl PartitionPruner {
                     .is_file_range_index(*row_group_index)
                 {
                     let file_index = row_group_index.index - num_memtables;
+                    if matches!(
+                        pruner.inner.stream_ctx.input.files[file_index]
+                            .meta_ref()
+                            .format,
+                        crate::sst::file::FileFormat::Native(_)
+                    ) {
+                        continue;
+                    }
                     if dedup_set.contains(&file_index) {
                         continue;
                     } else {
@@ -85,6 +93,11 @@ impl PartitionPruner {
             pre_filter_modes,
             current_position: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn finish_native_range(&self, index: RowGroupIndex) {
+        self.pruner
+            .skip_file_range(index, &mut ReaderMetrics::default());
     }
 
     /// Excludes files replaced by another candidate source from prefetching.

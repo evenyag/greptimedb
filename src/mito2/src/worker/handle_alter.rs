@@ -243,7 +243,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             sender.send(Err(e));
             return;
         }
-        if let Err(e) = options.validate_column_compression(&new_meta) {
+        if let Err(e) = options.validate_schema(&new_meta) {
             sender.send(Err(e));
             return;
         }
@@ -412,15 +412,13 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             }
             .build()
         })?;
-        candidate
-            .validate_column_compression(&version.metadata)
-            .map_err(|e| {
-                store_api::metadata::InvalidRegionRequestSnafu {
-                    region_id: region.region_id,
-                    err: e.to_string(),
-                }
-                .build()
-            })?;
+        candidate.validate_schema(&version.metadata).map_err(|e| {
+            store_api::metadata::InvalidRegionRequestSnafu {
+                region_id: region.region_id,
+                err: e.to_string(),
+            }
+            .build()
+        })?;
         if all_options_altered {
             region.version_control.alter_options(candidate);
             Ok(None)

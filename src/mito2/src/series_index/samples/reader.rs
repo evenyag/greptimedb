@@ -114,10 +114,7 @@ impl SamplesReader {
             handle.file_id().file_id() == entry.file_id,
             "samples source handle mismatch",
         )?;
-        let path = format!(
-            "{}manifest.json",
-            crate::series_index::samples::samples_prefix(region, artifact.generation)
-        );
+        let path = handle.manifest_path();
         let mut objects = HashMap::new();
         for object in &artifact.objects {
             require(
@@ -137,11 +134,16 @@ impl SamplesReader {
         let bytes = read_range(&store, &path, 0, length).await?;
         // A manifest that the current format cannot read predates exact identity or is
         // corrupt; either way it must never be reused.
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
             invalid(format!(
                 "samples manifest is not readable; rebuild the artifact: {error}"
             ))
         })?;
+        manifest.prefix = Some(
+            path.strip_suffix("manifest.json")
+                .ok_or_else(|| invalid("invalid native manifest path"))?
+                .to_string(),
+        );
         if manifest.version != VERSION {
             return Err(unsupported("samples manifest version"));
         }

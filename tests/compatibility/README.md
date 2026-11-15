@@ -31,6 +31,11 @@ Frozen objects of the object store WAL are checked byte for byte by the format t
 
 ## Manifest fixtures
 
+[Native metric-storage fixtures](manifest/native_metric_storage/README.md) cover
+samples and series-index metadata, checkpoint replay, coverage retirement and
+legacy Parquet defaults. They exercise the opt-in PoC's supported reader, not
+downgrade compatibility with binaries that predate native storage.
+
 [Table-compaction fixtures](manifest/table_compaction/README.md) are exercised by
 mito2's Rust tests. They cover ordinary file-edit compatibility, supported SST
 levels, and explicit rejection of unpublished prototype task-state records.

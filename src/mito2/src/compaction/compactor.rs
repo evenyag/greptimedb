@@ -443,6 +443,8 @@ impl CompactionContext {
         merge_output: MergeOutput,
     ) -> Result<(RegionEdit, ManifestVersion)> {
         let edit = RegionEdit {
+            series_indexes_to_add: Vec::new(),
+            series_indexes_to_remove: Vec::new(),
             files_to_add: merge_output.files_to_add,
             files_to_remove: merge_output.files_to_remove,
             timestamp_ms: Some(chrono::Utc::now().timestamp_millis()),
@@ -489,6 +491,7 @@ impl CompactionContext {
 /// `num_rows` may read `0` for legacy `FileMeta`s where the count is unknown.
 fn sst_info_from_file_meta(meta: &FileMeta) -> SstInfo {
     SstInfo {
+        format: meta.format.clone(),
         file_id: meta.file_id,
         time_range: meta.time_range,
         file_size: meta.file_size,
@@ -662,7 +665,11 @@ impl SstMerger for DefaultSstMerger {
                     // their effective sequences here could promote old rows above
                     // versions in SSTs that were not part of this merge.
                     max_sequence: None,
-                    sst_write_format: if flat_format {
+                    sst_write_format: if context.region_options.sst_format
+                        == Some(FormatType::Native)
+                    {
+                        FormatType::Native
+                    } else if flat_format {
                         FormatType::Flat
                     } else {
                         FormatType::PrimaryKey
@@ -702,6 +709,7 @@ impl SstMerger for DefaultSstMerger {
                 };
 
                 Ok(FileMeta {
+                    format: sst_info.format.clone(),
                     region_id,
                     file_id: sst_info.file_id,
                     time_range: sst_info.time_range,
@@ -1139,6 +1147,8 @@ mod tests {
                 .await
                 .update(
                     RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                        series_indexes_to_add: Vec::new(),
+                        series_indexes_to_remove: Vec::new(),
                         committed_sequence: Some(committed_sequence),
                         files_to_add: vec![],
                         files_to_remove: vec![],

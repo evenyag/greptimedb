@@ -1221,6 +1221,7 @@ impl IndexBuildTask {
                 upload_tracker
                     .clean(
                         &[SstInfo {
+                            format: Default::default(),
                             file_id,
                             index_metadata: output,
                             ..Default::default()
@@ -1696,6 +1697,8 @@ mod tests {
             .update_manifest(
                 RegionLeaderState::Writable,
                 RegionMetaActionList::with_action(RegionMetaAction::Edit(RegionEdit {
+                    series_indexes_to_add: Vec::new(),
+                    series_indexes_to_remove: Vec::new(),
                     files_to_add: vec![file_meta.clone()],
                     files_to_remove: Vec::new(),
                     timestamp_ms: None,

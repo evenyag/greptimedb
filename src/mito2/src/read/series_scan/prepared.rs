@@ -1005,10 +1005,14 @@ fn sample_to_flat(
                         Arc::new(StringArray::from(vec![value.as_deref(); batch.num_rows()]))
                     }
                 } else {
-                    batch
-                        .column_by_name(name)
-                        .ok_or_else(|| invalid("missing sample field"))?
-                        .clone()
+                    match batch.column_by_name(name) {
+                        Some(array) => array.clone(),
+                        None if field.is_nullable() => datatypes::arrow::array::new_null_array(
+                            field.data_type(),
+                            batch.num_rows(),
+                        ),
+                        None => return Err(invalid("missing non-null sample field")),
+                    }
                 }
             }
         };
@@ -1134,4 +1138,168 @@ fn sample_projection(
         })
         .map(|(_, field)| field.name().clone())
         .collect()
+}
+
+/// Reads an authoritative samples SST through the existing flat merge pipeline.
+/// Key discovery is implicit when no series-index selection is supplied.
+pub(crate) async fn read_native_file(
+    context: Arc<StreamContext>,
+    file: crate::sst::file::FileHandle,
+) -> Result<BoxedRecordBatchStream> {
+    use crate::series_index::artifact::SamplesFileHandle;
+    use mito_codec::row_converter::sparse::SparsePrimaryKeyCodec;
+    use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
+    let selected_keys = native_series_selection(&context, &file).await?;
+    let handle = SamplesFileHandle::from_native(file.clone())?;
+    let reader = crate::series_index::samples::reader::SamplesReader::open(
+        context.input.access_layer.object_store().clone(),
+        handle,
+    )
+    .await?;
+    let schema = context
+        .input
+        .mapper
+        .input_arrow_schema(context.input.compaction);
+    let projection = sample_projection(&reader.schema(), &context);
+    // Apply only key/time predicates before merging. Field predicates remain residuals,
+    // otherwise an older matching value could replace a newer nonmatching value.
+    let filters = context
+        .input
+        .predicate_for_file(&file)
+        .into_iter()
+        .flat_map(|predicate| predicate.exprs().to_vec())
+        .filter(|expr| {
+            expr.column_refs().iter().all(|col| {
+                context
+                    .input
+                    .region_metadata()
+                    .column_by_name(&col.name)
+                    .is_some_and(|c| c.semantic_type != SemanticType::Field)
+            })
+        })
+        .map(|expr| Predicate::to_physical_expr(&expr, &schema).map_err(|e| invalid(e.to_string())))
+        .collect::<Result<Vec<_>>>()?;
+    let stream = async_stream::try_stream! {
+        let mut batches = reader.read(SamplesReadRequest { projection, keys: selected_keys, ..Default::default() })?;
+        let codec = SparsePrimaryKeyCodec::schemaless();
+        while let Some(samples) = batches.try_next().await? {
+            let CompositeValues::Sparse(values) = codec.decode(samples.key.bytes())
+                .context(crate::error::DecodeSnafu)? else {
+                Err(invalid("native samples require sparse keys"))?;
+                continue;
+            };
+            let tags = context.input.region_metadata().primary_key_columns()
+                .map(|column| {
+                    let value = match values.get_or_null(column.column_id) {
+                        Value::String(value) => Some(value.as_utf8().to_string()),
+                        _ => None,
+                    };
+                    (column.column_id, value)
+                }).collect();
+            let key = Buffer::from(samples.key.bytes());
+            let candidate = Candidate { id: samples.key.id(), key: key.clone(),
+                merge_key: key, tags, metric: None };
+            let mut batch = sample_to_flat(samples.batch, &candidate, &context, Some(&schema))?;
+            if matches!(&file.meta_ref().format, crate::sst::file::FileFormat::Native(native) if native.use_file_sequence)
+                && let Some(sequence) = file.meta_ref().sequence
+            {
+                let mut arrays = batch.columns().to_vec();
+                let index = batch.schema().index_of(SEQUENCE_COLUMN_NAME)
+                    .map_err(|e| invalid(e.to_string()))?;
+                arrays[index] = Arc::new(UInt64Array::from(vec![sequence.get(); batch.num_rows()]));
+                batch = RecordBatch::try_new(batch.schema(), arrays).context(NewRecordBatchSnafu)?;
+            }
+            batch = filter_visibility(batch, &context)?;
+            for filter in &filters {
+                let predicate = filter.evaluate(&batch).map_err(|e| invalid(e.to_string()))?
+                    .into_array(batch.num_rows()).map_err(|e| invalid(e.to_string()))?;
+                let predicate = predicate.as_any().downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| invalid("native predicate is not boolean"))?;
+                batch = filter_record_batch(&batch, predicate).context(ComputeArrowSnafu)?;
+            }
+            if batch.num_rows() > 0 { yield batch; }
+        }
+    };
+    Ok(Box::pin(stream))
+}
+
+/// Use an immutable index only when its complete source set is present in this scan.
+async fn native_series_selection(
+    context: &StreamContext,
+    file: &crate::sst::file::FileHandle,
+) -> Result<Option<std::collections::BTreeSet<ExactSeriesKey>>> {
+    use crate::series_index::format::FormatReader;
+    if context.input.compaction {
+        return Ok(None);
+    }
+    let Some(index) = context.input.native_series_indexes.iter().find(|index| {
+        matches!(&index.meta_ref().format, crate::sst::file::FileFormat::NativeSeries(meta)
+            if meta.sources.contains(&file.file_id()) && meta.sources.iter().all(|source|
+                context.input.files.iter().any(|file| file.file_id() == *source)))
+    }) else {
+        return Ok(None);
+    };
+    let reader = crate::series_index::columnar::reader::ColumnarReader::open(
+        context.input.access_layer.object_store().clone(),
+        crate::series_index::SeriesIndexFileHandle::from_native(index.clone())?,
+    )
+    .await?;
+    let schema = reader.schema();
+    format::validate_series_schema(&schema, context.input.region_metadata())?;
+    let conjuncts = predicate_conjuncts(context.input.predicate_group().predicate());
+    let (request, _) = series_read_request(&schema, &conjuncts);
+    let mut tags = schema
+        .fields()
+        .iter()
+        .skip(3)
+        .map(|field| Ok((format::field_id(field)?, field.name().clone())))
+        .collect::<Result<Vec<_>>>()?;
+    tags.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    let mut batches = reader.read(request)?;
+    let mut keys = std::collections::BTreeSet::new();
+    let codec = SparsePrimaryKeyCodec::schemaless();
+    let mut offsets = mito_codec::row_converter::SparseOffsetsCache::new();
+    while let Some(batch) = batches.try_next().await? {
+        let table = batch
+            .column_by_name(DATA_SCHEMA_TABLE_ID_COLUMN_NAME)
+            .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+            .ok_or_else(|| invalid("invalid native series table ID"))?;
+        let tsid = batch
+            .column_by_name(DATA_SCHEMA_TSID_COLUMN_NAME)
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| invalid("invalid native series TSID"))?;
+        let tags = tags
+            .iter()
+            .map(|(id, name)| {
+                let array = batch
+                    .column_by_name(name)
+                    .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+                    .ok_or_else(|| invalid("invalid native series label"))?;
+                Ok((*id, array))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..batch.num_rows() {
+            let mut key = Vec::new();
+            codec
+                .encode_internal(table.value(row), tsid.value(row), &mut key)
+                .map_err(|e| invalid(e.to_string()))?;
+            codec
+                .encode_to_vec(
+                    tags.iter().map(|(id, array)| {
+                        (
+                            *id,
+                            if array.is_null(row) {
+                                ValueRef::Null
+                            } else {
+                                ValueRef::String(array.value(row))
+                            },
+                        )
+                    }),
+                    &mut key,
+                )
+                .map_err(|e| invalid(e.to_string()))?;
+            keys.insert(ExactSeriesKey::from_sparse_key(&key, &mut offsets)?);
+        }
+    }
+    Ok(Some(keys))
 }

@@ -1487,7 +1487,15 @@ pub(crate) async fn scan_flat_file_ranges(
     index: RowGroupIndex,
     read_type: &'static str,
     partition_pruner: Arc<PartitionPruner>,
-) -> Result<impl Stream<Item = Result<RecordBatch>>> {
+) -> Result<BoxedRecordBatchStream> {
+    let file = stream_ctx.input.file_from_index(index);
+    if matches!(
+        file.meta_ref().format,
+        crate::sst::file::FileFormat::Native(_)
+    ) {
+        partition_pruner.finish_native_range(index);
+        return crate::read::series_scan::read_native_file(stream_ctx.clone(), file.clone()).await;
+    }
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),
         ..Default::default()
@@ -1516,13 +1524,13 @@ pub(crate) async fn scan_flat_file_ranges(
         None
     };
 
-    Ok(build_flat_file_range_scan_stream(
+    Ok(Box::pin(build_flat_file_range_scan_stream(
         stream_ctx,
         part_metrics,
         read_type,
         ranges,
         init_per_file_metrics,
-    ))
+    )))
 }
 
 /// Filters a flat-format record batch by the exact sequence range.

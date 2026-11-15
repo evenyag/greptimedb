@@ -821,6 +821,8 @@ mod tests {
             .clone();
         region.version_control.apply_edit(
             Some(crate::manifest::action::RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_remove: vec![newest.clone()],
                 files_to_add: Vec::new(),
                 timestamp_ms: None,

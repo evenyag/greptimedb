@@ -1255,18 +1255,26 @@ pub fn convert_bulk_part(
 
 #[derive(Debug, Clone)]
 pub struct EncodedBulkPart {
-    data: Bytes,
+    payload: EncodedBulkPayload,
     metadata: BulkPartMeta,
     /// Cached Arrow schema to avoid rebuilding it from parquet metadata.
     schema: SchemaRef,
 }
 
+#[derive(Debug, Clone)]
+enum EncodedBulkPayload {
+    Parquet {
+        data: Bytes,
+        metadata: Arc<ParquetMetaData>,
+    },
+    Native(crate::series_index::samples::bulk::NativeBulkPart),
+}
+
 impl EncodedBulkPart {
-    pub fn new(data: Bytes, metadata: BulkPartMeta, schema: SchemaRef) -> Self {
-        Self {
-            data,
-            metadata,
-            schema,
+    pub fn parquet_metadata(&self) -> Option<&Arc<ParquetMetaData>> {
+        match &self.payload {
+            EncodedBulkPayload::Parquet { metadata, .. } => Some(metadata),
+            EncodedBulkPayload::Native(_) => None,
         }
     }
 
@@ -1280,12 +1288,18 @@ impl EncodedBulkPart {
 
     /// Returns the size of the encoded data in bytes
     pub(crate) fn size_bytes(&self) -> usize {
-        self.data.len()
+        match &self.payload {
+            EncodedBulkPayload::Parquet { data, .. } => data.len(),
+            EncodedBulkPayload::Native(part) => part.size_bytes(),
+        }
     }
 
-    /// Returns the encoded data.
-    pub fn data(&self) -> &Bytes {
-        &self.data
+    /// Only Parquet parts can use the existing direct-upload shortcut.
+    pub fn data(&self) -> Option<&Bytes> {
+        match &self.payload {
+            EncodedBulkPayload::Parquet { data, .. } => Some(data),
+            EncodedBulkPayload::Native(_) => None,
+        }
     }
 
     /// Creates MemtableStats from this EncodedBulkPart.
@@ -1313,11 +1327,10 @@ impl EncodedBulkPart {
     ///
     /// # Returns
     /// Returns a `SstInfo` instance with information derived from this bulk part's metadata
-    pub(crate) fn to_sst_info(&self, file_id: FileId) -> SstInfo {
+    pub(crate) fn to_sst_info(&self, file_id: FileId) -> Option<SstInfo> {
+        let parquet_metadata = self.parquet_metadata()?;
         let unit = self.metadata.region_metadata.time_index_type().unit();
-        let max_row_group_uncompressed_size: u64 = self
-            .metadata
-            .parquet_metadata
+        let max_row_group_uncompressed_size: u64 = parquet_metadata
             .row_groups()
             .iter()
             .map(|rg| {
@@ -1328,20 +1341,21 @@ impl EncodedBulkPart {
             })
             .max()
             .unwrap_or(0);
-        SstInfo {
+        Some(SstInfo {
+            format: Default::default(),
             file_id,
             time_range: (
                 Timestamp::new(self.metadata.min_timestamp, unit),
                 Timestamp::new(self.metadata.max_timestamp, unit),
             ),
-            file_size: self.data.len() as u64,
+            file_size: self.size_bytes() as u64,
             max_row_group_uncompressed_size,
             num_rows: self.metadata.num_rows,
-            num_row_groups: self.metadata.parquet_metadata.num_row_groups() as u64,
-            file_metadata: Some(self.metadata.parquet_metadata.clone()),
+            num_row_groups: parquet_metadata.num_row_groups() as u64,
+            file_metadata: Some(parquet_metadata.clone()),
             index_metadata: IndexOutput::default(),
             num_series: self.metadata.num_series,
-        }
+        })
     }
 
     pub(crate) fn read(
@@ -1350,12 +1364,34 @@ impl EncodedBulkPart {
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Result<Option<BoxedRecordBatchIterator>> {
+        if let EncodedBulkPayload::Native(part) = &self.payload {
+            let iter =
+                part.read(self.schema.clone())
+                    .flat_map(move |batch| -> BoxedRecordBatchIterator {
+                        match batch {
+                            Ok(batch) => {
+                                Box::new(super::part_reader::BulkPartBatchIter::from_single(
+                                    batch,
+                                    context.clone(),
+                                    sequence,
+                                    1,
+                                    mem_scan_metrics.clone(),
+                                ))
+                            }
+                            Err(error) => Box::new(std::iter::once(Err(error))),
+                        }
+                    });
+            return Ok(Some(Box::new(iter)));
+        }
+        let parquet_metadata = self.parquet_metadata().ok_or_else(|| {
+            crate::series_index::columnar::invalid("missing Parquet bulk metadata")
+        })?;
         // Compute skip_fields for row group pruning from the configured pre-filter mode.
         let skip_fields_for_pruning = context.pre_filter_mode().skip_fields();
 
         // use predicate to find row groups to read.
         let row_groups_to_read =
-            context.row_groups_to_read(&self.metadata.parquet_metadata, skip_fields_for_pruning);
+            context.row_groups_to_read(parquet_metadata, skip_fields_for_pruning);
 
         if row_groups_to_read.is_empty() {
             // All row groups are filtered.
@@ -1382,8 +1418,6 @@ pub struct BulkPartMeta {
     pub max_timestamp: i64,
     /// Min timestamp in part.
     pub min_timestamp: i64,
-    /// Part file metadata.
-    pub parquet_metadata: Arc<ParquetMetaData>,
     /// Part region schema.
     pub region_metadata: RegionMetadataRef,
     /// Number of series.
@@ -1412,6 +1446,7 @@ pub struct BulkPartEncodeMetrics {
 pub struct BulkPartEncoder {
     metadata: RegionMetadataRef,
     writer_props: Option<WriterProperties>,
+    native: bool,
 }
 
 impl BulkPartEncoder {
@@ -1444,11 +1479,17 @@ impl BulkPartEncoder {
         Ok(Self {
             metadata,
             writer_props,
+            native: false,
         })
     }
 }
 
 impl BulkPartEncoder {
+    pub(super) fn with_native(mut self, native: bool) -> Self {
+        self.native = native;
+        self
+    }
+
     /// Encodes [BoxedRecordBatchIterator] into [EncodedBulkPart] with min/max timestamps.
     pub fn encode_record_batch_iter(
         &self,
@@ -1459,6 +1500,41 @@ impl BulkPartEncoder {
         sequence_bounds: RangeInclusive<SequenceNumber>,
         metrics: &mut BulkPartEncodeMetrics,
     ) -> Result<Option<EncodedBulkPart>> {
+        if self.native {
+            let mut part = crate::series_index::samples::bulk::NativeBulkPart::default();
+            let mut total_rows = 0;
+            let mut series_estimator = SeriesEstimator::default();
+            for batch in iter {
+                let batch = batch?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                metrics.raw_size += record_batch_estimated_size(&batch);
+                series_estimator.update_flat(&batch);
+                total_rows += batch.num_rows();
+                let start = Instant::now();
+                part.push(&batch)?;
+                metrics.write_cost += start.elapsed();
+            }
+            if total_rows == 0 {
+                return Ok(None);
+            }
+            metrics.encoded_size += part.size_bytes();
+            metrics.num_rows += total_rows;
+            return Ok(Some(EncodedBulkPart {
+                payload: EncodedBulkPayload::Native(part),
+                metadata: BulkPartMeta {
+                    num_rows: total_rows,
+                    min_timestamp,
+                    max_timestamp,
+                    region_metadata: self.metadata.clone(),
+                    num_series: series_estimator.finish(),
+                    min_sequence: *sequence_bounds.start(),
+                    max_sequence: *sequence_bounds.end(),
+                },
+                schema: arrow_schema,
+            }));
+        }
         let mut buf = Vec::with_capacity(4096);
         let mut writer =
             ArrowWriter::try_new(&mut buf, arrow_schema.clone(), self.writer_props.clone())
@@ -1500,12 +1576,14 @@ impl BulkPartEncoder {
         let num_series = series_estimator.finish();
 
         Ok(Some(EncodedBulkPart {
-            data: buf,
+            payload: EncodedBulkPayload::Parquet {
+                data: buf,
+                metadata: parquet_metadata,
+            },
             metadata: BulkPartMeta {
                 num_rows: total_rows,
                 max_timestamp,
                 min_timestamp,
-                parquet_metadata,
                 region_metadata: self.metadata.clone(),
                 num_series,
                 min_sequence: *sequence_bounds.start(),
@@ -1521,6 +1599,16 @@ impl BulkPartEncoder {
             return Ok(None);
         }
 
+        if self.native {
+            return self.encode_record_batch_iter(
+                Box::new(std::iter::once(Ok(part.batch.clone()))),
+                part.batch.schema(),
+                part.min_timestamp,
+                part.max_timestamp,
+                part.min_sequence..=part.sequence,
+                &mut BulkPartEncodeMetrics::default(),
+            );
+        }
         let mut buf = Vec::with_capacity(4096);
         let arrow_schema = part.batch.schema();
 
@@ -1536,12 +1624,14 @@ impl BulkPartEncoder {
         let parquet_metadata = Arc::new(file_metadata);
 
         Ok(Some(EncodedBulkPart {
-            data: buf,
+            payload: EncodedBulkPayload::Parquet {
+                data: buf,
+                metadata: parquet_metadata,
+            },
             metadata: BulkPartMeta {
                 num_rows: part.batch.num_rows(),
                 max_timestamp: part.max_timestamp,
                 min_timestamp: part.min_timestamp,
-                parquet_metadata,
                 region_metadata: self.metadata.clone(),
                 num_series: part.estimated_series_count() as u64,
                 max_sequence: part.sequence,

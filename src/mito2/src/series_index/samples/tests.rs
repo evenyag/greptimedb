@@ -2420,3 +2420,99 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
 }
 
 mod keys;
+
+/// Native readers use the SST lifetime, not the local sidecar purger.
+#[tokio::test]
+async fn native_file_reader_pins_sst_lifetime() {
+    use crate::sst::file::{
+        FileFormat, FileHandle, FileMeta, NativeFileMeta, NativeObjectMeta, NativeSamplesPart,
+    };
+    use crate::sst::file_purger::FilePurger;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingPurger(Arc<AtomicUsize>);
+    impl FilePurger for CountingPurger {
+        fn purge_file(&self, _: FileMeta) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let store = store();
+    let meta = metadata();
+    let id = FileId::random();
+    let prefix = format!("table/region/native/{id}/");
+    let rows = vec![
+        (1, 2, 100, 7, 0, Some(1.5f64.to_bits())),
+        (1, 2, 101, 8, 0, None),
+    ];
+    let mut writer = ColumnarSamplesFormat::default()
+        .writer(meta.clone(), store.clone(), &prefix, id, id)
+        .await
+        .unwrap();
+    writer.write(&batch(&meta, &rows, false)).await.unwrap();
+    let artifact = writer.finish().await.unwrap();
+    let object = |o: &crate::series_index::artifact::ArtifactObject| NativeObjectMeta {
+        path: o.path.clone(),
+        file_size: o.file_size,
+    };
+    let native = NativeFileMeta {
+        use_file_sequence: false,
+        manifest: object(
+            artifact
+                .objects
+                .iter()
+                .find(|o| o.path.ends_with("manifest.json"))
+                .unwrap(),
+        ),
+        parts: artifact
+            .objects
+            .iter()
+            .filter(|o| o.path.ends_with(".samples"))
+            .enumerate()
+            .map(|(i, o)| NativeSamplesPart {
+                part_id: i as u32,
+                object: object(o),
+            })
+            .collect(),
+    };
+    let file_meta = FileMeta {
+        region_id: meta.region_id,
+        file_id: id,
+        format: FileFormat::Native(native),
+        file_size: artifact.file_size,
+        num_rows: rows.len() as u64,
+        ..Default::default()
+    };
+    let restored: FileMeta =
+        serde_json::from_str(&serde_json::to_string(&file_meta).unwrap()).unwrap();
+    assert_eq!(file_meta, restored);
+    let purged = Arc::new(AtomicUsize::new(0));
+    let file = FileHandle::new(restored, Arc::new(CountingPurger(purged.clone())));
+    let handle = SamplesFileHandle::from_native(file.clone()).unwrap();
+    let reader = reader::SamplesReader::open(store, handle).await.unwrap();
+    file.mark_deleted();
+    drop(file);
+    assert_eq!(0, purged.load(Ordering::Relaxed));
+    let batches: Vec<_> = reader
+        .read(full_request())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(rows, collect_rows(&batches));
+    drop(reader);
+    assert_eq!(1, purged.load(Ordering::Relaxed));
+}
+
+#[test]
+fn native_region_schema_rejected_before_writes() {
+    let options = crate::region::options::RegionOptions {
+        sst_format: Some(crate::sst::FormatType::Native),
+        ..Default::default()
+    };
+    options.validate_schema(&metadata()).unwrap();
+    let unsupported_field = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
+    assert!(options.validate_schema(&unsupported_field).is_err());
+    let dense = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Dense);
+    assert!(options.validate_schema(&dense).is_err());
+}

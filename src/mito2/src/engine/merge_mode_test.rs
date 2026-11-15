@@ -120,6 +120,8 @@ async fn test_admitted_sst_compaction_preserves_intermediate_memtable(
         .edit_region(
             region_id,
             RegionEdit {
+                series_indexes_to_add: Vec::new(),
+                series_indexes_to_remove: Vec::new(),
                 files_to_add: vec![foreign],
                 files_to_remove: vec![],
                 timestamp_ms: None,
