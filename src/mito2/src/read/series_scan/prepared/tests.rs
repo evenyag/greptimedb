@@ -54,6 +54,25 @@ use crate::series_index::samples::ColumnarSamplesFormat;
 use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 use crate::test_util::{TestEnv, flush_region};
 
+#[test]
+fn native_partition_filter_ignores_empty_and_matching_rules() {
+    // Frontend-created unpartitioned regions persist Some("") rather than None.
+    assert!(native_partition_filter(None, None).unwrap().is_none());
+    assert!(native_partition_filter(Some(""), None).unwrap().is_none());
+    let rule = partition::expr::col("tag").eq(Value::from("api"));
+    let json = rule.as_json_str().unwrap();
+    assert!(
+        native_partition_filter(Some(&json), Some(&rule))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        native_partition_filter(Some(&json), None).unwrap(),
+        Some(rule)
+    );
+    assert!(native_partition_filter(Some("invalid"), None).is_err());
+}
+
 async fn fixture() -> (TestEnv, MitoEngine, MitoRegionRef) {
     fixture_with(false).await
 }

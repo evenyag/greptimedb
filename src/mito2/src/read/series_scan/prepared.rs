@@ -1140,6 +1140,21 @@ fn sample_projection(
         .collect()
 }
 
+/// Returns a partition rule only when native rows need filtering for this owner.
+fn native_partition_filter(
+    region_partition: Option<&str>,
+    file_partition: Option<&partition::expr::PartitionExpr>,
+) -> Result<Option<partition::expr::PartitionExpr>> {
+    Ok(region_partition
+        .map(|json| {
+            partition::expr::PartitionExpr::from_json_str(json)
+                .map_err(|error| invalid(error.to_string()))
+        })
+        .transpose()?
+        .flatten()
+        .filter(|partition| file_partition != Some(partition)))
+}
+
 /// Reads an authoritative samples SST through the existing flat merge pipeline.
 /// Key discovery is implicit when no series-index selection is supplied.
 pub(crate) async fn read_native_file(
@@ -1164,14 +1179,17 @@ pub(crate) async fn read_native_file(
         .input
         .mapper
         .input_arrow_schema(context.input.compaction);
+    let partition = native_partition_filter(
+        context.input.region_metadata().partition_expr.as_deref(),
+        file.meta_ref().partition_expr.as_ref(),
+    )?;
     // Sparse compaction output omits labels. Materialize them for partition
     // evaluation, then restore the expected encoded-key schema before merging.
-    let schema =
-        if context.input.compaction && context.input.region_metadata().partition_expr.is_some() {
-            context.input.mapper.input_arrow_schema(false)
-        } else {
-            output_schema.clone()
-        };
+    let schema = if context.input.compaction && partition.is_some() {
+        context.input.mapper.input_arrow_schema(false)
+    } else {
+        output_schema.clone()
+    };
     let output_projection = (schema != output_schema)
         .then(|| {
             output_schema
@@ -1219,11 +1237,7 @@ pub(crate) async fn read_native_file(
     // Compaction does not build a query PredicateGroup. Match the Parquet
     // reader's per-file partition check before writing target-owned output;
     // otherwise remapped rows outside the target partition become permanent.
-    if let Some(json) = &context.input.region_metadata().partition_expr
-        && let Some(partition) = partition::expr::PartitionExpr::from_json_str(json)
-            .map_err(|error| invalid(error.to_string()))?
-        && file.meta_ref().partition_expr.as_ref() != Some(&partition)
-    {
+    if let Some(partition) = partition {
         filters.push(
             partition
                 .try_as_physical_expr(&schema)
