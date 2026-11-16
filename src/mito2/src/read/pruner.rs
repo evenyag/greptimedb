@@ -95,11 +95,6 @@ impl PartitionPruner {
         }
     }
 
-    pub(crate) fn finish_native_range(&self, index: RowGroupIndex) {
-        self.pruner
-            .skip_file_range(index, &mut ReaderMetrics::default());
-    }
-
     /// Excludes files replaced by another candidate source from prefetching.
     pub(crate) fn excluding_files(mut self, excluded: &HashSet<usize>) -> Self {
         self.file_indices.retain(|index| !excluded.contains(index));

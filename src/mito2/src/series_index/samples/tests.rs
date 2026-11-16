@@ -2568,3 +2568,66 @@ async fn native_write_error_cleans_completed_parts_before_returning() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn native_prepared_discovery_empty_projection_skips_payload() {
+    let store = store();
+    let metadata = metadata();
+    let rows = (1..=2)
+        .flat_map(|id| (0..10).map(move |time| (1, id, time, 1, 1, Some(1.0f64.to_bits()))))
+        .collect::<Vec<_>>();
+    let handle = build(
+        &ColumnarSamplesFormat::default(),
+        &store,
+        metadata.clone(),
+        &[batch(&metadata, &rows, false)],
+    )
+    .await;
+    let (_, framing, _, _) = root_page(&store, &handle).await;
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let observed = reads.clone();
+    let store = store.layer(
+        MockLayerBuilder::default()
+            .reader_factory(Arc::new(move |path, _, inner| {
+                Box::new(RecordingRead {
+                    inner,
+                    path: path.into(),
+                    reads: observed.clone(),
+                })
+            }))
+            .build()
+            .unwrap(),
+    );
+    let reader = reader::SamplesReader::open(store, handle).await.unwrap();
+    let discovered = reader
+        .read(SamplesReadRequest::default())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        20,
+        discovered
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>()
+    );
+    assert!(discovered.iter().all(|batch| batch.num_columns() == 0));
+    assert_eq!(
+        2,
+        discovered
+            .iter()
+            .map(|batch| &batch.key)
+            .collect::<BTreeSet<_>>()
+            .len()
+    );
+    let reads = reads.lock().unwrap();
+    assert!(reads.iter().any(|(path, _)| path.ends_with(".samples")));
+    for (path, range) in reads.iter().filter(|(path, _)| path.ends_with(".samples")) {
+        let end = range.offset() + range.size().unwrap();
+        assert!(
+            end <= HEADER_SIZE || range.offset() >= framing.payload_end,
+            "preparation read sample payload: {path} {range:?}"
+        );
+    }
+}

@@ -70,6 +70,8 @@ pub(crate) enum FlatReadMode {
 /// The output order is always `order by primary keys, time index` inside every
 /// [`PartitionRange`]. Each "partition" may contains many [`PartitionRange`]s.
 pub struct SeqScan {
+    /// Shares native candidate discovery across batch-output partitions.
+    native_preparation: Arc<crate::read::series_scan::prepared::Preparation>,
     /// Properties of the scanner.
     properties: ScannerProperties,
     /// Context of streams.
@@ -100,6 +102,7 @@ impl SeqScan {
         let pruner = Arc::new(Pruner::new(stream_ctx.clone(), num_workers));
 
         Self {
+            native_preparation: Arc::new(crate::read::series_scan::prepared::Preparation::default()),
             properties,
             stream_ctx,
             pruner,
@@ -156,6 +159,20 @@ impl SeqScan {
         let part_metrics = self.new_partition_metrics(false, &metrics_set, 0);
         debug_assert_eq!(1, self.properties.partitions.len());
         let partition_ranges = &self.properties.partitions[0];
+
+        if self.stream_ctx.input.requires_native_preparation() {
+            let source = self
+                .native_preparation
+                .prepare_batches(
+                    self.stream_ctx.clone(),
+                    partition_ranges.clone(),
+                    part_metrics,
+                )
+                .await?;
+            return source.read_batches(
+                0..store_api::region_engine::PreparedSeriesSource::num_series(source.as_ref()),
+            );
+        }
 
         let reader = Self::merge_all_flat_ranges_for_compaction(
             &self.stream_ctx,
@@ -440,6 +457,22 @@ impl SeqScan {
             }
         );
 
+        if self.stream_ctx.input.requires_native_preparation() {
+            return Ok(crate::read::series_scan::prepared::scan_batches(
+                self.native_preparation.clone(),
+                self.stream_ctx.clone(),
+                self.properties
+                    .partitions
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect(),
+                partition,
+                self.properties.partitions.len().max(1),
+                part_metrics,
+            ));
+        }
+
         if self.properties.partitions[partition].is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
         }
@@ -625,6 +658,8 @@ impl RegionScanner for SeqScan {
     }
 
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
+        self.native_preparation =
+            Arc::new(crate::read::series_scan::prepared::Preparation::default());
         self.properties.prepare(request);
 
         self.check_scan_limit().map_err(BoxedError::new)?;
@@ -645,6 +680,11 @@ impl RegionScanner for SeqScan {
         &mut self,
         filter_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
     ) -> Vec<bool> {
+        if self.stream_ctx.input.requires_native_preparation() {
+            // Prepared ordinals are immutable. Keep changing filters in the caller
+            // rather than claiming pushdown that discovery cannot honor.
+            return vec![false; filter_exprs.len()];
+        }
         self.stream_ctx.add_dyn_filter_to_predicate(filter_exprs)
     }
 

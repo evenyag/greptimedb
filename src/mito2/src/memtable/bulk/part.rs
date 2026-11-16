@@ -1358,6 +1358,13 @@ impl EncodedBulkPart {
         })
     }
 
+    pub(crate) fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+        match &self.payload {
+            EncodedBulkPayload::Native(part) => Some(part.primary_keys()),
+            EncodedBulkPayload::Parquet { .. } => None,
+        }
+    }
+
     pub(crate) fn read(
         &self,
         context: BulkIterContextRef,
@@ -1857,6 +1864,15 @@ pub struct MultiBulkPart {
 }
 
 impl MultiBulkPart {
+    pub(crate) fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+        let iterators = self
+            .batches
+            .iter()
+            .map(bulk_primary_keys)
+            .collect::<Option<Vec<_>>>()?;
+        Some(Box::new(iterators.into_iter().flatten()))
+    }
+
     /// Creates a new MultiBulkPart from a single BulkPart.
     pub fn from_bulk_part(part: BulkPart, metadata: &RegionMetadata) -> Self {
         let num_rows = part.num_rows();
@@ -2034,6 +2050,47 @@ impl MultiBulkPart {
             series_count: self.series_count,
         }
     }
+}
+
+/// Reads only the primary-key array of an already materialized bulk batch.
+pub(crate) fn bulk_primary_keys(
+    batch: &RecordBatch,
+) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+    use datatypes::arrow::array::BinaryArray;
+    let column = batch.column_by_name(store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME)?;
+    let (values, indices) =
+        if let Some(dictionary) = column.as_any().downcast_ref::<PrimaryKeyArray>() {
+            (
+                dictionary
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()?
+                    .clone(),
+                Some(dictionary.keys().clone()),
+            )
+        } else {
+            (column.as_any().downcast_ref::<BinaryArray>()?.clone(), None)
+        };
+    let rows = batch.num_rows();
+    let mut row = 0;
+    Some(Box::new(std::iter::from_fn(move || {
+        if row == rows {
+            return None;
+        }
+        let value = |row| {
+            values.value(
+                indices
+                    .as_ref()
+                    .map_or(row, |keys| keys.value(row) as usize),
+            )
+        };
+        let bytes = value(row);
+        row += 1;
+        while row < rows && value(row) == bytes {
+            row += 1;
+        }
+        Some(bytes::Bytes::copy_from_slice(bytes))
+    })))
 }
 
 #[cfg(test)]

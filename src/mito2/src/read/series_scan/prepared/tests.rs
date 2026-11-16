@@ -1166,6 +1166,7 @@ async fn ordinal_range_batches_sample_requests_and_pushes_time_bounds() {
     let source = scan.prepared.source.get().unwrap().as_ref().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let source = ColumnarPreparedSource {
+        merge_field_start: 0,
         context: source.context.clone(),
         labels: source.labels.clone(),
         raw: source.raw.clone(),
@@ -2765,6 +2766,103 @@ async fn visibility_fast_path_preserves_buffers_and_partial_filtering() {
                 assert!(Arc::ptr_eq(batch.column(1), filtered.column(1)));
             }
         }
+    }
+    engine.stop().await.unwrap();
+}
+
+#[rstest::rstest]
+#[case::raw_bulk(false)]
+#[case::encoded_bulk(true)]
+#[tokio::test]
+async fn authoritative_native_preparation_without_sidecars(#[case] encoded: bool) {
+    let mut env = TestEnv::with_prefix("native-prepared-authoritative").await;
+    let engine = env
+        .create_engine(MitoConfig {
+            experimental_enable_series_index: false,
+            experimental_series_scan_v2: false,
+            ..Default::default()
+        })
+        .await;
+    let mut metadata = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
+    metadata
+        .column_metadatas
+        .iter_mut()
+        .find(|column| column.column_id == 2)
+        .unwrap()
+        .column_schema
+        .data_type = ConcreteDataType::float64_datatype();
+    let mut create = crate::test_util::CreateRequestBuilder::new()
+        .insert_option("primary_key_encoding", "sparse")
+        .insert_option("sst_format", "native")
+        .insert_option("memtable.type", "bulk")
+        .build();
+    create.column_metadatas = metadata.column_metadatas;
+    create.primary_key = metadata.primary_key;
+    if encoded {
+        for (key, value) in [
+            ("memtable.bulk.merge_threshold", "2"),
+            ("memtable.bulk.encode_row_threshold", "1"),
+            ("memtable.bulk.encode_bytes_threshold", "1"),
+        ] {
+            create.options.insert(key.into(), value.into());
+        }
+    }
+    let id = store_api::storage::RegionId::new(42, 0);
+    engine
+        .handle_request(id, RegionRequest::Create(create))
+        .await
+        .unwrap();
+    let region = engine.get_region(id).unwrap();
+    assert!(region.series_index_store.is_none());
+    write(&engine, &region, 7, 1000, Some(10.0)).await;
+    write_with_tags(&engine, &region, 7, 1000, Some(20.0), &["b", "x"]).await;
+    let ctx = QueryScanContext::default();
+    let metrics = ExecutionPlanMetricsSet::new();
+    for stage in 0..3 {
+        if stage == 1 {
+            flush_region(&engine, id, None).await;
+        }
+        if stage == 2 {
+            write(&engine, &region, 7, 1000, Some(1.0)).await;
+        }
+        let request = ScanRequest {
+            distribution: Some(TimeSeriesDistribution::PerSeries),
+            filters: vec![col("field_0").gt(lit(5.0))],
+            ..Default::default()
+        };
+        let scan = engine.handle_query(id, request.clone()).await.unwrap();
+        let binding = labels(scan.metadata());
+        let prepared = scan
+            .prepare_series(&ctx, &metrics, &binding)
+            .await
+            .unwrap()
+            .expect("native reads must prepare without sidecars, including live memory");
+        let chunks = prepared
+            .read_series(0..prepared.num_series())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut actual = samples(&chunks);
+        actual.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let expected = if stage < 2 {
+            vec![(1000, 10.0), (1000, 20.0)]
+        } else {
+            vec![(1000, 20.0)]
+        };
+        assert_eq!(expected, actual, "raw stage {stage}");
+        let scan = engine.handle_query(id, request).await.unwrap();
+        let mut rows = 0;
+        for partition in 0..scan.properties().num_partitions() {
+            let batches = scan
+                .scan_partition(&ctx, &metrics, partition)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            rows += batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        }
+        assert_eq!(expected.len(), rows, "batch stage {stage}");
     }
     engine.stop().await.unwrap();
 }

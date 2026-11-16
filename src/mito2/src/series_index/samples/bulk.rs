@@ -176,6 +176,17 @@ impl NativeBulkPart {
             .sum()
     }
 
+    /// Native keys are separate from encoded sample columns.
+    pub(crate) fn primary_keys(&self) -> crate::memtable::BoxedPrimaryKeyIterator {
+        Box::new(
+            self.blocks
+                .iter()
+                .map(|block| block.key.clone())
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
     pub(crate) fn read(
         &self,
         schema: SchemaRef,
@@ -278,7 +289,24 @@ mod tests {
         let mut encoded = NativeBulkPart::default();
         encoded.push(&batch).unwrap();
         assert_eq!(2, encoded.blocks.len());
-        let decoded = encoded.read(schema).collect::<Result<Vec<_>>>().unwrap();
+        let decoded = encoded
+            .read(schema.clone())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            encoded.primary_keys().collect::<Vec<_>>()
+        );
+        let mut corrupt = encoded.clone();
+        corrupt.blocks[0].columns[0] = NativeBulkColumn::Float {
+            nulls: 0,
+            bytes: Bytes::new(),
+        };
+        assert!(corrupt.read(schema).next().unwrap().is_err());
+        assert_eq!(
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            corrupt.primary_keys().collect::<Vec<_>>()
+        );
         for (index, block) in decoded.iter().enumerate() {
             let expected = batch.slice(index * 2, 2);
             for column in 1..5 {

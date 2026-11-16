@@ -914,6 +914,10 @@ struct MultiBulkRangeIterBuilder {
 }
 
 impl IterBuilder for BulkRangeIterBuilder {
+    fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+        part::bulk_primary_keys(&self.part.batch)
+    }
+
     fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
         UnsupportedOperationSnafu {
             err_msg: "BatchIterator is not supported for bulk memtable",
@@ -957,6 +961,10 @@ impl IterBuilder for BulkRangeIterBuilder {
 }
 
 impl IterBuilder for MultiBulkRangeIterBuilder {
+    fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+        self.part.primary_keys()
+    }
+
     fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
         UnsupportedOperationSnafu {
             err_msg: "BatchIterator is not supported for multi bulk memtable",
@@ -1001,6 +1009,10 @@ struct EncodedBulkRangeIterBuilder {
 }
 
 impl IterBuilder for EncodedBulkRangeIterBuilder {
+    fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
+        self.part.primary_keys()
+    }
+
     fn build(&self, _metrics: Option<MemScanMetrics>) -> Result<BoxedBatchIterator> {
         UnsupportedOperationSnafu {
             err_msg: "BatchIterator is not supported for encoded bulk memtable",

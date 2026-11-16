@@ -88,7 +88,12 @@ pending. DDL cancellation retains its existing scheduling fence and priority.
 - **SST/Parquet layout** (`sst/`): readers must stay compatible with existing files.
 - **Native storage PoC**: `sst_format=native` makes samples authoritative SSTs
   (`sst/native.rs`), with native bulk parts, SeriesScan queries and SeqScan
-  compaction. `FileMeta::format` carries native object inventories; manifest and
+  compaction. All native reads require the shared prepared core in
+  `read/series_scan/prepared.rs`, including batch output for SQL/compaction.
+  `prepared/native.rs` opens authoritative handles independently of sidecar settings;
+  uncovered samples discover exact keys from metadata. Live memtable sources join
+  the same prepared merge. Never route native SSTs through legacy file scanning.
+  `FileMeta::format` carries native object inventories; manifest and
   `SstVersion` also own optional immutable series indexes. Replacing any covered
   samples retires the whole index. Coverage does not own samples: readers pin
   samples and indexes independently through ordinary file references. Native

@@ -1493,8 +1493,10 @@ pub(crate) async fn scan_flat_file_ranges(
         file.meta_ref().format,
         crate::sst::file::FileFormat::Native(_)
     ) {
-        partition_pruner.finish_native_range(index);
-        return crate::read::series_scan::read_native_file(stream_ctx.clone(), file.clone()).await;
+        return crate::error::UnsupportedOperationSnafu {
+            err_msg: "Native files must be read through scanner-wide preparation",
+        }
+        .fail();
     }
     let mut reader_metrics = ReaderMetrics {
         filter_metrics: new_filter_metrics(part_metrics.explain_verbose()),

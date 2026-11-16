@@ -632,6 +632,9 @@ impl ScanRegion {
             .with_predicate(predicate)
             .with_memtables(mem_range_builders)
             .with_files(files)
+            .with_native_format(
+                self.version.options.sst_format == Some(crate::sst::FormatType::Native),
+            )
             .with_native_series_indexes(
                 self.version
                     .ssts
@@ -1001,6 +1004,8 @@ pub struct ScanInput {
     /// Handles to SST files to scan.
     pub(crate) files: Vec<FileHandle>,
     pub(crate) native_series_indexes: Vec<FileHandle>,
+    /// Native regions require prepared reads, even before the first flush.
+    pub(crate) native_format: bool,
     /// Visible sources excluded solely by the query time range.
     pub(crate) time_pruned_files: HashSet<store_api::storage::FileId>,
     /// Shares the pinned schema's encoded defaults across parallel range readers.
@@ -1092,6 +1097,7 @@ impl ScanInput {
                 memtables: Vec::new(),
                 files: Vec::new(),
                 native_series_indexes: Vec::new(),
+                native_format: false,
                 time_pruned_files: HashSet::new(),
                 primary_key_mapper: OnceLock::new(),
                 batch_size: crate::sst::parquet::DEFAULT_READ_BATCH_SIZE,
@@ -1323,8 +1329,14 @@ impl ScanInputBuilder {
         self
     }
 
-    /// Sets files to read.
+    /// Requires prepared reads even when this native region has no SSTs yet.
     #[must_use]
+    pub(crate) fn with_native_format(mut self, native: bool) -> Self {
+        self.input.native_format = native;
+        self
+    }
+
+    /// Sets the pinned authoritative series indexes.
     fn with_native_series_indexes(mut self, indexes: Vec<FileHandle>) -> Self {
         self.input.native_series_indexes = indexes;
         self
@@ -1511,6 +1523,16 @@ impl ScanInputBuilder {
 }
 
 impl ScanInput {
+    pub(crate) fn requires_native_preparation(&self) -> bool {
+        self.native_format
+            || self.files.iter().any(|file| {
+                matches!(
+                    file.meta_ref().format,
+                    crate::sst::file::FileFormat::Native(_)
+                )
+            })
+    }
+
     pub(crate) fn uses_scan_memory_limit(&self) -> bool {
         let covered = self
             .scan_memory_tracker
