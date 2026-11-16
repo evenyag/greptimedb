@@ -203,6 +203,8 @@ impl SstReplaceCommand {
         let edit = RegionEdit {
             files_to_add: vec![new_file],
             files_to_remove: vec![],
+            series_indexes_to_add: vec![],
+            series_indexes_to_remove: vec![],
             timestamp_ms: None,
             compaction_time_window: None,
             flushed_entry_id: None,

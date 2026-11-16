@@ -1151,11 +1151,15 @@ pub(crate) async fn read_native_file(
     use mito_codec::row_converter::{CompositeValues, PrimaryKeyCodec};
     let selected_keys = native_series_selection(&context, &file).await?;
     let handle = SamplesFileHandle::from_native(file.clone())?;
-    let reader = crate::series_index::samples::reader::SamplesReader::open(
+    // Authoritative artifacts are immutable and their file ID is their generation.
+    let namespace = file.meta_ref().file_id;
+    let reader = crate::series_index::samples::reader::SamplesReader::open_cached(
         context.input.access_layer.object_store().clone(),
         handle,
+        context.input.cache_strategy.columnar_metadata(namespace),
     )
-    .await?;
+    .await?
+    .with_payload_cache(context.input.cache_strategy.columnar_payload(namespace));
     let output_schema = context
         .input
         .mapper
@@ -1182,6 +1186,18 @@ pub(crate) async fn read_native_file(
         })
         .transpose()?;
     let projection = sample_projection(&reader.schema(), &context);
+    let conjuncts = predicate_conjuncts(context.input.predicate_group().predicate());
+    let (series_request, _) = series_read_request(&schema, &conjuncts);
+    let unit = context.input.region_metadata().time_index_type().unit();
+    let bounds = context.input.time_range.as_ref();
+    let start = bounds
+        .and_then(|range| *range.start())
+        .and_then(|time| time.convert_to_ceil(unit))
+        .map(|time| time.value());
+    let end = bounds
+        .and_then(|range| *range.end())
+        .and_then(|time| time.convert_to_ceil(unit))
+        .map(|time| time.value());
     // Apply only key/time predicates before merging. Field predicates remain residuals,
     // otherwise an older matching value could replace a newer nonmatching value.
     let mut filters = context
@@ -1214,23 +1230,46 @@ pub(crate) async fn read_native_file(
                 .map_err(|error| invalid(error.to_string()))?,
         );
     }
+    // Compaction normally merges encoded keys without materializing labels.
+    // Decode only tags required by the flat schema (including partition checks).
+    let tag_ids: Vec<_> = context
+        .input
+        .region_metadata()
+        .primary_key_columns()
+        .filter(|column| {
+            column.column_id != ReservedColumnId::table_id()
+                && column.column_id != ReservedColumnId::tsid()
+                && schema.index_of(&column.column_schema.name).is_ok()
+        })
+        .map(|column| column.column_id)
+        .collect();
     let stream = async_stream::try_stream! {
-        let mut batches = reader.read(SamplesReadRequest { projection, keys: selected_keys, ..Default::default() })?;
+        let mut batches = reader.read(SamplesReadRequest {
+            projection,
+            keys: selected_keys,
+            table_id: series_request.table_id,
+            start,
+            end,
+            ..Default::default()
+        })?;
         let codec = SparsePrimaryKeyCodec::schemaless();
         while let Some(samples) = batches.try_next().await? {
-            let CompositeValues::Sparse(values) = codec.decode(samples.key.bytes())
+            let tags = if tag_ids.is_empty() {
+                HashMap::new()
+            } else {
+                let CompositeValues::Sparse(values) = codec.decode(samples.key.bytes())
                 .context(crate::error::DecodeSnafu)? else {
-                Err(invalid("native samples require sparse keys"))?;
-                continue;
-            };
-            let tags = context.input.region_metadata().primary_key_columns()
-                .map(|column| {
-                    let value = match values.get_or_null(column.column_id) {
+                    Err(invalid("native samples require sparse keys"))?;
+                    continue;
+                };
+                tag_ids.iter().map(|column_id| {
+                    let value = match values.get_or_null(*column_id) {
                         Value::String(value) => Some(value.as_utf8().to_string()),
                         _ => None,
                     };
-                    (column.column_id, value)
-                }).collect();
+                    (*column_id, value)
+                }).collect()
+            };
             let key = Buffer::from(samples.key.bytes());
             let candidate = Candidate { id: samples.key.id(), key: key.clone(),
                 merge_key: key, tags, metric: None };

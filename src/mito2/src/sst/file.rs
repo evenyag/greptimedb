@@ -531,6 +531,15 @@ fn is_zero(version: &u8) -> bool {
 }
 
 impl FileMeta {
+    /// Returns the authoritative object path, using the artifact manifest for native files.
+    pub fn file_path(&self, table_dir: &str, path_type: PathType) -> String {
+        match &self.format {
+            FileFormat::Parquet => location::sst_file_path(table_dir, self.file_id(), path_type),
+            FileFormat::Native(native) => native.manifest.path.clone(),
+            FileFormat::NativeSeries(native) => native.manifest.path.clone(),
+        }
+    }
+
     /// Returns whether this file's row sequences are trusted in the target region.
     ///
     /// Foreign files use their target-local sequence barrier; local files require
@@ -782,11 +791,7 @@ impl FileHandle {
 
     /// Returns the complete file path of the file.
     pub fn file_path(&self, table_dir: &str, path_type: PathType) -> String {
-        match &self.meta_ref().format {
-            FileFormat::Parquet => location::sst_file_path(table_dir, self.file_id(), path_type),
-            FileFormat::Native(native) => native.manifest.path.clone(),
-            FileFormat::NativeSeries(native) => native.manifest.path.clone(),
-        }
+        self.meta_ref().file_path(table_dir, path_type)
     }
 
     /// Returns the time range of the file.
@@ -1078,6 +1083,8 @@ pub async fn delete_files(
     Ok(())
 }
 
+type UncommittedFileMap = HashMap<FileId, (u64, bool, FileFormat)>;
+
 /// Tracks finalized SSTs until their manifest edit is committed.
 ///
 /// Flush and local compaction jobs use this to remove files that were written successfully but
@@ -1085,7 +1092,7 @@ pub async fn delete_files(
 #[derive(Clone)]
 pub(crate) struct UncommittedSsts {
     region_id: RegionId,
-    files: Arc<Mutex<HashMap<FileId, (u64, bool, FileFormat)>>>,
+    files: Arc<Mutex<UncommittedFileMap>>,
     access_layer: AccessLayerRef,
     cache_manager: Option<CacheManagerRef>,
 }

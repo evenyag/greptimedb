@@ -72,7 +72,7 @@ use crate::request::{OnFailure, OptionOutputTx};
 use crate::series_index::{SeriesIndexVersion, SeriesIndexVersionControl};
 use crate::sst::file::{self, FileMeta};
 use crate::sst::file_purger::FilePurgerRef;
-use crate::sst::location::{index_file_path, sst_file_path};
+use crate::sst::location::index_file_path;
 use crate::time_provider::TimeProviderRef;
 
 /// This is the approximate factor to estimate the size of wal.
@@ -956,7 +956,7 @@ impl MitoRegion {
                 let file_path = OnceCell::new();
                 if !filters.matches(|column| match column {
                     sst_entry::FILE_PATH => Some(file_path.get_or_init(|| {
-                        ScalarValue::Utf8(Some(sst_file_path(table_dir, meta.file_id(), path_type)))
+                        ScalarValue::Utf8(Some(meta.file_path(table_dir, path_type)))
                     })),
                     _ => None,
                 }) {
@@ -979,7 +979,7 @@ impl MitoRegion {
                 let file_path = if projection.file_path {
                     match file_path.into_inner() {
                         Some(ScalarValue::Utf8(Some(path))) => path,
-                        _ => sst_file_path(table_dir, meta.file_id(), path_type),
+                        _ => meta.file_path(table_dir, path_type),
                     }
                 } else {
                     String::new()
@@ -2597,6 +2597,53 @@ mod tests {
                     "visibility must retain the original snapshot"
                 );
             }
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_manifest_native_file_path_filter() {
+        use common_recordbatch::filter::MetadataFilter;
+        use datafusion_expr::{col, lit};
+        use futures::StreamExt;
+
+        use super::ManifestSstProjection;
+        use crate::sst::file::{FileFormat, FileMeta, NativeFileMeta, NativeObjectMeta};
+
+        let env = SchedulerEnv::new().await;
+        let region = build_test_region(&env).await;
+        let path = "shared/native/00000000-0000-0000-0000-000000000001/manifest.json";
+        let mut edit = empty_edit();
+        edit.files_to_add.push(FileMeta {
+            file_id: FileId::random(),
+            format: FileFormat::Native(NativeFileMeta {
+                use_file_sequence: false,
+                manifest: NativeObjectMeta {
+                    path: path.to_string(),
+                    file_size: 1,
+                },
+                parts: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        region
+            .manifest_ctx
+            .manifest_manager
+            .write()
+            .await
+            .update(
+                RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for filters in [
+            MetadataFilter::new(&[]),
+            MetadataFilter::new(&[col("file_path").eq(lit(path))]),
+        ] {
+            let mut stream = region.manifest_sst_stream(filters, ManifestSstProjection::new(None));
+            assert_eq!(stream.next().await.unwrap().file_path, path);
             assert!(stream.next().await.is_none());
         }
     }
