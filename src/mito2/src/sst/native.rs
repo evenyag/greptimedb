@@ -77,48 +77,55 @@ pub(crate) async fn write_samples(
     let mut lower = i64::MAX;
     let mut upper = i64::MIN;
     let timestamp = &request.metadata.time_index_column().column_schema.name;
-    while let Some(batch) = request.source.next_batch().await? {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let ts = batch.column_by_name(timestamp).ok_or_else(|| {
-            InvalidRecordBatchSnafu {
-                reason: "native samples lack timestamp".to_string(),
+    let write_result: Result<()> = async {
+        while let Some(batch) = request.source.next_batch().await? {
+            if batch.num_rows() == 0 {
+                continue;
             }
-            .build()
-        })?;
-        let (values, _) =
-            datatypes::timestamp::timestamp_array_to_primitive(ts).ok_or_else(|| {
+            let ts = batch.column_by_name(timestamp).ok_or_else(|| {
                 InvalidRecordBatchSnafu {
-                    reason: "invalid native timestamp".to_string(),
+                    reason: "native samples lack timestamp".to_string(),
                 }
                 .build()
             })?;
-        lower = lower.min(min(&values).unwrap_or(lower));
-        upper = upper.max(max(&values).unwrap_or(upper));
-        let keys = batch.column_by_name("__primary_key").ok_or_else(|| {
-            InvalidRecordBatchSnafu {
-                reason: "native samples lack primary key".to_string(),
+            let (values, _) =
+                datatypes::timestamp::timestamp_array_to_primitive(ts).ok_or_else(|| {
+                    InvalidRecordBatchSnafu {
+                        reason: "invalid native timestamp".to_string(),
+                    }
+                    .build()
+                })?;
+            lower = lower.min(min(&values).unwrap_or(lower));
+            upper = upper.max(max(&values).unwrap_or(upper));
+            let keys = batch.column_by_name("__primary_key").ok_or_else(|| {
+                InvalidRecordBatchSnafu {
+                    reason: "native samples lack primary key".to_string(),
+                }
+                .build()
+            })?;
+            let keys = cast(keys, &DataType::Binary).context(ComputeArrowSnafu)?;
+            let keys = keys.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                InvalidRecordBatchSnafu {
+                    reason: "invalid native primary key".to_string(),
+                }
+                .build()
+            })?;
+            for key in keys.iter().flatten() {
+                if key != previous_key {
+                    series += 1;
+                    previous_key.clear();
+                    previous_key.extend_from_slice(key);
+                }
             }
-            .build()
-        })?;
-        let keys = cast(keys, &DataType::Binary).context(ComputeArrowSnafu)?;
-        let keys = keys.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
-            InvalidRecordBatchSnafu {
-                reason: "invalid native primary key".to_string(),
-            }
-            .build()
-        })?;
-        for key in keys.iter().flatten() {
-            if key != previous_key {
-                series += 1;
-                previous_key.clear();
-                previous_key.extend_from_slice(key);
-            }
+            rows += batch.num_rows();
+            // Native files always retain row sequences; import barriers are applied by readers.
+            writer.write(&batch).await?;
         }
-        rows += batch.num_rows();
-        // Native files always retain row sequences; import barriers are applied by readers.
-        writer.write(&batch).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        return Err(abort_native_write(writer, error).await);
     }
     if rows == 0 {
         writer.abort().await?;
@@ -258,8 +265,15 @@ pub(crate) async fn write_series(
         &entry,
         prefix,
     )?;
-    while let Some(batch) = batches.next_batch().await? {
-        writer.write(&batch).await?;
+    let write_result: Result<()> = async {
+        while let Some(batch) = batches.next_batch().await? {
+            writer.write(&batch).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = write_result {
+        return Err(abort_native_write(writer, error).await);
     }
     let artifact = writer.finish().await?;
     file.file_size = artifact.file_size;
@@ -278,4 +292,16 @@ pub(crate) async fn write_series(
     }
     validate_inventory(layer, &file)?;
     Ok(file)
+}
+
+/// Complete cleanup before reporting a failed write. Drop cleanup remains a fallback
+/// for cancellation, but can race runtime shutdown after an ordinary returned error.
+pub(crate) async fn abort_native_write(
+    writer: Box<dyn crate::series_index::format::FormatWriter>,
+    error: crate::error::Error,
+) -> crate::error::Error {
+    if let Err(cleanup_error) = writer.abort().await {
+        common_telemetry::warn!(cleanup_error; "Failed to abort unpublished native artifact");
+    }
+    error
 }

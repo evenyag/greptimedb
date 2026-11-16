@@ -2516,3 +2516,55 @@ fn native_region_schema_rejected_before_writes() {
     let dense = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Dense);
     assert!(options.validate_schema(&dense).is_err());
 }
+
+#[tokio::test]
+async fn native_write_error_cleans_completed_parts_before_returning() {
+    let store = store();
+    let metadata = metadata();
+    let format = ColumnarSamplesFormat {
+        block_rows: 1,
+        part_bytes: 1,
+        ..Default::default()
+    };
+    let mut writer = format
+        .writer(
+            metadata.clone(),
+            store.clone(),
+            "native-error/",
+            FileId::random(),
+            FileId::random(),
+        )
+        .await
+        .unwrap();
+    writer
+        .write(&batch(
+            &metadata,
+            &[
+                (1, 1, 1000, 1, 0, Some(1.0_f64.to_bits())),
+                (1, 2, 1000, 1, 0, Some(2.0_f64.to_bits())),
+                (1, 3, 1000, 1, 0, Some(3.0_f64.to_bits())),
+            ],
+            true,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .list_with("native-error/")
+            .recursive(true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let error = crate::series_index::columnar::invalid("injected source error");
+    let error = crate::sst::native::abort_native_write(writer, error).await;
+    assert!(error.to_string().contains("injected source error"));
+    assert!(
+        store
+            .list_with("native-error/")
+            .recursive(true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
