@@ -873,25 +873,53 @@ impl LocalGcWorker {
             })?;
         let index_cnt = index_entries.len();
         all_entries.extend(index_entries);
-        // Native artifacts consist of a manifest and parts below one immutable ID.
-        let native_dir = format!("{}native/", self.access_layer.build_region_dir(region_id));
-        let listing = self
-            .access_layer
-            .object_store()
-            .lister_with(&native_dir)
-            .recursive(true)
-            .await;
-        match listing {
+        // Only descend into artifact directories, not index/blob/staging/cache directories.
+        let mut narthex_dirs = Vec::new();
+        all_entries.retain(|entry| {
+            if entry.metadata().is_dir() {
+                narthex_dirs.push(entry.path().to_string());
+                false
+            } else {
+                true
+            }
+        });
+        let legacy = location::legacy_native_dir(&self.access_layer.build_region_dir(region_id));
+        match self.access_layer.object_store().lister(&legacy).await {
             Ok(mut lister) => {
-                while let Some(entry) = lister.next().await {
-                    let entry = entry.context(OpenDalSnafu)?;
-                    if entry.metadata().is_file() {
-                        all_entries.push(entry);
+                while let Some(entry) = lister.try_next().await.context(OpenDalSnafu)? {
+                    if entry.metadata().is_dir() && location::is_narthex_file_dir(entry.path()) {
+                        narthex_dirs.push(entry.path().to_string());
                     }
                 }
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(e).context(OpenDalSnafu),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context(OpenDalSnafu),
+        }
+        for dir in narthex_dirs {
+            let mut lister = self
+                .access_layer
+                .object_store()
+                .lister_with(&dir)
+                .recursive(true)
+                .await
+                .context(OpenDalSnafu)?;
+            let mut empty = true;
+            while let Some(entry) = lister.try_next().await.context(OpenDalSnafu)? {
+                // Filesystem listings include the directory itself.
+                if entry.metadata().is_dir() && entry.path() == dir {
+                    continue;
+                }
+                empty = false;
+                if entry.metadata().is_file() {
+                    all_entries.push(entry);
+                }
+            }
+            if empty {
+                // Non-recursive deletion cannot remove objects from a concurrent writer.
+                if let Err(error) = self.access_layer.object_store().delete(&dir).await {
+                    debug!("Could not remove empty narthex directory {dir}: {error}");
+                }
+            }
         }
         info!(
             "gc: full listing mode cost {} secs using {lister_cnt} lister for root={root_cnt} index={index_cnt} files in region {}.",
@@ -972,8 +1000,8 @@ impl LocalGcWorker {
                     let stream = stream
                         .filter(|e| {
                             if let Ok(e) = &e {
-                                // notice that we only care about files, skip dirs
-                                e.metadata().is_file()
+                                // Artifact directories contain narthex objects; skip other directories.
+                                e.metadata().is_file() || location::is_narthex_file_dir(e.path())
                             } else {
                                 // error entry, take for further logging
                                 true
@@ -1041,9 +1069,9 @@ impl LocalGcWorker {
 
         // Every listed object must be eligible before deleting an artifact. In
         // particular, an old part cannot bypass a younger manifest's grace period.
-        let mut native_eligibility: HashMap<FileId, bool> = HashMap::new();
+        let mut narthex_eligibility: HashMap<FileId, bool> = HashMap::new();
         for entry in entries {
-            if let Some(file_id) = crate::sst::native::file_id_from_path(entry.path()) {
+            if let Some(file_id) = crate::sst::location::parse_narthex_file_id(entry.path()) {
                 let in_manifest = in_manifest.contains_key(&file_id);
                 let in_tmp_ref = referenced_ssts.contains(&file_id);
                 let linger = may_linger_files.contains_key(&file_id);
@@ -1064,7 +1092,7 @@ impl LocalGcWorker {
                     &entry,
                     unknown_file_may_linger_until,
                 );
-                *native_eligibility.entry(file_id).or_insert(true) &= delete;
+                *narthex_eligibility.entry(file_id).or_insert(true) &= delete;
                 continue;
             }
             if entry.name() == DROPPING_MARKER_FILE {
@@ -1153,7 +1181,7 @@ impl LocalGcWorker {
             }
         }
         ready_for_delete.extend(
-            native_eligibility
+            narthex_eligibility
                 .into_iter()
                 .filter_map(|(id, eligible)| eligible.then_some(RemovedFile::File(id, None))),
         );

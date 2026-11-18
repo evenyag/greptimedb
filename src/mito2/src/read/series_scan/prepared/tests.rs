@@ -55,22 +55,22 @@ use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_wit
 use crate::test_util::{TestEnv, flush_region};
 
 #[test]
-fn native_partition_filter_ignores_empty_and_matching_rules() {
+fn narthex_partition_filter_ignores_empty_and_matching_rules() {
     // Frontend-created unpartitioned regions persist Some("") rather than None.
-    assert!(native_partition_filter(None, None).unwrap().is_none());
-    assert!(native_partition_filter(Some(""), None).unwrap().is_none());
+    assert!(narthex_partition_filter(None, None).unwrap().is_none());
+    assert!(narthex_partition_filter(Some(""), None).unwrap().is_none());
     let rule = partition::expr::col("tag").eq(Value::from("api"));
     let json = rule.as_json_str().unwrap();
     assert!(
-        native_partition_filter(Some(&json), Some(&rule))
+        narthex_partition_filter(Some(&json), Some(&rule))
             .unwrap()
             .is_none()
     );
     assert_eq!(
-        native_partition_filter(Some(&json), None).unwrap(),
+        narthex_partition_filter(Some(&json), None).unwrap(),
         Some(rule)
     );
-    assert!(native_partition_filter(Some("invalid"), None).is_err());
+    assert!(narthex_partition_filter(Some("invalid"), None).is_err());
 }
 
 async fn fixture() -> (TestEnv, MitoEngine, MitoRegionRef) {
@@ -2774,8 +2774,8 @@ async fn visibility_fast_path_preserves_buffers_and_partial_filtering() {
 #[case::raw_bulk(false)]
 #[case::encoded_bulk(true)]
 #[tokio::test]
-async fn authoritative_native_preparation_without_sidecars(#[case] encoded: bool) {
-    let mut env = TestEnv::with_prefix("native-prepared-authoritative").await;
+async fn authoritative_narthex_preparation_without_sidecars(#[case] encoded: bool) {
+    let mut env = TestEnv::with_prefix("narthex-prepared-authoritative").await;
     let engine = env
         .create_engine(MitoConfig {
             experimental_enable_series_index: false,
@@ -2793,7 +2793,7 @@ async fn authoritative_native_preparation_without_sidecars(#[case] encoded: bool
         .data_type = ConcreteDataType::float64_datatype();
     let mut create = crate::test_util::CreateRequestBuilder::new()
         .insert_option("primary_key_encoding", "sparse")
-        .insert_option("sst_format", "native")
+        .insert_option("sst_format", "narthex")
         .insert_option("memtable.type", "bulk")
         .build();
     create.column_metadatas = metadata.column_metadatas;
@@ -2836,7 +2836,7 @@ async fn authoritative_native_preparation_without_sidecars(#[case] encoded: bool
             .prepare_series(&ctx, &metrics, &binding)
             .await
             .unwrap()
-            .expect("native reads must prepare without sidecars, including live memory");
+            .expect("narthex reads must prepare without sidecars, including live memory");
         let chunks = prepared
             .read_series(0..prepared.num_series())
             .unwrap()

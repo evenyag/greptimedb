@@ -340,9 +340,9 @@ impl WriteCache {
                     )
                     .await?
             }
-            crate::sst::FormatType::Native => {
+            crate::sst::FormatType::Narthex => {
                 return crate::error::UnsupportedOperationSnafu {
-                    err_msg: "native writer bypasses Parquet write cache",
+                    err_msg: "narthex writer bypasses Parquet write cache",
                 }
                 .fail();
             }

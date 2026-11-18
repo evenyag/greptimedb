@@ -40,8 +40,8 @@ use crate::series_index::format::{FormatWriter, SamplesFormat, SamplesFormatRead
 use crate::series_index::identity::IdentityEncoding;
 use crate::series_index::{MetricSeriesId, TABLE_ID_COLUMN, TSID_COLUMN};
 
-/// Reject unsupported native schemas before accepting mutations that cannot flush.
-pub(crate) fn validate_native_metadata(
+/// Reject unsupported narthex schemas before accepting mutations that cannot flush.
+pub(crate) fn validate_narthex_metadata(
     metadata: &store_api::metadata::RegionMetadata,
 ) -> Result<()> {
     crate::series_index::writer::validate_metadata(metadata)?;
@@ -54,12 +54,12 @@ pub(crate) fn validate_native_metadata(
                 .as_arrow_type(),
             DataType::Timestamp(_, None)
         ),
-        "native samples require a timestamp time index",
+        "narthex samples require a timestamp time index",
     )?;
     for column in metadata.field_columns() {
         require(
             column.column_schema.data_type.as_arrow_type() == DataType::Float64,
-            "native samples support only Float64 fields",
+            "narthex samples support only Float64 fields",
         )?;
     }
     Ok(())

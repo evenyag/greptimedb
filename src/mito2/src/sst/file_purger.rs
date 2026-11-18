@@ -185,13 +185,9 @@ impl LocalFilePurger {
                     return;
                 }
             }
-            if let Some(objects) = file_meta.format.native_objects() {
-                // Shared-file protection applies to every object; delete the manifest last.
-                for object in objects {
-                    if let Err(error) = sst_layer.object_store().delete(&object.path).await {
-                        error!(error; "Failed to delete native object {}", object.path);
-                        return;
-                    }
+            if file_meta.format.narthex_objects().is_some() {
+                if let Err(error) = sst_layer.delete_narthex_objects(&file_meta.format).await {
+                    error!(error; "Failed to delete narthex artifact {}", file_meta.file_id());
                 }
                 return;
             }

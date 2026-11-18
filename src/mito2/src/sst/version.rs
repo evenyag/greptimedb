@@ -158,7 +158,7 @@ impl SstVersion {
     pub(crate) fn remove_files(&mut self, files_to_remove: impl Iterator<Item = FileMeta>) {
         let files_to_remove: Vec<_> = files_to_remove.collect();
         Arc::make_mut(&mut self.series_indexes).retain(|_, file| {
-            let retire = matches!(&file.meta_ref().format, file::FileFormat::NativeSeries(index)
+            let retire = matches!(&file.meta_ref().format, file::FileFormat::NarthexSeriesIndex(index)
                 if index.sources.iter().any(|source| files_to_remove.iter().any(|removed| removed.file_id() == *source)));
             if retire { file.mark_deleted(); }
             !retire

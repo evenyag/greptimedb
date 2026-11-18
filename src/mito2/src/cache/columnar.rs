@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Immutable native-reader metadata shares the decoded SST reservation.
+//! Immutable Narthex reader metadata shares the decoded SST reservation.
 
 use std::any::{Any, TypeId};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use crate::metrics::{CACHE_BYTES, CACHE_HIT, CACHE_LOAD, CACHE_MISS};
 
 const COLUMNAR_META: &str = "columnar_metadata";
 
-/// Identity of one immutable native-reader structure.
+/// Identity of one immutable Narthex reader structure.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct DecodedKey {
     namespace: FileId,
@@ -43,7 +43,7 @@ impl DecodedValue {
         COLUMNAR_META
     }
 }
-/// Weigher for the native-reader metadata tier; the value carries its own admitted weight.
+/// Weigher for the Narthex reader metadata tier; the value carries its own admitted weight.
 pub(crate) fn columnar_meta_weight(_key: &DecodedKey, value: &DecodedValue) -> u32 {
     value.weight
 }
@@ -67,13 +67,13 @@ impl CacheStrategy {
     }
 }
 
-// Native payload blocks used to share the page-cache budget through the shared
+// Narthex payload blocks used to share the page-cache budget through the shared
 // `PageRangeCache`, which main replaced with `ParquetPageCache`. That cache serves
 // uniform-size blocks fetched through a reader, so it cannot hold these aligned blocks
 // clipped to the payload area.
-// TODO(narthex-merge): re-attach native payload byte caching to a dedicated page-cache
+// TODO(narthex-merge): re-attach narthex payload byte caching to a dedicated page-cache
 // budget in `CacheManager`; until then payload reads stay uncached.
-/// Placeholder for the disabled native payload byte cache.
+/// Placeholder for the disabled narthex payload byte cache.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct PayloadCache {

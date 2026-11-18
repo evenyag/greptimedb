@@ -72,7 +72,7 @@ impl PartitionPruner {
                         pruner.inner.stream_ctx.input.files[file_index]
                             .meta_ref()
                             .format,
-                        crate::sst::file::FileFormat::Native(_)
+                        crate::sst::file::FileFormat::NarthexSamples(_)
                     ) {
                         continue;
                     }

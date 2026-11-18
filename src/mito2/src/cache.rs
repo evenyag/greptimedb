@@ -1116,7 +1116,7 @@ pub struct CacheManager {
     disable_sst_meta_cache_on_write: bool,
     /// Cache for decoded SST metadata, used only as an acceleration tier.
     sst_decoded_meta_cache: Option<SstDecodedMetaCache>,
-    /// Immutable native-reader (columnar series/samples) metadata tier. It cannot share
+    /// Immutable Narthex reader (columnar series/samples) metadata tier. It cannot share
     /// `sst_decoded_meta_cache` because that tier stores `SstMetaLoadResult` under a
     /// page-index-aware key.
     columnar_meta_cache: Option<ColumnarMetaCache>,
@@ -1594,7 +1594,7 @@ pub fn selector_result_cache_hit() {
 #[derive(Default)]
 pub struct CacheManagerBuilder {
     sst_meta_cache_size: u64,
-    /// Reserves a quarter of `sst_meta_cache_size` for the native-reader metadata tier.
+    /// Reserves a quarter of `sst_meta_cache_size` for the Narthex reader metadata tier.
     /// Only enabled when the columnar series-index format is configured; otherwise the
     /// decoded tier keeps main's full half of the budget.
     enable_columnar_meta_cache: bool,
@@ -1619,7 +1619,7 @@ impl CacheManagerBuilder {
         self
     }
 
-    /// Enables the native-reader metadata tier, funded by a quarter of `sst_meta_cache_size`.
+    /// Enables the Narthex reader metadata tier, funded by a quarter of `sst_meta_cache_size`.
     pub fn enable_columnar_meta_cache(mut self, enable: bool) -> Self {
         self.enable_columnar_meta_cache = enable;
         self
@@ -1710,7 +1710,7 @@ impl CacheManagerBuilder {
         // decoded acceleration entries from evicting metadata that would require storage I/O to
         // recover. Both reservations together equal the configured limit.
         let compact_meta_capacity = self.sst_meta_cache_size.div_ceil(2);
-        // TODO(narthex-merge): native-reader metadata is a second acceleration tier that main's
+        // TODO(narthex-merge): Narthex reader metadata is a second acceleration tier that main's
         // typed decoded cache cannot hold; it takes a quarter of the same budget so the total
         // still matches the configured size. Re-unify the tiers once the loader accounting is
         // shared, and move this to a dedicated config knob instead of splitting the reservation.
@@ -2038,7 +2038,7 @@ impl SstDecodedMetaKey {
 type SstMetaCache = Cache<SstMetaKey, Arc<CompactSstMeta>>;
 /// Maps (region id, file id) to decoded SST metadata retained as an acceleration tier.
 type SstDecodedMetaCache = common_cache::Cache<SstDecodedMetaKey, Arc<SstMetaLoadResult>>;
-/// Maps native-reader metadata identity to validated immutable structures.
+/// Maps Narthex reader metadata identity to validated immutable structures.
 pub(crate) type ColumnarMetaCache = Cache<DecodedKey, DecodedValue>;
 /// Maps [Value] to a vector that holds this value repeatedly.
 ///
@@ -2544,7 +2544,7 @@ mod tests {
 
     #[test]
     fn test_sst_meta_cache_splits_capacity() {
-        // Default (columnar format off): main's split, the native-reader tier is not created.
+        // Default (columnar format off): main's split, the Narthex reader tier is not created.
         let cache = CacheManager::builder().sst_meta_cache_size(101).build();
         assert_eq!(
             50,
@@ -2552,7 +2552,7 @@ mod tests {
         );
         assert!(cache.columnar_meta_cache.is_none());
 
-        // Columnar format on: a quarter of the budget funds the native-reader tier.
+        // Columnar format on: a quarter of the budget funds the Narthex reader tier.
         let cache = CacheManager::builder()
             .sst_meta_cache_size(101)
             .enable_columnar_meta_cache(true)
@@ -2567,7 +2567,7 @@ mod tests {
                 .policy()
                 .max_capacity()
         );
-        // The acceleration half is split between the decoded and native-reader tiers.
+        // The acceleration half is split between the decoded and Narthex reader tiers.
         assert_eq!(
             25,
             cache.sst_decoded_meta_cache.as_ref().unwrap().capacity()

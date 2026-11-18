@@ -527,7 +527,9 @@ impl MemtableBuilderProvider {
                     .with_config(config.clone())
                     .with_row_group_size(options.row_group_size())
                     .with_float_field_encoding(options.float_field_encoding)
-                    .with_native(options.sst_format == Some(crate::sst::FormatType::Native))
+                    .with_narthex_format(
+                        options.sst_format == Some(crate::sst::FormatType::Narthex),
+                    )
                     .with_compact_dispatcher(self.compact_dispatcher.clone()),
             ),
             Some(MemtableOptions::TimeSeries) => Arc::new(TimeSeriesMemtableBuilder::new(
@@ -553,7 +555,7 @@ impl MemtableBuilderProvider {
         .with_config(self.default_bulk_memtable_config.clone())
         .with_row_group_size(options.row_group_size())
         .with_float_field_encoding(options.float_field_encoding)
-        .with_native(options.sst_format == Some(crate::sst::FormatType::Native))
+        .with_narthex_format(options.sst_format == Some(crate::sst::FormatType::Narthex))
         .with_compact_dispatcher(self.compact_dispatcher.clone());
 
         if let Some(MemtableOptions::Bulk(config)) = &options.memtable {

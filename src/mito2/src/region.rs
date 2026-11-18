@@ -888,7 +888,7 @@ impl MitoRegion {
         let region_options = serde_json::to_string(&version.options)
             .unwrap_or_else(|err| serde_json::json!({ "error": err.to_string() }).to_string());
         let sst_format = match version.options.sst_format.unwrap_or_default() {
-            crate::sst::FormatType::Native => "native",
+            crate::sst::FormatType::Narthex => "narthex",
             crate::sst::FormatType::PrimaryKey => "primary_key",
             crate::sst::FormatType::Flat => "flat",
         }
@@ -2602,13 +2602,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manifest_native_file_path_filter() {
+    async fn test_manifest_narthex_file_path_filter() {
         use common_recordbatch::filter::MetadataFilter;
         use datafusion_expr::{col, lit};
         use futures::StreamExt;
 
         use super::ManifestSstProjection;
-        use crate::sst::file::{FileFormat, FileMeta, NativeFileMeta, NativeObjectMeta};
+        use crate::sst::file::{FileFormat, FileMeta, NarthexObjectMeta, NarthexSamplesMeta};
 
         let env = SchedulerEnv::new().await;
         let region = build_test_region(&env).await;
@@ -2616,9 +2616,9 @@ mod tests {
         let mut edit = empty_edit();
         edit.files_to_add.push(FileMeta {
             file_id: FileId::random(),
-            format: FileFormat::Native(NativeFileMeta {
+            format: FileFormat::NarthexSamples(NarthexSamplesMeta {
                 use_file_sequence: false,
-                manifest: NativeObjectMeta {
+                manifest: NarthexObjectMeta {
                     path: path.to_string(),
                     file_size: 1,
                 },

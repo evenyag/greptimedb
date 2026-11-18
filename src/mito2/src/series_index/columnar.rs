@@ -70,7 +70,7 @@ impl Default for ColumnarSeriesFormat {
 
 #[cfg(any(test, feature = "test"))]
 impl ColumnarSeriesFormat {
-    pub(crate) fn native_writer(
+    pub(crate) fn narthex_writer(
         &self,
         metadata: RegionMetadataRef,
         store: ObjectStore,

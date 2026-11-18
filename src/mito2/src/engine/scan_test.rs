@@ -79,8 +79,8 @@ async fn test_sparse_upsert_after_adding_nullable_tag() -> WhateverResult<()> {
 }
 
 #[tokio::test]
-async fn test_native_sparse_upsert_after_adding_nullable_tag() -> WhateverResult<()> {
-    check_sparse_upsert_after_adding_nullable_tag("native").await
+async fn test_narthex_sparse_upsert_after_adding_nullable_tag() -> WhateverResult<()> {
+    check_sparse_upsert_after_adding_nullable_tag("narthex").await
 }
 
 async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> WhateverResult<()> {
@@ -97,7 +97,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         .insert_option("primary_key_encoding", "sparse")
         .insert_option("sst_format", format)
         .build();
-    if format == "native" {
+    if format == "narthex" {
         for (key, value) in [
             ("memtable.type", "bulk"),
             ("memtable.bulk.merge_threshold", "2"),
@@ -130,7 +130,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         ])],
     };
     test_util::put_rows(&engine, region_id, rows.clone()).await;
-    if format == "native" {
+    if format == "narthex" {
         test_util::put_rows(&engine, region_id, rows.clone()).await;
         for memtable in engine
             .find_region(region_id)
@@ -143,7 +143,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             let ranges = memtable.ranges(None, crate::memtable::RangesOptions::default())?;
             assert_eq!(ranges.ranges.len(), 1);
             let range = ranges.ranges.values().next().unwrap();
-            // Two input parts were merged and encoded, but native parts cannot
+            // Two input parts were merged and encoded, but narthex parts cannot
             // use the Parquet direct-upload shortcut.
             assert!(range.encoded().is_none());
             let decoded = range
@@ -155,7 +155,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             );
         }
     }
-    if format == "native" {
+    if format == "narthex" {
         let stream = engine
             .scan_to_stream(region_id, ScanRequest::default())
             .await?;
@@ -210,7 +210,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
 +-------+---------+---------------------+------+";
         assert_eq!(batches.pretty_print()?, expected);
     }
-    if format == "native" {
+    if format == "narthex" {
         let unindexed = RecordBatches::try_collect(
             engine
                 .scan_to_stream(region_id, ScanRequest::default())
@@ -228,7 +228,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
                 .flat_map(|level| level.files.values())
                 .all(|file| matches!(
                     file.meta_ref().format,
-                    crate::sst::file::FileFormat::Native(_)
+                    crate::sst::file::FileFormat::NarthexSamples(_)
                 ))
         );
         let sources: Vec<_> = region
@@ -251,7 +251,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         }
         .build_flat_sst_reader()
         .await?;
-        let index = crate::sst::native::write_series(
+        let index = crate::sst::narthex::write_series(
             &region.access_layer,
             region.metadata(),
             &sources,
@@ -284,7 +284,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             RecordBatches::try_collect(indexed).await?.pretty_print()?,
             unindexed
         );
-        let old_index = crate::series_index::SeriesIndexFileHandle::from_native(
+        let old_index = crate::series_index::SeriesIndexFileHandle::from_narthex(
             region.version().ssts.series_indexes()[&index_id].clone(),
         )?;
         let index_reader = crate::series_index::columnar::reader::ColumnarReader::open(
@@ -303,7 +303,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             .clone();
         let samples_reader = crate::series_index::samples::reader::SamplesReader::open(
             region.access_layer.object_store().clone(),
-            crate::series_index::artifact::SamplesFileHandle::from_native(old_samples)?,
+            crate::series_index::artifact::SamplesFileHandle::from_narthex(old_samples)?,
         )
         .await?;
         let inputs: std::collections::HashSet<_> = region
@@ -351,7 +351,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         );
         assert!(outputs.iter().all(|file| matches!(
             file.meta_ref().format,
-            crate::sst::file::FileFormat::Native(_)
+            crate::sst::file::FileFormat::NarthexSamples(_)
         )));
         reopen_region(&engine, region_id, table_dir, true, HashMap::new()).await;
         let stream = engine

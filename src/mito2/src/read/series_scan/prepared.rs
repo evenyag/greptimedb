@@ -14,7 +14,7 @@
 
 //! Scanner-wide columnar candidates and independent, lazy sample reads.
 
-mod native;
+mod narthex;
 #[cfg(test)]
 mod tests;
 
@@ -198,8 +198,8 @@ fn unaccounted_scan_pool() -> Arc<dyn MemoryPool> {
 }
 
 pub(crate) fn validate_inputs(context: &StreamContext, ranges: &[PartitionRange]) -> Result<bool> {
-    if native::has_native_files(context) {
-        native::file_indices(context, ranges)?;
+    if narthex::has_narthex_files(context) {
+        narthex::file_indices(context, ranges)?;
         return Ok(true);
     }
     collect_inputs(context, ranges).map(|inputs| inputs.is_some())
@@ -485,8 +485,8 @@ impl ColumnarPreparedSource {
         let started = Instant::now();
         let input = &context.input;
         let metadata = input.region_metadata();
-        let (samples, series) = if native::has_native_files(&context) {
-            native::open_sources(&context, &ranges).await?
+        let (samples, series) = if narthex::has_narthex_files(&context) {
+            narthex::open_sources(&context, &ranges).await?
         } else {
             open_sidecar_sources(&context, &ranges).await?
         };
@@ -560,9 +560,9 @@ impl ColumnarPreparedSource {
                         .map_err(|e| invalid(e.to_string()))?,
                 );
             }
-            if native::has_native_files(&context)
+            if narthex::has_narthex_files(&context)
                 && let Some(partition) =
-                    native_partition_filter(metadata.partition_expr.as_deref(), None)?
+                    narthex_partition_filter(metadata.partition_expr.as_deref(), None)?
             {
                 filters.push(
                     partition
@@ -1236,7 +1236,7 @@ fn filter_visibility(batch: RecordBatch, context: &StreamContext) -> Result<Reco
 }
 
 /// The mapper includes projected and residual-filter columns. Identity/time and
-/// merge visibility columns are always needed by the native source adapter. The exact
+/// merge visibility columns are always needed by the narthex source adapter. The exact
 /// series key is not projected: the samples reader returns it once per batch.
 fn sample_projection(
     schema: &datatypes::arrow::datatypes::Schema,
@@ -1255,8 +1255,8 @@ fn sample_projection(
         .collect()
 }
 
-/// Returns a partition rule only when native rows need filtering for this owner.
-fn native_partition_filter(
+/// Returns a partition rule only when metrics rows need filtering for this owner.
+fn narthex_partition_filter(
     region_partition: Option<&str>,
     file_partition: Option<&partition::expr::PartitionExpr>,
 ) -> Result<Option<partition::expr::PartitionExpr>> {
@@ -1270,7 +1270,7 @@ fn native_partition_filter(
         .filter(|partition| file_partition != Some(partition)))
 }
 
-/// Shares native discovery across partitions and assigns disjoint exact-series ranges.
+/// Shares narthex discovery across partitions and assigns disjoint exact-series ranges.
 pub(crate) fn scan_batches(
     preparation: Arc<Preparation>,
     context: Arc<StreamContext>,

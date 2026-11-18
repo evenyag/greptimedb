@@ -73,7 +73,7 @@ impl ColumnarWriter {
     pub(crate) fn with_prefix(mut self, prefix: String) -> Result<Self> {
         require(
             prefix.ends_with('/') && !prefix.split('/').any(|part| part == ".."),
-            "invalid native series prefix",
+            "invalid narthex series prefix",
         )?;
         self.manifest.prefix = Some(prefix);
         Ok(self)

@@ -496,7 +496,7 @@ impl MitoEngine {
     }
 
     /// Edit region's metadata by [RegionEdit] directly. Use with care.
-    /// Allows adding/removing data files and native series indexes.
+    /// Allows adding/removing data files and narthex series indexes.
     /// Other region editing intention will result in an "invalid request" error.
     /// Also note that if a region is to be edited directly, we MUST not write data to it thereafter.
     pub async fn edit_region(&self, region_id: RegionId, edit: RegionEdit) -> Result<()> {

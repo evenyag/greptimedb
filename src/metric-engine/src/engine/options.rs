@@ -74,12 +74,14 @@ pub fn set_data_region_options(options: &mut HashMap<String, String>) {
     let legacy_encoding = options.remove(MEMTABLE_PARTITION_TREE_PRIMARY_KEY_ENCODING);
     options.retain(|k, _| !k.starts_with(LEGACY_PARTITION_TREE_OPTION_PREFIX));
 
-    // Bulk memtables support both flat Parquet and native samples. Preserve
-    // explicit native storage while keeping the existing Parquet default.
+    // Bulk memtables support both flat Parquet and Narthex samples. Preserve
+    // explicit Narthex storage while keeping the existing Parquet default.
     options.insert("memtable.type".to_string(), "bulk".to_string());
-    if options.get("sst_format").map(String::as_str) != Some("native") {
-        options.insert("sst_format".to_string(), "flat".to_string());
-    }
+    let sst_format = match options.get("sst_format").map(String::as_str) {
+        Some("narthex" | "metrics" | "native") => "narthex",
+        _ => "flat",
+    };
+    options.insert("sst_format".to_string(), sst_format.to_string());
 
     // Decide the top-level primary key encoding: caller-supplied top-level key wins,
     // then extracted legacy value, then the `sparse` default.
@@ -160,12 +162,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_set_data_region_options_preserves_native_storage() {
-        let mut options = HashMap::from([("sst_format".to_string(), "native".to_string())]);
-        set_data_region_options(&mut options);
-        assert_eq!(options.get("sst_format").unwrap(), "native");
-        assert_eq!(options.get("memtable.type").unwrap(), "bulk");
-        assert_eq!(options.get(PRIMARY_KEY_ENCODING).unwrap(), "sparse");
+    fn test_set_data_region_options_preserves_narthex_storage() {
+        for format in ["narthex", "metrics", "native"] {
+            let mut options = HashMap::from([("sst_format".to_string(), format.to_string())]);
+            set_data_region_options(&mut options);
+            assert_eq!(options.get("sst_format").unwrap(), "narthex");
+            assert_eq!(options.get("memtable.type").unwrap(), "bulk");
+            assert_eq!(options.get(PRIMARY_KEY_ENCODING).unwrap(), "sparse");
+        }
     }
 
     #[test]

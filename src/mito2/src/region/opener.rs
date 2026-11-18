@@ -840,7 +840,7 @@ pub(crate) fn sanitize_region_options(manifest: &RegionManifest, options: &mut R
     }
     options.primary_key_encoding = Some(manifest.metadata.primary_key_encoding);
     if manifest.metadata.primary_key_encoding == PrimaryKeyEncoding::Sparse
-        && options.sst_format.unwrap_or(manifest.sst_format) != FormatType::Native
+        && options.sst_format.unwrap_or(manifest.sst_format) != FormatType::Narthex
     {
         options.sst_format = Some(FormatType::Flat);
     }

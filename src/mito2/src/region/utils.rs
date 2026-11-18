@@ -106,8 +106,8 @@ pub enum FileDescriptor {
     },
     /// A data file.
     Data { file_id: FileId, size: u64 },
-    /// One native object; manifests carry rewritten owner metadata.
-    NativeObject {
+    /// One narthex object; manifests carry rewritten owner metadata.
+    NarthexObject {
         source: String,
         target: String,
         size: u64,
@@ -120,13 +120,13 @@ impl FileDescriptor {
         match self {
             FileDescriptor::Index { size, .. } => *size,
             FileDescriptor::Data { size, .. } => *size,
-            FileDescriptor::NativeObject { size, .. } => *size,
+            FileDescriptor::NarthexObject { size, .. } => *size,
         }
     }
 
     fn file_path(&self, region_id: RegionId, table_dir: &str, path_type: PathType) -> String {
         match *self {
-            FileDescriptor::NativeObject { ref target, .. } => target.clone(),
+            FileDescriptor::NarthexObject { ref target, .. } => target.clone(),
             FileDescriptor::Index {
                 file_id, version, ..
             } => location::index_file_path(
@@ -159,7 +159,7 @@ fn build_copy_file_paths(
     table_dir: &str,
     path_type: PathType,
 ) -> (String, String) {
-    if let FileDescriptor::NativeObject { source, target, .. } = file_descriptor {
+    if let FileDescriptor::NarthexObject { source, target, .. } = file_descriptor {
         return (source, target);
     }
     (
@@ -231,7 +231,7 @@ impl RegionFileCopier {
                         path_type,
                     );
                     let now = Instant::now();
-                    let result = if let FileDescriptor::NativeObject {
+                    let result = if let FileDescriptor::NarthexObject {
                         manifest: Some(bytes),
                         ..
                     } = &file_desc
@@ -279,6 +279,16 @@ impl RegionFileCopier {
         let table_dir = self.access_layer.table_dir();
         let path_type = self.access_layer.path_type();
         let object_store = self.access_layer.object_store();
+        let narthex_dirs: std::collections::BTreeSet<_> = file_ids
+            .iter()
+            .filter_map(|file| {
+                if let FileDescriptor::NarthexObject { target, .. } = file {
+                    location::parent_dir(target).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect();
         let delete_file_path = file_ids
             .into_iter()
             .map(|file_descriptor| {
@@ -291,6 +301,12 @@ impl RegionFileCopier {
         );
         if let Err(err) = object_store.delete_iter(delete_file_path).await {
             error!(err; "Failed to delete files from region {}", target_region_id);
+            return;
+        }
+        for dir in narthex_dirs {
+            if let Err(err) = object_store.delete(&dir).await {
+                error!(err; "Failed to remove copied artifact directory {dir}");
+            }
         }
     }
 }

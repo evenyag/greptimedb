@@ -27,15 +27,15 @@ use crate::series_index::catalog::{RangeIndexEntry, SeriesIndexEntry};
 use crate::series_index::purger::{IndexFilePurger, PurgeRequest};
 use crate::sst::file::RegionFileId;
 
-/// Legacy codec coverage descriptor derived from immutable native metadata.
-/// Native admission and scan selection use the region-qualified `sources` instead.
-pub(crate) fn native_series_entry(
+/// Legacy codec coverage descriptor derived from immutable narthex metadata.
+/// Narthex admission and scan selection use the region-qualified `sources` instead.
+pub(crate) fn narthex_series_entry(
     file: &crate::sst::file::FileMeta,
 ) -> crate::error::Result<SeriesIndexEntry> {
     use crate::series_index::artifact::{ArtifactFormat, ArtifactMetadata, ArtifactObject};
-    let crate::sst::file::FileFormat::NativeSeries(index) = &file.format else {
+    let crate::sst::file::FileFormat::NarthexSeriesIndex(index) = &file.format else {
         return Err(crate::series_index::columnar::invalid(
-            "expected native series metadata",
+            "expected narthex series metadata",
         ));
     };
     Ok(SeriesIndexEntry {
@@ -96,27 +96,27 @@ impl SeriesIndexFileHandle {
                 entry,
                 deleted: AtomicBool::new(false),
                 purger: Some(purger),
-                native: None,
+                narthex_file: None,
             }),
         }
     }
 
-    pub(crate) fn from_native(file: crate::sst::file::FileHandle) -> crate::error::Result<Self> {
-        let entry = native_series_entry(file.meta_ref())?;
+    pub(crate) fn from_narthex(file: crate::sst::file::FileHandle) -> crate::error::Result<Self> {
+        let entry = narthex_series_entry(file.meta_ref())?;
         Ok(Self {
             inner: Arc::new(SeriesIndexFileHandleInner {
                 file_id: file.file_id(),
                 entry,
                 deleted: AtomicBool::new(false),
                 purger: None,
-                native: Some(file),
+                narthex_file: Some(file),
             }),
         })
     }
 
     pub(crate) fn manifest_path(&self) -> String {
-        if let Some(file) = &self.inner.native
-            && let crate::sst::file::FileFormat::NativeSeries(index) = &file.meta_ref().format
+        if let Some(file) = &self.inner.narthex_file
+            && let crate::sst::file::FileFormat::NarthexSeriesIndex(index) = &file.meta_ref().format
         {
             return index.manifest.path.clone();
         }
@@ -146,7 +146,7 @@ struct SeriesIndexFileHandleInner {
     entry: SeriesIndexEntry,
     deleted: AtomicBool,
     purger: Option<IndexFilePurger>,
-    native: Option<crate::sst::file::FileHandle>,
+    narthex_file: Option<crate::sst::file::FileHandle>,
 }
 
 impl Drop for SeriesIndexFileHandleInner {

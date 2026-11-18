@@ -841,7 +841,10 @@ impl RegionFlushTask {
             primary_key_min,
             primary_key_max,
             preserve_row_sequence: preserve_row_sequence
-                || matches!(sst_info.format, crate::sst::file::FileFormat::Native(_)),
+                || matches!(
+                    sst_info.format,
+                    crate::sst::file::FileFormat::NarthexSamples(_)
+                ),
         })
     }
 
@@ -866,8 +869,8 @@ impl RegionFlushTask {
             // contain Puts and retained delete barriers for the same row.
             max_sequence: (version.options.merge_mode() != MergeMode::LastNonNull)
                 .then_some(max_sequence),
-            sst_write_format: if version.options.sst_format == Some(FormatType::Native) {
-                FormatType::Native
+            sst_write_format: if version.options.sst_format == Some(FormatType::Narthex) {
+                FormatType::Narthex
             } else if flat_format {
                 FormatType::Flat
             } else {
@@ -959,7 +962,7 @@ fn memtable_flat_sources(
     let mut rows_remaining = components
         .iter()
         .filter(|component| {
-            options.sst_format == Some(FormatType::Native)
+            options.sst_format == Some(FormatType::Narthex)
                 || component.len() != 1
                 || component[0].encoded().is_none()
         })
@@ -971,7 +974,7 @@ fn memtable_flat_sources(
     for component in components {
         // A standalone encoded component is an ordering barrier. Do not merge
         // raw ranges on either side while uploading the intervening rows as-is.
-        if options.sst_format != Some(FormatType::Native)
+        if options.sst_format != Some(FormatType::Narthex)
             && component.len() == 1
             && let Some(encoded) = component[0].encoded()
         {

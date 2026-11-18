@@ -666,9 +666,9 @@ impl SstMerger for DefaultSstMerger {
                     // versions in SSTs that were not part of this merge.
                     max_sequence: None,
                     sst_write_format: if context.region_options.sst_format
-                        == Some(FormatType::Native)
+                        == Some(FormatType::Narthex)
                     {
-                        FormatType::Native
+                        FormatType::Narthex
                     } else if flat_format {
                         FormatType::Flat
                     } else {

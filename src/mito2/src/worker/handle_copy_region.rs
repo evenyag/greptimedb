@@ -27,7 +27,7 @@ use crate::request::{
     BackgroundNotify, CopyRegionFromFinished, CopyRegionFromRequest, WorkerRequest,
 };
 use crate::sst::file::{self, FileMeta};
-use crate::sst::location::region_dir_from_table_dir;
+use crate::sst::location::{self, region_dir_from_table_dir};
 use crate::worker::{RegionWorkerLoop, WorkerRequestWithTime};
 
 impl<S> RegionWorkerLoop<S> {
@@ -97,7 +97,7 @@ impl<S> RegionWorkerLoop<S> {
                                 || !matches!(file.format, file::FileFormat::Parquet)
                         }) =>
                 {
-                    // Shared references and native artifacts enter the serialized
+                    // Shared references and narthex artifacts enter the serialized
                     // edit lane for admission sequences and coverage validation.
                     // The response lists installed references, including shared SSTs
                     // whose objects stay in place; it is not a physical COPY count.
@@ -235,8 +235,8 @@ impl<S> RegionWorkerLoop<S> {
             }
             if file_meta.level == file::LEVEL_SHARED {
                 new_file_metas.push(file_meta.clone());
-            } else if matches!(file_meta.format, file::FileFormat::Native(_)) {
-                let (copied, objects) = prepare_native_copy(region, file_meta).await?;
+            } else if matches!(file_meta.format, file::FileFormat::NarthexSamples(_)) {
+                let (copied, objects) = prepare_narthex_copy(region, file_meta).await?;
                 new_file_metas.push(copied);
                 file_descriptors.extend(objects);
             } else {
@@ -256,15 +256,15 @@ impl<S> RegionWorkerLoop<S> {
             if target_region_manifest.series_indexes.contains_key(id) {
                 continue;
             }
-            let (mut copied, objects) = prepare_native_copy(region, index).await?;
-            if let file::FileFormat::NativeSeries(native) = &mut copied.format {
-                for source in &mut native.sources {
+            let (mut copied, objects) = prepare_narthex_copy(region, index).await?;
+            if let file::FileFormat::NarthexSeriesIndex(narthex) = &mut copied.format {
+                for source in &mut narthex.sources {
                     *source =
                         *target_samples
                             .get(&source.file_id())
                             .context(InvalidRequestSnafu {
                                 region_id: target_region_id,
-                                reason: "Native copy index has missing samples",
+                                reason: "Narthex copy index has missing samples",
                             })?;
                 }
             }
@@ -363,21 +363,20 @@ fn file_descriptors_for_meta(file_meta: &FileMeta) -> Vec<FileDescriptor> {
     }
 }
 
-/// Prepares a physical native copy without rewriting encoded parts. The artifact
+/// Prepares a physical narthex copy without rewriting encoded parts. The artifact
 /// manifest records the physical owner; paths are resolved from FileMeta on read.
-async fn prepare_native_copy(
+async fn prepare_narthex_copy(
     region: &MitoRegionRef,
     source: &FileMeta,
 ) -> Result<(FileMeta, Vec<FileDescriptor>)> {
     use crate::series_index::columnar::{invalid, require};
-    use crate::sst::file::{FileFormat, NativeObjectMeta};
+    use crate::sst::file::{FileFormat, NarthexObjectMeta};
 
     let layer = region.access_layer();
-    crate::sst::native::validate_inventory(&layer, source)?;
     let source_manifest = match &source.format {
-        FileFormat::Native(native) => &native.manifest,
-        FileFormat::NativeSeries(native) => &native.manifest,
-        FileFormat::Parquet => return Err(invalid("expected native copy source")),
+        FileFormat::NarthexSamples(narthex) => &narthex.manifest,
+        FileFormat::NarthexSeriesIndex(narthex) => &narthex.manifest,
+        FileFormat::Parquet => return Err(invalid("expected narthex copy source")),
     };
     let bytes = layer
         .object_store()
@@ -390,40 +389,34 @@ async fn prepare_native_copy(
     require(
         manifest["region_id"].as_u64() == Some(source.region_id.as_u64())
             && manifest["generation"].as_str() == Some(source.file_id.to_string().as_str()),
-        "native copy manifest identity mismatch",
+        "narthex copy manifest identity mismatch",
     )?;
     manifest["region_id"] = serde_json::json!(region.region_id.as_u64());
     let bytes = bytes::Bytes::from(
         serde_json::to_vec(&manifest).map_err(|error| invalid(error.to_string()))?,
     );
-    let source_prefix = format!(
-        "{}native/{}/",
-        layer.build_region_dir(source.region_id),
-        source.file_id
-    );
-    let target_prefix = format!(
-        "{}native/{}/",
-        layer.build_region_dir(region.region_id),
-        source.file_id
-    );
+    let source_prefix = location::parent_dir(&source_manifest.path)
+        .ok_or_else(|| invalid("narthex manifest has no parent directory"))?;
+    let target_prefix =
+        location::narthex_file_dir(&layer.build_region_dir(region.region_id), source.file_id);
     let mut descriptors = Vec::new();
-    let mut remap = |object: &mut NativeObjectMeta| -> Result<()> {
+    let mut remap = |object: &mut NarthexObjectMeta| -> Result<()> {
         let name = object
             .path
-            .strip_prefix(&source_prefix)
-            .ok_or_else(|| invalid("native copy object outside owner namespace"))?;
+            .strip_prefix(source_prefix)
+            .ok_or_else(|| invalid("narthex copy object outside owner namespace"))?;
         let target = format!("{target_prefix}{name}");
         let manifest = (object.path == source_manifest.path).then(|| bytes.clone());
         let size = manifest
             .as_ref()
             .map_or(object.file_size, |bytes| bytes.len() as u64);
-        descriptors.push(FileDescriptor::NativeObject {
+        descriptors.push(FileDescriptor::NarthexObject {
             source: object.path.clone(),
             target: target.clone(),
             size,
             manifest,
         });
-        *object = NativeObjectMeta {
+        *object = NarthexObjectMeta {
             path: target,
             file_size: size,
         };
@@ -431,24 +424,23 @@ async fn prepare_native_copy(
     };
     let mut copied = remap_copied_file_meta(source, region.region_id);
     match &mut copied.format {
-        FileFormat::Native(native) => {
-            for part in &mut native.parts {
+        FileFormat::NarthexSamples(narthex) => {
+            for part in &mut narthex.parts {
                 remap(&mut part.object)?;
             }
-            remap(&mut native.manifest)?;
+            remap(&mut narthex.manifest)?;
         }
-        FileFormat::NativeSeries(native) => {
-            for part in &mut native.parts {
+        FileFormat::NarthexSeriesIndex(narthex) => {
+            for part in &mut narthex.parts {
                 remap(part)?;
             }
-            remap(&mut native.manifest)?;
+            remap(&mut narthex.manifest)?;
         }
-        FileFormat::Parquet => return Err(invalid("expected native copy source")),
+        FileFormat::Parquet => return Err(invalid("expected narthex copy source")),
     }
     copied.file_size = descriptors.iter().try_fold(0u64, |size, object| {
         size.checked_add(object.size())
-            .ok_or_else(|| invalid("native copy size overflow"))
+            .ok_or_else(|| invalid("narthex copy size overflow"))
     })?;
-    crate::sst::native::validate_inventory(&layer, &copied)?;
     Ok((copied, descriptors))
 }

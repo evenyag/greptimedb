@@ -70,8 +70,8 @@ pub(crate) enum FlatReadMode {
 /// The output order is always `order by primary keys, time index` inside every
 /// [`PartitionRange`]. Each "partition" may contains many [`PartitionRange`]s.
 pub struct SeqScan {
-    /// Shares native candidate discovery across batch-output partitions.
-    native_preparation: Arc<crate::read::series_scan::prepared::Preparation>,
+    /// Shares narthex candidate discovery across batch-output partitions.
+    narthex_preparation: Arc<crate::read::series_scan::prepared::Preparation>,
     /// Properties of the scanner.
     properties: ScannerProperties,
     /// Context of streams.
@@ -102,7 +102,9 @@ impl SeqScan {
         let pruner = Arc::new(Pruner::new(stream_ctx.clone(), num_workers));
 
         Self {
-            native_preparation: Arc::new(crate::read::series_scan::prepared::Preparation::default()),
+            narthex_preparation: Arc::new(
+                crate::read::series_scan::prepared::Preparation::default(),
+            ),
             properties,
             stream_ctx,
             pruner,
@@ -160,9 +162,9 @@ impl SeqScan {
         debug_assert_eq!(1, self.properties.partitions.len());
         let partition_ranges = &self.properties.partitions[0];
 
-        if self.stream_ctx.input.requires_native_preparation() {
+        if self.stream_ctx.input.requires_narthex_preparation() {
             let source = self
-                .native_preparation
+                .narthex_preparation
                 .prepare_batches(
                     self.stream_ctx.clone(),
                     partition_ranges.clone(),
@@ -457,9 +459,9 @@ impl SeqScan {
             }
         );
 
-        if self.stream_ctx.input.requires_native_preparation() {
+        if self.stream_ctx.input.requires_narthex_preparation() {
             return Ok(crate::read::series_scan::prepared::scan_batches(
-                self.native_preparation.clone(),
+                self.narthex_preparation.clone(),
                 self.stream_ctx.clone(),
                 self.properties
                     .partitions
@@ -658,7 +660,7 @@ impl RegionScanner for SeqScan {
     }
 
     fn prepare(&mut self, request: PrepareRequest) -> Result<(), BoxedError> {
-        self.native_preparation =
+        self.narthex_preparation =
             Arc::new(crate::read::series_scan::prepared::Preparation::default());
         self.properties.prepare(request);
 
@@ -680,7 +682,7 @@ impl RegionScanner for SeqScan {
         &mut self,
         filter_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
     ) -> Vec<bool> {
-        if self.stream_ctx.input.requires_native_preparation() {
+        if self.stream_ctx.input.requires_narthex_preparation() {
             // Prepared ordinals are immutable. Keep changing filters in the caller
             // rather than claiming pushdown that discovery cannot honor.
             return vec![false; filter_exprs.len()];

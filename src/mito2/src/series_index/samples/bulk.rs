@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Synchronous in-memory blocks using the native samples column codecs.
+//! Synchronous in-memory blocks using the narthex samples column codecs.
 
 use std::sync::Arc;
 
@@ -30,39 +30,39 @@ use super::{MAX_ROWS, codec, invalid, require};
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, Result};
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct NativeBulkPart {
-    blocks: Vec<NativeBulkBlock>,
+pub(crate) struct NarthexBulkPart {
+    blocks: Vec<NarthexBulkBlock>,
 }
 
 #[derive(Debug, Clone)]
-struct NativeBulkBlock {
+struct NarthexBulkBlock {
     key: Bytes,
     rows: usize,
-    columns: Vec<NativeBulkColumn>,
+    columns: Vec<NarthexBulkColumn>,
 }
 
 #[derive(Debug, Clone)]
-enum NativeBulkColumn {
+enum NarthexBulkColumn {
     Key,
     Numbers { encoding: u16, bytes: Bytes },
     Float { nulls: u32, bytes: Bytes },
     Operations { encoding: u16, bytes: Bytes },
 }
 
-impl NativeBulkPart {
+impl NarthexBulkPart {
     pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
         let key = batch
             .column_by_name(PRIMARY_KEY_COLUMN_NAME)
-            .ok_or_else(|| invalid("native bulk part requires exact primary keys"))?;
+            .ok_or_else(|| invalid("narthex bulk part requires exact primary keys"))?;
         let keys = cast(key, &DataType::Binary).context(ComputeArrowSnafu)?;
         let keys = keys
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| invalid("native bulk key must be binary"))?;
-        require(keys.null_count() == 0, "native bulk key must not be null")?;
+            .ok_or_else(|| invalid("narthex bulk key must be binary"))?;
+        require(keys.null_count() == 0, "narthex bulk key must not be null")?;
         let mut start = 0;
         while start < batch.num_rows() {
             let mut end = start + 1;
@@ -79,63 +79,63 @@ impl NativeBulkPart {
                 .zip(slice.schema().fields())
                 .map(|(array, field)| {
                     if field.name() == PRIMARY_KEY_COLUMN_NAME {
-                        return Ok(NativeBulkColumn::Key);
+                        return Ok(NarthexBulkColumn::Key);
                     }
                     let column = match field.data_type() {
                         DataType::Float64 => {
                             let values = array
                                 .as_any()
                                 .downcast_ref::<Float64Array>()
-                                .ok_or_else(|| invalid("invalid native bulk float column"))?;
+                                .ok_or_else(|| invalid("invalid narthex bulk float column"))?;
                             let bits = values
                                 .iter()
                                 .map(|v| v.map(f64::to_bits))
                                 .collect::<Vec<_>>();
-                            NativeBulkColumn::Float {
+                            NarthexBulkColumn::Float {
                                 nulls: array.null_count() as u32,
                                 bytes: codec::encode_float(&bits).into(),
                             }
                         }
                         DataType::Timestamp(_, _) => {
-                            require(array.null_count() == 0, "null native bulk timestamp")?;
+                            require(array.null_count() == 0, "null narthex bulk timestamp")?;
                             let array = cast(array, &DataType::Int64).context(ComputeArrowSnafu)?;
                             let values = array
                                 .as_any()
                                 .downcast_ref::<Int64Array>()
-                                .ok_or_else(|| invalid("invalid native bulk timestamp"))?;
+                                .ok_or_else(|| invalid("invalid narthex bulk timestamp"))?;
                             let (encoding, bytes) = codec::encode_time(values.values());
-                            NativeBulkColumn::Numbers {
+                            NarthexBulkColumn::Numbers {
                                 encoding,
                                 bytes: bytes.into(),
                             }
                         }
                         DataType::UInt64 => {
-                            require(array.null_count() == 0, "null native bulk sequence")?;
+                            require(array.null_count() == 0, "null narthex bulk sequence")?;
                             let values = array
                                 .as_any()
                                 .downcast_ref::<UInt64Array>()
-                                .ok_or_else(|| invalid("invalid native bulk sequence"))?;
+                                .ok_or_else(|| invalid("invalid narthex bulk sequence"))?;
                             let (encoding, bytes) = codec::encode_sequence(values.values());
-                            NativeBulkColumn::Numbers {
+                            NarthexBulkColumn::Numbers {
                                 encoding,
                                 bytes: bytes.into(),
                             }
                         }
                         DataType::UInt8 => {
-                            require(array.null_count() == 0, "null native bulk operation")?;
+                            require(array.null_count() == 0, "null narthex bulk operation")?;
                             let values = array
                                 .as_any()
                                 .downcast_ref::<UInt8Array>()
-                                .ok_or_else(|| invalid("invalid native bulk operation"))?;
+                                .ok_or_else(|| invalid("invalid narthex bulk operation"))?;
                             let (encoding, bytes) = codec::encode_operations(values.values());
-                            NativeBulkColumn::Operations {
+                            NarthexBulkColumn::Operations {
                                 encoding,
                                 bytes: bytes.into(),
                             }
                         }
                         other => {
                             return Err(invalid(format!(
-                                "unsupported native bulk column {}: {other}",
+                                "unsupported narthex bulk column {}: {other}",
                                 field.name()
                             )));
                         }
@@ -143,7 +143,7 @@ impl NativeBulkPart {
                     Ok(column)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            self.blocks.push(NativeBulkBlock {
+            self.blocks.push(NarthexBulkBlock {
                 key: Bytes::copy_from_slice(keys.value(start)),
                 rows: end - start,
                 columns,
@@ -158,17 +158,17 @@ impl NativeBulkPart {
             .iter()
             .map(|block| {
                 block.key.len()
-                    + std::mem::size_of::<NativeBulkBlock>()
+                    + std::mem::size_of::<NarthexBulkBlock>()
                     + block
                         .columns
                         .iter()
                         .map(|column| {
-                            std::mem::size_of::<NativeBulkColumn>()
+                            std::mem::size_of::<NarthexBulkColumn>()
                                 + match column {
-                                    NativeBulkColumn::Key => 0,
-                                    NativeBulkColumn::Numbers { bytes, .. }
-                                    | NativeBulkColumn::Float { bytes, .. }
-                                    | NativeBulkColumn::Operations { bytes, .. } => bytes.len(),
+                                    NarthexBulkColumn::Key => 0,
+                                    NarthexBulkColumn::Numbers { bytes, .. }
+                                    | NarthexBulkColumn::Float { bytes, .. }
+                                    | NarthexBulkColumn::Operations { bytes, .. } => bytes.len(),
                                 }
                         })
                         .sum::<usize>()
@@ -176,7 +176,7 @@ impl NativeBulkPart {
             .sum()
     }
 
-    /// Native keys are separate from encoded sample columns.
+    /// Narthex keys are separate from encoded sample columns.
     pub(crate) fn primary_keys(&self) -> crate::memtable::BoxedPrimaryKeyIterator {
         Box::new(
             self.blocks
@@ -198,7 +198,7 @@ impl NativeBulkPart {
     }
 }
 
-impl NativeBulkBlock {
+impl NarthexBulkBlock {
     fn decode(&self, schema: SchemaRef) -> Result<RecordBatch> {
         let columns = self
             .columns
@@ -206,13 +206,13 @@ impl NativeBulkBlock {
             .zip(schema.fields())
             .map(|(column, field)| {
                 let array: ArrayRef = match column {
-                    NativeBulkColumn::Key => {
+                    NarthexBulkColumn::Key => {
                         let array: ArrayRef = Arc::new(BinaryArray::from_iter_values(
                             std::iter::repeat_n(self.key.as_ref(), self.rows),
                         ));
                         cast(&array, field.data_type()).context(ComputeArrowSnafu)?
                     }
-                    NativeBulkColumn::Numbers { encoding, bytes } => {
+                    NarthexBulkColumn::Numbers { encoding, bytes } => {
                         let values = codec::decode_numbers(bytes, *encoding, self.rows)?;
                         if matches!(field.data_type(), DataType::Timestamp(_, _)) {
                             let array: ArrayRef = Arc::new(Int64Array::from(
@@ -223,15 +223,15 @@ impl NativeBulkBlock {
                             Arc::new(UInt64Array::from(values))
                         }
                     }
-                    NativeBulkColumn::Float { bytes, nulls } => Arc::new(Float64Array::from(
+                    NarthexBulkColumn::Float { bytes, nulls } => Arc::new(Float64Array::from(
                         codec::decode_float(bytes, self.rows, *nulls)?
                             .into_iter()
                             .map(|v| v.map(f64::from_bits))
                             .collect::<Vec<_>>(),
                     )),
-                    NativeBulkColumn::Operations { encoding, bytes } => Arc::new(UInt8Array::from(
-                        codec::decode_operations(bytes, *encoding, self.rows)?,
-                    )),
+                    NarthexBulkColumn::Operations { encoding, bytes } => Arc::new(
+                        UInt8Array::from(codec::decode_operations(bytes, *encoding, self.rows)?),
+                    ),
                 };
                 Ok(array)
             })
@@ -248,7 +248,7 @@ mod tests {
     use store_api::storage::consts::{OP_TYPE_COLUMN_NAME, SEQUENCE_COLUMN_NAME};
 
     #[test]
-    fn native_bulk_codec_preserves_keys_nulls_sequences_and_float_bits() {
+    fn narthex_bulk_codec_preserves_keys_nulls_sequences_and_float_bits() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Float64, true),
             Field::new(
@@ -286,7 +286,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut encoded = NativeBulkPart::default();
+        let mut encoded = NarthexBulkPart::default();
         encoded.push(&batch).unwrap();
         assert_eq!(2, encoded.blocks.len());
         let decoded = encoded
@@ -298,7 +298,7 @@ mod tests {
             encoded.primary_keys().collect::<Vec<_>>()
         );
         let mut corrupt = encoded.clone();
-        corrupt.blocks[0].columns[0] = NativeBulkColumn::Float {
+        corrupt.blocks[0].columns[0] = NarthexBulkColumn::Float {
             nulls: 0,
             bytes: Bytes::new(),
         };

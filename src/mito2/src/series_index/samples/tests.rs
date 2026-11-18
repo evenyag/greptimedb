@@ -2037,7 +2037,7 @@ async fn series_read_windows_are_bounded_and_gap_rows_are_not_returned() {
     }
 }
 
-#[ignore = "TODO(narthex-merge): native payload byte cache is disabled after the merge; re-enable with a dedicated page-cache budget"]
+#[ignore = "TODO(narthex-merge): narthex payload byte cache is disabled after the merge; re-enable with a dedicated page-cache budget"]
 #[tokio::test]
 async fn aligned_payload_cache_reuses_gap_bytes_across_readers() {
     use crate::cache::{CacheManager, CacheStrategy};
@@ -2421,11 +2421,11 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
 
 mod keys;
 
-/// Native readers use the SST lifetime, not the local sidecar purger.
+/// Narthex readers use the SST lifetime, not the local sidecar purger.
 #[tokio::test]
-async fn native_file_reader_pins_sst_lifetime() {
+async fn narthex_file_reader_pins_sst_lifetime() {
     use crate::sst::file::{
-        FileFormat, FileHandle, FileMeta, NativeFileMeta, NativeObjectMeta, NativeSamplesPart,
+        FileFormat, FileHandle, FileMeta, NarthexObjectMeta, NarthexSamplesMeta, NarthexSamplesPart,
     };
     use crate::sst::file_purger::FilePurger;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2451,11 +2451,11 @@ async fn native_file_reader_pins_sst_lifetime() {
         .unwrap();
     writer.write(&batch(&meta, &rows, false)).await.unwrap();
     let artifact = writer.finish().await.unwrap();
-    let object = |o: &crate::series_index::artifact::ArtifactObject| NativeObjectMeta {
+    let object = |o: &crate::series_index::artifact::ArtifactObject| NarthexObjectMeta {
         path: o.path.clone(),
         file_size: o.file_size,
     };
-    let native = NativeFileMeta {
+    let narthex = NarthexSamplesMeta {
         use_file_sequence: false,
         manifest: object(
             artifact
@@ -2469,7 +2469,7 @@ async fn native_file_reader_pins_sst_lifetime() {
             .iter()
             .filter(|o| o.path.ends_with(".samples"))
             .enumerate()
-            .map(|(i, o)| NativeSamplesPart {
+            .map(|(i, o)| NarthexSamplesPart {
                 part_id: i as u32,
                 object: object(o),
             })
@@ -2478,7 +2478,7 @@ async fn native_file_reader_pins_sst_lifetime() {
     let file_meta = FileMeta {
         region_id: meta.region_id,
         file_id: id,
-        format: FileFormat::Native(native),
+        format: FileFormat::NarthexSamples(narthex),
         file_size: artifact.file_size,
         num_rows: rows.len() as u64,
         ..Default::default()
@@ -2488,7 +2488,7 @@ async fn native_file_reader_pins_sst_lifetime() {
     assert_eq!(file_meta, restored);
     let purged = Arc::new(AtomicUsize::new(0));
     let file = FileHandle::new(restored, Arc::new(CountingPurger(purged.clone())));
-    let handle = SamplesFileHandle::from_native(file.clone()).unwrap();
+    let handle = SamplesFileHandle::from_narthex(file.clone()).unwrap();
     let reader = reader::SamplesReader::open(store, handle).await.unwrap();
     file.mark_deleted();
     drop(file);
@@ -2505,9 +2505,9 @@ async fn native_file_reader_pins_sst_lifetime() {
 }
 
 #[test]
-fn native_region_schema_rejected_before_writes() {
+fn narthex_region_schema_rejected_before_writes() {
     let options = crate::region::options::RegionOptions {
-        sst_format: Some(crate::sst::FormatType::Native),
+        sst_format: Some(crate::sst::FormatType::Narthex),
         ..Default::default()
     };
     options.validate_schema(&metadata()).unwrap();
@@ -2518,7 +2518,7 @@ fn native_region_schema_rejected_before_writes() {
 }
 
 #[tokio::test]
-async fn native_write_error_cleans_completed_parts_before_returning() {
+async fn narthex_write_error_cleans_completed_parts_before_returning() {
     let store = store();
     let metadata = metadata();
     let format = ColumnarSamplesFormat {
@@ -2530,7 +2530,7 @@ async fn native_write_error_cleans_completed_parts_before_returning() {
         .writer(
             metadata.clone(),
             store.clone(),
-            "native-error/",
+            "narthex-error/",
             FileId::random(),
             FileId::random(),
         )
@@ -2550,18 +2550,18 @@ async fn native_write_error_cleans_completed_parts_before_returning() {
         .unwrap();
     assert!(
         !store
-            .list_with("native-error/")
+            .list_with("narthex-error/")
             .recursive(true)
             .await
             .unwrap()
             .is_empty()
     );
     let error = crate::series_index::columnar::invalid("injected source error");
-    let error = crate::sst::native::abort_native_write(writer, error).await;
+    let error = crate::sst::narthex::abort_narthex_write(writer, error).await;
     assert!(error.to_string().contains("injected source error"));
     assert!(
         store
-            .list_with("native-error/")
+            .list_with("narthex-error/")
             .recursive(true)
             .await
             .unwrap()
@@ -2570,7 +2570,7 @@ async fn native_write_error_cleans_completed_parts_before_returning() {
 }
 
 #[tokio::test]
-async fn native_prepared_discovery_empty_projection_skips_payload() {
+async fn narthex_prepared_discovery_empty_projection_skips_payload() {
     let store = store();
     let metadata = metadata();
     let rows = (1..=2)

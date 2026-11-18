@@ -134,7 +134,7 @@ struct SamplesFileInner {
 #[derive(Debug)]
 enum SamplesLifetime {
     Sidecar(IndexFilePurger),
-    Native(crate::sst::file::FileHandle),
+    Narthex(crate::sst::file::FileHandle),
 }
 
 impl SamplesFileHandle {
@@ -148,14 +148,14 @@ impl SamplesFileHandle {
     }
 
     /// Pins an authoritative SST instead of giving the sidecar purger ownership.
-    pub(crate) fn from_native(file: crate::sst::file::FileHandle) -> crate::error::Result<Self> {
-        let crate::sst::file::FileFormat::Native(native) = &file.meta_ref().format else {
+    pub(crate) fn from_narthex(file: crate::sst::file::FileHandle) -> crate::error::Result<Self> {
+        let crate::sst::file::FileFormat::NarthexSamples(narthex) = &file.meta_ref().format else {
             return crate::error::UnsupportedOperationSnafu {
-                err_msg: "Expected native samples file",
+                err_msg: "Expected narthex samples file",
             }
             .fail();
         };
-        let objects: Vec<_> = native
+        let objects: Vec<_> = narthex
             .objects()
             .map(|object| ArtifactObject {
                 path: object.path.clone(),
@@ -165,7 +165,7 @@ impl SamplesFileHandle {
         let file_size = objects.iter().try_fold(0u64, |total, object| {
             total.checked_add(object.file_size).ok_or_else(|| {
                 crate::error::UnsupportedOperationSnafu {
-                    err_msg: "Native samples size overflow",
+                    err_msg: "Narthex samples size overflow",
                 }
                 .build()
             })
@@ -186,22 +186,22 @@ impl SamplesFileHandle {
                 source_windows: Default::default(),
             },
             retired: AtomicBool::new(false),
-            lifetime: SamplesLifetime::Native(file),
+            lifetime: SamplesLifetime::Narthex(file),
         })))
     }
 
     pub(crate) fn file_id(&self) -> RegionFileId {
         match &self.0.lifetime {
             SamplesLifetime::Sidecar(_) => self.0.file_id,
-            SamplesLifetime::Native(file) => file.file_id(),
+            SamplesLifetime::Narthex(file) => file.file_id(),
         }
     }
 
     pub(crate) fn manifest_path(&self) -> String {
-        if let SamplesLifetime::Native(file) = &self.0.lifetime
-            && let crate::sst::file::FileFormat::Native(native) = &file.meta_ref().format
+        if let SamplesLifetime::Narthex(file) = &self.0.lifetime
+            && let crate::sst::file::FileFormat::NarthexSamples(narthex) = &file.meta_ref().format
         {
-            return native.manifest.path.clone();
+            return narthex.manifest.path.clone();
         }
         format!(
             "{}manifest.json",

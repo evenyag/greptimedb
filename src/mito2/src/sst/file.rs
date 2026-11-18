@@ -30,7 +30,6 @@ use datatypes::schema::FulltextBackend;
 use partition::expr::PartitionExpr;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use snafu::ResultExt;
 use store_api::metadata::ColumnMetadata;
 use store_api::region_request::PathType;
 use store_api::storage::{ColumnId, FileId, IndexVersion, RegionId};
@@ -238,23 +237,25 @@ pub(crate) fn overlaps(l: &FileTimeRange, r: &FileTimeRange) -> bool {
 pub enum FileFormat {
     #[default]
     Parquet,
-    Native(NativeFileMeta),
-    NativeSeries(NativeSeriesIndexMeta),
+    #[serde(alias = "native", alias = "metrics_samples")]
+    NarthexSamples(NarthexSamplesMeta),
+    #[serde(alias = "native_series", alias = "metrics_series_index")]
+    NarthexSeriesIndex(NarthexSeriesIndexMeta),
 }
 
 impl FileFormat {
-    /// All objects in deletion order (manifest last), for authoritative native artifacts.
-    pub(crate) fn native_objects(&self) -> Option<Vec<&NativeObjectMeta>> {
+    /// All objects in deletion order (manifest last), for authoritative narthex artifacts.
+    pub(crate) fn narthex_objects(&self) -> Option<Vec<&NarthexObjectMeta>> {
         match self {
             Self::Parquet => None,
-            Self::Native(meta) => Some(
+            Self::NarthexSamples(meta) => Some(
                 meta.parts
                     .iter()
                     .map(|part| &part.object)
                     .chain(std::iter::once(&meta.manifest))
                     .collect(),
             ),
-            Self::NativeSeries(meta) => Some(
+            Self::NarthexSeriesIndex(meta) => Some(
                 meta.parts
                     .iter()
                     .chain(std::iter::once(&meta.manifest))
@@ -268,42 +269,42 @@ impl FileFormat {
     }
 }
 
-/// Native samples objects owned by one immutable file ID.
+/// Narthex samples objects owned by one immutable file ID.
 /// Common bounds, statistics and sequence semantics remain in [`FileMeta`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeFileMeta {
+pub struct NarthexSamplesMeta {
     /// Imported rows use the destination file admission sequence.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_file_sequence: bool,
-    pub manifest: NativeObjectMeta,
-    pub parts: Vec<NativeSamplesPart>,
+    pub manifest: NarthexObjectMeta,
+    pub parts: Vec<NarthexSamplesPart>,
 }
 
-/// Immutable native series index. Coverage identifies samples; it does not own them.
+/// Immutable narthex series index. Coverage identifies samples; it does not own them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeSeriesIndexMeta {
-    pub manifest: NativeObjectMeta,
-    pub parts: Vec<NativeObjectMeta>,
+pub struct NarthexSeriesIndexMeta {
+    pub manifest: NarthexObjectMeta,
+    pub parts: Vec<NarthexObjectMeta>,
     pub sources: Vec<RegionFileId>,
 }
 
-/// One native object's location and encoded size.
+/// One narthex object's location and encoded size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeObjectMeta {
+pub struct NarthexObjectMeta {
     pub path: String,
     pub file_size: u64,
 }
 
 /// One independently readable samples part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeSamplesPart {
+pub struct NarthexSamplesPart {
     pub part_id: u32,
-    pub object: NativeObjectMeta,
+    pub object: NarthexObjectMeta,
 }
 
-impl NativeFileMeta {
+impl NarthexSamplesMeta {
     /// Enumerates the complete object inventory, including the manifest.
-    pub fn objects(&self) -> impl Iterator<Item = &NativeObjectMeta> {
+    pub fn objects(&self) -> impl Iterator<Item = &NarthexObjectMeta> {
         std::iter::once(&self.manifest).chain(self.parts.iter().map(|part| &part.object))
     }
 }
@@ -531,12 +532,12 @@ fn is_zero(version: &u8) -> bool {
 }
 
 impl FileMeta {
-    /// Returns the authoritative object path, using the artifact manifest for native files.
+    /// Returns the authoritative object path, using the artifact manifest for narthex files.
     pub fn file_path(&self, table_dir: &str, path_type: PathType) -> String {
         match &self.format {
             FileFormat::Parquet => location::sst_file_path(table_dir, self.file_id(), path_type),
-            FileFormat::Native(native) => native.manifest.path.clone(),
-            FileFormat::NativeSeries(native) => native.manifest.path.clone(),
+            FileFormat::NarthexSamples(narthex) => narthex.manifest.path.clone(),
+            FileFormat::NarthexSeriesIndex(narthex) => narthex.manifest.path.clone(),
         }
     }
 
@@ -544,11 +545,11 @@ impl FileMeta {
     ///
     /// Foreign files use their target-local sequence barrier; local files require
     /// the preserve marker because their physical sequences belong to this region.
-    /// Native imports explicitly replace every row sequence with the admission
+    /// Metrics imports explicitly replace every row sequence with the admission
     /// barrier, including physical copies now owned by the target region.
     pub(crate) fn is_effective_target_sequence_trusted(&self, target_region_id: RegionId) -> bool {
         if self.region_id != target_region_id
-            || matches!(&self.format, FileFormat::Native(native) if native.use_file_sequence)
+            || matches!(&self.format, FileFormat::NarthexSamples(narthex) if narthex.use_file_sequence)
         {
             self.sequence.is_some()
         } else {
@@ -772,7 +773,7 @@ impl FileHandle {
     ///
     /// Foreign files use their target-local sequence barrier; local files require
     /// the preserve marker because their physical sequences belong to this region.
-    /// Native imports explicitly replace every row sequence with the admission
+    /// Metrics imports explicitly replace every row sequence with the admission
     /// barrier, including physical copies now owned by the target region.
     pub(crate) fn is_effective_target_sequence_trusted(&self, target_region_id: RegionId) -> bool {
         self.meta_ref()
@@ -1163,14 +1164,8 @@ impl UncommittedSsts {
         let delete_index = files.values().any(|(_, exists_index, _)| *exists_index);
         let mut file_ids = Vec::new();
         for (file_id, (index_version, _, format)) in files {
-            if let Some(objects) = format.native_objects() {
-                for object in objects {
-                    self.access_layer
-                        .object_store()
-                        .delete(&object.path)
-                        .await
-                        .context(crate::error::OpenDalSnafu)?;
-                }
+            if format.narthex_objects().is_some() {
+                self.access_layer.delete_narthex_objects(&format).await?;
             } else {
                 file_ids.push((file_id, index_version));
             }

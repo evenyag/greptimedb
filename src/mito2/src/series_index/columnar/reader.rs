@@ -124,7 +124,7 @@ impl ColumnarReader {
         })?;
         manifest.prefix = Some(
             path.strip_suffix("manifest.json")
-                .ok_or_else(|| invalid("invalid native series manifest path"))?
+                .ok_or_else(|| invalid("invalid narthex series manifest path"))?
                 .to_string(),
         );
         if manifest.version != VERSION {

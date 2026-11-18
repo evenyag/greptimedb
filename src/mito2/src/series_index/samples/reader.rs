@@ -141,7 +141,7 @@ impl SamplesReader {
         })?;
         manifest.prefix = Some(
             path.strip_suffix("manifest.json")
-                .ok_or_else(|| invalid("invalid native manifest path"))?
+                .ok_or_else(|| invalid("invalid narthex manifest path"))?
                 .to_string(),
         );
         if manifest.version != VERSION {

@@ -1491,10 +1491,10 @@ pub(crate) async fn scan_flat_file_ranges(
     let file = stream_ctx.input.file_from_index(index);
     if matches!(
         file.meta_ref().format,
-        crate::sst::file::FileFormat::Native(_)
+        crate::sst::file::FileFormat::NarthexSamples(_)
     ) {
         return crate::error::UnsupportedOperationSnafu {
-            err_msg: "Native files must be read through scanner-wide preparation",
+            err_msg: "Narthex files must be read through scanner-wide preparation",
         }
         .fail();
     }

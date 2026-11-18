@@ -620,7 +620,7 @@ impl RegionManifestManager {
                 } else {
                     &self.manifest
                 };
-                edit.validate_native_series(manifest)?;
+                edit.validate_narthex_series(manifest)?;
                 for file in edit.files_to_add.iter().chain(&edit.files_to_remove) {
                     ensure!(
                         file::is_supported_level(file.level),

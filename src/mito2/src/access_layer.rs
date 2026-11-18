@@ -304,14 +304,41 @@ impl AccessLayer {
         })?;
 
         // The caller has already fenced this physical artifact ID against live
-        // and foreign references. Reclaim all native objects for the same ID.
+        // and foreign references. Reclaim all narthex objects for the same ID.
         for file_id in file_ids {
-            let prefix = format!("{}native/{file_id}/", self.build_region_dir(region_id));
+            let region_dir = self.build_region_dir(region_id);
+            for parent in [&region_dir, &location::legacy_native_dir(&region_dir)] {
+                let prefix = location::narthex_file_dir(parent, *file_id);
+                self.object_store
+                    .delete_with(&prefix)
+                    .recursive(true)
+                    .await
+                    .context(OpenDalSnafu)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes narthex objects with the manifest last, then their empty directories.
+    pub(crate) async fn delete_narthex_objects(
+        &self,
+        format: &crate::sst::file::FileFormat,
+    ) -> Result<()> {
+        let Some(objects) = format.narthex_objects() else {
+            return Ok(());
+        };
+        let mut dirs = std::collections::BTreeSet::new();
+        for object in objects {
             self.object_store
-                .delete_with(&prefix)
-                .recursive(true)
+                .delete(&object.path)
                 .await
                 .context(OpenDalSnafu)?;
+            if let Some(dir) = location::parent_dir(&object.path) {
+                dirs.insert(dir);
+            }
+        }
+        for dir in dirs {
+            self.object_store.delete(dir).await.context(OpenDalSnafu)?;
         }
         Ok(())
     }
@@ -410,8 +437,8 @@ impl AccessLayer {
         metrics: &mut Metrics,
         context: Option<crate::sst::parquet::writer::SstWriteContext>,
     ) -> Result<SstInfoArray> {
-        if request.sst_write_format == FormatType::Native {
-            return crate::sst::native::write_samples(self, request, context.map(|ctx| ctx.guard))
+        if request.sst_write_format == FormatType::Narthex {
+            return crate::sst::narthex::write_samples(self, request, context.map(|ctx| ctx.guard))
                 .await;
         }
         let limits = context.as_ref().map(|context| context.limits);
@@ -500,9 +527,9 @@ impl AccessLayer {
                         )
                         .await?
                 }
-                FormatType::Native => {
+                FormatType::Narthex => {
                     return crate::error::UnsupportedOperationSnafu {
-                        err_msg: "native writer must bypass Parquet cache",
+                        err_msg: "narthex writer must bypass Parquet cache",
                     }
                     .fail();
                 }
@@ -662,7 +689,7 @@ impl AccessLayer {
 
                 let path = entry.path();
                 if !path.ends_with(".parquet") && !path.ends_with(".puffin")
-                    && crate::sst::native::file_id_from_path(path).is_none() {
+                    && crate::sst::location::parse_narthex_file_id(path).is_none() {
                     continue;
                 }
 

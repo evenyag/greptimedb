@@ -209,11 +209,11 @@ impl RegionOptions {
         Ok(())
     }
 
-    /// Validates native schema support and format-specific column compression.
+    /// Validates narthex schema support and format-specific column compression.
     /// The caller must resolve the SST format before validation.
     pub(crate) fn validate_schema(&self, metadata: &RegionMetadata) -> Result<()> {
-        if self.sst_format == Some(FormatType::Native) {
-            crate::series_index::samples::validate_native_metadata(metadata)?;
+        if self.sst_format == Some(FormatType::Narthex) {
+            crate::series_index::samples::validate_narthex_metadata(metadata)?;
         }
         if self.sst_format == Some(FormatType::Flat)
             && metadata.primary_key_encoding == PrimaryKeyEncoding::Dense
@@ -351,7 +351,7 @@ impl RegionOptions {
         // `put_sst()`, so the SST format must be flat to match.
         if (matches!(memtable, Some(MemtableOptions::Bulk(_)))
             || primary_key_encoding == Some(PrimaryKeyEncoding::Sparse))
-            && sst_format != Some(FormatType::Native)
+            && sst_format != Some(FormatType::Narthex)
         {
             if let Some(format) = sst_format
                 && format != FormatType::Flat

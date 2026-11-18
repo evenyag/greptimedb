@@ -162,17 +162,17 @@ impl RemapManifest {
     ) -> Result<()> {
         for (file_id, file_meta) in &source_manifest.files {
             if let Some(existing) = target_manifest.files.get(file_id)
-                && (existing.format.native_objects().is_some()
-                    || file_meta.format.native_objects().is_some())
+                && (existing.format.narthex_objects().is_some()
+                    || file_meta.format.narthex_objects().is_some())
             {
                 // Admission sequences may differ by logical region; physical
                 // ownership and object inventory must still agree in all builds.
                 ensure!(
                     existing.region_id == file_meta.region_id
-                        && existing.format.native_objects() == file_meta.format.native_objects(),
+                        && existing.format.narthex_objects() == file_meta.format.narthex_objects(),
                     error::InconsistentFileSnafu {
                         file_id: *file_id,
-                        reason: "native samples identity mismatch",
+                        reason: "narthex samples identity mismatch",
                     }
                 );
             }
@@ -203,7 +203,7 @@ impl RemapManifest {
                     existing == index,
                     error::InconsistentFileSnafu {
                         file_id: *id,
-                        reason: "native series identity mismatch",
+                        reason: "narthex series identity mismatch",
                     }
                 );
             } else {

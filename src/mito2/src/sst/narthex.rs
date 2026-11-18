@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Authoritative native samples SST writing.
+//! Authoritative narthex samples SST writing.
 
 use std::sync::Arc;
 
@@ -28,27 +28,13 @@ use crate::error::{ComputeArrowSnafu, InvalidRecordBatchSnafu, Result};
 use crate::series_index::format::SamplesFormat;
 use crate::series_index::samples::ColumnarSamplesFormat;
 use crate::sst::file::{
-    FileFormat, NativeFileMeta, NativeObjectMeta, NativeSamplesPart, RegionFileId,
+    FileFormat, NarthexObjectMeta, NarthexSamplesMeta, NarthexSamplesPart, RegionFileId,
 };
+use crate::sst::location;
 use crate::sst::parquet::SstInfo;
 use crate::sst::parquet::writer::SstWriteGuard;
 
-/// Physical artifact ID encoded in an authoritative native object path.
-/// Sidecar paths deliberately do not match this namespace.
-pub(crate) fn file_id_from_path(path: &str) -> Option<FileId> {
-    let (_, suffix) = path.rsplit_once("/native/")?;
-    let (id, object) = suffix.split_once('/')?;
-    if object.is_empty()
-        || object
-            .split('/')
-            .any(|part| part.is_empty() || part == "..")
-    {
-        return None;
-    }
-    id.parse().ok()
-}
-
-/// Reuses the native codec and the caller's merged, sequence-normalized source.
+/// Reuses the narthex codec and the caller's merged, sequence-normalized source.
 pub(crate) async fn write_samples(
     layer: &AccessLayer,
     mut request: SstWriteRequest,
@@ -61,7 +47,7 @@ pub(crate) async fn write_samples(
             .before_create(RegionFileId::new(region_id, id))
             .await?;
     }
-    let prefix = format!("{}native/{id}/", layer.build_region_dir(region_id));
+    let prefix = location::narthex_file_dir(&layer.build_region_dir(region_id), id);
     let mut writer = ColumnarSamplesFormat::default()
         .writer(
             request.metadata.clone(),
@@ -84,14 +70,14 @@ pub(crate) async fn write_samples(
             }
             let ts = batch.column_by_name(timestamp).ok_or_else(|| {
                 InvalidRecordBatchSnafu {
-                    reason: "native samples lack timestamp".to_string(),
+                    reason: "narthex samples lack timestamp".to_string(),
                 }
                 .build()
             })?;
             let (values, _) =
                 datatypes::timestamp::timestamp_array_to_primitive(ts).ok_or_else(|| {
                     InvalidRecordBatchSnafu {
-                        reason: "invalid native timestamp".to_string(),
+                        reason: "invalid narthex timestamp".to_string(),
                     }
                     .build()
                 })?;
@@ -99,14 +85,14 @@ pub(crate) async fn write_samples(
             upper = upper.max(max(&values).unwrap_or(upper));
             let keys = batch.column_by_name("__primary_key").ok_or_else(|| {
                 InvalidRecordBatchSnafu {
-                    reason: "native samples lack primary key".to_string(),
+                    reason: "narthex samples lack primary key".to_string(),
                 }
                 .build()
             })?;
             let keys = cast(keys, &DataType::Binary).context(ComputeArrowSnafu)?;
             let keys = keys.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
                 InvalidRecordBatchSnafu {
-                    reason: "invalid native primary key".to_string(),
+                    reason: "invalid narthex primary key".to_string(),
                 }
                 .build()
             })?;
@@ -118,14 +104,14 @@ pub(crate) async fn write_samples(
                 }
             }
             rows += batch.num_rows();
-            // Native files always retain row sequences; import barriers are applied by readers.
+            // Narthex files always retain row sequences; import barriers are applied by readers.
             writer.write(&batch).await?;
         }
         Ok(())
     }
     .await;
     if let Err(error) = write_result {
-        return Err(abort_native_write(writer, error).await);
+        return Err(abort_narthex_write(writer, error).await);
     }
     if rows == 0 {
         writer.abort().await?;
@@ -135,28 +121,28 @@ pub(crate) async fn write_samples(
     let mut manifest = None;
     let mut parts = Vec::new();
     for object in artifact.objects {
-        let native = NativeObjectMeta {
+        let narthex = NarthexObjectMeta {
             path: object.path,
             file_size: object.file_size,
         };
-        if native.path.ends_with("manifest.json") {
-            manifest = Some(native);
+        if narthex.path.ends_with("manifest.json") {
+            manifest = Some(narthex);
         } else {
-            parts.push(NativeSamplesPart {
+            parts.push(NarthexSamplesPart {
                 part_id: parts.len() as u32,
-                object: native,
+                object: narthex,
             });
         }
     }
     let manifest = manifest.ok_or_else(|| {
         InvalidRecordBatchSnafu {
-            reason: "native writer did not return a manifest".to_string(),
+            reason: "narthex writer did not return a manifest".to_string(),
         }
         .build()
     })?;
     let unit = request.metadata.time_index_type().unit();
     Ok(smallvec::smallvec![SstInfo {
-        format: FileFormat::Native(NativeFileMeta {
+        format: FileFormat::NarthexSamples(NarthexSamplesMeta {
             use_file_sequence: false,
             manifest,
             parts
@@ -176,48 +162,6 @@ pub(crate) async fn write_samples(
     }])
 }
 
-/// Checks that an artifact can only own objects inside its immutable owner namespace.
-pub(crate) fn validate_inventory(
-    layer: &AccessLayer,
-    file: &crate::sst::file::FileMeta,
-) -> Result<()> {
-    use crate::series_index::columnar::require;
-    let Some(objects) = file.format.native_objects() else {
-        return Ok(());
-    };
-    let prefix = format!(
-        "{}native/{}/",
-        layer.build_region_dir(file.region_id),
-        file.file_id
-    );
-    let manifest = match &file.format {
-        FileFormat::Native(meta) => &meta.manifest,
-        FileFormat::NativeSeries(meta) => &meta.manifest,
-        FileFormat::Parquet => return Ok(()),
-    };
-    require(
-        manifest.path == format!("{prefix}manifest.json"),
-        "native manifest is outside its owner namespace",
-    )?;
-    let mut paths = std::collections::HashSet::new();
-    let mut size = 0u64;
-    for object in objects {
-        require(
-            object.path.starts_with(&prefix)
-                && !object.path.split('/').any(|p| p == "..")
-                && paths.insert(&object.path),
-            "invalid or duplicate native artifact object",
-        )?;
-        size = size.checked_add(object.file_size).ok_or_else(|| {
-            crate::series_index::columnar::invalid("native artifact size overflow")
-        })?;
-    }
-    require(
-        size == file.file_size,
-        "native artifact byte count mismatch",
-    )
-}
-
 /// Explicit PoC builder: merge sample keys with the existing SeqScan before writing
 /// a durable series index. Publication is a separate manifest edit that rechecks coverage.
 #[cfg(any(test, feature = "test"))]
@@ -228,16 +172,16 @@ pub(crate) async fn write_series(
     mut batches: crate::read::FlatSource,
 ) -> Result<crate::sst::file::FileMeta> {
     use crate::series_index::columnar::{ColumnarSeriesFormat, require};
-    use crate::sst::file::{FileMeta, NativeSeriesIndexMeta};
-    require(!sources.is_empty(), "native series index requires samples")?;
+    use crate::sst::file::{FileMeta, NarthexSeriesIndexMeta};
+    require(!sources.is_empty(), "narthex series index requires samples")?;
     require(
         sources
             .iter()
-            .all(|source| matches!(source.meta_ref().format, FileFormat::Native(_))),
-        "native series index requires native sample sources",
+            .all(|source| matches!(source.meta_ref().format, FileFormat::NarthexSamples(_))),
+        "narthex series index requires narthex sample sources",
     )?;
     let id = FileId::random();
-    let prefix = format!("{}native/{id}/", layer.build_region_dir(metadata.region_id));
+    let prefix = location::narthex_file_dir(&layer.build_region_dir(metadata.region_id), id);
     let mut file = FileMeta {
         region_id: metadata.region_id,
         file_id: id,
@@ -246,10 +190,10 @@ pub(crate) async fn write_series(
             .map(|file| file.meta_ref().time_range)
             .reduce(|left, right| (left.0.min(right.0), left.1.max(right.1)))
             .ok_or_else(|| {
-                crate::series_index::columnar::invalid("empty native index source set")
+                crate::series_index::columnar::invalid("empty narthex index source set")
             })?,
-        format: FileFormat::NativeSeries(NativeSeriesIndexMeta {
-            manifest: NativeObjectMeta {
+        format: FileFormat::NarthexSeriesIndex(NarthexSeriesIndexMeta {
+            manifest: NarthexObjectMeta {
                 path: format!("{prefix}manifest.json"),
                 file_size: 0,
             },
@@ -258,8 +202,8 @@ pub(crate) async fn write_series(
         }),
         ..Default::default()
     };
-    let entry = crate::series_index::native_series_entry(&file)?;
-    let mut writer = ColumnarSeriesFormat::default().native_writer(
+    let entry = crate::series_index::narthex_series_entry(&file)?;
+    let mut writer = ColumnarSeriesFormat::default().narthex_writer(
         metadata,
         layer.object_store().clone(),
         &entry,
@@ -273,13 +217,13 @@ pub(crate) async fn write_series(
     }
     .await;
     if let Err(error) = write_result {
-        return Err(abort_native_write(writer, error).await);
+        return Err(abort_narthex_write(writer, error).await);
     }
     let artifact = writer.finish().await?;
     file.file_size = artifact.file_size;
-    if let FileFormat::NativeSeries(index) = &mut file.format {
+    if let FileFormat::NarthexSeriesIndex(index) = &mut file.format {
         for object in artifact.objects {
-            let object = NativeObjectMeta {
+            let object = NarthexObjectMeta {
                 path: object.path,
                 file_size: object.file_size,
             };
@@ -290,18 +234,17 @@ pub(crate) async fn write_series(
             }
         }
     }
-    validate_inventory(layer, &file)?;
     Ok(file)
 }
 
 /// Complete cleanup before reporting a failed write. Drop cleanup remains a fallback
 /// for cancellation, but can race runtime shutdown after an ordinary returned error.
-pub(crate) async fn abort_native_write(
+pub(crate) async fn abort_narthex_write(
     writer: Box<dyn crate::series_index::format::FormatWriter>,
     error: crate::error::Error,
 ) -> crate::error::Error {
     if let Err(cleanup_error) = writer.abort().await {
-        common_telemetry::warn!(cleanup_error; "Failed to abort unpublished native artifact");
+        common_telemetry::warn!(cleanup_error; "Failed to abort unpublished narthex artifact");
     }
     error
 }

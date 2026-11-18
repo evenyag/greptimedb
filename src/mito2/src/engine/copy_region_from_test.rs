@@ -684,7 +684,7 @@ async fn test_copy_region_from_clears_preserve_row_sequence_marker() {
 #[case::remap_references(true, true, false)]
 #[case::copy_retry(false, true, true)]
 #[tokio::test]
-async fn test_native_copy_and_remap(
+async fn test_narthex_copy_and_remap(
     #[case] remap: bool,
     #[case] with_index: bool,
     #[case] fail_copy: bool,
@@ -725,7 +725,7 @@ async fn test_native_copy_and_remap(
         .tag_num(1)
         .field_num(1)
         .insert_option("primary_key_encoding", "sparse")
-        .insert_option("sst_format", "native")
+        .insert_option("sst_format", "narthex")
         .insert_option("append_mode", "true")
         .insert_option("preserve_row_sequence", "true")
         .build();
@@ -783,7 +783,7 @@ async fn test_native_copy_and_remap(
         .build_flat_sst_reader()
         .await
         .unwrap();
-        let index = crate::sst::native::write_series(
+        let index = crate::sst::narthex::write_series(
             &owner.access_layer,
             owner.metadata(),
             &sources,
@@ -810,7 +810,7 @@ async fn test_native_copy_and_remap(
             .next()
             .unwrap()
             .format
-            .native_objects()
+            .narthex_objects()
             .unwrap()[0]
             .path
             .clone();
@@ -837,12 +837,19 @@ async fn test_native_copy_and_remap(
         let to = owner.access_layer.build_region_dir(target);
         for object in before
             .all_files()
-            .flat_map(|file| file.format.native_objects().unwrap())
+            .flat_map(|file| file.format.narthex_objects().unwrap())
         {
             let target_path = format!("{to}{}", object.path.strip_prefix(&from).unwrap());
             assert!(
                 !store.exists(&target_path).await.unwrap(),
                 "partial copy leaked {target_path}"
+            );
+        }
+        for file in before.all_files() {
+            let dir = crate::sst::location::narthex_file_dir(&to, file.file_id);
+            assert!(
+                !store.exists(&dir).await.unwrap(),
+                "partial copy leaked {dir}"
             );
         }
         store.write(&missing, saved).await.unwrap();
@@ -909,8 +916,18 @@ async fn test_native_copy_and_remap(
     let physical_owner = if remap { source } else { target };
     for meta in after.all_files() {
         assert_eq!(meta.region_id, physical_owner);
-        crate::sst::native::validate_inventory(&destination.access_layer, meta).unwrap();
-        for object in meta.format.native_objects().unwrap() {
+        let prefix = crate::sst::location::narthex_file_dir(
+            &destination.access_layer.build_region_dir(physical_owner),
+            meta.file_id,
+        );
+        assert!(
+            meta.format
+                .narthex_objects()
+                .unwrap()
+                .iter()
+                .all(|object| object.path.starts_with(&prefix))
+        );
+        for object in meta.format.narthex_objects().unwrap() {
             let actual = destination
                 .access_layer
                 .object_store()
@@ -919,7 +936,7 @@ async fn test_native_copy_and_remap(
                 .unwrap();
             assert_eq!(actual.content_length(), object.file_size);
         }
-        if let FileFormat::NativeSeries(index) = &meta.format {
+        if let FileFormat::NarthexSeriesIndex(index) = &meta.format {
             assert_eq!(index.sources.len(), 2);
             assert!(
                 index
@@ -950,7 +967,7 @@ async fn test_native_copy_and_remap(
     if !remap {
         let paths: Vec<_> = before
             .all_files()
-            .flat_map(|file| file.format.native_objects().unwrap())
+            .flat_map(|file| file.format.narthex_objects().unwrap())
             .map(|object| object.path.clone())
             .collect();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1022,7 +1039,7 @@ async fn test_native_copy_and_remap(
             .iter()
             .flat_map(|level| level.files.values())
             .all(|file| file.meta_ref().region_id == target
-                && matches!(file.meta_ref().format, FileFormat::Native(_)))
+                && matches!(file.meta_ref().format, FileFormat::NarthexSamples(_)))
     );
     let result = RecordBatches::try_collect(
         engine

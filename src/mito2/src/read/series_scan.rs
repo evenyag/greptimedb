@@ -209,7 +209,7 @@ pub struct SeriesScan {
 impl SeriesScan {
     /// Creates a new [SeriesScan].
     pub(crate) fn new(input: ScanInput, experimental_series_scan_v2: bool) -> Self {
-        let mode = if input.requires_native_preparation() {
+        let mode = if input.requires_narthex_preparation() {
             SeriesScanMode::Prepared
         } else if experimental_series_scan_v2 && Self::supports_two_phase(&input) {
             SeriesScanMode::TwoPhase
@@ -255,7 +255,7 @@ impl SeriesScan {
     }
 
     fn uses_columnar(&self) -> bool {
-        self.stream_ctx.input.requires_native_preparation()
+        self.stream_ctx.input.requires_narthex_preparation()
             || self
                 .stream_ctx
                 .input
@@ -310,11 +310,11 @@ impl SeriesScan {
         label_source: &RawLabelSource,
     ) -> Result<Option<(RawScanPreparation, bool)>, BoxedError> {
         let preparation = self.prepare_raw_scan_inner(label_source)?;
-        if self.stream_ctx.input.requires_native_preparation()
+        if self.stream_ctx.input.requires_narthex_preparation()
             && !matches!(preparation, Some((_, true)))
         {
             return Err(BoxedError::new(InvalidRecordBatchSnafu {
-                reason: "native raw scans require prepared-series support for the requested schema and options",
+                reason: "narthex raw scans require prepared-series support for the requested schema and options",
             }.build()));
         }
         Ok(preparation)
@@ -1110,7 +1110,7 @@ impl RegionScanner for SeriesScan {
         &mut self,
         filter_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
     ) -> Vec<bool> {
-        if self.stream_ctx.input.requires_native_preparation() {
+        if self.stream_ctx.input.requires_narthex_preparation() {
             // Prepared ordinals are immutable. Keep changing filters in the caller
             // rather than claiming pushdown that discovery cannot honor.
             return vec![false; filter_exprs.len()];

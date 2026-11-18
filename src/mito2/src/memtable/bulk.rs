@@ -715,7 +715,7 @@ impl BulkMemtable {
                     self.row_group_size,
                     self.float_field_encoding,
                 )
-                .with_native(self.compactor.lock().unwrap().native),
+                .with_narthex_format(self.compactor.lock().unwrap().narthex_format),
             )),
             compact_dispatcher: self.compact_dispatcher.clone(),
             compacting: Arc::new(AtomicBool::new(false)),
@@ -1239,12 +1239,12 @@ struct MemtableCompactor {
     /// Max number of rows in a parquet row group for encoded parts.
     row_group_size: usize,
     float_field_encoding: FloatFieldEncoding,
-    native: bool,
+    narthex_format: bool,
 }
 
 impl MemtableCompactor {
-    fn with_native(mut self, native: bool) -> Self {
-        self.native = native;
+    fn with_narthex_format(mut self, narthex_format: bool) -> Self {
+        self.narthex_format = narthex_format;
         self
     }
 
@@ -1262,7 +1262,7 @@ impl MemtableCompactor {
             config,
             row_group_size,
             float_field_encoding,
-            native: false,
+            narthex_format: false,
         }
     }
 
@@ -1320,7 +1320,7 @@ impl MemtableCompactor {
                     encode_bytes_threshold,
                     row_group_size,
                     float_field_encoding,
-                    self.native,
+                    self.narthex_format,
                 )
             })
             .collect::<Result<Vec<Option<MergedPart>>>>()?;
@@ -1357,7 +1357,7 @@ impl MemtableCompactor {
         encode_bytes_threshold: usize,
         row_group_size: usize,
         float_field_encoding: FloatFieldEncoding,
-        native: bool,
+        narthex_format: bool,
     ) -> Result<Option<MergedPart>> {
         if parts_to_merge.is_empty() {
             return Ok(None);
@@ -1468,7 +1468,7 @@ impl MemtableCompactor {
                 row_group_size,
                 float_field_encoding,
             )?
-            .with_native(native);
+            .with_narthex_format(narthex_format);
             let mut metrics = BulkPartEncodeMetrics::default();
             let encoded_part = encoder.encode_record_batch_iter(
                 boxed_iter,
@@ -1609,7 +1609,7 @@ pub struct BulkMemtableBuilder {
     /// Max number of rows in a parquet row group for encoded parts.
     row_group_size: usize,
     float_field_encoding: FloatFieldEncoding,
-    native: bool,
+    narthex_format: bool,
 }
 
 impl Default for BulkMemtableBuilder {
@@ -1622,14 +1622,14 @@ impl Default for BulkMemtableBuilder {
             merge_mode: MergeMode::default(),
             row_group_size: DEFAULT_ROW_GROUP_SIZE,
             float_field_encoding: FloatFieldEncoding::default(),
-            native: false,
+            narthex_format: false,
         }
     }
 }
 
 impl BulkMemtableBuilder {
-    pub(crate) fn with_native(mut self, native: bool) -> Self {
-        self.native = native;
+    pub(crate) fn with_narthex_format(mut self, narthex_format: bool) -> Self {
+        self.narthex_format = narthex_format;
         self
     }
 
@@ -1689,7 +1689,7 @@ impl MemtableBuilder for BulkMemtableBuilder {
             self.row_group_size,
             self.float_field_encoding,
         );
-        memtable.compactor.lock().unwrap().native = self.native;
+        memtable.compactor.lock().unwrap().narthex_format = self.narthex_format;
         Arc::new(memtable)
     }
 

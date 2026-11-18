@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Authoritative native inputs for scanner-wide series preparation.
+//! Authoritative narthex inputs for scanner-wide series preparation.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -45,12 +45,12 @@ use store_api::metric_engine_consts::{
     DATA_SCHEMA_TSID_COLUMN_NAME as TSID_COLUMN,
 };
 
-pub(crate) fn has_native_files(context: &StreamContext) -> bool {
-    context.input.requires_native_preparation()
+pub(crate) fn has_narthex_files(context: &StreamContext) -> bool {
+    context.input.requires_narthex_preparation()
 }
 
 /// Validates every assignment before opening authoritative objects. Missing support is an
-/// error, never permission to read native files through the legacy adapter.
+/// error, never permission to read narthex files through the legacy adapter.
 pub(crate) fn file_indices(
     context: &StreamContext,
     ranges: &[PartitionRange],
@@ -60,28 +60,28 @@ pub(crate) fn file_indices(
         let range = context
             .ranges
             .get(range.identifier)
-            .ok_or_else(|| invalid("invalid native prepared scan range"))?;
+            .ok_or_else(|| invalid("invalid narthex prepared scan range"))?;
         for index in &range.row_group_indices {
             if context.is_mem_range_index(*index) {
                 continue;
             }
             if !context.is_file_range_index(*index) {
                 return Err(invalid(
-                    "native preparation requires a prepared memtable source",
+                    "narthex preparation requires a prepared memtable source",
                 ));
             }
             let i = index.index - context.input.num_memtables();
             if !matches!(
                 context.input.files[i].meta_ref().format,
-                FileFormat::Native(_)
+                FileFormat::NarthexSamples(_)
             ) {
                 return Err(invalid(
-                    "native preparation cannot mix native and Parquet files",
+                    "narthex preparation cannot mix narthex and Parquet files",
                 ));
             }
             if index.row_group_index != -1 {
                 return Err(invalid(
-                    "native preparation requires a complete samples assignment",
+                    "narthex preparation requires a complete samples assignment",
                 ));
             }
             files.insert(i);
@@ -101,8 +101,8 @@ pub(crate) async fn open_sources(
     let mut series = Vec::<Box<dyn FormatReader>>::new();
     let indices = file_indices(context, ranges)?;
     let mut covered = std::collections::HashSet::new();
-    for file in &context.input.native_series_indexes {
-        let FileFormat::NativeSeries(index) = &file.meta_ref().format else {
+    for file in &context.input.narthex_series_indexes {
+        let FileFormat::NarthexSeriesIndex(index) = &file.meta_ref().format else {
             continue;
         };
         // Never borrow candidates from an index whose source coverage is outside this
@@ -121,7 +121,7 @@ pub(crate) async fn open_sources(
         }
         let reader = crate::series_index::columnar::reader::ColumnarReader::open_cached(
             context.input.access_layer.object_store().clone(),
-            crate::series_index::SeriesIndexFileHandle::from_native(file.clone())?,
+            crate::series_index::SeriesIndexFileHandle::from_narthex(file.clone())?,
             context
                 .input
                 .cache_strategy
@@ -146,21 +146,21 @@ pub(crate) async fn open_sources(
         let namespace = file.meta_ref().file_id;
         let reader = SamplesReader::open_cached(
             context.input.access_layer.object_store().clone(),
-            SamplesFileHandle::from_native(file.clone())?,
+            SamplesFileHandle::from_narthex(file.clone())?,
             context.input.cache_strategy.columnar_metadata(namespace),
         )
         .await?
         .with_payload_cache(context.input.cache_strategy.columnar_payload(namespace));
         let sequence = match &file.meta_ref().format {
-            FileFormat::Native(meta) if meta.use_file_sequence => {
+            FileFormat::NarthexSamples(meta) if meta.use_file_sequence => {
                 file.meta_ref().sequence.map(|sequence| sequence.get())
             }
             _ => None,
         };
         let reader: Arc<dyn SamplesFormatReader> =
-            Arc::new(NativeSamplesReader { reader, sequence });
+            Arc::new(NarthexSamplesReader { reader, sequence });
         if !covered.contains(&file.file_id()) {
-            series.push(Box::new(NativeSeriesReader::new(
+            series.push(Box::new(NarthexSeriesReader::new(
                 context.input.region_metadata().clone(),
                 reader.clone(),
             )?));
@@ -174,11 +174,11 @@ pub(crate) async fn open_sources(
                 continue;
             }
             for range in context.input.build_mem_ranges(*index) {
-                let reader: Arc<dyn SamplesFormatReader> = Arc::new(NativeMemtableReader {
+                let reader: Arc<dyn SamplesFormatReader> = Arc::new(NarthexMemtableReader {
                     range,
                     schema: context.input.mapper.input_arrow_schema(false),
                 });
-                series.push(Box::new(NativeSeriesReader::new(
+                series.push(Box::new(NarthexSeriesReader::new(
                     context.input.region_metadata().clone(),
                     reader.clone(),
                 )?));
@@ -190,12 +190,12 @@ pub(crate) async fn open_sources(
 }
 
 /// Applies COPY admission sequences before snapshot visibility and deduplication.
-struct NativeSamplesReader {
+struct NarthexSamplesReader {
     reader: SamplesReader,
     sequence: Option<u64>,
 }
 
-impl SamplesFormatReader for NativeSamplesReader {
+impl SamplesFormatReader for NarthexSamplesReader {
     fn schema(&self) -> SchemaRef {
         self.reader.schema()
     }
@@ -224,13 +224,13 @@ impl SamplesFormatReader for NativeSamplesReader {
 /// A series index is optional: sample metadata already owns the full exact key. Empty
 /// projection discovers keys without reading sample payloads. Actual sample reads enforce
 /// time/sequence visibility, so discovery may conservatively retain empty series.
-struct NativeSeriesReader {
+struct NarthexSeriesReader {
     schema: SchemaRef,
     tags: Vec<(u32, String)>,
     samples: Arc<dyn SamplesFormatReader>,
 }
 
-impl NativeSeriesReader {
+impl NarthexSeriesReader {
     fn new(metadata: RegionMetadataRef, samples: Arc<dyn SamplesFormatReader>) -> Result<Self> {
         let tags: Vec<_> = metadata
             .primary_key_columns()
@@ -257,7 +257,7 @@ impl NativeSeriesReader {
     }
 }
 
-impl FormatReader for NativeSeriesReader {
+impl FormatReader for NarthexSeriesReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -301,13 +301,13 @@ fn series_batch(
     for key in keys {
         let CompositeValues::Sparse(decoded) = codec.decode(key.bytes()).context(DecodeSnafu)?
         else {
-            return Err(invalid("native series requires sparse keys"));
+            return Err(invalid("narthex series requires sparse keys"));
         };
         for (id, column) in &mut values {
             column.push(match decoded.get_or_null(*id) {
                 Value::String(value) => Some(value.as_utf8().to_owned()),
                 Value::Null => None,
-                _ => return Err(invalid("native series requires string tags")),
+                _ => return Err(invalid("narthex series requires string tags")),
             });
         }
     }
@@ -324,14 +324,14 @@ fn series_batch(
         columns.push(Arc::new(StringArray::from(
             values
                 .remove(id)
-                .ok_or_else(|| invalid("missing native series tag"))?,
+                .ok_or_else(|| invalid("missing narthex series tag"))?,
         )));
     }
     let mut batch = RecordBatch::try_new(schema.clone(), columns).context(NewRecordBatchSnafu)?;
     for filter in &request.filters {
         let column = batch
             .column_by_name(filter.column_name())
-            .ok_or_else(|| invalid("unknown native series filter"))?;
+            .ok_or_else(|| invalid("unknown narthex series filter"))?;
         let mask = filter.evaluate_array(column).context(RecordBatchSnafu)?;
         batch = filter_record_batch(
             &batch,
@@ -354,12 +354,12 @@ fn series_batch(
 /// Reopens the pinned memtable range for independent selected-series reads. Discovery
 /// projects only keys at this boundary; no rows are merged or deduplicated before the
 /// prepared source combines memory and persisted samples.
-struct NativeMemtableReader {
+struct NarthexMemtableReader {
     range: crate::memtable::MemtableRange,
     schema: SchemaRef,
 }
 
-impl SamplesFormatReader for NativeMemtableReader {
+impl SamplesFormatReader for NarthexMemtableReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -395,9 +395,9 @@ impl SamplesFormatReader for NativeMemtableReader {
                 let batch = batch?;
                 let keys = batch.column_by_name(store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME)
                     .and_then(|array| array.as_any().downcast_ref::<PrimaryKeyArray>())
-                    .ok_or_else(|| invalid("native memtable requires dictionary primary keys"))?;
+                    .ok_or_else(|| invalid("narthex memtable requires dictionary primary keys"))?;
                 let values = keys.values().as_any().downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| invalid("native memtable requires binary primary keys"))?;
+                    .ok_or_else(|| invalid("narthex memtable requires binary primary keys"))?;
                 let projection = request.projection.iter().map(|name| batch.schema().index_of(name).map_err(|error| invalid(error.to_string()))).collect::<Result<Vec<_>>>()?;
                 let projected = batch.project(&projection).context(ComputeArrowSnafu)?;
                 let mut start = 0;

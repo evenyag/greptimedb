@@ -1267,14 +1267,14 @@ enum EncodedBulkPayload {
         data: Bytes,
         metadata: Arc<ParquetMetaData>,
     },
-    Native(crate::series_index::samples::bulk::NativeBulkPart),
+    Narthex(crate::series_index::samples::bulk::NarthexBulkPart),
 }
 
 impl EncodedBulkPart {
     pub fn parquet_metadata(&self) -> Option<&Arc<ParquetMetaData>> {
         match &self.payload {
             EncodedBulkPayload::Parquet { metadata, .. } => Some(metadata),
-            EncodedBulkPayload::Native(_) => None,
+            EncodedBulkPayload::Narthex(_) => None,
         }
     }
 
@@ -1290,7 +1290,7 @@ impl EncodedBulkPart {
     pub(crate) fn size_bytes(&self) -> usize {
         match &self.payload {
             EncodedBulkPayload::Parquet { data, .. } => data.len(),
-            EncodedBulkPayload::Native(part) => part.size_bytes(),
+            EncodedBulkPayload::Narthex(part) => part.size_bytes(),
         }
     }
 
@@ -1298,7 +1298,7 @@ impl EncodedBulkPart {
     pub fn data(&self) -> Option<&Bytes> {
         match &self.payload {
             EncodedBulkPayload::Parquet { data, .. } => Some(data),
-            EncodedBulkPayload::Native(_) => None,
+            EncodedBulkPayload::Narthex(_) => None,
         }
     }
 
@@ -1360,7 +1360,7 @@ impl EncodedBulkPart {
 
     pub(crate) fn primary_keys(&self) -> Option<crate::memtable::BoxedPrimaryKeyIterator> {
         match &self.payload {
-            EncodedBulkPayload::Native(part) => Some(part.primary_keys()),
+            EncodedBulkPayload::Narthex(part) => Some(part.primary_keys()),
             EncodedBulkPayload::Parquet { .. } => None,
         }
     }
@@ -1371,7 +1371,7 @@ impl EncodedBulkPart {
         sequence: Option<SequenceRange>,
         mem_scan_metrics: Option<MemScanMetrics>,
     ) -> Result<Option<BoxedRecordBatchIterator>> {
-        if let EncodedBulkPayload::Native(part) = &self.payload {
+        if let EncodedBulkPayload::Narthex(part) = &self.payload {
             let iter =
                 part.read(self.schema.clone())
                     .flat_map(move |batch| -> BoxedRecordBatchIterator {
@@ -1453,7 +1453,7 @@ pub struct BulkPartEncodeMetrics {
 pub struct BulkPartEncoder {
     metadata: RegionMetadataRef,
     writer_props: Option<WriterProperties>,
-    native: bool,
+    narthex_format: bool,
 }
 
 impl BulkPartEncoder {
@@ -1486,14 +1486,14 @@ impl BulkPartEncoder {
         Ok(Self {
             metadata,
             writer_props,
-            native: false,
+            narthex_format: false,
         })
     }
 }
 
 impl BulkPartEncoder {
-    pub(super) fn with_native(mut self, native: bool) -> Self {
-        self.native = native;
+    pub(super) fn with_narthex_format(mut self, narthex_format: bool) -> Self {
+        self.narthex_format = narthex_format;
         self
     }
 
@@ -1507,8 +1507,8 @@ impl BulkPartEncoder {
         sequence_bounds: RangeInclusive<SequenceNumber>,
         metrics: &mut BulkPartEncodeMetrics,
     ) -> Result<Option<EncodedBulkPart>> {
-        if self.native {
-            let mut part = crate::series_index::samples::bulk::NativeBulkPart::default();
+        if self.narthex_format {
+            let mut part = crate::series_index::samples::bulk::NarthexBulkPart::default();
             let mut total_rows = 0;
             let mut series_estimator = SeriesEstimator::default();
             for batch in iter {
@@ -1529,7 +1529,7 @@ impl BulkPartEncoder {
             metrics.encoded_size += part.size_bytes();
             metrics.num_rows += total_rows;
             return Ok(Some(EncodedBulkPart {
-                payload: EncodedBulkPayload::Native(part),
+                payload: EncodedBulkPayload::Narthex(part),
                 metadata: BulkPartMeta {
                     num_rows: total_rows,
                     min_timestamp,
@@ -1606,7 +1606,7 @@ impl BulkPartEncoder {
             return Ok(None);
         }
 
-        if self.native {
+        if self.narthex_format {
             return self.encode_record_batch_iter(
                 Box::new(std::iter::once(Ok(part.batch.clone()))),
                 part.batch.schema(),

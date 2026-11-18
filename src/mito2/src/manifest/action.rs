@@ -159,12 +159,12 @@ pub(crate) fn cap_wal_release(
 
 impl RegionEdit {
     /// Rechecked under the manifest lock before publication, after any concurrent compaction.
-    pub(crate) fn validate_native_series(&self, manifest: &RegionManifest) -> Result<()> {
+    pub(crate) fn validate_narthex_series(&self, manifest: &RegionManifest) -> Result<()> {
         let region_id = manifest.metadata.region_id;
         snafu::ensure!(
             self.files_to_add
                 .iter()
-                .all(|file| !matches!(file.format, file::FileFormat::NativeSeries(_))),
+                .all(|file| !matches!(file.format, file::FileFormat::NarthexSeriesIndex(_))),
             crate::error::InvalidRequestSnafu {
                 region_id,
                 reason: "Series indexes cannot be data SSTs"
@@ -175,7 +175,7 @@ impl RegionEdit {
             .values()
             .chain(self.files_to_add.iter())
             .filter(|file| {
-                matches!(file.format, file::FileFormat::Native(_))
+                matches!(file.format, file::FileFormat::NarthexSamples(_))
                     && !self
                         .files_to_remove
                         .iter()
@@ -184,7 +184,7 @@ impl RegionEdit {
             .map(|file| file.file_id())
             .collect();
         for file in &self.series_indexes_to_add {
-            let valid = matches!(&file.format, file::FileFormat::NativeSeries(index)
+            let valid = matches!(&file.format, file::FileFormat::NarthexSeriesIndex(index)
                 if !index.sources.is_empty() && index.sources.iter().all(|id| sources.contains(id))
                     && index.sources.iter().collect::<HashSet<_>>().len() == index.sources.len());
             snafu::ensure!(
@@ -201,7 +201,7 @@ impl RegionEdit {
                         .is_none_or(|existing| existing == file),
                 crate::error::InvalidRequestSnafu {
                     region_id,
-                    reason: "Stale native series coverage or conflicting immutable identity"
+                    reason: "Stale narthex series coverage or conflicting immutable identity"
                 }
             );
         }
@@ -460,7 +460,7 @@ impl RegionManifestBuilder {
         }
         self.series_indexes.retain(|_, file| {
             let retired = edit.series_indexes_to_remove.contains(&file.file_id())
-                || matches!(&file.format, crate::sst::file::FileFormat::NativeSeries(index)
+                || matches!(&file.format, crate::sst::file::FileFormat::NarthexSeriesIndex(index)
                     if index.sources.iter().any(|source| edit.files_to_remove.iter().any(|removed| removed.file_id() == *source)));
             if retired { removed_files.push(RemovedFile::File(file.file_id, None)); }
             !retired
@@ -537,7 +537,7 @@ impl RegionManifestBuilder {
             TruncateKind::Partial { files_to_remove } => {
                 let mut retired = vec![];
                 self.series_indexes.retain(|_, file| {
-                    let retire = matches!(&file.format, crate::sst::file::FileFormat::NativeSeries(index)
+                    let retire = matches!(&file.format, crate::sst::file::FileFormat::NarthexSeriesIndex(index)
                         if index.sources.iter().any(|source| files_to_remove.iter().any(|removed| removed.file_id() == *source)));
                     if retire { retired.push(RemovedFile::File(file.file_id, None)); }
                     !retire
@@ -1811,11 +1811,38 @@ mod tests {
         let (_, _, edit) = RegionMetaActionList::decode(bytes)
             .unwrap()
             .split_region_change_and_edit();
+        // The frozen prototype remains readable, while new manifests use Narthex names.
+        let metrics_bytes = include_bytes!(
+            "../../../../tests/compatibility/manifest/native_metric_storage/metrics-delta.json"
+        );
+        let (_, _, metrics_edit) = RegionMetaActionList::decode(metrics_bytes)
+            .unwrap()
+            .split_region_change_and_edit();
+        assert_eq!(edit, metrics_edit);
+        let narthex_bytes = include_bytes!(
+            "../../../../tests/compatibility/manifest/native_metric_storage/narthex-delta.json"
+        );
+        let (_, _, narthex_edit) = RegionMetaActionList::decode(narthex_bytes)
+            .unwrap()
+            .split_region_change_and_edit();
+        assert_eq!(edit, narthex_edit);
+        let encoded = serde_json::to_value(&edit).unwrap();
+        assert!(encoded["files_to_add"][0]["format"]["narthex_samples"].is_object());
+        assert!(encoded["series_indexes_to_add"][0]["format"]["narthex_series_index"].is_object());
         let mut builder = manifest_builder();
-        edit.validate_native_series(&manifest_builder().try_build().unwrap())
+        edit.validate_narthex_series(&manifest_builder().try_build().unwrap())
             .unwrap();
         assert_eq!(edit.files_to_add.len(), 2);
         assert_eq!(edit.series_indexes_to_add.len(), 1);
+        for file in edit.files_to_add.iter().chain(&edit.series_indexes_to_add) {
+            for object in file.format.narthex_objects().unwrap() {
+                // Frozen pre-layout-change paths remain authoritative after replay.
+                assert_eq!(
+                    crate::sst::location::parse_narthex_file_id(&object.path),
+                    Some(file.file_id)
+                );
+            }
+        }
         let index = edit.series_indexes_to_add[0].clone();
         let first = edit.files_to_add[0].clone();
         builder.apply_edit(1, edit);
@@ -1841,7 +1868,7 @@ mod tests {
                 series_indexes_to_add: vec![index],
                 ..Default::default()
             }
-            .validate_native_series(&replaced)
+            .validate_narthex_series(&replaced)
             .is_err()
         );
         let legacy = include_bytes!(

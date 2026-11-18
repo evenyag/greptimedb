@@ -189,7 +189,7 @@ impl SamplesWriter {
         source_file_id: FileId,
         generation: FileId,
     ) -> Result<Self> {
-        super::validate_native_metadata(&metadata)?;
+        super::validate_narthex_metadata(&metadata)?;
         require(
             (1..=super::MAX_ROWS).contains(&options.block_rows)
                 && (1..=metadata::ROOT_CAPACITY).contains(&options.root_capacity)

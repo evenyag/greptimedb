@@ -1878,13 +1878,22 @@ async fn test_full_listing_gc_skips_region(#[case] cause: &str) {
     assert_eq!(1, hook.gc_calls.load(Ordering::Relaxed));
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
 #[tokio::test]
-async fn test_native_artifact_gc_inventory_and_references() {
+async fn test_narthex_artifact_gc_inventory_and_references(#[case] legacy: bool) {
     let env = IndexGcTestEnv::new(true).await;
     let region_id = env.meta.region_id;
     let layer = &env.region.access_layer;
     let id = FileId::random();
-    let prefix = format!("{}native/{id}/", layer.build_region_dir(region_id));
+    let region_dir = layer.build_region_dir(region_id);
+    let parent = if legacy {
+        location::legacy_native_dir(&region_dir)
+    } else {
+        region_dir
+    };
+    let prefix = location::narthex_file_dir(&parent, id);
     let paths = [
         format!("{prefix}manifest.json"),
         format!("{prefix}part-0"),
@@ -1893,7 +1902,7 @@ async fn test_native_artifact_gc_inventory_and_references() {
     for path in &paths {
         layer
             .object_store()
-            .write(path, "native".as_bytes())
+            .write(path, "narthex".as_bytes())
             .await
             .unwrap();
     }
@@ -1904,7 +1913,7 @@ async fn test_native_artifact_gc_inventory_and_references() {
         .unwrap();
     let entries: Vec<_> = entries
         .into_iter()
-        .filter(|entry| crate::sst::native::file_id_from_path(entry.path()) == Some(id))
+        .filter(|entry| crate::sst::location::parse_narthex_file_id(entry.path()) == Some(id))
         .collect();
     assert_eq!(entries.len(), 3);
     let removed = RemovedFile::File(id, None);
@@ -1933,17 +1942,19 @@ async fn test_native_artifact_gc_inventory_and_references() {
     );
     assert_eq!(delete, vec![removed]);
     layer.delete_ssts(region_id, &[id]).await.unwrap();
+    assert!(!layer.object_store().exists(&prefix).await.unwrap());
     for path in paths {
         assert!(!layer.object_store().exists(&path).await.unwrap());
     }
 }
 
 #[tokio::test]
-async fn test_native_artifact_gc_requires_age_for_every_object() {
+async fn test_narthex_artifact_gc_requires_age_for_every_object() {
     let env = IndexGcTestEnv::new(true).await;
     let layer = &env.region.access_layer;
     let id = FileId::random();
-    let prefix = format!("{}native/{id}/", layer.build_region_dir(env.meta.region_id));
+    let prefix =
+        crate::sst::location::narthex_file_dir(&layer.build_region_dir(env.meta.region_id), id);
     let old = write_and_list_entry(layer.object_store(), &format!("{prefix}part-0")).await;
     // A missing timestamp must withhold the entire artifact even if another
     // part has a known, sufficiently old timestamp.
@@ -1966,7 +1977,7 @@ async fn test_native_artifact_gc_requires_age_for_every_object() {
 }
 
 #[tokio::test]
-async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
+async fn test_narthex_shared_samples_and_series_gc_after_owner_drop() {
     use crate::series_index::format::{FormatReader, SamplesFormatReader};
     use crate::test_util::sst_util::sst_region_metadata_with_encoding;
     use api::v1::helper::row;
@@ -1997,7 +2008,7 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
         .tag_num(1)
         .field_num(1)
         .insert_option("primary_key_encoding", "sparse")
-        .insert_option("sst_format", "native")
+        .insert_option("sst_format", "narthex")
         .insert_option("append_mode", "true")
         .insert_option("preserve_row_sequence", "true")
         .build();
@@ -2057,7 +2068,7 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
     .build_flat_sst_reader()
     .await
     .unwrap();
-    let index = crate::sst::native::write_series(&layer, region.metadata(), &sources, flat)
+    let index = crate::sst::narthex::write_series(&layer, region.metadata(), &sources, flat)
         .await
         .unwrap();
     let index_id = index.file_id();
@@ -2108,7 +2119,7 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
     let mut sample_reader = Some(
         crate::series_index::samples::reader::SamplesReader::open(
             layer.object_store().clone(),
-            crate::series_index::artifact::SamplesFileHandle::from_native(sources[0].clone())
+            crate::series_index::artifact::SamplesFileHandle::from_narthex(sources[0].clone())
                 .unwrap(),
         )
         .await
@@ -2117,7 +2128,7 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
     let mut index_reader = Some(
         crate::series_index::columnar::reader::ColumnarReader::open(
             layer.object_store().clone(),
-            crate::series_index::SeriesIndexFileHandle::from_native(
+            crate::series_index::SeriesIndexFileHandle::from_narthex(
                 region.version().ssts.series_indexes()[&index.file_id].clone(),
             )
             .unwrap(),
@@ -2130,7 +2141,7 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
         .chain(std::iter::once(&index))
         .map(|file| {
             file.format
-                .native_objects()
+                .narthex_objects()
                 .unwrap()
                 .iter()
                 .map(|object| object.path.clone())
@@ -2272,4 +2283,48 @@ async fn test_native_shared_samples_and_series_gc_after_owner_drop() {
         }
     }
     engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_narthex_empty_directories_and_inventory_cleanup() {
+    use crate::sst::file::{FileFormat, NarthexObjectMeta, NarthexSamplesMeta, NarthexSamplesPart};
+    let env = IndexGcTestEnv::new(true).await;
+    let region_id = env.meta.region_id;
+    let layer = &env.region.access_layer;
+    let region_dir = layer.build_region_dir(region_id);
+    for parent in [&region_dir, &location::legacy_native_dir(&region_dir)] {
+        let dir = location::narthex_file_dir(parent, FileId::random());
+        let part = NarthexObjectMeta {
+            path: format!("{dir}part-0.samples"),
+            file_size: 4,
+        };
+        let manifest = NarthexObjectMeta {
+            path: format!("{dir}manifest.json"),
+            file_size: 4,
+        };
+        for object in [&part, &manifest] {
+            layer
+                .object_store()
+                .write(&object.path, "test".as_bytes())
+                .await
+                .unwrap();
+        }
+        let format = FileFormat::NarthexSamples(NarthexSamplesMeta {
+            manifest,
+            parts: vec![NarthexSamplesPart {
+                part_id: 0,
+                object: part,
+            }],
+            use_file_sequence: false,
+        });
+        layer.delete_narthex_objects(&format).await.unwrap();
+        assert!(!layer.object_store().exists(&dir).await.unwrap());
+        // GC also reclaims empty directories left by earlier versions.
+        layer.object_store().create_dir(&dir).await.unwrap();
+        env.worker
+            .list_from_object_store(region_id, 3)
+            .await
+            .unwrap();
+        assert!(!layer.object_store().exists(&dir).await.unwrap());
+    }
 }

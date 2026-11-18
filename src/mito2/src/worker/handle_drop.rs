@@ -403,7 +403,7 @@ pub(crate) async fn remove_region_dir_once(
     object_store: &ObjectStore,
     force: bool,
 ) -> Result<bool> {
-    // Native SSTs live below native/<file-id>/ rather than at the region root.
+    // Narthex SSTs have objects below their file-ID directories.
     let mut has_sst_file = false;
     // Record non-SST files to remove before the dropping marker.
     let mut files_to_remove_first = vec![];
@@ -415,9 +415,9 @@ pub(crate) async fn remove_region_dir_once(
     while let Some(file) = files.try_next().await.context(OpenDalSnafu)? {
         if !force
             && (file.path().ends_with(".parquet")
-                || crate::sst::native::file_id_from_path(file.path()).is_some())
+                || crate::sst::location::parse_narthex_file_id(file.path()).is_some())
         {
-            // Readers may still pin either native samples or series indexes.
+            // Readers may still pin either narthex samples or series indexes.
             has_sst_file = true;
             break;
         } else if !file.path().ends_with(DROPPING_MARKER_FILE) {
@@ -452,13 +452,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_native_objects_prevent_region_directory_removal() {
+    async fn test_narthex_objects_prevent_region_directory_removal() {
         let store = ObjectStore::new(object_store::services::Memory::default()).unwrap();
         let region = "test/region/";
         let id = store_api::storage::FileId::random();
         let marker = format!("{region}{DROPPING_MARKER_FILE}");
-        let samples = format!("{region}native/{id}/part-0.samples");
-        let series = format!("{region}native/{id}/part-0.series");
+        let samples = format!(
+            "{}part-0.samples",
+            crate::sst::location::narthex_file_dir(region, id)
+        );
+        let series = format!(
+            "{}part-0.series",
+            crate::sst::location::narthex_file_dir(region, id)
+        );
         store.write(&marker, Bytes::new()).await.unwrap();
         for path in [&samples, &series] {
             store

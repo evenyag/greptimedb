@@ -86,18 +86,18 @@ pending. DDL cancellation retains its existing scheduling fence and priority.
   `tests/compatibility/manifest/table_compaction/` and
   `tests/compatibility/manifest/pending_tails/`.
 - **SST/Parquet layout** (`sst/`): readers must stay compatible with existing files.
-- **Native storage PoC**: `sst_format=native` makes samples authoritative SSTs
-  (`sst/native.rs`), with native bulk parts, SeriesScan queries and SeqScan
-  compaction. All native reads require the shared prepared core in
+- **Narthex storage PoC**: `sst_format=narthex` makes samples authoritative SSTs
+  (`sst/narthex.rs`), with Narthex bulk parts, SeriesScan queries and SeqScan
+  compaction. All Narthex reads require the shared prepared core in
   `read/series_scan/prepared.rs`, including batch output for SQL/compaction.
-  `prepared/native.rs` opens authoritative handles independently of sidecar settings;
+  `prepared/narthex.rs` opens authoritative handles independently of sidecar settings;
   uncovered samples discover exact keys from metadata. Live memtable sources join
-  the same prepared merge. Never route native SSTs through legacy file scanning.
-  `FileMeta::format` carries native object inventories; manifest and
+  the same prepared merge. Never route Narthex SSTs through legacy file scanning.
+  `FileMeta::format` carries Narthex object inventories; manifest and
   `SstVersion` also own optional immutable series indexes. Replacing any covered
   samples retires the whole index. Coverage does not own samples: readers pin
-  samples and indexes independently through ordinary file references. Native
-  artifacts use `native/<FileId>/` and must never use local sidecar eviction.
+  samples and indexes independently through ordinary file references. Narthex
+  artifact paths are defined in `sst/location.rs` as `<FileId>/` and must never use local sidecar eviction.
   Remap/staging preserves samples and series owners. Physical region copy rewrites
   artifact-manifest owners, object inventories and index source owners, then uses
   the serialized edit lane for destination admission sequences. Encoded parts
@@ -107,7 +107,7 @@ pending. DDL cancellation retains its existing scheduling fence and priority.
   and defer new builds when the shared estimate is full. Cleanup still prunes obsolete
   range entries and expires series indexes to reclaim published usage. Concurrent builds may
   overshoot; closed-region files are not counted. Series handles and the SST purger own file deletion.
-- **Series format PoC**: samples are rebuildable local SST sidecars. Optional writer interfaces (`format.rs`) integrate with reconciliation, catalog publication, and deferred purge. Defaults retain the original Parquet writer and disable samples. The opt-in columnar backend (`series_index/columnar.rs`) implements streaming OpenDAL writes and pinned format reads; its wire contract is in `docs/formats/mito-series.md`. Artifact objects record paths and sizes, including the manifest, so reads need no stat. Codecs currently run inline pending scheduling benchmarks. Sample payload reads coalesce nearby selected ranges in bounded, memory-accounted windows; boundary blocks keep timestamp-first pruning. Aligned native payload blocks share the page-cache budget with Parquet, with generation/namespace isolation and no shared lock held across I/O. Columnar stage timings and read counters are exported through Mito metrics. Columnar `SeriesScan` raw reads use scanner-wide preparation in `read/series_scan/prepared.rs`; ordinary record-batch scans retain their SST path. Native reader metadata shares the decoded SST cache reservation; maintenance readers bypass this cache. The paired `experimental_series_index_format` setting selects legacy or columnar artifacts.
+- **Series format PoC**: samples are rebuildable local SST sidecars. Optional writer interfaces (`format.rs`) integrate with reconciliation, catalog publication, and deferred purge. Defaults retain the original Parquet writer and disable samples. The opt-in columnar backend (`series_index/columnar.rs`) implements streaming OpenDAL writes and pinned format reads; its wire contract is in `docs/formats/mito-series.md`. Artifact objects record paths and sizes, including the manifest, so reads need no stat. Codecs currently run inline pending scheduling benchmarks. Sample payload reads coalesce nearby selected ranges in bounded, memory-accounted windows; boundary blocks keep timestamp-first pruning. Aligned Narthex payload blocks share the page-cache budget with Parquet, with generation/namespace isolation and no shared lock held across I/O. Columnar stage timings and read counters are exported through Mito metrics. Columnar `SeriesScan` raw reads use scanner-wide preparation in `read/series_scan/prepared.rs`; ordinary record-batch scans retain their SST path. Narthex reader metadata shares the decoded SST cache reservation; maintenance readers bypass this cache. The paired `experimental_series_index_format` setting selects legacy or columnar artifacts.
 - **Series-index coverage** (`series_index/catalog.rs`): `SeriesIndexEntry` stores
   compaction-window width and SST summaries keyed by aligned start in both catalogs and Parquet footers.
 - **Local index cache**: startup checks a root layout version before workers start; missing or incompatible versions reset the whole rebuildable cache, including catalogs and range indexes. Samples use one generation directory; source SST identity stays in metadata.

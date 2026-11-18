@@ -215,7 +215,7 @@ impl Default for WriteOptions {
 /// Parquet SST info returned by the writer.
 #[derive(Debug, Default)]
 pub struct SstInfo {
-    /// Physical encoding and owned native objects, when present.
+    /// Physical encoding and owned narthex objects, when present.
     pub format: crate::sst::file::FileFormat,
     /// SST file id.
     pub file_id: FileId,
