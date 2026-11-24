@@ -304,7 +304,14 @@ impl ColumnarPreparedSource {
         match attempt(!indexes.is_empty()).await {
             // Parts are opened lazily. Discard every candidate from the failed
             // attempt before discovering keys from the same pinned sample snapshot.
-            Err(error) if !indexes.is_empty() && error.is_object_not_found() => {
+            Err(error)
+                if !indexes.is_empty()
+                    && (error.is_object_not_found()
+                        || matches!(
+                            error,
+                            Error::InvalidMeta { .. } | Error::UnsupportedOperation { .. }
+                        )) =>
+            {
                 attempt(false).await
             }
             result => result,

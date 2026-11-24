@@ -295,6 +295,7 @@ impl SeriesIndexTask {
                 };
                 meta.coverage.as_ref().is_none_or(|proof| {
                     proof.region_id != region.region_id
+                        || proof.schema_version != version.metadata.schema_version
                         || proof.truncated_entry_id != version.truncated_entry_id
                         || proof.windows.iter().all(|window| expired(window.end))
                 })
@@ -556,6 +557,12 @@ impl SeriesIndexTask {
                 series_indexes_to_remove: remove.clone(),
                 ..Default::default()
             };
+            if !self.state.is_running() {
+                if let Some(handle) = handle {
+                    handle.mark_deleted();
+                }
+                return WorkerStoppedSnafu { id: self.worker_id }.fail();
+            }
             let (tx, rx) = oneshot::channel();
             let mut request = RegionEditRequest::new(region.region_id, edit, false, tx);
             request.kind = RegionEditKind::NativeSeries(region.clone(), version.clone());
@@ -625,14 +632,6 @@ impl SeriesIndexTask {
         for region in self.regions.list_regions() {
             if !self.state.is_running() {
                 break;
-            }
-            // Best effort: the region can still change state during reconciliation.
-            // Local indexes can be built on followers as well as writable leaders.
-            if !matches!(
-                region.state(),
-                RegionRoleState::Follower | RegionRoleState::Leader(RegionLeaderState::Writable)
-            ) {
-                continue;
             }
             if let Err(error) = self.reconcile_region(region.clone()).await {
                 warn!(error; "Failed to reconcile series indexes, worker: {}, region: {}", self.worker_id, region.region_id);
