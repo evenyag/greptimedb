@@ -97,33 +97,22 @@ pub(crate) async fn open_sources(
             continue;
         };
         let region = context.input.region_metadata().region_id;
-        let selected: Vec<_> = if let Some(proof) = &index.coverage {
-            if proof.schema_version != context.input.region_metadata().schema_version
-                || proof.region_id != region
-                || proof.truncated_entry_id != context.input.truncated_entry_id
-            {
-                continue;
-            }
-            indices
-                .iter()
-                .map(|i| &context.input.files[*i])
-                .filter(|sample| proof.covers(sample.meta_ref()))
-                .map(|sample| sample.file_id())
-                .collect()
-        } else {
-            if !index
-                .sources
-                .iter()
-                .all(|id| context.input.files.iter().any(|f| f.file_id() == *id))
-            {
-                continue;
-            }
-            indices
-                .iter()
-                .map(|i| context.input.files[*i].file_id())
-                .filter(|id| index.sources.contains(id))
-                .collect()
+        let Some(proof) = &index.coverage else {
+            // Source lists from older manifests cannot establish logical coverage.
+            continue;
         };
+        if proof.schema_version != context.input.region_metadata().schema_version
+            || proof.region_id != region
+            || proof.truncated_entry_id != context.input.truncated_entry_id
+        {
+            continue;
+        }
+        let selected: Vec<_> = indices
+            .iter()
+            .map(|i| &context.input.files[*i])
+            .filter(|sample| proof.covers(sample.meta_ref()))
+            .map(|sample| sample.file_id())
+            .collect();
         if selected.is_empty() {
             continue;
         }
@@ -158,11 +147,11 @@ pub(crate) async fn open_sources(
             continue;
         }
         opened.insert(file.file_id());
-        certificates.push((index.coverage.as_ref(), selected));
+        certificates.push((proof, selected));
         series.push(Box::new(reader));
     }
     for (proof, selected) in certificates {
-        if proof.is_none_or(|p| p.required_files.iter().all(|f| opened.contains(f))) {
+        if proof.required_files.iter().all(|f| opened.contains(f)) {
             covered.extend(selected);
         }
     }

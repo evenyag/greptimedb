@@ -1648,6 +1648,8 @@ impl Error {
     /// from a revoked key, a changed bucket policy or clock skew) never proves nothing was written.
     pub(crate) fn may_have_persisted_manifest_update(&self) -> bool {
         match self {
+            Error::EditRegion { source, .. } => source.may_have_persisted_manifest_update(),
+            Error::RegionBusy { .. } => false,
             // Applicability and capability checks reject the edit before storage I/O.
             Error::InvalidRequest { .. }
             | Error::UpdateManifest { .. }

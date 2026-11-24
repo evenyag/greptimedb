@@ -70,7 +70,6 @@ use crate::manifest::manager::RegionManifestManager;
 use crate::metrics::manifest_size::RegionManifestSizeMetric;
 use crate::region::version::{VersionControlRef, VersionRef};
 use crate::request::{OnFailure, OptionOutputTx};
-use crate::series_index::{SeriesIndexVersion, SeriesIndexVersionControl};
 use crate::sst::file::{self, FileMeta};
 use crate::sst::file_purger::FilePurgerRef;
 use crate::sst::location::index_file_path;
@@ -193,10 +192,6 @@ pub struct MitoRegion {
     ///
     /// We MUST update the version control inside the write lock of the region manifest manager.
     pub(crate) version_control: VersionControlRef,
-    /// Snapshot controller for range and series indexes.
-    pub(crate) series_index_version_control: SeriesIndexVersionControl,
-    /// Store containing the region's series indexes.
-    pub(crate) series_index_store: Option<ObjectStore>,
     /// SSTs accessor for this region.
     pub(crate) access_layer: AccessLayerRef,
     /// Context to maintain manifest for this region.
@@ -311,9 +306,6 @@ impl MitoRegion {
     }
 
     /// Returns the current immutable series-index snapshot.
-    pub(crate) fn series_index_version(&self) -> Arc<SeriesIndexVersion> {
-        self.series_index_version_control.current()
-    }
 
     fn remove_region_metrics(&self) {
         let region_id = self.region_id.as_u64().to_string();
@@ -3162,8 +3154,6 @@ mod tests {
             region_id: metadata.region_id,
             compaction_state: Default::default(),
             version_control,
-            series_index_version_control: Default::default(),
-            series_index_store: None,
             access_layer: env.access_layer.clone(),
             manifest_ctx,
             file_purger: crate::test_util::new_noop_file_purger(),
@@ -4299,8 +4289,6 @@ mod tests {
             region_id: metadata.region_id,
             compaction_state: Default::default(),
             version_control,
-            series_index_version_control: Default::default(),
-            series_index_store: None,
             access_layer,
             manifest_ctx: manifest_ctx.clone(),
             file_purger: crate::test_util::new_noop_file_purger(),

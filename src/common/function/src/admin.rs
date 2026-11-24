@@ -36,7 +36,7 @@ use reconcile_catalog::ReconcileCatalogFunction;
 use reconcile_database::ReconcileDatabaseFunction;
 use reconcile_table::ReconcileTableFunction;
 
-use crate::admin::build_index_table::{BuildIndexFunction, BuildSeriesIndexFunction};
+use crate::admin::build_index_table::BuildIndexFunction;
 use crate::admin::cancel_region_compaction::CancelRegionCompactionFunction;
 use crate::admin::discard_pending_tails::DiscardPendingTailsFunction;
 use crate::admin::discard_unflushed_data::DiscardUnflushedDataFunction;
@@ -58,7 +58,6 @@ impl AdminFunction {
         registry.register(GcRegionsFunction::factory());
         registry.register(GcTableFunction::factory());
         registry.register(BuildIndexFunction::factory());
-        registry.register(BuildSeriesIndexFunction::factory());
         registry.register(FlushFlowFunction::factory());
         registry.register(ReconcileCatalogFunction::factory());
         registry.register(ReconcileDatabaseFunction::factory());

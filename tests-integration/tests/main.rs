@@ -15,7 +15,6 @@
 #![recursion_limit = "256"]
 
 mod admin_function_event;
-mod build_series_index;
 mod database_ddl_event;
 mod dict_groupby_sst;
 mod drain_datanode;

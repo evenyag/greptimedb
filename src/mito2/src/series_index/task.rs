@@ -245,13 +245,12 @@ impl SeriesIndexTask {
         if !allow_builds {
             SERIES_INDEX_CAPACITY_DEFERRED.inc();
         }
-        if !allow_builds
-            || region.version().options.sst_format != Some(crate::sst::FormatType::Narthex)
+        if region.version().options.sst_format != Some(crate::sst::FormatType::Narthex)
             || region.state() != RegionRoleState::Leader(RegionLeaderState::Writable)
         {
             return Ok(false);
         }
-        let result = self.reconcile_native(region, manual).await;
+        let result = self.reconcile_native(region, manual, allow_builds).await;
         if result.is_err() {
             SERIES_INDEX_RECONCILE_TOTAL
                 .with_label_values(&["failure"])
@@ -260,7 +259,12 @@ impl SeriesIndexTask {
         result
     }
 
-    async fn reconcile_native(&self, region: MitoRegionRef, manual: bool) -> Result<bool> {
+    async fn reconcile_native(
+        &self,
+        region: MitoRegionRef,
+        manual: bool,
+        allow_builds: bool,
+    ) -> Result<bool> {
         use crate::request::{
             RegionEditKind, RegionEditRequest, WorkerRequest, WorkerRequestWithTime,
         };
@@ -269,6 +273,55 @@ impl SeriesIndexTask {
 
         let current = region.version_control.current();
         let version = current.version;
+        let worker = self
+            .state
+            .worker
+            .as_ref()
+            .ok_or_else(|| WorkerStoppedSnafu { id: self.worker_id }.build())?;
+        let now = common_time::Timestamp::new_millisecond(self.time_provider.current_time_millis());
+        let expired = |end| {
+            version
+                .options
+                .ttl
+                .is_some_and(|ttl| ttl.is_expired(&end, &now).unwrap_or(false))
+        };
+        let retire = version
+            .ssts
+            .series_indexes()
+            .values()
+            .filter(|file| {
+                let FileFormat::NarthexSeriesIndex(meta) = &file.meta_ref().format else {
+                    return false;
+                };
+                meta.coverage.as_ref().is_none_or(|proof| {
+                    proof.region_id != region.region_id
+                        || proof.truncated_entry_id != version.truncated_entry_id
+                        || proof.windows.iter().all(|window| expired(window.end))
+                })
+            })
+            .map(|file| file.file_id())
+            .collect::<Vec<_>>();
+        if !retire.is_empty() {
+            let edit = crate::manifest::action::RegionEdit {
+                series_indexes_to_remove: retire,
+                ..Default::default()
+            };
+            let (tx, rx) = oneshot::channel();
+            let mut request = RegionEditRequest::new(region.region_id, edit, false, tx);
+            request.kind = RegionEditKind::NativeSeries(region.clone(), version);
+            worker
+                .send(WorkerRequestWithTime::new(WorkerRequest::EditRegion(
+                    request,
+                )))
+                .await
+                .map_err(|_| WorkerStoppedSnafu { id: self.worker_id }.build())?;
+            rx.await
+                .map_err(|_| WorkerStoppedSnafu { id: self.worker_id }.build())??;
+            return Ok(true);
+        }
+        if !allow_builds {
+            return Ok(false);
+        }
         // A completed flush published its inputs and committed boundary together.
         // Defer during in-flight admissions, unflushed writes and WAL recovery.
         if current.last_sequence != version.flushed_sequence
@@ -293,17 +346,18 @@ impl SeriesIndexTask {
             .iter()
             .flat_map(|l| l.files.values().cloned())
             .collect();
-        let buckets =
-            group_files_into_series_buckets(&files, width, (window.as_secs() as i64).max(1));
+        let buckets = group_files_into_series_buckets(&files, width);
         let indexes = version.ssts.series_indexes();
-        let worker = self
-            .state
-            .worker
-            .as_ref()
-            .ok_or_else(|| WorkerStoppedSnafu { id: self.worker_id }.build())?;
         let mut job = None;
         for bucket in buckets {
-            if bucket.files.iter().all(|f| f.meta_ref().sequence.is_none()) {
+            if expired(bucket.end)
+                || !bucket.files.iter().any(|f| {
+                    f.meta_ref()
+                        .sequence
+                        .is_some_and(|seq| seq.get() <= version.flushed_sequence)
+                        && f.time_range().1 < bucket.end
+                })
+            {
                 continue;
             }
             let existing: Vec<_> = indexes
@@ -321,7 +375,12 @@ impl SeriesIndexTask {
             if bucket
                 .files
                 .iter()
-                .filter(|f| f.meta_ref().sequence.is_some())
+                .filter(|f| {
+                    f.meta_ref()
+                        .sequence
+                        .is_some_and(|seq| seq.get() <= version.flushed_sequence)
+                        && f.time_range().1 < bucket.end
+                })
                 .all(|f| {
                     existing.iter().any(|(_, p)| {
                         p.schema_version == version.metadata.schema_version

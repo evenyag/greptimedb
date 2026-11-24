@@ -170,29 +170,43 @@ impl<S> RegionWorkerLoop<S> {
         &mut self,
         region_id: RegionId,
         req: RegionBuildIndexRequest,
-        sender: OptionOutputTx,
+        mut sender: OptionOutputTx,
     ) {
-        match req.options {
-            Some(build_index_request::Options::SeriesIndex(_)) => {
-                self.handle_build_series_index_request(region_id, sender);
-            }
-            None | Some(build_index_request::Options::SstIndex(_)) => {
-                self.handle_rebuild_index(
-                    BuildIndexRequest {
-                        region_id,
-                        build_type: IndexBuildType::Manual,
-                        file_metas: Vec::new(),
-                        result_senders: Vec::new(),
-                    },
-                    sender,
-                )
-                .await;
-            }
+        if matches!(
+            req.options,
+            Some(build_index_request::Options::SeriesIndex(_))
+        ) {
+            sender.send(
+                InvalidRequestSnafu {
+                    region_id,
+                    reason: "legacy series-index builds are unsupported",
+                }
+                .fail(),
+            );
+            return;
         }
+        if req.options.is_none()
+            && self.regions.get_region(region_id).is_some_and(|region| {
+                region.version().options.sst_format == Some(crate::sst::FormatType::Narthex)
+            })
+        {
+            self.handle_native_index_request(region_id, sender);
+            return;
+        }
+        self.handle_rebuild_index(
+            BuildIndexRequest {
+                region_id,
+                build_type: IndexBuildType::Manual,
+                file_metas: Vec::new(),
+                result_senders: Vec::new(),
+            },
+            sender,
+        )
+        .await;
     }
 
     /// Submits manual reconciliation without blocking the region worker on index I/O.
-    fn handle_build_series_index_request(&self, region_id: RegionId, mut sender: OptionOutputTx) {
+    fn handle_native_index_request(&self, region_id: RegionId, mut sender: OptionOutputTx) {
         let Some(region) = self.regions.writable_region_or(region_id, &mut sender) else {
             return;
         };

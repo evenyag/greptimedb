@@ -232,9 +232,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         );
         let build = || {
             RegionRequest::BuildIndex(store_api::region_request::RegionBuildIndexRequest {
-                options: Some(api::v1::region::build_index_request::Options::SeriesIndex(
-                    Default::default(),
-                )),
+                options: None,
             })
         };
         engine.handle_request(region_id, build()).await?;

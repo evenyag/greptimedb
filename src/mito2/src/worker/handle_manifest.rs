@@ -437,6 +437,7 @@ impl<S: LogStore> RegionWorkerLoop<S> {
             let current = region.version();
             if !Arc::ptr_eq(origin, &region)
                 || region.is_staging()
+                || current.options.ttl != snapshot.options.ttl
                 || current.metadata.schema_version != snapshot.metadata.schema_version
                 || current.truncated_entry_id != snapshot.truncated_entry_id
                 || !current.pending_tails.is_empty()

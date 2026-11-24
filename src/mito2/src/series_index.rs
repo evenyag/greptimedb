@@ -14,22 +14,16 @@
 
 //! Series index construction, search, and maintenance.
 //!
-//! Under development. Index files are currently stored on the local filesystem.
+//! Native index artifacts are owned and published by the region manifest.
 
 pub(crate) mod artifact;
 mod artifact_writer;
 mod bucket;
-mod builder;
 mod catalog;
 pub(crate) mod columnar;
 pub(crate) mod format;
-#[cfg(test)]
-mod format_tests;
 pub(crate) mod identity;
-mod maintenance;
-mod purger;
 pub(crate) mod samples;
-mod searcher;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -37,44 +31,18 @@ mod version;
 mod writer;
 
 #[cfg(test)]
-pub(crate) use maintenance::reconcile_series_indexes_with_mode;
-#[cfg(test)]
 pub(crate) use tests::prepare_region_with_metadata;
 
-use std::sync::Arc;
-
 use futures::stream::BoxStream;
-use object_store::ObjectStore;
 use store_api::metric_engine_consts::{
     DATA_SCHEMA_TABLE_ID_COLUMN_NAME as TABLE_ID_COLUMN,
     DATA_SCHEMA_TSID_COLUMN_NAME as TSID_COLUMN,
 };
 
 use crate::error::Result;
-#[cfg(test)]
-pub(crate) use crate::series_index::catalog::{RangeIndexEntry, SeriesIndexEntry};
-pub(crate) use crate::series_index::catalog::{
-    delete_catalogs, load_version_control, series_index_path,
-};
-pub(crate) use crate::series_index::purger::{IndexFilePurger, series_index_channel};
-pub use crate::series_index::searcher::SeriesIndexSearcher;
 pub(crate) use crate::series_index::task::{SeriesIndexTaskState, spawn_series_index_tasks};
+pub(crate) use crate::series_index::version::SeriesIndexFileHandle;
 pub(crate) use crate::series_index::version::narthex_series_entry;
-pub(crate) use crate::series_index::version::{
-    SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexVersionControl,
-};
-pub use crate::series_index::writer::{
-    SeriesIndexWriter, SeriesIndexWriterMetrics, SeriesIndexWriterOptions, series_index_schema,
-};
-
-/// Index storage and pinned catalog snapshot for a query.
-#[derive(Clone)]
-pub(crate) struct SeriesIndexReadContext {
-    pub(crate) cache_namespace: store_api::storage::FileId,
-    pub(crate) format: crate::config::SeriesIndexFormat,
-    pub(crate) store: ObjectStore,
-    pub(crate) version: Arc<SeriesIndexVersion>,
-}
 
 pub(crate) const MIN_TS_COLUMN: &str = "__series_min_ts";
 pub(crate) const MAX_TS_COLUMN: &str = "__series_max_ts";

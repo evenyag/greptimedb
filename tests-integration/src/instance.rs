@@ -341,7 +341,6 @@ mod tests {
                 "SELECT gc_regions(0)",
                 "SELECT gc_table('admin_fn_demo')",
                 "SELECT build_index('admin_fn_demo')",
-                "SELECT build_series_index('admin_fn_demo')",
                 "SELECT flush_flow('admin_fn_demo')",
                 "SELECT reconcile_catalog()",
                 "SELECT reconcile_database('public')",
