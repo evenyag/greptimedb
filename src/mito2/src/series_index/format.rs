@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use common_recordbatch::filter::SimpleFilterEvaluator;
 use datatypes::arrow::datatypes::{Field, SchemaRef};
 use datatypes::arrow::record_batch::RecordBatch;
+#[cfg(test)]
 use datatypes::prelude::DataType;
 use futures::stream::BoxStream;
 use object_store::ObjectStore;
@@ -31,10 +32,15 @@ use store_api::storage::FileId;
 use store_api::storage::consts::ReservedColumnId;
 
 use crate::error::{InvalidRecordBatchSnafu, Result};
-use crate::series_index::artifact::{ArtifactMetadata, SamplesFileHandle};
+use crate::series_index::MetricSeriesId;
+#[cfg(test)]
+use crate::series_index::SeriesIndexFileHandle;
+use crate::series_index::artifact::ArtifactMetadata;
+#[cfg(test)]
+use crate::series_index::artifact::SamplesFileHandle;
+#[cfg(test)]
 use crate::series_index::catalog::SeriesIndexEntry;
 use crate::series_index::identity::ExactSeriesKey;
-use crate::series_index::{MetricSeriesId, SeriesIndexFileHandle};
 use crate::sst::PARQUET_FIELD_ID_KEY;
 
 /// Writers own partial outputs until finish succeeds; abort removes every partial object.
@@ -62,6 +68,7 @@ pub(crate) trait FormatReader: Send + Sync {
 }
 
 /// Builds and opens immutable series-index artifacts.
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait SeriesIndexFormat: Debug + Send + Sync {
     async fn reader(
@@ -125,6 +132,7 @@ pub(crate) trait SamplesFormatReader: Send + Sync {
 /// Builds and opens immutable samples artifacts.
 #[async_trait]
 pub(crate) trait SamplesFormat: Debug + Send + Sync {
+    #[cfg(test)]
     async fn reader(
         &self,
         _store: ObjectStore,
@@ -156,6 +164,7 @@ pub(crate) fn field_id(field: &Field) -> Result<u32> {
 }
 
 /// Checks whether samples can be read with the current region schema.
+#[cfg(test)]
 pub(crate) fn validate_sample_schema(schema: &SchemaRef, metadata: &RegionMetadata) -> Result<()> {
     // Exact identity: readers attribute every sample row by this column, so an
     // artifact that cannot expose it is unusable.

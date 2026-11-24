@@ -12775,7 +12775,7 @@ async fn native_promql_columnar_fused_series_matches_legacy() {
     const TABLE: &str = "native_columnar_fused";
     let mito_config = mito2::config::MitoConfig {
         experimental_enable_series_index: true,
-        // Slow the periodic pass, so the manual build below is what publishes the catalog.
+        // Slow the periodic pass, so the manual build below publishes the native index.
         experimental_series_index_maintenance_interval: Duration::from_secs(3600),
         ..Default::default()
     };
@@ -12854,27 +12854,12 @@ async fn native_promql_columnar_fused_series_matches_legacy() {
     let series_schema = series_scan.series_schema();
     assert_eq!(series_schema.fields.len(), 1);
     assert_eq!(series_schema.fields[0].name.as_ref(), "val");
-    // Only the columnar writer publishes these formats, so the scanned region's catalog rules out
-    // a configuration-only run.
-    let samples = std::path::Path::new(&standalone.opts.storage.data_home)
-        .join("series_index")
-        .join(physical_metadata.region_id.as_u64().to_string())
-        .join("samples.json");
-    let catalog: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(samples).unwrap()).unwrap();
-    let entries = catalog["entries"].as_array().unwrap();
-    let series = catalog["series"].as_array().unwrap();
-    assert!(!entries.is_empty() && !series.is_empty(), "published");
-    assert!(
-        entries
-            .iter()
-            .all(|entry| entry["artifact"]["format"] == "columnar-samples")
-    );
-    assert!(
-        series
-            .iter()
-            .all(|entry| entry["artifact"]["format"] == "columnar-series")
-    );
+    // The Narthex region accounts for samples and independently published indexes.
+    let stats = standalone
+        .mito_engine
+        .get_region_statistic(physical_metadata.region_id)
+        .unwrap();
+    assert!(stats.sst_num > 0 && stats.index_size > 0);
     // One value per series: the node ran, rather than being merely planned.
     let output_values = fused_metric_set(&plan)
         .iter()

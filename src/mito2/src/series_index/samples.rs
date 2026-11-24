@@ -34,9 +34,13 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::FileId;
 
 use crate::error::Result;
-use crate::series_index::artifact::{ArtifactFormat, SamplesFileHandle};
+use crate::series_index::artifact::ArtifactFormat;
+#[cfg(test)]
+use crate::series_index::artifact::SamplesFileHandle;
 use crate::series_index::columnar::{invalid, require, unsupported};
-use crate::series_index::format::{FormatWriter, SamplesFormat, SamplesFormatReader};
+#[cfg(test)]
+use crate::series_index::format::SamplesFormatReader;
+use crate::series_index::format::{FormatWriter, SamplesFormat};
 use crate::series_index::identity::IdentityEncoding;
 use crate::series_index::{MetricSeriesId, TABLE_ID_COLUMN, TSID_COLUMN};
 
@@ -115,6 +119,7 @@ impl SamplesFormat for ColumnarSamplesFormat {
             generation,
         )?))
     }
+    #[cfg(test)]
     async fn reader(
         &self,
         store: ObjectStore,

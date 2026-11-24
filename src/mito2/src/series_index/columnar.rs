@@ -23,6 +23,7 @@ mod writer;
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use async_trait::async_trait;
 use datatypes::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use object_store::ObjectStore;
@@ -33,11 +34,11 @@ use store_api::storage::FileId;
 use crate::error::{InvalidMetaSnafu, Result};
 use crate::series_index::artifact::ArtifactFormat;
 use crate::series_index::catalog::SeriesIndexEntry;
-use crate::series_index::format::{FormatReader, FormatWriter, SeriesIndexFormat};
+use crate::series_index::format::FormatWriter;
+#[cfg(test)]
+use crate::series_index::format::{FormatReader, SeriesIndexFormat};
 use crate::series_index::identity::IdentityEncoding;
-use crate::series_index::{
-    MetricSeriesId, ROW_COUNT_COLUMN, SeriesIndexFileHandle, TABLE_ID_COLUMN, TSID_COLUMN,
-};
+use crate::series_index::{MetricSeriesId, ROW_COUNT_COLUMN, TABLE_ID_COLUMN, TSID_COLUMN};
 
 pub(crate) const VERSION: u32 = 1;
 pub(crate) const MANIFEST_LIMIT: usize = 64 * 1024 * 1024;
@@ -83,6 +84,10 @@ impl ColumnarSeriesFormat {
     }
 }
 
+#[cfg(test)]
+use crate::series_index::SeriesIndexFileHandle;
+
+#[cfg(test)]
 #[async_trait]
 impl SeriesIndexFormat for ColumnarSeriesFormat {
     async fn writer(
