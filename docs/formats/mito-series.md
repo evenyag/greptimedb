@@ -421,3 +421,43 @@ stored. A block contains at most 8,388,608 series. The manifest is at most 64 Mi
 Offsets, lengths, and counts must fit their enclosing areas without arithmetic
 overflow. Counts must not imply allocations larger than the enclosing decoded
 payload permits.
+
+## Delta build measurements
+
+Delta generation stays opt-in through `experimental_narthex_series_delta`.
+At 95% unchanged series it reduced total maintenance I/O by 33%, but the
+twelve reconciliations took 14% longer. With entirely unchanged series it
+also reduced elapsed time. With entirely new series it increased bytes written.
+
+| Unchanged | Build | Bytes read | Bytes written | Maintenance ms | Peak RSS KiB | Median discovery ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 0% | Full | 7,570,782 | 370,166 | 2,150 | 215,480 | 288.4 |
+| 0% | Delta | 5,261,726 | 386,386 | 2,687 | 216,732 | 285.6 |
+| 95% | Full | 7,448,261 | 200,324 | 1,655 | 188,752 | 118.0 |
+| 95% | Delta | 4,965,356 | 186,210 | 1,884 | 190,104 | 116.1 |
+| 100% | Full | 7,433,062 | 182,830 | 1,625 | 185,296 | 106.9 |
+| 100% | Delta | 4,228,850 | 97,614 | 1,462 | 182,768 | 112.3 |
+
+Each Linux test process wrote 100 series for each of 32 logical tables per
+cycle, using two or three of eight physical tags. Distinct exact keys
+deliberately shared TSIDs. Three flushes per window across four windows
+exercised both index advancement and the four-file compaction trigger. The
+cumulative fingerprints of the sample parts across all twelve snapshots matched
+between paths for every population (0% `7ac0c43a`, 95% `8dd73b47`, 100%
+`1c2c9f6d`).
+
+The byte counters cover object-store reads and writes during each manual
+reconciliation, including series compaction and publication. Input generation,
+fingerprinting and query I/O run outside the counters. Discovery measures
+scanner preparation before sample payload reads. RSS is the process high-water
+mark across the entire case. These are unoptimized test-profile measurements
+on local storage with four virtual CPUs. Object-store latency and optimized
+builds can change elapsed times.
+
+Run each case in a fresh process to measure its peak independently.
+
+```bash
+for case_number in 1 2 3 4 5 6; do
+  cargo test -p mito2 --lib "native_index_cycles::case_${case_number}_" -- --ignored --nocapture
+done
+```
