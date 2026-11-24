@@ -322,12 +322,22 @@ impl SeriesIndexTask {
         if !allow_builds {
             return Ok(false);
         }
-        // A completed flush published its inputs and committed boundary together.
-        // Defer during in-flight admissions, unflushed writes and WAL recovery.
-        if current.last_sequence != version.flushed_sequence
-            || current.committed_sequence != version.flushed_sequence
+        // A flush publishes its input set and boundary together. A destination
+        // admission can advance the durable sequence without flushing a memtable.
+        // The edit lane reserves the sequence before I/O and commits it when
+        // installing the files. Never certify a pending reservation or WAL tail.
+        let frontier = current.committed_sequence;
+        if current.last_sequence != frontier
             || !version.memtables.is_empty()
             || !version.pending_tails.is_empty()
+            || (frontier > version.flushed_sequence
+                && region
+                    .manifest_ctx
+                    .manifest()
+                    .await
+                    .committed_sequence
+                    .unwrap_or_default()
+                    < frontier)
         {
             return Ok(false);
         }
@@ -354,7 +364,7 @@ impl SeriesIndexTask {
                 || !bucket.files.iter().any(|f| {
                     f.meta_ref()
                         .sequence
-                        .is_some_and(|seq| seq.get() <= version.flushed_sequence)
+                        .is_some_and(|seq| seq.get() <= frontier)
                         && f.time_range().1 < bucket.end
                 })
             {
@@ -378,7 +388,7 @@ impl SeriesIndexTask {
                 .filter(|f| {
                     f.meta_ref()
                         .sequence
-                        .is_some_and(|seq| seq.get() <= version.flushed_sequence)
+                        .is_some_and(|seq| seq.get() <= frontier)
                         && f.time_range().1 < bucket.end
                 })
                 .all(|f| {
@@ -399,7 +409,7 @@ impl SeriesIndexTask {
                 windows: vec![CertifiedWindow {
                     start: bucket.start,
                     end: bucket.end,
-                    frontier: version.flushed_sequence,
+                    frontier,
                 }],
             };
             let mut bases = Vec::new();

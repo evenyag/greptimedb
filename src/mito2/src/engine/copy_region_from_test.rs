@@ -890,12 +890,9 @@ async fn test_narthex_copy_and_remap(
     let destination = engine.get_region(target).unwrap();
     let after = destination.manifest_ctx.manifest().await;
     assert_eq!(after.files.len(), 2);
-    assert_eq!(after.committed_sequence, if remap { Some(1) } else { None });
+    assert_eq!(after.committed_sequence, Some(1));
     for file in after.files.values() {
-        assert_eq!(
-            file.sequence.map(|s| s.get()),
-            if remap { Some(1) } else { None }
-        );
+        assert_eq!(file.sequence.map(|s| s.get()), Some(1));
         assert!(!file.preserve_row_sequence);
         assert!(matches!(file.format, FileFormat::NarthexSamples(_)));
         assert_eq!(file.is_effective_target_sequence_trusted(target), remap);

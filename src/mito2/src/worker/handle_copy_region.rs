@@ -144,13 +144,12 @@ impl<S> RegionWorkerLoop<S> {
 
             match region_edit {
                 Some(region_edit)
-                    if region_edit
-                        .files_to_add
-                        .iter()
-                        .any(|file| file.level == file::LEVEL_SHARED) =>
+                    if region_edit.files_to_add.iter().any(|file| {
+                        file.level == file::LEVEL_SHARED
+                            || matches!(file.format, file::FileFormat::NarthexSamples(_))
+                    }) =>
                 {
-                    // Shared references enter the serialized
-                    // edit lane for destination admission sequences.
+                    // Native samples and shared references acquire destination admission sequences.
                     // The response lists installed references, including shared SSTs
                     // whose objects stay in place; it is not a physical COPY count.
                     let copied_file_ids = region_edit
@@ -378,11 +377,10 @@ impl<S> RegionWorkerLoop<S> {
             committed_sequence: None,
             ..Default::default()
         };
-        if edit
-            .files_to_add
-            .iter()
-            .any(|file| file.level == file::LEVEL_SHARED)
-        {
+        if edit.files_to_add.iter().any(|file| {
+            file.level == file::LEVEL_SHARED
+                || matches!(file.format, file::FileFormat::NarthexSamples(_))
+        }) {
             return Ok((Some(edit), source_file_ids));
         }
         let action_list = RegionMetaActionList::with_action(RegionMetaAction::Edit(edit.clone()));
