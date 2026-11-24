@@ -243,13 +243,65 @@ pub type FileMetaRef = MetadataRef<FileMeta>;
 pub type PartitionExprRef = MetadataRef<PartitionExpr>;
 
 /// Physical encoding of an immutable SST. Legacy manifests contain Parquet files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(try_from = "StoredFileFormat")]
 pub enum FileFormat {
     #[default]
     Parquet,
     NarthexSamples(Box<NarthexSamplesMeta>),
     NarthexSeriesIndex(Box<NarthexSeriesIndexMeta>),
+}
+
+// An older reader must reject a physical copy whose row sequences need
+// translation. Unknown fields inside the original samples variant are ignored.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StoredFileFormat {
+    Parquet,
+    NarthexSamples(Box<NarthexSamplesMeta>),
+    NarthexAdmittedSamples(Box<NarthexSamplesMeta>),
+    NarthexSeriesIndex(Box<NarthexSeriesIndexMeta>),
+}
+
+impl TryFrom<StoredFileFormat> for FileFormat {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredFileFormat) -> std::result::Result<Self, Self::Error> {
+        Ok(match stored {
+            StoredFileFormat::Parquet => Self::Parquet,
+            StoredFileFormat::NarthexSamples(meta) => Self::NarthexSamples(meta),
+            StoredFileFormat::NarthexAdmittedSamples(meta) if !meta.row_sequences.is_encoded() => {
+                Self::NarthexSamples(meta)
+            }
+            StoredFileFormat::NarthexAdmittedSamples(_) => {
+                return Err("missing native admission sequence mapping");
+            }
+            StoredFileFormat::NarthexSeriesIndex(meta) => Self::NarthexSeriesIndex(meta),
+        })
+    }
+}
+
+impl Serialize for FileFormat {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Parquet => serializer.serialize_unit_variant("FileFormat", 0, "parquet"),
+            Self::NarthexSamples(meta) if meta.row_sequences.is_encoded() => {
+                serializer.serialize_newtype_variant("FileFormat", 1, "narthex_samples", meta)
+            }
+            Self::NarthexSeriesIndex(meta) => {
+                serializer.serialize_newtype_variant("FileFormat", 2, "narthex_series_index", meta)
+            }
+            Self::NarthexSamples(meta) => serializer.serialize_newtype_variant(
+                "FileFormat",
+                3,
+                "narthex_admitted_samples",
+                meta,
+            ),
+        }
+    }
 }
 
 impl FileFormat {

@@ -51,7 +51,9 @@ manifest records its file ID and sequence bound. A shared reference uses its des
 reserves a new interval in the destination sequence domain. Its manifest records
 the offset applied to stored row sequences. This preserves the source ordering
 of overlapping puts and deletes. The prepared reader applies the mapping before
-evaluating visibility or merging rows.
+evaluating visibility or merging rows. The region manifest uses the distinct
+`narthex_admitted_samples` variant for these mappings. Readers predating the
+mapping reject the unknown variant when reopening the region.
 
 The source file ID and generation use existing `FileId` serialization. The
 generation is unique for each build. A manifest contains:
