@@ -31,7 +31,6 @@ use crate::metrics::{
 };
 use crate::read::series_candidate::is_sparse_metric_metadata;
 use crate::region::{MitoRegionRef, RegionLeaderState, RegionMapRef, RegionRoleState};
-use crate::series_index::maintenance::ReconcileStats;
 use crate::time_provider::TimeProviderRef;
 
 /// Commands serialized with periodic series-index maintenance.
@@ -40,7 +39,7 @@ pub(crate) enum SeriesIndexCommand {
     Wake,
     Reconcile {
         region: MitoRegionRef,
-        sender: oneshot::Sender<Result<ReconcileStats>>,
+        sender: oneshot::Sender<Result<bool>>,
     },
     Stop,
 }
@@ -86,7 +85,7 @@ impl SeriesIndexTaskState {
     pub(crate) fn try_reconcile(
         &self,
         region: MitoRegionRef,
-    ) -> Result<oneshot::Receiver<Result<ReconcileStats>>> {
+    ) -> Result<oneshot::Receiver<Result<bool>>> {
         ensure!(self.is_running(), WorkerStoppedSnafu { id: self.worker_id });
         let region_id = region.region_id;
         let (sender, receiver) = oneshot::channel();
@@ -217,17 +216,22 @@ impl SeriesIndexTask {
         Ok(())
     }
 
-    async fn reconcile_manual(&mut self, region: MitoRegionRef) -> Result<ReconcileStats> {
+    async fn reconcile_manual(&mut self, region: MitoRegionRef) -> Result<bool> {
         self.validate_manual_region(&region)?;
         self.refresh_usage();
-        let result = self.reconcile_region_with_mode(region.clone(), true).await;
-        self.refresh_usage();
-        let result = result?;
-        self.validate_manual_region(&region)?;
-        Ok(result)
+        let mut changed = false;
+        while self
+            .reconcile_region_with_mode(region.clone(), true)
+            .await?
+        {
+            changed = true;
+            self.refresh_usage();
+            self.validate_manual_region(&region)?;
+        }
+        Ok(changed)
     }
 
-    async fn reconcile_region(&self, region: MitoRegionRef) -> Result<ReconcileStats> {
+    async fn reconcile_region(&self, region: MitoRegionRef) -> Result<bool> {
         self.reconcile_region_with_mode(region, false).await
     }
 
@@ -235,7 +239,7 @@ impl SeriesIndexTask {
         &self,
         region: MitoRegionRef,
         manual: bool,
-    ) -> Result<ReconcileStats> {
+    ) -> Result<bool> {
         // Full capacity defers builds, but cleanup must still reclaim published usage.
         let allow_builds = self.disk_usage.load(Ordering::Relaxed) < self.max_size;
         if !allow_builds {
@@ -245,7 +249,7 @@ impl SeriesIndexTask {
             || region.version().options.sst_format != Some(crate::sst::FormatType::Narthex)
             || region.state() != RegionRoleState::Leader(RegionLeaderState::Writable)
         {
-            return Ok(ReconcileStats::default());
+            return Ok(false);
         }
         let result = self.reconcile_native(region, manual).await;
         if result.is_err() {
@@ -256,18 +260,13 @@ impl SeriesIndexTask {
         result
     }
 
-    async fn reconcile_native(
-        &self,
-        region: MitoRegionRef,
-        manual: bool,
-    ) -> Result<ReconcileStats> {
+    async fn reconcile_native(&self, region: MitoRegionRef, manual: bool) -> Result<bool> {
         use crate::request::{
             RegionEditKind, RegionEditRequest, WorkerRequest, WorkerRequestWithTime,
         };
         use crate::series_index::bucket::{group_files_into_series_buckets, rounded_bucket_width};
         use crate::sst::file::{CertifiedWindow, FileFormat, NarthexCoverage};
 
-        let mut stats = ReconcileStats::default();
         let current = region.version_control.current();
         let version = current.version;
         // A completed flush published its inputs and committed boundary together.
@@ -277,16 +276,16 @@ impl SeriesIndexTask {
             || !version.memtables.is_empty()
             || !version.pending_tails.is_empty()
         {
-            return Ok(stats);
+            return Ok(false);
         }
         let Some(window) = version
             .compaction_time_window
             .or(manual.then_some(self.bucket_width))
         else {
-            return Ok(stats);
+            return Ok(false);
         };
         let Some(width) = rounded_bucket_width(self.bucket_width, window) else {
-            return Ok(stats);
+            return Ok(false);
         };
         let files: Vec<_> = version
             .ssts
@@ -500,11 +499,9 @@ impl SeriesIndexTask {
                 }
                 return Err(error);
             }
-            stats.built_series += usize::from(handle.is_some());
-            stats.source_files += inputs.len();
-            stats.removed_series += remove.len();
+            return Ok(true);
         }
-        Ok(stats)
+        Ok(false)
     }
 
     /// Each worker contributes only its open regions, refreshed at maintenance boundaries.

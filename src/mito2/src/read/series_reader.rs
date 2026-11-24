@@ -157,20 +157,14 @@ impl SeriesBatchCollector {
 struct MetricSeriesFilter {
     range: SeriesRange,
     series: Arc<HashSet<MetricSeriesId>>,
-    sorted_series: Arc<Vec<MetricSeriesId>>,
     enable_range_cache: bool,
 }
 
 impl MetricSeriesFilter {
     fn new(assigned: &AssignedSeriesBatch) -> Self {
-        let mut sorted_series = assigned.series().to_vec();
-        sorted_series.sort_unstable();
-        sorted_series.dedup();
-        let series = sorted_series.iter().copied().collect();
         Self {
             range: assigned.range(),
-            series: Arc::new(series),
-            sorted_series: Arc::new(sorted_series),
+            series: Arc::new(assigned.series().iter().copied().collect()),
             enable_range_cache: assigned.enable_range_cache(),
         }
     }
@@ -525,16 +519,7 @@ fn scan_series_file_ranges(
 
         for range in ranges {
             let build_start = Instant::now();
-            let searcher = range.range_index_searcher().await?;
-            let reader = if let Some(searcher) = searcher {
-                let row_group_id = u32::try_from(range.row_group_index()).map_err(|_| UnexpectedSnafu {
-                    reason: format!("row group index exceeds u32: {}", range.row_group_index()),
-                }.build())?;
-                let selected = searcher.search(row_group_id, &filter.sorted_series).await?;
-                range.reader_by_row_ranges(selected, fetch_metrics.as_deref()).await?
-            } else {
-                range.reader_by_primary_key(primary_key_filter.as_mut(), fetch_metrics.as_deref()).await?
-            };
+            let reader = range.reader_by_primary_key(primary_key_filter.as_mut(), fetch_metrics.as_deref()).await?;
             let build_cost = build_start.elapsed();
             reader_metrics.build_cost += build_cost;
             part_metrics.inc_build_reader_cost(build_cost);

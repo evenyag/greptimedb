@@ -2185,26 +2185,15 @@ async fn check_series_scan_single_source_range_batches(rows_per_series: usize) {
 
 #[tokio::test]
 async fn test_two_phase_series_scan() {
-    for use_index in [false, true] {
-        for use_range_index in [false, true] {
-            for mode in [
-                crate::config::ScanMemoryMode::Basic,
-                crate::config::ScanMemoryMode::Extended,
-            ] {
-                check_two_phase_series_scan(use_index, use_range_index, true, mode).await;
-            }
-        }
-        check_two_phase_series_scan(use_index, true, false, crate::config::ScanMemoryMode::Basic)
-            .await;
+    for mode in [
+        crate::config::ScanMemoryMode::Basic,
+        crate::config::ScanMemoryMode::Extended,
+    ] {
+        check_two_phase_series_scan(mode).await;
     }
 }
 
-async fn check_two_phase_series_scan(
-    use_index: bool,
-    use_range_index: bool,
-    enable_range_index: bool,
-    scan_memory_mode: crate::config::ScanMemoryMode,
-) {
+async fn check_two_phase_series_scan(scan_memory_mode: crate::config::ScanMemoryMode) {
     let mut env = TestEnv::with_prefix("test_two_phase_series_scan").await;
     let engine = env
         .create_engine(MitoConfig {
@@ -2213,8 +2202,6 @@ async fn check_two_phase_series_scan(
                 timeout: std::time::Duration::from_secs(30),
             },
             experimental_series_scan_v2: true,
-            experimental_enable_series_index: true,
-            experimental_enable_range_index: enable_range_index,
             ..Default::default()
         })
         .await;
@@ -2292,104 +2279,6 @@ async fn check_two_phase_series_scan(
         .await
         .unwrap();
     test_util::flush_region(&engine, region_id, None).await;
-    if use_index || use_range_index {
-        use datatypes::arrow::array::{BinaryArray, UInt8Array, UInt64Array};
-
-        use crate::series_index::{
-            SeriesIndexEntry, SeriesIndexFileHandle, SeriesIndexVersion, SeriesIndexWriter,
-            SeriesIndexWriterOptions, series_index_channel, series_index_path,
-        };
-
-        let region = engine.find_region(region_id).unwrap();
-        let store = region.series_index_store.clone().unwrap();
-        let sequence = region.flushed_sequence();
-        let entry = SeriesIndexEntry {
-            artifact: None,
-            file_size: 0,
-            index_uuid: FileId::random(),
-            bucket_start: Timestamp::new_millisecond(0),
-            bucket_end: Timestamp::new_millisecond(2001),
-            source_file_ids: Vec::new(),
-            min_file_sequence: sequence,
-            max_file_sequence: sequence,
-            compaction_window_secs: 1,
-            window_sequences: Default::default(),
-        };
-        let keys = [
-            (10, 0, "a", "x"),
-            (10, u64::MAX, "b", "y"),
-            (20, 0, "c", "z"),
-        ]
-        .map(|(table, tsid, a, b)| new_sparse_primary_key(&[a, b], &metadata, table, tsid));
-        let batch = DfRecordBatch::try_from_iter(vec![
-            (
-                "ts",
-                Arc::new(TimestampMillisecondArray::from(vec![1000; 3])) as ArrayRef,
-            ),
-            (
-                "__primary_key",
-                Arc::new(BinaryArray::from_iter_values(&keys)),
-            ),
-            ("__sequence", Arc::new(UInt64Array::from_value(sequence, 3))),
-            ("__op_type", Arc::new(UInt8Array::from_value(0, 3))),
-        ])
-        .unwrap();
-        let mut index_version = SeriesIndexVersion::default();
-        if use_index {
-            let path = series_index_path(region_id, entry.index_uuid);
-            let mut writer = SeriesIndexWriter::try_new(
-                metadata.clone(),
-                store.clone(),
-                &path,
-                SeriesIndexWriterOptions::default(),
-                None,
-            )
-            .await
-            .unwrap();
-            writer.write(&batch).await.unwrap();
-            writer.finish().await.unwrap();
-            let (purger, _receiver) = series_index_channel(store.clone());
-            let handle = SeriesIndexFileHandle::new(region_id, entry.clone(), purger);
-            index_version
-                .series_indexes
-                .insert(entry.index_uuid, handle);
-        }
-        if use_range_index {
-            use crate::sst::range_index::{
-                SstRangeIndexWriter, SstRangeIndexWriterOptions, range_index_path,
-            };
-            let version = region.version();
-            let file = version
-                .ssts
-                .levels()
-                .iter()
-                .flat_map(|level| level.files.values())
-                .next()
-                .unwrap();
-            assert_eq!(1, file.meta_ref().num_row_groups);
-            let file_id = file.file_id().file_id();
-            let mut writer = SstRangeIndexWriter::try_new(
-                metadata.clone(),
-                store,
-                &range_index_path(region_id, file_id),
-                SstRangeIndexWriterOptions::default(),
-            )
-            .await
-            .unwrap();
-            writer.write(0, &batch).await.unwrap();
-            writer.finish().await.unwrap();
-            index_version.range_indexes.insert(
-                file_id,
-                crate::series_index::RangeIndexEntry {
-                    file_id,
-                    file_size: 0,
-                },
-            );
-        }
-        region
-            .series_index_version_control
-            .publish(Arc::new(index_version));
-    }
     // A newer SST remains uncovered; the remaining writes stay in memory.
     engine
         .handle_request(region_id, put(rows(&[(10, 0, "a", "x", 11, 1000)])))
@@ -2455,12 +2344,6 @@ async fn check_two_phase_series_scan(
     }))
     .await
     .unwrap();
-
-    let index_files = metrics_set
-        .clone_inner()
-        .sum_by_name("candidate_index_files")
-        .map_or(0, |value| value.as_usize());
-    assert_eq!(usize::from(use_index), index_files);
 
     let mut series_to_partition = BTreeMap::new();
     let mut actual_rows = Vec::new();
@@ -2673,69 +2556,6 @@ async fn check_two_phase_series_scan(
         1,
         batches.iter().map(|batch| batch.num_rows()).sum::<usize>()
     );
-
-    if use_range_index {
-        // Enabled queries must read the cataloged index; disabled queries must
-        // succeed even when that file is unavailable.
-        let region = engine.find_region(region_id).unwrap();
-        let version = region.series_index_version_control.current();
-        let file_id = *version.range_indexes.keys().next().unwrap();
-        region
-            .series_index_store
-            .as_ref()
-            .unwrap()
-            .delete(&crate::sst::range_index::range_index_path(
-                region_id, file_id,
-            ))
-            .await
-            .unwrap();
-        let scanner = engine
-            .scanner(
-                region_id,
-                ScanRequest {
-                    distribution: Some(TimeSeriesDistribution::PerSeries),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        if enable_range_index {
-            if let Ok(stream) = scanner.scan().await {
-                assert!(stream.try_collect::<Vec<_>>().await.is_err());
-            }
-        } else {
-            let batches = scanner
-                .scan()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let mut rows = Vec::new();
-            for batch in batches {
-                let tags = batch.column_by_name("tag_0").unwrap();
-                let fields = batch
-                    .column_by_name("field_0")
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                let timestamps = batch
-                    .column_by_name("ts")
-                    .unwrap()
-                    .as_primitive::<TimestampMillisecondType>();
-                for row in 0..batch.num_rows() {
-                    rows.push((
-                        datatypes::arrow_array::string_array_value_at_index(tags, row)
-                            .unwrap()
-                            .to_string(),
-                        fields.value(row),
-                        timestamps.value(row),
-                    ));
-                }
-            }
-            rows.sort();
-            assert_eq!(actual_rows, rows);
-        }
-    }
 }
 
 /// Runs one two-phase series scan over `filters` and returns `(tag_0, field_0, ts)` per row.

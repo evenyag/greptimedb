@@ -312,12 +312,6 @@ impl SeriesScan {
 
     fn uses_columnar(&self) -> bool {
         self.stream_ctx.input.requires_narthex_preparation()
-            || self
-                .stream_ctx
-                .input
-                .series_index
-                .as_ref()
-                .is_some_and(|context| context.format == crate::config::SeriesIndexFormat::Columnar)
     }
 
     /// Whether every selected *field* is a `Float64`, which is all the columnar prepared reader
