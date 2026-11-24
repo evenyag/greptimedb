@@ -9,12 +9,11 @@ The format has two artifact roles: `NarthexSamples` owns sample data, and
 Region manifests serialize these roles as `narthex_samples` and
 `narthex_series_index`.
 
-## Region storage and publication
+## Object layout
 
 Each artifact owns `<region_dir>/<file_id>/manifest.json` and its
 `part-<n>.samples` or `part-<n>.series` objects. The region manifest records
-their encoded sizes and physical owner. Query versions pin the files they read.
-A sample compaction can replace its inputs while a reader still holds an index.
+their encoded sizes and physical owner.
 
 ## Wire specification
 
@@ -30,7 +29,7 @@ An artifact written before exact identity has the same version number and record
 only `(table_id, tsid)`, a hash; it can be structurally valid and perfectly ordered
 while two distinct series were merged. Nothing in such an artifact proves
 otherwise, so a manifest without the `identity_encoding` discriminator is
-rejected, and its artifact rebuilt from SSTs; there is no dual reader. The same
+rejected. The same
 applies to an artifact of the earlier layout of this format, whose keys sat inside
 the block descriptors: its `identity_encoding` value is the older
 `exact-sparse-key`, so it is refused when the manifest is opened rather than when a
@@ -42,12 +41,11 @@ in single-series blocks bounded by rows and decoded bytes.
 
 ## Artifact manifest
 
-The catalog identifier is `columnar-samples`. Its file and manifest version is 1,
-independent of the series format's version and both formats' codec identifiers.
-Existing `parquet` and `columnar-series` identifiers keep their meaning.
+The artifact manifest identifies the format as `columnar-samples`, version 1.
 
 A native sample artifact stores the rows of a flush or compaction. The region
-manifest records its file ID and sequence bound. A shared reference uses its destination admission sequence. A physical copy
+manifest records its file ID and sequence bound. A shared reference uses its
+destination admission sequence. A physical copy
 reserves a new interval in the destination sequence domain. Its manifest records
 the offset applied to stored row sequences. This preserves the source ordering
 of overlapping puts and deletes. The prepared reader applies the mapping before
@@ -104,7 +102,7 @@ No object path is stored in a part descriptor.
 Parts follow input order. Adjacent identifier ranges satisfy
 `previous.last <= next.first`; equality is allowed because a series can continue
 in another part. The shared boundary series can also have equal timestamps on
-both sides. These ranges are **not disjoint**, unlike the series-index format.
+both sides.
 Readers consider every matching part rather than choosing a unique owner.
 
 `ArtifactMetadata.objects` records the manifest and every part as `{ path, file_size }`;
@@ -544,10 +542,5 @@ invalid metadata, even for an unprojected column. Unknown fields or malformed
 references must not be interpreted as omitted all-null columns.
 
 New column encodings or compression methods receive new IDs. Structural changes,
-changed field meanings, or incompatible limits require a new version. Deeper
-metadata trees require an explicit reader-support and rollout decision; an
-unchanged layout alone does not make them readable by version-1 implementations.
-
-The local cache root contains a layout-version marker. Startup clears the entire
-series-index cache when this marker is absent or incompatible, then rebuilds
-artifacts through existing maintenance. Source SST identity remains in metadata.
+changed field meanings, or incompatible limits require a new version. Version 1
+readers reject deeper metadata trees.
