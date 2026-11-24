@@ -25,6 +25,7 @@ use store_api::storage::FileId;
 use crate::access_layer::SstInfoArray;
 use crate::access_layer::{AccessLayer, SstWriteRequest};
 use crate::error::{ComputeArrowSnafu, InvalidRecordBatchSnafu, Result};
+use crate::series_index::MetricSeriesId;
 use crate::series_index::format::SamplesFormat;
 use crate::series_index::samples::ColumnarSamplesFormat;
 use crate::sst::file::{FileFormat, NarthexPartMeta, NarthexSamplesMeta, RegionFileId};
@@ -164,6 +165,7 @@ async fn series_keys(
     layer: &AccessLayer,
     source: &crate::sst::file::FileHandle,
     metadata: &store_api::metadata::RegionMetadata,
+    ranges: Option<Arc<[(MetricSeriesId, MetricSeriesId)]>>,
 ) -> Result<
     futures::stream::BoxStream<'static, Result<crate::series_index::identity::ExactSeriesKey>>,
 > {
@@ -195,10 +197,13 @@ async fn series_keys(
         .map(|f| f.name().clone())
         .chain(tags.iter().map(|(_, name)| name.clone()))
         .collect();
-    let mut batches = reader.read(SeriesReadRequest {
-        projection,
-        ..Default::default()
-    })?;
+    let mut batches = reader.read_ranges(
+        SeriesReadRequest {
+            projection,
+            ..Default::default()
+        },
+        ranges,
+    )?;
     Ok(Box::pin(async_stream::try_stream! {
         let codec = SparsePrimaryKeyCodec::schemaless();
         let mut offsets = SparseOffsetsCache::new();
@@ -227,6 +232,20 @@ pub(crate) async fn write_series(
     sources: &[crate::sst::file::FileHandle],
     coverage: Option<crate::sst::file::NarthexCoverage>,
 ) -> Result<crate::sst::file::FileMeta> {
+    write_series_difference(layer, metadata, sources, &[], coverage)
+        .await?
+        .ok_or_else(|| crate::series_index::columnar::invalid("empty native series build"))
+}
+
+/// Writes the sorted input union minus the published base union. Equal exact
+/// keys from base streams precede input keys in the heap.
+pub(crate) async fn write_series_difference(
+    layer: &AccessLayer,
+    metadata: store_api::metadata::RegionMetadataRef,
+    sources: &[crate::sst::file::FileHandle],
+    bases: &[crate::sst::file::FileHandle],
+    coverage: Option<crate::sst::file::NarthexCoverage>,
+) -> Result<Option<crate::sst::file::FileMeta>> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -271,18 +290,25 @@ pub(crate) async fn write_series(
         &entry,
         prefix,
     )?;
-    let write_result: Result<()> = async {
-        let mut streams = Vec::with_capacity(sources.len());
+    let write_result: Result<bool> = async {
+        let mut wrote_key = false;
+        let mut streams = Vec::with_capacity(sources.len() + bases.len());
         let mut heads = BinaryHeap::new();
+        let mut ranges = Vec::new();
         for source in sources {
             let mut stream = match &source.meta_ref().format {
-                FileFormat::NarthexSeriesIndex(_) => series_keys(layer, source, &metadata).await?,
+                FileFormat::NarthexSeriesIndex(_) => {
+                    series_keys(layer, source, &metadata, None).await?
+                }
                 FileFormat::NarthexSamples(_) => {
                     let handle = SamplesFileHandle::from_narthex(
                         source.clone(),
                         &layer.build_region_dir(source.region_id()),
                     )?;
                     let reader = SamplesReader::open(layer.object_store().clone(), handle).await?;
+                    if !bases.is_empty() {
+                        ranges.extend(reader.series_ranges());
+                    }
                     reader
                         .read(Default::default())?
                         .map_ok(|block| block.key)
@@ -295,25 +321,52 @@ pub(crate) async fn write_series(
                 }
             };
             if let Some(key) = stream.try_next().await? {
-                heads.push(Reverse((key, streams.len())));
+                heads.push(Reverse((key, true, streams.len())));
+            }
+            streams.push(stream);
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(MetricSeriesId, MetricSeriesId)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        let merged: Arc<[_]> = merged.into();
+        for base in bases {
+            let mut stream = series_keys(layer, base, &metadata, Some(merged.clone())).await?;
+            if let Some(key) = stream.try_next().await? {
+                heads.push(Reverse((key, false, streams.len())));
             }
             streams.push(stream);
         }
         let mut previous = None;
-        while let Some(Reverse((key, index))) = heads.pop() {
+        while let Some(Reverse((key, incoming, index))) = heads.pop() {
             if previous.as_ref() != Some(&key) {
-                writer.append_key(key.bytes()).await?;
+                if incoming {
+                    writer.append_key(key.bytes()).await?;
+                    wrote_key = true;
+                }
                 previous = Some(key);
             }
             if let Some(key) = streams[index].try_next().await? {
-                heads.push(Reverse((key, index)));
+                heads.push(Reverse((key, incoming, index)));
             }
         }
-        Ok(())
+        Ok(wrote_key)
     }
     .await;
-    if let Err(error) = write_result {
-        return Err(abort_narthex_write(writer, error).await);
+    match write_result {
+        Err(error) => return Err(abort_narthex_write(writer, error).await),
+        Ok(false) if !bases.is_empty() => {
+            writer.abort().await?;
+            return Ok(None);
+        }
+        Ok(_) => (),
     }
     let artifact = writer.finish().await?;
     file.file_size = artifact.file_size;
@@ -330,7 +383,7 @@ pub(crate) async fn write_series(
             })
             .collect();
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Complete cleanup before reporting a failed write. Drop cleanup remains a fallback

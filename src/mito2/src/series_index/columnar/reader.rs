@@ -216,6 +216,17 @@ impl FormatReader for ColumnarReader {
     }
 
     fn read(&self, request: SeriesReadRequest) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        self.read_ranges(request, None)
+    }
+}
+
+impl ColumnarReader {
+    /// Restrict key discovery to pages whose table/TSID span intersects an incoming sample part.
+    pub(crate) fn read_ranges(
+        &self,
+        request: SeriesReadRequest,
+        ranges: Option<Arc<[(MetricSeriesId, MetricSeriesId)]>>,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let schema = self.schema();
         let mut projection = Vec::new();
         for name in &request.projection {
@@ -249,8 +260,12 @@ impl FormatReader for ColumnarReader {
             // Retained across every yield, even after the reader object is dropped.
             let _handle = handle;
             let mut metrics = ColumnarReadMetrics::default();
+            let relevant = |first, last| matches_range(first,last,&request) && ranges.as_ref().is_none_or(|ranges| {
+                let i = ranges.partition_point(|(_, end)| *end < first);
+                ranges.get(i).is_some_and(|(start,_)| *start <= last)
+            });
             for part in &manifest.files {
-                if !matches_range(part.first, part.last, &request) { continue; }
+                if !relevant(part.first, part.last) { continue; }
                 *metrics.counts.entry("series_parts").or_default() += 1;
                 let timer = metrics.timer("columnar_series_metadata_wall");
                 let path = manifest.part_path(part.part_id);
@@ -280,7 +295,7 @@ impl FormatReader for ColumnarReader {
                 loop {
                     let page = if let Some(page) = active.take() { page } else {
                         let Some(child) = child_iter.next() else { break; };
-                        if !matches_range(child.first, child.last, &request) { continue; }
+                        if !relevant(child.first, child.last) { continue; }
                         let timer = metrics.timer("columnar_series_metadata_wall");
                         let page = load_metadata_page(cache.as_ref(), &store, (&path, size), &child, 1, trailer.payload_end, &names).await?;
                         drop(timer);
@@ -294,7 +309,7 @@ impl FormatReader for ColumnarReader {
                             column.payload.validate(previous_payload_end, trailer.payload_end, false)?;
                             previous_payload_end = column.payload.end()?;
                         }
-                        if !matches_range(block.first_id(), block.last_id(), &request) || !matches_statistics(block, &request.filters) { continue; }
+                        if !relevant(block.first_id(), block.last_id()) || !matches_statistics(block, &request.filters) { continue; }
                         *metrics.counts.entry("series_blocks_read").or_default() += 1;
                         *metrics.counts.entry("series_rows_examined").or_default() += u64::from(block.rows);
                         if let Some(mut output) = read_block(&store, &path, block, &request, projected.clone(), &mut metrics).await? {
@@ -309,7 +324,7 @@ impl FormatReader for ColumnarReader {
                         }
                     }
                 }
-                if request.ids.is_none() && request.table_id.is_none() {
+                if ranges.is_none() && request.ids.is_none() && request.table_id.is_none() {
                     require(observed_rows == part.num_series, "series part row count mismatch")?;
                 }
             }

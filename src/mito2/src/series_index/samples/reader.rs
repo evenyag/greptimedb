@@ -54,6 +54,15 @@ pub(crate) struct SamplesReader {
     parts: Arc<Vec<OnceCell<Reader>>>,
 }
 impl SamplesReader {
+    pub(crate) fn series_ranges(
+        &self,
+    ) -> impl Iterator<Item = (MetricSeriesId, MetricSeriesId)> + '_ {
+        self.manifest
+            .files
+            .iter()
+            .map(|part| (part.first, part.last))
+    }
+
     pub(crate) async fn open_cached(
         store: ObjectStore,
         handle: SamplesFileHandle,

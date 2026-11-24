@@ -60,6 +60,7 @@ impl SstVersion {
             let file = file.into();
             indexes
                 .entry(file.file_id)
+                .and_modify(|current| *current = current.with_updated_index(file.clone()))
                 .or_insert_with(|| FileHandle::new(file, purger.clone()));
         }
     }

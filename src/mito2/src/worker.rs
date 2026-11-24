@@ -812,6 +812,7 @@ impl<S: LogStore> WorkerStarter<S> {
         {
             let (mut state, receiver) =
                 SeriesIndexTaskState::new(self.id, self.config.worker_channel_size);
+            state.delta = self.config.experimental_narthex_series_delta;
             state.worker = Some(sender.clone());
             (Some(Arc::new(state)), Some(receiver))
         } else {

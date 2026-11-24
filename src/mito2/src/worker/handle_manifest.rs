@@ -440,12 +440,14 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 || current.metadata.schema_version != snapshot.metadata.schema_version
                 || current.truncated_entry_id != snapshot.truncated_entry_id
                 || !current.pending_tails.is_empty()
-                || current
-                    .ssts
-                    .series_indexes()
-                    .keys()
-                    .collect::<std::collections::HashSet<_>>()
-                    != snapshot.ssts.series_indexes().keys().collect()
+                || current.ssts.series_indexes().len() != snapshot.ssts.series_indexes().len()
+                || snapshot.ssts.series_indexes().iter().any(|(id, expected)| {
+                    current
+                        .ssts
+                        .series_indexes()
+                        .get(id)
+                        .is_none_or(|file| file.meta_ref() != expected.meta_ref())
+                })
             {
                 waiters.reply_with(|| RegionBusySnafu { region_id }.fail());
                 return RegionEditDispatch::Rejected;

@@ -286,6 +286,9 @@ pub struct CertifiedWindow {
 /// Logical coverage in the sequence domain of a pinned region version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NarthexCoverage {
+    /// For a delta build every member names the complete immutable union.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_files: Vec<RegionFileId>,
     pub schema_version: u64,
     pub region_id: RegionId,
     pub truncated_entry_id: Option<crate::wal::EntryId>,
@@ -1484,6 +1487,7 @@ mod tests {
             frontier,
         };
         let mut coverage = NarthexCoverage {
+            required_files: Vec::new(),
             schema_version: 0,
             region_id: RegionId::new(1, 0),
             truncated_entry_id: None,

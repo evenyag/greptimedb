@@ -53,6 +53,7 @@ pub(crate) struct SeriesIndexTaskState {
     worker_id: u32,
     running: AtomicBool,
     sender: Sender<SeriesIndexCommand>,
+    pub(crate) delta: bool,
     pub(crate) worker: Option<Sender<crate::request::WorkerRequestWithTime>>,
 }
 
@@ -64,6 +65,7 @@ impl SeriesIndexTaskState {
                 worker_id,
                 running: AtomicBool::new(true),
                 sender,
+                delta: false,
                 worker: None,
             },
             receiver,
@@ -363,6 +365,7 @@ impl SeriesIndexTask {
             }
 
             let coverage = NarthexCoverage {
+                required_files: Vec::new(),
                 region_id: region.region_id,
                 schema_version: version.metadata.schema_version,
                 truncated_entry_id: version.truncated_entry_id,
@@ -372,16 +375,34 @@ impl SeriesIndexTask {
                     frontier: version.flushed_sequence,
                 }],
             };
-            let remove = existing
-                .iter()
-                .filter(|(_, p)| {
-                    p.windows
-                        .iter()
-                        .all(|w| bucket.start <= w.start && w.end <= bucket.end)
-                })
-                .map(|(f, _)| f.file_id())
-                .collect::<Vec<_>>();
-            job = Some((bucket.files.into_vec(), remove, coverage));
+            let mut bases = Vec::new();
+            let mut remove = Vec::new();
+            for (file, proof) in &existing {
+                if proof
+                    .windows
+                    .iter()
+                    .all(|w| bucket.start <= w.start && w.end <= bucket.end)
+                {
+                    if self.state.delta && proof.schema_version == version.metadata.schema_version {
+                        bases.push((*file).clone());
+                    } else {
+                        remove.push(file.file_id());
+                    }
+                }
+            }
+            let mut sources = bucket.files.into_vec();
+            if !bases.is_empty() {
+                sources.retain(|f| {
+                    !existing.iter().any(|(index, p)| {
+                        bases.iter().any(|b| b.file_id() == index.file_id())
+                            && p.required_files
+                                .iter()
+                                .all(|id| bases.iter().any(|b| b.file_id() == *id))
+                            && p.covers(f.meta_ref())
+                    })
+                });
+            }
+            job = Some((sources, bases, remove, coverage));
             break;
         }
         if job.is_none() {
@@ -404,19 +425,36 @@ impl SeriesIndexTask {
                 {
                     continue;
                 }
-                inputs.push(file.clone());
+                if inputs
+                    .iter()
+                    .any(|f: &crate::sst::file::FileHandle| f.file_id() == file.file_id())
+                {
+                    continue;
+                }
+                let members = proof.required_files.iter().map(|id|
+                    indexes.get(&id.file_id()).filter(|f| f.file_id() == *id && matches!(&f.meta_ref().format,
+                        FileFormat::NarthexSeriesIndex(meta) if meta.coverage.as_ref() == Some(proof)))
+                ).collect::<Option<Vec<_>>>();
+                let Some(members) = members else { continue };
+                if members.is_empty() {
+                    inputs.push(file.clone());
+                } else {
+                    inputs.extend(members.into_iter().cloned());
+                }
                 windows.extend(proof.windows.iter().cloned());
-                if inputs.len() == 4 {
+                if inputs.len() >= 4 {
                     break;
                 }
             }
-            if inputs.len() == 4 {
+            if inputs.len() >= 4 {
                 windows.sort_by_key(|w| w.start);
                 let remove = inputs.iter().map(|f| f.file_id()).collect();
                 job = Some((
                     inputs,
+                    Vec::new(),
                     remove,
                     NarthexCoverage {
+                        required_files: Vec::new(),
                         region_id: region.region_id,
                         schema_version: version.metadata.schema_version,
                         truncated_entry_id: version.truncated_entry_id,
@@ -425,18 +463,45 @@ impl SeriesIndexTask {
                 ));
             }
         }
-        if let Some((inputs, remove, coverage)) = job {
-            let output = crate::sst::narthex::write_series(
-                &region.access_layer,
-                version.metadata.clone(),
-                &inputs,
-                Some(coverage),
-            )
-            .await?;
-            let handle =
-                crate::sst::file::FileHandle::new(output.clone(), region.file_purger.clone());
+        if let Some((inputs, bases, remove, mut coverage)) = job {
+            let output = if bases.is_empty() {
+                Some(
+                    crate::sst::narthex::write_series(
+                        &region.access_layer,
+                        version.metadata.clone(),
+                        &inputs,
+                        Some(coverage.clone()),
+                    )
+                    .await?,
+                )
+            } else {
+                crate::sst::narthex::write_series_difference(
+                    &region.access_layer,
+                    version.metadata.clone(),
+                    &inputs,
+                    &bases,
+                    Some(coverage.clone()),
+                )
+                .await?
+            };
+            let handle = output.as_ref().map(|output| {
+                crate::sst::file::FileHandle::new(output.clone(), region.file_purger.clone())
+            });
+            let mut additions = bases
+                .iter()
+                .map(|f| f.meta_ref().clone())
+                .chain(output)
+                .collect::<Vec<_>>();
+            if !bases.is_empty() {
+                coverage.required_files = additions.iter().map(|f| f.file_id()).collect();
+                for file in &mut additions {
+                    if let FileFormat::NarthexSeriesIndex(meta) = &mut file.format {
+                        meta.coverage = Some(coverage.clone());
+                    }
+                }
+            }
             let edit = crate::manifest::action::RegionEdit {
-                series_indexes_to_add: vec![output],
+                series_indexes_to_add: additions,
                 series_indexes_to_remove: remove.clone(),
                 ..Default::default()
             };
@@ -450,19 +515,23 @@ impl SeriesIndexTask {
                 .await
                 .is_err()
             {
-                handle.mark_deleted();
+                if let Some(handle) = handle {
+                    handle.mark_deleted();
+                }
                 return WorkerStoppedSnafu { id: self.worker_id }.fail();
             }
             if let Err(error) = rx
                 .await
                 .map_err(|_| WorkerStoppedSnafu { id: self.worker_id }.build())?
             {
-                if !error.may_have_persisted_manifest_update() {
+                if !error.may_have_persisted_manifest_update()
+                    && let Some(handle) = handle
+                {
                     handle.mark_deleted();
                 }
                 return Err(error);
             }
-            stats.built_series += 1;
+            stats.built_series += usize::from(handle.is_some());
             stats.source_files += inputs.len();
             stats.removed_series += remove.len();
         }

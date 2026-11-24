@@ -114,6 +114,8 @@ pub struct MitoConfig {
     /// Under development; do not enable. Whether to enable series indexes (default false).
     /// Indexes are stored on the local filesystem under `{data_home}/series_index`.
     pub experimental_enable_series_index: bool,
+    /// Evaluate native delta builds against the published exact-key union.
+    pub experimental_narthex_series_delta: bool,
     /// Paired artifact format (default legacy).
     pub experimental_series_index_format: SeriesIndexFormat,
     /// Approximate series and range index size limit in open regions (default: 5 GiB).
@@ -262,6 +264,7 @@ impl Default for MitoConfig {
             compress_manifest: false,
             max_background_index_builds: divide_num_cpus(8),
             experimental_enable_series_index: false,
+            experimental_narthex_series_delta: false,
             experimental_series_index_format: SeriesIndexFormat::Legacy,
             experimental_series_index_max_size: ReadableSize::gb(5),
             experimental_enable_range_index: false,

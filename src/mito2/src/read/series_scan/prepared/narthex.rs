@@ -90,6 +90,8 @@ pub(crate) async fn open_sources(
     let mut series = Vec::<Box<dyn FormatReader>>::new();
     let indices = file_indices(context, ranges)?;
     let mut covered = std::collections::HashSet::new();
+    let mut opened = std::collections::HashSet::new();
+    let mut certificates = Vec::new();
     for file in &context.input.narthex_series_indexes {
         let FileFormat::NarthexSeriesIndex(index) = &file.meta_ref().format else {
             continue;
@@ -155,8 +157,14 @@ pub(crate) async fn open_sources(
         {
             continue;
         }
-        covered.extend(selected);
+        opened.insert(file.file_id());
+        certificates.push((index.coverage.as_ref(), selected));
         series.push(Box::new(reader));
+    }
+    for (proof, selected) in certificates {
+        if proof.is_none_or(|p| p.required_files.iter().all(|f| opened.contains(f))) {
+            covered.extend(selected);
+        }
     }
     for i in indices {
         let file = &context.input.files[i];
