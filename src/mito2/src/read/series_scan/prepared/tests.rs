@@ -1750,6 +1750,7 @@ async fn authoritative_fixture(merge_mode: &str) -> (TestEnv, MitoEngine, MitoRe
     let engine = env
         .create_engine(MitoConfig {
             schedule_compaction_after_edit: false,
+            min_compaction_interval: Duration::from_secs(3600),
             experimental_enable_series_index: true,
             experimental_series_index_bucket_width: Duration::from_secs(100),
             ..Default::default()
@@ -1766,6 +1767,8 @@ async fn authoritative_fixture(merge_mode: &str) -> (TestEnv, MitoEngine, MitoRe
     let mut create = crate::test_util::CreateRequestBuilder::new()
         .insert_option("primary_key_encoding", "sparse")
         .insert_option("sst_format", "narthex")
+        .insert_option("compaction.type", "twcs")
+        .insert_option("compaction.twcs.time_window", "100s")
         .insert_option("merge_mode", merge_mode)
         .build();
     create.column_metadatas = metadata.column_metadatas;
@@ -1776,6 +1779,7 @@ async fn authoritative_fixture(merge_mode: &str) -> (TestEnv, MitoEngine, MitoRe
         .await
         .unwrap();
     let region = engine.get_region(id).unwrap();
+    region.update_schedule_compaction_millis();
     (env, engine, region)
 }
 
@@ -2151,7 +2155,8 @@ async fn authoritative_copy_preserves_source_order(#[case] delete: bool) {
                     }
                 )
                 .await
-                .is_ok()
+                // This last-row region has no exact append-history capability.
+                .is_err()
         );
     }
     engine.stop().await.unwrap();
