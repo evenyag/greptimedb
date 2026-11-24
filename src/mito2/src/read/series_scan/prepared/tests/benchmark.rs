@@ -91,6 +91,7 @@ async fn native_index_cycles(#[case] delta: bool, #[case] unchanged: u64) {
         .field_num(1)
         .insert_option("primary_key_encoding", "sparse")
         .insert_option("sst_format", "narthex")
+        .insert_option("compaction.type", "twcs")
         .insert_option("compaction.twcs.time_window", "1m")
         .build();
     let reserved = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);

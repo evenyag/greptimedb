@@ -92,12 +92,6 @@ impl PartitionPruner {
         }
     }
 
-    /// Excludes files replaced by another candidate source from prefetching.
-    pub(crate) fn excluding_files(mut self, excluded: &HashSet<usize>) -> Self {
-        self.file_indices.retain(|index| !excluded.contains(index));
-        self
-    }
-
     /// Gets or creates the FileRangeBuilder for a file.
     ///
     /// This method also triggers pre-fetching of upcoming files in the background

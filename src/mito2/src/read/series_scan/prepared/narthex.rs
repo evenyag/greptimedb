@@ -176,16 +176,22 @@ pub(crate) async fn open_sources(
             context.input.cache_strategy.columnar_metadata(namespace),
         )
         .await?;
-        // Match Parquet: foreign SSTs use the destination admission sequence,
-        // while local SSTs retain their encoded row sequences. A local file's
-        // sequence metadata is only a bound, not a replacement for every row.
-        let sequence = if file
-            .meta_ref()
-            .uses_admission_sequence(context.input.region_metadata().region_id)
-        {
-            file.meta_ref().sequence.map(|sequence| sequence.get())
-        } else {
-            None
+        use crate::sst::file::NarthexRowSequences;
+        let mapping = match &file.meta_ref().format {
+            FileFormat::NarthexSamples(meta)
+                if file.region_id() == context.input.region_metadata().region_id =>
+            {
+                meta.row_sequences
+            }
+            _ => NarthexRowSequences::Admission,
+        };
+        let sequence = match mapping {
+            NarthexRowSequences::Encoded => None,
+            NarthexRowSequences::Admission => file
+                .meta_ref()
+                .sequence
+                .map(|seq| NarthexSequence::Constant(seq.get())),
+            NarthexRowSequences::Offset(base) => Some(NarthexSequence::Offset(base)),
         };
         let reader: Arc<dyn SamplesFormatReader> =
             Arc::new(NarthexSamplesReader { reader, sequence });
@@ -222,10 +228,16 @@ pub(crate) async fn open_sources(
     Ok((samples, series))
 }
 
+#[derive(Clone, Copy)]
+enum NarthexSequence {
+    Constant(u64),
+    Offset(u64),
+}
+
 /// Applies COPY admission sequences before snapshot visibility and deduplication.
 struct NarthexSamplesReader {
     reader: SamplesReader,
-    sequence: Option<u64>,
+    sequence: Option<NarthexSequence>,
 }
 
 impl SamplesFormatReader for NarthexSamplesReader {
@@ -245,7 +257,13 @@ impl SamplesFormatReader for NarthexSamplesReader {
                     && let Ok(index) = samples.batch.schema().index_of(SEQUENCE_COLUMN_NAME)
                 {
                     let mut columns = samples.batch.columns().to_vec();
-                    columns[index] = Arc::new(UInt64Array::from(vec![sequence; samples.batch.num_rows()]));
+                    columns[index] = match sequence { NarthexSequence::Constant(sequence) => {
+                        Arc::new(UInt64Array::from(vec![sequence; samples.batch.num_rows()]))
+                    }, NarthexSequence::Offset(base) => {
+                        let values = columns[index].as_any().downcast_ref::<UInt64Array>().ok_or_else(|| invalid("invalid native row sequence"))?;
+                        let translated = values.values().iter().map(|v| base.checked_add(*v).ok_or_else(|| invalid("native row sequence overflow"))).collect::<Result<Vec<_>>>()?;
+                        Arc::new(UInt64Array::from(translated))
+                    }};
                     samples.batch = RecordBatch::try_new(samples.batch.schema(), columns).context(NewRecordBatchSnafu)?;
                 }
                 yield samples;

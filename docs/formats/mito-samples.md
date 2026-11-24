@@ -47,9 +47,11 @@ independent of the series format's version and both formats' codec identifiers.
 Existing `parquet` and `columnar-series` identifiers keep their meaning.
 
 A native sample artifact stores the rows of a flush or compaction. The region
-manifest records its file ID and sequence bound. Foreign shared references and
-native physical copies can carry a destination admission sequence. The prepared
-reader applies that sequence to the rows before evaluating visibility.
+manifest records its file ID and sequence bound. A shared reference uses its destination admission sequence. A physical copy
+reserves a new interval in the destination sequence domain. Its manifest records
+the offset applied to stored row sequences. This preserves the source ordering
+of overlapping puts and deletes. The prepared reader applies the mapping before
+evaluating visibility or merging rows.
 
 The source file ID and generation use existing `FileId` serialization. The
 generation is unique for each build. A manifest contains:

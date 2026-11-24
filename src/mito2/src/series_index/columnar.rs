@@ -85,10 +85,6 @@ impl ColumnarSeriesFormat {
 
 #[async_trait]
 impl SeriesIndexFormat for ColumnarSeriesFormat {
-    fn format(&self) -> ArtifactFormat {
-        ArtifactFormat::ColumnarSeries
-    }
-
     async fn writer(
         &self,
         metadata: RegionMetadataRef,

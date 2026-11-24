@@ -2095,7 +2095,7 @@ async fn narthex_file_reader_pins_sst_lifetime() {
     let artifact = writer.finish().await.unwrap();
     let (manifest, parts) = artifact.objects.split_first().unwrap();
     let narthex = NarthexSamplesMeta {
-        use_admission_sequence: false,
+        row_sequences: Default::default(),
         manifest_size: manifest.file_size,
         parts: parts
             .iter()

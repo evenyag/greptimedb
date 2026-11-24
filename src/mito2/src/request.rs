@@ -1532,6 +1532,8 @@ impl Waiters {
 #[derive(Debug)]
 pub(crate) enum RegionEditKind {
     Import,
+    /// Install physically copied samples in a newly reserved destination sequence interval.
+    NativeCopy,
     /// Conditional series publication from this live region and pinned index set.
     NativeSeries(MitoRegionRef, crate::region::version::VersionRef),
     #[cfg(feature = "enterprise")]

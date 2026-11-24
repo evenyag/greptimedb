@@ -98,9 +98,6 @@ impl Default for ColumnarSamplesFormat {
 }
 #[async_trait]
 impl SamplesFormat for ColumnarSamplesFormat {
-    fn format(&self) -> ArtifactFormat {
-        ArtifactFormat::ColumnarSamples
-    }
     async fn writer(
         &self,
         metadata: RegionMetadataRef,

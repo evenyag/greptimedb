@@ -64,7 +64,11 @@ fn narthex_partition_filter_ignores_empty_and_matching_rules() {
 }
 
 async fn fixture() -> (TestEnv, MitoEngine, MitoRegionRef) {
-    let (env, engine, region) = authoritative_fixture("last_row").await;
+    populated_fixture("last_row").await
+}
+
+async fn populated_fixture(mode: &str) -> (TestEnv, MitoEngine, MitoRegionRef) {
+    let (env, engine, region) = authoritative_fixture(mode).await;
     for ts in [1000, 1000, 2000] {
         write(&engine, &region, 0, ts, Some(1.0)).await;
         flush_region(&engine, region.region_id, None).await;
@@ -852,7 +856,12 @@ async fn residual_conjuncts_still_filter_discovered_series() {
 #[case::last_non_null(true)]
 #[tokio::test]
 async fn identity_merge_preserves_tag_and_mixed_predicates(#[case] last_non_null: bool) {
-    let (_env, engine, region) = fixture().await;
+    let (_env, engine, region) = populated_fixture(if last_non_null {
+        "last_non_null"
+    } else {
+        "last_row"
+    })
+    .await;
     if last_non_null {
         // A newer null in the first field must recover the older value across SSTs.
         let metadata = region.version().metadata.clone();
@@ -1506,7 +1515,7 @@ async fn reset_state_and_other_bindings_drop_the_preflight_cache() {
 async fn added_dynamic_filters_drop_the_preflight_cache() {
     use datafusion::physical_plan::expressions::{DynamicFilterPhysicalExpr, lit as physical_lit};
 
-    let (_env, engine, region) = fixture().await;
+    let (_env, engine, region) = fixture_with(true).await;
     write(&engine, &region, 0, 1000, Some(1.0)).await;
     flush_region(&engine, region.region_id, None).await;
     build(&engine, &region).await;
@@ -2094,14 +2103,12 @@ async fn authoritative_copy_preserves_source_order(#[case] delete: bool) {
         )
         .await
         .unwrap();
-    assert_eq!(
-        engine
-            .get_region(target)
-            .unwrap()
-            .version_control
-            .committed_sequence(),
-        0
-    );
+    let admitted = engine
+        .get_region(target)
+        .unwrap()
+        .version_control
+        .committed_sequence();
+    assert!(admitted > 0);
     for reopen in [false, true] {
         if reopen {
             crate::test_util::reopen_region(
@@ -2139,12 +2146,12 @@ async fn authoritative_copy_preserves_source_order(#[case] delete: bool) {
                     ScanRequest {
                         exact_sequence_range: true,
                         memtable_min_sequence: Some(0),
-                        memtable_max_sequence: Some(1),
+                        memtable_max_sequence: Some(admitted),
                         ..Default::default()
                     }
                 )
                 .await
-                .is_err()
+                .is_ok()
         );
     }
     engine.stop().await.unwrap();

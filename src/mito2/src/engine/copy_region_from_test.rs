@@ -890,12 +890,23 @@ async fn test_narthex_copy_and_remap(
     let destination = engine.get_region(target).unwrap();
     let after = destination.manifest_ctx.manifest().await;
     assert_eq!(after.files.len(), 2);
-    assert_eq!(after.committed_sequence, Some(1));
+    let upper = if remap {
+        1
+    } else {
+        1 + before
+            .files
+            .values()
+            .filter_map(|f| f.sequence)
+            .map(|seq| seq.get())
+            .max()
+            .unwrap()
+    };
+    assert_eq!(after.committed_sequence, Some(upper));
     for file in after.files.values() {
-        assert_eq!(file.sequence.map(|s| s.get()), Some(1));
+        assert!(file.sequence.is_some_and(|s| s.get() <= upper));
         assert!(!file.preserve_row_sequence);
         assert!(matches!(file.format, FileFormat::NarthexSamples(_)));
-        assert_eq!(file.is_effective_target_sequence_trusted(target), remap);
+        assert!(file.is_effective_target_sequence_trusted(target));
     }
 
     assert_eq!(after.series_indexes.len(), usize::from(with_index));
@@ -991,7 +1002,7 @@ async fn test_narthex_copy_and_remap(
             target,
             ScanRequest {
                 memtable_min_sequence: Some(0),
-                memtable_max_sequence: Some(1),
+                memtable_max_sequence: Some(upper),
                 exact_sequence_range: true,
                 ..Default::default()
             },
@@ -1038,7 +1049,7 @@ async fn test_narthex_copy_and_remap(
                 target,
                 ScanRequest {
                     memtable_min_sequence: Some(0),
-                    memtable_max_sequence: Some(1),
+                    memtable_max_sequence: Some(upper),
                     exact_sequence_range: true,
                     ..Default::default()
                 },
@@ -1241,7 +1252,7 @@ async fn test_region_storage_format_admission(
 
     let foreign_format = if source_format == "narthex" {
         FileFormat::NarthexSamples(Box::new(NarthexSamplesMeta {
-            use_admission_sequence: false,
+            row_sequences: Default::default(),
             manifest_size: 1,
             parts: Default::default(),
         }))

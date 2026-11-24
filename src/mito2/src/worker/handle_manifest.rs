@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use common_telemetry::{debug, info, warn};
 use parquet::file::metadata::PageIndexPolicy;
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 use store_api::logstore::LogStore;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{RegionId, SequenceNumber};
@@ -454,8 +454,12 @@ impl<S: LogStore> RegionWorkerLoop<S> {
                 return RegionEditDispatch::Rejected;
             }
         }
-        if matches!(kind, RegionEditKind::Import)
-            && let Err(error) = prepare_region_edit(&region, &mut edit)
+        if matches!(kind, RegionEditKind::Import | RegionEditKind::NativeCopy)
+            && let Err(error) = prepare_region_edit(
+                &region,
+                &mut edit,
+                matches!(kind, RegionEditKind::NativeCopy),
+            )
         {
             let error = Arc::new(error);
             waiters.reply_with(|| Err(error.clone()).context(EditRegionSnafu { region_id }));
@@ -486,7 +490,9 @@ impl<S: LogStore> RegionWorkerLoop<S> {
         // Updates manifest in background.
         common_runtime::spawn_global(async move {
             let result = match kind {
-                RegionEditKind::Import | RegionEditKind::NativeSeries(_, _) => {
+                RegionEditKind::Import
+                | RegionEditKind::NativeCopy
+                | RegionEditKind::NativeSeries(_, _) => {
                     edit_region(
                         &region,
                         edit.clone(),
@@ -999,7 +1005,11 @@ impl<S: LogStore> RegionWorkerLoop<S> {
     }
 }
 
-fn prepare_region_edit(region: &MitoRegionRef, edit: &mut RegionEdit) -> Result<()> {
+fn prepare_region_edit(
+    region: &MitoRegionRef,
+    edit: &mut RegionEdit,
+    native_copy: bool,
+) -> Result<()> {
     let region_id = region.region_id;
     region.version().options.validate_file_formats(
         region_id,
@@ -1076,23 +1086,54 @@ fn prepare_region_edit(region: &MitoRegionRef, edit: &mut RegionEdit) -> Result<
             .files_to_add
             .iter()
             .all(|file| existing_sequence(file).is_some());
-    let sequence =
-        if same_import || (edit.files_to_add.is_empty() && edit.files_to_remove.is_empty()) {
-            None
-        } else {
-            let sequence = current.last_sequence.checked_add(1).context(
-                crate::error::InvalidRequestSnafu {
-                    region_id,
-                    reason: "Region sequence exhausted",
-                },
-            )?;
-            edit.committed_sequence = Some(sequence);
-            NonZeroU64::new(sequence)
-        };
+    if same_import {
+        for file in &mut edit.files_to_add {
+            file.sequence = existing_sequence(file);
+            file.preserve_row_sequence = false;
+        }
+        return Ok(());
+    }
+    if edit.files_to_add.is_empty() && edit.files_to_remove.is_empty() {
+        return Ok(());
+    }
+    let exhausted = || {
+        crate::error::InvalidRequestSnafu {
+            region_id,
+            reason: "Region sequence exhausted",
+        }
+        .build()
+    };
+    let first = current.last_sequence.checked_add(1).ok_or_else(exhausted)?;
+    let mut committed = first;
     for file in &mut edit.files_to_add {
-        file.sequence = existing_sequence(file).or(sequence);
+        if native_copy
+            && file.level != file::LEVEL_SHARED
+            && let file::FileFormat::NarthexSamples(meta) = &mut file.format
+        {
+            // Translate the entire source ordering into a fresh interval. All
+            // files from this COPY share its origin, including overlapping files.
+            let source_upper = file.sequence.map_or(0, NonZeroU64::get);
+            meta.row_sequences = match meta.row_sequences {
+                file::NarthexRowSequences::Admission => file::NarthexRowSequences::Admission,
+                file::NarthexRowSequences::Encoded => file::NarthexRowSequences::Offset(first),
+                file::NarthexRowSequences::Offset(base) => file::NarthexRowSequences::Offset(
+                    first.checked_add(base).ok_or_else(exhausted)?,
+                ),
+            };
+            let upper = first.checked_add(source_upper).ok_or_else(exhausted)?;
+            file.sequence = NonZeroU64::new(upper);
+            committed = committed.max(upper);
+        } else {
+            file.sequence = existing_sequence(file).or(NonZeroU64::new(first));
+            if file.region_id == region_id
+                && let file::FileFormat::NarthexSamples(meta) = &mut file.format
+            {
+                meta.row_sequences = file::NarthexRowSequences::Admission;
+            }
+        }
         file.preserve_row_sequence = false;
     }
+    edit.committed_sequence = Some(committed);
     Ok(())
 }
 

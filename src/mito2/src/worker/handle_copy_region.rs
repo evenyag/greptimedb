@@ -158,14 +158,18 @@ impl<S> RegionWorkerLoop<S> {
                         .map(|file| file.file_id)
                         .collect();
                     let (tx, rx) = tokio::sync::oneshot::channel();
+                    let native = region_edit.files_to_add.iter().any(|file| {
+                        matches!(file.format, file::FileFormat::NarthexSamples(_))
+                            && file.level != file::LEVEL_SHARED
+                    });
+                    let mut admission =
+                        crate::request::RegionEditRequest::new(region_id, region_edit, false, tx);
+                    if native {
+                        admission.kind = crate::request::RegionEditKind::NativeCopy;
+                    }
                     if worker_sender
                         .send(WorkerRequestWithTime::new(WorkerRequest::EditRegion(
-                            crate::request::RegionEditRequest::new(
-                                region_id,
-                                region_edit,
-                                false,
-                                tx,
-                            ),
+                            admission,
                         )))
                         .await
                         .is_err()
@@ -476,7 +480,49 @@ async fn prepare_narthex_copy(
     match &mut copied.format {
         FileFormat::NarthexSamples(meta) => {
             meta.manifest_size = manifest_size;
-            meta.use_admission_sequence = true;
+            use file::NarthexRowSequences;
+            let source_base = match meta.row_sequences {
+                NarthexRowSequences::Offset(base) => base,
+                _ => 0,
+            };
+            copied.sequence = if source.sequence.is_some()
+                && (source.preserve_row_sequence
+                    || meta.row_sequences != NarthexRowSequences::Encoded)
+            {
+                source.sequence
+            } else {
+                // Older physical copies can contain source-domain row sequences
+                // without a trustworthy file bound. Only the sequence column is needed.
+                use crate::series_index::artifact::SamplesFileHandle;
+                use crate::series_index::format::{SamplesFormatReader, SamplesReadRequest};
+                use crate::series_index::samples::reader::SamplesReader;
+                use futures::TryStreamExt;
+                let handle = file::FileHandle::new(source.clone(), region.file_purger.clone());
+                let input = SamplesFileHandle::from_narthex(
+                    handle,
+                    &layer.build_region_dir(source.region_id),
+                )?;
+                let reader = SamplesReader::open(layer.object_store().clone(), input).await?;
+                let mut batches = reader.read(SamplesReadRequest {
+                    projection: vec![store_api::storage::consts::SEQUENCE_COLUMN_NAME.to_owned()],
+                    ..Default::default()
+                })?;
+                let mut upper = 0;
+                while let Some(batch) = batches.try_next().await? {
+                    let column = batch
+                        .batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<datatypes::arrow::array::UInt64Array>()
+                        .ok_or_else(|| invalid("invalid native copy sequence column"))?;
+                    upper = upper.max(column.values().iter().copied().max().unwrap_or(0));
+                }
+                std::num::NonZeroU64::new(
+                    source_base
+                        .checked_add(upper)
+                        .ok_or_else(|| invalid("native copy sequence overflow"))?,
+                )
+            };
         }
         FileFormat::NarthexSeriesIndex(meta) => meta.manifest_size = manifest_size,
         FileFormat::Parquet => return Err(invalid("expected Narthex copy source")),

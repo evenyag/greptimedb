@@ -14,13 +14,9 @@
 
 //! Behavioral coverage for series-index reconciliation.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use api::v1::helper::row;
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, Rows, SemanticType, WriteHint};
-use store_api::codec::PrimaryKeyEncoding;
 use store_api::metric_engine_consts::PRIMARY_KEY_ENCODING;
 use store_api::region_engine::RegionEngine;
 use store_api::region_request::{RegionPutRequest, RegionRequest};
@@ -30,44 +26,8 @@ use store_api::storage::consts::PRIMARY_KEY_COLUMN_NAME;
 use crate::config::MitoConfig;
 use crate::engine::MitoEngine;
 use crate::region::MitoRegionRef;
-use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
+use crate::test_util::sst_util::new_sparse_primary_key;
 use crate::test_util::{CreateRequestBuilder, TestEnv, flush_region, rows_schema};
-
-/// Builds real sparse SSTs; background maintenance is disabled so tests control publication.
-pub(super) async fn prepare_region(env: &mut TestEnv) -> (MitoEngine, MitoRegionRef) {
-    prepare_region_with_timestamps(env, &[1000, 2000, 3000, 4000]).await
-}
-
-pub(crate) async fn prepare_region_with_timestamps(
-    env: &mut TestEnv,
-    timestamps: &[i64],
-) -> (MitoEngine, MitoRegionRef) {
-    prepare_region_with_config(
-        env,
-        timestamps,
-        MitoConfig {
-            min_compaction_interval: Duration::from_secs(3600),
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-pub(crate) async fn prepare_region_with_config(
-    env: &mut TestEnv,
-    timestamps: &[i64],
-    config: MitoConfig,
-) -> (MitoEngine, MitoRegionRef) {
-    prepare_region_with_metadata(
-        env,
-        timestamps,
-        config,
-        Arc::new(sst_region_metadata_with_encoding(
-            PrimaryKeyEncoding::Sparse,
-        )),
-    )
-    .await
-}
 
 pub(crate) async fn prepare_region_with_metadata(
     env: &mut TestEnv,

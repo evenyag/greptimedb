@@ -31,7 +31,7 @@ use store_api::storage::FileId;
 use store_api::storage::consts::ReservedColumnId;
 
 use crate::error::{InvalidRecordBatchSnafu, Result};
-use crate::series_index::artifact::{ArtifactFormat, ArtifactMetadata, SamplesFileHandle};
+use crate::series_index::artifact::{ArtifactMetadata, SamplesFileHandle};
 use crate::series_index::catalog::SeriesIndexEntry;
 use crate::series_index::identity::ExactSeriesKey;
 use crate::series_index::{MetricSeriesId, SeriesIndexFileHandle};
@@ -64,7 +64,6 @@ pub(crate) trait FormatReader: Send + Sync {
 /// Builds and opens immutable series-index artifacts.
 #[async_trait]
 pub(crate) trait SeriesIndexFormat: Debug + Send + Sync {
-    fn format(&self) -> ArtifactFormat;
     async fn reader(
         &self,
         _store: ObjectStore,
@@ -126,7 +125,6 @@ pub(crate) trait SamplesFormatReader: Send + Sync {
 /// Builds and opens immutable samples artifacts.
 #[async_trait]
 pub(crate) trait SamplesFormat: Debug + Send + Sync {
-    fn format(&self) -> ArtifactFormat;
     async fn reader(
         &self,
         _store: ObjectStore,
