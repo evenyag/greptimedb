@@ -5,22 +5,16 @@ for Prometheus-style metric data. It separates series identities and string tags
 from timestamped numeric samples.
 
 The format has two artifact roles: `NarthexSamples` owns sample data, and
-`NarthexSeriesIndex` indexes series and references the samples it covers.
+`NarthexSeriesIndex` stores an optional exact-key candidate set.
 Region manifests serialize these roles as `narthex_samples` and
 `narthex_series_index`.
 
-## Authoritative storage and derived sidecars
+## Region storage and publication
 
-With `sst_format = 'narthex'`, samples are authoritative SSTs. Each artifact owns
-`<region_dir>/<file_id>/manifest.json` and its `part-<n>.samples` or
-`part-<n>.series` objects. The region manifest records the manifest size and a `parts` array in part-ID order.
-Each part record contains its encoded `file_size` in bytes. Series indexes reference region-qualified sample file IDs without owning those
-samples. Both artifact types use ordinary SST lifetimes and reclamation.
-
-The same codecs also support rebuildable sidecars over Parquet SSTs. The catalog
-paths, source-SST coverage, daily consolidation, and local-cache rollout described
-below apply to that sidecar mode. They do not make authoritative Narthex samples
-rebuildable or subject them to local-cache eviction.
+Each artifact owns `<region_dir>/<file_id>/manifest.json` and its
+`part-<n>.samples` or `part-<n>.series` objects. The region manifest records
+their encoded sizes and physical owner. Query versions pin the files they read.
+A sample compaction can replace its inputs while a reader still holds an index.
 
 ## Wire specification
 
@@ -52,36 +46,10 @@ The catalog identifier is `columnar-samples`. Its file and manifest version is 1
 independent of the series format's version and both formats' codec identifiers.
 Existing `parquet` and `columnar-series` identifiers keep their meaning.
 
-An artifact is derived either from one immutable source SST (legacy) or from
-a bounded group of snapshot SSTs contributing to one UTC day. It owns
-these objects:
-
-```text
-<region_id>/samples/<generation>/manifest.json
-<region_id>/samples/<generation>/part-0.samples
-<region_id>/samples/<generation>/part-1.samples
-...
-```
-
-Daily catalog entries add `source_file_ids` (the complete, sorted source SST
-set) and `window` (signed UTC day number since the Unix epoch). Missing fields
-retain legacy whole-SST semantics. The catalog key and manifest owner ID for a
-daily artifact are its unique generation ID, not an individual source SST.
-Each source group is merged once and rows are routed to nonempty days; sequence numbers, deletion markers,
-and duplicate versions are preserved. Blocks and parts retain their existing
-size bounds. An SST crossing midnight contributes to multiple artifacts.
-
-Publication uses the existing atomic samples catalog, which also commits series
-and range indexes. Readers pin each generation once. A grouped artifact is
-ineligible if any source SST is absent from the query's data snapshot; exact
-sequence-range or SST-sequence-pruned scans fall back to the existing path.
-Maintenance retains complete visible groups and groups only uncovered sources,
-with at most 64 sources per merge. One anchor entry per group records `source_windows`, the
-actual populated days for every source in its group. Other daily entries share
-the same ordered source set without repeating the coverage map. Coverage checks use this
-record rather than enumerating the timestamp span. Earlier daily entries without
-this record require rebuilding. Publication commits all days together; retired
-objects remain pinned until readers release them. Source Parquet SSTs are unchanged.
+A native sample artifact stores the rows of a flush or compaction. The region
+manifest records its file ID and sequence bound. Foreign shared references and
+native physical copies can carry a destination admission sequence. The prepared
+reader applies that sequence to the rows before evaluating visibility.
 
 The source file ID and generation use existing `FileId` serialization. The
 generation is unique for each build. A manifest contains:
@@ -579,32 +547,3 @@ unchanged layout alone does not make them readable by version-1 implementations.
 The local cache root contains a layout-version marker. Startup clears the entire
 series-index cache when this marker is absent or incompatible, then rebuilds
 artifacts through existing maintenance. Source SST identity remains in metadata.
-
-### Local cache rollout
-
-Daily consolidation is the only layout the opt-in columnar samples backend
-writes, including manual reconciliation. Legacy-format defaults are unchanged. A day may
-contain several generations with disjoint source sets (at most 64 SSTs per merge),
-and each generation may contain multiple bounded part files. Source Parquet files
-are never rewritten.
-
-This branch has no deployments, so the local series-index cache token is pinned to
-`1`: a cache written by any other build is discarded on startup and rebuilt from
-the SSTs before regions open, and ordinary SST reads remain available meanwhile.
-That is the only cache migration this layout has. An artifact written by an earlier
-build of this branch — keys inside the block descriptors, a key area without stored
-checksums, a 112-byte trailer without `key_end` — carries a different
-`identity_encoding` value, `exact-sparse-key` instead of `exact-sparse-key-area`, so
-it is refused when its manifest is opened. Maintenance treats that refusal as "not
-reusable" and rebuilds the artifact, so an old artifact is never marked reusable and
-then fails on the first part read. A part reached without that check would also be
-rejected: the reader locates a trailer from the recorded object size, reads the last
-120 bytes of such a part, and refuses the shifted frame instead of decoding it.
-Allow for rebuild time and I/O in either direction; do not reuse daily catalogs with
-an older reader outside this startup check. Existing per-SST catalog entries remain
-readable by the new reader.
-
-A prepared scan uses a grouped artifact only when all of its sources belong to
-that scan's assignment or were excluded solely by its time filter. Partial coverage
-or a stale source set selects the
-ordinary SST path until reconciliation supplies complete valid coverage.

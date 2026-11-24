@@ -110,6 +110,8 @@ async fn native_index_cycles(#[case] delta: bool, #[case] unchanged: u64) {
     let mut discovery = Vec::new();
     let mut total_read = 0;
     let mut total_written = 0usize;
+    let mut sample_hashes = std::collections::HashMap::new();
+    let mut snapshots = crc32fast::Hasher::new();
     // Three overlapping admissions per window, across four windows, also
     // exercise the scheduler's four-artifact series compaction trigger.
     for cycle in 0..12_u64 {
@@ -145,6 +147,39 @@ async fn native_index_cycles(#[case] delta: bool, #[case] unchanged: u64) {
             .await
             .unwrap();
         flush_region(&engine, id, None).await;
+        // Compare the actual part bytes of every snapshot across modes. UUIDs
+        // identify independently created files and do not participate in the digest.
+        let version = region.version();
+        let mut snapshot = Vec::new();
+        for file in version.ssts.levels().iter().flat_map(|level| level.files()) {
+            let id = file.file_id();
+            if let std::collections::hash_map::Entry::Vacant(entry) = sample_hashes.entry(id) {
+                let dir = region.access_layer.build_region_dir(file.region_id());
+                let mut hash = crc32fast::Hasher::new();
+                for part in file
+                    .meta_ref()
+                    .narthex_objects(&dir)
+                    .unwrap()
+                    .iter()
+                    .filter(|object| object.path.ends_with(".samples"))
+                {
+                    let bytes = region
+                        .access_layer
+                        .object_store()
+                        .read(&part.path)
+                        .await
+                        .unwrap()
+                        .to_bytes();
+                    hash.update(&bytes);
+                }
+                entry.insert(hash.finalize());
+            }
+            snapshot.push(sample_hashes[&id]);
+        }
+        snapshot.sort_unstable();
+        for hash in snapshot {
+            snapshots.update(&hash.to_le_bytes());
+        }
         reads.store(0, Ordering::Relaxed);
         writes.lock().unwrap().write_sizes.clear();
         let started = Instant::now();
@@ -175,8 +210,9 @@ async fn native_index_cycles(#[case] delta: bool, #[case] unchanged: u64) {
         .lines()
         .find(|line| line.starts_with("VmHWM:"))
         .unwrap();
+    let digest = snapshots.finalize();
     println!(
-        "delta={delta} unchanged={unchanged} read_bytes={total_read} written_bytes={total_written} maintenance_ms={} discovery_median_us={} {peak}",
+        "snapshots={digest:08x} delta={delta} unchanged={unchanged} read_bytes={total_read} written_bytes={total_written} maintenance_ms={} discovery_median_us={} {peak}",
         build_time.as_millis(),
         discovery[discovery.len() / 2]
     );

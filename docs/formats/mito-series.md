@@ -5,22 +5,16 @@ for Prometheus-style metric data. It separates series identities and string tags
 from timestamped numeric samples.
 
 The format has two artifact roles: `NarthexSamples` owns sample data, and
-`NarthexSeriesIndex` indexes series and references the samples it covers.
+`NarthexSeriesIndex` stores an optional exact-key candidate set.
 Region manifests serialize these roles as `narthex_samples` and
 `narthex_series_index`.
 
-## Authoritative storage and derived sidecars
+## Region storage and publication
 
-With `sst_format = 'narthex'`, samples are authoritative SSTs. Each artifact owns
-`<region_dir>/<file_id>/manifest.json` and its `part-<n>.samples` or
-`part-<n>.series` objects. The region manifest records the manifest size and a `parts` array in part-ID order.
-Each part record contains its encoded `file_size` in bytes. Series indexes reference region-qualified sample file IDs without owning those
-samples. Both artifact types use ordinary SST lifetimes and reclamation.
-
-The same codecs also support rebuildable sidecars over Parquet SSTs. The catalog
-paths, source-SST coverage, daily consolidation, and local-cache rollout described
-below apply to that sidecar mode. They do not make authoritative Narthex samples
-rebuildable or subject them to local-cache eviction.
+Each artifact owns `<region_dir>/<file_id>/manifest.json` and its
+`part-<n>.samples` or `part-<n>.series` objects. The region manifest records
+their encoded sizes and physical owner. Query versions pin the files they read.
+A sample compaction can replace its inputs while a reader still holds an index.
 
 ## Wire specification
 
@@ -40,18 +34,19 @@ from SSTs; there is no dual reader. For samples, see
 
 ## Artifact manifest
 
-The catalog format identifier is `columnar-series`. Its wire version is separate
-from that identifier and from all column-encoding and compression identifiers.
-Legacy catalog entries and the `parquet` identifier keep their existing meaning.
+The region manifest stores logical certificates in
+`narthex_series_index.coverage`. Each half-open window has its own sequence
+frontier. The region ID, truncate entry ID and schema version bind the proof to
+the snapshot lineage. When a build writes a delta, every member of the union
+lists the base and delta file IDs in `required_files`. An unchanged build can
+advance the frontier on the existing files. Independent series compaction
+publishes their sorted union and retains the original window frontiers.
 
-One immutable artifact owns the following objects under a unique generation:
-
-```text
-<region_id>/series/<index_uuid>/manifest.json
-<region_id>/series/<index_uuid>/part-0.series
-<region_id>/series/<index_uuid>/part-1.series
-...
-```
+The compatibility field `sources` is empty on certified indexes. A reader
+using the older source-list protocol finds no matching sample and discovers
+keys from samples. A new reader encountering only an old source list also uses
+sample discovery. The codec's historical `coverage` descriptor inside the
+artifact is separate from the certificate in the region manifest.
 
 `manifest.json` contains these fields:
 
@@ -70,8 +65,8 @@ One immutable artifact owns the following objects under a unique generation:
 in file order. The object name is derived as `part-<part_id>.series`, using the
 decimal ID without leading zeros, under the artifact's generation prefix. No
 path is stored in a file entry. `first` and `last` are inclusive identifiers,
-represented as objects with `table_id` and `tsid`. Ranges are strictly ordered
-and disjoint. Coverage and generation must match the catalog entry.
+represented as objects with `table_id` and `tsid`. Consecutive coarse ranges can touch when two exact keys share a TSID.
+Generation and object inventory must match the region manifest.
 
 The tag list records the schema at build time, including tags currently absent
 from some logical tables. The logical Arrow schema is `__table_id`, `__tsid`,
@@ -117,8 +112,7 @@ order are not wire contracts. Reject trailing bytes in decoded structures.
 
 ### Column payloads
 
-An artifact indexes the series in one Mito series-index bucket. In sidecar mode, authoritative
-data remains in Parquet SSTs and these indexes can be rebuilt. Each record contains:
+An artifact can span several certified windows. Each record contains these columns.
 
 | Logical column | Type | Storage |
 | --- | --- | --- |
@@ -146,13 +140,9 @@ they overlap for colliding series and only ever over-select.
 There is no stored `__primary_key` column: identity is reconstructed by encoding
 the record's own tags in the artifact order, which reproduces the SST key.
 
-The row count records input rows aggregated for each identifier. Tags are constant
-for that identifier under the uniqueness assumption. The count is not necessarily
-the query-visible row count after deduplication or snapshot filtering.
-
-No per-series or per-block timestamps or timestamp unit are stored. Time coverage
-is recorded only in the catalog bucket. Tags named `job` and `instance` are
-ordinary tag columns, not dedicated identifier components.
+The count column is a codec statistic. Full builds stream distinct exact keys,
+and a union can retain identities whose samples were deleted. Queries determine
+live rows and counts from the samples.
 
 #### Integer encoding 1
 
@@ -431,10 +421,3 @@ stored. A block contains at most 8,388,608 series. The manifest is at most 64 Mi
 Offsets, lengths, and counts must fit their enclosing areas without arithmetic
 overflow. Counts must not imply allocations larger than the enclosing decoded
 payload permits.
-
-## Local cache compatibility
-
-The local series-index cache has a root `version` marker independent of this
-format version. Before workers start, a missing or incompatible marker causes
-the entire derived cache (including samples, ranges, and catalogs) to be reset.
-Matching-version restarts preserve the cache.
