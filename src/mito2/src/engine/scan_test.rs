@@ -338,6 +338,7 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             file.meta_ref().format,
             crate::sst::file::FileFormat::NarthexSamples(_)
         )));
+        let before_delta = region.version();
         // Re-admitting the same exact key advances the window with no new series object.
         engine.handle_request(region_id, put(2.0)).await?;
         test_util::flush_region(&engine, region_id, None).await;
@@ -348,6 +349,28 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
         let crate::sst::file::FileFormat::NarthexSeriesIndex(meta) = &base.meta_ref().format else {
             unreachable!()
         };
+        // A competing full replacement planned before the delta names the same
+        // physical index ID. Its pinned metadata no longer matches the frontier.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut stale = crate::request::RegionEditRequest::new(
+            region_id,
+            crate::manifest::action::RegionEdit {
+                series_indexes_to_remove: vec![base.file_id()],
+                ..Default::default()
+            },
+            false,
+            tx,
+        );
+        stale.kind = crate::request::RegionEditKind::NativeSeries(region.clone(), before_delta);
+        engine
+            .inner
+            .workers
+            .submit_to_worker(region_id, crate::request::WorkerRequest::EditRegion(stale))
+            .await?;
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(crate::error::Error::RegionBusy { .. })
+        ));
         let proof = meta.coverage.as_ref().unwrap();
         assert_eq!(proof.required_files, vec![base.file_id()]);
         assert!(
@@ -380,6 +403,28 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             .await?;
         let batches = RecordBatches::try_collect(stream).await?;
         assert_eq!(batches.pretty_print()?, unindexed);
+        // A late, colliding key in the old time window remains discoverable
+        // before and after its memtable flush even with this damaged optional base.
+        let late = new_sparse_primary_key(&["late"], &region.metadata(), 42, 7);
+        engine
+            .handle_request(
+                region_id,
+                test_util::sparse_metric_put(late, 1000, Some(3.0)),
+            )
+            .await?;
+        for persisted in [false, true] {
+            if persisted {
+                test_util::flush_region(&engine, region_id, None).await;
+            }
+            let batches = RecordBatches::try_collect(
+                engine
+                    .scan_to_stream(region_id, ScanRequest::default())
+                    .await?,
+            )
+            .await?;
+            let rows = batches.pretty_print()?;
+            assert!(rows.contains("late") && rows.contains("api"), "{rows}");
+        }
     }
     engine.stop().await?;
     Ok(())
