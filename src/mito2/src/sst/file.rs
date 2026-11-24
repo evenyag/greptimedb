@@ -259,8 +259,8 @@ pub enum FileFormat {
 enum StoredFileFormat {
     Parquet,
     NarthexSamples(Box<NarthexSamplesMeta>),
-    NarthexAdmittedSamples(Box<NarthexSamplesMeta>),
     NarthexSeriesIndex(Box<NarthexSeriesIndexMeta>),
+    NarthexAdmittedSamples(Box<NarthexSamplesMeta>),
 }
 
 impl TryFrom<StoredFileFormat> for FileFormat {
@@ -368,11 +368,18 @@ pub struct NarthexCoverage {
 
 impl NarthexCoverage {
     pub(crate) fn covers(&self, file: &FileMeta) -> bool {
+        CertifiedWindow::cover_file(&self.windows, file)
+    }
+}
+
+impl CertifiedWindow {
+    /// Test the union of windows sorted by start. A lower frontier cannot bridge a gap.
+    pub(crate) fn cover_file(windows: &[Self], file: &FileMeta) -> bool {
         let Some(sequence) = file.sequence else {
             return false;
         };
         let (mut cursor, last) = file.time_range;
-        for window in &self.windows {
+        for window in windows {
             if window.start > cursor {
                 return false;
             }

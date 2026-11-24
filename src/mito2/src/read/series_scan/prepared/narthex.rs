@@ -90,7 +90,6 @@ pub(crate) async fn open_sources(
     let mut samples = Vec::<Arc<dyn SamplesFormatReader>>::new();
     let mut series = Vec::<Box<dyn FormatReader>>::new();
     let indices = file_indices(context, ranges)?;
-    let mut covered = std::collections::HashSet::new();
     let mut opened = std::collections::HashSet::new();
     let mut certificates = Vec::new();
     let indexes = if use_indexes {
@@ -113,13 +112,16 @@ pub(crate) async fn open_sources(
         {
             continue;
         }
-        let selected: Vec<_> = indices
-            .iter()
-            .map(|i| &context.input.files[*i])
-            .filter(|sample| proof.covers(sample.meta_ref()))
-            .map(|sample| sample.file_id())
-            .collect();
-        if selected.is_empty() {
+        if !indices.iter().any(|i| {
+            let sample = context.input.files[*i].meta_ref();
+            sample.sequence.is_some_and(|seq| {
+                proof.windows.iter().any(|window| {
+                    window.frontier >= seq.get()
+                        && sample.time_range.0 < window.end
+                        && window.start <= sample.time_range.1
+                })
+            })
+        }) {
             continue;
         }
         let reader = match crate::series_index::columnar::reader::ColumnarReader::open_cached(
@@ -153,14 +155,15 @@ pub(crate) async fn open_sources(
             continue;
         }
         opened.insert(file.file_id());
-        certificates.push((proof, selected));
+        certificates.push(proof);
         series.push(Box::new(reader));
     }
-    for (proof, selected) in certificates {
-        if proof.required_files.iter().all(|f| opened.contains(f)) {
-            covered.extend(selected);
-        }
-    }
+    let mut windows: Vec<_> = certificates
+        .into_iter()
+        .filter(|proof| proof.required_files.iter().all(|id| opened.contains(id)))
+        .flat_map(|proof| proof.windows.iter().cloned())
+        .collect();
+    windows.sort_unstable_by_key(|window| window.start);
     for i in indices {
         let file = &context.input.files[i];
         let namespace = file.meta_ref().file_id;
@@ -195,7 +198,7 @@ pub(crate) async fn open_sources(
         };
         let reader: Arc<dyn SamplesFormatReader> =
             Arc::new(NarthexSamplesReader { reader, sequence });
-        if !covered.contains(&file.file_id()) {
+        if !crate::sst::file::CertifiedWindow::cover_file(&windows, file.meta_ref()) {
             crate::metrics::NARTHEX_SAMPLE_DISCOVERY.inc();
             series.push(Box::new(NarthexSeriesReader::new(
                 context.input.region_metadata().clone(),
