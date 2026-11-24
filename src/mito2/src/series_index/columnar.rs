@@ -34,9 +34,8 @@ use store_api::storage::FileId;
 use crate::error::{InvalidMetaSnafu, Result};
 use crate::series_index::artifact::ArtifactFormat;
 use crate::series_index::catalog::SeriesIndexEntry;
-use crate::series_index::format::FormatWriter;
 #[cfg(test)]
-use crate::series_index::format::{FormatReader, SeriesIndexFormat};
+use crate::series_index::format::{FormatReader, FormatWriter, SeriesIndexFormat};
 use crate::series_index::identity::IdentityEncoding;
 use crate::series_index::{MetricSeriesId, ROW_COUNT_COLUMN, TABLE_ID_COLUMN, TSID_COLUMN};
 
