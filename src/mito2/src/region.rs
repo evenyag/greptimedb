@@ -35,7 +35,6 @@ use common_time::timestamp::TimeUnit;
 use crossbeam_utils::atomic::AtomicCell;
 use datafusion_common::ScalarValue;
 use futures::stream::{BoxStream, StreamExt};
-use object_store::ObjectStore;
 use partition::expr::PartitionExpr;
 use snafu::{OptionExt, ResultExt, ensure};
 use store_api::ManifestVersion;
@@ -3290,6 +3289,7 @@ mod tests {
             region_id: region.region_id,
             file_size: 2,
             format: FileFormat::NarthexSamples(Box::new(NarthexSamplesMeta {
+                use_admission_sequence: false,
                 manifest_size: 1,
                 parts: smallvec::smallvec![NarthexPartMeta { file_size: 1 }],
             })),

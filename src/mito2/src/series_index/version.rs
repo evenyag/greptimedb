@@ -19,7 +19,7 @@ use crate::sst::file::{FileHandle, RegionFileId};
 use std::sync::Arc;
 
 /// Legacy codec coverage descriptor derived from immutable narthex metadata.
-/// Narthex admission and scan selection use the region-qualified `sources` instead.
+/// The region manifest carries logical coverage separately from this descriptor.
 pub(crate) fn narthex_series_entry(
     file: &crate::sst::file::FileMeta,
     region_dir: &str,

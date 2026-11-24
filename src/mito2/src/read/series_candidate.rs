@@ -14,7 +14,6 @@
 
 //! Candidate metric-series discovery for the two-stage series scan.
 
-use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -564,15 +563,12 @@ fn decode_metric_series(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
     use std::time::Instant;
 
     use common_time::Timestamp;
     use datafusion::execution::memory_pool::UnboundedMemoryPool;
     use datafusion_expr::{col, lit};
-    use datatypes::arrow::array::{
-        ArrayRef, DictionaryArray, TimestampMillisecondArray, UInt8Array, UInt32Array, UInt64Array,
-    };
+    use datatypes::arrow::array::{ArrayRef, DictionaryArray, UInt32Array, UInt64Array};
     use datatypes::arrow::datatypes::UInt32Type;
     use futures::TryStreamExt;
     use store_api::codec::PrimaryKeyEncoding;

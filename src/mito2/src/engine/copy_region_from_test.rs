@@ -997,15 +997,7 @@ async fn test_narthex_copy_and_remap(
             },
         )
         .await;
-    let stream = if remap {
-        exact.unwrap()
-    } else {
-        assert!(exact.is_err());
-        engine
-            .scan_to_stream(target, ScanRequest::default())
-            .await
-            .unwrap()
-    };
+    let stream = exact.unwrap();
     let batches = RecordBatches::try_collect(stream).await.unwrap();
     assert_eq!(
         batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
@@ -1045,9 +1037,9 @@ async fn test_narthex_copy_and_remap(
             .scan_to_stream(
                 target,
                 ScanRequest {
-                    memtable_min_sequence: remap.then_some(0),
-                    memtable_max_sequence: remap.then_some(1),
-                    exact_sequence_range: remap,
+                    memtable_min_sequence: Some(0),
+                    memtable_max_sequence: Some(1),
+                    exact_sequence_range: true,
                     ..Default::default()
                 },
             )
@@ -1249,6 +1241,7 @@ async fn test_region_storage_format_admission(
 
     let foreign_format = if source_format == "narthex" {
         FileFormat::NarthexSamples(Box::new(NarthexSamplesMeta {
+            use_admission_sequence: false,
             manifest_size: 1,
             parts: Default::default(),
         }))

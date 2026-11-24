@@ -4,6 +4,7 @@
       "Edit": {
         "files_to_add": [],
         "files_to_remove": [],
+        "compaction_time_window": null,
         "series_indexes_to_add": [
           {
             "region_id": 98784247841,

@@ -394,6 +394,11 @@ impl SeriesIndexTask {
                 .all(|f| {
                     existing.iter().any(|(_, p)| {
                         p.schema_version == version.metadata.schema_version
+                            && p.required_files.iter().all(|id| {
+                                indexes
+                                    .get(&id.file_id())
+                                    .is_some_and(|f| f.file_id() == *id)
+                            })
                             && p.covers(f.meta_ref())
                     })
                 })
@@ -401,6 +406,15 @@ impl SeriesIndexTask {
                 continue;
             }
 
+            let previous = existing
+                .iter()
+                .filter(|(_, proof)| proof.schema_version == version.metadata.schema_version)
+                .flat_map(|(_, proof)| &proof.windows)
+                .filter(|window| window.start <= bucket.start && window.end >= bucket.end)
+                .map(|window| window.frontier)
+                .max()
+                .unwrap_or_default();
+            crate::metrics::NARTHEX_COVERAGE_LAG.observe(frontier.saturating_sub(previous) as f64);
             let coverage = NarthexCoverage {
                 required_files: Vec::new(),
                 region_id: region.region_id,

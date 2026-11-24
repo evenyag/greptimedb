@@ -16,7 +16,7 @@
 //! is usually a row group in a parquet file.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::{BitAnd, Range};
+use std::ops::BitAnd;
 use std::sync::Arc;
 
 use api::v1::{OpType, SemanticType};
@@ -32,7 +32,7 @@ use mito_codec::row_converter::PrimaryKeyCodec;
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{OptionExt, ResultExt};
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::metadata::RegionMetadataRef;
 use store_api::storage::{ColumnId, TimeSeriesRowSelector};
@@ -40,8 +40,8 @@ use table::predicate::Predicate;
 
 use crate::cache::CacheStrategy;
 use crate::error::{
-    ComputeArrowSnafu, DecodeStatsSnafu, EvalPartitionFilterSnafu, InvalidRecordBatchSnafu,
-    NewRecordBatchSnafu, RecordBatchSnafu, Result, StatsNotPresentSnafu, UnexpectedSnafu,
+    ComputeArrowSnafu, DecodeStatsSnafu, EvalPartitionFilterSnafu, NewRecordBatchSnafu,
+    RecordBatchSnafu, Result, StatsNotPresentSnafu, UnexpectedSnafu,
 };
 use crate::read::compat::FlatCompatBatch;
 use crate::read::last_row::FlatRowGroupLastRowCachedReader;

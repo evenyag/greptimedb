@@ -341,7 +341,6 @@ async fn read_rows(
 
 /// Publishes a writer that was created from the returned `entry`.
 async fn handle_of(
-    store: &ObjectStore,
     mut entry: SeriesIndexEntry,
     writer: Box<dyn crate::series_index::format::FormatWriter>,
 ) -> SeriesIndexFileHandle {
@@ -388,7 +387,7 @@ async fn colliding_tsids_are_retained_not_merged() {
                 .await
                 .unwrap();
         }
-        let handle = handle_of(&store, entry, writer).await;
+        let handle = handle_of(entry, writer).await;
         // Two batches of two rows per series: both rows and both label sets survive,
         // and each series keeps its own count.
         assert_eq!(
@@ -420,7 +419,7 @@ async fn many_distinct_keys_under_one_tsid_are_retained() {
             .await
             .unwrap();
         writer.write(&batch(&keys, dictionary, 0)).await.unwrap();
-        let handle = handle_of(&store, entry, writer).await;
+        let handle = handle_of(entry, writer).await;
         let rows = read_rows(&format, &store, handle).await;
         assert_eq!(rows.len(), keys.len());
         for (index, row) in rows.iter().enumerate() {

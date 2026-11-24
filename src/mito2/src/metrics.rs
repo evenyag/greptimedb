@@ -448,7 +448,16 @@ lazy_static! {
 lazy_static! {
     /// Approximate published index bytes in open regions, refreshed by maintenance.
     pub static ref SERIES_INDEX_DISK_BYTES: IntGauge = register_int_gauge!(
-        "greptime_mito_series_index_disk_bytes", "estimated series and range index bytes in open regions"
+        "greptime_mito_series_index_disk_bytes", "published native series index bytes in open regions"
+    ).unwrap();
+    /// Sample files opened for key discovery because no usable certificate covered them.
+    pub static ref NARTHEX_SAMPLE_DISCOVERY: IntCounter = register_int_counter!(
+        "greptime_mito_narthex_sample_discovery_total", "sample files requiring series discovery"
+    ).unwrap();
+    /// Advancement in sequence numbers from the preceding frontier for a build window.
+    pub static ref NARTHEX_COVERAGE_LAG: Histogram = register_histogram!(
+        "greptime_mito_narthex_coverage_lag", "sequence distance to the preceding window certificate when planning a build",
+        prometheus::exponential_buckets(1.0, 4.0, 16).unwrap()
     ).unwrap();
     /// Maintenance passes deferred by the estimated disk usage.
     pub static ref SERIES_INDEX_CAPACITY_DEFERRED: IntCounter = register_int_counter!(

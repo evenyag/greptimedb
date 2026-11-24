@@ -26,7 +26,6 @@ use std::time::Instant;
 use api::v1::SemanticType;
 use common_error::ext::BoxedError;
 use common_recordbatch::filter::SimpleFilterEvaluator;
-use common_time::Timestamp;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_expr::{Expr, utils::split_conjunction};
 use datatypes::arrow::array::{
@@ -48,8 +47,8 @@ use store_api::metric_engine_consts::{
 use store_api::region_engine::{
     PartitionRange, PreparedSeriesSource, RawLabelSource, SendableRawSeriesStream, SeriesInfo,
 };
+use store_api::storage::SequenceRange;
 use store_api::storage::consts::{ReservedColumnId, SEQUENCE_COLUMN_NAME};
-use store_api::storage::{FileId, SequenceRange};
 use table::predicate::Predicate;
 use tokio::sync::OnceCell;
 
@@ -63,7 +62,7 @@ use crate::read::seq_scan::SeqScan;
 use crate::read::series_scan::{RawScanPreparation, raw};
 use crate::read::stream::ScanBatch;
 use crate::series_index::format::{
-    self, FormatReader, SamplesBatch, SamplesFormatReader, SamplesReadRequest, SeriesReadRequest,
+    self, SamplesBatch, SamplesFormatReader, SamplesReadRequest, SeriesReadRequest,
 };
 use crate::series_index::identity::ExactSeriesKey;
 use crate::series_index::{MetricSeriesId, ROW_COUNT_COLUMN};
@@ -290,6 +289,37 @@ impl ColumnarPreparedSource {
         metrics: PartitionMetrics,
         scan_pool: Arc<dyn MemoryPool>,
     ) -> Result<Self> {
+        let indexes = &context.input.narthex_series_indexes;
+        let attempt = |use_indexes| {
+            Self::prepare_from_snapshot(
+                context.clone(),
+                ranges.clone(),
+                labels.clone(),
+                raw.clone(),
+                metrics.clone(),
+                scan_pool.clone(),
+                use_indexes,
+            )
+        };
+        match attempt(!indexes.is_empty()).await {
+            // Parts are opened lazily. Discard every candidate from the failed
+            // attempt before discovering keys from the same pinned sample snapshot.
+            Err(error) if !indexes.is_empty() && error.is_object_not_found() => {
+                attempt(false).await
+            }
+            result => result,
+        }
+    }
+
+    async fn prepare_from_snapshot(
+        context: Arc<StreamContext>,
+        ranges: Vec<PartitionRange>,
+        labels: RawLabelSource,
+        raw: RawScanPreparation,
+        metrics: PartitionMetrics,
+        scan_pool: Arc<dyn MemoryPool>,
+        use_indexes: bool,
+    ) -> Result<Self> {
         let _prepare_timer = crate::metrics::READ_STAGE_ELAPSED
             .with_label_values(&["columnar_prepare_wall"])
             .start_timer();
@@ -298,7 +328,8 @@ impl ColumnarPreparedSource {
         let started = Instant::now();
         let input = &context.input;
         let metadata = input.region_metadata();
-        let (samples, series) = narthex::open_sources(&context, &ranges, &scan_pool).await?;
+        let (samples, series) =
+            narthex::open_sources(&context, &ranges, &scan_pool, use_indexes).await?;
         preparation_metrics.add_elapsed("columnar_prepare_coverage", started.elapsed());
         preparation_metrics
             .counts

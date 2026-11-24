@@ -117,19 +117,6 @@ pub fn create_file_purger(
     }
 }
 
-/// Creates a local file purger that deletes files from both the storage and the cache.
-pub fn create_local_file_purger(
-    scheduler: SchedulerRef,
-    sst_layer: AccessLayerRef,
-    cache_manager: Option<CacheManagerRef>,
-    file_ref_manager: FileReferenceManagerRef,
-) -> FilePurgerRef {
-    Arc::new(
-        LocalFilePurger::new(scheduler, sst_layer, cache_manager)
-            .with_file_ref_manager(file_ref_manager),
-    )
-}
-
 impl LocalFilePurger {
     /// Creates a new purger.
     pub fn new(

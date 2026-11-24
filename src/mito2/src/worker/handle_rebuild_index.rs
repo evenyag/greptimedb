@@ -170,7 +170,7 @@ impl<S> RegionWorkerLoop<S> {
         &mut self,
         region_id: RegionId,
         req: RegionBuildIndexRequest,
-        mut sender: OptionOutputTx,
+        sender: OptionOutputTx,
     ) {
         if matches!(
             req.options,

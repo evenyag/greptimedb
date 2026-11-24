@@ -82,6 +82,7 @@ pub(crate) async fn open_sources(
     context: &StreamContext,
     ranges: &[PartitionRange],
     pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    use_indexes: bool,
 ) -> Result<(
     Vec<Arc<dyn SamplesFormatReader>>,
     Vec<Box<dyn FormatReader>>,
@@ -92,7 +93,12 @@ pub(crate) async fn open_sources(
     let mut covered = std::collections::HashSet::new();
     let mut opened = std::collections::HashSet::new();
     let mut certificates = Vec::new();
-    for file in &context.input.narthex_series_indexes {
+    let indexes = if use_indexes {
+        context.input.narthex_series_indexes.as_slice()
+    } else {
+        &[]
+    };
+    for file in indexes {
         let FileFormat::NarthexSeriesIndex(index) = &file.meta_ref().format else {
             continue;
         };
@@ -173,7 +179,10 @@ pub(crate) async fn open_sources(
         // Match Parquet: foreign SSTs use the destination admission sequence,
         // while local SSTs retain their encoded row sequences. A local file's
         // sequence metadata is only a bound, not a replacement for every row.
-        let sequence = if file.region_id() != context.input.region_metadata().region_id {
+        let sequence = if file
+            .meta_ref()
+            .uses_admission_sequence(context.input.region_metadata().region_id)
+        {
             file.meta_ref().sequence.map(|sequence| sequence.get())
         } else {
             None
@@ -181,6 +190,7 @@ pub(crate) async fn open_sources(
         let reader: Arc<dyn SamplesFormatReader> =
             Arc::new(NarthexSamplesReader { reader, sequence });
         if !covered.contains(&file.file_id()) {
+            crate::metrics::NARTHEX_SAMPLE_DISCOVERY.inc();
             series.push(Box::new(NarthexSeriesReader::new(
                 context.input.region_metadata().clone(),
                 reader.clone(),

@@ -372,7 +372,8 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             .access_layer
             .object_store()
             .delete(&manifest.path)
-            .await?;
+            .await
+            .unwrap();
         reopen_region(&engine, region_id, table_dir, true, HashMap::new()).await;
         let stream = engine
             .scan_to_stream(region_id, ScanRequest::default())

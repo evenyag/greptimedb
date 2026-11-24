@@ -38,7 +38,7 @@ use super::*;
 use crate::series_index::artifact::{SamplesEntry, SamplesFileHandle};
 use crate::series_index::columnar::codec as columnar_codec;
 use crate::series_index::format::{SamplesBatch, SamplesFormat, SamplesReadRequest};
-use crate::series_index::identity::{ExactSeriesKey, IdentityEncoding};
+use crate::series_index::identity::ExactSeriesKey;
 use crate::sst::file::RegionFileId;
 use crate::test_util::sst_util::{new_sparse_primary_key, sst_region_metadata_with_encoding};
 
@@ -2095,6 +2095,7 @@ async fn narthex_file_reader_pins_sst_lifetime() {
     let artifact = writer.finish().await.unwrap();
     let (manifest, parts) = artifact.objects.split_first().unwrap();
     let narthex = NarthexSamplesMeta {
+        use_admission_sequence: false,
         manifest_size: manifest.file_size,
         parts: parts
             .iter()

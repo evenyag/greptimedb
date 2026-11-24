@@ -269,6 +269,9 @@ pub struct NarthexPartMeta {
 /// Common bounds, statistics and sequence semantics remain in [`FileMeta`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NarthexSamplesMeta {
+    /// All rows of a physically copied file entered this region at its admission sequence.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_admission_sequence: bool,
     /// Encoded size of manifest.json.
     pub manifest_size: u64,
     /// Parts in part-ID order, starting at zero.
@@ -638,11 +641,16 @@ impl FileMeta {
     /// Foreign files use their target-local sequence barrier; local files require
     /// the preserve marker because their physical sequences belong to this region.
     pub(crate) fn is_effective_target_sequence_trusted(&self, target_region_id: RegionId) -> bool {
-        if self.region_id != target_region_id {
+        if self.uses_admission_sequence(target_region_id) {
             self.sequence.is_some()
         } else {
             self.preserve_row_sequence
         }
+    }
+
+    pub(crate) fn uses_admission_sequence(&self, target: RegionId) -> bool {
+        self.region_id != target
+            || matches!(&self.format, FileFormat::NarthexSamples(meta) if meta.use_admission_sequence)
     }
 
     /// Returns the primary key range if both min and max are present.
@@ -1508,6 +1516,7 @@ mod tests {
     #[test]
     fn test_narthex_part_paths_follow_inventory_order() {
         let samples = FileFormat::NarthexSamples(Box::new(NarthexSamplesMeta {
+            use_admission_sequence: false,
             manifest_size: 5,
             parts: smallvec::smallvec![
                 NarthexPartMeta { file_size: 11 },

@@ -16,13 +16,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use api::v1::helper::row;
-use api::v1::region::build_index_request;
+mod benchmark;
 use api::v1::value::ValueData;
 use api::v1::{ColumnDataType, ColumnSchema, Rows};
-use common_error::ext::ErrorExt;
-use common_query::series_frame::unpack_raw_series;
-use datafusion::execution::TaskContext;
-use datafusion::physical_plan::{ExecutionPlan, metrics::ExecutionPlanMetricsSet};
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_expr::{col, lit};
 use datatypes::prelude::ConcreteDataType;
 use datatypes::series::SeriesOrdering;
@@ -30,13 +27,12 @@ use datatypes::series::raw::RawSeriesChunk;
 use datatypes::series::samples::SampleRef;
 use store_api::codec::PrimaryKeyEncoding;
 use store_api::region_engine::{
-    BoundTag, PartitionRange, PrepareRequest, QueryScanContext, RegionEngine, RegionScanner,
+    BoundTag, PrepareRequest, QueryScanContext, RegionEngine, RegionScanner,
 };
 use store_api::region_request::{
     RegionBuildIndexRequest, RegionDeleteRequest, RegionPutRequest, RegionRequest,
 };
 use store_api::storage::{ScanRequest, TimeSeriesDistribution};
-use table::table::scan::RegionScanExec;
 
 use super::*;
 use crate::config::MitoConfig;
@@ -124,9 +120,7 @@ async fn build(engine: &MitoEngine, region: &MitoRegionRef) {
     engine
         .handle_request(
             region.region_id,
-            RegionRequest::BuildIndex(RegionBuildIndexRequest {
-                options: Some(build_index_request::Options::SeriesIndex(Default::default())),
-            }),
+            RegionRequest::BuildIndex(RegionBuildIndexRequest { options: None }),
         )
         .await
         .unwrap();

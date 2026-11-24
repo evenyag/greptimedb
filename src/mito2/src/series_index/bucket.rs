@@ -42,7 +42,7 @@ pub(crate) fn rounded_bucket_width(
 /// Both widths must be positive, and `width_secs` must be a multiple of the compaction
 /// window width. Inclusive SST ranges are rounded outward to aligned,
 /// half-open intervals in seconds. Overlapping intervals merge; adjacent ones stay
-/// separate. Each merged bucket tracks its maximum sequence and any unknown sequence.
+/// separate. Each bucket pins all overlapping inputs.
 pub(crate) fn group_files_into_series_buckets(
     files: &[FileHandle],
     width_secs: i64,
@@ -71,7 +71,6 @@ pub(crate) fn group_files_into_series_buckets(
 
 /// Merges overlapping spans sorted by nondecreasing start; equal starts are allowed.
 /// Returns sorted, disjoint buckets. Adjacent half-open intervals remain separate.
-/// All spans must use the same compaction-window width for their SST summaries.
 fn group_series_buckets(spans: Vec<SeriesBucket>) -> Vec<SeriesBucket> {
     let mut buckets: Vec<SeriesBucket> = Vec::new();
     for mut span in spans {

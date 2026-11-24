@@ -474,7 +474,10 @@ async fn prepare_narthex_copy(
     let mut copied = remap_copied_file_meta(source, region.region_id);
     let manifest_size = bytes.len() as u64;
     match &mut copied.format {
-        FileFormat::NarthexSamples(meta) => meta.manifest_size = manifest_size,
+        FileFormat::NarthexSamples(meta) => {
+            meta.manifest_size = manifest_size;
+            meta.use_admission_sequence = true;
+        }
         FileFormat::NarthexSeriesIndex(meta) => meta.manifest_size = manifest_size,
         FileFormat::Parquet => return Err(invalid("expected Narthex copy source")),
     }
