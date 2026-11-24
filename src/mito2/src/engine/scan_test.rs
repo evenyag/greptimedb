@@ -425,6 +425,37 @@ async fn check_sparse_upsert_after_adding_nullable_tag(format: &str) -> Whatever
             let rows = batches.pretty_print()?;
             assert!(rows.contains("late") && rows.contains("api"), "{rows}");
         }
+        engine.handle_request(region_id, build()).await?;
+        let rebuilt = engine.get_region(region_id).unwrap().version();
+        assert!(!rebuilt.ssts.series_indexes().contains_key(&index_id));
+        assert_eq!(rebuilt.ssts.series_indexes().len(), 1);
+        // A fully covered window also needs repair when only a part disappears.
+        let index = rebuilt.ssts.series_indexes().values().next().unwrap();
+        let dir = region.access_layer.build_region_dir(region_id);
+        let objects = index.meta_ref().narthex_objects(&dir).unwrap();
+        region
+            .access_layer
+            .object_store()
+            .delete(&objects[0].path)
+            .await
+            .unwrap();
+        engine.handle_request(region_id, build()).await?;
+        let repaired = engine.get_region(region_id).unwrap().version();
+        assert_eq!(1, repaired.ssts.series_indexes().len());
+        assert!(
+            !repaired
+                .ssts
+                .series_indexes()
+                .contains_key(&index.meta_ref().file_id)
+        );
+        let batches = RecordBatches::try_collect(
+            engine
+                .scan_to_stream(region_id, ScanRequest::default())
+                .await?,
+        )
+        .await?;
+        let rows = batches.pretty_print()?;
+        assert!(rows.contains("late") && rows.contains("api"), "{rows}");
     }
     engine.stop().await?;
     Ok(())

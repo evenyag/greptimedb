@@ -14,12 +14,13 @@
 
 //! Worker-owned background maintenance for series indexes.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common_telemetry::{info, warn};
-use snafu::ensure;
+use snafu::{ResultExt, ensure};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -221,7 +222,7 @@ impl SeriesIndexTask {
         self.refresh_usage();
         let mut changed = false;
         while self
-            .reconcile_region_with_mode(region.clone(), true)
+            .reconcile_region_with_mode(region.clone(), true, !changed)
             .await?
         {
             changed = true;
@@ -232,13 +233,14 @@ impl SeriesIndexTask {
     }
 
     async fn reconcile_region(&self, region: MitoRegionRef) -> Result<bool> {
-        self.reconcile_region_with_mode(region, false).await
+        self.reconcile_region_with_mode(region, false, false).await
     }
 
     async fn reconcile_region_with_mode(
         &self,
         region: MitoRegionRef,
         manual: bool,
+        verify_objects: bool,
     ) -> Result<bool> {
         // Full capacity defers builds, but cleanup must still reclaim published usage.
         let allow_builds = self.disk_usage.load(Ordering::Relaxed) < self.max_size;
@@ -250,7 +252,18 @@ impl SeriesIndexTask {
         {
             return Ok(false);
         }
-        let result = self.reconcile_native(region, manual, allow_builds).await;
+        let result = self
+            .reconcile_native(region.clone(), manual, allow_builds, verify_objects)
+            .await;
+        // A delta or compaction may discover a missing base during I/O. Recheck the
+        // pinned inventory before retiring anything; sample I/O errors still propagate.
+        let result = match result {
+            Err(error) if !verify_objects && error.is_object_not_found() => {
+                self.reconcile_native(region, manual, allow_builds, true)
+                    .await
+            }
+            other => other,
+        };
         if result.is_err() {
             SERIES_INDEX_RECONCILE_TOTAL
                 .with_label_values(&["failure"])
@@ -264,6 +277,7 @@ impl SeriesIndexTask {
         region: MitoRegionRef,
         manual: bool,
         allow_builds: bool,
+        verify_objects: bool,
     ) -> Result<bool> {
         use crate::request::{
             RegionEditKind, RegionEditRequest, WorkerRequest, WorkerRequestWithTime,
@@ -285,16 +299,42 @@ impl SeriesIndexTask {
                 .ttl
                 .is_some_and(|ttl| ttl.is_expired(&end, &now).unwrap_or(false))
         };
-        let retire = version
-            .ssts
-            .series_indexes()
+        let indexes = version.ssts.series_indexes();
+        let mut missing = HashSet::new();
+        if verify_objects {
+            for file in indexes.values() {
+                let dir = region.access_layer.build_region_dir(file.region_id());
+                if let Some(objects) = file.meta_ref().narthex_objects(&dir) {
+                    for object in objects {
+                        if !region
+                            .access_layer
+                            .object_store()
+                            .exists(&object.path)
+                            .await
+                            .context(crate::error::OpenDalSnafu)?
+                        {
+                            missing.insert(file.file_id());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let retire = indexes
             .values()
             .filter(|file| {
                 let FileFormat::NarthexSeriesIndex(meta) = &file.meta_ref().format else {
                     return false;
                 };
                 meta.coverage.as_ref().is_none_or(|proof| {
-                    proof.region_id != region.region_id
+                    missing.contains(&file.file_id())
+                        || proof.required_files.iter().any(|id| {
+                            missing.contains(id)
+                                || indexes
+                                    .get(&id.file_id())
+                                    .is_none_or(|file| file.file_id() != *id)
+                        })
+                        || proof.region_id != region.region_id
                         || proof.schema_version != version.metadata.schema_version
                         || proof.truncated_entry_id != version.truncated_entry_id
                         || proof.windows.iter().all(|window| expired(window.end))
@@ -358,7 +398,6 @@ impl SeriesIndexTask {
             .flat_map(|l| l.files.values().cloned())
             .collect();
         let buckets = group_files_into_series_buckets(&files, width);
-        let indexes = version.ssts.series_indexes();
         let mut job = None;
         for bucket in buckets {
             if expired(bucket.end)
@@ -582,7 +621,10 @@ impl SeriesIndexTask {
                 .await
                 .map_err(|_| WorkerStoppedSnafu { id: self.worker_id }.build())?
             {
-                if !error.may_have_persisted_manifest_update()
+                // The worker returns RegionBusy directly for queue and stale-snapshot
+                // rejections. Errors from manifest execution are wrapped in EditRegion.
+                if (matches!(error, crate::error::Error::RegionBusy { .. })
+                    || !error.may_have_persisted_manifest_update())
                     && let Some(handle) = handle
                 {
                     handle.mark_deleted();

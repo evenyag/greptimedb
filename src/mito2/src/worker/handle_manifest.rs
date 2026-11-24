@@ -323,7 +323,10 @@ impl<S: LogStore> RegionWorkerLoop<S> {
 
 impl<S: LogStore> RegionWorkerLoop<S> {
     fn is_import_without_staging_binding(request: &RegionEditRequest) -> bool {
-        matches!(request.kind, RegionEditKind::Import) && request.staging_partition_expr.is_none()
+        matches!(
+            request.kind,
+            RegionEditKind::Import | RegionEditKind::NativeCopy
+        ) && request.staging_partition_expr.is_none()
     }
 
     /// Whether EnterStaging is pending in the worker, flush, or compaction queue.
@@ -1059,8 +1062,21 @@ fn prepare_region_edit(
             reason: "Invalid shared SST import or removal"
         }
     );
-    for file in &edit.files_to_add {
-        if let Some(existing) = shared.get(&file.file_id) {
+    for file in &mut edit.files_to_add {
+        // Shared references use a constant destination admission sequence. Normalize
+        // the owner-local mapping before comparing an idempotent retry.
+        let existing = shared.get(&file.file_id);
+        if file.region_id == region_id
+            && (!native_copy || file.level == file::LEVEL_SHARED)
+            && let file::FileFormat::NarthexSamples(meta) = &mut file.format
+        {
+            meta.row_sequences = match existing.map(|handle| &handle.meta_ref().format) {
+                // Preserve the installed sequence mapping, including pre-upgrade files.
+                Some(file::FileFormat::NarthexSamples(installed)) => installed.row_sequences,
+                _ => file::NarthexRowSequences::Admission,
+            };
+        }
+        if let Some(existing) = existing {
             let mut imported = file.clone();
             imported.sequence = existing.meta_ref().sequence;
             imported.preserve_row_sequence = false;
@@ -1106,30 +1122,27 @@ fn prepare_region_edit(
     let first = current.last_sequence.checked_add(1).ok_or_else(exhausted)?;
     let mut committed = first;
     for file in &mut edit.files_to_add {
-        if native_copy
-            && file.level != file::LEVEL_SHARED
-            && let file::FileFormat::NarthexSamples(meta) = &mut file.format
-        {
+        if let Some(sequence) = existing_sequence(file) {
+            file.sequence = Some(sequence);
+        } else if native_copy && let file::FileFormat::NarthexSamples(meta) = &mut file.format {
             // Translate the entire source ordering into a fresh interval. All
-            // files from this COPY share its origin, including overlapping files.
+            // files from this COPY share its origin, including shared references
+            // whose effective source sequence is their source admission barrier.
             let source_upper = file.sequence.map_or(0, NonZeroU64::get);
-            meta.row_sequences = match meta.row_sequences {
-                file::NarthexRowSequences::Admission => file::NarthexRowSequences::Admission,
-                file::NarthexRowSequences::Encoded => file::NarthexRowSequences::Offset(first),
-                file::NarthexRowSequences::Offset(base) => file::NarthexRowSequences::Offset(
-                    first.checked_add(base).ok_or_else(exhausted)?,
-                ),
-            };
+            if file.level != file::LEVEL_SHARED {
+                meta.row_sequences = match meta.row_sequences {
+                    file::NarthexRowSequences::Admission => file::NarthexRowSequences::Admission,
+                    file::NarthexRowSequences::Encoded => file::NarthexRowSequences::Offset(first),
+                    file::NarthexRowSequences::Offset(base) => file::NarthexRowSequences::Offset(
+                        first.checked_add(base).ok_or_else(exhausted)?,
+                    ),
+                };
+            }
             let upper = first.checked_add(source_upper).ok_or_else(exhausted)?;
             file.sequence = NonZeroU64::new(upper);
             committed = committed.max(upper);
         } else {
-            file.sequence = existing_sequence(file).or(NonZeroU64::new(first));
-            if file.region_id == region_id
-                && let file::FileFormat::NarthexSamples(meta) = &mut file.format
-            {
-                meta.row_sequences = file::NarthexRowSequences::Admission;
-            }
+            file.sequence = NonZeroU64::new(first);
         }
         file.preserve_row_sequence = false;
     }

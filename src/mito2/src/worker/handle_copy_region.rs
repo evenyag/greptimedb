@@ -158,10 +158,10 @@ impl<S> RegionWorkerLoop<S> {
                         .map(|file| file.file_id)
                         .collect();
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let native = region_edit.files_to_add.iter().any(|file| {
-                        matches!(file.format, file::FileFormat::NarthexSamples(_))
-                            && file.level != file::LEVEL_SHARED
-                    });
+                    let native = region_edit
+                        .files_to_add
+                        .iter()
+                        .any(|file| matches!(file.format, file::FileFormat::NarthexSamples(_)));
                     let mut admission =
                         crate::request::RegionEditRequest::new(region_id, region_edit, false, tx);
                     if native {
@@ -310,7 +310,8 @@ impl<S> RegionWorkerLoop<S> {
             if file_meta.level == file::LEVEL_SHARED {
                 new_file_metas.push(file_meta.as_ref().clone());
             } else if narthex_format {
-                let (copied, objects) = prepare_narthex_copy(region, file_meta).await?;
+                let (copied, objects) =
+                    prepare_narthex_copy(region, source_region_id, file_meta).await?;
                 new_file_metas.push(copied);
                 file_descriptors.extend(objects);
             } else {
@@ -339,7 +340,8 @@ impl<S> RegionWorkerLoop<S> {
             if target_region_manifest.series_indexes.contains_key(id) {
                 continue;
             }
-            let (mut copied, objects) = prepare_narthex_copy(region, index).await?;
+            let (mut copied, objects) =
+                prepare_narthex_copy(region, source_region_id, index).await?;
             if let file::FileFormat::NarthexSeriesIndex(narthex) = &mut copied.format {
                 for source in &mut narthex.sources {
                     // A retained index may refer to samples absent from this copy.
@@ -445,6 +447,7 @@ fn file_descriptors_for_meta(file_meta: &FileMeta) -> Vec<FileDescriptor> {
 /// manifest records the physical owner; paths are resolved from FileMeta on read.
 async fn prepare_narthex_copy(
     region: &MitoRegionRef,
+    source_region_id: RegionId,
     source: &FileMeta,
 ) -> Result<(FileMeta, Vec<FileDescriptor>)> {
     use crate::series_index::columnar::{invalid, require};
@@ -481,6 +484,15 @@ async fn prepare_narthex_copy(
         FileFormat::NarthexSamples(meta) => {
             meta.manifest_size = manifest_size;
             use file::NarthexRowSequences;
+            // A remapped file can be physically owned by a third region. Match
+            // the effective sequence seen by a scan of the logical COPY source.
+            if source.region_id != source_region_id {
+                meta.row_sequences = if source.sequence.is_some() {
+                    NarthexRowSequences::Admission
+                } else {
+                    NarthexRowSequences::Encoded
+                };
+            }
             let source_base = match meta.row_sequences {
                 NarthexRowSequences::Offset(base) => base,
                 _ => 0,

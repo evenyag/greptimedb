@@ -1649,7 +1649,6 @@ impl Error {
     pub(crate) fn may_have_persisted_manifest_update(&self) -> bool {
         match self {
             Error::EditRegion { source, .. } => source.may_have_persisted_manifest_update(),
-            Error::RegionBusy { .. } => false,
             // Applicability and capability checks reject the edit before storage I/O.
             Error::InvalidRequest { .. }
             | Error::UpdateManifest { .. }

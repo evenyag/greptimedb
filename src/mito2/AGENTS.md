@@ -127,8 +127,8 @@ Tests live next to the code as `*_test.rs` (e.g. `src/mito2/src/engine/flush_tes
   arbitrary partial groups: readers and index row IDs rely on this layout.
 - Append-mode Narthex raw-series reads apply LastRow dedup after merging;
   non-append reads use the configured merge mode, and batch reads retain append
-  semantics. Physical COPY follows Parquet's
-  untrusted source-sequence semantics; repartition still assigns admission sequences.
+  semantics. Narthex COPY translates physical rows and shared admission barriers
+  into one destination sequence interval. Repartition assigns admission sequences.
   The region worker owns COPY locks; task guards hold them through publication and
   installation so retries cannot race failure cleanup, including across region reopen.
   The last active or queued task removes its lock entry, including on cancellation.

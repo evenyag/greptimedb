@@ -678,6 +678,142 @@ async fn test_copy_region_from_clears_preserve_row_sequence_marker() {
     );
 }
 
+fn narthex_copy_create_request(append: bool) -> store_api::region_request::RegionCreateRequest {
+    use crate::test_util::sst_util::sst_region_metadata_with_encoding;
+    use store_api::codec::PrimaryKeyEncoding;
+
+    let mut request = CreateRequestBuilder::new()
+        .tag_num(1)
+        .field_num(1)
+        .insert_option("primary_key_encoding", "sparse")
+        .insert_option("sst_format", "narthex")
+        .insert_option("append_mode", if append { "true" } else { "false" })
+        .insert_option(
+            "preserve_row_sequence",
+            if append { "true" } else { "false" },
+        )
+        .build();
+    let reserved = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
+    request
+        .column_metadatas
+        .extend(reserved.column_metadatas.into_iter().take(2));
+    request
+        .primary_key
+        .splice(0..0, reserved.primary_key.into_iter().take(2));
+    request
+}
+
+#[cfg(feature = "enterprise")]
+#[tokio::test]
+async fn test_narthex_copy_preserves_shared_order_and_admission() {
+    use crate::manifest::action::RegionEdit;
+    use crate::sst::file::{FileMeta, LEVEL_SHARED};
+    use crate::test_util::sst_util::new_sparse_primary_key;
+    use crate::test_util::{flush_region, sparse_metric_put};
+
+    let mut env = TestEnv::new().await;
+    let engine = env
+        .create_engine(MitoConfig {
+            schedule_compaction_after_edit: false,
+            ..Default::default()
+        })
+        .await;
+    let owner = RegionId::new(2, 1);
+    let source = RegionId::new(2, 2);
+    let target = RegionId::new(2, 3);
+    let request = narthex_copy_create_request(false);
+    for region in [owner, source, target] {
+        engine
+            .handle_request(region, RegionRequest::Create(request.clone()))
+            .await
+            .unwrap();
+    }
+    for (region, value) in [(source, 1.0), (owner, 2.0)] {
+        let metadata = engine.get_region(region).unwrap().metadata();
+        let key = new_sparse_primary_key(&["api"], &metadata, 42, 7);
+        engine
+            .handle_request(region, sparse_metric_put(key, 1000, Some(value)))
+            .await
+            .unwrap();
+        flush_region(&engine, region, None).await;
+    }
+    let shared = FileMeta {
+        level: LEVEL_SHARED,
+        ..engine.get_region(owner).unwrap().version().ssts.levels()[0]
+            .files()
+            .next()
+            .unwrap()
+            .meta_ref()
+            .clone()
+    };
+    let edit = RegionEdit {
+        files_to_add: vec![shared],
+        ..Default::default()
+    };
+    for region in [owner, owner, source] {
+        engine.edit_region(region, edit.clone()).await.unwrap();
+    }
+    engine
+        .copy_region_from(
+            target,
+            MitoCopyRegionFromRequest {
+                source_region_id: source,
+                parallelism: 1,
+            },
+        )
+        .await
+        .unwrap();
+    for region in [source, target] {
+        let rows = RecordBatches::try_collect(
+            engine
+                .scan_to_stream(region, ScanRequest::default())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(1, rows.iter().map(|b| b.num_rows()).sum::<usize>());
+        assert!(rows.pretty_print().unwrap().contains("| 2.0 "));
+    }
+}
+
+#[tokio::test]
+async fn test_native_copy_edit_rejected_in_staging() {
+    use crate::request::{RegionEditKind, RegionEditRequest, WorkerRequest};
+    use store_api::region_request::{EnterStagingRequest, StagingPartitionDirective};
+
+    let mut env = TestEnv::new().await;
+    let engine = env.create_engine(Default::default()).await;
+    let target = RegionId::new(2, 3);
+    engine
+        .handle_request(
+            target,
+            RegionRequest::Create(narthex_copy_create_request(true)),
+        )
+        .await
+        .unwrap();
+    // Deliver the final COPY edit after staging starts, as if object I/O had just finished.
+    engine
+        .handle_request(
+            target,
+            RegionRequest::EnterStaging(EnterStagingRequest {
+                partition_directive: StagingPartitionDirective::RejectAllWrites,
+            }),
+        )
+        .await
+        .unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut admission = RegionEditRequest::new(target, Default::default(), false, tx);
+    admission.kind = RegionEditKind::NativeCopy;
+    engine
+        .inner
+        .workers
+        .submit_to_worker(target, WorkerRequest::EditRegion(admission))
+        .await
+        .unwrap();
+    assert_matches!(rx.await.unwrap(), Err(Error::RejectWriteInStaging { .. }));
+}
+
 #[rstest::rstest]
 #[case::samples_only(false, false, false)]
 #[case::physical_copy(false, true, false)]
@@ -691,12 +827,10 @@ async fn test_narthex_copy_and_remap(
 ) {
     use crate::manifest::action::RegionEdit;
     use crate::sst::file::FileFormat;
-    use crate::test_util::sst_util::sst_region_metadata_with_encoding;
     use crate::test_util::{flush_region, reopen_region};
     use datatypes::value::Value;
     use partition::expr::col;
     use std::collections::HashMap;
-    use store_api::codec::PrimaryKeyEncoding;
     use store_api::region_engine::{RemapManifestsRequest, SettableRegionRoleState};
     use store_api::region_request::{
         ApplyStagingManifestRequest, EnterStagingRequest, RegionDropRequest,
@@ -719,21 +853,7 @@ async fn test_narthex_copy_and_remap(
     let source = RegionId::new(2, 1);
     // Different decimal width exercises the rewritten manifest's byte counts.
     let target = RegionId::new(2, u32::MAX);
-    let mut request = CreateRequestBuilder::new()
-        .tag_num(1)
-        .field_num(1)
-        .insert_option("primary_key_encoding", "sparse")
-        .insert_option("sst_format", "narthex")
-        .insert_option("append_mode", "true")
-        .insert_option("preserve_row_sequence", "true")
-        .build();
-    let reserved = sst_region_metadata_with_encoding(PrimaryKeyEncoding::Sparse);
-    request
-        .column_metadatas
-        .extend(reserved.column_metadatas.into_iter().take(2));
-    request
-        .primary_key
-        .splice(0..0, reserved.primary_key.into_iter().take(2));
+    let request = narthex_copy_create_request(true);
     for region in [source, target] {
         engine
             .handle_request(region, RegionRequest::Create(request.clone()))
