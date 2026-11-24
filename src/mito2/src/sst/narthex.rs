@@ -159,6 +159,67 @@ pub(crate) async fn write_samples(
     }])
 }
 
+/// Reconstruct the canonical sparse key from a native series row, in SST order.
+async fn series_keys(
+    layer: &AccessLayer,
+    source: &crate::sst::file::FileHandle,
+    metadata: &store_api::metadata::RegionMetadata,
+) -> Result<
+    futures::stream::BoxStream<'static, Result<crate::series_index::identity::ExactSeriesKey>>,
+> {
+    use crate::series_index::columnar::{invalid, reader::ColumnarReader};
+    use crate::series_index::format::{self, FormatReader, SeriesReadRequest};
+    use crate::series_index::identity::ExactSeriesKey;
+    use datatypes::arrow::array::{StringArray, UInt32Array, UInt64Array};
+    use datatypes::value::ValueRef;
+    use futures::TryStreamExt;
+    use mito_codec::row_converter::{SparseOffsetsCache, SparsePrimaryKeyCodec};
+    let handle = crate::series_index::SeriesIndexFileHandle::from_narthex(
+        source.clone(),
+        &layer.build_region_dir(source.region_id()),
+    )?;
+    let reader = ColumnarReader::open(layer.object_store().clone(), handle).await?;
+    let schema = reader.schema();
+    format::validate_series_schema(&schema, metadata)?;
+    let mut tags = schema
+        .fields()
+        .iter()
+        .skip(3)
+        .map(|f| Ok((format::field_id(f)?, f.name().clone())))
+        .collect::<Result<Vec<_>>>()?;
+    tags.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    let projection = schema
+        .fields()
+        .iter()
+        .take(2)
+        .map(|f| f.name().clone())
+        .chain(tags.iter().map(|(_, name)| name.clone()))
+        .collect();
+    let mut batches = reader.read(SeriesReadRequest {
+        projection,
+        ..Default::default()
+    })?;
+    Ok(Box::pin(async_stream::try_stream! {
+        let codec = SparsePrimaryKeyCodec::schemaless();
+        let mut offsets = SparseOffsetsCache::new();
+        let mut encoded = Vec::new();
+        while let Some(batch) = batches.try_next().await? {
+            let table = batch.column(0).as_any().downcast_ref::<UInt32Array>().ok_or_else(|| invalid("invalid native series table id"))?;
+            let tsid = batch.column(1).as_any().downcast_ref::<UInt64Array>().ok_or_else(|| invalid("invalid native series TSID"))?;
+            let columns = tags.iter().enumerate().map(|(i,(id,_))| {
+                let values = batch.column(i+2).as_any().downcast_ref::<StringArray>().ok_or_else(|| invalid("invalid native series tag"))?;
+                Ok((*id,values))
+            }).collect::<Result<Vec<_>>>()?;
+            for row in 0..batch.num_rows() {
+                encoded.clear();
+                codec.encode_internal(table.value(row), tsid.value(row), &mut encoded).map_err(|e| invalid(e.to_string()))?;
+                codec.encode_to_vec(columns.iter().map(|(id,values)| (*id, if values.is_null(row) { ValueRef::Null } else { ValueRef::String(values.value(row)) })), &mut encoded).map_err(|e| invalid(e.to_string()))?;
+                yield ExactSeriesKey::from_sparse_key(&encoded, &mut offsets)?;
+            }
+        }
+    }))
+}
+
 /// Merge the sorted sample key areas. A separate manifest edit publishes the index.
 pub(crate) async fn write_series(
     layer: &AccessLayer,
@@ -174,14 +235,8 @@ pub(crate) async fn write_series(
     use crate::series_index::format::{FormatWriter, SamplesFormatReader};
     use crate::series_index::samples::reader::SamplesReader;
     use crate::sst::file::{FileMeta, NarthexSeriesIndexMeta};
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
     require(!sources.is_empty(), "narthex series index requires samples")?;
-    require(
-        sources
-            .iter()
-            .all(|source| matches!(source.meta_ref().format, FileFormat::NarthexSamples(_))),
-        "narthex series index requires narthex sample sources",
-    )?;
     let id = FileId::random();
     let prefix = location::narthex_file_dir(&layer.build_region_dir(metadata.region_id), id);
     let mut file = FileMeta {
@@ -211,7 +266,7 @@ pub(crate) async fn write_series(
         &layer.build_region_dir(metadata.region_id),
     )?;
     let mut writer = ColumnarSeriesFormat::default().narthex_writer(
-        metadata,
+        metadata.clone(),
         layer.object_store().clone(),
         &entry,
         prefix,
@@ -220,15 +275,27 @@ pub(crate) async fn write_series(
         let mut streams = Vec::with_capacity(sources.len());
         let mut heads = BinaryHeap::new();
         for source in sources {
-            let handle = SamplesFileHandle::from_narthex(
-                source.clone(),
-                &layer.build_region_dir(source.region_id()),
-            )?;
-            let reader = SamplesReader::open(layer.object_store().clone(), handle).await?;
-            // Empty projection and no time predicate read only metadata and exact keys.
-            let mut stream = reader.read(Default::default())?;
-            if let Some(block) = stream.try_next().await? {
-                heads.push(Reverse((block.key, streams.len())));
+            let mut stream = match &source.meta_ref().format {
+                FileFormat::NarthexSeriesIndex(_) => series_keys(layer, source, &metadata).await?,
+                FileFormat::NarthexSamples(_) => {
+                    let handle = SamplesFileHandle::from_narthex(
+                        source.clone(),
+                        &layer.build_region_dir(source.region_id()),
+                    )?;
+                    let reader = SamplesReader::open(layer.object_store().clone(), handle).await?;
+                    reader
+                        .read(Default::default())?
+                        .map_ok(|block| block.key)
+                        .boxed()
+                }
+                FileFormat::Parquet => {
+                    return Err(crate::series_index::columnar::invalid(
+                        "expected native series or samples",
+                    ));
+                }
+            };
+            if let Some(key) = stream.try_next().await? {
+                heads.push(Reverse((key, streams.len())));
             }
             streams.push(stream);
         }
@@ -238,8 +305,8 @@ pub(crate) async fn write_series(
                 writer.append_key(key.bytes()).await?;
                 previous = Some(key);
             }
-            if let Some(block) = streams[index].try_next().await? {
-                heads.push(Reverse((block.key, index)));
+            if let Some(key) = streams[index].try_next().await? {
+                heads.push(Reverse((key, index)));
             }
         }
         Ok(())

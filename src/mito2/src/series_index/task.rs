@@ -331,6 +331,7 @@ impl SeriesIndexTask {
             .worker
             .as_ref()
             .ok_or_else(|| WorkerStoppedSnafu { id: self.worker_id }.build())?;
+        let mut job = None;
         for bucket in buckets {
             if bucket.files.iter().all(|f| f.meta_ref().sequence.is_none()) {
                 continue;
@@ -343,12 +344,8 @@ impl SeriesIndexTask {
                     };
                     let proof = index.coverage.as_ref()?;
                     (proof.region_id == region.region_id
-                        && proof.truncated_entry_id == version.truncated_entry_id
-                        && proof
-                            .windows
-                            .iter()
-                            .all(|w| bucket.start <= w.start && w.end <= bucket.end))
-                    .then_some((file, proof))
+                        && proof.truncated_entry_id == version.truncated_entry_id)
+                        .then_some((file, proof))
                 })
                 .collect();
             if bucket
@@ -375,10 +372,64 @@ impl SeriesIndexTask {
                     frontier: version.flushed_sequence,
                 }],
             };
+            let remove = existing
+                .iter()
+                .filter(|(_, p)| {
+                    p.windows
+                        .iter()
+                        .all(|w| bucket.start <= w.start && w.end <= bucket.end)
+                })
+                .map(|(f, _)| f.file_id())
+                .collect::<Vec<_>>();
+            job = Some((bucket.files.into_vec(), remove, coverage));
+            break;
+        }
+        if job.is_none() {
+            // Reuse the four-file maintenance trigger. Union only certified peers
+            // in this schema and domain; retain their individual window frontiers.
+            let mut inputs = Vec::new();
+            let mut windows = Vec::new();
+            let mut peers: Vec<_> = indexes.values().collect();
+            peers.sort_unstable_by_key(|file| file.time_range().0);
+            for file in peers {
+                let FileFormat::NarthexSeriesIndex(meta) = &file.meta_ref().format else {
+                    continue;
+                };
+                let Some(proof) = &meta.coverage else {
+                    continue;
+                };
+                if proof.region_id != region.region_id
+                    || proof.truncated_entry_id != version.truncated_entry_id
+                    || proof.schema_version != version.metadata.schema_version
+                {
+                    continue;
+                }
+                inputs.push(file.clone());
+                windows.extend(proof.windows.iter().cloned());
+                if inputs.len() == 4 {
+                    break;
+                }
+            }
+            if inputs.len() == 4 {
+                windows.sort_by_key(|w| w.start);
+                let remove = inputs.iter().map(|f| f.file_id()).collect();
+                job = Some((
+                    inputs,
+                    remove,
+                    NarthexCoverage {
+                        region_id: region.region_id,
+                        schema_version: version.metadata.schema_version,
+                        truncated_entry_id: version.truncated_entry_id,
+                        windows,
+                    },
+                ));
+            }
+        }
+        if let Some((inputs, remove, coverage)) = job {
             let output = crate::sst::narthex::write_series(
                 &region.access_layer,
                 version.metadata.clone(),
-                &bucket.files,
+                &inputs,
                 Some(coverage),
             )
             .await?;
@@ -386,7 +437,7 @@ impl SeriesIndexTask {
                 crate::sst::file::FileHandle::new(output.clone(), region.file_purger.clone());
             let edit = crate::manifest::action::RegionEdit {
                 series_indexes_to_add: vec![output],
-                series_indexes_to_remove: existing.iter().map(|(file, _)| file.file_id()).collect(),
+                series_indexes_to_remove: remove.clone(),
                 ..Default::default()
             };
             let (tx, rx) = oneshot::channel();
@@ -412,10 +463,8 @@ impl SeriesIndexTask {
                 return Err(error);
             }
             stats.built_series += 1;
-            stats.source_files += bucket.files.len();
-            stats.removed_series += existing.len();
-            // The index set changed. Capture a fresh snapshot for the next publication.
-            break;
+            stats.source_files += inputs.len();
+            stats.removed_series += remove.len();
         }
         Ok(stats)
     }
