@@ -45,8 +45,8 @@ The artifact manifest identifies the format as `columnar-samples`, version 1.
 
 A native sample artifact stores the rows of a flush or compaction. The region
 manifest records its file ID and sequence bound. A shared reference uses its
-destination admission sequence. A physical copy
-reserves a new interval in the destination sequence domain. Its manifest records
+destination admission sequence. A physical copy reserves a new interval in the
+destination sequence domain. Its manifest records
 the offset applied to stored row sequences. This preserves the source ordering
 of overlapping puts and deletes. The prepared reader applies the mapping before
 evaluating visibility or merging rows. The region manifest uses the distinct
@@ -62,8 +62,8 @@ generation is unique for each build. A manifest contains:
 | `version` | Integer 1 |
 | `identity_encoding` | String `exact-sparse-key-area`; required, never defaulted. It names the identity *and* the layout that stores it, so `exact-sparse-key` (keys inline in the block descriptors) is different and not readable |
 | `region_id` | Physical region ID, u64 |
-| `source_file_id` | Artifact owner ID matching `SamplesEntry.file_id`; the SST ID for legacy artifacts, or the generation ID for daily artifacts |
-| `generation` | `FileId` matching the catalog artifact generation |
+| `source_file_id` | Physical sample file ID from the region manifest |
+| `generation` | Same physical file ID, identifying this immutable generation |
 | `timestamp` | Object with `column_id`, `name`, and `unit` |
 | `fields` | Ordered objects with `column_id`, `name`, `type`, and `nullable` |
 | `files` | Ordered part descriptors, defined below |
@@ -109,7 +109,8 @@ Readers consider every matching part rather than choosing a unique owner.
 the artifact's `file_size` is their checked sum. An empty artifact has an empty
 file list and no part files. The manifest is at most 64 MiB.
 
-Region, source SST, and generation must match the catalog entry. The artifact
+The region ID must match the physical owner. Both file IDs must match the
+physical file ID in the region manifest. The artifact
 object list must contain exactly the derived manifest and part paths, without
 duplicates, extra objects, or inconsistent size totals. Part order comes from
 the manifest.
