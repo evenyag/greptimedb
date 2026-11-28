@@ -32,7 +32,7 @@ use store_api::metadata::RegionMetadataRef;
 use store_api::storage::FileId;
 
 use super::metadata::{
-    Bounds, HEADER_SIZE, KEY_CHECKSUM_BYTES, Page, PayloadReference, TRAILER_SIZE, Trailer,
+    Bounds, FOOTER_SIZE, Group, HEADER_SIZE, KEY_CHECKSUM_BYTES, Page, PayloadReference,
 };
 use super::*;
 use crate::series_index::columnar::codec as columnar_codec;
@@ -274,9 +274,18 @@ async fn rewrite_part(
     )
 }
 
+fn part_groups(bytes: &[u8]) -> Vec<Group> {
+    let footer_start = bytes.len() - FOOTER_SIZE as usize;
+    let footer = metadata::DirectoryFooter::decode(&bytes[footer_start..]).unwrap();
+    let start = footer_start - footer.length as usize;
+    footer
+        .groups(&bytes[start..footer_start], start as u64)
+        .unwrap()
+}
+
 /// Reads the descriptor and root page of a one-part artifact, plus the part's bytes. Tests
 /// use it to inspect what the reader decodes and to rewrite a stored page.
-async fn root_page(store: &ObjectStore, handle: &FileHandle) -> (Manifest, Trailer, Page, Vec<u8>) {
+async fn root_page(store: &ObjectStore, handle: &FileHandle) -> (Manifest, Group, Page, Vec<u8>) {
     let manifest = manifest(store, handle).await;
     assert_eq!(
         1,
@@ -289,8 +298,7 @@ async fn root_page(store: &ObjectStore, handle: &FileHandle) -> (Manifest, Trail
         .unwrap()
         .to_bytes()
         .to_vec();
-    let trailer_start = bytes.len() - TRAILER_SIZE as usize;
-    let trailer = Trailer::decode(&bytes[trailer_start..], bytes.len() as u64).unwrap();
+    let [trailer]: [Group; 1] = part_groups(&bytes).try_into().unwrap();
     assert_eq!(1, trailer.depth, "one leaf keeps the root page addressable");
     let start = trailer.root.payload.offset as usize;
     let stored = &bytes[start..start + trailer.root.payload.stored as usize];
@@ -493,6 +501,7 @@ async fn equal_timestamps_cross_leaves_and_parts() {
         // One block descriptor plus header; a block now also stores its exact series key.
         page_bytes: 288,
         root_capacity: 2,
+        part_bytes: 450,
         ..Default::default()
     };
     let rows: Vec<_> = (0..7)
@@ -501,17 +510,11 @@ async fn equal_timestamps_cross_leaves_and_parts() {
         .collect();
     let handle = build(&format, &store, m.clone(), &[batch(&m, &rows, true)]).await;
     let manifest = manifest(&store, &handle).await;
-    assert!(manifest.files.len() >= 4);
+    assert!(manifest.files.len() >= 2);
     let first = store.read(&manifest.part_path(0)).await.unwrap().to_bytes();
-    assert_eq!(
-        Trailer::decode(
-            &first[first.len() - TRAILER_SIZE as usize..],
-            first.len() as u64
-        )
-        .unwrap()
-        .depth,
-        2
-    );
+    let groups = part_groups(&first);
+    assert!(groups.len() >= 2);
+    assert_eq!(groups[0].depth, 2);
     let reader = format.reader(store, handle).await.unwrap();
     for (start, end) in [(99, 100), (100, 101), (101, 102), (50, 101)] {
         let mut req = full_request();
@@ -941,6 +944,137 @@ impl mock::Read for RecordingRead {
     }
 }
 #[tokio::test]
+async fn group_pruning_preserves_colliding_keys_and_skips_unselected_ranges() {
+    let store = store();
+    let meta = metadata();
+    let format = ColumnarSamplesFormat {
+        block_rows: 1,
+        metadata_bytes: 256,
+        ..Default::default()
+    };
+    let selected = exact(&meta, &["a", "b"], 1, 7);
+    let partner = exact(&meta, &["a", "c"], 1, 7);
+    let other = exact(&meta, &["a", "d"], 1, 8);
+    let keys = [&selected, &selected, &partner, &other].map(|key| key.bytes().to_vec());
+    let handle = build(
+        &format,
+        &store,
+        meta.clone(),
+        &[keyed_batch(&meta, &keys, &[10, 50, 50, 50], true)],
+    )
+    .await;
+    let manifest = manifest(&store, &handle).await;
+    assert_eq!(1, manifest.files.len());
+    let path = manifest.part_path(0);
+    let bytes = store.read(&path).await.unwrap().to_bytes();
+    let groups = part_groups(&bytes);
+    assert_eq!(4, groups.len());
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let observed = reads.clone();
+    let layer = MockLayerBuilder::default()
+        .reader_factory(Arc::new(move |path, _, inner| {
+            Box::new(RecordingRead {
+                inner,
+                path: path.into(),
+                reads: observed.clone(),
+            })
+        }))
+        .build()
+        .unwrap();
+    let reader = format
+        .reader(store.clone().layer(layer), handle.clone())
+        .await
+        .unwrap();
+    let mut req = full_request();
+    req.keys = Some(BTreeSet::from([selected.clone()]));
+    req.start = Some(50);
+    let batches = reader
+        .read(req)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].key, selected);
+    assert_eq!(collect_rows(&batches)[0].2, 50);
+    // Group 0 misses on time and group 3 misses on ID. Group 2 shares both
+    // coarse bounds with the match, so only its exact key can disqualify it.
+    {
+        let reads = reads.lock().unwrap();
+        let touched: Vec<_> = groups
+            .iter()
+            .map(|group| {
+                let end = group.root.payload.end().unwrap();
+                reads.iter().any(|(file, range)| {
+                    file == &path
+                        && range.offset() < end
+                        && range.offset() + range.size().unwrap() > group.start
+                })
+            })
+            .collect();
+        assert_eq!(touched, [false, true, true, false]);
+    }
+
+    // Each group starts at relative offset zero in its cache extent. Reopening
+    // the reader must retrieve the correct key and payload for every group.
+    let strategy = crate::cache::CacheStrategy::EnableAll(Arc::new(
+        crate::cache::CacheManager::builder()
+            .page_cache_size(1024 * 1024)
+            .sst_meta_cache_size(1024 * 1024)
+            .build(),
+    ));
+    let expected = format
+        .reader(store.clone(), handle.clone())
+        .await
+        .unwrap()
+        .read(full_request())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let reader = reader::SamplesReader::open_cached(
+            store.clone(),
+            handle.clone(),
+            REGION_DIR,
+            strategy.columnar_metadata(),
+        )
+        .await
+        .unwrap();
+        let actual = reader
+            .read(full_request())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_rows(&actual), collect_rows(&expected));
+        assert_eq!(
+            actual.iter().map(|b| &b.key).collect::<Vec<_>>(),
+            expected.iter().map(|b| &b.key).collect::<Vec<_>>()
+        );
+    }
+
+    // Even with a valid checksum, a key area cannot start in the previous group.
+    let directory_start = groups.last().unwrap().root.payload.end().unwrap() as usize;
+    let mut bad = groups;
+    bad[1].payload_end = bad[0].payload_end;
+    let mut rewritten = bytes[..directory_start].to_vec();
+    rewritten.extend(metadata::encode_directory(&bad));
+    store.write(&path, rewritten).await.unwrap();
+    let reader = format.reader(store, handle).await.unwrap();
+    let err = reader
+        .read(full_request())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("invalid sample group boundaries"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn selective_reads_pin_the_artifact() {
     let store = store();
     let m = metadata();
@@ -983,10 +1117,9 @@ async fn selective_reads_pin_the_artifact() {
     let result = stream.try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].column(0).null_count(), 1);
-
-    // Header, trailer, one leaf/root, and the selected block's key from the key area. The
+    // Header, footer, directory, one leaf/root, and the selected block's key from the key area. The
     // all-null projected field has no payload.
-    assert_eq!(reads.lock().unwrap().len(), 4);
+    assert_eq!(reads.lock().unwrap().len(), 5);
 }
 #[test]
 fn payload_limits_and_timestamp_envelopes() {
@@ -1019,14 +1152,28 @@ fn payload_limits_and_timestamp_envelopes() {
         max: 50,
     });
     assert_eq!((bounds.min, bounds.max), (0, 200));
-    let (mut reference, bytes) = metadata::pack(&[1, 2, 3], (1u64 << 32) + 5, 1, false).unwrap();
+    let (mut reference, bytes) = metadata::pack(
+        &mut zstd::bulk::Compressor::new(3).unwrap(),
+        &[1, 2, 3],
+        (1u64 << 32) + 5,
+        1,
+        false,
+    )
+    .unwrap();
     reference
         .validate(16, reference.end().unwrap(), false)
         .unwrap();
     assert_eq!(reference.unpack(&bytes).unwrap(), [1, 2, 3]);
     reference.offset = u64::MAX;
     assert!(reference.end().is_err());
-    let (mut reference, bytes) = metadata::pack(&vec![0; 1024], 16, 1, false).unwrap();
+    let (mut reference, bytes) = metadata::pack(
+        &mut zstd::bulk::Compressor::new(3).unwrap(),
+        &vec![0; 1024],
+        16,
+        1,
+        false,
+    )
+    .unwrap();
     reference.decoded = 1000;
     assert!(reference.unpack(&bytes).is_err());
 }
@@ -1045,13 +1192,20 @@ async fn malformed_framing_and_payload_corruption() {
     let manifest = manifest(&store, &handle).await;
     let path = manifest.part_path(0);
     let original = store.read(&path).await.unwrap().to_vec();
-    let end = original.len() - TRAILER_SIZE as usize;
-    let trailer = Trailer::decode(&original[end..], original.len() as u64).unwrap();
+    let trailer = part_groups(&original).remove(0);
+    let end = trailer.root.payload.end().unwrap() as usize;
     for (encoding, compression) in [(99, 0), (1, 99)] {
-        let mut unsupported = Trailer::decode(&original[end..], original.len() as u64).unwrap();
-        unsupported.root.payload.encoding = encoding;
-        unsupported.root.payload.compression = compression;
-        assert!(Trailer::decode(&unsupported.encode(), original.len() as u64).is_err());
+        let mut bad = trailer.clone();
+        bad.root.payload.encoding = encoding;
+        bad.root.payload.compression = compression;
+        let directory = metadata::encode_directory(&[bad]);
+        let (entries, footer) = directory.split_at(metadata::GROUP_BYTES);
+        assert!(
+            metadata::DirectoryFooter::decode(footer)
+                .unwrap()
+                .groups(entries, end as u64)
+                .is_err()
+        );
     }
     let decoded = trailer
         .root
@@ -1083,7 +1237,7 @@ async fn malformed_framing_and_payload_corruption() {
             .await
             .is_err()
     );
-    for offset in [0, end + 72, end + TRAILER_SIZE as usize - 8] {
+    for offset in [0, end + 72, original.len() - 8] {
         let mut bad = original.clone();
         bad[offset] ^= 3;
         store.write(&path, bad).await.unwrap();
@@ -1200,8 +1354,7 @@ async fn unknown_field_codec(store: &ObjectStore, handle: FileHandle) -> FileHan
     };
     // The payload area ends where the pages begin, so only the page's own reference and the
     // file length change.
-    trailer.file_length = (bytes.len() + TRAILER_SIZE as usize) as u64;
-    bytes.extend_from_slice(&trailer.encode());
+    bytes.extend_from_slice(&metadata::encode_directory(&[trailer]));
     rewrite_part(store, handle, manifest, bytes).await
 }
 
@@ -1477,7 +1630,7 @@ async fn batches_column_io_reuses_readers_and_releases_reservations() {
         let reads = reads.lock().unwrap();
         // Each stream reads framing/root, one payload read across both blocks, and the part's
         // exact keys from the key area.
-        assert_eq!(10, reads.len());
+        assert_eq!(12, reads.len());
         assert_eq!(
             2 * part_size,
             reads
@@ -1587,9 +1740,9 @@ async fn boundary_blocks_fetch_remaining_columns_only_for_selected_rows() {
     // would silently point at the key-area read instead.
     let timestamp_read = {
         let reads = reads.lock().unwrap();
-        // Header, trailer, root, the selected block's key, then timestamps only. The other part
+        // Header, footer, directory, root, the selected block's key, then timestamps only. The other part
         // is pruned.
-        assert_eq!(5, reads.len());
+        assert_eq!(6, reads.len());
         reads
             .iter()
             .find(|(_, range)| range.offset() == HEADER_SIZE)
@@ -1611,8 +1764,8 @@ async fn boundary_blocks_fetch_remaining_columns_only_for_selected_rows() {
     assert_eq!(2, creations.load(Ordering::Relaxed));
     let reads = reads.lock().unwrap();
     // Both boundary blocks read timestamps before fetching remaining columns, and each part
-    // reads its own keys.
-    assert_eq!(12, reads.len());
+    // reads its own directory and keys.
+    assert_eq!(14, reads.len());
     assert_eq!(
         Some(&timestamp_read),
         reads
@@ -1660,11 +1813,11 @@ async fn series_read_windows_are_bounded_and_gap_rows_are_not_returned() {
     assert_eq!(input, collect_rows(&all));
     let (full_bytes, first_window_bytes) = {
         let reads = reads.lock().unwrap();
-        // Header, trailer, root (one leaf: a fixed 56-byte descriptor no longer carries the
+        // Header, footer, directory, root (one leaf: a fixed 56-byte descriptor no longer carries the
         // series key, so this fixture's 260 blocks fit one page where a key-carrying descriptor
         // needed two), three windows of at most 128 blocks, and one merged key read for the
         // page's selected keys.
-        assert_eq!(7, reads.len());
+        assert_eq!(8, reads.len());
         // The initial read-ahead window is the first read of block 0's first column: it starts
         // at the payload header, while the header, trailer, and page reads do not. Anchor on
         // that range rather than on an index so a reordered traversal cannot point the
@@ -1727,7 +1880,7 @@ async fn series_read_windows_are_bounded_and_gap_rows_are_not_returned() {
     assert_eq!(vec![input[0], input[2]], collect_rows(&selected));
     // The intervening series is read as a gap, but never decoded or returned: only the
     // leaf that owns both selected blocks and one payload window are fetched.
-    assert_eq!(5, reads.lock().unwrap().len());
+    assert_eq!(6, reads.lock().unwrap().len());
 
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
     // The first pool rejects read-ahead outright. The second admits the first 128-block,
@@ -2018,6 +2171,7 @@ async fn exact_key_output_reservation_covers_the_retained_array() {
 #[case(64 * 1024)]
 #[tokio::test]
 async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
+    use crate::cache::{CacheManager, CacheStrategy};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
     let store = store();
     let m = metadata();
@@ -2043,9 +2197,13 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
         &[batch(&m, &input, false)],
     )
     .await;
-    let reader = reader::SamplesReader::open(store, handle, REGION_DIR)
-        .await
-        .unwrap();
+    let strategy = CacheStrategy::EnableAll(Arc::new(
+        CacheManager::builder().page_cache_size(1024 * 1024).build(),
+    ));
+    let reader =
+        reader::SamplesReader::open_cached(store, handle, REGION_DIR, strategy.columnar_metadata())
+            .await
+            .unwrap();
     let pool = Arc::new(GreedyMemoryPool::new(capacity));
     let mut request = full_request();
     request.memory_pool = Some(pool.clone());
@@ -2070,6 +2228,97 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
             .collect::<Vec<_>>()
     );
     assert_eq!(pool.reserved(), 0);
+}
+
+#[tokio::test]
+async fn aligned_payload_cache_reuses_gap_bytes_across_readers() {
+    use crate::cache::{CacheManager, CacheStrategy};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+    let store = store();
+    let m = metadata();
+    let input = (1..=2)
+        .flat_map(|id| (0..3).map(move |t| (1, id, t, 1, 1, Some(t as u64))))
+        .collect::<Vec<_>>();
+    let handle = build(
+        &ColumnarSamplesFormat::default(),
+        &store,
+        m.clone(),
+        &[batch(&m, &input, false)],
+    )
+    .await;
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let observed = reads.clone();
+    let store = store.layer(
+        MockLayerBuilder::default()
+            .reader_factory(Arc::new(move |path, _, inner| {
+                Box::new(RecordingRead {
+                    inner,
+                    path: path.into(),
+                    reads: observed.clone(),
+                })
+            }))
+            .build()
+            .unwrap(),
+    );
+    let strategy = CacheStrategy::EnableAll(Arc::new(
+        CacheManager::builder()
+            .page_cache_size(1024 * 1024)
+            .sst_meta_cache_size(1024 * 1024)
+            .build(),
+    ));
+    for id in [1, 2] {
+        reads.lock().unwrap().clear();
+        let reader = reader::SamplesReader::open_cached(
+            store.clone(),
+            handle.clone(),
+            REGION_DIR,
+            strategy.columnar_metadata(),
+        )
+        .await
+        .unwrap();
+        let mut request = full_request();
+        request.keys = Some([exact(&m, &["a", "b"], 1, id)].into());
+        request.start = Some(1);
+        request.end = Some(3);
+        let rows = reader
+            .read(request)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .copied()
+                .filter(|r| r.1 == id && r.2 >= 1)
+                .collect::<Vec<_>>(),
+            collect_rows(&rows)
+        );
+        if id == 2 {
+            assert!(
+                reads.lock().unwrap().is_empty(),
+                "a different series must reuse the aligned over-read, including boundary values"
+            );
+        }
+    }
+    let reader =
+        reader::SamplesReader::open_cached(store, handle, REGION_DIR, strategy.columnar_metadata())
+            .await
+            .unwrap();
+    let pool = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let mut request = full_request();
+    request.memory_pool = Some(pool.clone());
+    let mut stream = reader.read(request).unwrap();
+    assert!(stream.try_next().await.unwrap().is_some());
+    assert!(pool.reserved() > 0);
+    drop(stream);
+    assert_eq!(0, pool.reserved());
+    let pool = Arc::new(GreedyMemoryPool::new(1));
+    let mut request = full_request();
+    request.memory_pool = Some(pool.clone());
+    assert!(reader.read(request).unwrap().try_next().await.is_err());
+    assert_eq!(0, pool.reserved());
 }
 
 mod keys;

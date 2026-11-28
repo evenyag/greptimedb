@@ -27,18 +27,20 @@ use datatypes::arrow::compute::take;
 use datatypes::arrow::datatypes::SchemaRef;
 use datatypes::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use futures::stream::BoxStream;
-use object_store::{ObjectStore, Reader};
+use object_store::ObjectStore;
 use snafu::ResultExt;
 use tokio::sync::OnceCell;
 
-use crate::cache::columnar::{self as metadata_cache, MetadataCache};
+use crate::cache::columnar::{
+    self as metadata_cache, MetadataCache, MetadataIdentity, MetadataPart, ObjectReader, PartArea,
+};
 use crate::error::{ComputeArrowSnafu, NewRecordBatchSnafu, OpenDalSnafu, Result};
 use crate::metrics::ColumnarReadMetrics;
 use crate::series_index::artifact::ArtifactFormat;
 use crate::series_index::format::{SamplesBatch, SamplesFormatReader, SamplesReadRequest};
 use crate::series_index::identity::{ExactSeriesKey, IdentityEncoding};
 use crate::series_index::samples::metadata::{
-    self, Areas, Block, BlockOrder, Bounds, Column, Page, PageReference, Trailer,
+    self, Areas, Block, BlockOrder, Bounds, Column, Page, PageReference,
 };
 use crate::series_index::samples::{
     MANIFEST_LIMIT, Manifest, MetricSeriesId, TimestampUnit, VERSION, codec, histogram, invalid,
@@ -46,7 +48,6 @@ use crate::series_index::samples::{
 };
 use crate::sst::file::{FileFormat, FileHandle};
 use crate::sst::location;
-use crate::sst::parquet::helper::fetch_byte_ranges;
 
 pub(crate) struct SamplesReader {
     store: ObjectStore,
@@ -54,7 +55,7 @@ pub(crate) struct SamplesReader {
     schema: SchemaRef,
     cache: Option<MetadataCache>,
     handle: FileHandle,
-    parts: Arc<Vec<OnceCell<Reader>>>,
+    parts: Arc<Vec<OnceCell<ObjectReader>>>,
 }
 impl SamplesReader {
     pub(crate) async fn open_cached(
@@ -63,13 +64,11 @@ impl SamplesReader {
         region_dir: &str,
         cache: Option<MetadataCache>,
     ) -> Result<Self> {
-        let file = handle.meta_ref();
-        let identity = format!(
-            "{region_dir}/{:?}/{:?}/{}",
-            handle.file_id(),
-            file.format,
-            file.file_size
-        );
+        let identity = MetadataIdentity::SamplesManifest(handle.meta_ref().file_id);
+        let loader_store = store.clone();
+        let loader_handle = handle.clone();
+        let loader_cache = cache.clone();
+        let region_dir = region_dir.to_owned();
         let descriptor = metadata_cache::load(
             cache.as_ref(),
             identity,
@@ -83,8 +82,14 @@ impl SamplesReader {
                         .map(|field| field.size() + std::mem::size_of::<usize>())
                         .sum::<usize>()
             },
-            async {
-                let reader = Self::open(store.clone(), handle.clone(), region_dir).await?;
+            move || async move {
+                let reader = Self::open_descriptor(
+                    loader_store,
+                    loader_handle,
+                    &region_dir,
+                    loader_cache.as_ref(),
+                )
+                .await?;
                 Ok((reader.manifest, reader.schema))
             },
         )
@@ -108,6 +113,15 @@ impl SamplesReader {
         handle: FileHandle,
         region_dir: &str,
     ) -> Result<Self> {
+        Self::open_descriptor(store, handle, region_dir, None).await
+    }
+
+    async fn open_descriptor(
+        store: ObjectStore,
+        handle: FileHandle,
+        region_dir: &str,
+        cache: Option<&MetadataCache>,
+    ) -> Result<Self> {
         let file = handle.meta_ref();
         let FileFormat::NarthexSamples(samples) = &file.format else {
             return Err(invalid("expected Narthex samples file"));
@@ -119,7 +133,16 @@ impl SamplesReader {
             length > 0 && length <= MANIFEST_LIMIT as u64,
             "samples manifest exceeds limit",
         )?;
-        let bytes = read_range(&store, &path, 0, length).await?;
+        let object = ObjectReader::open(
+            cache,
+            Some(&handle),
+            crate::cache::file_cache::FileType::Samples(None),
+            &store,
+            &path,
+            length,
+        )
+        .await?;
+        let bytes = object.read(0..length).await.context(OpenDalSnafu)?;
         // A manifest that the current format cannot read predates exact identity or is
         // corrupt; either way it must never be reused.
         let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
@@ -160,7 +183,10 @@ impl SamplesReader {
                     && part.num_blocks <= part.num_rows
                     && part.first <= part.last
                     && part.min_timestamp <= part.max_timestamp
-                    && part.file_size >= metadata::HEADER_SIZE + metadata::TRAILER_SIZE,
+                    && part.file_size
+                        >= metadata::HEADER_SIZE
+                            + metadata::FOOTER_SIZE
+                            + metadata::GROUP_BYTES as u64,
                 "invalid sample part descriptor",
             )?;
             if let Some(last) = previous {
@@ -247,7 +273,6 @@ impl SamplesFormatReader for SamplesReader {
         let handle = self.handle.clone();
         let parts = self.parts.clone();
         Ok(Box::pin(async_stream::try_stream! {
-            let _handle = &handle;
             let mut metrics = ColumnarReadMetrics::default();
             if empty { return; }
             // One decoder and one scratch per stream, reused by every block. The decoder holds
@@ -274,7 +299,7 @@ impl SamplesFormatReader for SamplesReader {
             // advanced by a block whose key was pruned: the two loaded keys on either side of a
             // gap are still compared with each other.
             let mut loaded_key: Option<BlockOrder> = None;
-            // The last loaded key of the previous part, with the pool bytes it is charged. A
+            // The last loaded key of the previous group, with the pool bytes it is charged. A
             // reference is a location inside one part, so the exact bytes are what decides
             // whether a series continues into another; this copy outlives every per-part
             // reservation, so it has a consumer of its own.
@@ -282,204 +307,244 @@ impl SamplesFormatReader for SamplesReader {
                 .map(|pool| MemoryConsumer::new("ColumnarSamplesBoundaryKey").register(pool));
             let mut spanning_key: Option<ExactSeriesKey> = None;
             let mut spanning_bytes = 0usize;
+            let mut group_id = 0u64;
             for part in &manifest.files {
                 let bounds = Bounds { first: part.first, last: part.last, min: part.min_timestamp, max: part.max_timestamp };
                 if !matches(bounds, &request, ids.as_ref()) { adjacent = false; continue; }
                 let path = manifest.part_path(part.part_id);
                 // One lazy reader per accessed part, shared across this query's streams.
                 let reader = parts[part.part_id as usize].get_or_try_init(|| async {
-                    store.reader_with(&path).concurrent(8).gap(0).await.context(OpenDalSnafu)
+                    ObjectReader::open(cache.as_ref(), Some(&handle), crate::cache::file_cache::FileType::Samples(Some(part.part_id)), &store, &path, part.file_size).await
                 }).await?;
-                let size = part.file_size;
+                let object = MetadataPart { generation: manifest.generation, part_id: part.part_id };
                 let metadata_started = Instant::now();
-                let trailer = metadata_cache::load(cache.as_ref(), format!("{path}/{size}/framing"), |_| std::mem::size_of::<Trailer>(), async {
-                let header = read_part_range(reader, 0, metadata::HEADER_SIZE).await?;
-                metadata::validate_header(&header)?;
-                let bytes = read_part_range(reader, part.file_size - metadata::TRAILER_SIZE, part.file_size).await?;
-                let trailer = Trailer::decode(&bytes, part.file_size)?;
-                    Ok(trailer)
-                }).await?;
-                require(trailer.root.bounds == bounds, "sample root/part bounds mismatch")?;
-                let root = load_metadata_page(cache.as_ref(), reader, (&path, size), &trailer.root, trailer.depth, trailer.areas(), &manifest).await?;
+                let framing = reader.clone();
+                let descriptor = part.clone();
+                let groups = metadata_cache::load(
+                    cache.as_ref(), MetadataIdentity::SamplesDirectory(object),
+                    |groups: &Vec<metadata::Group>| groups.capacity() * std::mem::size_of::<metadata::Group>(),
+                    move || async move { load_groups(&framing, &descriptor).await },
+                ).await?;
                 metrics.add_elapsed("columnar_metadata_wall", metadata_started.elapsed());
-                let (mut active, children) = match root.as_ref() { Page::Leaf(_) => (Some(root.clone()), Vec::new()), Page::Internal(children) => (None, children.clone()) };
-                let mut children = children.into_iter(); let mut row_count = 0u64; let mut block_count = 0u64;
-                let mut payload_position = metadata::HEADER_SIZE;
-                // Exact keys live in the part's key area, outside every metadata page. Every
-                // block of one series references the same copy, so one load serves them all.
-                let keys_reservation = request.memory_pool.as_ref()
-                    .map(|pool| MemoryConsumer::new("ColumnarSamplesKeys").register(pool));
-                // `KeyRef` is the cache key; its fields are readable, so the map needs no
-                // ordering or hashing of the reference type itself.
-                let mut part_keys = HashMap::<(u64, u32), ExactSeriesKey>::new();
-                let mut key_offsets = mito_codec::row_converter::SparseOffsetsCache::new();
-                loop {
-                    let page = if let Some(page) = active.take() { page } else {
-                        let Some(child) = children.next() else { break; };
-                        if !matches(child.bounds, &request, ids.as_ref()) { adjacent = false; continue; }
-                        let started = Instant::now();
-                        let page = load_metadata_page(cache.as_ref(), reader, (&path, size), &child, 1, trailer.areas(), &manifest).await?;
-                        metrics.add_elapsed("columnar_metadata_wall", started.elapsed());
-                        page
-                    };
-                    let blocks = match page.as_ref() { Page::Leaf(blocks) => blocks, Page::Internal(_) => Err(unsupported("internal child in sample depth-two tree"))? };
-                    // One merged read for the keys of this page's selected blocks: a page can
-                    // hold hundreds of short series, and one read per series would multiply
-                    // this scan's I/O by the number of series it touches.
-                    load_page_keys(
-                        reader,
-                        trailer.areas(),
-                        blocks,
-                        &request,
-                        ids.as_ref(),
-                        &mut part_keys,
-                        keys_reservation.as_ref(),
-                        &mut key_offsets,
-                        &mut metrics,
-                    )
-                    .await?;
-                    let mut prefetched = PrefetchedBlocks::default();
-                    for (block_index, block) in blocks.iter().enumerate() {
-                        row_count = row_count.checked_add(u64::from(block.rows)).ok_or_else(|| invalid("samples row count overflow"))?;
-                        block_count += 1;
-                        let order = block.order(part.part_id);
-                        if let Some(prior) = &previous {
-                            if prior.part() == order.part() {
-                                // Reference positions are part-relative: only a block of the same
-                                // part may be compared with the previous block's reference.
-                                prior.precedes(&order, adjacent)?;
-                            } else {
-                                // Across a part boundary the references name unrelated key areas,
-                                // so only the ordered identifier applies here. Whether the same
-                                // series continues is decided on the exact keys below.
-                                require(prior.id() <= order.id(), "unordered sample series keys")?;
-                            }
-                        } else if complete { require(block.ordinal == 0, "initial sample ordinal is not zero")?; }
-                        for column in &block.columns {
-                            column.payload.validate(payload_position, trailer.payload_end, false)?;
-                            payload_position = column.payload.end()?;
-                        }
-                        // Ownership is exact, so it needs the block's key rather than its
-                        // coarse identifier. Pruned blocks never load one, and every key this
-                        // page selects was already fetched in one merged read.
-                        let key_id = (block.key.offset, block.key.length);
-                        let mut owner = false;
-                        if matches(block.bounds(), &request, ids.as_ref()) {
-                            if let std::collections::hash_map::Entry::Vacant(slot) =
-                                part_keys.entry(key_id)
-                            {
-                                // The page-level prefetch was refused by the memory pool, or
-                                // this series has no copy cached for the part yet. This path
-                                // reserves its own read before issuing it.
-                                let key = load_block_key(
-                                    reader,
-                                    trailer.areas(),
-                                    block,
-                                    keys_reservation.as_ref(),
-                                    &mut key_offsets,
-                                    &mut metrics,
-                                )
-                                .await?;
-                                slot.insert(key);
-                            }
-                            let key = part_keys
-                                .get(&key_id)
-                                .ok_or_else(|| invalid("missing sample key"))?;
-                            // A key that parses but claims another identifier is a malformed
-                            // reference: ownership would silently point at the wrong series.
-                            require(
-                                key.id() == block.id,
-                                "sample block series key disagrees with its identifier",
-                            )?;
-                            // Only the keys this stream loaded can be checked here: a reference
-                            // is a location, and selection prunes blocks without reading theirs,
-                            // so unvisited ranges are validated structurally only. The check is
-                            // chained across such gaps - it compares the last *loaded* key, not
-                            // the last visited block - so skipping a block cannot hide the keys
-                            // on either side of it. Loaded keys must be nondecreasing, and a
-                            // repeated key must continue its series instead of restarting it.
-                            // That is also the only way a series that spans a part boundary is
-                            // recognised: its two references name unrelated key areas.
-                            if let Some(prior) = &loaded_key {
-                                let prior_key = if prior.part() == order.part() {
-                                    let reference = prior.key();
-                                    part_keys.get(&(reference.offset, reference.length))
+                for (index, group) in groups.iter().enumerate() {
+                    group_id = group_id.checked_add(1).ok_or_else(|| invalid("too many sample groups"))?;
+                    if !matches(group.root.bounds, &request, ids.as_ref()) { adjacent = false; continue; }
+                    let metadata_started = Instant::now();
+                    let areas = group.areas();
+                    let payload = PartArea::new(reader.clone(), cache.clone(), manifest.generation, part.part_id, group.start..group.payload_end);
+                    let keys = PartArea::new(reader.clone(), cache.clone(), manifest.generation, part.part_id, areas.keys.start..areas.keys.end);
+                    let root = load_metadata_page(cache.as_ref(), reader, object, &group.root, group.depth, group.areas(), &manifest).await?;
+                    metrics.add_elapsed("columnar_metadata_wall", metadata_started.elapsed());
+                    let (mut active, children) = match root.as_ref() { Page::Leaf(_) => (Some(root.clone()), Vec::new()), Page::Internal(children) => (None, children.clone()) };
+                    let mut children = children.into_iter(); let mut row_count = 0u64; let mut block_count = 0u64;
+                    let mut payload_position = group.start;
+                    // Exact keys live in the group's key area, outside every metadata page. Every
+                    // block of one series references the same copy, so one load serves them all.
+                    let keys_reservation = request.memory_pool.as_ref()
+                        .map(|pool| MemoryConsumer::new("ColumnarSamplesKeys").register(pool));
+                    // `KeyRef` is the cache key; its fields are readable, so the map needs no
+                    // ordering or hashing of the reference type itself.
+                    let mut group_keys = HashMap::<(u64, u32), ExactSeriesKey>::new();
+                    let mut key_offsets = mito_codec::row_converter::SparseOffsetsCache::new();
+                    loop {
+                        let page = if let Some(page) = active.take() { page } else {
+                            let Some(child) = children.next() else { break; };
+                            if !matches(child.bounds, &request, ids.as_ref()) { adjacent = false; continue; }
+                            let started = Instant::now();
+                            let page = load_metadata_page(cache.as_ref(), reader, object, &child, 1, group.areas(), &manifest).await?;
+                            metrics.add_elapsed("columnar_metadata_wall", started.elapsed());
+                            page
+                        };
+                        let blocks = match page.as_ref() { Page::Leaf(blocks) => blocks, Page::Internal(_) => Err(unsupported("internal child in sample depth-two tree"))? };
+                        // One merged read for the keys of this page's selected blocks: a page can
+                        // hold hundreds of short series, and one read per series would multiply
+                        // this scan's I/O by the number of series it touches.
+                        load_page_keys(
+                            &keys,
+                            group.areas(),
+                            blocks,
+                            &request,
+                            ids.as_ref(),
+                            &mut group_keys,
+                            keys_reservation.as_ref(),
+                            &mut key_offsets,
+                            &mut metrics,
+                        )
+                        .await?;
+                        let mut prefetched = PrefetchedBlocks::default();
+                        for (block_index, block) in blocks.iter().enumerate() {
+                            row_count = row_count.checked_add(u64::from(block.rows)).ok_or_else(|| invalid("samples row count overflow"))?;
+                            block_count += 1;
+                            let order = block.order(group_id);
+                            if let Some(prior) = &previous {
+                                if prior.group() == order.group() {
+                                    // References name one group’s key area: only a block of the same
+                                    // group may be compared with the previous block's reference.
+                                    prior.precedes(&order, adjacent)?;
                                 } else {
-                                    spanning_key.as_ref()
-                                };
-                                if let Some(prior_key) = prior_key {
-                                    // The exact-next-block rules only hold when nothing was
-                                    // traversed in between; a gap still requires the order and
-                                    // the ordinal to keep increasing.
-                                    let consecutive =
-                                        adjacent && previous.as_ref() == Some(prior);
-                                    require(key >= prior_key, "unordered sample exact series keys")?;
-                                    if key == prior_key {
-                                        prior.continues(&order, consecutive)?;
-                                    } else if consecutive {
-                                        // A new series starts at ordinal zero, which the
-                                        // structural check above only covers inside one part.
-                                        require(block.ordinal == 0, "first sample block has nonzero ordinal")?;
+                                    // Across a group boundary the references name unrelated key areas,
+                                    // so only the ordered identifier applies here. Whether the same
+                                    // series continues is decided on the exact keys below.
+                                    require(prior.id() <= order.id(), "unordered sample series keys")?;
+                                }
+                            } else if complete { require(block.ordinal == 0, "initial sample ordinal is not zero")?; }
+                            for column in &block.columns {
+                                column.payload.validate(payload_position, group.payload_end, false)?;
+                                payload_position = column.payload.end()?;
+                            }
+                            // Ownership is exact, so it needs the block's key rather than its
+                            // coarse identifier. Pruned blocks never load one, and every key this
+                            // page selects was already fetched in one merged read.
+                            let key_id = (block.key.offset, block.key.length);
+                            let mut owner = false;
+                            if matches(block.bounds(), &request, ids.as_ref()) {
+                                if let std::collections::hash_map::Entry::Vacant(slot) =
+                                    group_keys.entry(key_id)
+                                {
+                                    // The page-level prefetch was refused by the memory pool, or
+                                    // this series has no copy cached for the group yet. This path
+                                    // reserves its own read before issuing it.
+                                    let key = load_block_key(
+                                        &keys,
+                                        group.areas(),
+                                        block,
+                                        keys_reservation.as_ref(),
+                                        &mut key_offsets,
+                                        &mut metrics,
+                                    )
+                                    .await?;
+                                    slot.insert(key);
+                                }
+                                let key = group_keys
+                                    .get(&key_id)
+                                    .ok_or_else(|| invalid("missing sample key"))?;
+                                // A key that parses but claims another identifier is a malformed
+                                // reference: ownership would silently point at the wrong series.
+                                require(
+                                    key.id() == block.id,
+                                    "sample block series key disagrees with its identifier",
+                                )?;
+                                // Only the keys this stream loaded can be checked here: a reference
+                                // is a location, and selection prunes blocks without reading theirs,
+                                // so unvisited ranges are validated structurally only. The check is
+                                // chained across such gaps - it compares the last *loaded* key, not
+                                // the last visited block - so skipping a block cannot hide the keys
+                                // on either side of it. Loaded keys must be nondecreasing, and a
+                                // repeated key must continue its series instead of restarting it.
+                                // That is also the only way a series that spans a group boundary is
+                                // recognised: its two references name unrelated key areas.
+                                if let Some(prior) = &loaded_key {
+                                    let prior_key = if prior.group() == order.group() {
+                                        let reference = prior.key();
+                                        group_keys.get(&(reference.offset, reference.length))
+                                    } else {
+                                        spanning_key.as_ref()
+                                    };
+                                    if let Some(prior_key) = prior_key {
+                                        // The exact-next-block rules only hold when nothing was
+                                        // traversed in between; a gap still requires the order and
+                                        // the ordinal to keep increasing.
+                                        let consecutive =
+                                            adjacent && previous.as_ref() == Some(prior);
+                                        require(key >= prior_key, "unordered sample exact series keys")?;
+                                        if key == prior_key {
+                                            prior.continues(&order, consecutive)?;
+                                        } else if consecutive {
+                                            // A new series starts at ordinal zero, which the
+                                            // structural check above only covers inside one group.
+                                            require(block.ordinal == 0, "first sample block has nonzero ordinal")?;
+                                        }
                                     }
                                 }
+                                loaded_key = Some(order);
+                                owner = owns(key.bytes(), &request);
                             }
-                            loaded_key = Some(order);
-                            owner = owns(key.bytes(), &request);
-                        }
-                        let batch = if owner {
-                            if block_index >= prefetched.end {
-                                // Release the previous window before reserving the next one.
-                                drop(std::mem::take(&mut prefetched));
-                                prefetched = prefetch_blocks(reader, blocks, block_index, &field_ids, &request, ids.as_ref(), &projection, trailer.payload_end, &mut metrics).await?;
+                            let batch = if owner {
+                                if block_index >= prefetched.end {
+                                    // Release the previous window before reserving the next one.
+                                    drop(std::mem::take(&mut prefetched));
+                                    prefetched = prefetch_blocks(&payload, blocks, block_index, &field_ids, &request, ids.as_ref(), &projection, group.areas(), &mut metrics).await?;
+                                }
+                                *metrics.counts.entry("blocks").or_default() += 1;
+                                *metrics.counts.entry("decoded_rows").or_default() += u64::from(block.rows);
+                                read_block(&payload, block, &manifest, &request, buffers_consumer.as_ref(), &projection, &field_ids, projected.clone(), &mut prefetched, &mut scratch, &mut decoder, &mut metrics).await?
+                            } else { None };
+                            // The block's payload slices are shared with the read-ahead window and
+                            // the group cache, so they are dropped before the yield: the block's
+                            // reservation is then the only charge alive with the batch.
+                            scratch.release();
+                            if let Some((batch, _reservation)) = batch {
+                                // The key is copied only now: `read_block` has just reserved the
+                                // bytes the batch retains, so the clone is paid for before it
+                                // happens instead of being allocated first and charged after.
+                                let key = group_keys
+                                    .get(&key_id)
+                                    .ok_or_else(|| invalid("missing sample key"))?
+                                    .clone();
+                                *metrics.counts.entry("batches").or_default() += 1;
+                                *metrics.counts.entry("output_rows").or_default() += batch.num_rows() as u64;
+                                // The block's key is emitted once, not once per row.
+                                yield SamplesBatch { batch, key };
                             }
-                            *metrics.counts.entry("blocks").or_default() += 1;
-                            *metrics.counts.entry("decoded_rows").or_default() += u64::from(block.rows);
-                            read_block(reader, block, &manifest, &request, buffers_consumer.as_ref(), &projection, &field_ids, projected.clone(), &mut prefetched, &mut scratch, &mut decoder, &mut metrics).await?
-                        } else { None };
-                        // The block's payload slices are shared with the read-ahead window and
-                        // the part cache, so they are dropped before the yield: the block's
-                        // reservation is then the only charge alive with the batch.
-                        scratch.release();
-                        if let Some((batch, _reservation)) = batch {
-                            // The key is copied only now: `read_block` has just reserved the
-                            // bytes the batch retains, so the clone is paid for before it
-                            // happens instead of being allocated first and charged after.
-                            let key = part_keys
-                                .get(&key_id)
-                                .ok_or_else(|| invalid("missing sample key"))?
-                                .clone();
-                            *metrics.counts.entry("batches").or_default() += 1;
-                            *metrics.counts.entry("output_rows").or_default() += batch.num_rows() as u64;
-                            // The block's key is emitted once, not once per row.
-                            yield SamplesBatch { batch, key };
+                            previous = Some(order); adjacent = true;
                         }
-                        previous = Some(order); adjacent = true;
                     }
+                    // The next group's references name its own key area, so the last loaded block's
+                    // exact key is the only thing that can prove a series continues there. It is
+                    // kept, with its own pool charge, only while another group remains to be read. A
+                    // group that loaded nothing leaves the carried key alone: it is still the last
+                    // key this stream read.
+                    if let Some(loaded) = loaded_key.filter(|loaded| loaded.group() == group_id) {
+                        let reference = loaded.key();
+                        let more_groups = index + 1 < groups.len() || part.part_id as usize + 1 < manifest.files.len();
+                        let retain = group_keys.get(&(reference.offset, reference.length)).filter(|_| more_groups);
+                        retain_boundary_key(
+                            boundary_reservation.as_ref(),
+                            &mut spanning_bytes,
+                            &mut spanning_key,
+                            retain,
+                        )?;
+                    }
+                    if complete { require(row_count == group.rows && block_count == group.blocks, "sample group totals mismatch")?; }
                 }
-                // The next part's references name its own key area, so the last loaded block's
-                // exact key is the only thing that can prove a series continues there. It is
-                // kept, with its own pool charge, only while another part remains to be read. A
-                // part that loaded nothing leaves the carried key alone: it is still the last
-                // key this stream read.
-                if let Some(loaded) = loaded_key.filter(|loaded| loaded.part() == part.part_id) {
-                    let retain = ((part.part_id as usize) + 1 < manifest.files.len())
-                        .then(|| {
-                            let reference = loaded.key();
-                            part_keys.get(&(reference.offset, reference.length))
-                        })
-                        .flatten();
-                    retain_boundary_key(
-                        boundary_reservation.as_ref(),
-                        &mut spanning_bytes,
-                        &mut spanning_key,
-                        retain,
-                    )?;
-                }
-                if complete { require(row_count == part.num_rows && block_count == part.num_blocks, "sample part totals mismatch")?; }
             }
         }))
     }
 }
+/// Read one part directory. Authenticate its ranges and reconcile the aggregate
+/// bounds and counts with the manifest before pruning individual groups.
+async fn load_groups(reader: &ObjectReader, part: &super::Part) -> Result<Vec<metadata::Group>> {
+    metadata::validate_header(
+        &reader
+            .read(0..metadata::HEADER_SIZE)
+            .await
+            .context(OpenDalSnafu)?,
+    )?;
+    let footer_start = part.file_size - metadata::FOOTER_SIZE;
+    let footer = metadata::DirectoryFooter::decode(
+        &reader
+            .read(footer_start..part.file_size)
+            .await
+            .context(OpenDalSnafu)?,
+    )?;
+    let start = footer_start
+        .checked_sub(footer.length)
+        .filter(|&n| n >= metadata::HEADER_SIZE)
+        .ok_or_else(|| invalid("sample directory offset outside part"))?;
+    let groups = footer.groups(
+        &reader
+            .read(start..footer_start)
+            .await
+            .context(OpenDalSnafu)?,
+        start,
+    )?;
+    require(
+        &super::Part::from_groups(part.part_id, part.file_size, &groups)? == part,
+        "sample directory/part inventory mismatch",
+    )?;
+    Ok(groups)
+}
+
 /// Every block records the exact series key that owns its rows. A coarse identifier
 /// match is not ownership: a colliding partner shares the identifier.
 fn owns(key: &[u8], request: &SamplesReadRequest) -> bool {
@@ -499,9 +564,9 @@ fn retained_key_bytes(length: u32) -> usize {
     length as usize + KEY_ENTRY_BYTES
 }
 
-/// Replaces the exact key that carries one series across a part boundary.
+/// Replaces the exact key that carries one series across a group boundary.
 ///
-/// Unlike the keys of a part's blocks, this copy outlives every per-part reservation, so it has a
+/// Unlike the keys of a group's blocks, this copy outlives every per-group reservation, so it has a
 /// consumer of its own: a replacement is charged before it is made, and the previous charge goes
 /// back as soon as it is replaced or no longer needed.
 fn retain_boundary_key(
@@ -586,7 +651,7 @@ fn verified_key(entry: &[u8], length: u32) -> Result<&[u8]> {
     Ok(key)
 }
 
-/// Reads one block's exact key from the part's key area.
+/// Reads one block's exact key from the group's key area.
 ///
 /// The page-level prefetch serves a whole page in one read, but it is charged up front. When the
 /// scan pool cannot take that, this path reads one key at a time, so a block that fits the pool
@@ -594,7 +659,7 @@ fn verified_key(entry: &[u8], length: u32) -> Result<&[u8]> {
 /// fetched entry, whatever alignment or assembly that fetch costs, and the owned key built from
 /// it. Reading first and refusing the key afterwards would leave the bytes already fetched.
 async fn load_block_key(
-    reader: &Reader,
+    reader: &PartArea,
     areas: Areas,
     block: &Block,
     reservation: Option<&MemoryReservation>,
@@ -611,13 +676,19 @@ async fn load_block_key(
         reservation,
         transient: peak - retained,
     };
-    let mut fetched = fetch_ranges(reader, ranges, metrics).await?;
+    let mut fetched = fetch_ranges(reader, ranges, reservation, metrics).await?;
     let entry = fetched
         .pop()
         .ok_or_else(|| invalid("missing sample key response"))?;
-    let key = ExactSeriesKey::from_sparse_key(verified_key(&entry, block.key.length)?, offsets)?;
-    // A key that parses but claims another identifier is a malformed reference: ownership would
-    // silently point at the wrong series.
+    decode_block_key(block, &entry, offsets)
+}
+
+fn decode_block_key(
+    block: &Block,
+    entry: &[u8],
+    offsets: &mut mito_codec::row_converter::SparseOffsetsCache,
+) -> Result<ExactSeriesKey> {
+    let key = ExactSeriesKey::from_sparse_key(verified_key(entry, block.key.length)?, offsets)?;
     require(
         key.id() == block.id,
         "sample block series key disagrees with its identifier",
@@ -652,7 +723,7 @@ fn fetch_peak(ranges: &[std::ops::Range<u64>]) -> usize {
 /// fetched.
 #[allow(clippy::too_many_arguments)]
 async fn load_page_keys(
-    reader: &Reader,
+    reader: &PartArea,
     areas: Areas,
     blocks: &[Block],
     request: &SamplesReadRequest,
@@ -708,16 +779,9 @@ async fn load_page_keys(
         reservation,
         transient: peak - retained,
     };
-    let fetched = fetch_ranges(reader, &ranges, metrics).await?;
+    let fetched = fetch_ranges(reader, &ranges, reservation, metrics).await?;
     for (block, entry) in wanted.iter().take(window).zip(fetched) {
-        let key =
-            ExactSeriesKey::from_sparse_key(verified_key(&entry, block.key.length)?, offsets)?;
-        // A key that parses but claims another identifier is a malformed reference: ownership
-        // would silently point at the wrong series.
-        require(
-            key.id() == block.id,
-            "sample block series key disagrees with its identifier",
-        )?;
+        let key = decode_block_key(block, &entry, offsets)?;
         keys.insert((block.key.offset, block.key.length), key);
     }
     Ok(())
@@ -745,47 +809,41 @@ fn matches(
     }
     first <= last && ids.is_none_or(|ids| ids.range(first..=last).next().is_some())
 }
-async fn read_range(store: &ObjectStore, path: &str, start: u64, end: u64) -> Result<bytes::Bytes> {
-    require(start <= end, "reversed sample byte range")?;
-    let mut buffers = fetch_byte_ranges(path, store.clone(), std::slice::from_ref(&(start..end)))
-        .await
-        .context(OpenDalSnafu)?;
-    let bytes = buffers
-        .pop()
-        .ok_or_else(|| invalid("missing sample range response"))?;
-    require(
-        buffers.is_empty() && bytes.len() as u64 == end - start,
-        "sample range length mismatch",
-    )?;
-    Ok(bytes)
-}
 /// Reuses validated immutable metadata; traversal remains local to each stream.
 async fn load_metadata_page(
     cache: Option<&MetadataCache>,
-    reader: &Reader,
-    object: (&str, u64),
+    reader: &ObjectReader,
+    part: MetadataPart,
     reference: &PageReference,
     depth: u32,
     areas: Areas,
-    manifest: &Manifest,
+    manifest: &Arc<Manifest>,
 ) -> Result<Arc<Page>> {
-    let (path, size) = object;
+    let reader = reader.clone();
+    let reference = *reference;
+    let manifest = manifest.clone();
     metadata_cache::load(
         cache,
-        format!("{path}/{size}/{reference:?}/{depth}/{}", areas.payload_end),
+        MetadataIdentity::SamplesPage {
+            part,
+            reference,
+            depth,
+        },
         Page::retained_size,
-        async {
+        move || async move {
             if reference.payload.encoding != 1 {
                 return Err(unsupported("sample metadata codec"));
             }
-            let bytes =
-                read_part_range(reader, reference.payload.offset, reference.payload.end()?).await?;
+            let bytes = reader
+                .read(reference.payload.offset..reference.payload.end()?)
+                .await
+                .context(OpenDalSnafu)?;
             Page::decode(
                 &reference.payload.unpack(&bytes)?,
-                reference,
+                &reference,
                 depth,
                 areas,
-                manifest,
+                &manifest,
             )
         },
     )
@@ -891,7 +949,7 @@ fn timestamp_array(values: impl Iterator<Item = i64>, unit: TimestampUnit) -> Ar
 }
 #[allow(clippy::too_many_arguments)]
 async fn read_block(
-    reader: &Reader,
+    reader: &PartArea,
     block: &Block,
     manifest: &Manifest,
     request: &SamplesReadRequest,
@@ -966,9 +1024,23 @@ async fn read_block(
         }
     }
     if boundary {
-        fetch_columns(reader, &[&block.columns[0]], &mut scratch.buffers, metrics).await?;
+        fetch_columns(
+            reader,
+            &[&block.columns[0]],
+            &mut scratch.buffers,
+            reservation.as_ref(),
+            metrics,
+        )
+        .await?;
     } else {
-        fetch_columns(reader, &columns, &mut scratch.buffers, metrics).await?;
+        fetch_columns(
+            reader,
+            &columns,
+            &mut scratch.buffers,
+            reservation.as_ref(),
+            metrics,
+        )
+        .await?;
     }
     let decode_started = Instant::now();
     scratch.selected.clear();
@@ -1008,7 +1080,14 @@ async fn read_block(
             .into_iter()
             .filter(|column| column.role != 1)
             .collect::<Vec<_>>();
-        fetch_columns(reader, &remaining, &mut scratch.buffers, metrics).await?;
+        fetch_columns(
+            reader,
+            &remaining,
+            &mut scratch.buffers,
+            reservation.as_ref(),
+            metrics,
+        )
+        .await?;
     }
     let decode_started = Instant::now();
     scratch.arrays.clear();
@@ -1159,27 +1238,14 @@ async fn read_block(
     Ok(Some((batch, reservation)))
 }
 
-async fn read_part_range(reader: &Reader, start: u64, end: u64) -> Result<bytes::Bytes> {
-    require(start <= end, "reversed sample byte range")?;
-    let bytes = reader
-        .read(start..end)
-        .await
-        .context(OpenDalSnafu)?
-        .to_bytes();
-    require(
-        bytes.len() as u64 == end - start,
-        "sample range length mismatch",
-    )?;
-    Ok(bytes)
-}
-
 /// Fetch selected ranges with bounded gap coalescing and shared-buffer slices.
 /// The read window and scan reservation bound retained buffers;
 /// OpenDAL bounds concurrency to 8.
 async fn fetch_columns(
-    reader: &Reader,
+    reader: &PartArea,
     columns: &[&Column],
     buffers: &mut HashMap<u64, bytes::Bytes>,
+    reservation: Option<&MemoryReservation>,
     metrics: &mut ColumnarReadMetrics,
 ) -> Result<()> {
     let columns: Vec<_> = columns
@@ -1194,7 +1260,7 @@ async fn fetch_columns(
         .iter()
         .map(|column| Ok(column.payload.offset..column.payload.end()?))
         .collect::<Result<Vec<_>>>()?;
-    let fetched = fetch_ranges(reader, &ranges, metrics).await?;
+    let fetched = fetch_ranges(reader, &ranges, reservation, metrics).await?;
     for (column, bytes) in columns.iter().zip(fetched) {
         buffers.insert(column.payload.offset, bytes);
     }
@@ -1203,8 +1269,9 @@ async fn fetch_columns(
 
 /// Fetches nearby ranges in bounded merged reads.
 async fn fetch_ranges(
-    reader: &Reader,
+    reader: &PartArea,
     ranges: &[std::ops::Range<u64>],
+    reservation: Option<&MemoryReservation>,
     metrics: &mut ColumnarReadMetrics,
 ) -> Result<Vec<bytes::Bytes>> {
     *metrics.counts.entry("column_ranges").or_default() += ranges.len() as u64;
@@ -1214,12 +1281,50 @@ async fn fetch_ranges(
         return Ok(Vec::new());
     }
 
+    // Count vector fetch calls on both paths. OpenDAL handles physical range coalescing.
+    let started = Instant::now();
+    let cached = if let Some(reservation) = reservation {
+        // Charge aligned I/O to the existing key, block, or read-ahead consumer.
+        // The worker keeps this part of the charge if the requesting stream is dropped.
+        if let Some(bytes) = reader.page_fetch_bytes(ranges)
+            && reservation.try_grow(bytes).is_ok()
+        {
+            let charge = Arc::new(reservation.split(bytes));
+            reader
+                .cached_ranges(ranges, Some(charge.clone()))
+                .await?
+                .map(|(buffers, stats)| {
+                    // Retain only the requested bytes under the caller's original reservation.
+                    let buffers = buffers
+                        .iter()
+                        .map(|b| bytes::Bytes::copy_from_slice(b))
+                        .collect();
+                    (buffers, stats)
+                })
+        } else {
+            None
+        }
+    } else {
+        reader.cached_ranges(ranges, None).await?
+    };
+    if let Some((buffers, stats)) = cached {
+        metrics.add_elapsed("columnar_payload_fetch_wall", started.elapsed());
+        *metrics.counts.entry("payload_cache_misses").or_default() += stats.cache_miss as u64;
+        *metrics.counts.entry("payload_reads").or_default() += u64::from(stats.loaded_bytes > 0);
+        *metrics.counts.entry("payload_cache_hits").or_default() += stats.cache_hit as u64;
+        *metrics.bytes.entry("fetched").or_default() += stats.loaded_bytes;
+        return Ok(buffers);
+    }
+
     // Merging is bounded by [`MAX_READ_BYTES`], and a requested range never exceeds that, so
     // every range lies inside exactly one merged read.
     let merged = merge_read_ranges(ranges);
-    *metrics.counts.entry("payload_reads").or_default() += merged.len() as u64;
-    let started = Instant::now();
-    let fetched = reader.fetch(merged.clone()).await.context(OpenDalSnafu)?;
+    *metrics.counts.entry("payload_reads").or_default() += 1;
+    let fetched = reader
+        .reader
+        .fetch(merged.clone())
+        .await
+        .context(OpenDalSnafu)?;
     metrics.add_elapsed("columnar_payload_fetch_wall", started.elapsed());
     require(
         fetched.len() == merged.len(),
@@ -1227,8 +1332,7 @@ async fn fetch_ranges(
     )?;
     let mut result = Vec::with_capacity(ranges.len());
     let mut index = 0;
-    for (range, buffer) in merged.iter().zip(fetched) {
-        let bytes = buffer.to_bytes();
+    for (range, bytes) in merged.iter().zip(fetched) {
         require(
             bytes.len() as u64 == range.end - range.start,
             "sample range length mismatch",
@@ -1314,14 +1418,14 @@ struct PrefetchedBlocks {
 
 #[allow(clippy::too_many_arguments)]
 async fn prefetch_blocks(
-    reader: &Reader,
+    reader: &PartArea,
     blocks: &[Block],
     start: usize,
     field_ids: &HashSet<u32>,
     request: &SamplesReadRequest,
     ids: Option<&BTreeSet<MetricSeriesId>>,
     projection: &[usize],
-    payload_end: u64,
+    areas: Areas,
     metrics: &mut ColumnarReadMetrics,
 ) -> Result<PrefetchedBlocks> {
     const MAX_BLOCKS: usize = 128;
@@ -1360,7 +1464,7 @@ async fn prefetch_blocks(
         for column in &selected {
             column
                 .payload
-                .validate(metadata::HEADER_SIZE, payload_end, false)?;
+                .validate(areas.payload_start, areas.payload_end, false)?;
             let range = column.payload.offset..column.payload.end()?;
             if let Some(previous) = next_range.as_mut()
                 && can_merge_ranges(previous, &range)
@@ -1398,7 +1502,14 @@ async fn prefetch_blocks(
         });
     }
     let mut buffers = HashMap::new();
-    fetch_columns(reader, &columns, &mut buffers, metrics).await?;
+    fetch_columns(
+        reader,
+        &columns,
+        &mut buffers,
+        reservation.as_ref(),
+        metrics,
+    )
+    .await?;
     Ok(PrefetchedBlocks {
         end,
         buffers,

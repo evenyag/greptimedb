@@ -117,6 +117,7 @@ impl SeriesIndexTaskState {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_series_index_tasks(
     worker_id: u32,
+    write_cache: Option<crate::cache::write_cache::WriteCacheRef>,
     schema_manager: SchemaMetadataManagerRef,
     regions: RegionMapRef,
     state: Arc<SeriesIndexTaskState>,
@@ -128,6 +129,7 @@ pub(crate) fn spawn_series_index_tasks(
 ) -> JoinHandle<()> {
     common_runtime::spawn_compact(async move {
         SeriesIndexTask {
+            write_cache,
             schema_manager,
             worker_id,
             regions,
@@ -146,6 +148,7 @@ pub(crate) fn spawn_series_index_tasks(
 
 /// Periodic series-index maintenance for one region worker.
 struct SeriesIndexTask {
+    write_cache: Option<crate::cache::write_cache::WriteCacheRef>,
     schema_manager: SchemaMetadataManagerRef,
     regions: RegionMapRef,
     bucket_width: Duration,
@@ -327,12 +330,17 @@ impl SeriesIndexTask {
             let truncated = version.truncated_entry_id;
             let metadata = version.metadata.clone();
             drop(version);
-            let output =
-                crate::sst::narthex::write_series(&region.access_layer, metadata, &inputs, window)
-                    .await
-                    .inspect_err(|_| {
-                        self.failed_merge.insert(region.region_id, rank);
-                    })?;
+            let output = crate::sst::narthex::write_series(
+                &region.access_layer,
+                self.write_cache.as_ref(),
+                metadata,
+                &inputs,
+                window,
+            )
+            .await
+            .inspect_err(|_| {
+                self.failed_merge.insert(region.region_id, rank);
+            })?;
             let handle = FileHandle::new(output.clone(), region.file_purger.clone());
             let edit = crate::manifest::action::RegionEdit {
                 series_indexes_to_add: vec![output],
@@ -471,6 +479,7 @@ impl SeriesIndexTask {
             };
             let output = match crate::sst::narthex::write_series(
                 &region.access_layer,
+                self.write_cache.as_ref(),
                 metadata.clone(),
                 &sources,
                 window,
@@ -541,6 +550,7 @@ impl SeriesIndexTask {
                     .map_err(Arc::new),
                 waiters: Waiters::one(tx),
                 is_staging: false,
+                preload_sst_cache: false,
                 update_region_state: false,
             }),
         };
