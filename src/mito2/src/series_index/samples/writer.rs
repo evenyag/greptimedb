@@ -112,7 +112,7 @@ enum FieldInput<'a> {
     Float(&'a Float64Array),
     Histogram(&'a ArrayRef, &'a StructArray),
 }
-pub(super) struct SamplesWriter {
+pub(crate) struct SamplesWriter {
     options: ColumnarSamplesFormat,
     manifest: Manifest,
     outputs: Outputs,
@@ -140,6 +140,10 @@ pub(super) struct SamplesWriter {
     failed: bool,
 }
 impl SamplesWriter {
+    pub(crate) fn set_upload(&mut self, upload: crate::cache::write_cache::NarthexUpload) {
+        self.outputs.upload = Some(upload);
+    }
+
     pub fn new(
         options: ColumnarSamplesFormat,
         metadata: RegionMetadataRef,
@@ -201,6 +205,7 @@ impl SamplesWriter {
                 active: None,
                 paths: Vec::new(),
                 committed: false,
+                upload: None,
             },
             compressor: zstd::bulk::Compressor::new(3)
                 .map_err(|e| invalid(format!("sample compression: {e}")))?,
@@ -592,7 +597,7 @@ impl SamplesWriter {
         self.outputs.open(self.manifest.path()).await?;
         self.outputs.write(bytes).await?;
         self.outputs.close().await?;
-        self.outputs.committed = true;
+        self.outputs.commit().await;
         Ok(ArtifactMetadata {
             format: ArtifactFormat::ColumnarSamples,
             generation: self.manifest.generation,
@@ -744,6 +749,7 @@ mod tests {
             active: None,
             paths: Vec::new(),
             committed: false,
+            upload: None,
         }
     }
 

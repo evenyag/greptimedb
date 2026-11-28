@@ -20,10 +20,11 @@ mod histogram;
 mod metadata;
 #[cfg(test)]
 pub(crate) use histogram::tests::{TestHistogram, histogram_array};
+pub(crate) use metadata::PageReference;
 pub(crate) mod reader;
 #[cfg(test)]
 mod tests;
-mod writer;
+pub(crate) mod writer;
 
 use std::collections::HashSet;
 use std::sync::Arc;

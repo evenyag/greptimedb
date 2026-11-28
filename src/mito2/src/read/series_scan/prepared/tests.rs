@@ -669,6 +669,23 @@ async fn visibility_uses_named_columns_and_region_time_unit(
 }
 
 #[test]
+fn prefilter_distinguishes_a_tag_name_from_a_compound_predicate() {
+    use datatypes::arrow::datatypes::{DataType, Field};
+    let tag = "x IS NULL OR x";
+    let schema = Schema::new(vec![
+        Field::new("x", DataType::Utf8, true),
+        Field::new(tag, DataType::Utf8, true),
+    ]);
+    let left = col("x").is_null().or(col("x").is_null());
+    let right = Expr::Column(datafusion_common::Column::from_name(tag)).is_null();
+    assert_eq!(left.to_string(), right.to_string());
+    let (left, accepted_left) = series_read_request(&schema, &[&left]);
+    let (right, accepted_right) = series_read_request(&schema, &[&right]);
+    assert_eq!((accepted_left, accepted_right), (vec![true], vec![true]));
+    assert_ne!(left.filter_exprs, right.filter_exprs);
+}
+
+#[test]
 fn series_pushdown_preserves_predicate_semantics() {
     use datafusion_expr::{Expr, Operator};
     use datatypes::arrow::datatypes::{DataType, Field};
@@ -1722,6 +1739,94 @@ async fn authoritative_narthex_preparation_without_sidecars(
         );
     }
     assert_eq!(pool.reserved(), 0);
+    engine.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn narthex_index_open_error_falls_back_to_samples() {
+    use crate::test_util::{sparse_metric_create_request, sparse_metric_put};
+
+    use object_store::layers::mock::{self, MockLayerBuilder, oio};
+    struct FailingReader;
+    impl mock::Read for FailingReader {
+        async fn read(
+            &self,
+            _range: mock::BytesRange,
+        ) -> object_store::Result<(mock::RpRead, object_store::Buffer)> {
+            Err(injected_failure())
+        }
+
+        async fn open(
+            &self,
+            _range: mock::BytesRange,
+        ) -> object_store::Result<(mock::RpRead, Box<dyn oio::ReadStreamDyn>)> {
+            Err(injected_failure())
+        }
+    }
+
+    fn injected_failure() -> mock::Error {
+        mock::Error::new(
+            mock::ErrorKind::Unexpected,
+            "injected series manifest read failure",
+        )
+    }
+
+    let failed_path = Arc::new(Mutex::new(String::new()));
+    let observed = failed_path.clone();
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = failures.clone();
+    let layer = MockLayerBuilder::default()
+        .reader_factory(Arc::new(move |path, _, inner| {
+            if path.trim_start_matches('/') == observed.lock().unwrap().trim_start_matches('/') {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::new(FailingReader)
+            } else {
+                inner
+            }
+        }))
+        .build()
+        .unwrap();
+    let mut env = TestEnv::new().await.with_mock_layer(layer);
+    let engine = env
+        .create_engine(MitoConfig {
+            experimental_enable_series_index: true,
+            experimental_series_index_min_files: 1,
+            sst_meta_cache_size: common_base::readable_size::ReadableSize(0),
+            ..Default::default()
+        })
+        .await;
+    let id = store_api::storage::RegionId::new(1024, 0);
+    engine
+        .handle_request(
+            id,
+            RegionRequest::Create(sparse_metric_create_request("narthex")),
+        )
+        .await
+        .unwrap();
+    let region = engine.get_region(id).unwrap();
+    let key = new_sparse_primary_key(&["west"], &region.metadata(), 42, 7);
+    engine
+        .handle_request(id, sparse_metric_put(key, 1000, Some(1.0)))
+        .await
+        .unwrap();
+    flush_region(&engine, id, None).await;
+    build(&engine, &region).await;
+    let version = region.version();
+    let index = version.ssts.series_indexes().values().next().unwrap();
+    let dir = region.access_layer.build_region_dir(id);
+    *failed_path.lock().unwrap() = crate::sst::location::narthex_manifest_path(
+        &crate::sst::location::narthex_file_dir(&dir, index.meta_ref().file_id),
+    );
+    let stream = engine
+        .scan_to_stream(id, ScanRequest::default())
+        .await
+        .unwrap();
+    let rows = common_recordbatch::RecordBatches::try_collect(stream)
+        .await
+        .unwrap();
+    assert_eq!(1, rows.iter().map(|b| b.num_rows()).sum::<usize>());
+    assert!(rows.pretty_print().unwrap().contains("west"));
+    assert!(failures.load(std::sync::atomic::Ordering::Relaxed) > 0);
     engine.stop().await.unwrap();
 }
 

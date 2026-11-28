@@ -542,11 +542,7 @@ async fn key_bytes_that_disagree_with_the_descriptor_are_rejected() {
 /// The trailer and root page of one part, plus its bytes.
 ///
 /// `root_page` insists on a single-part artifact; the part-boundary tests need one part at a time.
-async fn part_root(
-    store: &ObjectStore,
-    handle: &FileHandle,
-    part: u32,
-) -> (Group, Page, Vec<u8>) {
+async fn part_root(store: &ObjectStore, handle: &FileHandle, part: u32) -> (Group, Page, Vec<u8>) {
     let manifest = super::manifest(store, handle).await;
     let bytes = store
         .read(&manifest.part_path(part))

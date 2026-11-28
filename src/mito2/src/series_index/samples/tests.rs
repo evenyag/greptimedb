@@ -285,10 +285,7 @@ fn part_groups(bytes: &[u8]) -> Vec<Group> {
 
 /// Reads the descriptor and root page of a one-part artifact, plus the part's bytes. Tests
 /// use it to inspect what the reader decodes and to rewrite a stored page.
-async fn root_page(
-    store: &ObjectStore,
-    handle: &FileHandle,
-) -> (Manifest, Group, Page, Vec<u8>) {
+async fn root_page(store: &ObjectStore, handle: &FileHandle) -> (Manifest, Group, Page, Vec<u8>) {
     let manifest = manifest(store, handle).await;
     assert_eq!(
         1,
@@ -1016,6 +1013,45 @@ async fn group_pruning_preserves_colliding_keys_and_skips_unselected_ranges() {
             })
             .collect();
         assert_eq!(touched, [false, true, true, false]);
+    }
+
+    // Each group starts at relative offset zero in its cache extent. Reopening
+    // the reader must retrieve the correct key and payload for every group.
+    let strategy = crate::cache::CacheStrategy::EnableAll(Arc::new(
+        crate::cache::CacheManager::builder()
+            .page_cache_size(1024 * 1024)
+            .sst_meta_cache_size(1024 * 1024)
+            .build(),
+    ));
+    let expected = format
+        .reader(store.clone(), handle.clone())
+        .await
+        .unwrap()
+        .read(full_request())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let reader = reader::SamplesReader::open_cached(
+            store.clone(),
+            handle.clone(),
+            REGION_DIR,
+            strategy.columnar_metadata(),
+        )
+        .await
+        .unwrap();
+        let actual = reader
+            .read(full_request())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_rows(&actual), collect_rows(&expected));
+        assert_eq!(
+            actual.iter().map(|b| &b.key).collect::<Vec<_>>(),
+            expected.iter().map(|b| &b.key).collect::<Vec<_>>()
+        );
     }
 
     // Even with a valid checksum, a key area cannot start in the previous group.
@@ -2135,6 +2171,7 @@ async fn exact_key_output_reservation_covers_the_retained_array() {
 #[case(64 * 1024)]
 #[tokio::test]
 async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
+    use crate::cache::{CacheManager, CacheStrategy};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
     let store = store();
     let m = metadata();
@@ -2160,9 +2197,13 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
         &[batch(&m, &input, false)],
     )
     .await;
-    let reader = reader::SamplesReader::open(store, handle, REGION_DIR)
-        .await
-        .unwrap();
+    let strategy = CacheStrategy::EnableAll(Arc::new(
+        CacheManager::builder().page_cache_size(1024 * 1024).build(),
+    ));
+    let reader =
+        reader::SamplesReader::open_cached(store, handle, REGION_DIR, strategy.columnar_metadata())
+            .await
+            .unwrap();
     let pool = Arc::new(GreedyMemoryPool::new(capacity));
     let mut request = full_request();
     request.memory_pool = Some(pool.clone());
@@ -2187,6 +2228,97 @@ async fn sparse_cached_reads_fit_the_scan_pool(#[case] capacity: usize) {
             .collect::<Vec<_>>()
     );
     assert_eq!(pool.reserved(), 0);
+}
+
+#[tokio::test]
+async fn aligned_payload_cache_reuses_gap_bytes_across_readers() {
+    use crate::cache::{CacheManager, CacheStrategy};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+    let store = store();
+    let m = metadata();
+    let input = (1..=2)
+        .flat_map(|id| (0..3).map(move |t| (1, id, t, 1, 1, Some(t as u64))))
+        .collect::<Vec<_>>();
+    let handle = build(
+        &ColumnarSamplesFormat::default(),
+        &store,
+        m.clone(),
+        &[batch(&m, &input, false)],
+    )
+    .await;
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let observed = reads.clone();
+    let store = store.layer(
+        MockLayerBuilder::default()
+            .reader_factory(Arc::new(move |path, _, inner| {
+                Box::new(RecordingRead {
+                    inner,
+                    path: path.into(),
+                    reads: observed.clone(),
+                })
+            }))
+            .build()
+            .unwrap(),
+    );
+    let strategy = CacheStrategy::EnableAll(Arc::new(
+        CacheManager::builder()
+            .page_cache_size(1024 * 1024)
+            .sst_meta_cache_size(1024 * 1024)
+            .build(),
+    ));
+    for id in [1, 2] {
+        reads.lock().unwrap().clear();
+        let reader = reader::SamplesReader::open_cached(
+            store.clone(),
+            handle.clone(),
+            REGION_DIR,
+            strategy.columnar_metadata(),
+        )
+        .await
+        .unwrap();
+        let mut request = full_request();
+        request.keys = Some([exact(&m, &["a", "b"], 1, id)].into());
+        request.start = Some(1);
+        request.end = Some(3);
+        let rows = reader
+            .read(request)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .copied()
+                .filter(|r| r.1 == id && r.2 >= 1)
+                .collect::<Vec<_>>(),
+            collect_rows(&rows)
+        );
+        if id == 2 {
+            assert!(
+                reads.lock().unwrap().is_empty(),
+                "a different series must reuse the aligned over-read, including boundary values"
+            );
+        }
+    }
+    let reader =
+        reader::SamplesReader::open_cached(store, handle, REGION_DIR, strategy.columnar_metadata())
+            .await
+            .unwrap();
+    let pool = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+    let mut request = full_request();
+    request.memory_pool = Some(pool.clone());
+    let mut stream = reader.read(request).unwrap();
+    assert!(stream.try_next().await.unwrap().is_some());
+    assert!(pool.reserved() > 0);
+    drop(stream);
+    assert_eq!(0, pool.reserved());
+    let pool = Arc::new(GreedyMemoryPool::new(1));
+    let mut request = full_request();
+    request.memory_pool = Some(pool.clone());
+    assert!(reader.read(request).unwrap().try_next().await.is_err());
+    assert_eq!(0, pool.reserved());
 }
 
 mod keys;
